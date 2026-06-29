@@ -20,6 +20,7 @@ appending a table row rather than editing call sites.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import re
 
@@ -28,6 +29,21 @@ import re
 from .errors import NoMarketDataError as NoMarketDataError
 
 logger = logging.getLogger(__name__)
+
+
+_CN_A_SHANGHAI_PREFIXES = ("600", "601", "603", "605", "688", "900")
+_CN_A_SHENZHEN_PREFIXES = ("000", "001", "002", "003", "300", "301", "200")
+_CN_A_RE = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>SS|SH|SZ))?$")
+
+
+@dataclass(frozen=True)
+class ChinaAInstrument:
+    raw_input: str
+    yahoo_symbol: str
+    akshare_code: str
+    baostock_code: str
+    market: str
+    exchange: str
 
 
 # ISO-4217 codes common enough to appear in retail forex pairs. A bare
@@ -80,6 +96,47 @@ _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 
 
+def _infer_china_a_exchange(code: str, suffix: str | None) -> str | None:
+    if suffix in {"SS", "SH"}:
+        return "shanghai"
+    if suffix == "SZ":
+        return "shenzhen"
+    if code.startswith(_CN_A_SHANGHAI_PREFIXES):
+        return "shanghai"
+    if code.startswith(_CN_A_SHENZHEN_PREFIXES):
+        return "shenzhen"
+    return None
+
+
+def resolve_china_a_symbol(raw: str) -> ChinaAInstrument | None:
+    """Return structured China A-share identifiers, or None for non A-shares."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    original = raw.strip()
+    s = original.upper().rstrip("+")
+    match = _CN_A_RE.fullmatch(s)
+    if not match:
+        return None
+
+    code = match.group("code")
+    suffix = match.group("suffix")
+    exchange = _infer_china_a_exchange(code, suffix)
+    if exchange is None:
+        return None
+
+    yahoo_suffix = ".SS" if exchange == "shanghai" else ".SZ"
+    baostock_prefix = "sh" if exchange == "shanghai" else "sz"
+    return ChinaAInstrument(
+        raw_input=original,
+        yahoo_symbol=f"{code}{yahoo_suffix}",
+        akshare_code=code,
+        baostock_code=f"{baostock_prefix}.{code}",
+        market="cn_a",
+        exchange=exchange,
+    )
+
+
 def _normalize_crypto(s: str) -> str | None:
     """Return ``<BASE>-USD`` if ``s`` is a known crypto quoted in USD/USDT/USDC.
 
@@ -117,6 +174,13 @@ def normalize_symbol(raw: str) -> str:
     s = raw.strip().upper()
     # Broker CFD/qualifier suffixes Yahoo never uses.
     s = s.rstrip("+")
+
+    china_a = resolve_china_a_symbol(s)
+    if china_a is not None:
+        canonical = china_a.yahoo_symbol
+        if canonical != raw.strip().upper():
+            logger.info("Resolved symbol %r to Yahoo symbol %r", raw, canonical)
+        return canonical
 
     crypto = _normalize_crypto(s)
     if s in _ALIASES:
