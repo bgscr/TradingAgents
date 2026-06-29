@@ -185,3 +185,13 @@ Use CodeGraph first for:
 - indexed file-structure lookup
 
 Do not start with grep, find, or broad file reads for structural questions. Use shell search only as a fallback when CodeGraph output is missing, stale, incomplete, or ambiguous.
+
+### Worktree Initialization
+
+Each git worktree has its own working directory. Because `.codegraph/` is local generated index state and should be ignored by Git, every newly created worktree must initialize CodeGraph before CodeGraph MCP tools can be relied on in that worktree.
+
+After creating a new worktree, run:
+
+```bash
+rtk codegraph init
+rtk codegraph status
