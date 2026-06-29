@@ -98,9 +98,9 @@ _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 
 def _infer_china_a_exchange(code: str, suffix: str | None) -> str | None:
     if suffix in {"SS", "SH"}:
-        return "shanghai"
+        return "shanghai" if code.startswith(_CN_A_SHANGHAI_PREFIXES) else None
     if suffix == "SZ":
-        return "shenzhen"
+        return "shenzhen" if code.startswith(_CN_A_SHENZHEN_PREFIXES) else None
     if code.startswith(_CN_A_SHANGHAI_PREFIXES):
         return "shanghai"
     if code.startswith(_CN_A_SHENZHEN_PREFIXES):

@@ -89,6 +89,11 @@ class TestChinaASymbols(unittest.TestCase):
         self.assertIsNone(resolve_china_a_symbol("123456"))
         self.assertEqual(normalize_symbol("123456"), "123456")
 
+    def test_invalid_suffixed_six_digit_code_is_not_resolved(self):
+        for raw in ("123456.SH", "123456.SZ"):
+            self.assertIsNone(resolve_china_a_symbol(raw))
+            self.assertEqual(normalize_symbol(raw), raw)
+
     def test_existing_non_china_symbols_keep_current_behavior(self):
         self.assertEqual(normalize_symbol("XAUUSD"), "GC=F")
         self.assertEqual(normalize_symbol("EURUSD"), "EURUSD=X")
