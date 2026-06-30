@@ -49,9 +49,11 @@ class VendorRoutingTests(unittest.TestCase):
         _reset_config()
 
     def _route(self, vendors_for_get_stock_data):
+        missing = set(vendors_for_get_stock_data) - set(interface.VENDOR_METHODS["get_stock_data"])
+        self.assertFalse(missing, f"Missing production get_stock_data vendors: {sorted(missing)}")
         return mock.patch.dict(
-            interface.VENDOR_METHODS,
-            {"get_stock_data": vendors_for_get_stock_data},
+            interface.VENDOR_METHODS["get_stock_data"],
+            vendors_for_get_stock_data,
             clear=False,
         )
 
@@ -97,7 +99,9 @@ class VendorRoutingTests(unittest.TestCase):
         self.assertEqual(result, "AV_DATA")
 
     def _route_method(self, method, vendors):
-        return mock.patch.dict(interface.VENDOR_METHODS, {method: vendors}, clear=False)
+        missing = set(vendors) - set(interface.VENDOR_METHODS[method])
+        self.assertFalse(missing, f"Missing production {method} vendors: {sorted(missing)}")
+        return mock.patch.dict(interface.VENDOR_METHODS[method], vendors, clear=False)
 
     def test_optional_category_degrades_instead_of_raising(self):
         # An optional enrichment vendor (FRED macro) that raises must NOT abort
@@ -208,6 +212,27 @@ class VendorRoutingTests(unittest.TestCase):
 
         self.assertEqual(result, "YF_DATA")
         akshare.assert_not_called()
+
+    def test_real_vendor_table_registers_configured_china_a_vendors(self):
+        cfg = config_module.get_config()
+        expected_methods = {
+            "core_stock_apis": "get_stock_data",
+            "technical_indicators": "get_indicators",
+            "fundamental_data": "get_fundamentals",
+            "news_data": "get_news",
+        }
+
+        for category, method in expected_methods.items():
+            configured = {
+                vendor.strip()
+                for vendor in cfg["market_data_vendors"]["cn_a"][category].split(",")
+                if vendor.strip()
+            }
+            registered = set(interface.VENDOR_METHODS[method])
+            self.assertTrue(
+                configured.issubset(registered),
+                f"{method} missing configured China vendors: {sorted(configured - registered)}",
+            )
 
 
 if __name__ == "__main__":

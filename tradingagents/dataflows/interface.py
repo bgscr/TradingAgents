@@ -103,22 +103,36 @@ TICKER_SCOPED_METHODS = {
     "get_insider_transactions",
 }
 
+
+def get_akshare_placeholder(symbol, *args, **kwargs):
+    raise NoMarketDataError(symbol, symbol, "akshare vendor not implemented yet")
+
+
+def get_baostock_placeholder(symbol, *args, **kwargs):
+    raise NoMarketDataError(symbol, symbol, "baostock vendor not implemented yet")
+
+
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
+        "akshare": get_akshare_placeholder,
+        "baostock": get_baostock_placeholder,
     },
     # technical_indicators
     "get_indicators": {
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
+        "akshare": get_akshare_placeholder,
     },
     # fundamental_data
     "get_fundamentals": {
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
+        "akshare": get_akshare_placeholder,
+        "baostock": get_baostock_placeholder,
     },
     "get_balance_sheet": {
         "alpha_vantage": get_alpha_vantage_balance_sheet,
@@ -136,6 +150,7 @@ VENDOR_METHODS = {
     "get_news": {
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
+        "akshare": get_akshare_placeholder,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,
