@@ -285,3 +285,23 @@ change needed for optional China market news.
 - Baostock package: https://pypi.org/project/baostock/
 - Tushare permission model: https://tushare.pro/document/1?doc_id=108
 - Tushare points/frequency table: https://tushare.pro/document/1?doc_id=290
+
+## Implementation Verification
+
+Implementation must complete the focused unit tests, broader dataflow regressions,
+real data smoke for `601138.SH` and `600895.SH`, and manual CLI smoke with DeepSeek.
+
+Verification results from the implementation worktree:
+
+- Focused regression suite:
+  `tests/test_symbol_utils.py tests/test_vendor_routing.py tests/test_akshare_data.py tests/test_baostock_data.py tests/test_symbol_normalization_paths.py tests/test_china_dependencies.py`
+  passed with 50 tests.
+- Broader dataflow regressions:
+  `tests/test_no_data_handling.py tests/test_vendor_errors.py tests/test_yfinance_stale_ohlcv_guard.py tests/test_date_boundaries.py`
+  passed with 18 tests.
+- Real data smoke through `route_to_vendor` returned `601138.SS` stock data from
+  `AKShare stock_zh_a_hist` and `600895.SS News` from `AKShare stock_news_em`.
+- CLI entrypoint import/help check passed with `python -m cli.main --help`.
+- Full interactive DeepSeek CLI smoke remains a manual check after this branch is
+  merged or the launcher points at this worktree, because `start_tradingagents.ps1`
+  currently hardcodes the primary checkout path.
