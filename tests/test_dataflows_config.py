@@ -59,3 +59,14 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
         fresh = get_config()
         self.assertEqual(fresh["tool_vendors"]["get_stock_data"], "alpha_vantage")
         self.assertEqual(fresh["tool_vendors"]["get_news"], "alpha_vantage")
+
+    def test_market_data_vendors_default_contains_china_a_chain(self):
+        fresh = get_config()
+        self.assertEqual(
+            fresh["market_data_vendors"]["cn_a"]["core_stock_apis"],
+            "akshare,baostock,yfinance",
+        )
+        self.assertEqual(
+            fresh["market_data_vendors"]["cn_a"]["news_data"],
+            "akshare,yfinance",
+        )

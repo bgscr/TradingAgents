@@ -133,6 +133,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
         "prediction_markets": "polymarket",  # Options: polymarket (keyless)
     },
+    "market_data_vendors": {
+        "cn_a": {
+            "core_stock_apis": "akshare,baostock,yfinance",
+            "technical_indicators": "akshare,yfinance",
+            "fundamental_data": "akshare,yfinance,baostock",
+            "news_data": "akshare,yfinance",
+        },
+    },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default

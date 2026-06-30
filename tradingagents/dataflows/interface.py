@@ -19,6 +19,7 @@ from .errors import (
 )
 from .fred import get_macro_data as get_fred_macro_data
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
+from .symbol_utils import resolve_china_a_symbol
 from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -91,6 +92,17 @@ VENDOR_LIST = [
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
 OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
 
+TICKER_SCOPED_METHODS = {
+    "get_stock_data",
+    "get_indicators",
+    "get_fundamentals",
+    "get_balance_sheet",
+    "get_cashflow",
+    "get_income_statement",
+    "get_news",
+    "get_insider_transactions",
+}
+
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
     # core_stock_apis
@@ -143,6 +155,26 @@ VENDOR_METHODS = {
     },
 }
 
+
+def _first_symbol_arg(args, kwargs):
+    if args:
+        return args[0]
+    for key in ("symbol", "ticker"):
+        if key in kwargs:
+            return kwargs[key]
+    return None
+
+
+def _get_market_for_call(method: str, args: tuple, kwargs: dict) -> str | None:
+    if method not in TICKER_SCOPED_METHODS:
+        return None
+    symbol = _first_symbol_arg(args, kwargs)
+    if not isinstance(symbol, str):
+        return None
+    if resolve_china_a_symbol(symbol) is not None:
+        return "cn_a"
+    return None
+
 def get_category_for_method(method: str) -> str:
     """Get the category that contains the specified method."""
     for category, info in TOOLS_CATEGORIES.items():
@@ -150,25 +182,27 @@ def get_category_for_method(method: str) -> str:
             return category
     raise ValueError(f"Method '{method}' not found in any category")
 
-def get_vendor(category: str, method: str = None) -> str:
-    """Get the configured vendor for a data category or specific tool method.
-    Tool-level configuration takes precedence over category-level.
-    """
+def get_vendor(category: str, method: str = None, market: str | None = None) -> str:
+    """Get the configured vendor chain for a data category or specific tool method."""
     config = get_config()
 
-    # Check tool-level configuration first (if method provided)
     if method:
         tool_vendors = config.get("tool_vendors", {})
         if method in tool_vendors:
             return tool_vendors[method]
 
-    # Fall back to category-level configuration
+    if market:
+        market_vendors = config.get("market_data_vendors", {}).get(market, {})
+        if category in market_vendors:
+            return market_vendors[category]
+
     return config.get("data_vendors", {}).get(category, "default")
 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
-    vendor_config = get_vendor(category, method)
+    market = _get_market_for_call(method, args, kwargs)
+    vendor_config = get_vendor(category, method, market)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
 
     if method not in VENDOR_METHODS:

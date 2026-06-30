@@ -118,6 +118,97 @@ class VendorRoutingTests(unittest.TestCase):
                 self.assertRaises(ValueError):
             interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
 
+    def test_china_a_symbol_uses_market_specific_vendor_chain(self):
+        set_config({
+            "market_data_vendors": {
+                "cn_a": {
+                    "core_stock_apis": "akshare,baostock,yfinance",
+                }
+            }
+        })
+        calls = []
+
+        def akshare(symbol, *a, **k):
+            calls.append(("akshare", symbol))
+            return "AK_DATA"
+
+        def baostock(symbol, *a, **k):
+            calls.append(("baostock", symbol))
+            return "BS_DATA"
+
+        with self._route({
+            "akshare": akshare,
+            "baostock": baostock,
+            "yfinance": _returns("YF_DATA"),
+        }):
+            result = interface.route_to_vendor(
+                "get_stock_data", "601138.SH", "2026-06-01", "2026-06-29"
+            )
+
+        self.assertEqual(result, "AK_DATA")
+        self.assertEqual(calls, [("akshare", "601138.SH")])
+
+    def test_china_a_market_chain_falls_back_in_order(self):
+        set_config({
+            "market_data_vendors": {
+                "cn_a": {
+                    "core_stock_apis": "akshare,baostock,yfinance",
+                }
+            }
+        })
+        with self._route({
+            "akshare": _no_data,
+            "baostock": _returns("BS_DATA"),
+            "yfinance": _returns("YF_DATA"),
+        }):
+            result = interface.route_to_vendor(
+                "get_stock_data", "601138.SS", "2026-06-01", "2026-06-29"
+            )
+
+        self.assertEqual(result, "BS_DATA")
+
+    def test_non_china_symbol_ignores_market_specific_vendor_chain(self):
+        set_config({
+            "data_vendors": {"core_stock_apis": "yfinance"},
+            "market_data_vendors": {
+                "cn_a": {
+                    "core_stock_apis": "akshare,baostock,yfinance",
+                }
+            },
+        })
+        akshare = mock.Mock(side_effect=_returns("AK_DATA"))
+        with self._route({
+            "akshare": akshare,
+            "yfinance": _returns("YF_DATA"),
+        }):
+            result = interface.route_to_vendor(
+                "get_stock_data", "AAPL", "2026-06-01", "2026-06-29"
+            )
+
+        self.assertEqual(result, "YF_DATA")
+        akshare.assert_not_called()
+
+    def test_tool_vendor_override_still_wins_for_china_a_symbol(self):
+        set_config({
+            "tool_vendors": {"get_stock_data": "yfinance"},
+            "market_data_vendors": {
+                "cn_a": {
+                    "core_stock_apis": "akshare,baostock,yfinance",
+                }
+            },
+        })
+        akshare = mock.Mock(side_effect=_returns("AK_DATA"))
+        with self._route({
+            "akshare": akshare,
+            "yfinance": _returns("YF_DATA"),
+        }):
+            result = interface.route_to_vendor(
+                "get_stock_data", "601138.SH", "2026-06-01", "2026-06-29"
+            )
+
+        self.assertEqual(result, "YF_DATA")
+        akshare.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
