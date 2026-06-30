@@ -22,6 +22,7 @@ from .baostock_data import (
     get_stock_data as get_baostock_stock,
     get_stock_stats_indicators_window as get_baostock_stock_stats_indicators_window,
 )
+from .china_a_enhancements import get_china_a_enhancements_for_categories
 from .config import get_config
 from .errors import (
     NoMarketDataError,
@@ -211,6 +212,42 @@ def _get_market_for_call(method: str, args: tuple, kwargs: dict) -> str | None:
         return "cn_a"
     return None
 
+
+ENHANCEMENT_CATEGORIES_BY_METHOD = {
+    "get_stock_data": {"flow_sentiment"},
+    "get_news": {"announcements", "industry_policy"},
+    "get_fundamentals": {"announcements"},
+}
+
+
+def _date_for_enhancement(method: str, args: tuple, kwargs: dict) -> str | None:
+    if method == "get_stock_data":
+        return kwargs.get("end_date") or (args[2] if len(args) > 2 else None)
+    if method == "get_news":
+        return kwargs.get("end_date") or (args[2] if len(args) > 2 else None)
+    if method == "get_fundamentals":
+        return kwargs.get("curr_date") or (args[1] if len(args) > 1 else None)
+    return None
+
+
+def append_china_a_enhancement(method: str, result: str, args: tuple, kwargs: dict) -> str:
+    if not isinstance(result, str):
+        return result
+    categories = ENHANCEMENT_CATEGORIES_BY_METHOD.get(method)
+    if not categories:
+        return result
+    symbol = _first_symbol_arg(args, kwargs)
+    if not isinstance(symbol, str) or resolve_china_a_symbol(symbol) is None:
+        return result
+    curr_date = _date_for_enhancement(method, args, kwargs)
+    if not curr_date:
+        return result
+    preset = get_config().get("china_a_enhancement_preset", "basic")
+    appendix = get_china_a_enhancements_for_categories(symbol, curr_date, preset, categories)
+    if not appendix.strip():
+        return result
+    return f"{result}\n\n{appendix}"
+
 def get_category_for_method(method: str) -> str:
     """Get the category that contains the specified method."""
     for category, info in TOOLS_CATEGORIES.items():
@@ -270,7 +307,8 @@ def route_to_vendor(method: str, *args, **kwargs):
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+            return append_china_a_enhancement(method, result, args, kwargs)
         except VendorRateLimitError:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
             continue

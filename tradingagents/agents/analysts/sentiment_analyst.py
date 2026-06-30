@@ -39,6 +39,8 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.dataflows.china_a_enhancements import get_china_a_enhancements_for_categories
+from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.china_sentiment import get_china_a_local_sentiment
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
@@ -52,6 +54,17 @@ def _seven_days_back(trade_date: str) -> str:
 def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> dict[str, str]:
     news_block = get_news.func(ticker, start_date, end_date)
     if resolve_china_a_symbol(ticker) is not None:
+        local_sentiment = get_china_a_local_sentiment(ticker, start_date, end_date)
+        preset = get_config().get("china_a_enhancement_preset", "basic")
+        flow_enhancement = get_china_a_enhancements_for_categories(
+            ticker,
+            end_date,
+            preset,
+            {"flow_sentiment"},
+        )
+        local_block = "\n\n".join(
+            part for part in (local_sentiment, flow_enhancement) if part.strip()
+        )
         return {
             "news_block": news_block,
             "stocktwits_block": (
@@ -64,7 +77,7 @@ def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> di
                 "subreddits are not a reliable mainland China ticker sentiment source. "
                 "Do not infer absence of discussion from this skipped source.>"
             ),
-            "local_sentiment_block": get_china_a_local_sentiment(ticker, start_date, end_date),
+            "local_sentiment_block": local_block,
         }
 
     return {
