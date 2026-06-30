@@ -108,3 +108,58 @@ rtk .\.venv\Scripts\python.exe -m pytest tests/test_vendor_routing.py tests/test
 ### Concerns
 
 - Placeholder vendors intentionally return `NoMarketDataError` until Tasks 3/4/5 replace them with real implementations.
+
+## Review Fix Follow-Up 2 (2026-06-29)
+
+### Issue Addressed
+
+- The first review follow-up still left real China placeholder registrations incomplete for ticker-scoped methods sharing the `fundamental_data` and `news_data` market chains.
+- Regression coverage only checked representative methods, so `get_balance_sheet`, `get_cashflow`, `get_income_statement`, and `get_insider_transactions` could still silently filter configured China vendors out of the real dispatch table.
+
+### Red Phase
+
+Command:
+
+```text
+rtk .\.venv\Scripts\python.exe -m pytest tests/test_vendor_routing.py tests/test_dataflows_config.py -q
+```
+
+Output:
+
+```text
+.........F.......
+FAILED tests/test_vendor_routing.py::VendorRoutingTests::test_real_vendor_table_registers_configured_china_a_vendors
+1 failed, 16 passed in 0.84s
+```
+
+Observed failure matched the review finding:
+- `get_balance_sheet` was missing `akshare` and `baostock` in the real `VENDOR_METHODS` table.
+
+### Fix
+
+- Expanded the real-table regression to assert configured China vendor names for every ticker-scoped method using a China market-specific category chain:
+  - `get_stock_data`
+  - `get_indicators`
+  - `get_fundamentals`
+  - `get_balance_sheet`
+  - `get_cashflow`
+  - `get_income_statement`
+  - `get_news`
+  - `get_insider_transactions`
+- Added minimal placeholder registrations in `tradingagents/dataflows/interface.py` for the remaining methods:
+  - `get_balance_sheet`: `akshare`, `baostock`
+  - `get_cashflow`: `akshare`, `baostock`
+  - `get_income_statement`: `akshare`, `baostock`
+  - `get_insider_transactions`: `akshare`
+- Kept `get_global_news` unchanged.
+
+### Verification
+
+```text
+rtk .\.venv\Scripts\python.exe -m pytest tests/test_vendor_routing.py tests/test_dataflows_config.py -q
+17 passed in 0.58s
+```
+
+### Concerns
+
+- Placeholder vendors still intentionally raise `NoMarketDataError(..., "<vendor> vendor not implemented yet")` until later tasks replace them with live implementations.

@@ -216,13 +216,17 @@ class VendorRoutingTests(unittest.TestCase):
     def test_real_vendor_table_registers_configured_china_a_vendors(self):
         cfg = config_module.get_config()
         expected_methods = {
-            "core_stock_apis": "get_stock_data",
-            "technical_indicators": "get_indicators",
-            "fundamental_data": "get_fundamentals",
-            "news_data": "get_news",
+            "get_stock_data": "core_stock_apis",
+            "get_indicators": "technical_indicators",
+            "get_fundamentals": "fundamental_data",
+            "get_balance_sheet": "fundamental_data",
+            "get_cashflow": "fundamental_data",
+            "get_income_statement": "fundamental_data",
+            "get_news": "news_data",
+            "get_insider_transactions": "news_data",
         }
 
-        for category, method in expected_methods.items():
+        for method, category in expected_methods.items():
             configured = {
                 vendor.strip()
                 for vendor in cfg["market_data_vendors"]["cn_a"][category].split(",")
