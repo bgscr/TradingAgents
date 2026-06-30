@@ -71,6 +71,10 @@ agent/<task-name>
 * Multiple independent tasks may run in parallel when appropriate.
 * Use separate worktrees and separate branches to avoid workspace conflicts.
 * Subagents may be dispatched only when the environment supports safe parallel execution.
+* When spawning or dispatching subagents, each subagent must use the same model version as the main agent.
+* Do not mix model versions between the main agent and subagents within the same task.
+* If the environment cannot guarantee safe parallel execution and model-version consistency, do not dispatch subagents.
+* If model consistency is uncertain, state the uncertainty and proceed without subagents unless explicitly approved.
 
 ## 3. Code Review Process
 
