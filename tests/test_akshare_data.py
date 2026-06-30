@@ -8,16 +8,16 @@ from tradingagents.dataflows.errors import NoMarketDataError
 def _hist_frame():
     return pd.DataFrame(
         {
-            "日期": pd.to_datetime(["2026-06-27", "2026-06-29"]).date,
-            "股票代码": ["601138", "601138"],
-            "开盘": [68.0, 69.3],
-            "收盘": [70.0, 69.61],
-            "最高": [71.0, 71.46],
-            "最低": [67.5, 66.5],
-            "成交量": [1000, 1964970],
-            "成交额": [70000.0, 13558013854.0],
-            "涨跌幅": [1.2, -0.87],
-            "换手率": [0.5, 0.99],
+            "\u65e5\u671f": pd.to_datetime(["2026-06-27", "2026-06-29"]).date,
+            "\u80a1\u7968\u4ee3\u7801": ["601138", "601138"],
+            "\u5f00\u76d8": [68.0, 69.3],
+            "\u6536\u76d8": [70.0, 69.61],
+            "\u6700\u9ad8": [71.0, 71.46],
+            "\u6700\u4f4e": [67.5, 66.5],
+            "\u6210\u4ea4\u91cf": [1000, 1964970],
+            "\u6210\u4ea4\u989d": [70000.0, 13558013854.0],
+            "\u6da8\u8dcc\u5e45": [1.2, -0.87],
+            "\u6362\u624b\u7387": [0.5, 0.99],
         }
     )
 
@@ -73,3 +73,61 @@ def test_indicator_uses_akshare_ohlcv(monkeypatch):
     assert "## close_10_ema values" in out
     assert "2026-06-29:" in out
     assert "AKShare stock_zh_a_hist" in out
+
+
+@pytest.mark.unit
+def test_get_news_filters_to_requested_window(monkeypatch):
+    news = pd.DataFrame({
+        "\u5173\u952e\u8bcd": ["601138", "601138"],
+        "\u65b0\u95fb\u6807\u9898": ["inside window", "outside window"],
+        "\u65b0\u95fb\u5185\u5bb9": ["kept body", "old body"],
+        "\u53d1\u5e03\u65f6\u95f4": ["2026-06-26 16:30:06", "2026-05-01 09:00:00"],
+        "\u6587\u7ae0\u6765\u6e90": ["source a", "source b"],
+        "\u65b0\u95fb\u94fe\u63a5": ["https://example.test/1", "https://example.test/2"],
+    })
+    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+
+    out = akshare_data.get_news("601138.SH", "2026-06-20", "2026-06-29")
+
+    assert "## 601138.SS News" in out
+    assert "inside window" in out
+    assert "kept body" in out
+    assert "outside window" not in out
+
+
+@pytest.mark.unit
+def test_get_fundamentals_degrades_failed_optional_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_zyjs_ths",
+        lambda symbol: pd.DataFrame({
+            "\u80a1\u7968\u4ee3\u7801": ["601138"],
+            "\u4e3b\u8425\u4e1a\u52a1": ["test business"],
+            "\u4ea7\u54c1\u7c7b\u578b": ["3C product type"],
+            "\u4ea7\u54c1\u540d\u79f0": ["3C product name"],
+            "\u7ecf\u8425\u8303\u56f4": ["test scope"],
+        }),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_financial_abstract",
+        lambda symbol: pd.DataFrame({
+            "\u9009\u9879": ["common indicators"],
+            "\u6307\u6807": ["net profit"],
+            "20260331": ["100"],
+            "20251231": ["90"],
+        }),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_individual_fund_flow",
+        lambda stock, market: (_ for _ in ()).throw(ValueError("shape mismatch")),
+    )
+
+    out = akshare_data.get_fundamentals("601138.SS", "2026-06-29")
+
+    assert "# Company Fundamentals for 601138.SS" in out
+    assert "Primary source: AKShare" in out
+    assert "test business" in out
+    assert "net profit" in out
+    assert "DATA_DEGRADED: AKShare stock_individual_fund_flow unavailable" in out

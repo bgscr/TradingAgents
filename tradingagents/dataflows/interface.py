@@ -12,6 +12,8 @@ from .alpha_vantage import (
     get_stock as get_alpha_vantage_stock,
 )
 from .akshare_data import (
+    get_fundamentals as get_akshare_fundamentals,
+    get_news as get_akshare_news,
     get_stock_data as get_akshare_stock,
     get_stock_stats_indicators_window as get_akshare_stock_stats_indicators_window,
 )
@@ -134,9 +136,9 @@ VENDOR_METHODS = {
     },
     # fundamental_data
     "get_fundamentals": {
+        "akshare": get_akshare_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
-        "akshare": get_akshare_placeholder,
         "baostock": get_baostock_placeholder,
     },
     "get_balance_sheet": {
@@ -159,9 +161,9 @@ VENDOR_METHODS = {
     },
     # news_data
     "get_news": {
+        "akshare": get_akshare_news,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
-        "akshare": get_akshare_placeholder,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,

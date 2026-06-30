@@ -73,3 +73,54 @@ def test_news_lookup_normalizes_symbol(monkeypatch):
     assert seen["symbol"] == "GC=F"   # news queried with the canonical symbol
     assert "XAUUSD" in out            # the user's ticker stays in the report
     assert "GC=F" in out              # provenance noted
+
+
+def test_identity_lookup_for_china_a_uses_yahoo_canonical(monkeypatch):
+    seen = {}
+
+    class FakeTicker:
+        def __init__(self, symbol):
+            seen["symbol"] = symbol
+
+        @property
+        def info(self):
+            return {
+                "longName": "Foxconn Industrial Internet Co., Ltd.",
+                "sector": "Technology",
+                "industry": "Communication Equipment",
+                "exchange": "SHH",
+                "quoteType": "EQUITY",
+            }
+
+    monkeypatch.setattr(au.yf, "Ticker", FakeTicker)
+    au.resolve_instrument_identity.cache_clear()
+
+    identity = au.resolve_instrument_identity("601138.SH")
+
+    assert seen["symbol"] == "601138.SS"
+    assert identity["company_name"] == "Foxconn Industrial Internet Co., Ltd."
+    assert identity["sector"] == "Technology"
+
+
+def test_identity_lookup_for_china_a_falls_back_to_akshare(monkeypatch):
+    class FakeTicker:
+        def __init__(self, symbol):
+            pass
+
+        @property
+        def info(self):
+            return {}
+
+    monkeypatch.setattr(au.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(
+        au,
+        "get_china_a_identity",
+        lambda ticker: {"company_name": "宸ヤ笟瀵岃仈", "exchange": "shanghai"},
+        raising=False,
+    )
+    au.resolve_instrument_identity.cache_clear()
+
+    identity = au.resolve_instrument_identity("601138.SH")
+
+    assert identity["company_name"] == "宸ヤ笟瀵岃仈"
+    assert identity["exchange"] == "shanghai"

@@ -161,3 +161,154 @@ def get_stock_stats_indicators_window(
         + "\n\nSource: AKShare stock_zh_a_hist\n\n"
         + INDICATOR_DESCRIPTIONS[indicator]
     )
+
+
+def _format_optional_error(endpoint: str, exc: Exception) -> str:
+    return f"DATA_DEGRADED: AKShare {endpoint} unavailable ({exc})."
+
+
+def _safe_frame(endpoint: str, fn):
+    try:
+        data = fn()
+    except Exception as exc:  # noqa: BLE001 - degrade optional endpoints into report text
+        return None, _format_optional_error(endpoint, exc)
+    if data is None or data.empty:
+        return None, f"DATA_DEGRADED: AKShare {endpoint} returned no rows."
+    return data, None
+
+
+def get_news(ticker: str, start_date: str, end_date: str) -> str:
+    instrument = _require_china_a(ticker)
+    raw = ak.stock_news_em(symbol=instrument.akshare_code)
+    if raw is None or raw.empty:
+        return f"No news found for {ticker} (resolved to {instrument.yahoo_symbol})"
+
+    frame = raw.copy()
+    frame["发布时间"] = pd.to_datetime(frame["发布时间"], errors="coerce")
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+    frame = frame[(frame["发布时间"] >= start) & (frame["发布时间"] <= end)]
+    if frame.empty:
+        return (
+            f"No news found for {ticker} (resolved to {instrument.yahoo_symbol}) "
+            f"between {start_date} and {end_date}"
+        )
+
+    lines = [
+        f"## {instrument.yahoo_symbol} News, from {start_date} to {end_date}:",
+        "",
+        "Source: AKShare stock_news_em",
+        "",
+    ]
+    for _, row in frame.iterrows():
+        title = row.get("新闻标题", "No title")
+        source = row.get("文章来源", "Unknown")
+        lines.append(f"### {title} (source: {source})")
+        content = row.get("新闻内容")
+        if isinstance(content, str) and content.strip():
+            lines.append(content.strip())
+        link = row.get("新闻链接")
+        if isinstance(link, str) and link.strip():
+            lines.append(f"Link: {link.strip()}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _business_section(code: str) -> tuple[list[str], list[str]]:
+    data, error = _safe_frame("stock_zyjs_ths", lambda: ak.stock_zyjs_ths(symbol=code))
+    if error:
+        return [], [error]
+    row = data.iloc[0]
+    lines = ["## Business Description"]
+    for col in ("主营业务", "产品类型", "产品名称", "经营范围"):
+        value = row.get(col)
+        if pd.notna(value) and str(value).strip():
+            lines.append(f"{col}: {value}")
+    return lines, []
+
+
+def _financial_abstract_section(code: str) -> tuple[list[str], list[str]]:
+    data, error = _safe_frame(
+        "stock_financial_abstract", lambda: ak.stock_financial_abstract(symbol=code)
+    )
+    if error:
+        return [], [error]
+    latest_cols = [col for col in data.columns if str(col).isdigit()]
+    latest_cols = sorted(latest_cols, reverse=True)[:4]
+    if not latest_cols:
+        return [], ["DATA_DEGRADED: AKShare stock_financial_abstract returned no period columns."]
+    keep = ["选项", "指标", *latest_cols]
+    lines = ["## Financial Abstract", data[keep].head(20).to_csv(index=False)]
+    return lines, []
+
+
+def _fund_flow_section(code: str, exchange: str) -> tuple[list[str], list[str]]:
+    market = "sh" if exchange == "shanghai" else "sz"
+    data, error = _safe_frame(
+        "stock_individual_fund_flow",
+        lambda: ak.stock_individual_fund_flow(stock=code, market=market),
+    )
+    if error:
+        return [], [error]
+    keep = [
+        col
+        for col in ("日期", "收盘价", "涨跌幅", "主力净流入-净额", "主力净流入-净占比")
+        if col in data.columns
+    ]
+    if not keep:
+        return [], ["DATA_DEGRADED: AKShare stock_individual_fund_flow returned no expected columns."]
+    lines = ["## Recent Fund Flow", data[keep].tail(10).to_csv(index=False)]
+    return lines, []
+
+
+def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
+    instrument = _require_china_a(ticker)
+    sections = [
+        f"# Company Fundamentals for {instrument.yahoo_symbol}",
+        "# Primary source: AKShare",
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    degraded: list[str] = []
+
+    for builder in (
+        lambda: _business_section(instrument.akshare_code),
+        lambda: _financial_abstract_section(instrument.akshare_code),
+        lambda: _fund_flow_section(instrument.akshare_code, instrument.exchange),
+    ):
+        lines, errors = builder()
+        if lines:
+            sections.extend(lines)
+            sections.append("")
+        degraded.extend(errors)
+
+    if degraded:
+        sections.append("## Degraded Fields")
+        sections.extend(degraded)
+        sections.append("Do not fabricate degraded or missing AKShare values.")
+
+    return "\n".join(sections)
+
+
+def get_china_a_identity(ticker: str) -> dict[str, str]:
+    instrument = resolve_china_a_symbol(ticker)
+    if instrument is None:
+        return {}
+
+    identity = {"exchange": instrument.exchange}
+    data, error = _safe_frame("stock_zyjs_ths", lambda: ak.stock_zyjs_ths(symbol=instrument.akshare_code))
+    if error or data is None:
+        return identity
+
+    row = data.iloc[0]
+    for source_key in ("股票简称", "股票名称", "证券简称", "证券名称"):
+        company_name = row.get(source_key)
+        if pd.notna(company_name) and str(company_name).strip():
+            identity["company_name"] = str(company_name).strip()
+            break
+
+    business = row.get("主营业务")
+    if pd.notna(business) and str(business).strip():
+        identity["industry"] = str(business).strip()
+
+    return identity
