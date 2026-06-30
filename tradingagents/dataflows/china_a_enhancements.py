@@ -35,7 +35,7 @@ PRESET_CATEGORIES = {
 SOURCE_TIMEOUT_SECONDS = 8
 CACHE_TTL_SECONDS = 6 * 60 * 60
 MAX_SOURCE_LINES = 8
-_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+SOURCE_LINE_PREFIXES = ("- Source:", "- Source unavailable:")
 
 
 @dataclass(frozen=True)
@@ -88,10 +88,13 @@ def _call_source(
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return fn()
 
-    future = _EXECUTOR.submit(_wrapped)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_wrapped)
     try:
         frame = future.result(timeout=timeout_seconds)
     except TimeoutError:
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
         return None, SourceResult(
             source=source,
             status="unavailable",
@@ -99,12 +102,15 @@ def _call_source(
             error=f"timed out after {timeout_seconds}s",
         )
     except Exception as exc:  # noqa: BLE001 - fail-open enrichment surface
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
         return None, SourceResult(
             source=source,
             status="unavailable",
             as_of=None,
             error=str(exc),
         )
+    executor.shutdown(wait=False, cancel_futures=True)
     if frame is None or frame.empty:
         return None, SourceResult(
             source=source,
@@ -141,9 +147,21 @@ def _format_result(result: SourceResult) -> list[str]:
     if result.status == "ok":
         return [
             f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; {record}"
-            for record in result.records[:MAX_SOURCE_LINES]
+            for record in result.records
         ]
     return [f"- Source unavailable: {result.source} ({result.error or 'unknown error'})."]
+
+
+def _cap_source_lines(lines: list[str]) -> list[str]:
+    kept: list[str] = []
+    source_line_count = 0
+    for line in lines:
+        if line.startswith(SOURCE_LINE_PREFIXES):
+            if source_line_count >= MAX_SOURCE_LINES:
+                continue
+            source_line_count += 1
+        kept.append(line)
+    return kept
 
 
 def _format_snapshot(
@@ -169,7 +187,7 @@ def _format_snapshot(
         for result in source_results:
             lines.extend(_format_result(result))
         lines.append("")
-    return "\n".join(lines).strip()
+    return "\n".join(_cap_source_lines(lines)).strip()
 
 
 def _eastmoney_symbol(instrument) -> str:
@@ -212,18 +230,12 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
                     ),
                 )
             )
-        results.append(
-            SourceResult(
-                source="stock_individual_fund_flow",
-                status="ok",
-                as_of=curr_date,
-                records=tuple(records),
-            )
-        )
+        results.append(SourceResult("stock_individual_fund_flow", "ok", curr_date, tuple(records)))
 
     end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     start = (end_dt - timedelta(days=14)).strftime("%Y%m%d")
     end = end_dt.strftime("%Y%m%d")
+
     frame, error = _call_source(
         "stock_lhb_detail_em",
         lambda: ak.stock_lhb_detail_em(start_date=start, end_date=end),
@@ -231,28 +243,18 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
     if error:
         results.append(error)
     else:
-        code_col = _find_column(frame, ("代码", "证券代码", "code"))
+        code_col = _find_column(frame, ("code", "代码", "证券代码"))
         if code_col is None:
-            results.append(
-                SourceResult(
-                    source="stock_lhb_detail_em",
-                    status="unavailable",
-                    as_of=None,
-                    error="missing code column",
-                )
-            )
+            results.append(SourceResult("stock_lhb_detail_em", "unavailable", None, error="missing code column"))
         else:
             stock_rows = frame[frame[code_col].astype(str).str.zfill(6) == instrument.akshare_code]
             records = []
             for _, row in stock_rows.head(3).iterrows():
                 records.append(
                     "date={date}; reason={reason}; net_buy={net_buy}".format(
-                        date=_first_present(row, ("上榜日", "日期", "date")),
-                        reason=_first_present(row, ("解读", "上榜原因", "原因", "reason")),
-                        net_buy=_first_present(
-                            row,
-                            ("龙虎榜净买额", "净买额", "net_buy"),
-                        ),
+                        date=_first_present(row, ("date", "上榜日", "日期")),
+                        reason=_first_present(row, ("reason", "解读", "上榜原因", "原因")),
+                        net_buy=_first_present(row, ("net_buy", "龙虎榜净买额", "净买额")),
                     )
                 )
             if not records:
@@ -271,11 +273,9 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
     if error:
         results.append(error)
     else:
-        code_col = _find_column(frame, ("证券代码", "标的证券代码", "code"))
+        code_col = _find_column(frame, ("code", "证券代码", "标的证券代码"))
         if code_col is None:
-            results.append(
-                SourceResult(source_name, "unavailable", None, error="missing code column")
-            )
+            results.append(SourceResult(source_name, "unavailable", None, error="missing code column"))
         else:
             stock_rows = frame[frame[code_col].astype(str).str.zfill(6) == instrument.akshare_code]
             records = []
@@ -284,11 +284,17 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
                     "financing_balance={fin}; securities_lending_balance={lend}".format(
                         fin=_first_present(
                             row,
-                            ("融资余额", "融资余额(元)", "financing_balance"),
+                            ("financing_balance", "融资余额", "铻嶈祫浣欓", "融资余额(元)", "铻嶈祫浣欓(鍏�"),
                         ),
                         lend=_first_present(
                             row,
-                            ("融券余额", "融券余额(元)", "securities_lending_balance"),
+                            (
+                                "securities_lending_balance",
+                                "融券余额",
+                                "铻嶅埜浣欓",
+                                "融券余额(元)",
+                                "铻嶅埜浣欓(鍏�",
+                            ),
                         ),
                     )
                 )
@@ -305,15 +311,8 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
         results.append(error)
     else:
         row = frame.iloc[0]
-        rank = _first_present(row, ("rank", "排名", "当前排名"))
-        results.append(
-            SourceResult(
-                "stock_hot_rank_latest_em",
-                "ok",
-                curr_date,
-                (f"rank={rank or 'unknown'}",),
-            )
-        )
+        rank = _first_present(row, ("rank", "排名", "当前排名", "鎺掑悕", "褰撳墠鎺掑悕"))
+        results.append(SourceResult("stock_hot_rank_latest_em", "ok", curr_date, (f"rank={rank or 'unknown'}",)))
 
     frame, error = _call_source(
         "stock_hot_keyword_em",
@@ -322,13 +321,19 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
     if error:
         results.append(error)
     else:
-        keyword_col = _find_column(frame, ("title", "关键词", "概念名称"))
+        keyword_col = _find_column(frame, ("title", "关键词", "概念名称", "鍏抽敭璇�", "姒傚康鍚嶇О"))
         values = []
         if keyword_col is not None:
             values = [_string_value(v) for v in frame[keyword_col].head(5).tolist()]
             values = [value for value in values if value]
-        record = "top_keywords=" + (", ".join(values) if values else "none")
-        results.append(SourceResult("stock_hot_keyword_em", "ok", curr_date, (record,)))
+        results.append(
+            SourceResult(
+                "stock_hot_keyword_em",
+                "ok",
+                curr_date,
+                (f"top_keywords={', '.join(values) if values else 'none'}",),
+            )
+        )
 
     return results
 
@@ -351,11 +356,32 @@ def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
     if error:
         results.append(error)
     else:
-        important = ("业绩", "分红", "回购", "减持", "质押", "重组", "诉讼", "关联交易", "合同", "公告")
+        important = (
+            "业绩",
+            "分红",
+            "回购",
+            "减持",
+            "质押",
+            "重组",
+            "诉讼",
+            "关联交易",
+            "合同",
+            "公告",
+            "earnings",
+            "dividend",
+            "buyback",
+            "stake reduction",
+            "pledge",
+            "restructuring",
+            "litigation",
+            "related party",
+            "contract",
+            "announcement",
+        )
         records = []
         for _, row in frame.head(20).iterrows():
-            title = _first_present(row, ("title", "公告标题", "标题"))
-            date = _first_present(row, ("date", "公告时间", "公告日期"))
+            title = _first_present(row, ("title", "公告标题", "标题", "鍏憡鏍囬", "鏍囬"))
+            date = _first_present(row, ("date", "公告时间", "公告日期", "鍏憡鏃堕棿", "鍏憡鏃ユ湡"))
             if title and any(token in title for token in important):
                 records.append(f"date={date}; title={title}")
             if len(records) >= 8:
@@ -382,20 +408,13 @@ def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
         for _, row in frame.head(5).iterrows():
             records.append(
                 "date={date}; title={title}".format(
-                    date=_first_present(row, ("date", "公告日期", "披露日期")),
-                    title=_first_present(row, ("title", "公告标题", "标题")),
+                    date=_first_present(row, ("date", "公告日期", "披露日期", "鍏憡鏃ユ湡", "鎶湶鏃ユ湡")),
+                    title=_first_present(row, ("title", "公告标题", "标题", "鍏憡鏍囬", "鏍囬")),
                 )
             )
         if not records:
             records = ["no cninfo disclosures found in the lookback window"]
-        results.append(
-            SourceResult(
-                "stock_zh_a_disclosure_report_cninfo",
-                "ok",
-                curr_date,
-                tuple(records),
-            )
-        )
+        results.append(SourceResult("stock_zh_a_disclosure_report_cninfo", "ok", curr_date, tuple(records)))
 
     return results
 
@@ -415,9 +434,12 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         for _, row in frame.head(5).iterrows():
             records.append(
                 "sector={sector}; pct_change={pct}; net_inflow={net}".format(
-                    sector=_first_present(row, ("sector", "名称", "板块名称")),
-                    pct=_first_present(row, ("pct_change", "涨跌幅")),
-                    net=_first_present(row, ("net_inflow", "主力净流入-净额", "净流入")),
+                    sector=_first_present(row, ("sector", "名称", "板块名称", "鍚嶇О", "鏉垮潡鍚嶇О")),
+                    pct=_first_present(row, ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
+                    net=_first_present(
+                        row,
+                        ("net_inflow", "主力净流入-净额", "净流入", "涓诲姏鍑€娴佸叆-鍑€棰�", "鍑€娴佸叆"),
+                    ),
                 )
             )
         results.append(SourceResult("stock_sector_fund_flow_rank", "ok", curr_date, tuple(records)))
@@ -430,8 +452,8 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         for _, row in frame.head(5).iterrows():
             records.append(
                 "title={title}; source={source}".format(
-                    title=_first_present(row, ("title", "标题", "新闻标题")),
-                    source=_first_present(row, ("source", "来源", "文章来源")),
+                    title=_first_present(row, ("title", "标题", "新闻标题", "鏍囬", "鏂伴椈鏍囬")),
+                    source=_first_present(row, ("source", "来源", "文章来源", "鏉ユ簮", "鏂囩珷鏉ユ簮")),
                 )
             )
         results.append(SourceResult("stock_info_global_em", "ok", curr_date, tuple(records)))

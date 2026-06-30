@@ -40,12 +40,12 @@ def test_flow_sentiment_snapshot_limits_records(monkeypatch, tmp_path):
     monkeypatch.setattr(
         enh.ak,
         "stock_hot_rank_latest_em",
-        lambda symbol: pd.DataFrame({"rank": [287], "证券代码": ["600895"]}),
+        lambda symbol: pd.DataFrame({"rank": [287], "code": ["600895"]}),
     )
     monkeypatch.setattr(
         enh.ak,
         "stock_hot_keyword_em",
-        lambda symbol: pd.DataFrame({"title": ["光刻机", "张江"]}),
+        lambda symbol: pd.DataFrame({"title": ["chipmaking", "zhangjiang"]}),
     )
 
     out = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
@@ -54,7 +54,73 @@ def test_flow_sentiment_snapshot_limits_records(monkeypatch, tmp_path):
     assert "Preset: flow_sentiment" in out
     assert "stock_individual_fund_flow" in out
     assert out.count("Source:") <= 8
-    assert "光刻机" in out
+
+
+@pytest.mark.unit
+def test_flow_sentiment_snapshot_caps_total_source_labeled_lines(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_individual_fund_flow",
+        lambda stock, market: pd.DataFrame(
+            {
+                "date": [f"2026-06-{day:02d}" for day in range(26, 31)],
+                "close": [40, 41, 42, 43, 44],
+                "pct_change": [1, 1, 1, 1, 1],
+                "main_net_inflow": [10, 11, 12, 13, 14],
+                "main_net_ratio": [2, 2, 2, 2, 2],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_lhb_detail_em",
+        lambda start_date, end_date: pd.DataFrame(
+            {
+                "code": ["600895", "600895", "600895"],
+                "date": ["2026-06-28", "2026-06-29", "2026-06-30"],
+                "reason": ["reason-1", "reason-2", "reason-3"],
+                "net_buy": ["1", "2", "3"],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_margin_detail_sse",
+        lambda date: pd.DataFrame(
+            {
+                "code": ["600895", "600895"],
+                "financing_balance": ["100", "101"],
+                "securities_lending_balance": ["10", "11"],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_hot_rank_latest_em",
+        lambda symbol: pd.DataFrame({"rank": [12]}),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_hot_keyword_em",
+        lambda symbol: pd.DataFrame({"title": ["chipmaking", "zhangjiang", "semiconductor"]}),
+    )
+
+    out = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
+    source_lines = [
+        line
+        for line in out.splitlines()
+        if line.startswith("- Source:") or line.startswith("- Source unavailable:")
+    ]
+
+    assert len(source_lines) <= enh.MAX_SOURCE_LINES
+    assert any("stock_individual_fund_flow" in line for line in source_lines)
 
 
 @pytest.mark.unit
@@ -95,7 +161,7 @@ def test_category_filter_omits_unrequested_sections(monkeypatch, tmp_path):
         enh.ak,
         "stock_individual_notice_report",
         lambda security, symbol, begin_date, end_date: pd.DataFrame(
-            {"title": ["分红公告"], "date": ["2026-06-20"]}
+            {"title": ["dividend announcement"], "date": ["2026-06-20"]}
         ),
     )
     monkeypatch.setattr(enh.ak, "stock_zh_a_disclosure_report_cninfo", lambda **kwargs: pd.DataFrame())
@@ -108,7 +174,7 @@ def test_category_filter_omits_unrequested_sections(monkeypatch, tmp_path):
     )
 
     assert "Announcements and disclosures" in out
-    assert "分红公告" in out
+    assert "dividend announcement" in out
     assert "Fund flow and trading activity" not in out
 
 
@@ -146,7 +212,7 @@ def test_cache_avoids_repeat_source_calls_within_ttl(monkeypatch, tmp_path):
     monkeypatch.setattr(
         enh.ak,
         "stock_hot_keyword_em",
-        lambda symbol: pd.DataFrame({"title": ["光刻机"]}),
+        lambda symbol: pd.DataFrame({"title": ["chipmaking"]}),
     )
 
     first = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
