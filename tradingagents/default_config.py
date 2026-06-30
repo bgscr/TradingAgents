@@ -136,7 +136,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "market_data_vendors": {
         "cn_a": {
             "core_stock_apis": "akshare,baostock,yfinance",
-            "technical_indicators": "akshare,yfinance",
+            "technical_indicators": "akshare,baostock,yfinance",
             "fundamental_data": "akshare,yfinance,baostock",
             "news_data": "akshare,yfinance",
         },

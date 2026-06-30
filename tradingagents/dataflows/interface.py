@@ -1,5 +1,11 @@
 import logging
 
+from .akshare_data import (
+    get_fundamentals as get_akshare_fundamentals,
+    get_news as get_akshare_news,
+    get_stock_data as get_akshare_stock,
+    get_stock_stats_indicators_window as get_akshare_stock_stats_indicators_window,
+)
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -11,15 +17,10 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_stock as get_alpha_vantage_stock,
 )
-from .akshare_data import (
-    get_fundamentals as get_akshare_fundamentals,
-    get_news as get_akshare_news,
-    get_stock_data as get_akshare_stock,
-    get_stock_stats_indicators_window as get_akshare_stock_stats_indicators_window,
-)
 from .baostock_data import (
     get_fundamentals as get_baostock_fundamentals,
     get_stock_data as get_baostock_stock,
+    get_stock_stats_indicators_window as get_baostock_stock_stats_indicators_window,
 )
 from .config import get_config
 from .errors import (
@@ -136,6 +137,7 @@ VENDOR_METHODS = {
     # technical_indicators
     "get_indicators": {
         "akshare": get_akshare_stock_stats_indicators_window,
+        "baostock": get_baostock_stock_stats_indicators_window,
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
     },
@@ -262,6 +264,7 @@ def route_to_vendor(method: str, *args, **kwargs):
 
     last_no_data: NoMarketDataError | None = None
     first_error: Exception | None = None
+    first_error_vendor: str | None = None
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
@@ -275,17 +278,19 @@ def route_to_vendor(method: str, *args, **kwargs):
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
             if first_error is None:
                 first_error = e  # Surface it if no other vendor can serve the call.
+                first_error_vendor = vendor
             continue
         except NoMarketDataError as e:
             last_no_data = e  # No data here; another configured vendor may have it
             continue
         except Exception as e:
             # Don't let one vendor's failure crash the call when another can
-            # serve it, but never swallow silently: a broken primary must be
-            # visible in the logs (#989), not hidden behind a fallback's verdict.
-            logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
+            # serve it. Defer warning until we know fallback could not produce
+            # usable data; otherwise successful fallback should not look fatal
+            # in the interactive CLI.
             if first_error is None:
                 first_error = e
+                first_error_vendor = vendor
             continue
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
@@ -297,8 +302,8 @@ def route_to_vendor(method: str, *args, **kwargs):
             # A vendor also hit a real error; surface it in logs so the no-data
             # verdict can't hide a broken primary (network/auth/etc.).
             logger.warning(
-                "Returning NO_DATA for %s, but a vendor errored earlier: %s",
-                method, first_error,
+                "Returning NO_DATA for %s, but vendor %r errored earlier: %s",
+                method, first_error_vendor, first_error,
             )
         sym = last_no_data.symbol
         canonical = last_no_data.canonical
@@ -320,7 +325,13 @@ def route_to_vendor(method: str, *args, **kwargs):
     # abort the run.
     if first_error is not None:
         if category in OPTIONAL_CATEGORIES:
-            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
+            logger.warning(
+                "Optional %s unavailable for %s after vendor %r errored: %s",
+                category,
+                method,
+                first_error_vendor,
+                first_error,
+            )
             return (
                 f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
                 f"({first_error}). Proceed without it; do not fabricate values."

@@ -1,28 +1,34 @@
 from __future__ import annotations
 
+import contextlib
+import io
 from contextlib import contextmanager
 from datetime import datetime
 
 import baostock as bs
 import pandas as pd
+from dateutil.relativedelta import relativedelta
+from stockstats import wrap
 
+from .akshare_data import INDICATOR_DESCRIPTIONS
 from .errors import NoMarketDataError, VendorNotConfiguredError
 from .stockstats_utils import _assert_ohlcv_not_stale
 from .symbol_utils import resolve_china_a_symbol
-
 
 FIELDS = "date,code,open,high,low,close,volume,amount"
 
 
 @contextmanager
 def _session():
-    login = bs.login()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        login = bs.login()
     if getattr(login, "error_code", "0") != "0":
         raise VendorNotConfiguredError(f"Baostock login failed: {login.error_msg}")
     try:
         yield
     finally:
-        bs.logout()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            bs.logout()
 
 
 def _rows_to_frame(rows: list[list[str]], symbol: str, canonical: str) -> pd.DataFrame:
@@ -74,6 +80,75 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     header += f"# Total records: {len(out)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     return header + out.to_csv(index=False)
+
+
+def load_ohlcv(symbol: str, curr_date: str, years: int = 5) -> pd.DataFrame:
+    curr = pd.to_datetime(curr_date)
+    start = (curr - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+    instrument = resolve_china_a_symbol(symbol)
+    if instrument is None:
+        raise NoMarketDataError(symbol, symbol, "Baostock supports China A-share symbols only")
+
+    with _session():
+        rs = bs.query_history_k_data_plus(
+            instrument.baostock_code,
+            FIELDS,
+            start_date=start,
+            end_date=curr.strftime("%Y-%m-%d"),
+            frequency="d",
+            adjustflag="2",
+        )
+        if getattr(rs, "error_code", "0") != "0":
+            raise NoMarketDataError(symbol, instrument.yahoo_symbol, rs.error_msg)
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+
+    frame = _rows_to_frame(rows, symbol, instrument.yahoo_symbol)
+    filtered = frame[frame["Date"] <= curr].copy()
+    _assert_ohlcv_not_stale(filtered, curr_date, symbol, instrument.yahoo_symbol)
+    return filtered
+
+
+def _indicator_values(symbol: str, indicator: str, curr_date: str) -> dict[str, str]:
+    data = load_ohlcv(symbol, curr_date)
+    df = wrap(data)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+    df[indicator]
+    values = {}
+    for _, row in df.iterrows():
+        value = row[indicator]
+        values[row["Date"]] = "N/A" if pd.isna(value) else str(value)
+    return values
+
+
+def get_stock_stats_indicators_window(
+    symbol: str,
+    indicator: str,
+    curr_date: str,
+    look_back_days: int,
+) -> str:
+    if indicator not in INDICATOR_DESCRIPTIONS:
+        raise ValueError(
+            f"Indicator {indicator} is not supported. Please choose from: {list(INDICATOR_DESCRIPTIONS.keys())}"
+        )
+
+    curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    before = curr_date_dt - relativedelta(days=look_back_days)
+    values = _indicator_values(symbol, indicator, curr_date)
+    lines = []
+    current = curr_date_dt
+    while current >= before:
+        date_str = current.strftime("%Y-%m-%d")
+        lines.append(f"{date_str}: {values.get(date_str, 'N/A: Not a trading day (weekend or holiday)')}")
+        current = current - relativedelta(days=1)
+
+    return (
+        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {curr_date}:\n\n"
+        + "\n".join(lines)
+        + "\n\nSource: Baostock query_history_k_data_plus\n\n"
+        + INDICATOR_DESCRIPTIONS[indicator]
+    )
 
 
 def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:

@@ -13,8 +13,7 @@ import pytest
 
 import tradingagents.dataflows.config as config_module
 import tradingagents.default_config as default_config
-from tradingagents.dataflows import akshare_data
-from tradingagents.dataflows import interface
+from tradingagents.dataflows import akshare_data, interface
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.symbol_utils import NoMarketDataError
 
@@ -72,6 +71,16 @@ class VendorRoutingTests(unittest.TestCase):
         set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
         with self._route({"yfinance": _no_data, "alpha_vantage": _returns("AV_DATA")}):
             result = interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
+        self.assertEqual(result, "AV_DATA")
+
+    def test_successful_fallback_does_not_emit_warning(self):
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(ConnectionError("temporary network failure")),
+            "alpha_vantage": _returns("AV_DATA"),
+        }), self.assertNoLogs("tradingagents.dataflows.interface", level="WARNING"):
+            result = interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
+
         self.assertEqual(result, "AV_DATA")
 
     def test_primary_error_is_logged_not_masked(self):
@@ -172,6 +181,39 @@ class VendorRoutingTests(unittest.TestCase):
 
         self.assertEqual(result, "BS_DATA")
 
+    def test_china_a_technical_indicators_fall_back_to_baostock(self):
+        set_config({
+            "market_data_vendors": {
+                "cn_a": {
+                    "technical_indicators": "akshare,baostock,yfinance",
+                }
+            }
+        })
+        calls = []
+
+        def akshare(symbol, *a, **k):
+            calls.append(("akshare", symbol))
+            raise ConnectionError("Remote end closed connection without response")
+
+        def baostock(symbol, *a, **k):
+            calls.append(("baostock", symbol))
+            return "BS_INDICATORS"
+
+        with self._route_method(
+            "get_indicators",
+            {
+                "akshare": akshare,
+                "baostock": baostock,
+                "yfinance": _returns("YF_INDICATORS"),
+            },
+        ):
+            result = interface.route_to_vendor(
+                "get_indicators", "600895.SH", "rsi", "2026-06-30", 30
+            )
+
+        self.assertEqual(result, "BS_INDICATORS")
+        self.assertEqual(calls, [("akshare", "600895.SH"), ("baostock", "600895.SH")])
+
     def test_non_china_symbol_ignores_market_specific_vendor_chain(self):
         set_config({
             "data_vendors": {"core_stock_apis": "yfinance"},
@@ -238,6 +280,16 @@ class VendorRoutingTests(unittest.TestCase):
                 configured.issubset(registered),
                 f"{method} missing configured China vendors: {sorted(configured - registered)}",
             )
+
+    def test_default_china_a_technical_indicator_chain_includes_baostock(self):
+        cfg = config_module.get_config()
+        vendors = [
+            vendor.strip()
+            for vendor in cfg["market_data_vendors"]["cn_a"]["technical_indicators"].split(",")
+            if vendor.strip()
+        ]
+
+        self.assertEqual(vendors, ["akshare", "baostock", "yfinance"])
 
     def test_akshare_price_and_indicator_placeholders_are_replaced(self):
         self.assertIs(
