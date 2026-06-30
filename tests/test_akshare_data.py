@@ -96,6 +96,24 @@ def test_get_news_filters_to_requested_window(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_news_excludes_next_day_midnight(monkeypatch):
+    news = pd.DataFrame({
+        "\u5173\u952e\u8bcd": ["601138", "601138"],
+        "\u65b0\u95fb\u6807\u9898": ["inside window", "next day midnight"],
+        "\u65b0\u95fb\u5185\u5bb9": ["kept body", "future body"],
+        "\u53d1\u5e03\u65f6\u95f4": ["2026-06-29 23:59:59", "2026-06-30 00:00:00"],
+        "\u6587\u7ae0\u6765\u6e90": ["source a", "source b"],
+        "\u65b0\u95fb\u94fe\u63a5": ["https://example.test/1", "https://example.test/2"],
+    })
+    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+
+    out = akshare_data.get_news("601138.SH", "2026-06-20", "2026-06-29")
+
+    assert "inside window" in out
+    assert "next day midnight" not in out
+
+
+@pytest.mark.unit
 def test_get_fundamentals_degrades_failed_optional_endpoint(monkeypatch):
     monkeypatch.setattr(
         akshare_data.ak,
@@ -123,6 +141,11 @@ def test_get_fundamentals_degrades_failed_optional_endpoint(monkeypatch):
         "stock_individual_fund_flow",
         lambda stock, market: (_ for _ in ()).throw(ValueError("shape mismatch")),
     )
+    monkeypatch.setattr(
+        akshare_data,
+        "_get_yfinance_fundamentals",
+        lambda ticker, curr_date: "Name: Foxconn Industrial Internet Co., Ltd.",
+    )
 
     out = akshare_data.get_fundamentals("601138.SS", "2026-06-29")
 
@@ -130,4 +153,47 @@ def test_get_fundamentals_degrades_failed_optional_endpoint(monkeypatch):
     assert "Primary source: AKShare" in out
     assert "test business" in out
     assert "net profit" in out
+    assert "Yahoo Supplemental Profile" in out
+    assert "Foxconn Industrial Internet" in out
     assert "DATA_DEGRADED: AKShare stock_individual_fund_flow unavailable" in out
+
+
+@pytest.mark.unit
+def test_get_fundamentals_degrades_yahoo_supplemental_error(monkeypatch):
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_zyjs_ths",
+        lambda symbol: pd.DataFrame({"\u4e3b\u8425\u4e1a\u52a1": ["test business"]}),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_financial_abstract",
+        lambda symbol: pd.DataFrame({"\u9009\u9879": ["common"], "\u6307\u6807": ["net profit"], "20260331": ["100"]}),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_individual_fund_flow",
+        lambda stock, market: pd.DataFrame({"\u65e5\u671f": ["2026-06-29"], "\u6536\u76d8\u4ef7": [69.61]}),
+    )
+    monkeypatch.setattr(
+        akshare_data,
+        "_get_yfinance_fundamentals",
+        lambda ticker, curr_date: "Error retrieving fundamentals for 601138.SS: timeout",
+    )
+
+    out = akshare_data.get_fundamentals("601138.SS", "2026-06-29")
+
+    assert "Yahoo Supplemental Profile" not in out
+    assert "DATA_DEGRADED: Yahoo supplemental fundamentals unavailable" in out
+
+
+@pytest.mark.unit
+def test_financial_abstract_missing_label_columns_degrades():
+    data = pd.DataFrame({"20260331": ["100"], "20251231": ["90"]})
+
+    lines, errors = akshare_data._financial_abstract_section_from_frame(data)
+
+    assert lines == []
+    assert errors == [
+        "DATA_DEGRADED: AKShare stock_financial_abstract missing label columns: \u9009\u9879, \u6307\u6807."
+    ]

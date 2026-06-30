@@ -167,6 +167,36 @@ def _format_optional_error(endpoint: str, exc: Exception) -> str:
     return f"DATA_DEGRADED: AKShare {endpoint} unavailable ({exc})."
 
 
+def _get_yfinance_fundamentals(ticker: str, curr_date: str | None = None) -> str:
+    from .y_finance import get_fundamentals as get_yfinance_fundamentals
+
+    return get_yfinance_fundamentals(ticker, curr_date)
+
+
+def _yahoo_supplemental_section(
+    yahoo_symbol: str, curr_date: str | None = None
+) -> tuple[list[str], list[str]]:
+    try:
+        supplemental = _get_yfinance_fundamentals(yahoo_symbol, curr_date)
+    except Exception as exc:  # noqa: BLE001 - Yahoo is supplemental only
+        return [], [f"DATA_DEGRADED: Yahoo supplemental fundamentals unavailable ({exc})."]
+
+    if not isinstance(supplemental, str) or not supplemental.strip():
+        return [], ["DATA_DEGRADED: Yahoo supplemental fundamentals unavailable (empty response)."]
+
+    stripped = supplemental.strip()
+    unavailable_markers = (
+        "Error retrieving fundamentals",
+        "NO_DATA_AVAILABLE",
+        "no fundamental fields returned",
+        "no fundamentals returned",
+    )
+    if any(marker in stripped for marker in unavailable_markers):
+        return [], [f"DATA_DEGRADED: Yahoo supplemental fundamentals unavailable ({stripped})."]
+
+    return ["## Yahoo Supplemental Profile", stripped], []
+
+
 def _safe_frame(endpoint: str, fn):
     try:
         data = fn()
@@ -187,7 +217,7 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     frame["发布时间"] = pd.to_datetime(frame["发布时间"], errors="coerce")
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-    frame = frame[(frame["发布时间"] >= start) & (frame["发布时间"] <= end)]
+    frame = frame[(frame["发布时间"] >= start) & (frame["发布时间"] < end)]
     if frame.empty:
         return (
             f"No news found for {ticker} (resolved to {instrument.yahoo_symbol}) "
@@ -227,19 +257,30 @@ def _business_section(code: str) -> tuple[list[str], list[str]]:
     return lines, []
 
 
+def _financial_abstract_section_from_frame(data: pd.DataFrame) -> tuple[list[str], list[str]]:
+    latest_cols = [col for col in data.columns if str(col).isdigit()]
+    latest_cols = sorted(latest_cols, reverse=True)[:4]
+    if not latest_cols:
+        return [], ["DATA_DEGRADED: AKShare stock_financial_abstract returned no period columns."]
+    label_cols = ["选项", "指标"]
+    missing_labels = [col for col in label_cols if col not in data.columns]
+    if missing_labels:
+        return [], [
+            "DATA_DEGRADED: AKShare stock_financial_abstract missing label columns: "
+            f"{', '.join(missing_labels)}."
+        ]
+    keep = ["选项", "指标", *latest_cols]
+    lines = ["## Financial Abstract", data[keep].head(20).to_csv(index=False)]
+    return lines, []
+
+
 def _financial_abstract_section(code: str) -> tuple[list[str], list[str]]:
     data, error = _safe_frame(
         "stock_financial_abstract", lambda: ak.stock_financial_abstract(symbol=code)
     )
     if error:
         return [], [error]
-    latest_cols = [col for col in data.columns if str(col).isdigit()]
-    latest_cols = sorted(latest_cols, reverse=True)[:4]
-    if not latest_cols:
-        return [], ["DATA_DEGRADED: AKShare stock_financial_abstract returned no period columns."]
-    keep = ["选项", "指标", *latest_cols]
-    lines = ["## Financial Abstract", data[keep].head(20).to_csv(index=False)]
-    return lines, []
+    return _financial_abstract_section_from_frame(data)
 
 
 def _fund_flow_section(code: str, exchange: str) -> tuple[list[str], list[str]]:
@@ -275,6 +316,7 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
         lambda: _business_section(instrument.akshare_code),
         lambda: _financial_abstract_section(instrument.akshare_code),
         lambda: _fund_flow_section(instrument.akshare_code, instrument.exchange),
+        lambda: _yahoo_supplemental_section(instrument.yahoo_symbol, curr_date),
     ):
         lines, errors = builder()
         if lines:
