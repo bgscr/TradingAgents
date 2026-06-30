@@ -17,6 +17,10 @@ from .akshare_data import (
     get_stock_data as get_akshare_stock,
     get_stock_stats_indicators_window as get_akshare_stock_stats_indicators_window,
 )
+from .baostock_data import (
+    get_fundamentals as get_baostock_fundamentals,
+    get_stock_data as get_baostock_stock,
+)
 from .config import get_config
 from .errors import (
     NoMarketDataError,
@@ -90,6 +94,7 @@ VENDOR_LIST = [
     "polymarket",
     "alpha_vantage",
     "akshare",
+    "baostock",
 ]
 
 # Optional enrichment categories. These add macro/event context to the news
@@ -124,9 +129,9 @@ VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
         "akshare": get_akshare_stock,
+        "baostock": get_baostock_stock,
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
-        "baostock": get_baostock_placeholder,
     },
     # technical_indicators
     "get_indicators": {
@@ -137,9 +142,9 @@ VENDOR_METHODS = {
     # fundamental_data
     "get_fundamentals": {
         "akshare": get_akshare_fundamentals,
+        "baostock": get_baostock_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
-        "baostock": get_baostock_placeholder,
     },
     "get_balance_sheet": {
         "alpha_vantage": get_alpha_vantage_balance_sheet,
