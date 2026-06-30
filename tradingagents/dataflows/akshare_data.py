@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from functools import lru_cache
 
 import akshare as ak
 import pandas as pd
@@ -10,7 +11,6 @@ from stockstats import wrap
 from .errors import NoMarketDataError
 from .stockstats_utils import _assert_ohlcv_not_stale
 from .symbol_utils import resolve_china_a_symbol
-
 
 INDICATOR_DESCRIPTIONS = {
     "close_50_sma": (
@@ -113,13 +113,18 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     return header + out.to_csv(index=False)
 
 
-def load_ohlcv(symbol: str, curr_date: str, years: int = 5) -> pd.DataFrame:
+@lru_cache(maxsize=64)
+def _load_ohlcv_cached(symbol: str, curr_date: str, years: int) -> pd.DataFrame:
     curr = pd.to_datetime(curr_date)
     start = (curr - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
     canonical, frame = _fetch_hist(symbol, start, curr.strftime("%Y-%m-%d"))
     filtered = frame[frame["Date"] <= curr].copy()
     _assert_ohlcv_not_stale(filtered, curr_date, symbol, canonical)
     return filtered
+
+
+def load_ohlcv(symbol: str, curr_date: str, years: int = 5) -> pd.DataFrame:
+    return _load_ohlcv_cached(symbol, curr_date, years).copy()
 
 
 def _indicator_values(symbol: str, indicator: str, curr_date: str) -> dict[str, str]:

@@ -163,3 +163,43 @@ def test_get_stock_stats_indicators_window_uses_baostock_rows(monkeypatch):
     assert "## rsi values from 2026-06-27 to 2026-06-30" in out
     assert "Source: Baostock query_history_k_data_plus" in out
     assert "2026-06-30:" in out
+
+
+@pytest.mark.unit
+def test_indicators_reuse_cached_baostock_ohlcv(monkeypatch):
+    cache = getattr(baostock_data, "_load_ohlcv_cached", None)
+    if cache is not None:
+        cache.cache_clear()
+    calls = 0
+    rows = []
+    for day in range(1, 31):
+        rows.append(
+            [
+                f"2026-06-{day:02d}",
+                "sh.600895",
+                str(10 + day),
+                str(11 + day),
+                str(9 + day),
+                str(10.5 + day),
+                str(100000 + day),
+                str(1000000 + day),
+            ]
+        )
+
+    def fake_query(*a, **k):
+        nonlocal calls
+        calls += 1
+        return FakeQuery(rows)
+
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: FakeLogin())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(baostock_data.bs, "query_history_k_data_plus", fake_query)
+
+    baostock_data.get_stock_stats_indicators_window(
+        "600895.SH", "close_10_ema", "2026-06-30", 3
+    )
+    baostock_data.get_stock_stats_indicators_window(
+        "600895.SH", "rsi", "2026-06-30", 3
+    )
+
+    assert calls == 1

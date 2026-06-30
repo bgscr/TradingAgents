@@ -76,6 +76,30 @@ def test_indicator_uses_akshare_ohlcv(monkeypatch):
 
 
 @pytest.mark.unit
+def test_indicator_reuses_cached_akshare_ohlcv(monkeypatch):
+    cache = getattr(akshare_data, "_load_ohlcv_cached", None)
+    if cache is not None:
+        cache.cache_clear()
+    calls = 0
+
+    def fake_hist(**kwargs):
+        nonlocal calls
+        calls += 1
+        return _hist_frame()
+
+    monkeypatch.setattr(akshare_data.ak, "stock_zh_a_hist", fake_hist)
+
+    akshare_data.get_stock_stats_indicators_window(
+        "601138.SH", "close_10_ema", "2026-06-29", 1
+    )
+    akshare_data.get_stock_stats_indicators_window(
+        "601138.SH", "rsi", "2026-06-29", 1
+    )
+
+    assert calls == 1
+
+
+@pytest.mark.unit
 def test_get_news_filters_to_requested_window(monkeypatch):
     news = pd.DataFrame({
         "\u5173\u952e\u8bcd": ["601138", "601138"],
