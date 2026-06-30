@@ -163,3 +163,49 @@ rtk .\.venv\Scripts\python.exe -m pytest tests/test_vendor_routing.py tests/test
 ### Concerns
 
 - Placeholder vendors still intentionally raise `NoMarketDataError(..., "<vendor> vendor not implemented yet")` until later tasks replace them with live implementations.
+
+## Task 2 Implementation Report (2026-06-30)
+
+- Status: DONE
+- Commit SHA(s): `a595f4b`
+- Files changed:
+  - `cli/main.py`
+  - `tests/test_china_a_run_logging.py`
+- Implementation summary:
+  - Added `_prepare_run_artifacts(config, selections)` to create per-run `runs/<run_id>/message_tool.log` and `runs/<run_id>/reports`, while keeping the existing root results path under `reports/<ticker>_<stamp>` untouched elsewhere.
+  - Added `_append_line_to_run_logs(paths, line)` and wired message and tool-call logging so each line is mirrored to both the run-scoped log and `latest_message_tool.log`.
+  - Seeded run log metadata with `run_id`, `ticker`, `analysis_date`, `asset_type`, and `china_a_enhancement_preset`, defaulting the preset to `basic` when absent.
+  - Kept report section writes pointed at the run-scoped report directory by rebasing `report_dir` through the new artifact helper.
+- TDD evidence:
+  - Failing test command/output summary:
+    - `rtk pytest tests/test_china_a_run_logging.py -q`
+    - Failed with two `AttributeError`s because `cli.main` did not yet define `_prepare_run_artifacts` or `_append_line_to_run_logs`.
+  - Passing test command/output summary:
+    - `rtk pytest tests/test_china_a_run_logging.py -q`
+    - Passed: `2 passed`
+- Verification commands and results:
+  - `rtk pytest tests/test_china_a_run_logging.py -q` -> `2 passed`
+  - `rtk pytest tests/test_reporting.py -q` -> `3 passed`
+  - `rtk git commit -m "feat: isolate TradingAgents run logs"` -> created commit `a595f4b`
+- Concerns, if any:
+  - None.
+
+## Task 2 Review Fix Report (2026-06-30)
+
+- Status: DONE
+- Commit SHA(s): `0eca202`
+- Files changed:
+  - `tests/test_china_a_run_logging.py`
+  - `.superpowers/sdd/task-2-report.md`
+- Implementation summary:
+  - Added a successive-run regression that creates run A, appends extra content, then creates run B under the same ticker/date root and verifies `latest_message_tool.log` is reset to run B metadata and mirrors only run B output.
+  - Added a default-metadata regression that omits `china_a_enhancement_preset` and verifies seeded run metadata falls back to `china_a_enhancement_preset=basic`.
+  - No production code changes were needed; the existing helper implementation already satisfied both review findings.
+- TDD evidence:
+  - Added the new tests first, then ran `rtk pytest tests/test_china_a_run_logging.py -q`.
+  - The suite passed immediately (`4 passed`), which showed the review items were a coverage gap rather than an implementation defect.
+- Verification commands and results:
+  - `rtk pytest tests/test_china_a_run_logging.py -q` -> `4 passed`
+  - `rtk pytest tests/test_reporting.py -q` -> `3 passed`
+- Concerns, if any:
+  - None.
