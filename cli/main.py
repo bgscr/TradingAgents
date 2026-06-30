@@ -1063,6 +1063,40 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     return config
 
 
+def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | str]:
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
+    run_dir = results_dir / "runs" / run_id
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = run_dir / "message_tool.log"
+    latest_log_file = results_dir / "latest_message_tool.log"
+    metadata = (
+        f"run_id={run_id} "
+        f"ticker={selections['ticker']} "
+        f"analysis_date={selections['analysis_date']} "
+        f"asset_type={selections['asset_type']} "
+        f"china_a_enhancement_preset={selections.get('china_a_enhancement_preset', 'basic')}\n"
+    )
+    log_file.write_text(metadata, encoding="utf-8")
+    latest_log_file.write_text(metadata, encoding="utf-8")
+    return {
+        "run_id": run_id,
+        "results_dir": results_dir,
+        "run_dir": run_dir,
+        "report_dir": report_dir,
+        "log_file": log_file,
+        "latest_log_file": latest_log_file,
+    }
+
+
+def _append_line_to_run_logs(paths: list[Path], line: str) -> None:
+    for path in paths:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
 def run_analysis(checkpoint: bool | None = None):
     # First get all user selections
     selections = get_user_selections()
@@ -1092,13 +1126,12 @@ def run_analysis(checkpoint: bool | None = None):
     # Track start time for elapsed display
     start_time = time.time()
 
-    # Create result directory
-    results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
-    results_dir.mkdir(parents=True, exist_ok=True)
-    report_dir = results_dir / "reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    log_file = results_dir / "message_tool.log"
-    log_file.touch(exist_ok=True)
+    artifacts = _prepare_run_artifacts(config, selections)
+    results_dir = artifacts["results_dir"]
+    report_dir = artifacts["report_dir"]
+    log_file = artifacts["log_file"]
+    latest_log_file = artifacts["latest_log_file"]
+    run_log_paths = [log_file, latest_log_file]
 
     def save_message_decorator(obj, func_name):
         func = getattr(obj, func_name)
@@ -1107,8 +1140,10 @@ def run_analysis(checkpoint: bool | None = None):
             func(*args, **kwargs)
             timestamp, message_type, content = obj.messages[-1]
             content = content.replace("\n", " ")  # Replace newlines with spaces
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} [{message_type}] {content}\n")
+            _append_line_to_run_logs(
+                run_log_paths,
+                f"{timestamp} [{message_type}] {content}\n",
+            )
         return wrapper
 
     def save_tool_call_decorator(obj, func_name):
@@ -1118,8 +1153,10 @@ def run_analysis(checkpoint: bool | None = None):
             func(*args, **kwargs)
             timestamp, tool_name, args = obj.tool_calls[-1]
             args_str = ", ".join(f"{k}={v}" for k, v in args.items())
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} [Tool Call] {tool_name}({args_str})\n")
+            _append_line_to_run_logs(
+                run_log_paths,
+                f"{timestamp} [Tool Call] {tool_name}({args_str})\n",
+            )
         return wrapper
 
     def save_report_section_decorator(obj, func_name):
