@@ -28,8 +28,7 @@ def test_start_script_uses_script_relative_project_dir():
         ],
         cwd=repo_root.parent,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=30,
         check=False,
     )
