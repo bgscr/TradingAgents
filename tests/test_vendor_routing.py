@@ -372,6 +372,62 @@ class VendorRoutingTests(unittest.TestCase):
             {"announcements"},
         )
 
+    def test_non_string_vendor_result_is_returned_unchanged(self):
+        set_config({"china_a_enhancement_preset": "flow_sentiment"})
+        payload = {"close": 12.34}
+        with self._route({"akshare": _returns(payload)}):
+            with mock.patch(
+                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+                return_value="FLOW_APPENDIX",
+            ) as enh:
+                result = interface.route_to_vendor(
+                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+                )
+
+        self.assertIs(result, payload)
+        enh.assert_not_called()
+
+    def test_empty_appendix_leaves_original_output_unchanged(self):
+        set_config({"china_a_enhancement_preset": "flow_sentiment"})
+        with self._route({"akshare": _returns("PRICE_DATA")}):
+            with mock.patch(
+                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+                return_value="   ",
+            ):
+                result = interface.route_to_vendor(
+                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+                )
+
+        self.assertEqual(result, "PRICE_DATA")
+
+    def test_string_error_fundamentals_result_is_returned_unchanged(self):
+        set_config({"china_a_enhancement_preset": "announcements"})
+        error_result = "Error retrieving fundamentals for 600895.SS"
+        with self._route_method("get_fundamentals", {"akshare": _returns(error_result)}):
+            with mock.patch(
+                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+                return_value="FUND_APPENDIX",
+            ) as enh:
+                result = interface.route_to_vendor(
+                    "get_fundamentals", "600895.SS", "2026-06-30"
+                )
+
+        self.assertEqual(result, error_result)
+        enh.assert_not_called()
+
+    def test_enhancement_exception_in_routing_returns_original_output(self):
+        set_config({"china_a_enhancement_preset": "flow_sentiment"})
+        with self._route({"akshare": _returns("PRICE_DATA")}):
+            with mock.patch(
+                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+                side_effect=RuntimeError("cache offline"),
+            ):
+                result = interface.route_to_vendor(
+                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+                )
+
+        self.assertEqual(result, "PRICE_DATA")
+
 
 if __name__ == "__main__":
     unittest.main()

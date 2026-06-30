@@ -230,8 +230,24 @@ def _date_for_enhancement(method: str, args: tuple, kwargs: dict) -> str | None:
     return None
 
 
-def append_china_a_enhancement(method: str, result: str, args: tuple, kwargs: dict) -> str:
+def _is_successful_string_result(result: object) -> bool:
     if not isinstance(result, str):
+        return False
+    normalized = result.strip()
+    if not normalized:
+        return False
+    error_prefixes = (
+        "ERROR ",
+        "ERROR:",
+        "ERROR RETRIEVING",
+        "NO_DATA_AVAILABLE:",
+        "DATA_UNAVAILABLE:",
+    )
+    return normalized.upper().startswith(error_prefixes) is False
+
+
+def append_china_a_enhancement(method: str, result: str, args: tuple, kwargs: dict) -> str:
+    if not _is_successful_string_result(result):
         return result
     categories = ENHANCEMENT_CATEGORIES_BY_METHOD.get(method)
     if not categories:
@@ -243,7 +259,16 @@ def append_china_a_enhancement(method: str, result: str, args: tuple, kwargs: di
     if not curr_date:
         return result
     preset = get_config().get("china_a_enhancement_preset", "basic")
-    appendix = get_china_a_enhancements_for_categories(symbol, curr_date, preset, categories)
+    try:
+        appendix = get_china_a_enhancements_for_categories(symbol, curr_date, preset, categories)
+    except Exception as exc:
+        logger.warning(
+            "China A-share enhancement unavailable for %s %s: %s",
+            method,
+            symbol,
+            exc,
+        )
+        return result
     if not appendix.strip():
         return result
     return f"{result}\n\n{appendix}"

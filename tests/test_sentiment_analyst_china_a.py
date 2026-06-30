@@ -98,3 +98,21 @@ def test_collect_sentiment_blocks_adds_china_flow_enhancement(monkeypatch):
 
     assert "LOCAL" in blocks["local_sentiment_block"]
     assert "FLOW_SENTIMENT_APPENDIX" in blocks["local_sentiment_block"]
+
+
+@pytest.mark.unit
+def test_collect_sentiment_blocks_ignores_enhancement_exception(monkeypatch):
+    from tradingagents.dataflows.config import set_config
+
+    set_config({"china_a_enhancement_preset": "flow_sentiment"})
+    monkeypatch.setattr(sa.get_news, "func", lambda ticker, start, end: "NEWS")
+    monkeypatch.setattr(sa, "get_china_a_local_sentiment", lambda ticker, start, end: "LOCAL")
+    monkeypatch.setattr(
+        sa,
+        "get_china_a_enhancements_for_categories",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("cache offline")),
+    )
+
+    blocks = sa._collect_sentiment_blocks("600895.SS", "2026-06-23", "2026-06-30")
+
+    assert blocks["local_sentiment_block"] == "LOCAL"

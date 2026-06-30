@@ -25,6 +25,7 @@ See: https://github.com/TauricResearch/TradingAgents/issues/796
 """
 
 from datetime import datetime, timedelta
+import logging
 
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -46,6 +47,8 @@ from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 
+logger = logging.getLogger(__name__)
+
 
 def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -56,12 +59,20 @@ def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> di
     if resolve_china_a_symbol(ticker) is not None:
         local_sentiment = get_china_a_local_sentiment(ticker, start_date, end_date)
         preset = get_config().get("china_a_enhancement_preset", "basic")
-        flow_enhancement = get_china_a_enhancements_for_categories(
-            ticker,
-            end_date,
-            preset,
-            {"flow_sentiment"},
-        )
+        try:
+            flow_enhancement = get_china_a_enhancements_for_categories(
+                ticker,
+                end_date,
+                preset,
+                {"flow_sentiment"},
+            )
+        except Exception as exc:
+            logger.warning(
+                "China A-share sentiment enhancement unavailable for %s: %s",
+                ticker,
+                exc,
+            )
+            flow_enhancement = ""
         local_block = "\n\n".join(
             part for part in (local_sentiment, flow_enhancement) if part.strip()
         )
