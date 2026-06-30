@@ -681,6 +681,7 @@ def test_category_filter_omits_unrequested_sections(monkeypatch, tmp_path):
     set_config({"data_cache_dir": str(tmp_path)})
 
     monkeypatch.setattr(enh.ak, "stock_individual_notice_report", lambda security, symbol, begin_date, end_date: pd.DataFrame({"公告标题": ["分红公告"], "公告时间": ["2026-06-20"]}))
+    monkeypatch.setattr(enh.ak, "stock_zh_a_disclosure_report_cninfo", lambda **kwargs: pd.DataFrame())
 
     out = enh.get_china_a_enhancements_for_categories(
         "600895.SS",
@@ -1468,4 +1469,3 @@ rtk git commit -m "test: verify China A-share enhancements"
 ```
 
 Expected: commit succeeds. If no files changed, skip this commit.
-
