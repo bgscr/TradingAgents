@@ -39,12 +39,40 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.dataflows.china_sentiment import get_china_a_local_sentiment
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 
 
 def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> dict[str, str]:
+    news_block = get_news.func(ticker, start_date, end_date)
+    if resolve_china_a_symbol(ticker) is not None:
+        return {
+            "news_block": news_block,
+            "stocktwits_block": (
+                "<stocktwits skipped: not applicable for China A-shares; "
+                "StockTwits does not reliably cover mainland China tickers. "
+                "Do not treat this as a missing retail-sentiment failure.>"
+            ),
+            "reddit_block": (
+                "<reddit skipped: not applicable for China A-shares; English finance "
+                "subreddits are not a reliable mainland China ticker sentiment source. "
+                "Do not infer absence of discussion from this skipped source.>"
+            ),
+            "local_sentiment_block": get_china_a_local_sentiment(ticker, start_date, end_date),
+        }
+
+    return {
+        "news_block": news_block,
+        "stocktwits_block": fetch_stocktwits_messages(ticker, limit=30),
+        "reddit_block": fetch_reddit_posts(ticker),
+        "local_sentiment_block": "",
+    }
 
 
 def create_sentiment_analyst(llm):
@@ -63,20 +91,19 @@ def create_sentiment_analyst(llm):
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
 
-        # Pre-fetch all three sources. Each fetcher degrades gracefully and
+        # Pre-fetch sources. Each fetcher degrades gracefully and
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
-        news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        blocks = _collect_sentiment_blocks(ticker, start_date, end_date)
 
         system_message = _build_system_message(
             ticker=ticker,
             start_date=start_date,
             end_date=end_date,
-            news_block=news_block,
-            stocktwits_block=stocktwits_block,
-            reddit_block=reddit_block,
+            news_block=blocks["news_block"],
+            stocktwits_block=blocks["stocktwits_block"],
+            reddit_block=blocks["reddit_block"],
+            local_sentiment_block=blocks["local_sentiment_block"],
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -126,18 +153,31 @@ def _build_system_message(
     news_block: str,
     stocktwits_block: str,
     reddit_block: str,
+    local_sentiment_block: str = "",
 ) -> str:
     """Assemble the sentiment-analyst system message with structured data blocks."""
+    local_section = ""
+    if local_sentiment_block.strip():
+        local_section = f"""
+### China A-share local sentiment — AKShare/Eastmoney
+Mainland-market retail attention, stock comment, and northbound-holding context. This section replaces US-centric retail/social sources when the ticker is a China A-share.
+
+<start_of_china_local_sentiment>
+{local_sentiment_block}
+<end_of_china_local_sentiment>
+"""
+
     return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
 
 ## Data sources (pre-fetched, in this prompt)
 
-### News headlines — Yahoo Finance, past 7 days
+### News headlines — configured news vendor, past 7 days
 Institutional framing. Fact-driven, slower-moving signal.
 
 <start_of_news>
 {news_block}
 <end_of_news>
+{local_section}
 
 ### StockTwits messages — retail-trader social platform indexed by cashtag
 Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
@@ -165,7 +205,7 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
+6. **Be honest about data limits.** If StockTwits returned only a handful of messages, Reddit was rate-limited, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If a source is marked skipped or not applicable for China A-shares, do not count it as a data failure; rely on the China A-share local sentiment block instead.
 
 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
 
