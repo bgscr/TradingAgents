@@ -49,6 +49,16 @@ Use isolated workspaces for clean, parallel development.
 * Every new task or feature must be executed in a dedicated git worktree on a new branch.
 * Never create or checkout feature branches inside the primary repository directory.
 * Keep the primary repository directory on the main branch as source of truth.
+* Treat CodeGraph initialization as part of worktree creation, not as a later optional setup step.
+
+After creating any new worktree, immediately initialize and verify CodeGraph from inside that worktree:
+
+```bash
+rtk codegraph init
+rtk codegraph status
+```
+
+Do not rely on CodeGraph MCP tools in a newly created worktree until `rtk codegraph status` confirms the index is available.
 
 ### Worktree Structure
 
@@ -190,12 +200,8 @@ Use CodeGraph first for:
 
 Do not start with grep, find, or broad file reads for structural questions. Use shell search only as a fallback when CodeGraph output is missing, stale, incomplete, or ambiguous.
 
-### Worktree Initialization
+### Worktree Index State
 
-Each git worktree has its own working directory. Because `.codegraph/` is local generated index state and should be ignored by Git, every newly created worktree must initialize CodeGraph before CodeGraph MCP tools can be relied on in that worktree.
+Each git worktree has its own working directory. Because `.codegraph/` is local generated index state and should be ignored by Git, CodeGraph must be initialized separately per worktree.
 
-After creating a new worktree, run:
-
-```bash
-rtk codegraph init
-rtk codegraph status
+The required commands are part of the worktree creation flow in Section 2.
