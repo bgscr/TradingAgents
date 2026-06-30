@@ -4,6 +4,7 @@ import time
 from collections import deque
 from functools import wraps
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import typer
 from rich import box
@@ -41,6 +42,7 @@ from cli.utils import (
     select_shallow_thinking_agent,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
@@ -57,6 +59,47 @@ app = typer.Typer(
     help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
     add_completion=True,  # Enable shell completion
 )
+
+
+CHINA_A_ENHANCEMENT_PRESETS = {
+    "basic": "Basic - current behavior, no extra China A-share enhancement",
+    "flow_sentiment": "Flow and sentiment - fund flow, Dragon-Tiger, margin, heat",
+    "announcements": "Announcements - disclosures, dividends, buybacks, major events",
+    "industry_policy": "Industry and policy - sector, concept, policy context",
+    "all": "All enhancements - flow, announcements, industry, and policy context",
+}
+
+CHINA_A_ENHANCEMENT_ALIASES = {
+    "1": "basic",
+    "2": "flow_sentiment",
+    "3": "announcements",
+    "4": "industry_policy",
+    "5": "all",
+}
+
+
+def is_china_a_ticker(ticker: str) -> bool:
+    return resolve_china_a_symbol(ticker) is not None
+
+
+def select_china_a_enhancement_preset() -> str:
+    console.print("[bold]China A-share enhancement preset[/bold]")
+    for idx, (value, label) in enumerate(CHINA_A_ENHANCEMENT_PRESETS.items(), start=1):
+        console.print(f"  {idx}. {value} - {label}")
+
+    while True:
+        raw = typer.prompt(
+            "Select preset",
+            default="2",
+        ).strip().lower()
+        choice = CHINA_A_ENHANCEMENT_ALIASES.get(raw, raw)
+        if choice in CHINA_A_ENHANCEMENT_PRESETS:
+            return choice
+        console.print(
+            "[red]Invalid preset. Choose 1-5 or one of: "
+            + ", ".join(CHINA_A_ENHANCEMENT_PRESETS)
+            + "[/red]"
+        )
 
 
 # Create a deque to store recent messages with a maximum length
@@ -542,6 +585,16 @@ def get_user_selections():
     )
     selected_ticker = get_ticker()
     asset_type = detect_asset_type(selected_ticker)
+    china_a_enhancement_preset = "basic"
+    if is_china_a_ticker(selected_ticker):
+        console.print(
+            create_question_box(
+                "Step 1b: China A-share Enhancements",
+                "Select additional mainland China data sources for this run",
+                "flow_sentiment",
+            )
+        )
+        china_a_enhancement_preset = select_china_a_enhancement_preset()
     # Only announce when it's not the default stock path, to avoid printing
     # "stock" on every run.
     if asset_type.value != "stock":
@@ -550,7 +603,7 @@ def get_user_selections():
         )
 
     # Step 2: Analysis date
-    default_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    default_date = _analysis_date_limit(selected_ticker)[0].strftime("%Y-%m-%d")
     console.print(
         create_question_box(
             "Step 2: Analysis Date",
@@ -558,7 +611,7 @@ def get_user_selections():
             default_date,
         )
     )
-    analysis_date = get_analysis_date()
+    analysis_date = get_analysis_date(selected_ticker)
 
     # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
     if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
@@ -725,21 +778,34 @@ def get_user_selections():
         "openai_reasoning_effort": reasoning_effort,
         "anthropic_effort": anthropic_effort,
         "output_language": output_language,
+        "china_a_enhancement_preset": china_a_enhancement_preset,
     }
 
 
-def get_analysis_date():
+def _analysis_date_limit(ticker: str | None = None) -> tuple[datetime.date, str]:
+    if ticker and is_china_a_ticker(ticker):
+        return datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date(), "Beijing"
+    return datetime.datetime.now().date(), "local"
+
+
+def get_analysis_date(ticker: str | None = None):
     """Get the analysis date from user input."""
     while True:
-        date_str = typer.prompt(
-            "", default=datetime.datetime.now().strftime("%Y-%m-%d")
-        )
+        limit_date, limit_label = _analysis_date_limit(ticker)
+        date_str = typer.prompt("", default=limit_date.strftime("%Y-%m-%d"))
         try:
-            # Validate date format and ensure it's not in the future
             analysis_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-            if analysis_date.date() > datetime.datetime.now().date():
-                console.print("[red]Error: Analysis date cannot be in the future[/red]")
+            if analysis_date.date() > limit_date:
+                console.print(
+                    f"[red]Error: Analysis date cannot be in the future "
+                    f"(max {limit_label} date: {limit_date:%Y-%m-%d})[/red]"
+                )
                 continue
+            if ticker and is_china_a_ticker(ticker) and analysis_date.date() == limit_date:
+                console.print(
+                    "[yellow]China A-share same-day data may be incomplete until "
+                    "mainland markets close and vendors finish publishing.[/yellow]"
+                )
             return date_str
         except ValueError:
             console.print(
@@ -981,6 +1047,10 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
     config["output_language"] = selections.get("output_language", "English")
+    config["china_a_enhancement_preset"] = selections.get(
+        "china_a_enhancement_preset",
+        DEFAULT_CONFIG.get("china_a_enhancement_preset", "basic"),
+    )
     # --checkpoint/--no-checkpoint overrides only when explicitly given; omitting
     # the flag preserves TRADINGAGENTS_CHECKPOINT_ENABLED / the default (#976).
     if checkpoint is not None:

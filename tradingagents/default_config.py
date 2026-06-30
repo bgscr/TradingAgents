@@ -101,6 +101,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",
+    # China mainland A-share enhancement preset. The CLI asks for this only
+    # when the ticker resolves to a mainland A-share. "basic" preserves current
+    # behavior.
+    "china_a_enhancement_preset": "basic",
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
