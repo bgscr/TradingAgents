@@ -20,6 +20,11 @@ def test_is_china_a_ticker_rejects_non_mainland_forms():
     assert m.is_china_a_ticker("AAPL") is False
     assert m.is_china_a_ticker("0700.HK") is False
     assert m.is_china_a_ticker("BTC-USD") is False
+    assert m.is_china_a_ticker("900901.SS") is False
+    assert m.is_china_a_ticker("900901.SH") is False
+    assert m.is_china_a_ticker("200012.SZ") is False
+    assert m.is_china_a_ticker("900901") is False
+    assert m.is_china_a_ticker("200012") is False
 
 
 @pytest.mark.unit
@@ -51,6 +56,18 @@ def test_china_a_preset_prompt_maps_numeric_choice_to_value(monkeypatch):
     monkeypatch.setattr(m.typer, "prompt", lambda *a, **k: "2")
 
     assert m.select_china_a_enhancement_preset() == "flow_sentiment"
+
+
+@pytest.mark.unit
+def test_china_a_preset_prompt_defaults_to_basic_on_enter(monkeypatch):
+    import cli.main as m
+
+    def prompt_returns_default(*args, **kwargs):
+        return kwargs["default"]
+
+    monkeypatch.setattr(m.typer, "prompt", prompt_returns_default)
+
+    assert m.select_china_a_enhancement_preset() == "basic"
 
 
 class FixedDateTime(datetime.datetime):

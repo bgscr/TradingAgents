@@ -77,9 +77,14 @@ CHINA_A_ENHANCEMENT_ALIASES = {
     "5": "all",
 }
 
+CHINA_A_B_SHARE_PREFIXES = ("900", "200")
+
 
 def is_china_a_ticker(ticker: str) -> bool:
-    return resolve_china_a_symbol(ticker) is not None
+    instrument = resolve_china_a_symbol(ticker)
+    if instrument is None:
+        return False
+    return not instrument.akshare_code.startswith(CHINA_A_B_SHARE_PREFIXES)
 
 
 def select_china_a_enhancement_preset() -> str:
@@ -90,7 +95,7 @@ def select_china_a_enhancement_preset() -> str:
     while True:
         raw = typer.prompt(
             "Select preset",
-            default="2",
+            default="1",
         ).strip().lower()
         choice = CHINA_A_ENHANCEMENT_ALIASES.get(raw, raw)
         if choice in CHINA_A_ENHANCEMENT_PRESETS:
@@ -591,7 +596,7 @@ def get_user_selections():
             create_question_box(
                 "Step 1b: China A-share Enhancements",
                 "Select additional mainland China data sources for this run",
-                "flow_sentiment",
+                "basic",
             )
         )
         china_a_enhancement_preset = select_china_a_enhancement_preset()
