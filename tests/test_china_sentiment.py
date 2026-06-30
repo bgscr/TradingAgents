@@ -97,3 +97,16 @@ def test_get_china_a_local_sentiment_marks_non_china_as_not_applicable():
 
     assert "not applicable" in out
     assert "China A-share symbols only" in out
+
+
+@pytest.mark.unit
+def test_optional_akshare_endpoint_output_is_suppressed(capsys):
+    data, error = china_sentiment._safe_frame(
+        "noisy_endpoint",
+        lambda: print("progress should be hidden") or pd.DataFrame({"x": [1]}),
+    )
+
+    captured = capsys.readouterr()
+    assert error is None
+    assert data is not None
+    assert "progress should be hidden" not in captured.out

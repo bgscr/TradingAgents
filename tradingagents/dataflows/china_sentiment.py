@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+
 import akshare as ak
 import pandas as pd
 
@@ -12,7 +15,8 @@ def _format_optional_error(endpoint: str, exc: Exception) -> str:
 
 def _safe_frame(endpoint: str, fn) -> tuple[pd.DataFrame | None, str | None]:
     try:
-        data = fn()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            data = fn()
     except Exception as exc:  # noqa: BLE001 - optional enrichment only
         return None, _format_optional_error(endpoint, exc)
     if data is None or data.empty:
