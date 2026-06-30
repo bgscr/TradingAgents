@@ -13,6 +13,7 @@ import pytest
 
 import tradingagents.dataflows.config as config_module
 import tradingagents.default_config as default_config
+from tradingagents.dataflows import akshare_data
 from tradingagents.dataflows import interface
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.symbol_utils import NoMarketDataError
@@ -237,6 +238,16 @@ class VendorRoutingTests(unittest.TestCase):
                 configured.issubset(registered),
                 f"{method} missing configured China vendors: {sorted(configured - registered)}",
             )
+
+    def test_akshare_price_and_indicator_placeholders_are_replaced(self):
+        self.assertIs(
+            interface.VENDOR_METHODS["get_stock_data"]["akshare"],
+            akshare_data.get_stock_data,
+        )
+        self.assertIs(
+            interface.VENDOR_METHODS["get_indicators"]["akshare"],
+            akshare_data.get_stock_stats_indicators_window,
+        )
 
 
 if __name__ == "__main__":
