@@ -35,6 +35,7 @@ PRESET_CATEGORIES = {
 SOURCE_TIMEOUT_SECONDS = 8
 CACHE_TTL_SECONDS = 6 * 60 * 60
 MAX_SOURCE_LINES = 8
+MAX_SOURCE_LINE_CHARS = 360
 SOURCE_LINE_PREFIXES = ("- Source:", "- Source unavailable:")
 
 
@@ -143,25 +144,73 @@ def _find_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
     return None
 
 
+def _profile_pairs(frame: pd.DataFrame) -> dict[str, str]:
+    if frame.empty:
+        return {}
+
+    item_col = _find_column(frame, ("item", "name", "项目", "字段"))
+    value_col = _find_column(frame, ("value", "值", "内容"))
+    if item_col and value_col:
+        pairs = {}
+        for _, row in frame.iterrows():
+            key = _string_value(row.get(item_col))
+            value = _string_value(row.get(value_col))
+            if key and value:
+                pairs[key] = value
+        return pairs
+
+    row = frame.iloc[0]
+    return {
+        str(column): _string_value(row.get(column))
+        for column in frame.columns
+        if _string_value(row.get(column))
+    }
+
+
+def _profile_value(pairs: dict[str, str], names: tuple[str, ...]) -> str:
+    normalized_names = tuple(name.lower() for name in names)
+    for key, value in pairs.items():
+        normalized_key = key.strip().lower()
+        if any(name in normalized_key for name in normalized_names):
+            return value
+    return ""
+
+
+def _split_concepts(value: str) -> list[str]:
+    if not value:
+        return []
+    normalized = value.replace("，", ",").replace("、", ",").replace(";", ",")
+    return [part.strip() for part in normalized.split(",") if part.strip()]
+
+
+def _matches_any_term(value: str, terms: list[str]) -> bool:
+    lowered = value.lower()
+    return any(term.lower() in lowered or lowered in term.lower() for term in terms if term)
+
+
+def _truncate_text(text: str, limit: int = MAX_SOURCE_LINE_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
 def _format_result(result: SourceResult) -> list[str]:
     if result.status == "ok":
         return [
-            f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; {record}"
+            f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; "
+            f"{_truncate_text(record)}"
             for record in result.records
         ]
-    return [f"- Source unavailable: {result.source} ({result.error or 'unknown error'})."]
+    return [
+        f"- Source unavailable: {result.source} "
+        f"({_truncate_text(result.error or 'unknown error')})."
+    ]
 
 
-def _cap_source_lines(lines: list[str]) -> list[str]:
-    kept: list[str] = []
-    source_line_count = 0
-    for line in lines:
-        if line.startswith(SOURCE_LINE_PREFIXES):
-            if source_line_count >= MAX_SOURCE_LINES:
-                continue
-            source_line_count += 1
-        kept.append(line)
-    return kept
+def _section_source_line_limit(section_count: int) -> int:
+    if section_count <= 1:
+        return MAX_SOURCE_LINES
+    return max(1, MAX_SOURCE_LINES // section_count)
 
 
 def _format_snapshot(
@@ -182,12 +231,19 @@ def _format_snapshot(
         "Use this source-labeled snapshot as supplemental China-local context.",
         "",
     ]
+    section_source_limit = _section_source_line_limit(len(results))
     for title, source_results in results:
         lines.append(f"### {title}")
+        source_line_count = 0
         for result in source_results:
-            lines.extend(_format_result(result))
+            for line in _format_result(result):
+                if line.startswith(SOURCE_LINE_PREFIXES):
+                    if source_line_count >= section_source_limit:
+                        continue
+                    source_line_count += 1
+                lines.append(line)
         lines.append("")
-    return "\n".join(_cap_source_lines(lines)).strip()
+    return "\n".join(lines).strip()
 
 
 def _eastmoney_symbol(instrument) -> str:
@@ -420,8 +476,40 @@ def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
 
 
 def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
-    del instrument
     results: list[SourceResult] = []
+    profile_terms: list[str] = []
+
+    frame, error = _call_source(
+        "stock_individual_info_em",
+        lambda: ak.stock_individual_info_em(symbol=instrument.akshare_code),
+    )
+    if error:
+        results.append(error)
+    else:
+        pairs = _profile_pairs(frame)
+        industry = _profile_value(
+            pairs,
+            ("industry", "sector", "行业", "所属行业", "板块", "所属板块"),
+        )
+        concepts = _split_concepts(
+            _profile_value(
+                pairs,
+                ("concept", "concepts", "概念", "所属概念", "概念板块"),
+            )
+        )
+        profile_terms = [term for term in [industry, *concepts] if term]
+        records = []
+        if industry:
+            records.append(f"stock_code={instrument.akshare_code}; industry={industry}")
+        if concepts:
+            records.append(
+                f"stock_code={instrument.akshare_code}; concepts={', '.join(concepts[:5])}"
+            )
+        if not records:
+            records = [
+                f"stock_code={instrument.akshare_code}; no industry/concept fields returned"
+            ]
+        results.append(SourceResult("stock_individual_info_em", "ok", curr_date, tuple(records)))
 
     frame, error = _call_source(
         "stock_sector_fund_flow_rank",
@@ -431,10 +519,13 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         results.append(error)
     else:
         records = []
-        for _, row in frame.head(5).iterrows():
+        for _, row in frame.head(30).iterrows():
+            sector = _first_present(row, ("sector", "名称", "板块名称", "鍚嶇О", "鏉垮潡鍚嶇О"))
+            if profile_terms and not _matches_any_term(sector, profile_terms):
+                continue
             records.append(
                 "sector={sector}; pct_change={pct}; net_inflow={net}".format(
-                    sector=_first_present(row, ("sector", "名称", "板块名称", "鍚嶇О", "鏉垮潡鍚嶇О")),
+                    sector=sector,
                     pct=_first_present(row, ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
                     net=_first_present(
                         row,
@@ -442,6 +533,18 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
                     ),
                 )
             )
+            if len(records) >= 3:
+                break
+        if not records:
+            if profile_terms:
+                records = [
+                    "no sector fund-flow row matched ticker industry/concepts: "
+                    + ", ".join(profile_terms[:5])
+                ]
+            else:
+                records = [
+                    "no ticker-specific industry/concept fields available to filter sector fund flow"
+                ]
         results.append(SourceResult("stock_sector_fund_flow_rank", "ok", curr_date, tuple(records)))
 
     frame, error = _call_source("stock_info_global_em", ak.stock_info_global_em)
@@ -449,13 +552,28 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         results.append(error)
     else:
         records = []
-        for _, row in frame.head(5).iterrows():
+        for _, row in frame.head(30).iterrows():
+            title = _first_present(row, ("title", "标题", "新闻标题", "鏍囬", "鏂伴椈鏍囬"))
+            if profile_terms and not _matches_any_term(title, profile_terms):
+                continue
             records.append(
                 "title={title}; source={source}".format(
-                    title=_first_present(row, ("title", "标题", "新闻标题", "鏍囬", "鏂伴椈鏍囬")),
+                    title=title,
                     source=_first_present(row, ("source", "来源", "文章来源", "鏉ユ簮", "鏂囩珷鏉ユ簮")),
                 )
             )
+            if len(records) >= 3:
+                break
+        if not records:
+            if profile_terms:
+                records = [
+                    "no policy/industry headline matched ticker industry/concepts: "
+                    + ", ".join(profile_terms[:5])
+                ]
+            else:
+                records = [
+                    "no ticker-specific industry/concept fields available to filter policy headlines"
+                ]
         results.append(SourceResult("stock_info_global_em", "ok", curr_date, tuple(records)))
 
     return results
