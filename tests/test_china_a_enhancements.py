@@ -280,6 +280,86 @@ def test_industry_policy_uses_ticker_specific_profile_fields(monkeypatch, tmp_pa
 
 
 @pytest.mark.unit
+def test_industry_policy_does_not_emit_generic_rows_when_profile_fails(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_individual_info_em",
+        lambda symbol: (_ for _ in ()).throw(ValueError("profile offline")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_sector_fund_flow_rank",
+        lambda indicator: pd.DataFrame(
+            {"sector": ["Generic Sector"], "pct_change": ["1.2"], "net_inflow": ["1200"]}
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_info_global_em",
+        lambda: pd.DataFrame(
+            {"title": ["Generic market policy headline"], "source": ["policy desk"]}
+        ),
+    )
+
+    out = enh.get_china_a_enhancements(
+        "600895.SS", "2026-06-30", "industry_policy"
+    )
+
+    assert "Source unavailable: stock_individual_info_em" in out
+    assert "no ticker-specific industry/concept fields available" in out
+    assert "Generic Sector" not in out
+    assert "Generic market policy headline" not in out
+
+
+@pytest.mark.unit
+def test_industry_policy_does_not_emit_generic_rows_when_profile_has_no_fields(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_individual_info_em",
+        lambda symbol: pd.DataFrame({"item": ["name"], "value": ["Ticker Name"]}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_sector_fund_flow_rank",
+        lambda indicator: pd.DataFrame(
+            {"sector": ["Generic Sector"], "pct_change": ["1.2"], "net_inflow": ["1200"]}
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_info_global_em",
+        lambda: pd.DataFrame(
+            {"title": ["Generic market policy headline"], "source": ["policy desk"]}
+        ),
+    )
+
+    out = enh.get_china_a_enhancements(
+        "600895.SS", "2026-06-30", "industry_policy"
+    )
+
+    assert "stock_code=600895; no industry/concept fields returned" in out
+    assert "no ticker-specific industry/concept fields available" in out
+    assert "Generic Sector" not in out
+    assert "Generic market policy headline" not in out
+
+
+@pytest.mark.unit
 def test_all_preset_preserves_source_lines_for_each_requested_category(monkeypatch, tmp_path):
     import tradingagents.dataflows.config as config_module
     from tradingagents.dataflows import china_a_enhancements as enh

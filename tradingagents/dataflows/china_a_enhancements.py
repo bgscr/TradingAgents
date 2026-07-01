@@ -510,6 +510,7 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
                 f"stock_code={instrument.akshare_code}; no industry/concept fields returned"
             ]
         results.append(SourceResult("stock_individual_info_em", "ok", curr_date, tuple(records)))
+    has_profile_terms = bool(profile_terms)
 
     frame, error = _call_source(
         "stock_sector_fund_flow_rank",
@@ -519,24 +520,25 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         results.append(error)
     else:
         records = []
-        for _, row in frame.head(30).iterrows():
-            sector = _first_present(row, ("sector", "名称", "板块名称", "鍚嶇О", "鏉垮潡鍚嶇О"))
-            if profile_terms and not _matches_any_term(sector, profile_terms):
-                continue
-            records.append(
-                "sector={sector}; pct_change={pct}; net_inflow={net}".format(
-                    sector=sector,
-                    pct=_first_present(row, ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
-                    net=_first_present(
-                        row,
-                        ("net_inflow", "主力净流入-净额", "净流入", "涓诲姏鍑€娴佸叆-鍑€棰�", "鍑€娴佸叆"),
-                    ),
+        if has_profile_terms:
+            for _, row in frame.head(30).iterrows():
+                sector = _first_present(row, ("sector", "名称", "板块名称", "鍚嶇О", "鏉垮潡鍚嶇О"))
+                if not _matches_any_term(sector, profile_terms):
+                    continue
+                records.append(
+                    "sector={sector}; pct_change={pct}; net_inflow={net}".format(
+                        sector=sector,
+                        pct=_first_present(row, ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
+                        net=_first_present(
+                            row,
+                            ("net_inflow", "主力净流入-净额", "净流入", "涓诲姏鍑€娴佸叆-鍑€棰�", "鍑€娴佸叆"),
+                        ),
+                    )
                 )
-            )
-            if len(records) >= 3:
-                break
+                if len(records) >= 3:
+                    break
         if not records:
-            if profile_terms:
+            if has_profile_terms:
                 records = [
                     "no sector fund-flow row matched ticker industry/concepts: "
                     + ", ".join(profile_terms[:5])
@@ -552,20 +554,21 @@ def _collect_industry_policy(instrument, curr_date: str) -> list[SourceResult]:
         results.append(error)
     else:
         records = []
-        for _, row in frame.head(30).iterrows():
-            title = _first_present(row, ("title", "标题", "新闻标题", "鏍囬", "鏂伴椈鏍囬"))
-            if profile_terms and not _matches_any_term(title, profile_terms):
-                continue
-            records.append(
-                "title={title}; source={source}".format(
-                    title=title,
-                    source=_first_present(row, ("source", "来源", "文章来源", "鏉ユ簮", "鏂囩珷鏉ユ簮")),
+        if has_profile_terms:
+            for _, row in frame.head(30).iterrows():
+                title = _first_present(row, ("title", "标题", "新闻标题", "鏍囬", "鏂伴椈鏍囬"))
+                if not _matches_any_term(title, profile_terms):
+                    continue
+                records.append(
+                    "title={title}; source={source}".format(
+                        title=title,
+                        source=_first_present(row, ("source", "来源", "文章来源", "鏉ユ簮", "鏂囩珷鏉ユ簮")),
+                    )
                 )
-            )
-            if len(records) >= 3:
-                break
+                if len(records) >= 3:
+                    break
         if not records:
-            if profile_terms:
+            if has_profile_terms:
                 records = [
                     "no policy/industry headline matched ticker industry/concepts: "
                     + ", ".join(profile_terms[:5])
