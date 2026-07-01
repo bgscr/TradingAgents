@@ -13,9 +13,18 @@ def _state():
     return {
         "market_report": "MKT",
         "news_report": "NEWS",
-        "investment_debate_state": {"judge_decision": "RM PLAN"},
+        "investment_debate_state": {
+            "bull_history": "BULL FULL HISTORY",
+            "bear_history": "BEAR FULL HISTORY",
+            "judge_decision": "RM PLAN",
+        },
         "trader_investment_plan": "TRADE",
-        "risk_debate_state": {"judge_decision": "PM DECISION"},
+        "risk_debate_state": {
+            "aggressive_history": "AGGRESSIVE FULL HISTORY",
+            "conservative_history": "CONSERVATIVE FULL HISTORY",
+            "neutral_history": "NEUTRAL FULL HISTORY",
+            "judge_decision": "PM DECISION",
+        },
     }
 
 
@@ -31,6 +40,38 @@ def test_write_report_tree_creates_files(tmp_path):
     complete = out.read_text()
     assert "Trading Analysis Report: AAPL" in complete
     assert "MKT" in complete and "PM DECISION" in complete
+
+
+@pytest.mark.unit
+def test_complete_report_is_summary_first_and_links_full_histories(tmp_path):
+    out = write_report_tree(_state(), "AAPL", tmp_path)
+    complete = out.read_text()
+
+    assert complete.index("## I. Portfolio Manager Decision") < complete.index(
+        "## II. Trading Team Plan"
+    )
+    assert complete.index("## II. Trading Team Plan") < complete.index(
+        "## III. Research Manager Decision"
+    )
+    assert complete.index("## III. Research Manager Decision") < complete.index(
+        "## IV. Analyst Team Reports"
+    )
+
+    assert "PM DECISION" in complete
+    assert "TRADE" in complete
+    assert "RM PLAN" in complete
+    assert "MKT" in complete
+    assert "BULL FULL HISTORY" not in complete
+    assert "BEAR FULL HISTORY" not in complete
+    assert "AGGRESSIVE FULL HISTORY" not in complete
+    assert "CONSERVATIVE FULL HISTORY" not in complete
+    assert "NEUTRAL FULL HISTORY" not in complete
+
+    assert "2_research/bull.md" in complete
+    assert "2_research/bear.md" in complete
+    assert "4_risk/aggressive.md" in complete
+    assert "4_risk/conservative.md" in complete
+    assert "4_risk/neutral.md" in complete
 
 
 @pytest.mark.unit
