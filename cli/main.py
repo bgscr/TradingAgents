@@ -1072,7 +1072,9 @@ def _now_iso() -> str:
     )
 
 
-def _analyst_values(analysts) -> list[str]:
+def _analyst_values(analysts=None) -> list[str]:
+    if analysts is None:
+        return []
     return [analyst.value if hasattr(analyst, "value") else str(analyst) for analyst in analysts]
 
 
@@ -1115,7 +1117,7 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
             "ticker": selections["ticker"],
             "analysis_date": selections["analysis_date"],
             "asset_type": selections["asset_type"],
-            "selected_analysts": _analyst_values(selections["analysts"]),
+            "selected_analysts": _analyst_values(selections.get("analysts")),
             "china_a_enhancement_preset": selections.get(
                 "china_a_enhancement_preset", "basic"
             ),
