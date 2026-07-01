@@ -5,16 +5,36 @@ import sys
 import akshare as ak
 import pandas as pd
 
-REQUIRED_COLS = ["代码", "名称", "最新价", "成交额"]
-NUMERIC_COLS = ["最新价", "涨跌幅", "成交额", "换手率", "市盈率-动态"]
+CODE_COL = "\u4ee3\u7801"
+NAME_COL = "\u540d\u79f0"
+PRICE_COL = "\u6700\u65b0\u4ef7"
+CHANGE_COL = "\u6da8\u8dcc\u5e45"
+AMOUNT_COL = "\u6210\u4ea4\u989d"
+TURNOVER_COL = "\u6362\u624b\u7387"
+DYNAMIC_PE_COL = "\u5e02\u76c8\u7387-\u52a8\u6001"
+
+VALUATION_COLUMNS = (
+    DYNAMIC_PE_COL,
+    "\u5e02\u76c8\u7387-TTM",
+    "\u5e02\u76c8\u7387-\u9759\u6001",
+    "PE(TTM)",
+    "pe_ttm",
+)
+VALUATION_STATUS_COL = "valuation_data_status"
+CANDIDATE_WARNING_COL = "candidate_warning"
+
+REQUIRED_COLS = [CODE_COL, NAME_COL, PRICE_COL, AMOUNT_COL]
+NUMERIC_COLS = [PRICE_COL, CHANGE_COL, AMOUNT_COL, TURNOVER_COL, *VALUATION_COLUMNS]
 DISPLAY_COLS = [
-    "代码",
-    "名称",
-    "最新价",
-    "涨跌幅",
-    "成交额",
-    "换手率",
-    "市盈率-动态",
+    CODE_COL,
+    NAME_COL,
+    PRICE_COL,
+    CHANGE_COL,
+    AMOUNT_COL,
+    TURNOVER_COL,
+    DYNAMIC_PE_COL,
+    VALUATION_STATUS_COL,
+    CANDIDATE_WARNING_COL,
     "score",
     "tradingagents_ticker",
 ]
@@ -57,37 +77,68 @@ def load_spot_data() -> tuple[pd.DataFrame, str]:
     raise RuntimeError("Unable to fetch A-share spot data:\n" + "\n".join(f"- {e}" for e in errors))
 
 
+def _resolve_valuation_column(data: pd.DataFrame) -> str | None:
+    for col in VALUATION_COLUMNS:
+        if col in data.columns:
+            return col
+    return None
+
+
+def _valuation_missing_warning(source: str) -> str:
+    return f"valuation data unavailable from {source}"
+
+
 def prepare_candidates(data: pd.DataFrame, source: str) -> pd.DataFrame:
     missing = [col for col in REQUIRED_COLS if col not in data.columns]
     if missing:
         raise ValueError(f"{source} missing required columns: {', '.join(missing)}")
 
-    keep_cols = [col for col in [*REQUIRED_COLS, "涨跌幅", "换手率", "市盈率-动态"] if col in data.columns]
+    valuation_col = _resolve_valuation_column(data)
+    optional_cols = [CHANGE_COL, TURNOVER_COL]
+    if valuation_col:
+        optional_cols.append(valuation_col)
+    keep_cols = [col for col in [*REQUIRED_COLS, *optional_cols] if col in data.columns]
     df = data[keep_cols].copy()
-    df["代码"] = df["代码"].apply(normalize_stock_code)
+    df[CODE_COL] = df[CODE_COL].apply(normalize_stock_code)
+
+    if valuation_col and valuation_col != DYNAMIC_PE_COL:
+        df[DYNAMIC_PE_COL] = df[valuation_col]
+
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # 基础过滤：排除 ST、低流动性、异常价格
-    df = df[~df["名称"].astype(str).str.contains("ST", case=False, na=False)]
-    df = df[df["成交额"] > 300_000_000]  # 成交额 > 3 亿
-    df = df[df["最新价"] > 3]  # 排除低价异常股
+    df = df[~df[NAME_COL].astype(str).str.contains("ST", case=False, na=False)]
+    df = df[df[AMOUNT_COL] > 300_000_000]  # 成交额 > 3 亿
+    df = df[df[PRICE_COL] > 3]  # 排除低价异常股
 
-    if "市盈率-动态" in df.columns:
-        df = df[(df["市盈率-动态"] > 0) & (df["市盈率-动态"] < 80)]
+    if valuation_col:
+        df[VALUATION_STATUS_COL] = "ok"
+        df[CANDIDATE_WARNING_COL] = ""
+        missing_mask = df[DYNAMIC_PE_COL].isna()
+        df.loc[missing_mask, VALUATION_STATUS_COL] = "missing_row"
+        df.loc[missing_mask, CANDIDATE_WARNING_COL] = "valuation missing for row"
+        df = df[(df[DYNAMIC_PE_COL] > 0) & (df[DYNAMIC_PE_COL] < 80)]
+    else:
+        df[DYNAMIC_PE_COL] = pd.NA
+        df[VALUATION_STATUS_COL] = "missing_source"
+        df[CANDIDATE_WARNING_COL] = _valuation_missing_warning(source)
 
     df["score"] = 0.0
-    df["score"] += df["成交额"].rank(pct=True) * 40
+    df["score"] += df[AMOUNT_COL].rank(pct=True) * 40
 
-    if "涨跌幅" in df.columns:
-        df["score"] += df["涨跌幅"].between(0, 5).astype(int) * 30
-        df["score"] -= df["涨跌幅"].abs().rank(pct=True) * 10
+    if CHANGE_COL in df.columns:
+        df["score"] += df[CHANGE_COL].between(0, 5).astype(int) * 30
+        df["score"] -= df[CHANGE_COL].abs().rank(pct=True) * 10
 
-    if "换手率" in df.columns:
-        df["score"] += df["换手率"].between(1, 8).astype(int) * 20
+    if TURNOVER_COL in df.columns:
+        df["score"] += df[TURNOVER_COL].between(1, 8).astype(int) * 20
 
-    df["tradingagents_ticker"] = df["代码"].apply(to_ta_ticker)
+    if not valuation_col:
+        df["score"] -= 25
+
+    df["tradingagents_ticker"] = df[CODE_COL].apply(to_ta_ticker)
     return df.sort_values("score", ascending=False).head(10)
 
 
@@ -95,6 +146,11 @@ def main() -> int:
     try:
         data, source = load_spot_data()
         result = prepare_candidates(data, source)
+        if (
+            VALUATION_STATUS_COL in result.columns
+            and (result[VALUATION_STATUS_COL] == "missing_source").any()
+        ):
+            print(_valuation_missing_warning(source))
     except Exception as exc:  # noqa: BLE001 - script entrypoint reports concise failures
         print(str(exc))
         return 1
