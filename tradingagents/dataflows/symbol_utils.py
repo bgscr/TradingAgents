@@ -20,9 +20,9 @@ appending a table row rather than editing call sites.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import re
+from dataclasses import dataclass
 
 # NoMarketDataError lives in the vendor-error taxonomy (errors.py); re-exported
 # here for the many call sites that import it alongside normalize_symbol.

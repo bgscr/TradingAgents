@@ -4,11 +4,11 @@ import contextlib
 import hashlib
 import io
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 import akshare as ak
 import pandas as pd

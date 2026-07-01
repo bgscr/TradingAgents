@@ -19,17 +19,17 @@ if (-not (Test-Path -LiteralPath $ProjectDir -PathType Container)) {
     exit 1
 }
 
-if (-not (Test-Path -LiteralPath $VenvActivate -PathType Leaf)) {
-    Write-Host "Virtual environment does not exist: $VenvActivate" -ForegroundColor Red
-    Write-Host "Run first: python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e ." -ForegroundColor Yellow
-    exit 1
-}
-
 if ($DryRun) {
     Write-Host "ProjectDir=$ProjectDir"
     Write-Host "VenvActivate=$VenvActivate"
     Write-Host "Launcher=tradingagents"
     exit 0
+}
+
+if (-not (Test-Path -LiteralPath $VenvActivate -PathType Leaf)) {
+    Write-Host "Virtual environment does not exist: $VenvActivate" -ForegroundColor Red
+    Write-Host "Run first: python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e ." -ForegroundColor Yellow
+    exit 1
 }
 
 Set-Location -LiteralPath $ProjectDir

@@ -303,14 +303,13 @@ class VendorRoutingTests(unittest.TestCase):
 
     def test_china_a_get_stock_data_appends_flow_enhancement_when_enabled(self):
         set_config({"china_a_enhancement_preset": "flow_sentiment"})
-        with self._route({"akshare": _returns("PRICE_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="FLOW_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
-                )
+        with self._route({"akshare": _returns("PRICE_DATA")}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="FLOW_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+            )
 
         self.assertEqual(result, "PRICE_DATA\n\nFLOW_APPENDIX")
         enh.assert_called_once_with(
@@ -322,28 +321,26 @@ class VendorRoutingTests(unittest.TestCase):
 
     def test_non_china_get_stock_data_does_not_append_china_enhancement(self):
         set_config({"china_a_enhancement_preset": "flow_sentiment"})
-        with self._route({"yfinance": _returns("PRICE_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="FLOW_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_stock_data", "AAPL", "2026-06-01", "2026-06-30"
-                )
+        with self._route({"yfinance": _returns("PRICE_DATA")}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="FLOW_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_stock_data", "AAPL", "2026-06-01", "2026-06-30"
+            )
 
         self.assertEqual(result, "PRICE_DATA")
         enh.assert_not_called()
 
     def test_china_a_get_news_appends_announcement_and_policy_enhancements(self):
         set_config({"china_a_enhancement_preset": "all"})
-        with self._route_method("get_news", {"akshare": _returns("NEWS_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="NEWS_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_news", "600895.SS", "2026-06-23", "2026-06-30"
-                )
+        with self._route_method("get_news", {"akshare": _returns("NEWS_DATA")}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="NEWS_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_news", "600895.SS", "2026-06-23", "2026-06-30"
+            )
 
         self.assertEqual(result, "NEWS_DATA\n\nNEWS_APPENDIX")
         enh.assert_called_once_with(
@@ -355,14 +352,15 @@ class VendorRoutingTests(unittest.TestCase):
 
     def test_china_a_get_fundamentals_appends_announcement_enhancement(self):
         set_config({"china_a_enhancement_preset": "announcements"})
-        with self._route_method("get_fundamentals", {"akshare": _returns("FUND_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="FUND_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_fundamentals", "600895.SS", "2026-06-30"
-                )
+        with self._route_method(
+            "get_fundamentals", {"akshare": _returns("FUND_DATA")}
+        ), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="FUND_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_fundamentals", "600895.SS", "2026-06-30"
+            )
 
         self.assertEqual(result, "FUND_DATA\n\nFUND_APPENDIX")
         enh.assert_called_once_with(
@@ -375,56 +373,54 @@ class VendorRoutingTests(unittest.TestCase):
     def test_non_string_vendor_result_is_returned_unchanged(self):
         set_config({"china_a_enhancement_preset": "flow_sentiment"})
         payload = {"close": 12.34}
-        with self._route({"akshare": _returns(payload)}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="FLOW_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
-                )
+        with self._route({"akshare": _returns(payload)}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="FLOW_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+            )
 
         self.assertIs(result, payload)
         enh.assert_not_called()
 
     def test_empty_appendix_leaves_original_output_unchanged(self):
         set_config({"china_a_enhancement_preset": "flow_sentiment"})
-        with self._route({"akshare": _returns("PRICE_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="   ",
-            ):
-                result = interface.route_to_vendor(
-                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
-                )
+        with self._route({"akshare": _returns("PRICE_DATA")}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="   ",
+        ):
+            result = interface.route_to_vendor(
+                "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+            )
 
         self.assertEqual(result, "PRICE_DATA")
 
     def test_string_error_fundamentals_result_is_returned_unchanged(self):
         set_config({"china_a_enhancement_preset": "announcements"})
         error_result = "Error retrieving fundamentals for 600895.SS"
-        with self._route_method("get_fundamentals", {"akshare": _returns(error_result)}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                return_value="FUND_APPENDIX",
-            ) as enh:
-                result = interface.route_to_vendor(
-                    "get_fundamentals", "600895.SS", "2026-06-30"
-                )
+        with self._route_method(
+            "get_fundamentals", {"akshare": _returns(error_result)}
+        ), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            return_value="FUND_APPENDIX",
+        ) as enh:
+            result = interface.route_to_vendor(
+                "get_fundamentals", "600895.SS", "2026-06-30"
+            )
 
         self.assertEqual(result, error_result)
         enh.assert_not_called()
 
     def test_enhancement_exception_in_routing_returns_original_output(self):
         set_config({"china_a_enhancement_preset": "flow_sentiment"})
-        with self._route({"akshare": _returns("PRICE_DATA")}):
-            with mock.patch(
-                "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
-                side_effect=RuntimeError("cache offline"),
-            ):
-                result = interface.route_to_vendor(
-                    "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
-                )
+        with self._route({"akshare": _returns("PRICE_DATA")}), mock.patch(
+            "tradingagents.dataflows.interface.get_china_a_enhancements_for_categories",
+            side_effect=RuntimeError("cache offline"),
+        ):
+            result = interface.route_to_vendor(
+                "get_stock_data", "600895.SS", "2026-06-01", "2026-06-30"
+            )
 
         self.assertEqual(result, "PRICE_DATA")
 

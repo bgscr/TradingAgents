@@ -41,8 +41,8 @@ from cli.utils import (
     select_research_depth,
     select_shallow_thinking_agent,
 )
-from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
@@ -1127,7 +1127,6 @@ def run_analysis(checkpoint: bool | None = None):
     start_time = time.time()
 
     artifacts = _prepare_run_artifacts(config, selections)
-    results_dir = artifacts["results_dir"]
     report_dir = artifacts["report_dir"]
     log_file = artifacts["log_file"]
     latest_log_file = artifacts["latest_log_file"]
