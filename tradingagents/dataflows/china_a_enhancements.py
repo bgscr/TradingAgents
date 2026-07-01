@@ -4,7 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -37,6 +37,9 @@ CACHE_TTL_SECONDS = 6 * 60 * 60
 MAX_SOURCE_LINES = 8
 MAX_SOURCE_LINE_CHARS = 360
 SOURCE_LINE_PREFIXES = ("- Source:", "- Source unavailable:")
+STATUS_OK = "ok"
+STATUS_PARTIAL = "partial"
+STATUS_FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,13 @@ class SourceResult:
     as_of: str | None
     records: tuple[str, ...] = ()
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotSection:
+    title: str
+    results: Sequence[SourceResult]
+    status: str
 
 
 def _cache_root() -> Path:
@@ -195,7 +205,7 @@ def _truncate_text(text: str, limit: int = MAX_SOURCE_LINE_CHARS) -> str:
 
 
 def _format_result(result: SourceResult) -> list[str]:
-    if result.status == "ok":
+    if result.status == STATUS_OK:
         return [
             f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; "
             f"{_truncate_text(record)}"
@@ -205,6 +215,34 @@ def _format_result(result: SourceResult) -> list[str]:
         f"- Source unavailable: {result.source} "
         f"({_truncate_text(result.error or 'unknown error')})."
     ]
+
+
+def _source_result_is_ok(result: SourceResult) -> bool:
+    return result.status == STATUS_OK and bool(result.records)
+
+
+def _section_status(results: Sequence[SourceResult]) -> str:
+    ok_count = sum(1 for result in results if _source_result_is_ok(result))
+    if ok_count == 0:
+        return STATUS_FAILED
+    if ok_count < len(results):
+        return STATUS_PARTIAL
+    return STATUS_OK
+
+
+def _snapshot_status(sections: Sequence[SnapshotSection]) -> str:
+    if not sections:
+        return STATUS_FAILED
+    statuses = {section.status for section in sections}
+    if statuses == {STATUS_OK}:
+        return STATUS_OK
+    if statuses == {STATUS_FAILED}:
+        return STATUS_FAILED
+    return STATUS_PARTIAL
+
+
+def _should_cache_snapshot(sections: Sequence[SnapshotSection]) -> bool:
+    return _snapshot_status(sections) != STATUS_FAILED
 
 
 def _section_source_line_limit(section_count: int) -> int:
@@ -217,9 +255,9 @@ def _format_snapshot(
     ticker: str,
     curr_date: str,
     preset: str,
-    results: list[tuple[str, list[SourceResult]]],
+    sections: Sequence[SnapshotSection],
 ) -> str:
-    if not results:
+    if not sections:
         return ""
 
     lines = [
@@ -227,15 +265,17 @@ def _format_snapshot(
         f"Ticker: {ticker}",
         f"Analysis date: {curr_date}",
         f"Preset: {preset}",
+        f"Overall status: {_snapshot_status(sections)}",
         "",
         "Use this source-labeled snapshot as supplemental China-local context.",
         "",
     ]
-    section_source_limit = _section_source_line_limit(len(results))
-    for title, source_results in results:
-        lines.append(f"### {title}")
+    section_source_limit = _section_source_line_limit(len(sections))
+    for section in sections:
+        lines.append(f"### {section.title}")
+        lines.append(f"Section status: {section.status}")
         source_line_count = 0
-        for result in source_results:
+        for result in section.results:
             for line in _format_result(result):
                 if line.startswith(SOURCE_LINE_PREFIXES):
                     if source_line_count >= section_source_limit:
@@ -605,18 +645,29 @@ def get_china_a_enhancements_for_categories(
     if cached is not None:
         return cached
 
-    sections: list[tuple[str, list[SourceResult]]] = []
-    if CATEGORY_FLOW_SENTIMENT in allowed:
-        sections.append(("Fund flow and trading activity", _collect_flow_sentiment(instrument, curr_date)))
-    if CATEGORY_ANNOUNCEMENTS in allowed:
-        sections.append(("Announcements and disclosures", _collect_announcements(instrument, curr_date)))
-    if CATEGORY_INDUSTRY_POLICY in allowed:
+    sections: list[SnapshotSection] = []
+
+    def add_section(title: str, results: list[SourceResult]) -> None:
         sections.append(
-            ("Industry, sector, and policy context", _collect_industry_policy(instrument, curr_date))
+            SnapshotSection(
+                title=title,
+                results=tuple(results),
+                status=_section_status(results),
+            )
+        )
+
+    if CATEGORY_FLOW_SENTIMENT in allowed:
+        add_section("Fund flow and trading activity", _collect_flow_sentiment(instrument, curr_date))
+    if CATEGORY_ANNOUNCEMENTS in allowed:
+        add_section("Announcements and disclosures", _collect_announcements(instrument, curr_date))
+    if CATEGORY_INDUSTRY_POLICY in allowed:
+        add_section(
+            "Industry, sector, and policy context",
+            _collect_industry_policy(instrument, curr_date),
         )
 
     text = _format_snapshot(instrument.yahoo_symbol, curr_date, preset, sections)
-    if text:
+    if text and _should_cache_snapshot(sections):
         _write_cache(cache_path, text)
     return text
 

@@ -223,6 +223,94 @@ def test_cache_avoids_repeat_source_calls_within_ttl(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_all_failed_enrichment_snapshot_is_not_cached(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+
+    calls = {"fund_flow": 0}
+
+    def fail_fund_flow(stock, market):
+        calls["fund_flow"] += 1
+        raise ValueError("shape mismatch")
+
+    monkeypatch.setattr(enh.ak, "stock_individual_fund_flow", fail_fund_flow)
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_lhb_detail_em",
+        lambda start_date, end_date: (_ for _ in ()).throw(ValueError("lhb offline")),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_margin_detail_sse",
+        lambda date: (_ for _ in ()).throw(ValueError("margin offline")),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_hot_rank_latest_em",
+        lambda symbol: (_ for _ in ()).throw(ValueError("rank offline")),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_hot_keyword_em",
+        lambda symbol: (_ for _ in ()).throw(ValueError("keyword offline")),
+    )
+
+    first = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
+    second = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
+
+    assert "Overall status: failed" in first
+    assert "Overall status: failed" in second
+    assert calls["fund_flow"] == 2
+
+
+@pytest.mark.unit
+def test_partial_enrichment_snapshot_is_cached_with_status(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+
+    calls = {"fund_flow": 0}
+
+    def fund_flow(stock, market):
+        calls["fund_flow"] += 1
+        return pd.DataFrame(
+            {
+                "date": ["2026-06-30"],
+                "close": [41.2],
+                "pct_change": [1.3],
+                "main_net_inflow": [1200000],
+                "main_net_ratio": [4.2],
+            }
+        )
+
+    monkeypatch.setattr(enh.ak, "stock_individual_fund_flow", fund_flow)
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_lhb_detail_em",
+        lambda start_date, end_date: (_ for _ in ()).throw(ValueError("lhb offline")),
+    )
+    monkeypatch.setattr(enh.ak, "stock_margin_detail_sse", lambda date: pd.DataFrame())
+    monkeypatch.setattr(enh.ak, "stock_hot_rank_latest_em", lambda symbol: pd.DataFrame())
+    monkeypatch.setattr(enh.ak, "stock_hot_keyword_em", lambda symbol: pd.DataFrame())
+
+    first = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
+    second = enh.get_china_a_enhancements("600895.SS", "2026-06-30", "flow_sentiment")
+
+    assert first == second
+    assert "Overall status: partial" in first
+    assert "Section status: partial" in first
+    assert "Source unavailable: stock_lhb_detail_em" in first
+    assert calls["fund_flow"] == 1
+
+
+@pytest.mark.unit
 def test_industry_policy_uses_ticker_specific_profile_fields(monkeypatch, tmp_path):
     import tradingagents.dataflows.config as config_module
     from tradingagents.dataflows import china_a_enhancements as enh
