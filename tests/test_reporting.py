@@ -67,11 +67,11 @@ def test_complete_report_is_summary_first_and_links_full_histories(tmp_path):
     assert "CONSERVATIVE FULL HISTORY" not in complete
     assert "NEUTRAL FULL HISTORY" not in complete
 
-    assert "2_research/bull.md" in complete
-    assert "2_research/bear.md" in complete
-    assert "4_risk/aggressive.md" in complete
-    assert "4_risk/conservative.md" in complete
-    assert "4_risk/neutral.md" in complete
+    assert "[2_research/bull.md](2_research/bull.md)" in complete
+    assert "[2_research/bear.md](2_research/bear.md)" in complete
+    assert "[4_risk/aggressive.md](4_risk/aggressive.md)" in complete
+    assert "[4_risk/conservative.md](4_risk/conservative.md)" in complete
+    assert "[4_risk/neutral.md](4_risk/neutral.md)" in complete
 
 
 @pytest.mark.unit

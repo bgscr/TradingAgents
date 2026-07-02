@@ -16,7 +16,8 @@ def _write_markdown(path: Path, text: str) -> None:
 
 
 def _appendix_entry(label: str, path: Path, root: Path) -> str:
-    return f"- {label}: `{path.relative_to(root).as_posix()}`"
+    rel_path = path.relative_to(root).as_posix()
+    return f"- {label}: [{rel_path}]({rel_path})"
 
 
 def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
