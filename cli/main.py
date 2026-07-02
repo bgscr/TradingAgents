@@ -1208,16 +1208,20 @@ def run_analysis(checkpoint: bool | None = None):
     latest_log_file = artifacts["latest_log_file"]
     run_log_paths = [log_file, latest_log_file]
 
-    # Initialize the graph with callbacks bound to LLMs
-    graph = TradingAgentsGraph(
-        selected_analyst_keys,
-        config=config,
-        debug=True,
-        callbacks=[stats_handler],
-    )
+    try:
+        # Initialize the graph with callbacks bound to LLMs
+        graph = TradingAgentsGraph(
+            selected_analyst_keys,
+            config=config,
+            debug=True,
+            callbacks=[stats_handler],
+        )
 
-    # Initialize message buffer with selected analysts
-    message_buffer.init_for_analysis(selected_analyst_keys)
+        # Initialize message buffer with selected analysts
+        message_buffer.init_for_analysis(selected_analyst_keys)
+    except Exception as exc:
+        _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        raise
 
     # Track start time for elapsed display
     start_time = time.time()

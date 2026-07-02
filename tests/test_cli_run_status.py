@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,28 @@ def _selections():
         "analysts": ["market", "social"],
         "china_a_enhancement_preset": "all",
     }
+
+
+def _run_selections():
+    selections = _selections()
+    selections.update(
+        {
+            "analysts": [
+                SimpleNamespace(value="market"),
+                SimpleNamespace(value="social"),
+            ],
+            "research_depth": 1,
+            "shallow_thinker": "gpt-5-mini",
+            "deep_thinker": "gpt-5",
+            "backend_url": None,
+            "llm_provider": "openai",
+            "google_thinking_level": None,
+            "openai_reasoning_effort": None,
+            "anthropic_effort": None,
+            "output_language": "English",
+        }
+    )
+    return selections
 
 
 @pytest.mark.unit
@@ -74,3 +97,30 @@ def test_mark_run_failed_records_error_summary(tmp_path):
     assert payload["current_phase"] == "graph_stream"
     assert payload["completed_at"] is None
     assert payload["error_summary"] == "RuntimeError: stream stopped"
+
+
+@pytest.mark.unit
+def test_run_analysis_marks_failed_when_graph_initialization_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
+    monkeypatch.setattr(
+        cli_main,
+        "DEFAULT_CONFIG",
+        dict(cli_main.DEFAULT_CONFIG, results_dir=str(tmp_path)),
+    )
+
+    def fail_graph_init(*args, **kwargs):
+        raise RuntimeError("graph boot failed")
+
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", fail_graph_init)
+
+    with pytest.raises(RuntimeError, match="graph boot failed"):
+        cli_main.run_analysis()
+
+    status_files = list(tmp_path.rglob("run_status.json"))
+    assert len(status_files) == 1
+    payload = json.loads(status_files[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["current_phase"] == "graph_initializing"
+    assert payload["error_summary"] == "RuntimeError: graph boot failed"
