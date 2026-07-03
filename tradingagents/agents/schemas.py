@@ -159,8 +159,8 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     """Render a TraderProposal to markdown.
 
     The trailing ``FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**`` line is
-    preserved for backward compatibility with the analyst stop-signal text
-    and any external code that greps for it.
+    preserved for backward compatibility with reports and external code that
+    grep for it.
     """
     parts = [
         f"**Action**: {proposal.action.value}",

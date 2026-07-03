@@ -7,11 +7,17 @@ behavior we added for the Trader, Research Manager, and Sentiment Analyst
 so they share the same deterministic output shape.
 """
 
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
+from tradingagents.agents.analysts.fundamentals_analyst import (
+    create_fundamentals_analyst,
+)
+from tradingagents.agents.analysts.market_analyst import create_market_analyst
+from tradingagents.agents.analysts.news_analyst import create_news_analyst
 from tradingagents.agents.analysts.sentiment_analyst import create_sentiment_analyst
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.schemas import (
@@ -34,14 +40,27 @@ from tradingagents.agents.trader.trader import create_trader
 
 
 @pytest.mark.unit
+def test_analyst_prompts_do_not_expose_final_transaction_proposal_signal():
+    analyst_factories = (
+        create_market_analyst,
+        create_sentiment_analyst,
+        create_news_analyst,
+        create_fundamentals_analyst,
+    )
+
+    for factory in analyst_factories:
+        assert "FINAL TRANSACTION PROPOSAL" not in inspect.getsource(factory)
+
+
+@pytest.mark.unit
 class TestRenderTraderProposal:
     def test_minimal_required_fields(self):
         p = TraderProposal(action=TraderAction.HOLD, reasoning="Balanced setup; no edge.")
         md = render_trader_proposal(p)
         assert "**Action**: Hold" in md
         assert "**Reasoning**: Balanced setup; no edge." in md
-        # The trailing FINAL TRANSACTION PROPOSAL line is preserved for the
-        # analyst stop-signal text and any external code that greps for it.
+        # The trailing FINAL TRANSACTION PROPOSAL line is preserved for
+        # reports and any external code that greps for it.
         assert "FINAL TRANSACTION PROPOSAL: **HOLD**" in md
 
     def test_optional_fields_included_when_present(self):
