@@ -3,6 +3,7 @@ import json
 import os
 import time
 from collections import deque
+from contextlib import suppress
 from functools import wraps
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1151,18 +1152,30 @@ def _update_run_status(artifacts: dict, **updates) -> None:
     _write_run_status(status_file, payload)
 
 
-def _mark_run_failed(artifacts: dict | None, exc: Exception, current_phase: str) -> None:
+def _exception_summary(exc: BaseException) -> str:
+    message = str(exc)
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: str) -> None:
     if artifacts is None:
         return
-    try:
+    summary = _exception_summary(exc)
+    with suppress(Exception):
         _update_run_status(
             artifacts,
             status="failed",
             current_phase=current_phase,
-            error_summary=f"{type(exc).__name__}: {exc}",
+            error_summary=summary,
         )
-    except Exception:
-        return
+    with suppress(Exception):
+        _append_line_to_run_logs(
+            [artifacts["log_file"], artifacts["latest_log_file"]],
+            f"{datetime.datetime.now().strftime('%H:%M:%S')} "
+            f"[System] Run failed during {current_phase}: {summary}\n",
+        )
 
 
 def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
@@ -1219,7 +1232,7 @@ def run_analysis(checkpoint: bool | None = None):
 
         # Initialize message buffer with selected analysts
         message_buffer.init_for_analysis(selected_analyst_keys)
-    except Exception as exc:
+    except BaseException as exc:
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         raise
 
@@ -1451,7 +1464,7 @@ def run_analysis(checkpoint: bool | None = None):
             _update_run_status(artifacts, current_phase=current_phase)
             _write_run_reports(final_state, selections["ticker"], artifacts)
 
-    except Exception as exc:
+    except BaseException as exc:
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         raise
 
