@@ -13,15 +13,15 @@ def get_indicators(
     look_back_days: Annotated[int, "how many days to look back"] = 30,
 ) -> str:
     """
-    Retrieve a single technical indicator for a given ticker symbol.
+    Retrieve one or more technical indicators for a given ticker symbol.
     Uses the configured technical_indicators vendor.
     Args:
         symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
-        indicator (str): A single technical indicator name, e.g. 'rsi', 'macd'. Call this tool once per indicator.
+        indicator (str): A technical indicator name, e.g. 'rsi', or a comma-separated list such as 'rsi,macd,boll'.
         curr_date (str): The current trading date you are trading on, YYYY-mm-dd
         look_back_days (int): How many days to look back, default is 30
     Returns:
-        str: A formatted dataframe containing the technical indicators for the specified ticker symbol and indicator.
+        str: Formatted indicator windows for the specified ticker symbol and indicator(s).
     """
     # LLMs sometimes pass multiple indicators as a comma-separated string;
     # split and process each individually.
