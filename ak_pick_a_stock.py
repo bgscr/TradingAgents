@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 import sys
+import time
 from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
+import requests
 
 CODE_COL = "\u4ee3\u7801"
 NAME_COL = "\u540d\u79f0"
@@ -56,10 +59,119 @@ DISPLAY_COLS = [
     "score",
     "tradingagents_ticker",
 ]
-SPOT_SOURCES = ("stock_zh_a_spot_em", "stock_zh_a_spot")
+EASTMONEY_SPOT_DIRECT_SOURCE = "stock_zh_a_spot_em_direct"
+EASTMONEY_SPOT_AKSHARE_SOURCE = "stock_zh_a_spot_em"
+SPOT_SOURCES = (
+    EASTMONEY_SPOT_DIRECT_SOURCE,
+    EASTMONEY_SPOT_AKSHARE_SOURCE,
+    "stock_zh_a_spot",
+)
 BENCHMARK_INDEX_SYMBOL = "000300"
 HISTORICAL_LOOKBACK_DAYS = 120
 HISTORICAL_PREFILTER_LIMIT = 40
+EASTMONEY_TIMEOUT = 15
+EASTMONEY_PAGE_SLEEP_SECONDS = 0.2
+EASTMONEY_REFERER = "https://quote.eastmoney.com/center/gridlist.html#hs_a_board"
+EASTMONEY_SPOT_URLS = (
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/api/qt/clist/get",
+)
+EASTMONEY_SPOT_PARAMS = {
+    "pn": "1",
+    "pz": "100",
+    "po": "1",
+    "np": "1",
+    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    "fltt": "2",
+    "invt": "2",
+    "fid": "f12",
+    "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+    "fields": (
+        "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,"
+        "f20,f21,f23,f24,f25,f22,f11,f62,f128,f136,f115,f152"
+    ),
+}
+EASTMONEY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Referer": EASTMONEY_REFERER,
+}
+EASTMONEY_FIELD_RENAMES = {
+    "f2": PRICE_COL,
+    "f3": CHANGE_COL,
+    "f4": "涨跌额",
+    "f5": "成交量",
+    "f6": AMOUNT_COL,
+    "f7": "振幅",
+    "f8": TURNOVER_COL,
+    "f9": DYNAMIC_PE_COL,
+    "f10": "量比",
+    "f11": "5分钟涨跌",
+    "f12": CODE_COL,
+    "f14": NAME_COL,
+    "f15": "最高",
+    "f16": "最低",
+    "f17": "今开",
+    "f18": "昨收",
+    "f20": "总市值",
+    "f21": "流通市值",
+    "f22": "涨速",
+    "f23": "市净率",
+    "f24": "60日涨跌幅",
+    "f25": "年初至今涨跌幅",
+}
+EASTMONEY_OUTPUT_COLS = [
+    "序号",
+    CODE_COL,
+    NAME_COL,
+    PRICE_COL,
+    CHANGE_COL,
+    "涨跌额",
+    "成交量",
+    AMOUNT_COL,
+    "振幅",
+    "最高",
+    "最低",
+    "今开",
+    "昨收",
+    "量比",
+    TURNOVER_COL,
+    DYNAMIC_PE_COL,
+    "市净率",
+    "总市值",
+    "流通市值",
+    "涨速",
+    "5分钟涨跌",
+    "60日涨跌幅",
+    "年初至今涨跌幅",
+]
+EASTMONEY_NUMERIC_COLS = [
+    PRICE_COL,
+    CHANGE_COL,
+    "涨跌额",
+    "成交量",
+    AMOUNT_COL,
+    "振幅",
+    "最高",
+    "最低",
+    "今开",
+    "昨收",
+    "量比",
+    TURNOVER_COL,
+    DYNAMIC_PE_COL,
+    "市净率",
+    "总市值",
+    "流通市值",
+    "涨速",
+    "5分钟涨跌",
+    "60日涨跌幅",
+    "年初至今涨跌幅",
+]
 
 
 def normalize_stock_code(code: str) -> str:
@@ -91,11 +203,101 @@ def _call_akshare_source(source: str) -> pd.DataFrame:
     return _call_silently(getattr(ak, source))
 
 
+def _eastmoney_spot_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(EASTMONEY_HEADERS)
+    return session
+
+
+def _eastmoney_get_json(
+    session: requests.Session,
+    url: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    response = session.get(url, params=params, timeout=EASTMONEY_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Eastmoney returned a non-object JSON payload")
+    return payload
+
+
+def _eastmoney_diff(payload: dict[str, object], *, page: int) -> tuple[list[object], int]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Eastmoney page {page} missing data object")
+    diff = data.get("diff")
+    if not isinstance(diff, list):
+        raise RuntimeError(f"Eastmoney page {page} missing data.diff rows")
+    total = data.get("total", len(diff))
+    try:
+        total_rows = int(total)
+    except (TypeError, ValueError):
+        total_rows = len(diff)
+    return diff, total_rows
+
+
+def _normalize_eastmoney_spot_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    frame = raw.rename(columns=EASTMONEY_FIELD_RENAMES).copy()
+    for col in EASTMONEY_OUTPUT_COLS:
+        if col not in frame.columns and col != "序号":
+            frame[col] = pd.NA
+
+    for col in EASTMONEY_NUMERIC_COLS:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    frame = frame.sort_values(CHANGE_COL, ascending=False, na_position="last")
+    frame = frame.reset_index(drop=True)
+    frame.insert(0, "序号", frame.index + 1)
+    return frame[EASTMONEY_OUTPUT_COLS]
+
+
+def _fetch_eastmoney_spot_from_url(
+    session: requests.Session,
+    url: str,
+) -> pd.DataFrame:
+    params = EASTMONEY_SPOT_PARAMS.copy()
+    payload = _eastmoney_get_json(session, url, params)
+    diff, total_rows = _eastmoney_diff(payload, page=1)
+    if not diff:
+        return pd.DataFrame(columns=EASTMONEY_OUTPUT_COLS)
+
+    frames = [pd.DataFrame(diff)]
+    total_pages = max(math.ceil(total_rows / len(diff)), 1)
+    for page in range(2, total_pages + 1):
+        time.sleep(EASTMONEY_PAGE_SLEEP_SECONDS)
+        params["pn"] = page
+        payload = _eastmoney_get_json(session, url, params)
+        page_diff, _ = _eastmoney_diff(payload, page=page)
+        if page_diff:
+            frames.append(pd.DataFrame(page_diff))
+
+    raw = pd.concat(frames, ignore_index=True)
+    return _normalize_eastmoney_spot_frame(raw)
+
+
+def _fetch_eastmoney_spot_direct() -> pd.DataFrame:
+    errors = []
+    for url in EASTMONEY_SPOT_URLS:
+        try:
+            return _fetch_eastmoney_spot_from_url(_eastmoney_spot_session(), url)
+        except Exception as exc:  # noqa: BLE001 - URLs are ordered fallbacks
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("Eastmoney direct request failed:\n" + "\n".join(f"- {e}" for e in errors))
+
+
+def _call_spot_source(source: str) -> pd.DataFrame:
+    if source == EASTMONEY_SPOT_DIRECT_SOURCE:
+        return _fetch_eastmoney_spot_direct()
+    return _call_akshare_source(source)
+
+
 def load_spot_data() -> tuple[pd.DataFrame, str, list[str]]:
     errors = []
     for source in SPOT_SOURCES:
         try:
-            data = _call_akshare_source(source)
+            data = _call_spot_source(source)
         except Exception as exc:  # noqa: BLE001 - user-facing helper should try fallback sources
             errors.append(f"{source}: {type(exc).__name__}: {exc}")
             continue
