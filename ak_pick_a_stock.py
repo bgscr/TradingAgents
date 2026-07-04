@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import math
+import os
 import sys
 import time
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 import akshare as ak
 import pandas as pd
@@ -71,6 +74,9 @@ HISTORICAL_LOOKBACK_DAYS = 120
 HISTORICAL_PREFILTER_LIMIT = 40
 EASTMONEY_TIMEOUT = 15
 EASTMONEY_PAGE_SLEEP_SECONDS = 0.2
+EASTMONEY_DEBUG_ENV = "AK_PICK_DEBUG"
+EASTMONEY_DEBUG_BODY_CHARS_ENV = "AK_PICK_DEBUG_BODY_CHARS"
+EASTMONEY_DEBUG_TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 EASTMONEY_REFERER = "https://quote.eastmoney.com/center/gridlist.html#hs_a_board"
 EASTMONEY_SPOT_URLS = (
     "https://82.push2.eastmoney.com/api/qt/clist/get",
@@ -203,10 +209,137 @@ def _call_akshare_source(source: str) -> pd.DataFrame:
     return _call_silently(getattr(ak, source))
 
 
+def _eastmoney_debug_enabled() -> bool:
+    return os.environ.get(EASTMONEY_DEBUG_ENV, "").strip().lower() in EASTMONEY_DEBUG_TRUE_VALUES
+
+
+def _eastmoney_debug_body_chars() -> int:
+    raw = os.environ.get(EASTMONEY_DEBUG_BODY_CHARS_ENV, "500")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 500
+
+
+def _eastmoney_debug(message: str) -> None:
+    if _eastmoney_debug_enabled():
+        print(f"[eastmoney-debug] {message}", file=sys.stderr)
+
+
+def _eastmoney_redact_url(value: str) -> str:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value
+    if not parts.netloc or "@" not in parts.netloc:
+        return value
+
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, f"<redacted>@{host}", parts.path, parts.query, parts.fragment))
+
+
+def _eastmoney_debug_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _eastmoney_proxy_snapshot(url: str) -> dict[str, object]:
+    env_names = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    )
+    env_values = {
+        name: _eastmoney_redact_url(value)
+        for name in env_names
+        if (value := os.environ.get(name))
+    }
+    environ_proxies = {
+        name: _eastmoney_redact_url(value)
+        for name, value in requests.utils.get_environ_proxies(url).items()
+    }
+    return {"env": env_values, "requests_environ_proxies": environ_proxies}
+
+
+def _eastmoney_prepared_url(url: str, params: dict[str, object]) -> str:
+    request = requests.Request("GET", url, params=params)
+    prepared = request.prepare()
+    return prepared.url or url
+
+
+def _eastmoney_response_elapsed_seconds(response: requests.Response) -> float | None:
+    elapsed = getattr(response, "elapsed", None)
+    if elapsed is None:
+        return None
+    try:
+        return round(float(elapsed.total_seconds()), 3)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _eastmoney_body_snippet(response: requests.Response) -> str:
+    limit = _eastmoney_debug_body_chars()
+    if limit <= 0:
+        return ""
+    try:
+        text = response.text
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not hide original request failures
+        return f"<unable to read response.text: {type(exc).__name__}: {exc}>"
+    return " ".join(str(text)[:limit].split())
+
+
+def _eastmoney_log_response(response: requests.Response, *, page: object) -> None:
+    status = getattr(response, "status_code", "unknown")
+    reason = getattr(response, "reason", "")
+    headers = getattr(response, "headers", {}) or {}
+    content_type = headers.get("Content-Type", "")
+    elapsed = _eastmoney_response_elapsed_seconds(response)
+    final_url = getattr(response, "url", "")
+    _eastmoney_debug(
+        "response "
+        f"page={page} status={status} reason={reason} content_type={content_type} "
+        f"elapsed_seconds={elapsed} final_url={final_url}"
+    )
+
+    should_log_body = str(page) == "1"
+    try:
+        should_log_body = should_log_body or int(status) >= 400
+    except (TypeError, ValueError):
+        should_log_body = True
+    if should_log_body:
+        _eastmoney_debug(f"response body page={page} snippet={_eastmoney_body_snippet(response)}")
+
+
+def _eastmoney_log_json_shape(payload: object, *, page: object) -> None:
+    if not isinstance(payload, dict):
+        _eastmoney_debug(f"json page={page} payload_type={type(payload).__name__}")
+        return
+
+    data = payload.get("data")
+    diff = data.get("diff") if isinstance(data, dict) else None
+    total = data.get("total") if isinstance(data, dict) else None
+    diff_len = len(diff) if isinstance(diff, list) else "n/a"
+    _eastmoney_debug(
+        f"json page={page} top_keys={list(payload.keys())} "
+        f"data_type={type(data).__name__} diff_type={type(diff).__name__} "
+        f"diff_len={diff_len} total={total}"
+    )
+
+
 def _eastmoney_spot_session() -> requests.Session:
     session = requests.Session()
     session.trust_env = False
     session.headers.update(EASTMONEY_HEADERS)
+    _eastmoney_debug(
+        "session "
+        f"trust_env={session.trust_env} headers={_eastmoney_debug_json(dict(session.headers))}"
+    )
     return session
 
 
@@ -215,9 +348,30 @@ def _eastmoney_get_json(
     url: str,
     params: dict[str, object],
 ) -> dict[str, object]:
-    response = session.get(url, params=params, timeout=EASTMONEY_TIMEOUT)
+    page = params.get("pn", "?")
+    _eastmoney_debug(
+        "request "
+        f"page={page} url={_eastmoney_prepared_url(url, params)} "
+        f"timeout={EASTMONEY_TIMEOUT} proxy_snapshot={_eastmoney_debug_json(_eastmoney_proxy_snapshot(url))}"
+    )
+    try:
+        response = session.get(url, params=params, timeout=EASTMONEY_TIMEOUT)
+    except Exception as exc:
+        _eastmoney_debug(
+            f"request exception page={page} type={type(exc).__name__} message={exc}"
+        )
+        raise
+    _eastmoney_log_response(response, page=page)
     response.raise_for_status()
-    payload = response.json()
+    try:
+        payload = response.json()
+    except Exception as exc:
+        _eastmoney_debug(
+            f"json exception page={page} type={type(exc).__name__} message={exc} "
+            f"body_snippet={_eastmoney_body_snippet(response)}"
+        )
+        raise
+    _eastmoney_log_json_shape(payload, page=page)
     if not isinstance(payload, dict):
         raise RuntimeError("Eastmoney returned a non-object JSON payload")
     return payload
@@ -261,28 +415,40 @@ def _fetch_eastmoney_spot_from_url(
     payload = _eastmoney_get_json(session, url, params)
     diff, total_rows = _eastmoney_diff(payload, page=1)
     if not diff:
+        _eastmoney_debug("page=1 returned no rows")
         return pd.DataFrame(columns=EASTMONEY_OUTPUT_COLS)
 
     frames = [pd.DataFrame(diff)]
     total_pages = max(math.ceil(total_rows / len(diff)), 1)
+    _eastmoney_debug(
+        f"page=1 rows={len(diff)} total_rows={total_rows} total_pages={total_pages}"
+    )
     for page in range(2, total_pages + 1):
         time.sleep(EASTMONEY_PAGE_SLEEP_SECONDS)
         params["pn"] = page
         payload = _eastmoney_get_json(session, url, params)
         page_diff, _ = _eastmoney_diff(payload, page=page)
+        _eastmoney_debug(f"page={page} rows={len(page_diff)}")
         if page_diff:
             frames.append(pd.DataFrame(page_diff))
 
     raw = pd.concat(frames, ignore_index=True)
-    return _normalize_eastmoney_spot_frame(raw)
+    normalized = _normalize_eastmoney_spot_frame(raw)
+    _eastmoney_debug(f"normalized rows={len(normalized)} columns={list(normalized.columns)}")
+    return normalized
 
 
 def _fetch_eastmoney_spot_direct() -> pd.DataFrame:
     errors = []
+    _eastmoney_debug(f"direct source start urls={list(EASTMONEY_SPOT_URLS)}")
     for url in EASTMONEY_SPOT_URLS:
         try:
+            _eastmoney_debug(f"trying url={url}")
             return _fetch_eastmoney_spot_from_url(_eastmoney_spot_session(), url)
         except Exception as exc:  # noqa: BLE001 - URLs are ordered fallbacks
+            _eastmoney_debug(
+                f"url failed url={url} type={type(exc).__name__} message={exc}"
+            )
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
     raise RuntimeError("Eastmoney direct request failed:\n" + "\n".join(f"- {e}" for e in errors))
 

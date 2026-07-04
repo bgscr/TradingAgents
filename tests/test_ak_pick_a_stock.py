@@ -179,6 +179,111 @@ def test_load_spot_data_prefers_direct_eastmoney_before_akshare(monkeypatch):
     assert akshare_calls == []
 
 
+def test_eastmoney_debug_logs_request_response_and_json_shape(monkeypatch, capsys):
+    class FakeElapsed:
+        @staticmethod
+        def total_seconds():
+            return 0.123
+
+    class FakeResponse:
+        status_code = 200
+        reason = "OK"
+        url = "https://example.test/api?pn=1"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        text = '{"data":{"total":1,"diff":[{"f12":"600519"}]}}'
+        elapsed = FakeElapsed()
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"total": 1, "diff": [_eastmoney_row("600519", "贵州茅台")]}}
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.trust_env = True
+
+        def get(self, url, *, params, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("AK_PICK_DEBUG", "1")
+    monkeypatch.setattr(picker.requests, "Session", FakeSession)
+    monkeypatch.setattr(picker, "EASTMONEY_SPOT_URLS", ("https://example.test/api",))
+
+    result = picker._fetch_eastmoney_spot_direct()
+
+    captured = capsys.readouterr()
+    assert list(result["代码"]) == ["600519"]
+    assert "[eastmoney-debug] direct source start urls=['https://example.test/api']" in captured.err
+    assert "[eastmoney-debug] session trust_env=False" in captured.err
+    assert "[eastmoney-debug] request page=1 url=https://example.test/api?" in captured.err
+    assert "[eastmoney-debug] response page=1 status=200 reason=OK" in captured.err
+    assert (
+        "[eastmoney-debug] json page=1 top_keys=['data'] data_type=dict "
+        "diff_type=list diff_len=1 total=1"
+    ) in captured.err
+
+
+def test_eastmoney_debug_logs_request_exceptions(monkeypatch, capsys):
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.trust_env = True
+
+        def get(self, url, *, params, timeout):
+            raise requests.exceptions.ProxyError("proxy refused")
+
+    monkeypatch.setenv("AK_PICK_DEBUG", "1")
+    monkeypatch.setattr(picker.requests, "Session", FakeSession)
+    monkeypatch.setattr(picker, "EASTMONEY_SPOT_URLS", ("https://example.test/api",))
+
+    with pytest.raises(RuntimeError):
+        picker._fetch_eastmoney_spot_direct()
+
+    captured = capsys.readouterr()
+    assert (
+        "[eastmoney-debug] request exception page=1 type=ProxyError message=proxy refused"
+        in captured.err
+    )
+    assert (
+        "[eastmoney-debug] url failed url=https://example.test/api "
+        "type=ProxyError message=proxy refused"
+    ) in captured.err
+
+
+def test_eastmoney_debug_is_opt_in(monkeypatch, capsys):
+    class FakeResponse:
+        status_code = 200
+        reason = "OK"
+        url = "https://example.test/api?pn=1"
+        headers = {"Content-Type": "application/json"}
+        text = "{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"total": 1, "diff": [_eastmoney_row("600519", "贵州茅台")]}}
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.trust_env = True
+
+        def get(self, url, *, params, timeout):
+            return FakeResponse()
+
+    monkeypatch.delenv("AK_PICK_DEBUG", raising=False)
+    monkeypatch.setattr(picker.requests, "Session", FakeSession)
+    monkeypatch.setattr(picker, "EASTMONEY_SPOT_URLS", ("https://example.test/api",))
+
+    picker._fetch_eastmoney_spot_direct()
+
+    captured = capsys.readouterr()
+    assert "[eastmoney-debug]" not in captured.err
+
+
 def test_prepare_candidates_filters_missing_and_extreme_valuation_when_available():
     pe = picker.DYNAMIC_PE_COL
     data = pd.DataFrame(
