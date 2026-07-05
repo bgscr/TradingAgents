@@ -407,6 +407,40 @@ def test_main_falls_back_to_sina_when_eastmoney_spot_fails(monkeypatch, tmp_path
     assert list(result["tradingagents_ticker"]) == ["600519.SS", "000001.SZ"]
 
 
+def test_main_respects_ak_pick_output_path(monkeypatch, tmp_path):
+    def fail_eastmoney():
+        raise requests.ConnectionError("remote closed")
+
+    def sina_spot():
+        return pd.DataFrame(
+            [
+                {
+                    "代码": "sh600519",
+                    "名称": "贵州茅台",
+                    "最新价": 1700,
+                    "涨跌幅": 2.0,
+                    "成交额": 1_200_000_000,
+                },
+            ]
+        )
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    output_path = tmp_path / "reports" / "ak_candidates.csv"
+
+    monkeypatch.setattr(picker, "_fetch_eastmoney_spot_direct", fail_eastmoney)
+    monkeypatch.setattr(picker.ak, "stock_zh_a_spot_em", fail_eastmoney)
+    monkeypatch.setattr(picker.ak, "stock_zh_a_spot", sina_spot)
+    monkeypatch.setenv(picker.AK_PICK_OUTPUT_PATH_ENV, str(output_path))
+    monkeypatch.chdir(work_dir)
+
+    assert picker.main() == 0
+
+    result = pd.read_csv(output_path)
+    assert list(result["tradingagents_ticker"]) == ["600519.SS"]
+    assert not (work_dir / "ak_candidates.csv").exists()
+
+
 def test_main_prints_fallback_reason_and_uses_neutral_candidate_naming(
     monkeypatch, tmp_path, capsys
 ):

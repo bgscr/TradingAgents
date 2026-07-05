@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import akshare as ak
@@ -76,6 +77,7 @@ EASTMONEY_TIMEOUT = 15
 EASTMONEY_PAGE_SLEEP_SECONDS = 0.2
 EASTMONEY_DEBUG_ENV = "AK_PICK_DEBUG"
 EASTMONEY_DEBUG_BODY_CHARS_ENV = "AK_PICK_DEBUG_BODY_CHARS"
+AK_PICK_OUTPUT_PATH_ENV = "AK_PICK_OUTPUT_PATH"
 EASTMONEY_DEBUG_TRUE_VALUES = {"1", "true", "yes", "on", "debug"}
 EASTMONEY_REFERER = "https://quote.eastmoney.com/center/gridlist.html#hs_a_board"
 EASTMONEY_SPOT_URLS = (
@@ -758,6 +760,19 @@ def prepare_candidates(data: pd.DataFrame, source: str) -> pd.DataFrame:
     return df.sort_values("score", ascending=False).head(10)
 
 
+def resolve_candidate_output_path() -> Path:
+    raw_path = os.environ.get(AK_PICK_OUTPUT_PATH_ENV, "").strip()
+    return Path(raw_path) if raw_path else Path("ak_candidates.csv")
+
+
+def write_candidates_csv(result: pd.DataFrame) -> Path:
+    output_path = resolve_candidate_output_path()
+    if output_path.parent != Path("."):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
 def main() -> int:
     try:
         data, source, fallback_reasons = load_spot_data()
@@ -784,8 +799,8 @@ def main() -> int:
     print("\n候选标的（筛选结果，不构成投资建议）：")
     print(result)
 
-    result.to_csv("ak_candidates.csv", index=False, encoding="utf-8-sig")
-    print("\n已输出: ak_candidates.csv")
+    output_path = write_candidates_csv(result)
+    print(f"\n已输出: {output_path}")
     return 0
 
 
