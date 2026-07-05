@@ -36,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+build = [
+    "pyinstaller>=6.10",
+]
 dev = [
     "ruff>=0.15",
     "pytest>=8.0",
