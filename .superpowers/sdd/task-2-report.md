@@ -99,6 +99,13 @@ The candidate-picker command did not reach a clear market-data error within the 
 
 - The candidate-picker live smoke timed out after 184 seconds. This appears to be runtime/live-data behavior rather than a packaging import failure, but it did not emit a concrete market-data exception before timeout.
 
+## Review Fix
+
+- Packaged entrypoints now set portable output defaults before importing app modules.
+- `tradingagents_entry.py` defaults to `reports/runs`, `data/cache`, and `data/memory/trading_memory.md` under the app directory without overwriting launcher-provided environment values.
+- `ak_pick_a_stock_entry.py` now delays importing `ak_pick_a_stock.main` until after `AK_PICK_OUTPUT_PATH` defaults to `reports/ak_candidates.csv` under the app directory.
+- Targeted verification: `rtk pytest tests/test_pyinstaller_entrypoints.py -q` -> Pytest: 7 passed.
+
 ## Review Fix Follow-Up (2026-07-05)
 
 ### Issue Addressed

@@ -54,7 +54,7 @@ def test_ak_pick_entry_returns_picker_exit_code(monkeypatch):
         ROOT / "packaging" / "pyinstaller" / "ak_pick_a_stock_entry.py",
         "ak_pick_a_stock_entry_for_test",
     )
-    monkeypatch.setattr(module, "pick_main", lambda: 7)
+    monkeypatch.setattr(module, "get_picker_main", lambda: lambda: 7)
 
     assert module.main() == 7
 
@@ -98,10 +98,10 @@ def test_tradingagents_entry_sets_portable_defaults_before_cli_import(monkeypatc
     )
 
     assert module.get_app() is fake_app
-    assert os.environ["TRADINGAGENTS_RESULTS_DIR"] == str(exe_dir / "results")
-    assert os.environ["TRADINGAGENTS_CACHE_DIR"] == str(exe_dir / "cache")
+    assert os.environ["TRADINGAGENTS_RESULTS_DIR"] == str(exe_dir / "reports" / "runs")
+    assert os.environ["TRADINGAGENTS_CACHE_DIR"] == str(exe_dir / "data" / "cache")
     assert os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] == str(
-        exe_dir / "memory" / "trading_memory.md"
+        exe_dir / "data" / "memory" / "trading_memory.md"
     )
 
 
@@ -146,6 +146,7 @@ def test_ak_pick_entry_sets_output_path_before_picker_import(monkeypatch, tmp_pa
         "ak_pick_entry_portable_defaults_test",
     )
 
+    assert module.get_picker_main()() == 0
     assert module.main() == 0
 
 
@@ -170,4 +171,5 @@ def test_ak_pick_entry_preserves_launcher_output_path(monkeypatch, tmp_path):
         "ak_pick_entry_preserve_env_test",
     )
 
+    assert module.get_picker_main()() == 0
     assert module.main() == 0

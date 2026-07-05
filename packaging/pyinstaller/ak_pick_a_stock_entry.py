@@ -25,11 +25,15 @@ def _set_portable_defaults() -> None:
 
 _set_portable_defaults()
 
-from ak_pick_a_stock import main as pick_main
+
+def get_picker_main():
+    from ak_pick_a_stock import main as pick_main
+
+    return pick_main
 
 
 def main() -> int:
-    return pick_main()
+    return get_picker_main()()
 
 
 if __name__ == "__main__":
