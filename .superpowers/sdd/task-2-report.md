@@ -98,3 +98,50 @@ The candidate-picker command did not reach a clear market-data error within the 
 ## Concerns
 
 - The candidate-picker live smoke timed out after 184 seconds. This appears to be runtime/live-data behavior rather than a packaging import failure, but it did not emit a concrete market-data exception before timeout.
+
+## Review Fix Follow-Up (2026-07-05)
+
+### Issue Addressed
+
+- `packaging/pyinstaller/tradingagents_entry.py` imported `cli.main` without first setting app-local portable defaults, so direct execution of `tradingagents.exe` could fall back to `%USERPROFILE%\.tradingagents`.
+- `packaging/pyinstaller/ak_pick_a_stock_entry.py` imported `ak_pick_a_stock` before setting a packaged default output path.
+
+### Red Phase
+
+```text
+rtk pytest tests/test_pyinstaller_entrypoints.py -q
+Pytest: 5 passed, 2 failed
+```
+
+The new failing tests confirmed missing `TRADINGAGENTS_RESULTS_DIR` defaults and missing `AK_PICK_OUTPUT_PATH` before picker import.
+
+### Fix
+
+- Added wrapper-local app directory resolution:
+  - frozen mode: `Path(sys.executable).resolve().parent`
+  - source/script mode: repository root
+- `tradingagents_entry.py` now sets default `TRADINGAGENTS_RESULTS_DIR`, `TRADINGAGENTS_CACHE_DIR`, and `TRADINGAGENTS_MEMORY_LOG_PATH` under the app directory before `cli.main` is imported.
+- `ak_pick_a_stock_entry.py` now sets default `AK_PICK_OUTPUT_PATH` to `<app dir>\reports\ak_candidates.csv` before importing `ak_pick_a_stock`.
+- Used `os.environ.setdefault` so future launcher-provided environment values are preserved.
+
+### Verification
+
+```text
+rtk pytest tests/test_pyinstaller_entrypoints.py -q
+Pytest: 7 passed
+```
+
+```text
+rtk python packaging/pyinstaller/tradingagents_entry.py --help
+Exit code: 0
+Printed Typer help.
+```
+
+```text
+rtk python -c "...load both entrypoint files..."
+entrypoint imports ok
+```
+
+### Concerns
+
+- No long live market-data smoke was run for `ak_pick_a_stock_entry.py`; verification was intentionally kept to import-only smoke per controller clarification.
