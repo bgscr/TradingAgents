@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PORTABLE_ENV_NAMES = (
     "TRADINGAGENTS_RESULTS_DIR",
