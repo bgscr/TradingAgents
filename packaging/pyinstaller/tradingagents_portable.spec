@@ -1,9 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 block_cipher = None
+_SPEC_DIR = Path(SPECPATH).resolve()
+_REPO_ROOT = _SPEC_DIR.parents[1]
+TRADINGAGENTS_ENTRY = str(_SPEC_DIR / "tradingagents_entry.py")
+CANDIDATE_ENTRY = str(_SPEC_DIR / "ak_pick_a_stock_entry.py")
 
 
 def safe_collect_submodules(package_name):
@@ -58,8 +64,8 @@ for package_name in ["certifi", "cli"]:
 
 
 tradingagents_analysis = Analysis(
-    ["packaging/pyinstaller/tradingagents_entry.py"],
-    pathex=[],
+    [TRADINGAGENTS_ENTRY],
+    pathex=[str(_REPO_ROOT)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
@@ -96,8 +102,8 @@ tradingagents_exe = EXE(
 )
 
 candidate_analysis = Analysis(
-    ["packaging/pyinstaller/ak_pick_a_stock_entry.py"],
-    pathex=[],
+    [CANDIDATE_ENTRY],
+    pathex=[str(_REPO_ROOT)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
