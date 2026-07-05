@@ -807,6 +807,12 @@ Invoke-Checked "python" @(
 Invoke-Checked "python" @("-m", "pip", "install", "-e", ".[build]")
 
 if (Test-Path -LiteralPath $ReleaseDir) {
+    $ResolvedDistRoot = (Resolve-Path -LiteralPath $DistRootPath).Path
+    $ResolvedReleaseDir = (Resolve-Path -LiteralPath $ReleaseDir).Path
+    $ResolvedDistRootPrefix = $ResolvedDistRoot.TrimEnd('\') + '\'
+    if (-not $ResolvedReleaseDir.StartsWith($ResolvedDistRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove release directory outside dist root: $ResolvedReleaseDir"
+    }
     Remove-Item -LiteralPath $ReleaseDir -Recurse -Force
 }
 
