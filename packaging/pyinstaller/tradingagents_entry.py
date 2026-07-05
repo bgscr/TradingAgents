@@ -17,6 +17,8 @@ def _app_dir() -> Path:
 
 def _set_portable_defaults() -> None:
     app_dir = _app_dir()
+    if getattr(sys, "frozen", False):
+        os.chdir(app_dir)
     os.environ.setdefault("TRADINGAGENTS_RESULTS_DIR", str(app_dir / "reports" / "runs"))
     os.environ.setdefault("TRADINGAGENTS_CACHE_DIR", str(app_dir / "data" / "cache"))
     os.environ.setdefault(

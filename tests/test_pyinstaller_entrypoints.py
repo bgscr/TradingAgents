@@ -58,6 +58,18 @@ def test_ak_pick_entry_returns_picker_exit_code(monkeypatch):
     assert module.main() == 7
 
 
+def test_pyinstaller_spec_collects_akshare_data_files():
+    spec_text = (
+        ROOT / "packaging" / "pyinstaller" / "tradingagents_portable.spec"
+    ).read_text(encoding="utf-8")
+    data_collection_block = spec_text.split("datas = []", 1)[1].split(
+        "tradingagents_analysis",
+        1,
+    )[0]
+
+    assert '"akshare"' in data_collection_block
+
+
 def test_entrypoints_are_importable_from_script_directory(monkeypatch):
     script_dir = ROOT / "packaging" / "pyinstaller"
     original_path = list(sys.path)
@@ -102,6 +114,23 @@ def test_tradingagents_entry_sets_portable_defaults_before_cli_import(monkeypatc
     assert os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] == str(
         exe_dir / "data" / "memory" / "trading_memory.md"
     )
+
+
+def test_tradingagents_entry_uses_app_dir_as_cwd_when_frozen(monkeypatch, tmp_path):
+    exe_dir = tmp_path / "app"
+    outside_dir = tmp_path / "outside"
+    exe_dir.mkdir()
+    outside_dir.mkdir()
+    monkeypatch.chdir(outside_dir)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "tradingagents.exe"))
+
+    _load_module(
+        ROOT / "packaging" / "pyinstaller" / "tradingagents_entry.py",
+        "tradingagents_entry_portable_cwd_test",
+    )
+
+    assert Path.cwd() == exe_dir
 
 
 def test_tradingagents_entry_preserves_launcher_environment(monkeypatch, tmp_path):

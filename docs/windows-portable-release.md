@@ -23,6 +23,11 @@ The output folder is:
 dist\TradingAgents-Win64
 ```
 
+Copy the entire `dist\TradingAgents-Win64` folder to the target Windows 11
+machine. Keep the folder layout intact, including `_internal`, `.env`, the
+launchers, and the `data`, `logs`, and `reports` directories. Run the launchers
+from inside that copied folder.
+
 For a private internal package that copies the local `.env` into the release:
 
 ```powershell

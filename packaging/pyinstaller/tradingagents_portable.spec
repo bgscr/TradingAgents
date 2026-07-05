@@ -59,7 +59,7 @@ for package_name in HIDDEN_IMPORT_PACKAGES:
     hiddenimports += safe_collect_submodules(package_name)
 
 datas = []
-for package_name in ["certifi", "cli"]:
+for package_name in ["akshare", "certifi", "cli"]:
     datas += safe_collect_data_files(package_name)
 
 
