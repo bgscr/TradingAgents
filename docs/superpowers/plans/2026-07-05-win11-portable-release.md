@@ -524,17 +524,22 @@ function Ensure-Directory {
 }
 
 function Set-PortableTradingAgentsEnvironment {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [switch]$CreateDirectories
+    )
 
     $ReportsDir = Join-Path $Root "reports\runs"
     $CacheDir = Join-Path $Root "data\cache"
     $MemoryDir = Join-Path $Root "data\memory"
     $LogsDir = Join-Path $Root "logs"
 
-    Ensure-Directory $ReportsDir
-    Ensure-Directory $CacheDir
-    Ensure-Directory $MemoryDir
-    Ensure-Directory $LogsDir
+    if ($CreateDirectories) {
+        Ensure-Directory $ReportsDir
+        Ensure-Directory $CacheDir
+        Ensure-Directory $MemoryDir
+        Ensure-Directory $LogsDir
+    }
 
     $env:TRADINGAGENTS_RESULTS_DIR = $ReportsDir
     $env:TRADINGAGENTS_CACHE_DIR = $CacheDir
@@ -542,8 +547,7 @@ function Set-PortableTradingAgentsEnvironment {
 }
 
 if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
-    Set-PortableTradingAgentsEnvironment $AppDir
-    Set-Location -LiteralPath $AppDir
+    Set-PortableTradingAgentsEnvironment -Root $AppDir
 
     if ($DryRun) {
         Write-Host "Mode=portable"
@@ -554,6 +558,9 @@ if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
         Write-Host "TRADINGAGENTS_MEMORY_LOG_PATH=$env:TRADINGAGENTS_MEMORY_LOG_PATH"
         exit 0
     }
+
+    Set-PortableTradingAgentsEnvironment -Root $AppDir -CreateDirectories
+    Set-Location -LiteralPath $AppDir
 
     Write-Host "Starting TradingAgents portable release..." -ForegroundColor Green
     & $TradingAgentsExe @args
@@ -638,9 +645,6 @@ function Ensure-Directory {
     }
 }
 
-Ensure-Directory $ReportsDir
-Ensure-Directory $LogsDir
-
 $env:AK_PICK_OUTPUT_PATH = Join-Path $ReportsDir "ak_candidates.csv"
 
 if ($DryRun) {
@@ -650,6 +654,9 @@ if ($DryRun) {
     Write-Host "AK_PICK_OUTPUT_PATH=$env:AK_PICK_OUTPUT_PATH"
     exit 0
 }
+
+Ensure-Directory $ReportsDir
+Ensure-Directory $LogsDir
 
 if (-not (Test-Path -LiteralPath $CandidateExe -PathType Leaf)) {
     Write-Host "Candidate picker executable does not exist: $CandidateExe" -ForegroundColor Red
@@ -1114,7 +1121,7 @@ Expected:
 Run:
 
 ```powershell
-rtk powershell -NoProfile -Command "$before = Test-Path -LiteralPath \"$HOME\.tradingagents\"; .\dist\TradingAgents-Win64\start_tradingagents.ps1 -DryRun | Out-Null; .\dist\TradingAgents-Win64\ak_pick_a_stock.ps1 -DryRun | Out-Null; $after = Test-Path -LiteralPath \"$HOME\.tradingagents\"; if ($before -ne $after) { throw 'Dry runs changed user-profile TradingAgents state' }; 'user-profile state unchanged'"
+rtk powershell -NoProfile -Command '$profilePath = Join-Path $HOME ".tradingagents"; $before = Test-Path -LiteralPath $profilePath; & .\dist\TradingAgents-Win64\start_tradingagents.ps1 -DryRun | Out-Null; & .\dist\TradingAgents-Win64\ak_pick_a_stock.ps1 -DryRun | Out-Null; $after = Test-Path -LiteralPath $profilePath; if ($before -ne $after) { throw "Dry runs changed user-profile TradingAgents state" }; "user-profile state unchanged"'
 ```
 
 Expected: prints `user-profile state unchanged`.
