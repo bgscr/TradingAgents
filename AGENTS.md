@@ -1,207 +1,168 @@
-# Agent Development Protocol
+# **Agent Development Protocol**
 
-## 1. Core Implementation Principles
+## **1\. Core Implementation Principles**
 
 These principles apply to all agents when writing or modifying code.
 
-### Think Before Coding
+### **Think Before Coding**
 
-* State assumptions before writing code.
-* If requirements are ambiguous, ask for clarification instead of guessing silently.
+* State assumptions before writing code.  
+* If requirements are ambiguous, ask for clarification instead of guessing silently.  
 * If multiple implementation paths exist, present tradeoffs before choosing.
 
-### Simplicity First
+### **Simplicity First**
 
-* Prefer minimum viable implementation.
-* Avoid unrequested flexibility, bloated abstractions, speculative interfaces, or future-proofing.
+* Prefer minimum viable implementation (MVP).  
+* Avoid unrequested flexibility, bloated abstractions, speculative interfaces, or future-proofing.  
 * Do not turn a small fix into a large framework.
 
-### Surgical Changes
+### **Surgical Changes**
 
-* Make precise, task-scoped modifications.
-* Do not perform drive-by refactoring.
-* Do not optimize adjacent unrelated code.
-* Do not change unrelated formatting.
-* Match existing code style.
-* Remove only dead code created by current changes.
-* Do not touch pre-existing dead code unless explicitly requested.
+* Make precise, task-scoped modifications.  
+* Do not perform drive-by refactoring or optimize adjacent unrelated code.  
+* Match existing code style and do not change unrelated formatting.  
+* Remove only dead code created by current changes. Do not touch pre-existing dead code unless explicitly requested.
 
-### Goal-Driven Execution
+### **Goal-Driven Execution**
 
-* Convert instructions into verifiable goals.
-* For complex tasks, outline concise steps and verification criteria.
-* Use this format where useful:
+* Convert instructions into verifiable goals.  
+* For complex tasks, outline concise steps and verification criteria using this format:
 
-```text
-1. [Step] -> verify: [check]
-2. [Step] -> verify: [check]
-```
+1\. \[Step\] \-\> verify: \[check\]  
+2\. \[Step\] \-\> verify: \[check\]
 
-* Prefer test-driven or verification-first approaches when practical.
+* Prefer test-driven or verification-first approaches.  
 * Confirm behavior before and after changes.
 
-## 2. Branch and Workspace Rules
+## **2\. Branch and Workspace Rules**
 
 Use isolated workspaces for clean, parallel development.
 
-### Task Isolation via Worktrees
+### **Task Isolation via Worktrees**
 
-* Every new task or feature must be executed in a dedicated git worktree on a new branch.
-* Never create or checkout feature branches inside the primary repository directory.
-* Keep the primary repository directory on the main branch as source of truth.
-* Treat CodeGraph initialization as part of worktree creation, not as a later optional setup step.
+* Every new task or feature must be executed in a dedicated git worktree on a new branch.  
+* Never create or checkout feature branches inside the primary repository directory. Keep the primary repository directory on the main branch as the source of truth.  
+* Treat CodeGraph initialization as part of worktree creation. After creating a new worktree, immediately initialize and verify CodeGraph from inside that directory:
 
-After creating any new worktree, immediately initialize and verify CodeGraph from inside that worktree:
-
-```bash
-rtk codegraph init
+rtk codegraph init  
 rtk codegraph status
-```
 
-Do not rely on CodeGraph MCP tools in a newly created worktree until `rtk codegraph status` confirms the index is available.
+* Do not rely on CodeGraph MCP tools until rtk codegraph status confirms the index is available.
 
-### Worktree Structure
+### **Worktree Structure**
 
-* Store all worktrees under:
+* Store all worktrees under .worktrees/ using a consistent branch prefix:
 
-```text
-.worktrees/
-```
+.worktrees/agent/\<task-name\>
 
-* Create one worktree per task.
-* Create one corresponding branch per worktree.
-* Use a consistent branch prefix, for example:
+### **Parallel Work**
 
-```text
-agent/<task-name>
-```
+* Multiple independent tasks may run in parallel using separate worktrees and branches to avoid workspace conflicts.  
+* Subagents may be dispatched only when the environment supports safe parallel execution.  
+* When spawning or dispatching subagents, each subagent must use the exact same model version as the main agent. Do not mix model versions.  
+* If parallel safety or model consistency is uncertain, proceed without subagents unless explicitly approved.
 
-### Parallel Work
+## **3\. Code Review Process**
 
-* Multiple independent tasks may run in parallel when appropriate.
-* Use separate worktrees and separate branches to avoid workspace conflicts.
-* Subagents may be dispatched only when the environment supports safe parallel execution.
-* When spawning or dispatching subagents, each subagent must use the same model version as the main agent.
-* Do not mix model versions between the main agent and subagents within the same task.
-* If the environment cannot guarantee safe parallel execution and model-version consistency, do not dispatch subagents.
-* If model consistency is uncertain, state the uncertainty and proceed without subagents unless explicitly approved.
+After each completed feature or change, run the review in two stages.
 
-## 3. Code Review Process
+### **Stage 1: Spec Compliance Review**
 
-After each completed feature or change, run review in two stages.
+*Verify implementation matches target behavior before reviewing style or quality.*
 
-### Stage 1: Spec Compliance Review
+#### **Contract Alignment**
 
-Verify implementation matches target behavior before reviewing style or quality.
-
-#### Contract Alignment
-
-* Verify public interfaces match the specification or task goal.
-* For APIs, check routes, methods, parameters, validation rules, response shape, error shape, and status codes.
+* Verify public interfaces match the specification or task goal.  
+* For APIs, check routes, methods, parameters, validation rules, response shape, error shape, and status codes.  
 * For libraries or internal modules, check function signatures, input/output contracts, side effects, and compatibility expectations.
 
-#### Architecture Alignment
+#### **Architecture Alignment**
 
-* Verify code follows the project’s declared architecture.
-* Ensure responsibilities stay in the correct layers or modules.
-* Do not introduce cross-layer shortcuts unless explicitly required.
+* Verify code follows the project’s declared architecture.  
+* Ensure responsibilities stay in the correct layers or modules. Do not introduce cross-layer shortcuts.
 
-#### Data and Persistence
+#### **Data and Persistence**
 
-* Verify schema or migration changes are correct when applicable.
-* Verify data models, indexes, relationships, constraints, and query behavior.
-* Check for avoidable performance issues such as inefficient queries, repeated data loading, or unnecessary full scans.
+* Verify schema or migration changes are correct when applicable.  
+* Verify data models, indexes, relationships, constraints, and query behavior.  
+* Check for avoidable performance issues (such as inefficient queries, repeated data loading, or ![][image1] query issues).
 
-#### Gate
+#### **Gate**
 
-* Do not proceed to Code Quality Review if functional requirements are missing.
-* Do not proceed if observed behavior differs from specification.
+* Do not proceed to Stage 2 (Code Quality Review) if functional requirements are missing or observed behavior differs from specification.
 
-### Stage 2: Code Quality Review
+### **Stage 2: Code Quality Review**
 
-Review maintainability, safety, and implementation quality.
+*Review maintainability, safety, and implementation quality.*
 
-#### Boundary Separation
+#### **Boundary Separation**
 
-* Do not leak persistence/internal models across external boundaries.
-* Use explicit boundary models, request/response models, serializers, or adapters where appropriate.
-* Keep internal representation decoupled from public contracts.
+* Do not leak persistence/internal models across external boundaries.  
+* Use explicit boundary models, request/response models, serializers, or adapters where appropriate to keep internal representations decoupled.
 
-#### Error Handling
+#### **Error Handling**
 
-* Ensure errors are handled consistently.
-* Avoid exposing raw stack traces or internal implementation details to callers.
-* Return clear, stable, documented error payloads where applicable.
+* Ensure errors are handled consistently without exposing raw stack traces or internal implementation details to callers.  
+* Return clear, stable, and documented error payloads.
 
-#### State and Transaction Boundaries
+#### **State and Transaction Boundaries**
 
-* Ensure write operations have clear atomicity boundaries.
-* Ensure read operations avoid unnecessary locking or expensive work.
+* Ensure write operations have clear atomicity boundaries.  
+* Ensure read operations avoid unnecessary locking or expensive work.  
 * Keep side effects explicit and contained.
 
-#### Test Quality
+#### **Test Quality**
 
-* Verify relevant unit, integration, or end-to-end tests are present.
+* Verify relevant unit, integration, or end-to-end tests are present for both success and failure paths.  
 * Prefer fast, focused tests for business logic.
-* Use heavier integration tests only when they provide necessary coverage.
-* Tests should verify both success paths and important failure paths.
 
-#### Simplicity and Scope Check
+#### **Simplicity and Scope Check**
 
-* Flag unnecessary abstractions, generic wrappers, factory layers, adapters, or configuration.
-* Flag unrelated file changes.
-* Flag formatting-only changes outside the task scope.
+* Flag unnecessary abstractions, generic wrappers, factory layers, adapters, or configuration.  
+* Flag unrelated file changes or formatting-only changes outside the task scope.  
 * Flag speculative changes not required by current goals.
 
-#### Issue Severity
+#### **Issue Severity**
 
 Classify findings as:
 
-* Critical: correctness, security, data loss, broken contract, or production-blocking issue.
-* Important: maintainability, reliability, test coverage, performance, or architecture issue.
-* Minor: naming, clarity, localized cleanup, or low-risk improvement.
+* **Critical**: correctness, security, data loss, broken contract, or production-blocking issues.  
+* **Important**: maintainability, reliability, test coverage, performance, or architecture issues.  
+* **Minor**: naming, clarity, localized cleanup, or low-risk improvements.
 
-## 4. Feedback Handling
+## **4\. Feedback Handling**
 
-When receiving review feedback from a user or another agent, verify each item against actual code before applying it.
+When receiving review feedback from a user or another agent, verify each item against the actual codebase before applying it.
 
-### Do Not Blindly Agree
+### **Do Not Blindly Agree**
 
-* Check whether feedback is valid.
-* If current code already satisfies the specification, explain why.
+* Check whether feedback is valid.  
+* If the current code already satisfies the specification, explain why.  
 * Push back when feedback conflicts with requirements or existing behavior.
 
-### Manage Ambiguity
+### **Manage Ambiguity**
 
-* If feedback is unclear, state the ambiguity.
-* Ask for clarification before applying changes.
-* Never force changes while confused.
+* If feedback is unclear, state the ambiguity and ask for clarification. Never force changes while confused.
 
-### Apply Feedback Surgically
+### **Apply Feedback Surgically**
 
-* Apply only validated feedback.
-* Keep changes scoped.
-* Re-run relevant checks after changes.
+* Apply only validated feedback, keep changes scoped, and re-run relevant checks afterward.
 
-## 5. Use Rust Token Killer
+## **5\. Use Rust Token Killer**
+
 @RTK.md
 
-## 6. CodeGraph Usage
+## **6\. CodeGraph Usage**
 
 For codebase exploration, prefer CodeGraph MCP tools over shell-based search.
 
 Use CodeGraph first for:
-- locating symbols
-- finding callers and callees
-- impact analysis
-- architecture review
-- request / execution-flow tracing
-- indexed file-structure lookup
+
+* Locating symbols  
+* Finding callers and callees  
+* Impact analysis  
+* Architecture review  
+* Request / execution-flow tracing  
+* Indexed file-structure lookup
 
 Do not start with grep, find, or broad file reads for structural questions. Use shell search only as a fallback when CodeGraph output is missing, stale, incomplete, or ambiguous.
-
-### Worktree Index State
-
-Each git worktree has its own working directory. Because `.codegraph/` is local generated index state and should be ignored by Git, CodeGraph must be initialized separately per worktree.
-
-The required commands are part of the worktree creation flow in Section 2.
