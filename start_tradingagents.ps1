@@ -50,6 +50,7 @@ if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
 
     if ($DryRun) {
         Write-Host "Mode=portable"
+        Write-Host "ProjectDir=$AppDir"
         Write-Host "AppDir=$AppDir"
         Write-Host "Launcher=$TradingAgentsExe"
         Write-Host "TRADINGAGENTS_RESULTS_DIR=$env:TRADINGAGENTS_RESULTS_DIR"
@@ -68,6 +69,7 @@ if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
 
 if ($DryRun) {
     Write-Host "Mode=development"
+    Write-Host "ProjectDir=$AppDir"
     Write-Host "AppDir=$AppDir"
     Write-Host "VenvActivate=$VenvActivate"
     Write-Host "Launcher=tradingagents"

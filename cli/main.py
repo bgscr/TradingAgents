@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import os
 import time
@@ -1031,6 +1032,149 @@ def format_tool_args(args, max_length=80) -> str:
         return result[:max_length - 3] + "..."
     return result
 
+
+def _nonempty_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _state_event_fingerprint(value) -> str:
+    try:
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = str(value)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _add_state_event(events, seen_events, message_type, content, source_key, source_value):
+    event_key = (
+        message_type,
+        content,
+        source_key,
+        _state_event_fingerprint(source_value),
+    )
+    if event_key in seen_events:
+        return
+    seen_events.add(event_key)
+    events.append((message_type, content))
+
+
+def _investment_debate_speaker(text: str) -> str | None:
+    if text.startswith("Bull Analyst:"):
+        return "Bull Researcher"
+    if text.startswith("Bear Analyst:"):
+        return "Bear Researcher"
+    return None
+
+
+def _risk_debate_speaker(state: dict) -> tuple[str, str] | None:
+    speaker_map = {
+        "Aggressive": ("Aggressive Analyst", "current_aggressive_response"),
+        "Conservative": ("Conservative Analyst", "current_conservative_response"),
+        "Neutral": ("Neutral Analyst", "current_neutral_response"),
+    }
+    latest = _nonempty_text(state.get("latest_speaker"))
+    if latest in speaker_map:
+        label, response_key = speaker_map[latest]
+        return label, _nonempty_text(state.get(response_key))
+
+    for label, response_key in speaker_map.values():
+        response = _nonempty_text(state.get(response_key))
+        if response:
+            return label, response
+    return None
+
+
+def _state_progress_events(chunk: dict, seen_events: set) -> list[tuple[str, str]]:
+    """Return concise progress events for chunks that update state without messages."""
+    if not isinstance(chunk, dict) or chunk.get("messages"):
+        return []
+
+    events: list[tuple[str, str]] = []
+
+    investment_plan = _nonempty_text(chunk.get("investment_plan"))
+    if investment_plan:
+        _add_state_event(
+            events,
+            seen_events,
+            "Research",
+            "Research Manager produced investment plan",
+            "investment_plan",
+            investment_plan,
+        )
+    else:
+        debate_state = chunk.get("investment_debate_state")
+        if isinstance(debate_state, dict):
+            judge = _nonempty_text(debate_state.get("judge_decision"))
+            current = _nonempty_text(debate_state.get("current_response"))
+            if judge:
+                _add_state_event(
+                    events,
+                    seen_events,
+                    "Research",
+                    "Research Manager produced investment plan",
+                    "investment_debate_state",
+                    judge,
+                )
+            elif current:
+                speaker = _investment_debate_speaker(current)
+                if speaker:
+                    _add_state_event(
+                        events,
+                        seen_events,
+                        "Research",
+                        f"{speaker} updated investment debate",
+                        "investment_debate_state",
+                        current,
+                    )
+
+    final_trade_decision = _nonempty_text(chunk.get("final_trade_decision"))
+    if final_trade_decision:
+        _add_state_event(
+            events,
+            seen_events,
+            "Portfolio",
+            "Portfolio Manager produced final decision",
+            "final_trade_decision",
+            final_trade_decision,
+        )
+    else:
+        risk_state = chunk.get("risk_debate_state")
+        if isinstance(risk_state, dict):
+            judge = _nonempty_text(risk_state.get("judge_decision"))
+            if judge:
+                _add_state_event(
+                    events,
+                    seen_events,
+                    "Portfolio",
+                    "Portfolio Manager produced final decision",
+                    "risk_debate_state",
+                    judge,
+                )
+            else:
+                speaker = _risk_debate_speaker(risk_state)
+                if speaker:
+                    label, response = speaker
+                    _add_state_event(
+                        events,
+                        seen_events,
+                        "Risk",
+                        f"{label} updated risk debate",
+                        "risk_debate_state",
+                        response,
+                    )
+
+    return events
+
+
+def _emit_state_progress_events(message_buffer, chunk: dict, seen_events: set) -> None:
+    for message_type, content in _state_progress_events(chunk, seen_events):
+        message_buffer.add_message(message_type, content)
+
+
 def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     """Assemble the run config from interactive selections, honoring env precedence.
 
@@ -1337,6 +1481,7 @@ def run_analysis(checkpoint: bool | None = None):
             current_phase = "graph_stream"
             _update_run_status(artifacts, current_phase="graph_stream")
             trace = []
+            state_progress_seen = set()
             for chunk in graph.graph.stream(init_agent_state, **args):
                 # Process all messages in chunk, deduplicating by message ID
                 for message in chunk.get("messages", []):
@@ -1356,6 +1501,8 @@ def run_analysis(checkpoint: bool | None = None):
                                 message_buffer.add_tool_call(tool_call["name"], tool_call["args"])
                             else:
                                 message_buffer.add_tool_call(tool_call.name, tool_call.args)
+
+                _emit_state_progress_events(message_buffer, chunk, state_progress_seen)
 
                 # Update analyst statuses based on report state (runs on every chunk)
                 update_analyst_statuses(
