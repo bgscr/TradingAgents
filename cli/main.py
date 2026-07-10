@@ -10,19 +10,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import typer
-from rich import box
 from rich.align import Align
 from rich.console import Console
-from rich.layout import Layout
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
-from rich.spinner import Spinner
-from rich.table import Table
-from rich.text import Text
 
 from cli.announcements import display_announcements, fetch_announcements
+from cli.run_display import create_layout, render_layout
 from cli.stats_handler import StatsCallbackHandler
 from cli.utils import (
     ask_anthropic_effort,
@@ -300,234 +296,6 @@ class MessageBuffer:
 message_buffer = MessageBuffer()
 
 
-def create_layout():
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main"),
-        Layout(name="footer", size=3),
-    )
-    layout["main"].split_column(
-        Layout(name="upper", ratio=3), Layout(name="analysis", ratio=5)
-    )
-    layout["upper"].split_row(
-        Layout(name="progress", ratio=2), Layout(name="messages", ratio=3)
-    )
-    return layout
-
-
-def format_tokens(n):
-    """Format token count for display."""
-    if n >= 1000:
-        return f"{n/1000:.1f}k"
-    return str(n)
-
-
-def update_display(layout, spinner_text=None, stats_handler=None, start_time=None):
-    # Header with welcome message
-    layout["header"].update(
-        Panel(
-            "[bold green]Welcome to TradingAgents CLI[/bold green]\n"
-            "[dim]© [Tauric Research](https://github.com/TauricResearch)[/dim]",
-            title="Welcome to TradingAgents",
-            border_style="green",
-            padding=(1, 2),
-            expand=True,
-        )
-    )
-
-    # Progress panel showing agent status
-    progress_table = Table(
-        show_header=True,
-        header_style="bold magenta",
-        show_footer=False,
-        box=box.SIMPLE_HEAD,  # Use simple header with horizontal lines
-        title=None,  # Remove the redundant Progress title
-        padding=(0, 2),  # Add horizontal padding
-        expand=True,  # Make table expand to fill available space
-    )
-    progress_table.add_column("Team", style="cyan", justify="center", width=20)
-    progress_table.add_column("Agent", style="green", justify="center", width=20)
-    progress_table.add_column("Status", style="yellow", justify="center", width=20)
-
-    # Group agents by team - filter to only include agents in agent_status
-    all_teams = {
-        "Analyst Team": [
-            "Market Analyst",
-            "Sentiment Analyst",
-            "News Analyst",
-            "Fundamentals Analyst",
-        ],
-        "Research Team": ["Bull Researcher", "Bear Researcher", "Research Manager"],
-        "Trading Team": ["Trader"],
-        "Risk Management": ["Aggressive Analyst", "Neutral Analyst", "Conservative Analyst"],
-        "Portfolio Management": ["Portfolio Manager"],
-    }
-
-    # Filter teams to only include agents that are in agent_status
-    teams = {}
-    for team, agents in all_teams.items():
-        active_agents = [a for a in agents if a in message_buffer.agent_status]
-        if active_agents:
-            teams[team] = active_agents
-
-    for team, agents in teams.items():
-        # Add first agent with team name
-        first_agent = agents[0]
-        status = message_buffer.agent_status.get(first_agent, "pending")
-        if status == "in_progress":
-            spinner = Spinner(
-                "dots", text="[blue]in_progress[/blue]", style="bold cyan"
-            )
-            status_cell = spinner
-        else:
-            status_color = {
-                "pending": "yellow",
-                "completed": "green",
-                "error": "red",
-            }.get(status, "white")
-            status_cell = f"[{status_color}]{status}[/{status_color}]"
-        progress_table.add_row(team, first_agent, status_cell)
-
-        # Add remaining agents in team
-        for agent in agents[1:]:
-            status = message_buffer.agent_status.get(agent, "pending")
-            if status == "in_progress":
-                spinner = Spinner(
-                    "dots", text="[blue]in_progress[/blue]", style="bold cyan"
-                )
-                status_cell = spinner
-            else:
-                status_color = {
-                    "pending": "yellow",
-                    "completed": "green",
-                    "error": "red",
-                }.get(status, "white")
-                status_cell = f"[{status_color}]{status}[/{status_color}]"
-            progress_table.add_row("", agent, status_cell)
-
-        # Add horizontal line after each team
-        progress_table.add_row("─" * 20, "─" * 20, "─" * 20, style="dim")
-
-    layout["progress"].update(
-        Panel(progress_table, title="Progress", border_style="cyan", padding=(1, 2))
-    )
-
-    # Messages panel showing recent messages and tool calls
-    messages_table = Table(
-        show_header=True,
-        header_style="bold magenta",
-        show_footer=False,
-        expand=True,  # Make table expand to fill available space
-        box=box.MINIMAL,  # Use minimal box style for a lighter look
-        show_lines=True,  # Keep horizontal lines
-        padding=(0, 1),  # Add some padding between columns
-    )
-    messages_table.add_column("Time", style="cyan", width=8, justify="center")
-    messages_table.add_column("Type", style="green", width=10, justify="center")
-    messages_table.add_column(
-        "Content", style="white", no_wrap=False, ratio=1
-    )  # Make content column expand
-
-    # Combine tool calls and messages
-    all_messages = []
-
-    # Add tool calls
-    for timestamp, tool_name, args in message_buffer.tool_calls:
-        formatted_args = format_tool_args(args)
-        all_messages.append((timestamp, "Tool", f"{tool_name}: {formatted_args}"))
-
-    # Add regular messages
-    for timestamp, msg_type, content in message_buffer.messages:
-        content_str = str(content) if content else ""
-        if len(content_str) > 200:
-            content_str = content_str[:197] + "..."
-        all_messages.append((timestamp, msg_type, content_str))
-
-    # Sort by timestamp descending (newest first)
-    all_messages.sort(key=lambda x: x[0], reverse=True)
-
-    # Calculate how many messages we can show based on available space
-    max_messages = 12
-
-    # Get the first N messages (newest ones)
-    recent_messages = all_messages[:max_messages]
-
-    # Add messages to table (already in newest-first order)
-    for timestamp, msg_type, content in recent_messages:
-        # Format content with word wrapping
-        wrapped_content = Text(content, overflow="fold")
-        messages_table.add_row(timestamp, msg_type, wrapped_content)
-
-    layout["messages"].update(
-        Panel(
-            messages_table,
-            title="Messages & Tools",
-            border_style="blue",
-            padding=(1, 2),
-        )
-    )
-
-    # Analysis panel showing current report
-    if message_buffer.current_report:
-        layout["analysis"].update(
-            Panel(
-                Markdown(message_buffer.current_report),
-                title="Current Report",
-                border_style="green",
-                padding=(1, 2),
-            )
-        )
-    else:
-        layout["analysis"].update(
-            Panel(
-                "[italic]Waiting for analysis report...[/italic]",
-                title="Current Report",
-                border_style="green",
-                padding=(1, 2),
-            )
-        )
-
-    # Footer with statistics
-    # Agent progress - derived from agent_status dict
-    agents_completed = sum(
-        1 for status in message_buffer.agent_status.values() if status == "completed"
-    )
-    agents_total = len(message_buffer.agent_status)
-
-    # Report progress - based on agent completion (not just content existence)
-    reports_completed = message_buffer.get_completed_reports_count()
-    reports_total = len(message_buffer.report_sections)
-
-    # Build stats parts
-    stats_parts = [f"Agents: {agents_completed}/{agents_total}"]
-
-    # LLM and tool stats from callback handler
-    if stats_handler:
-        stats = stats_handler.get_stats()
-        stats_parts.append(f"LLM: {stats['llm_calls']}")
-        stats_parts.append(f"Tools: {stats['tool_calls']}")
-
-        # Token display with graceful fallback
-        if stats["tokens_in"] > 0 or stats["tokens_out"] > 0:
-            tokens_str = f"Tokens: {format_tokens(stats['tokens_in'])}\u2191 {format_tokens(stats['tokens_out'])}\u2193"
-        else:
-            tokens_str = "Tokens: --"
-        stats_parts.append(tokens_str)
-
-    stats_parts.append(f"Reports: {reports_completed}/{reports_total}")
-
-    # Elapsed time
-    if start_time:
-        elapsed = time.time() - start_time
-        elapsed_str = f"\u23f1 {int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-        stats_parts.append(elapsed_str)
-
-    stats_table = Table(show_header=False, box=None, padding=(0, 2), expand=True)
-    stats_table.add_column("Stats", justify="center")
-    stats_table.add_row(" | ".join(stats_parts))
-
-    layout["footer"].update(Panel(stats_table, border_style="grey50"))
 
 
 def get_user_selections():
@@ -1025,14 +793,6 @@ def classify_message_type(message) -> tuple[str, str | None]:
     return ("System", content)
 
 
-def format_tool_args(args, max_length=80) -> str:
-    """Format tool arguments for terminal display."""
-    result = str(args)
-    if len(result) > max_length:
-        return result[:max_length - 3] + "..."
-    return result
-
-
 def _nonempty_text(value) -> str:
     if value is None:
         return ""
@@ -1433,7 +1193,12 @@ def run_analysis(checkpoint: bool | None = None):
     try:
         with Live(layout, refresh_per_second=4):
             # Initial display
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            render_layout(
+                layout,
+                message_buffer,
+                stats_handler=stats_handler,
+                start_time=start_time,
+            )
 
             # Add initial messages
             message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
@@ -1446,19 +1211,35 @@ def run_analysis(checkpoint: bool | None = None):
                 "System",
                 f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
             )
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            render_layout(
+                layout,
+                message_buffer,
+                stats_handler=stats_handler,
+                start_time=start_time,
+            )
 
             # Update agent status to in_progress for the first analyst
             first_analyst = get_initial_analyst_node(analyst_execution_plan)
             message_buffer.update_agent_status(first_analyst, "in_progress")
             analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            render_layout(
+                layout,
+                message_buffer,
+                stats_handler=stats_handler,
+                start_time=start_time,
+            )
 
             # Create spinner text
             spinner_text = (
                 f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
             )
-            update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
+            render_layout(
+                layout,
+                message_buffer,
+                spinner_text=spinner_text,
+                stats_handler=stats_handler,
+                start_time=start_time,
+            )
 
             # Initialize state and get graph args with callbacks.
             # Resolve the instrument identity once here so all agents anchor to
@@ -1582,7 +1363,12 @@ def run_analysis(checkpoint: bool | None = None):
                         message_buffer.update_agent_status("Portfolio Manager", "completed")
 
                 # Update the display
-                update_display(layout, stats_handler=stats_handler, start_time=start_time)
+                render_layout(
+                    layout,
+                    message_buffer,
+                    stats_handler=stats_handler,
+                    start_time=start_time,
+                )
 
                 trace.append(chunk)
 
@@ -1606,7 +1392,12 @@ def run_analysis(checkpoint: bool | None = None):
                 if section in final_state:
                     message_buffer.update_report_section(section, final_state[section])
 
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            render_layout(
+                layout,
+                message_buffer,
+                stats_handler=stats_handler,
+                start_time=start_time,
+            )
             current_phase = "report_writing"
             _update_run_status(artifacts, current_phase=current_phase)
             _write_run_reports(final_state, selections["ticker"], artifacts)
