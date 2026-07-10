@@ -65,6 +65,26 @@ def test_progress_tracker_reads_state_changes_when_messages_are_cumulative():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("decision", "rating"),
+    [
+        ("**评级：买入**", "Buy"),
+        ("**最终交易决策: 增持**", "Overweight"),
+        ("**评级： 持有**", "Hold"),
+        ("**最终交易决策：卖出**\n\n降低敞口。", "Sell"),
+        ("**评级: 减持**\n\n控制仓位。", "Underweight"),
+    ],
+)
+def test_progress_tracker_maps_anchored_chinese_final_decisions(decision, rating):
+    tracker = StateProgressTracker()
+
+    events = tracker.events_for({"final_trade_decision": decision})
+
+    assert len(events) == 1
+    assert events[0].content == f"Final decision ready: {rating}"
+
+
+@pytest.mark.unit
 def test_progress_tracker_deduplicates_repeated_full_state():
     tracker = StateProgressTracker()
     chunk = {

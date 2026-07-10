@@ -33,6 +33,18 @@ _RATING_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CHINESE_RATING_RE = re.compile(
+    r"\*\*(?:最终交易决策|评级)\s*[:：]\s*(买入|增持|持有|减持|卖出)\*\*"
+)
+
+_CHINESE_RATINGS = {
+    "买入": "Buy",
+    "增持": "Overweight",
+    "持有": "Hold",
+    "减持": "Underweight",
+    "卖出": "Sell",
+}
+
 
 def stable_fingerprint(value: Any) -> str:
     try:
@@ -76,6 +88,9 @@ def _decision_content(value: Any) -> str:
         match = _RATING_RE.match(line.strip())
         if match:
             return f"Final decision ready: {match.group(1).title()}"
+        match = _CHINESE_RATING_RE.fullmatch(line.strip())
+        if match:
+            return f"Final decision ready: {_CHINESE_RATINGS[match.group(1)]}"
     return "Final decision ready"
 
 

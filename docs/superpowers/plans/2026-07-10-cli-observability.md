@@ -118,6 +118,26 @@ def test_progress_tracker_reads_state_changes_when_messages_are_cumulative():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("decision", "rating"),
+    [
+        ("**评级：买入**", "Buy"),
+        ("**最终交易决策: 增持**", "Overweight"),
+        ("**评级： 持有**", "Hold"),
+        ("**最终交易决策：卖出**\n\n降低敞口。", "Sell"),
+        ("**评级: 减持**\n\n控制仓位。", "Underweight"),
+    ],
+)
+def test_progress_tracker_maps_anchored_chinese_final_decisions(decision, rating):
+    tracker = StateProgressTracker()
+
+    events = tracker.events_for({"final_trade_decision": decision})
+
+    assert len(events) == 1
+    assert events[0].content == f"Final decision ready: {rating}"
+
+
+@pytest.mark.unit
 def test_progress_tracker_deduplicates_repeated_full_state():
     tracker = StateProgressTracker()
     chunk = {
@@ -218,6 +238,18 @@ _RATING_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CHINESE_RATING_RE = re.compile(
+    r"\*\*(?:最终交易决策|评级)\s*[:：]\s*(买入|增持|持有|减持|卖出)\*\*"
+)
+
+_CHINESE_RATINGS = {
+    "买入": "Buy",
+    "增持": "Overweight",
+    "持有": "Hold",
+    "减持": "Underweight",
+    "卖出": "Sell",
+}
+
 
 def stable_fingerprint(value: Any) -> str:
     try:
@@ -261,6 +293,9 @@ def _decision_content(value: Any) -> str:
         match = _RATING_RE.match(line.strip())
         if match:
             return f"Final decision ready: {match.group(1).title()}"
+        match = _CHINESE_RATING_RE.fullmatch(line.strip())
+        if match:
+            return f"Final decision ready: {_CHINESE_RATINGS[match.group(1)]}"
     return "Final decision ready"
 
 
@@ -413,6 +448,8 @@ from cli.run_display import (
     PlainRunDisplay,
     ResilientRunDisplay,
     RichRunDisplay,
+    create_layout,
+    render_layout,
 )
 from cli.run_progress import ProgressEvent
 
@@ -485,6 +522,24 @@ def test_rich_display_replaces_waiting_copy_with_final_report():
     output = stream.getvalue()
     assert "The report will appear when this analyst's tool/LLM round completes." in output
     assert "REPORT BODY" in output
+
+
+@pytest.mark.unit
+def test_rich_waiting_panel_shows_latest_tool_without_arguments():
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+    buffer = FakeBuffer()
+    buffer.tool_calls.append(
+        ("12:00:01", "get_stock_data", {"symbol": "SECRET_ARGUMENT"})
+    )
+    layout = create_layout()
+
+    render_layout(layout, buffer, spinner_text="Analyzing ticker...")
+    console.print(layout["analysis"])
+
+    output = stream.getvalue()
+    assert "Market Analyst - requested get_stock_data" in output
+    assert "SECRET_ARGUMENT" not in output
 
 
 @pytest.mark.unit
@@ -577,6 +632,9 @@ Use this exact no-report branch in `render_layout()`:
 else:
     active = _active_agent(message_buffer)
     activity = spinner_text or "working"
+    if message_buffer.tool_calls:
+        _, tool_name, _ = message_buffer.tool_calls[-1]
+        activity = f"requested {tool_name}"
     layout["analysis"].update(
         Panel(
             Group(
@@ -1329,8 +1387,10 @@ rtk pytest -q tests/test_cli_observability.py tests/test_cli_run_status.py tests
 Expected: all focused tests pass. The market report is announced once despite a
 repeated full-state chunk, debate-only chunks create no finalized report
 artifacts, exact top-level finalized reports are announced before stream
-exhaustion, plain output records new message and argument-free tool-request
-transitions once, and failure tests confirm display cleanup.
+exhaustion, the Rich waiting panel surfaces the latest argument-free tool name,
+localized anchored final-decision headings map to English progress labels,
+plain output records new message and argument-free tool-request transitions
+once, and failure tests confirm display cleanup.
 
 - [ ] **Step 8: Run the complete suite**
 
@@ -1351,6 +1411,10 @@ Spec compliance review:
 - Confirm every `ProgressEvent` reaches both `message_buffer.add_message()` and
   the display.
 - Confirm finalized reports remain the only `current_report` input.
+- Confirm the Rich waiting panel uses only the latest tool name and never tool
+  arguments, results, or partial report content.
+- Confirm localized ratings require an anchored heading and preserve English
+  rating behavior and the generic fallback.
 - Confirm plain output emits new buffered messages and argument-free tool
   requests once without duplicating published `ProgressEvent` lines.
 - Confirm report, graph, and status failures still use the existing failure path.

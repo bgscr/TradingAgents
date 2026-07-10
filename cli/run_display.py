@@ -210,6 +210,9 @@ def render_layout(
     else:
         active = _active_agent(message_buffer)
         activity = spinner_text or "working"
+        if message_buffer.tool_calls:
+            _, tool_name, _ = message_buffer.tool_calls[-1]
+            activity = f"requested {tool_name}"
         layout["analysis"].update(
             Panel(
                 Group(

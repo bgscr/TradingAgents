@@ -8,7 +8,9 @@ from cli.run_display import (
     PlainRunDisplay,
     ResilientRunDisplay,
     RichRunDisplay,
+    create_layout,
     create_run_display,
+    render_layout,
 )
 from cli.run_progress import ProgressEvent
 
@@ -175,6 +177,24 @@ def test_rich_display_replaces_waiting_copy_with_final_report():
     output = stream.getvalue()
     assert "The report will appear when this analyst's tool/LLM round completes." in output
     assert "REPORT BODY" in output
+
+
+@pytest.mark.unit
+def test_rich_waiting_panel_shows_latest_tool_without_arguments():
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
+    buffer = FakeBuffer()
+    buffer.tool_calls.append(
+        ("12:00:01", "get_stock_data", {"symbol": "SECRET_ARGUMENT"})
+    )
+    layout = create_layout()
+
+    render_layout(layout, buffer, spinner_text="Analyzing ticker...")
+    console.print(layout["analysis"])
+
+    output = stream.getvalue()
+    assert "Market Analyst - requested get_stock_data" in output
+    assert "SECRET_ARGUMENT" not in output
 
 
 @pytest.mark.unit
