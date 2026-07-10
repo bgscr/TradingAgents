@@ -38,6 +38,26 @@ def _run_selections():
     return selections
 
 
+class NoOpDisplay:
+    def __init__(self):
+        self.closed = False
+
+    def start(self):
+        return None
+
+    def refresh(self, spinner_text=None):
+        return None
+
+    def publish_event(self, event):
+        return None
+
+    def report_ready(self, section_name, content, path):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.mark.unit
 def test_prepare_run_artifacts_writes_running_status(tmp_path):
     artifacts = cli_main._prepare_run_artifacts(
@@ -164,6 +184,8 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
             return "resolved identity"
 
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
+    display = NoOpDisplay()
+    monkeypatch.setattr(cli_main, "create_run_display", lambda *args, **kwargs: display)
 
     with pytest.raises(KeyboardInterrupt, match="ctrl-c"):
         cli_main.run_analysis()
@@ -174,3 +196,4 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     assert payload["status"] == "failed"
     assert payload["current_phase"] == "graph_stream"
     assert payload["error_summary"] == "KeyboardInterrupt: ctrl-c"
+    assert display.closed is True
