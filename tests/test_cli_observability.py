@@ -35,53 +35,13 @@ def _run_selections():
     }
 
 
-@pytest.mark.unit
-def test_run_analysis_publishes_reports_and_state_progress_before_stream_end(
-    tmp_path,
-    monkeypatch,
-):
-    market_message = AIMessage(content="Market report body", id=None)
-    market_state = {
-        "messages": [market_message],
-        "market_report": "Market report body",
-    }
-    research_state = {
-        **market_state,
-        "investment_debate_state": {
-            "current_response": "Bull Analyst: upside case",
-            "bull_history": "Bull Analyst: upside case",
-            "bear_history": "",
-            "judge_decision": "",
-        },
-    }
-    final_state = {
-        **research_state,
-        "investment_plan": "**Recommendation**: Underweight",
-        "trader_investment_plan": "**Action**: Sell",
-        "risk_debate_state": {
-            "latest_speaker": "Judge",
-            "current_aggressive_response": "Aggressive Analyst: reduce risk",
-            "current_conservative_response": "",
-            "current_neutral_response": "",
-            "aggressive_history": "Aggressive Analyst: reduce risk",
-            "conservative_history": "",
-            "neutral_history": "",
-            "history": "Aggressive Analyst: reduce risk",
-            "judge_decision": "**Rating**: Underweight",
-            "count": 1,
-        },
-        "final_trade_decision": "**Rating**: Underweight\n\nReduce exposure.",
-    }
-
+def _run_with_chunks(tmp_path, monkeypatch, chunks):
     class FakeStream:
         def __init__(self):
             self.finished = False
 
         def stream(self, *args, **kwargs):
-            yield market_state
-            yield market_state
-            yield research_state
-            yield final_state
+            yield from chunks
             self.finished = True
 
     fake_stream = FakeStream()
@@ -135,17 +95,148 @@ def test_run_analysis_publishes_reports_and_state_progress_before_stream_end(
     monkeypatch.setattr(cli_main.typer, "prompt", lambda *args, **kwargs: "N")
 
     cli_main.run_analysis()
+    return display
 
-    market_calls = [call for call in display.report_calls if call[0] == "market_report"]
-    assert len(market_calls) == 1
-    assert market_calls[0][3] is False
+
+@pytest.mark.unit
+def test_debate_only_chunks_emit_progress_without_finalized_report_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    debate_state = {
+        "messages": [AIMessage(content="Debate activity", id=None)],
+        "investment_debate_state": {
+            "current_response": "Bull Analyst: upside case",
+            "bull_history": "Bull Analyst: upside case",
+            "bear_history": "",
+            "judge_decision": "",
+        },
+        "risk_debate_state": {
+            "latest_speaker": "Aggressive",
+            "current_aggressive_response": "Aggressive Analyst: reduce risk",
+            "current_conservative_response": "",
+            "current_neutral_response": "",
+            "aggressive_history": "Aggressive Analyst: reduce risk",
+            "conservative_history": "",
+            "neutral_history": "",
+            "history": "Aggressive Analyst: reduce risk",
+            "judge_decision": "",
+            "count": 1,
+        },
+    }
+
+    display = _run_with_chunks(tmp_path, monkeypatch, [debate_state])
+
     assert ("Research", "Bull Researcher updated investment debate") in display.events
+    assert ("Risk", "Aggressive Analyst updated risk debate") in display.events
+    assert not [
+        call
+        for call in display.report_calls
+        if call[0] in {"investment_plan", "final_trade_decision"}
+    ]
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    assert not (run_dir / "reports" / "investment_plan.md").exists()
+    assert not (run_dir / "reports" / "final_trade_decision.md").exists()
+
+
+@pytest.mark.unit
+def test_finalized_reports_are_published_exactly_before_stream_exhaustion(
+    tmp_path,
+    monkeypatch,
+):
+    finalized_state = {
+        "messages": [AIMessage(content="Final decisions", id=None)],
+        "investment_debate_state": {
+            "current_response": "Bull Analyst: upside case",
+            "bull_history": "Bull Analyst: upside case",
+            "bear_history": "",
+            "judge_decision": "Provisional research judge text",
+        },
+        "investment_plan": "**Recommendation**: Underweight",
+        "risk_debate_state": {
+            "latest_speaker": "Judge",
+            "current_aggressive_response": "Aggressive Analyst: reduce risk",
+            "current_conservative_response": "",
+            "current_neutral_response": "",
+            "aggressive_history": "Aggressive Analyst: reduce risk",
+            "conservative_history": "",
+            "neutral_history": "",
+            "history": "Aggressive Analyst: reduce risk",
+            "judge_decision": "Provisional risk judge text",
+            "count": 1,
+        },
+        "final_trade_decision": "**Rating**: Underweight\n\nReduce exposure.",
+    }
+
+    display = _run_with_chunks(tmp_path, monkeypatch, [finalized_state])
+
+    finalized_calls = [
+        call
+        for call in display.report_calls
+        if call[0] in {"investment_plan", "final_trade_decision"}
+    ]
+    assert [(call[0], call[1], call[3]) for call in finalized_calls] == [
+        ("investment_plan", "**Recommendation**: Underweight", False),
+        (
+            "final_trade_decision",
+            "**Rating**: Underweight\n\nReduce exposure.",
+            False,
+        ),
+    ]
+
+
+@pytest.mark.unit
+def test_repeated_full_state_writes_each_finalized_report_once(tmp_path, monkeypatch):
+    full_state = {
+        "messages": [AIMessage(content="Market report body", id=None)],
+        "market_report": "Market report body",
+        "investment_debate_state": {
+            "current_response": "Bull Analyst: upside case",
+            "bull_history": "Bull Analyst: upside case",
+            "bear_history": "Bear Analyst: downside case",
+            "judge_decision": "Provisional research judge text",
+        },
+        "investment_plan": "**Recommendation**: Underweight",
+        "trader_investment_plan": "**Action**: Sell",
+        "risk_debate_state": {
+            "latest_speaker": "Judge",
+            "current_aggressive_response": "Aggressive Analyst: reduce risk",
+            "current_conservative_response": "Conservative Analyst: exit",
+            "current_neutral_response": "Neutral Analyst: wait",
+            "aggressive_history": "Aggressive Analyst: reduce risk",
+            "conservative_history": "Conservative Analyst: exit",
+            "neutral_history": "Neutral Analyst: wait",
+            "history": "Risk debate history",
+            "judge_decision": "Provisional risk judge text",
+            "count": 3,
+        },
+        "final_trade_decision": "**Rating**: Underweight\n\nReduce exposure.",
+    }
+
+    display = _run_with_chunks(tmp_path, monkeypatch, [full_state, full_state])
+
+    report_calls = [
+        (section_name, content)
+        for section_name, content, _path, _finished in display.report_calls
+    ]
+    assert report_calls.count(("market_report", "Market report body")) == 1
+    assert report_calls.count(
+        ("investment_plan", "**Recommendation**: Underweight")
+    ) == 1
+    assert report_calls.count(("trader_investment_plan", "**Action**: Sell")) == 1
+    assert report_calls.count(
+        ("final_trade_decision", "**Rating**: Underweight\n\nReduce exposure.")
+    ) == 1
+    assert len(report_calls) == 4
+
+    assert ("Research", "Research Manager produced investment plan") in display.events
     assert ("Portfolio", "Final decision ready: Underweight") in display.events
 
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     log_text = (run_dir / "message_tool.log").read_text(encoding="utf-8")
     assert log_text.count("Market report body") == 1
-    assert "[Research] Bull Researcher updated investment debate" in log_text
+    assert "[Research] Research Manager produced investment plan" in log_text
     assert "[Portfolio] Final decision ready: Underweight" in log_text
     assert (run_dir / "reports" / "market_report.md").read_text(
         encoding="utf-8"

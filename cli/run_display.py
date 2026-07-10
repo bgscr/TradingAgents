@@ -354,6 +354,10 @@ class PlainRunDisplay:
         self.console = console
         self.message_buffer = message_buffer
         self._last_status: tuple[str, str] | None = None
+        self._last_messages: tuple[Any, ...] = ()
+        self._last_tool_calls: tuple[Any, ...] = ()
+        self._pending_buffered_events: dict[tuple[str, str], int] = {}
+        self._pending_published_events: dict[tuple[str, str], int] = {}
 
     def start(self) -> None:
         return None
@@ -361,6 +365,35 @@ class PlainRunDisplay:
     def refresh(self, spinner_text: str | None = None) -> None:
         active = _active_agent(self.message_buffer)
         activity = spinner_text or "working"
+
+        messages = tuple(self.message_buffer.messages)
+        for timestamp, message_type, content in self._new_items(
+            self._last_messages,
+            messages,
+        ):
+            content_text = str(content).strip() if content is not None else ""
+            if not content_text:
+                continue
+            signature = (str(message_type), content_text)
+            if message_type in {"Analysis", "Research", "Trading", "Risk", "Portfolio"}:
+                if self._consume_pending(self._pending_published_events, signature):
+                    continue
+                self._pending_buffered_events[signature] = (
+                    self._pending_buffered_events.get(signature, 0) + 1
+                )
+            self.console.print(f"{timestamp} [{message_type}] {content_text}")
+        self._last_messages = messages
+
+        tool_calls = tuple(self.message_buffer.tool_calls)
+        for timestamp, tool_name, _args in self._new_items(
+            self._last_tool_calls,
+            tool_calls,
+        ):
+            self.console.print(
+                f"{timestamp} [Tool] {active} requested {tool_name}"
+            )
+        self._last_tool_calls = tool_calls
+
         status = (active, activity)
         if status == self._last_status:
             return
@@ -368,7 +401,35 @@ class PlainRunDisplay:
         self.console.print(f"{_timestamp()} [Progress] {active} - {activity}")
 
     def publish_event(self, event: ProgressEvent) -> None:
+        signature = (event.message_type, event.content)
+        if self._consume_pending(self._pending_buffered_events, signature):
+            return
+        self._pending_published_events[signature] = (
+            self._pending_published_events.get(signature, 0) + 1
+        )
         self.console.print(f"{_timestamp()} [{event.message_type}] {event.content}")
+
+    @staticmethod
+    def _consume_pending(
+        pending: dict[tuple[str, str], int],
+        signature: tuple[str, str],
+    ) -> bool:
+        count = pending.get(signature, 0)
+        if count == 0:
+            return False
+        if count == 1:
+            del pending[signature]
+        else:
+            pending[signature] = count - 1
+        return True
+
+    @staticmethod
+    def _new_items(previous: tuple[Any, ...], current: tuple[Any, ...]) -> tuple[Any, ...]:
+        max_overlap = min(len(previous), len(current))
+        for overlap in range(max_overlap, 0, -1):
+            if previous[-overlap:] == current[:overlap]:
+                return current[overlap:]
+        return current
 
     def report_ready(self, section_name: str, content: str, path: Path) -> None:
         normalized = " ".join(str(content).split())

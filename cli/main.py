@@ -1160,20 +1160,14 @@ def run_analysis(checkpoint: bool | None = None):
                 # Only update status when there's actual content
                 if bull_hist or bear_hist:
                     update_research_team_status("in_progress")
-                if bull_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Bull Researcher Analysis\n{bull_hist}"
-                    )
-                if bear_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Bear Researcher Analysis\n{bear_hist}"
-                    )
                 if judge:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Research Manager Decision\n{judge}"
-                    )
                     update_research_team_status("completed")
                     message_buffer.update_agent_status("Trader", "in_progress")
+
+            if chunk.get("investment_plan"):
+                message_buffer.update_report_section(
+                    "investment_plan", chunk["investment_plan"]
+                )
 
             # Trading Team
             if chunk.get("trader_investment_plan"):
@@ -1192,33 +1186,34 @@ def run_analysis(checkpoint: bool | None = None):
                 neu_hist = risk_state.get("neutral_history", "").strip()
                 judge = risk_state.get("judge_decision", "").strip()
 
-                if agg_hist:
-                    if message_buffer.agent_status.get("Aggressive Analyst") != "completed":
-                        message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Aggressive Analyst Analysis\n{agg_hist}"
-                    )
-                if con_hist:
-                    if message_buffer.agent_status.get("Conservative Analyst") != "completed":
-                        message_buffer.update_agent_status("Conservative Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Conservative Analyst Analysis\n{con_hist}"
-                    )
-                if neu_hist:
-                    if message_buffer.agent_status.get("Neutral Analyst") != "completed":
-                        message_buffer.update_agent_status("Neutral Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Neutral Analyst Analysis\n{neu_hist}"
-                    )
+                if (
+                    agg_hist
+                    and message_buffer.agent_status.get("Aggressive Analyst")
+                    != "completed"
+                ):
+                    message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
+                if (
+                    con_hist
+                    and message_buffer.agent_status.get("Conservative Analyst")
+                    != "completed"
+                ):
+                    message_buffer.update_agent_status("Conservative Analyst", "in_progress")
+                if (
+                    neu_hist
+                    and message_buffer.agent_status.get("Neutral Analyst") != "completed"
+                ):
+                    message_buffer.update_agent_status("Neutral Analyst", "in_progress")
                 if judge and message_buffer.agent_status.get("Portfolio Manager") != "completed":
                     message_buffer.update_agent_status("Portfolio Manager", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Portfolio Manager Decision\n{judge}"
-                    )
                     message_buffer.update_agent_status("Aggressive Analyst", "completed")
                     message_buffer.update_agent_status("Conservative Analyst", "completed")
                     message_buffer.update_agent_status("Neutral Analyst", "completed")
                     message_buffer.update_agent_status("Portfolio Manager", "completed")
+
+            if chunk.get("final_trade_decision"):
+                message_buffer.update_report_section(
+                    "final_trade_decision", chunk["final_trade_decision"]
+                )
 
             latest_state = chunk
             display.refresh(spinner_text)
