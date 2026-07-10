@@ -387,6 +387,9 @@ rtk git commit -m "feat: track cumulative CLI progress"
 **Files:**
 - Create: `cli/run_display.py`
 - Create: `tests/test_cli_run_display.py`
+- Modify: `cli/main.py:1-530`
+- Modify: `cli/main.py:1028-1033`
+- Modify: `cli/main.py:1430-1610`
 
 **Interfaces:**
 - Consumes: `ProgressEvent` from Task 1.
@@ -768,20 +771,65 @@ def create_run_display(
 The protocol methods use `...` only as Python's required Protocol stub body;
 they are executable type declarations, not missing implementation work.
 
-- [ ] **Step 4: Run display tests and verify both modes pass**
+- [ ] **Step 4: Switch the current CLI to the relocated rendering helpers**
+
+In `cli/main.py`:
+
+- Remove the Rich imports used only by the relocated rendering body: `box`,
+  `Layout`, `Spinner`, `Table`, and `Text`.
+- Keep `Align`, `Console`, `Live`, `Markdown`, `Panel`, and `Rule`; the current
+  run loop and non-layout CLI screens still use them at this task boundary.
+- Delete `create_layout()`, `format_tokens()`, `update_display()`, and
+  `format_tool_args()` from `cli/main.py`.
+- Add this temporary import, which Task 3 will replace with
+  `create_run_display`:
+
+```python
+from cli.run_display import create_layout, render_layout
+```
+
+Replace each current `update_display(...)` call with the corresponding injected
+buffer call:
+
+```python
+render_layout(
+    layout,
+    message_buffer,
+    stats_handler=stats_handler,
+    start_time=start_time,
+)
+```
+
+For the call that currently passes `spinner_text`, use:
+
+```python
+render_layout(
+    layout,
+    message_buffer,
+    spinner_text=spinner_text,
+    stats_handler=stats_handler,
+    start_time=start_time,
+)
+```
+
+Do not change the `Live` lifecycle or graph loop in this task. This commit only
+relocates one implementation, so no display logic is duplicated between files.
+
+- [ ] **Step 5: Run display tests and current CLI regression tests**
 
 Run:
 
 ```powershell
-rtk pytest -q tests/test_cli_run_display.py tests/test_cli_progress.py
+rtk pytest -q tests/test_cli_run_display.py tests/test_cli_progress.py tests/test_cli_run_status.py tests/test_china_a_run_logging.py
 ```
 
-Expected: all tests pass, including Rich-to-plain fallback.
+Expected: all tests pass, including Rich-to-plain fallback and the existing
+`run_analysis()` failure paths using the relocated renderer.
 
-- [ ] **Step 5: Commit the display boundary**
+- [ ] **Step 6: Commit the display boundary and mechanical extraction**
 
 ```powershell
-rtk git add cli/run_display.py tests/test_cli_run_display.py
+rtk git add cli/run_display.py cli/main.py tests/test_cli_run_display.py
 rtk git commit -m "feat: add dual-mode CLI run display"
 ```
 
@@ -1034,17 +1082,15 @@ update.
 
 In `cli/main.py`:
 
-- Remove `hashlib` and the Rich imports used only by the relocated display body:
-  `box`, `Layout`, `Live`, `Spinner`, `Table`, `Text`.
+- Remove `hashlib` and `Live`. Task 2 already removed the Rich imports and
+  helper bodies used only by layout rendering.
 - Keep `Align`; the welcome screen still uses it outside the live layout.
 - Keep `Console`, `Markdown`, `Panel`, and `Rule` because post-run and complete
   report output still use them.
-- Delete `create_layout()`, `format_tokens()`, `update_display()`,
-  `format_tool_args()`, `_nonempty_text()`, `_state_event_fingerprint()`,
-  `_add_state_event()`, `_investment_debate_speaker()`,
-  `_risk_debate_speaker()`, `_state_progress_events()`, and
-  `_emit_state_progress_events()`.
-- Add these imports:
+- Delete `_nonempty_text()`, `_state_event_fingerprint()`, `_add_state_event()`,
+  `_investment_debate_speaker()`, `_risk_debate_speaker()`,
+  `_state_progress_events()`, and `_emit_state_progress_events()`.
+- Replace Task 2's temporary `create_layout, render_layout` import with:
 
 ```python
 from cli.run_display import create_run_display
@@ -1343,14 +1389,15 @@ rtk git commit -m "feat: surface CLI analysis progress"
 
 ---
 
-### Task 4: Windows and Final Verification Gate
+### Task 4: Automated Gate and User-Assisted PowerShell Smoke Test
 
 **Files:**
 - Verify only; no planned file changes.
 
 **Interfaces:**
 - Consumes: completed Tasks 1-3.
-- Produces: evidence that interactive and captured PowerShell execution match the approved design.
+- Produces: automated non-TTY evidence plus user-observed interactive PowerShell
+  evidence and an agent audit of the resulting run artifacts.
 
 - [ ] **Step 1: Verify repository and CodeGraph state**
 
@@ -1374,7 +1421,10 @@ rtk pytest -q
 
 Expected: all tests pass with zero failures.
 
-- [ ] **Step 3: Verify interactive PowerShell manually**
+- [ ] **Step 3: Hand the interactive smoke test to the user and stop**
+
+Send the user these exact instructions, then end the turn without continuing to
+final review or branch completion:
 
 From Windows Terminal PowerShell, run:
 
@@ -1389,23 +1439,44 @@ Verify before allowing the run to finish:
 - the first finalized report replaces the waiting copy
 - Research, Risk, and Portfolio progress appears during later phases
 
-- [ ] **Step 4: Verify captured PowerShell output manually**
+After the run completes, ask the user to report:
 
-Run a normal analysis while capturing output:
+- ticker, analysis date, and run ID if visible
+- whether each checkpoint above passed
+- any stale, duplicated, missing, or malformed display content
+- any screenshot or copied console excerpt that helps reproduce a mismatch
+
+Do not perform additional implementation work until the user explicitly says
+the smoke test is finished.
+
+- [ ] **Step 4: Resume from user feedback and audit the generated artifacts**
+
+After the user reports completion, incorporate their observations and locate the
+newest run status:
 
 ```powershell
-.\start_tradingagents.ps1 *>&1 | Tee-Object -FilePath .\cli-observability-smoke.log
+rtk proxy powershell -NoProfile -Command { Get-ChildItem -LiteralPath (Join-Path $HOME '.tradingagents\logs') -Recurse -Filter run_status.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1 FullName,LastWriteTime }
 ```
 
-Verify the capture contains timestamped Progress, Analysis, Research, Risk, and
-Portfolio lines before completion and contains no ANSI screen-control noise.
-Delete the single smoke log after inspection so it is not committed:
+Use the returned run directory to inspect completion status and progress events:
 
 ```powershell
-rtk proxy powershell -NoProfile -Command Remove-Item -LiteralPath '.\cli-observability-smoke.log'
+rtk rg -n '"(status|current_phase|error_summary|started_at|completed_at)"' '<RUN_DIR>\run_status.json'
+rtk rg -n "\[(Analysis|Research|Trading|Risk|Portfolio)\]" '<RUN_DIR>\message_tool.log'
+rtk proxy powershell -NoProfile -Command { Get-ChildItem -LiteralPath '<RUN_DIR>\reports' -Recurse -File | Sort-Object CreationTime | Select-Object FullName,CreationTime,LastWriteTime }
 ```
 
-- [ ] **Step 5: Confirm final diff scope**
+Replace `<RUN_DIR>` with the absolute directory returned by the first command.
+Verify that report creation and progress events occurred before `completed_at`,
+that the final portfolio event is present, and that the user's observations
+match the persisted evidence.
+
+If the smoke test reveals a defect, dispatch one fix subagent with the complete
+feedback and log evidence, re-run the focused and full automated tests, review
+the fix, and request another user smoke test only when the interactive behavior
+changed materially.
+
+- [ ] **Step 5: Confirm final diff scope after smoke verification**
 
 Run:
 
