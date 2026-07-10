@@ -1,9 +1,12 @@
+from io import StringIO
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage
+from rich.console import Console
 
 from cli import main as cli_main
+from cli.run_display import PlainRunDisplay
 
 
 @pytest.mark.unit
@@ -96,6 +99,75 @@ def _run_with_chunks(tmp_path, monkeypatch, chunks):
 
     cli_main.run_analysis()
     return display
+
+
+@pytest.mark.unit
+def test_run_analysis_attributes_tool_before_same_chunk_status_advance(
+    tmp_path,
+    monkeypatch,
+):
+    tool_message = AIMessage(
+        content="",
+        id="market-tool-message",
+        tool_calls=[
+            {
+                "name": "get_stock_data",
+                "args": {"symbol": "601658.SS"},
+                "id": "market-tool-call",
+                "type": "tool_call",
+            }
+        ],
+    )
+    chunks = [
+        {
+            "messages": [tool_message],
+            "market_report": "Market report body",
+        }
+    ]
+
+    class FakeStream:
+        def stream(self, *args, **kwargs):
+            yield from chunks
+
+    class FakePropagator:
+        def create_initial_state(self, *args, **kwargs):
+            return {}
+
+        def get_graph_args(self, *args, **kwargs):
+            return {}
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, *args, **kwargs):
+            self.propagator = FakePropagator()
+            self.graph = FakeStream()
+
+        def resolve_instrument_context(self, *args, **kwargs):
+            return "resolved identity"
+
+    stream = StringIO()
+    plain_console = Console(file=stream, force_terminal=False, color_system=None)
+    monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
+    monkeypatch.setattr(
+        cli_main,
+        "DEFAULT_CONFIG",
+        dict(cli_main.DEFAULT_CONFIG, results_dir=str(tmp_path)),
+    )
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
+    monkeypatch.setattr(
+        cli_main,
+        "create_run_display",
+        lambda _console, buffer, _stats, _start: PlainRunDisplay(
+            plain_console,
+            buffer,
+        ),
+    )
+    monkeypatch.setattr(cli_main.typer, "prompt", lambda *args, **kwargs: "N")
+
+    cli_main.run_analysis()
+
+    output = stream.getvalue()
+    assert "[Tool] Bull Researcher requested get_stock_data" not in output
+    assert output.count("[Tool] Market Analyst requested get_stock_data") == 1
 
 
 @pytest.mark.unit

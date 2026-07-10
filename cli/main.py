@@ -1139,6 +1139,8 @@ def run_analysis(checkpoint: bool | None = None):
                                 tool_call.args,
                             )
 
+            display.refresh(spinner_text)
+
             for event in tracker.events_for(chunk):
                 message_buffer.add_message(event.message_type, event.content)
                 display.publish_event(event)
