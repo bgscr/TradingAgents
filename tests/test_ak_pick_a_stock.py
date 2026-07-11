@@ -527,6 +527,47 @@ def test_prepare_candidates_uses_historical_factors_to_rank_candidates(monkeypat
         assert col in result.columns
 
 
+def test_higher_volatility_receives_larger_score_penalty(monkeypatch):
+    factors = {
+        "600001": {
+            picker.MOMENTUM_20D_COL: 0.10,
+            picker.MOMENTUM_60D_COL: 0.20,
+            picker.VOLATILITY_20D_COL: 0.01,
+            picker.MA_TREND_COL: 0.05,
+            picker.AVG_AMOUNT_20D_COL: 500_000_000,
+            picker.RELATIVE_STRENGTH_20D_COL: 0.03,
+        },
+        "600002": {
+            picker.MOMENTUM_20D_COL: 0.10,
+            picker.MOMENTUM_60D_COL: 0.20,
+            picker.VOLATILITY_20D_COL: 0.05,
+            picker.MA_TREND_COL: 0.05,
+            picker.AVG_AMOUNT_20D_COL: 500_000_000,
+            picker.RELATIVE_STRENGTH_20D_COL: 0.03,
+        },
+    }
+    candidates = pd.DataFrame(
+        {
+            picker.CODE_COL: ["600001", "600002"],
+            "score": [100.0, 100.0],
+        }
+    )
+
+    monkeypatch.setattr(picker, "load_benchmark_history", lambda: pd.DataFrame())
+    monkeypatch.setattr(picker, "load_stock_history", lambda code: code)
+    monkeypatch.setattr(
+        picker,
+        "_history_factors",
+        lambda code, benchmark_momentum_20d: factors[code],
+    )
+
+    result = picker._add_historical_factors(candidates).set_index(picker.CODE_COL)
+    ranked = result.sort_values("score", ascending=False)
+
+    assert result.loc["600001", "score"] > result.loc["600002", "score"]
+    assert ranked.index[0] == "600001"
+
+
 def test_load_stock_history_falls_back_when_eastmoney_history_fails(monkeypatch):
     calls = []
 

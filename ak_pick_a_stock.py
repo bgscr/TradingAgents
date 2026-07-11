@@ -665,9 +665,9 @@ def _history_factors(history: pd.DataFrame, benchmark_momentum_20d: float | None
     }
 
 
-def _rank_bonus(series: pd.Series, weight: float, *, lower_is_better: bool = False) -> pd.Series:
+def _rank_bonus(series: pd.Series, weight: float) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce")
-    ranked = numeric.rank(pct=True, ascending=not lower_is_better)
+    ranked = numeric.rank(pct=True)
     return ranked.fillna(0) * weight
 
 
@@ -701,7 +701,7 @@ def _add_historical_factors(df: pd.DataFrame) -> pd.DataFrame:
     out["score"] += _rank_bonus(out[RELATIVE_STRENGTH_20D_COL], 18)
     out["score"] += _rank_bonus(out[MA_TREND_COL], 12)
     out["score"] += _rank_bonus(out[AVG_AMOUNT_20D_COL], 10)
-    out["score"] -= _rank_bonus(out[VOLATILITY_20D_COL], 8, lower_is_better=True)
+    out["score"] -= _rank_bonus(out[VOLATILITY_20D_COL], 8)
     return out
 
 
