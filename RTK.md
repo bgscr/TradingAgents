@@ -4,7 +4,8 @@
 
 ## Rule
 
-Always prefix shell commands with `rtk`.
+1. Always prefix shell commands with `rtk`.
+2. **PowerShell Mandatory Rule**: Whenever you need to use PowerShell to execute a command, **you MUST use `pwsh`**. Do not use the legacy `powershell` command under any circumstances.
 
 Examples:
 
