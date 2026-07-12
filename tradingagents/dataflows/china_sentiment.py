@@ -35,9 +35,9 @@ def _filter_date_range(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    if date_col not in data.columns:
-        return data
     frame = data.copy()
+    if date_col not in frame.columns:
+        return frame.iloc[0:0]
     dates = pd.to_datetime(frame[date_col], errors="coerce")
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
@@ -73,7 +73,11 @@ def _popularity_section(
     ), []
 
 
-def _stock_comment_section(code: str) -> tuple[list[str], list[str]]:
+def _stock_comment_section(
+    code: str,
+    start_date: str,
+    end_date: str,
+) -> tuple[list[str], list[str]]:
     data, error = _safe_frame("stock_comment_em", ak.stock_comment_em)
     if error:
         return [], [error]
@@ -82,8 +86,12 @@ def _stock_comment_section(code: str) -> tuple[list[str], list[str]]:
     if "\u4ee3\u7801" not in frame.columns:
         return [], ["DATA_DEGRADED: AKShare stock_comment_em missing code column."]
     frame = frame[frame["\u4ee3\u7801"].astype(str).str.zfill(6) == code]
+    frame = _filter_date_range(frame, "交易日", start_date, end_date)
     if frame.empty:
-        return [], ["DATA_DEGRADED: AKShare stock_comment_em returned no row for this symbol."]
+        return [], [
+            "DATA_DEGRADED: AKShare stock_comment_em returned no row for this "
+            "symbol in requested window."
+        ]
     return _csv_section(
         "Eastmoney stock comment",
         frame,
@@ -148,7 +156,7 @@ def get_china_a_local_sentiment(ticker: str, start_date: str, end_date: str) -> 
 
     for builder in (
         lambda: _popularity_section(eastmoney_symbol, start_date, end_date),
-        lambda: _stock_comment_section(instrument.akshare_code),
+        lambda: _stock_comment_section(instrument.akshare_code, start_date, end_date),
         lambda: _northbound_section(instrument.akshare_code, start_date, end_date),
     ):
         lines, errors = builder()

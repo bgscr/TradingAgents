@@ -58,6 +58,42 @@ def test_get_china_a_local_sentiment_formats_local_sources(monkeypatch):
 
 
 @pytest.mark.unit
+def test_stock_comment_after_beijing_cutoff_is_degraded(monkeypatch):
+    monkeypatch.setattr(
+        china_sentiment.ak,
+        "stock_comment_em",
+        lambda: pd.DataFrame({
+            "代码": ["601138"],
+            "名称": ["工业富联"],
+            "最新价": [71.75],
+            "交易日": ["2026-06-30"],
+        }),
+    )
+
+    lines, errors = china_sentiment._stock_comment_section(
+        "601138", "2026-06-22", "2026-06-29"
+    )
+
+    assert lines == []
+    assert errors == [
+        "DATA_DEGRADED: AKShare stock_comment_em returned no row for this "
+        "symbol in requested window."
+    ]
+
+
+@pytest.mark.unit
+def test_filter_date_range_fails_closed_without_expected_date_column():
+    data = pd.DataFrame({"排名": [1], "证券代码": ["SH601138"]})
+
+    result = china_sentiment._filter_date_range(
+        data, "时间", "2026-06-22", "2026-06-29"
+    )
+
+    assert result.empty
+    assert list(result.columns) == ["排名", "证券代码"]
+
+
+@pytest.mark.unit
 def test_get_china_a_local_sentiment_degrades_optional_endpoint(monkeypatch):
     monkeypatch.setattr(
         china_sentiment.ak,
