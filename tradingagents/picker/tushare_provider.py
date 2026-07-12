@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from datetime import date
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from .errors import (
     PITConfigurationError,
+    PITError,
     PITSchemaError,
     TushareNotConfiguredError,
     TushareRateLimitError,
@@ -76,19 +78,28 @@ class TushareProvider:
 
         resolved_client = client
         if resolved_client is None:
+            import_failed = False
+            initialization_failed = False
             try:
                 module = importlib.import_module("tushare")
                 resolved_client = module.pro_api(config.token)
-            except ImportError as exc:
+            except ImportError:
+                import_failed = True
+            except Exception:
+                initialization_failed = True
+
+            if import_failed:
                 raise TushareNotConfiguredError(
                     'Tushare PIT support is unavailable; run pip install ".[pit]"'
-                ) from exc
+                )
+            if initialization_failed:
+                raise PITConfigurationError("Tushare client initialization failed")
 
         return cls(resolved_client, page_size=page_size)
 
     def probe(self) -> None:
         spec = ENDPOINTS[Dataset.TRADE_CAL]
-        year = str(date.today().year)
+        year = str(datetime.now(ZoneInfo("Asia/Shanghai")).year)
         kwargs = {
             "start_date": f"{year}0101",
             "end_date": f"{year}1231",
@@ -97,14 +108,18 @@ class TushareProvider:
             "limit": 1,
             "offset": 0,
         }
+        probe_failed = False
         try:
             result = self._query(spec.api_name, **kwargs)
         except TushareRateLimitError:
             raise
-        except Exception as exc:
+        except PITError:
+            probe_failed = True
+
+        if probe_failed:
             raise PITConfigurationError(
                 "Tushare endpoint 'trade_cal' probe failed; verify token permissions"
-            ) from exc
+            )
 
         if not isinstance(result, pd.DataFrame) or result.empty:
             raise PITConfigurationError(
@@ -169,12 +184,17 @@ class TushareProvider:
         try:
             return self.client.query(endpoint, **kwargs)
         except Exception as exc:
-            if not self._is_throttle(exc):
-                raise
+            throttled = self._is_throttle(exc)
             retry_after = getattr(exc, "retry_after", None)
             if isinstance(retry_after, bool) or not isinstance(retry_after, (int, float)):
                 retry_after = None
-            raise TushareRateLimitError(str(exc), retry_after=retry_after) from exc
+
+        if throttled:
+            raise TushareRateLimitError(
+                f"Tushare endpoint '{endpoint}' rate limit exceeded",
+                retry_after=retry_after,
+            )
+        raise PITError(f"Tushare endpoint '{endpoint}' request failed")
 
     @staticmethod
     def _concat_unique(frames: list[pd.DataFrame]) -> pd.DataFrame:

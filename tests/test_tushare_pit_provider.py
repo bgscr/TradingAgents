@@ -1,11 +1,14 @@
+import traceback
 from dataclasses import FrozenInstanceError
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from tradingagents.picker.errors import (
     PITConfigurationError,
+    PITError,
     PITSchemaError,
     TushareNotConfiguredError,
     TushareRateLimitError,
@@ -30,6 +33,16 @@ class FakePro:
 
 def config(tmp_path, token="token"):
     return PITConfig(token, tmp_path, 40, {}, 8)
+
+
+def assert_credential_safe(error):
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert "secret-token" not in str(error)
+    assert "secret-token" not in formatted
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_missing_token_fails_without_importing_sdk(tmp_path, monkeypatch):
@@ -85,12 +98,29 @@ def test_missing_sdk_error_has_install_hint_without_token(tmp_path, monkeypatch)
         raise ImportError("secret-token")
 
     monkeypatch.setattr("importlib.import_module", missing_sdk)
+    pit_config = config(tmp_path, token="secret-token")
 
     with pytest.raises(TushareNotConfiguredError) as error:
-        TushareProvider.create(config(tmp_path, token="secret-token"))
+        TushareProvider.create(pit_config)
 
     assert 'pip install ".[pit]"' in str(error.value)
-    assert "secret-token" not in str(error.value)
+    assert_credential_safe(error.value)
+
+
+def test_sdk_client_initialization_failure_is_sanitized(tmp_path, monkeypatch):
+    class BrokenModule:
+        @staticmethod
+        def pro_api(_token):
+            raise RuntimeError("secret-token")
+
+    monkeypatch.setattr("importlib.import_module", lambda _name: BrokenModule())
+    pit_config = config(tmp_path, token="secret-token")
+
+    with pytest.raises(PITConfigurationError) as error:
+        TushareProvider.create(pit_config)
+
+    assert str(error.value) == "Tushare client initialization failed"
+    assert_credential_safe(error.value)
 
 
 def test_endpoint_catalog_has_exact_phase_one_contract():
@@ -314,27 +344,41 @@ def test_throttle_signals_become_typed_error(tmp_path, error):
     client = FakePro([error])
     provider = TushareProvider.create(config(tmp_path), client=client)
 
-    with pytest.raises(TushareRateLimitError):
+    with pytest.raises(TushareRateLimitError) as raised:
         provider.fetch(PartitionKey(Dataset.DAILY, "20260710"))
+
+    assert str(raised.value) == "Tushare endpoint 'daily' rate limit exceeded"
 
 
 def test_throttle_preserves_numeric_retry_after(tmp_path):
-    client = FakePro([ThrottleError("rate limit", retry_after=2.5)])
+    client = FakePro([ThrottleError("rate limit secret-token", retry_after=2.5)])
     provider = TushareProvider.create(config(tmp_path), client=client)
 
     with pytest.raises(TushareRateLimitError) as error:
         provider.fetch(PartitionKey(Dataset.DAILY, "20260710"))
 
     assert error.value.retry_after == 2.5
+    assert_credential_safe(error.value)
+
+
+def test_generic_sdk_failure_becomes_sanitized_endpoint_error(tmp_path):
+    client = FakePro([RuntimeError("request failed for secret-token")])
+    provider = TushareProvider.create(config(tmp_path), client=client)
+
+    with pytest.raises(PITError) as error:
+        provider.fetch(PartitionKey(Dataset.DAILY, "20260710"))
+
+    assert str(error.value) == "Tushare endpoint 'daily' request failed"
+    assert_credential_safe(error.value)
 
 
 def test_probe_requests_one_current_year_trade_calendar_row(tmp_path):
-    client = FakePro([pd.DataFrame({"cal_date": [f"{date.today().year}0101"]})])
+    year = str(datetime.now(ZoneInfo("Asia/Shanghai")).year)
+    client = FakePro([pd.DataFrame({"cal_date": [f"{year}0101"]})])
     provider = TushareProvider.create(config(tmp_path), client=client)
 
     assert provider.probe() is None
 
-    year = str(date.today().year)
     assert client.calls == [
         (
             "trade_cal",
@@ -350,6 +394,47 @@ def test_probe_requests_one_current_year_trade_calendar_row(tmp_path):
     ]
 
 
+def test_probe_uses_china_year_at_los_angeles_new_year_boundary(tmp_path, monkeypatch):
+    los_angeles_time = datetime(
+        2026,
+        12,
+        31,
+        8,
+        30,
+        tzinfo=ZoneInfo("America/Los_Angeles"),
+    )
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, timezone):
+            assert timezone == ZoneInfo("Asia/Shanghai")
+            return los_angeles_time.astimezone(timezone)
+
+    class FixedHostDate:
+        @classmethod
+        def today(cls):
+            return los_angeles_time.date()
+
+    monkeypatch.setattr(
+        "tradingagents.picker.tushare_provider.datetime",
+        FixedDateTime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tradingagents.picker.tushare_provider.date",
+        FixedHostDate,
+        raising=False,
+    )
+    client = FakePro([pd.DataFrame({"cal_date": ["20270101"]})])
+    provider = TushareProvider.create(config(tmp_path), client=client)
+
+    provider.probe()
+
+    assert los_angeles_time.year == 2026
+    assert client.calls[0][1]["start_date"] == "20270101"
+    assert client.calls[0][1]["end_date"] == "20271231"
+
+
 @pytest.mark.parametrize("result", [RuntimeError("secret-token"), pd.DataFrame()])
 def test_probe_permission_failure_names_endpoint_without_exposing_token(tmp_path, result):
     client = FakePro([result])
@@ -358,14 +443,16 @@ def test_probe_permission_failure_names_endpoint_without_exposing_token(tmp_path
     with pytest.raises(PITConfigurationError, match="trade_cal") as error:
         provider.probe()
 
-    assert "secret-token" not in str(error.value)
+    assert_credential_safe(error.value)
 
 
 def test_probe_preserves_typed_throttle_error(tmp_path):
-    client = FakePro([ThrottleError("rate limit", retry_after=3)])
+    client = FakePro([ThrottleError("rate limit secret-token", retry_after=3)])
     provider = TushareProvider.create(config(tmp_path), client=client)
 
     with pytest.raises(TushareRateLimitError) as error:
         provider.probe()
 
     assert error.value.retry_after == 3
+    assert str(error.value) == "Tushare endpoint 'trade_cal' rate limit exceeded"
+    assert_credential_safe(error.value)
