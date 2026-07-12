@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from dataclasses import replace
 
 import pandas as pd
@@ -171,3 +172,137 @@ def test_malformed_manifest_fields_fail_as_schema_errors(tmp_path):
     assert not malformed.is_complete(key)
     with pytest.raises(PITSchemaError, match="failed verification"):
         malformed.load_frame(key)
+
+
+def test_store_complete_rejects_corrupt_existing_hash_target(tmp_path):
+    cache = PITCache(tmp_path)
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    raw_payload = b'[{"v": 1}]'
+    raw_sha256 = hashlib.sha256(raw_payload).hexdigest()
+    target = tmp_path / "raw" / "daily" / "20260710" / f"{raw_sha256}.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"corrupt pre-existing content")
+
+    with pytest.raises(PITSchemaError, match="checksum"):
+        cache.store_complete(key, raw_payload, pd.DataFrame({"v": [1]}), "1")
+
+    assert target.read_bytes() == b"corrupt pre-existing content"
+    assert cache.records() == {}
+    assert list((tmp_path / "normalized").rglob("*.parquet")) == []
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("raw_payload", [b"not-json", b'"\xff"'])
+def test_store_complete_rejects_invalid_raw_json_without_writing(tmp_path, raw_payload):
+    cache = PITCache(tmp_path)
+    key = PartitionKey(Dataset.DAILY, "20260710")
+
+    with pytest.raises(PITSchemaError, match="valid UTF-8 JSON"):
+        cache.store_complete(key, raw_payload, pd.DataFrame({"v": [1]}), "1")
+
+    assert cache.records() == {}
+    assert list(tmp_path.rglob("*.json")) == []
+    assert list(tmp_path.rglob("*.parquet")) == []
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_top_level_manifest_array_raises_schema_error(tmp_path):
+    (tmp_path / "manifest.json").write_text("[]", encoding="utf-8")
+
+    with pytest.raises(PITSchemaError, match="manifest.json is invalid"):
+        PITCache(tmp_path)
+
+
+def _cache_with_existing_version(tmp_path):
+    cache = PITCache(tmp_path)
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    record = cache.store_complete(
+        key, b'[{"v": 1}]', pd.DataFrame({"v": [1]}), "1"
+    )
+    preserved = {
+        tmp_path / record.raw_path: (tmp_path / record.raw_path).read_bytes(),
+        tmp_path / record.normalized_path: (
+            tmp_path / record.normalized_path
+        ).read_bytes(),
+    }
+    return cache, key, record, preserved
+
+
+def _assert_failed_store_preserved_existing_version(
+    tmp_path, cache, key, record, preserved
+):
+    assert cache.records()[key.storage_key] == record
+    assert PITCache(tmp_path).records()[key.storage_key] == record
+    for path, expected_bytes in preserved.items():
+        assert path.read_bytes() == expected_bytes
+    assert set((tmp_path / "raw").rglob("*.json")) == {tmp_path / record.raw_path}
+    assert set((tmp_path / "normalized").rglob("*.parquet")) == {
+        tmp_path / record.normalized_path
+    }
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_store_failure_after_raw_install_rolls_back_only_new_content(
+    tmp_path, monkeypatch
+):
+    cache, key, record, preserved = _cache_with_existing_version(tmp_path)
+    real_replace = os.replace
+    replacements = 0
+
+    def fail_normalized_install(source, target):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 2:
+            raise OSError("normalized install failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr("tradingagents.picker.cache.os.replace", fail_normalized_install)
+
+    with pytest.raises(OSError, match="normalized install failed"):
+        cache.store_complete(key, b'[{"v": 2}]', pd.DataFrame({"v": [2]}), "1")
+
+    _assert_failed_store_preserved_existing_version(
+        tmp_path, cache, key, record, preserved
+    )
+
+
+def test_store_failure_after_normalized_install_rolls_back_only_new_content(
+    tmp_path, monkeypatch
+):
+    cache, key, record, preserved = _cache_with_existing_version(tmp_path)
+
+    def fail_record_update(new_record):
+        raise OSError("record update failed")
+
+    monkeypatch.setattr(cache, "_replace_record", fail_record_update)
+
+    with pytest.raises(OSError, match="record update failed"):
+        cache.store_complete(key, b'[{"v": 2}]', pd.DataFrame({"v": [2]}), "1")
+
+    _assert_failed_store_preserved_existing_version(
+        tmp_path, cache, key, record, preserved
+    )
+
+
+def test_store_failure_during_manifest_replace_rolls_back_only_new_content(
+    tmp_path, monkeypatch
+):
+    cache, key, record, preserved = _cache_with_existing_version(tmp_path)
+    real_replace = os.replace
+    replacements = 0
+
+    def fail_manifest_replace(source, target):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 3:
+            raise OSError("manifest replace failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr("tradingagents.picker.cache.os.replace", fail_manifest_replace)
+
+    with pytest.raises(OSError, match="manifest replace failed"):
+        cache.store_complete(key, b'[{"v": 2}]', pd.DataFrame({"v": [2]}), "1")
+
+    _assert_failed_store_preserved_existing_version(
+        tmp_path, cache, key, record, preserved
+    )

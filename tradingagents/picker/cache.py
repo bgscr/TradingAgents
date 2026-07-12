@@ -60,6 +60,7 @@ class PITCache:
         frame: pd.DataFrame,
         schema_version: str,
     ) -> PartitionRecord:
+        self._validate_raw_json(raw_payload)
         raw_directory = self.root / "raw" / key.dataset.value / key.partition
         normalized_directory = (
             self.root / "normalized" / key.dataset.value / key.partition
@@ -160,7 +161,15 @@ class PITCache:
         try:
             raw = json.loads(self._manifest_path.read_text(encoding="utf-8"))
             manifest = Manifest.from_dict(raw)
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        except (
+            AttributeError,
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise PITSchemaError(
                 f"cache manifest {self._manifest_path.name} is invalid ({type(exc).__name__})"
             ) from exc
@@ -292,6 +301,16 @@ class PITCache:
         return digest.hexdigest()
 
     @staticmethod
+    def _validate_raw_json(raw_payload: bytes) -> None:
+        try:
+            decoded = raw_payload.decode("utf-8")
+            json.loads(decoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PITSchemaError(
+                "raw partition payload is not valid UTF-8 JSON"
+            ) from exc
+
+    @staticmethod
     def _new_temp_path(directory: Path, label: str) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(
@@ -327,12 +346,22 @@ class PITCache:
             path.unlink(missing_ok=True)
             raise
 
-    @staticmethod
-    def _install_version(source: Path, target: Path) -> bool:
+    @classmethod
+    def _install_version(cls, source: Path, target: Path) -> bool:
         if target.exists():
             if not target.is_file():
                 raise PITSchemaError(
                     f"content-addressed cache target {target.name} is not a file"
+                )
+            try:
+                existing_sha256 = cls._sha256_file(target)
+            except OSError as exc:
+                raise PITSchemaError(
+                    f"content-addressed cache target {target.name} cannot be verified"
+                ) from exc
+            if existing_sha256 != target.stem:
+                raise PITSchemaError(
+                    f"content-addressed cache target {target.name} has a checksum mismatch"
                 )
             source.unlink()
             return False
