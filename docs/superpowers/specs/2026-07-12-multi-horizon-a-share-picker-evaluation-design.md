@@ -125,8 +125,8 @@ The PIT dataset combines:
 - `stock_basic` queried across listed, delisted, and paused/list-status records
   for listing and delisting dates;
 - `daily` for unadjusted OHLCV execution data;
-- `daily_basic` for daily turnover, shares, total/free-float market value, and
-  historical valuation fields;
+- `daily_basic` for daily turnover, share counts, `circ_mv`, and historical
+  valuation fields;
 - `moneyflow` for date-bounded stock-level fund-flow inputs;
 - `adj_factor` for adjusted factor histories and reconciliation;
 - `namechange` for effective historical ST/name intervals;
@@ -139,6 +139,34 @@ The PIT dataset combines:
 
 `namechange` is a separate dataset, not a field of `daily_basic`. Current-only
 industry labels are never treated as PIT industry membership.
+
+### Canonical market-cap fields
+
+Tushare's normalized contract distinguishes circulating market value from
+true free-float market value. `daily_basic` uses `circ_mv`; `float_mv` is not a
+canonical field in this design.
+
+The provider adapter converts Tushare's documented ten-thousand-unit fields to
+CNY and exposes both values:
+
+```text
+circ_market_cap_cny = circ_mv * 10_000
+free_float_market_cap_cny = free_share * close * 10_000
+```
+
+`free_share` is measured in ten thousand shares and `close` in CNY per share.
+The RMB 500 million eligibility floor, size buckets, neutralization, and risk
+controls all consume only `free_float_market_cap_cny`. Raw `circ_mv`,
+`free_share`, and `float_share` remain provenance fields and cannot be read
+directly by Phase 2 or Phase 3 domain logic.
+
+Normalization fails a symbol/date when required values are missing, units are
+not the declared units, `free_share > float_share`, `float_share > total_share`,
+or `circ_market_cap_cny` does not reconcile with
+`float_share * close * 10_000` within the provider rounding tolerance.
+Reconciliation permits the larger of RMB 10,000 or 0.1% of reported
+circulating market value. This prevents different phases from silently using
+different definitions of market capitalization.
 
 ### Cache and provenance
 
@@ -157,6 +185,28 @@ partition records:
 Backtests read only cached partitions. Re-fetching creates a new version rather
 than mutating a prior run's evidence. A run manifest pins the exact partition
 checksums used.
+
+### Rate limiting and resume
+
+Historical ingestion is paced by an endpoint-aware token-bucket limiter and
+uses one network worker by default. Tushare does not provide one dependable
+quota-discovery contract for every token and endpoint, so the implementation
+must not claim automatic tier detection when it cannot prove it. The effective
+calls-per-minute value comes from an explicit endpoint override or
+`TUSHARE_CALLS_PER_MINUTE`; absent either, the conservative default is 40 calls
+per minute.
+
+On a throttling response, ingestion honors a provider retry delay when one is
+available. Otherwise it uses exponential backoff with jitter and reduces its
+effective rate for the rest of the run. After eight failed attempts, it records
+the partition as pending and exits non-zero rather than spinning indefinitely.
+
+Each successfully validated partition is written atomically before the next
+request and immediately recorded in the checkpoint manifest. A resumed run
+skips checksum-verified partitions, retries pending/failed partitions, and
+never discards completed dates. If an endpoint hits its maximum row count, the
+adapter must paginate and reconcile the combined row count before marking the
+partition complete.
 
 Tushare materially improves PIT reconstruction but is not assumed infallible.
 Provider revisions, missing coverage, permissions, and publication/effective
@@ -359,9 +409,15 @@ Before each market session the ledger processes:
 4. cash payment dates to move dividend receivables into settled cash and
    buying power.
 
-Rights issues, mergers, and other actions use distinct event types. If the
-first implementation cannot model an event affecting a held symbol, validated
-mode fails that symbol/date rather than pretending it is an ordinary split.
+Rights issues, mergers, and other actions use distinct event types. Rights
+issues are deliberately unsupported in the first implementation: the ledger
+must never create cash or shares for them and must never freeze subscription
+cash automatically. A symbol with a known active subscription window is
+ineligible for a new position. If a rights issue becomes effective while a
+symbol is held, the affected validated portfolio and fold stop with an
+`UNSUPPORTED_RIGHTS_ISSUE` verdict. The backtester must not remove the symbol
+and continue, because that would introduce post-selection survivorship bias.
+Live or paper mode emits a blocking manual-action warning.
 
 Cash receivables contribute to NAV from ex-date but not buying power before
 payment. Pending shares contribute to economic NAV but cannot be sold before
@@ -484,6 +540,8 @@ Validated backtests create an immutable run directory containing:
   required dataset named.
 - Missing mandatory PIT partitions invalidate the affected evaluation date; no
   keyless fallback fills them.
+- Exhausted ingestion retries leave the partition pending and the command exits
+  non-zero; a subsequent run resumes from the checkpoint manifest.
 - Missing PIT industry history activates documented size-only mode.
 - Missing execution, market-cap, or corporate-action data fails the symbol/date
   closed.
@@ -507,9 +565,14 @@ Unit tests cover:
 - size/industry caps and raw-versus-selected ranks;
 - PIT availability and effective-date comparisons;
 - cache checksums and manifest pinning;
+- token-bucket pacing, adaptive throttling, retry exhaustion, atomic partition
+  writes, pagination, and checkpoint resume using a fake clock/provider;
+- canonical `circ_market_cap_cny` and `free_float_market_cap_cny` conversion,
+  unit validation, and share-count reconciliation;
 - T+1 lots, suspensions, price-limit entry/exit behavior, and costs;
 - consecutive one-word limit-down forced holds;
 - cash dividends, bonus shares, pending entitlements, and payment/listing dates;
+- rights-issue entry exclusion and fail-closed held-position behavior;
 - adjustment-factor reconciliation failures; and
 - accounting invariants for cash, receivables, positions, and NAV.
 
@@ -529,9 +592,10 @@ Delivery is gated:
 
 ### Phase 1: PIT data foundation
 
-Implement Tushare capability checks, ingestion, immutable cache, manifests,
-and the PIT snapshot/universe contract. Verify reconstructible delisted/ST
-fixtures and fail-closed coverage.
+Implement Tushare capability checks, paced/resumable ingestion, immutable
+cache, manifests, canonical market-cap fields, and the PIT snapshot/universe
+contract. Verify reconstructible delisted/ST fixtures, throttle recovery,
+checkpoint resume, and fail-closed coverage.
 
 ### Phase 2: Multi-horizon ranking
 
