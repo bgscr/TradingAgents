@@ -349,6 +349,108 @@ def test_cache_backed_snapshot_loads_history_and_computes_twenty_day_average(tmp
     assert dates[-1] == AS_OF
 
 
+def test_cache_backed_snapshot_stitches_cross_year_calendar_and_daily_history(
+    tmp_path,
+):
+    cache = PITCache(tmp_path)
+    as_of = "20260109"
+    prior_year_dates = (
+        pd.bdate_range(end="2025-12-31", periods=53).strftime("%Y%m%d").tolist()
+    )
+    current_year_dates = (
+        pd.bdate_range(start="2026-01-01", end="2026-01-09")
+        .strftime("%Y%m%d")
+        .tolist()
+    )
+    all_dates = prior_year_dates + current_year_dates
+    trailing_dates = all_dates[-20:]
+
+    _store(
+        cache,
+        Dataset.TRADE_CAL,
+        "2026",
+        pd.DataFrame(
+            {
+                "cal_date": current_year_dates,
+                "is_open": [1] * len(current_year_dates),
+            }
+        ),
+    )
+    _store(
+        cache,
+        Dataset.TRADE_CAL,
+        "2025",
+        pd.DataFrame(
+            {
+                "cal_date": prior_year_dates,
+                "is_open": [1] * len(prior_year_dates),
+            }
+        ),
+    )
+    _store(
+        cache,
+        Dataset.STOCK_BASIC,
+        "current",
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "name": ["平安银行"],
+                "list_date": [all_dates[0]],
+                "delist_date": [""],
+            }
+        ),
+    )
+    _store(
+        cache,
+        Dataset.NAMECHANGE,
+        "all",
+        pd.DataFrame(columns=["ts_code", "name", "start_date", "end_date"]),
+    )
+    for index, trade_date in enumerate(trailing_dates):
+        _store(
+            cache,
+            Dataset.DAILY,
+            trade_date,
+            pd.DataFrame(
+                {
+                    "ts_code": ["000001.SZ"],
+                    "trade_date": [trade_date],
+                    "close": [10.0],
+                    "amount_cny": [301_000_000.0 + index * 1_000_000.0],
+                }
+            ),
+        )
+    _store(
+        cache,
+        Dataset.DAILY_BASIC,
+        as_of,
+        pd.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": [as_of],
+                "free_float_market_cap_cny": [500_000_000.0],
+            }
+        ),
+    )
+    _store(
+        cache,
+        Dataset.SUSPEND_D,
+        as_of,
+        pd.DataFrame(columns=["ts_code", "suspend_date"]),
+    )
+
+    snapshot = build_snapshot(cache, as_of)
+    row = snapshot.universe.iloc[0]
+
+    assert trailing_dates[0].startswith("2025")
+    assert trailing_dates[-1].startswith("2026")
+    assert row["listing_age_sessions"] == 60
+    assert row["amount_cny"] == 320_000_000.0
+    assert row["avg_amount_20d_cny"] == pytest.approx(310_500_000.0)
+    assert snapshot.coverage == 1.0
+    assert row["eligible"]
+
+
 @pytest.mark.parametrize(
     ("dataset", "partition"),
     [
