@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
@@ -16,20 +18,39 @@ from .errors import NoMarketDataError, VendorNotConfiguredError
 from .stockstats_utils import _assert_ohlcv_not_stale
 from .symbol_utils import resolve_china_a_symbol
 
+logger = logging.getLogger(__name__)
+
 FIELDS = "date,code,open,high,low,close,volume,amount"
+_BAOSTOCK_SESSION_LOCK = threading.Lock()
+_BAOSTOCK_SESSION_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 @contextmanager
 def _session():
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        login = bs.login()
-    if getattr(login, "error_code", "0") != "0":
-        raise VendorNotConfiguredError(f"Baostock login failed: {login.error_msg}")
+    acquired = _BAOSTOCK_SESSION_LOCK.acquire(timeout=_BAOSTOCK_SESSION_LOCK_TIMEOUT_SECONDS)
+    if not acquired:
+        message = (
+            f"Timed out after {_BAOSTOCK_SESSION_LOCK_TIMEOUT_SECONDS:g}s "
+            "waiting for the BaoStock session lock; another session may be hung."
+        )
+        logger.warning(message)
+        raise TimeoutError(message)
+
     try:
-        yield
-    finally:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            bs.logout()
+            login = bs.login()
+        if getattr(login, "error_code", "0") != "0":
+            raise VendorNotConfiguredError(f"Baostock login failed: {login.error_msg}")
+        try:
+            yield
+        finally:
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                bs.logout()
+    finally:
+        _BAOSTOCK_SESSION_LOCK.release()
 
 
 def _rows_to_frame(rows: list[list[str]], symbol: str, canonical: str) -> pd.DataFrame:
@@ -146,7 +167,9 @@ def get_stock_stats_indicators_window(
     current = curr_date_dt
     while current >= before:
         date_str = current.strftime("%Y-%m-%d")
-        lines.append(f"{date_str}: {values.get(date_str, 'N/A: Not a trading day (weekend or holiday)')}")
+        lines.append(
+            f"{date_str}: {values.get(date_str, 'N/A: Not a trading day (weekend or holiday)')}"
+        )
         current = current - relativedelta(days=1)
 
     return (
