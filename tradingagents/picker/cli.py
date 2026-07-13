@@ -40,9 +40,11 @@ def run_backfill(
     limiters: dict[str, TokenBucketLimiter] = {}
 
     def limiter_for(endpoint: str) -> TokenBucketLimiter:
-        return limiters.setdefault(
-            endpoint, TokenBucketLimiter(config.rate_for(endpoint))
-        )
+        limiter = limiters.get(endpoint)
+        if limiter is None:
+            limiter = TokenBucketLimiter(config.rate_for(endpoint))
+            limiters[endpoint] = limiter
+        return limiter
 
     ingestor = PITIngestor(provider, cache, limiter_for, RetryPolicy())
     ingestor.probe()
@@ -72,6 +74,7 @@ def backfill(
     ] = None,
     refresh: Annotated[bool, typer.Option("--refresh")] = False,
 ) -> None:
+    error: str | None = None
     try:
         completed, skipped, failed, run_id = run_backfill(
             start_date=start_date,
@@ -81,8 +84,10 @@ def backfill(
             refresh=refresh,
         )
     except PITError as exc:
-        typer.echo(f"PIT backfill failed: {_safe_error(exc)}", err=True)
-        raise typer.Exit(code=1) from exc
+        error = _safe_error(exc)
+    if error is not None:
+        typer.echo(f"PIT backfill failed: {error}", err=True)
+        raise typer.Exit(code=1)
     typer.echo(
         f"completed={completed} skipped={skipped} failed={failed} run_id={run_id}"
     )
@@ -93,9 +98,12 @@ def snapshot(
     date: Annotated[str, typer.Option("--date")],
     cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
 ) -> None:
+    error: str | None = None
     try:
         summary = snapshot_summary(date=date, cache_dir=cache_dir)
     except PITError as exc:
-        typer.echo(f"PIT snapshot failed: {_safe_error(exc)}", err=True)
-        raise typer.Exit(code=1) from exc
+        error = _safe_error(exc)
+    if error is not None:
+        typer.echo(f"PIT snapshot failed: {error}", err=True)
+        raise typer.Exit(code=1)
     typer.echo(json.dumps(summary, sort_keys=True))

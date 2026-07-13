@@ -123,9 +123,10 @@ The foundation ingests exactly six datasets:
 - `suspend_d`: daily suspension state.
 
 Phase 1 reconstructs listed, delisted, ST, and suspended cases as of the
-requested date. It intentionally excludes ranking or scoring, portfolio and
-execution behavior, rights-issue and dividend adjustment logic, and
-walk-forward fold orchestration. Those belong to later phases.
+requested date. It intentionally excludes industry history, money flow, price
+limits, dividends and broader corporate actions (including rights issues),
+ranking or scoring, portfolio and execution behavior, and walk-forward
+evaluation. Those belong to later phases.
 
 ## Validation and fail-closed behavior
 
