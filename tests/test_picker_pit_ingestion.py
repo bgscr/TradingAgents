@@ -1,11 +1,16 @@
 import json
 import re
+import traceback
 
 import pandas as pd
 import pytest
 
 from tradingagents.picker.cache import PITCache
-from tradingagents.picker.errors import PITSchemaError, TushareRateLimitError
+from tradingagents.picker.errors import (
+    PITError,
+    PITSchemaError,
+    TushareRateLimitError,
+)
 from tradingagents.picker.ingestion import (
     PITIngestor,
     open_trade_dates,
@@ -366,12 +371,14 @@ def test_eighth_throttle_leaves_pending_and_exits(tmp_path):
         sleeper=lambda _: None,
     )
 
-    with pytest.raises(TushareRateLimitError):
+    with pytest.raises(TushareRateLimitError) as caught:
         ingestor._ingest_keys([key])
 
     assert len(provider.calls) == 8
     assert limiter.acquires == 8
     assert limiter.penalties == 8
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert cache.records()[key.storage_key].status is PartitionStatus.PENDING
 
 
@@ -387,14 +394,20 @@ def test_non_throttle_error_marks_failed_without_leaking_token(tmp_path):
         sleeper=lambda _: None,
     )
 
-    with pytest.raises(RuntimeError, match="super-secret"):
+    with pytest.raises(PITError, match="partition 'daily/20260710'") as caught:
         ingestor._ingest_keys([key])
 
     record = cache.records()[key.storage_key]
     assert record.status is PartitionStatus.FAILED
     assert record.error.startswith("RuntimeError:")
     assert "super-secret" not in record.error
-    assert "token=<redacted>" in record.error
+    assert "token" not in record.error.casefold()
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert "super-secret" not in formatted
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_non_throttle_error_redacts_bearer_credential(tmp_path):
@@ -411,12 +424,18 @@ def test_non_throttle_error_redacts_bearer_credential(tmp_path):
         sleeper=lambda _: None,
     )
 
-    with pytest.raises(RuntimeError, match="highly-sensitive-value"):
+    with pytest.raises(PITError, match="partition 'daily/20260710'") as caught:
         ingestor._ingest_keys([key])
 
     error = cache.records()[key.storage_key].error
     assert "highly-sensitive-value" not in error
-    assert "Authorization: <redacted>" in error
+    assert "authorization" not in error.casefold()
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert "highly-sensitive-value" not in formatted
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_raw_table_json_is_captured_before_normalization(tmp_path, monkeypatch):
@@ -535,23 +554,72 @@ def test_all_skipped_reruns_create_distinct_complete_manifests(tmp_path):
 
 
 def test_ordinary_failure_finalizes_failed_run_with_sanitized_error(tmp_path):
+    marker = "TUSHARE_TOKEN"
+    secret = "exact-super-secret-value"
     cache = PITCache(tmp_path)
     ingestor = PITIngestor(
-        FakeProvider([RuntimeError("token=super-secret")]),
+        FakeProvider([RuntimeError(f"{marker}={secret}")]),
         cache,
         lambda endpoint: NoWaitLimiter(),
         RetryPolicy(),
         sleeper=lambda _: None,
     )
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(PITError, match="partition 'namechange/all'") as caught:
         ingestor.ingest("20260710", "20260710")
 
     manifest = load_only_run(cache)
+    partition_error = cache.records()["namechange/all"].error
     assert manifest["status"] == "failed"
     assert manifest["partitions"][0]["status"] == "failed"
-    assert manifest["error"].startswith("RuntimeError:")
-    assert "super-secret" not in manifest["error"]
+    persisted = json.dumps(
+        {"partition_error": partition_error, "run_manifest": manifest}
+    )
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    for leaked in (marker, secret):
+        assert leaked not in persisted
+        assert leaked not in formatted
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_public_ingest_final_throttle_is_sanitized_typed_and_pending(tmp_path):
+    marker = "TUSHARE_TOKEN"
+    secret = "throttle-super-secret-value"
+    throttles = [
+        TushareRateLimitError(f"{marker}={secret}", retry_after=4.5)
+        for _ in range(8)
+    ]
+    cache = PITCache(tmp_path)
+    ingestor = PITIngestor(
+        FakeProvider(throttles),
+        cache,
+        lambda endpoint: NoWaitLimiter(),
+        RetryPolicy(max_attempts=8),
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(TushareRateLimitError) as caught:
+        ingestor.ingest("20260710", "20260710")
+
+    assert caught.value.retry_after == 4.5
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    persisted = json.dumps(
+        {
+            "partition": cache.records()["namechange/all"].error,
+            "run": load_only_run(cache),
+        }
+    )
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    for leaked in (marker, secret):
+        assert leaked not in persisted
+        assert leaked not in formatted
+    assert cache.records()["namechange/all"].status is PartitionStatus.PENDING
 
 
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(2)])
@@ -607,3 +675,73 @@ def test_probe_uses_trade_cal_limiter_and_same_retry_path(tmp_path):
         "acquire",
         "probe",
     ]
+
+
+def test_probe_replaces_raw_failure_without_secret_context(tmp_path):
+    marker = "TUSHARE_TOKEN"
+    secret = "probe-super-secret-value"
+    ingestor = PITIngestor(
+        FakeProbeProvider([RuntimeError(f"{marker}={secret}")]),
+        PITCache(tmp_path),
+        lambda endpoint: NoWaitLimiter(),
+        RetryPolicy(),
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(PITError, match="endpoint 'trade_cal'") as caught:
+        ingestor.probe()
+
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    for leaked in (marker, secret):
+        assert leaked not in formatted
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_injected_retry_policy_is_hard_capped_at_eight_calls(tmp_path):
+    marker = "TUSHARE_TOKEN"
+    secret = "ninth-attempt-secret"
+    provider = FakeProbeProvider(
+        [
+            TushareRateLimitError(
+                f"{marker}={secret}", retry_after=float(attempt)
+            )
+            for attempt in range(1, 10)
+        ]
+    )
+    limiter = NoWaitLimiter()
+    ingestor = PITIngestor(
+        provider,
+        PITCache(tmp_path),
+        lambda endpoint: limiter,
+        RetryPolicy(max_attempts=9),
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(TushareRateLimitError) as caught:
+        ingestor.probe()
+
+    assert len(provider.results) == 1
+    assert limiter.acquires == 8
+    assert limiter.penalties == 8
+    assert caught.value.retry_after == 8.0
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    formatted = "".join(
+        traceback.format_exception(caught.type, caught.value, caught.tb)
+    )
+    assert marker not in formatted
+    assert secret not in formatted
+
+
+def test_non_positive_retry_attempt_count_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="max_attempts must be positive"):
+        PITIngestor(
+            FakeProbeProvider([]),
+            PITCache(tmp_path),
+            lambda endpoint: NoWaitLimiter(),
+            RetryPolicy(max_attempts=0),
+            sleeper=lambda _: None,
+        )

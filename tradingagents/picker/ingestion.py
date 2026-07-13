@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import TypeVar
 
 from tradingagents.picker.cache import PITCache
-from tradingagents.picker.errors import TushareRateLimitError
+from tradingagents.picker.errors import PITError, TushareRateLimitError
 from tradingagents.picker.normalize import normalize_partition
 from tradingagents.picker.pit_models import (
     Dataset,
@@ -23,9 +23,10 @@ from tradingagents.picker.tushare_provider import TushareProvider
 
 _DATE_RE = re.compile(r"\d{8}")
 _SECRET_RE = re.compile(
-    r"(?i)\b(token|api[_ -]?key|authorization)\b"
+    r"(?i)(?:\bTUSHARE_TOKEN\b|\btoken\b|\bapi[_ -]?key\b|\bauthorization\b)"
     r"(\s*[:=]\s*|\s+)(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
+_MAX_PROVIDER_ATTEMPTS = 8
 _Result = TypeVar("_Result")
 
 
@@ -108,9 +109,7 @@ def plan_daily_partitions(open_dates: list[str]) -> list[PartitionKey]:
 
 
 def _sanitized_error(exc: BaseException) -> str:
-    message = _SECRET_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}<redacted>", str(exc)
-    )
+    message = _SECRET_RE.sub("<redacted>", str(exc))
     return f"{type(exc).__name__}: {message}"
 
 
@@ -123,15 +122,27 @@ class PITIngestor:
         retry_policy: RetryPolicy,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
+        if retry_policy.max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         self.provider = provider
         self.cache = cache
         self.limiter_for = limiter_for
         self.retry_policy = retry_policy
+        self._max_attempts = min(retry_policy.max_attempts, _MAX_PROVIDER_ATTEMPTS)
         self.sleeper = sleeper
         self._active_manifest: IngestionRunManifest | None = None
 
     def probe(self) -> None:
-        self._call_with_retry(Dataset.TRADE_CAL.value, self.provider.probe)
+        failure: Exception | None = None
+        try:
+            self._call_with_retry(Dataset.TRADE_CAL.value, self.provider.probe)
+        except TushareRateLimitError as exc:
+            failure = exc
+        except Exception:
+            failure = PITError("Tushare endpoint 'trade_cal' probe failed")
+
+        if failure is not None:
+            raise failure
 
     def ingest(
         self, start_date: str, end_date: str, refresh: bool = False
@@ -150,6 +161,7 @@ class PITIngestor:
         )
         self.cache.write_run_manifest(self._active_manifest)
 
+        failure: Exception | None = None
         try:
             bootstrap = self._ingest_keys(
                 plan_bootstrap_partitions(start_date, end_date), refresh=refresh
@@ -163,7 +175,10 @@ class PITIngestor:
             raise
         except Exception as exc:
             self._finalize_run("failed", _sanitized_error(exc))
-            raise
+            failure = exc
+
+        if failure is not None:
+            raise failure
 
         self._finalize_run("complete")
         return IngestionSummary(
@@ -187,6 +202,7 @@ class PITIngestor:
                 continue
 
             self.cache.mark_pending(key)
+            failure: Exception | None = None
             try:
                 frame = self._call_with_retry(
                     key.dataset.value, lambda key=key: self.provider.fetch(key)
@@ -201,9 +217,9 @@ class PITIngestor:
                     normalized,
                     schema_version="1",
                 )
-            except TushareRateLimitError:
+            except TushareRateLimitError as exc:
                 self._record_partition(self.cache.records()[key.storage_key])
-                raise
+                failure = exc
             except (KeyboardInterrupt, SystemExit):
                 self._record_partition(self.cache.records()[key.storage_key])
                 raise
@@ -211,7 +227,12 @@ class PITIngestor:
                 failed += 1
                 self.cache.mark_failed(key, _sanitized_error(exc))
                 self._record_partition(self.cache.records()[key.storage_key])
-                raise
+                failure = PITError(
+                    f"PIT ingestion failed for partition '{key.storage_key}'"
+                )
+
+            if failure is not None:
+                raise failure
 
             completed += 1
             self._record_partition(record)
@@ -226,16 +247,21 @@ class PITIngestor:
         self, endpoint: str, callable: Callable[[], _Result]
     ) -> _Result:
         limiter = self.limiter_for(endpoint)
-        for attempt in range(1, self.retry_policy.max_attempts + 1):
+        final_retry_after: float | None = None
+        for attempt in range(1, self._max_attempts + 1):
             limiter.acquire()
             try:
                 return callable()
             except TushareRateLimitError as exc:
                 limiter.penalize()
-                if attempt == self.retry_policy.max_attempts:
-                    raise
+                if attempt == self._max_attempts:
+                    final_retry_after = exc.retry_after
+                    break
                 self.sleeper(self.retry_policy.delay(attempt, exc.retry_after))
-        raise RuntimeError("retry policy must allow at least one attempt")
+        raise TushareRateLimitError(
+            f"Tushare endpoint '{endpoint}' rate limit exceeded",
+            retry_after=final_retry_after,
+        )
 
     def _record_partition(self, record: PartitionRecord) -> None:
         if self._active_manifest is None:
