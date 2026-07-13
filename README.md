@@ -177,6 +177,13 @@ python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
 
+### Optional point-in-time A-share data
+
+For backtesting workflows that need a reproducible China A-share universe,
+TradingAgents provides an optional Tushare-backed PIT data foundation. See the
+[PIT data foundation operator guide](docs/pit-data-foundation.md) for setup,
+backfill, snapshot, storage, and recovery details.
+
 ### Markets and tickers
 
 TradingAgents works with any market Yahoo Finance covers, using the exchange-suffixed ticker. Company identity and the alpha benchmark resolve automatically per market.
