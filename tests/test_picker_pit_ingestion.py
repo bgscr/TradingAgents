@@ -7,6 +7,7 @@ import pytest
 
 from tradingagents.picker.cache import PITCache
 from tradingagents.picker.errors import (
+    PITConfigurationError,
     PITError,
     PITSchemaError,
     TushareRateLimitError,
@@ -19,6 +20,7 @@ from tradingagents.picker.ingestion import (
 )
 from tradingagents.picker.pit_models import Dataset, PartitionKey, PartitionStatus
 from tradingagents.picker.rate_limit import RetryPolicy
+from tradingagents.picker.tushare_provider import TushareProvider
 
 
 class FakeProvider:
@@ -26,12 +28,17 @@ class FakeProvider:
         self.results = list(results)
         self.calls = []
 
-    def fetch(self, key):
-        self.calls.append(key)
-        result = self.results.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        return result
+    def fetch(self, key, request_executor=None):
+        def request():
+            self.calls.append(key)
+            result = self.results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        if request_executor is None:
+            return request()
+        return request_executor(key.dataset.value, request)
 
 
 class FakeProbeProvider:
@@ -39,13 +46,18 @@ class FakeProbeProvider:
         self.results = list(results)
         self.events = events
 
-    def probe(self):
-        if self.events is not None:
-            self.events.append("probe")
-        result = self.results.pop(0)
-        if isinstance(result, BaseException):
-            raise result
-        return result
+    def probe(self, request_executor=None):
+        def request():
+            if self.events is not None:
+                self.events.append("probe")
+            result = self.results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        if request_executor is None:
+            return request()
+        return request_executor(Dataset.TRADE_CAL.value, request)
 
 
 class NoWaitLimiter:
@@ -140,7 +152,7 @@ def test_partition_planning_uses_only_cached_calendar(tmp_path):
 def test_partition_planning_rejects_non_date_only_or_reversed_ranges(
     start_date, end_date
 ):
-    with pytest.raises(ValueError):
+    with pytest.raises(PITConfigurationError):
         plan_bootstrap_partitions(start_date, end_date)
 
 
@@ -286,9 +298,17 @@ def test_limiter_acquire_is_immediately_before_every_provider_call(
     key = PartitionKey(Dataset.DAILY, "20260710")
 
     class EventProvider(FakeProvider):
-        def fetch(self, key):
-            events.append("fetch")
-            return super().fetch(key)
+        def fetch(self, key, request_executor=None):
+            if request_executor is None:
+                events.append("fetch")
+                return super().fetch(key)
+
+            def recording_executor(endpoint, request):
+                return request_executor(
+                    endpoint, lambda: events.append("fetch") or request()
+                )
+
+            return super().fetch(key, recording_executor)
 
     limiter = NoWaitLimiter(events)
     ingestor = PITIngestor(
@@ -309,6 +329,119 @@ def test_limiter_acquire_is_immediately_before_every_provider_call(
         "acquire",
         "fetch",
     ]
+
+
+class SDKThrottle(RuntimeError):
+    status_code = 429
+    retry_after = 2.5
+
+
+class FakeSDKClient:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def query(self, endpoint, **kwargs):
+        self.calls.append((endpoint, kwargs))
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def test_ingestor_paces_each_pagination_page_and_retries_only_throttled_page(
+    tmp_path, monkeypatch
+):
+    identity_normalizer(monkeypatch)
+    first_page = pd.DataFrame({"ts_code": ["000001.SZ", "000002.SZ"]})
+    final_page = pd.DataFrame({"ts_code": ["000003.SZ"]})
+    client = FakeSDKClient([first_page, SDKThrottle("429"), final_page])
+    provider = TushareProvider(client, page_size=2)
+    limiter = NoWaitLimiter()
+    sleeps = []
+    ingestor = PITIngestor(
+        provider,
+        PITCache(tmp_path),
+        lambda endpoint: limiter,
+        RetryPolicy(jitter=lambda low, high: 0.0),
+        sleeper=sleeps.append,
+    )
+
+    summary = ingestor._ingest_keys(
+        [PartitionKey(Dataset.DAILY, "20260710")]
+    )
+
+    assert summary.completed == 1
+    assert [call[1]["offset"] for call in client.calls] == [0, 2, 2]
+    assert limiter.acquires == len(client.calls) == 3
+    assert limiter.penalties == 1
+    assert sleeps == [2.5]
+
+
+def test_ingestor_paces_all_stock_status_queries_and_probe(tmp_path, monkeypatch):
+    identity_normalizer(monkeypatch)
+    client = FakeSDKClient(
+        [
+            pd.DataFrame({"cal_date": ["20260101"]}),
+            pd.DataFrame({"ts_code": ["L"]}),
+            pd.DataFrame({"ts_code": ["D"]}),
+            pd.DataFrame({"ts_code": ["P"]}),
+        ]
+    )
+    provider = TushareProvider(client)
+    limiter = NoWaitLimiter()
+    ingestor = PITIngestor(
+        provider,
+        PITCache(tmp_path),
+        lambda endpoint: limiter,
+        RetryPolicy(),
+        sleeper=lambda _: None,
+    )
+
+    ingestor.probe()
+    summary = ingestor._ingest_keys(
+        [PartitionKey(Dataset.STOCK_BASIC, "current")]
+    )
+
+    assert summary.completed == 1
+    assert limiter.acquires == len(client.calls) == 4
+    assert [call[0] for call in client.calls] == [
+        "trade_cal",
+        "stock_basic",
+        "stock_basic",
+        "stock_basic",
+    ]
+    assert [call[1].get("list_status") for call in client.calls[1:]] == [
+        "L",
+        "D",
+        "P",
+    ]
+
+
+def test_stock_status_retry_does_not_replay_successful_status(tmp_path, monkeypatch):
+    identity_normalizer(monkeypatch)
+    client = FakeSDKClient(
+        [
+            pd.DataFrame({"ts_code": ["L"]}),
+            SDKThrottle("429"),
+            pd.DataFrame({"ts_code": ["D"]}),
+            pd.DataFrame({"ts_code": ["P"]}),
+        ]
+    )
+    limiter = NoWaitLimiter()
+    ingestor = PITIngestor(
+        TushareProvider(client),
+        PITCache(tmp_path),
+        lambda endpoint: limiter,
+        RetryPolicy(),
+        sleeper=lambda _: None,
+    )
+
+    ingestor._ingest_keys([PartitionKey(Dataset.STOCK_BASIC, "current")])
+
+    assert [call[1]["list_status"] for call in client.calls] == ["L", "D", "D", "P"]
+    assert limiter.acquires == 4
+    assert limiter.penalties == 1
 
 
 def test_throttle_then_success_uses_provider_delay_and_completes(

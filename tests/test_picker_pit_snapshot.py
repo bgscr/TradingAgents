@@ -4,7 +4,11 @@ import pandas as pd
 import pytest
 
 from tradingagents.picker.cache import PITCache
-from tradingagents.picker.errors import PITCoverageError, PITSchemaError
+from tradingagents.picker.errors import (
+    PITConfigurationError,
+    PITCoverageError,
+    PITSchemaError,
+)
 from tradingagents.picker.pit_models import Dataset, PartitionKey
 from tradingagents.picker.snapshot import build_snapshot, build_snapshot_from_frames
 
@@ -64,6 +68,12 @@ def base_frames():
             }
         ),
     }
+
+
+@pytest.mark.parametrize("as_of", ["2026710", "20260229", "2026-07-10"])
+def test_snapshot_rejects_non_strict_or_impossible_dates(as_of):
+    with pytest.raises(PITConfigurationError, match="YYYYMMDD"):
+        build_snapshot_from_frames({}, as_of)
 
 
 def test_snapshot_keeps_future_delisted_stock_but_marks_effective_st():

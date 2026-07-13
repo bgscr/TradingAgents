@@ -146,6 +146,48 @@ def test_run_backfill_composes_provider_limiters_probe_and_ingestion(
     ]
 
 
+@pytest.mark.parametrize(
+    ("start_date", "end_date"),
+    [
+        ("2026710", "20260710"),
+        ("20260229", "20260710"),
+        ("20260711", "20260710"),
+    ],
+)
+def test_invalid_backfill_dates_never_create_or_probe_provider(
+    monkeypatch, tmp_path, start_date, end_date
+):
+    events = []
+    monkeypatch.setenv("TUSHARE_TOKEN", "secret-token")
+
+    class UnexpectedProvider:
+        def probe(self):
+            events.append("probe")
+
+    def create_provider(config):
+        events.append("create")
+        return UnexpectedProvider()
+
+    monkeypatch.setattr(cli.TushareProvider, "create", create_provider)
+    result = runner.invoke(
+        cli.app,
+        [
+            "backfill",
+            "--start-date",
+            start_date,
+            "--end-date",
+            end_date,
+            "--cache-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "PIT backfill failed:" in result.stderr
+    assert events == []
+    assert "secret-token" not in result.output
+
+
 def test_snapshot_prints_machine_readable_summary(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
@@ -166,6 +208,17 @@ def test_snapshot_prints_machine_readable_summary(monkeypatch, tmp_path):
         '{"active": 5000, "as_of": "20260710", "coverage": 0.99, '
         '"eligible": 1200, "warnings": ["partial suspension data"]}\n'
     )
+
+
+@pytest.mark.parametrize("value", ["2026710", "20260229", "2026-07-10"])
+def test_snapshot_command_reports_invalid_date_concisely(tmp_path, value):
+    result = runner.invoke(
+        cli.app, ["snapshot", "--date", value, "--cache-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "PIT snapshot failed:" in result.stderr
+    assert "YYYYMMDD" in result.stderr
 
 
 def test_backfill_reports_pit_error_without_printing_token(monkeypatch):

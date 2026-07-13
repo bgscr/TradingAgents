@@ -11,6 +11,7 @@ from typing import TypeVar
 from tradingagents.picker.cache import PITCache
 from tradingagents.picker.errors import PITError, TushareRateLimitError
 from tradingagents.picker.normalize import normalize_partition
+from tradingagents.picker.pit_dates import parse_yyyymmdd, validate_date_range
 from tradingagents.picker.pit_models import (
     Dataset,
     IngestionRunManifest,
@@ -21,30 +22,12 @@ from tradingagents.picker.pit_models import (
 from tradingagents.picker.rate_limit import RetryPolicy, TokenBucketLimiter
 from tradingagents.picker.tushare_provider import TushareProvider
 
-_DATE_RE = re.compile(r"\d{8}")
 _SECRET_RE = re.compile(
     r"(?i)(?:\bTUSHARE_TOKEN\b|\btoken\b|\bapi[_ -]?key\b|\bauthorization\b)"
     r"(\s*[:=]\s*|\s+)(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _MAX_PROVIDER_ATTEMPTS = 8
 _Result = TypeVar("_Result")
-
-
-def _parse_date(value: str, label: str) -> date:
-    if not isinstance(value, str) or _DATE_RE.fullmatch(value) is None:
-        raise ValueError(f"{label} must be a date in YYYYMMDD format")
-    try:
-        return datetime.strptime(value, "%Y%m%d").date()
-    except ValueError as exc:
-        raise ValueError(f"{label} must be a valid date in YYYYMMDD format") from exc
-
-
-def _validated_range(start_date: str, end_date: str) -> tuple[date, date]:
-    start = _parse_date(start_date, "start_date")
-    end = _parse_date(end_date, "end_date")
-    if start > end:
-        raise ValueError("start_date must be on or before end_date")
-    return start, end
 
 
 def _effective_start(start: date) -> date:
@@ -58,7 +41,7 @@ def _partition_order(key: PartitionKey) -> tuple[str, str]:
 def plan_bootstrap_partitions(
     start_date: str, end_date: str
 ) -> list[PartitionKey]:
-    start, end = _validated_range(start_date, end_date)
+    start, end = validate_date_range(start_date, end_date)
     warmup_start = _effective_start(start)
     keys = [
         PartitionKey(Dataset.TRADE_CAL, str(year))
@@ -76,7 +59,7 @@ def plan_bootstrap_partitions(
 def open_trade_dates(
     cache: PITCache, start_date: str, end_date: str
 ) -> list[str]:
-    start, end = _validated_range(start_date, end_date)
+    start, end = validate_date_range(start_date, end_date)
     warmup_start = _effective_start(start)
     lower = warmup_start.strftime("%Y%m%d")
     upper = end.strftime("%Y%m%d")
@@ -96,7 +79,7 @@ def open_trade_dates(
 def plan_daily_partitions(open_dates: list[str]) -> list[PartitionKey]:
     dates = sorted(
         {
-            _parse_date(value, "open date").strftime("%Y%m%d")
+            parse_yyyymmdd(value, "open date").strftime("%Y%m%d")
             for value in open_dates
         }
     )
@@ -135,7 +118,7 @@ class PITIngestor:
     def probe(self) -> None:
         failure: Exception | None = None
         try:
-            self._call_with_retry(Dataset.TRADE_CAL.value, self.provider.probe)
+            self.provider.probe(self._call_with_retry)
         except TushareRateLimitError as exc:
             failure = exc
         except Exception:
@@ -147,7 +130,7 @@ class PITIngestor:
     def ingest(
         self, start_date: str, end_date: str, refresh: bool = False
     ) -> IngestionSummary:
-        start, end = _validated_range(start_date, end_date)
+        start, end = validate_date_range(start_date, end_date)
         run_id = self._new_run_id()
         self._active_manifest = IngestionRunManifest(
             run_id=run_id,
@@ -204,9 +187,7 @@ class PITIngestor:
             self.cache.mark_pending(key)
             failure: Exception | None = None
             try:
-                frame = self._call_with_retry(
-                    key.dataset.value, lambda key=key: self.provider.fetch(key)
-                )
+                frame = self.provider.fetch(key, self._call_with_retry)
                 raw_payload = frame.to_json(
                     orient="table", date_format="iso"
                 ).encode("utf-8")

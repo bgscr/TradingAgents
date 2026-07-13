@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -17,6 +18,8 @@ from .errors import (
 )
 from .pit_config import PITConfig
 from .pit_models import Dataset, PartitionKey
+
+RequestExecutor = Callable[[str, Callable[[], Any]], Any]
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,7 @@ class TushareProvider:
 
         return cls(resolved_client, page_size=page_size)
 
-    def probe(self) -> None:
+    def probe(self, request_executor: RequestExecutor | None = None) -> None:
         spec = ENDPOINTS[Dataset.TRADE_CAL]
         year = str(datetime.now(ZoneInfo("Asia/Shanghai")).year)
         kwargs = {
@@ -110,7 +113,9 @@ class TushareProvider:
         }
         probe_failed = False
         try:
-            result = self._query(spec.api_name, **kwargs)
+            result = self._query(
+                spec.api_name, request_executor=request_executor, **kwargs
+            )
         except TushareRateLimitError:
             raise
         except PITError:
@@ -126,12 +131,16 @@ class TushareProvider:
                 "Tushare endpoint 'trade_cal' probe returned no rows; verify token permissions"
             )
 
-    def fetch(self, key: PartitionKey) -> pd.DataFrame:
+    def fetch(
+        self,
+        key: PartitionKey,
+        request_executor: RequestExecutor | None = None,
+    ) -> pd.DataFrame:
         spec = ENDPOINTS[key.dataset]
 
         if key.dataset is Dataset.STOCK_BASIC:
             frames = [
-                self._fetch_pages(spec, {"list_status": status})
+                self._fetch_pages(spec, {"list_status": status}, request_executor)
                 for status in ("L", "D", "P")
             ]
             return self._concat_unique(frames)
@@ -147,12 +156,13 @@ class TushareProvider:
         else:
             query_args = {}
 
-        return self._fetch_pages(spec, query_args)
+        return self._fetch_pages(spec, query_args, request_executor)
 
     def _fetch_pages(
         self,
         spec: EndpointSpec,
         query_args: dict[str, object],
+        request_executor: RequestExecutor | None = None,
     ) -> pd.DataFrame:
         offset = 0
         combined: pd.DataFrame | None = None
@@ -160,6 +170,7 @@ class TushareProvider:
         while True:
             page = self._query(
                 spec.api_name,
+                request_executor=request_executor,
                 **query_args,
                 fields=spec.fields,
                 limit=self.page_size,
@@ -180,7 +191,20 @@ class TushareProvider:
                 return combined
             offset += self.page_size
 
-    def _query(self, endpoint: str, **kwargs: object) -> Any:
+    def _query(
+        self,
+        endpoint: str,
+        request_executor: RequestExecutor | None = None,
+        **kwargs: object,
+    ) -> Any:
+        def request() -> Any:
+            return self._request(endpoint, **kwargs)
+
+        if request_executor is not None:
+            return request_executor(endpoint, request)
+        return request()
+
+    def _request(self, endpoint: str, **kwargs: object) -> Any:
         try:
             return self.client.query(endpoint, **kwargs)
         except Exception as exc:

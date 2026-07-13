@@ -61,6 +61,10 @@ def test_retry_policy_honors_provider_delay():
     assert policy.delay(attempt=3, retry_after=12.0) == 12.0
 
 
+def test_retry_policy_defaults_to_eight_attempts():
+    assert RetryPolicy().max_attempts == 8
+
+
 def test_retry_policy_caps_exponential_delay():
     policy = RetryPolicy(base_delay=1.0, max_delay=60.0, jitter=lambda low, high: 0.0)
     assert policy.delay(attempt=20, retry_after=None) == 60.0

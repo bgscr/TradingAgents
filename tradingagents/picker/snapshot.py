@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
 from numbers import Real
 
 import pandas as pd
 
 from tradingagents.picker.cache import PITCache
 from tradingagents.picker.errors import PITCoverageError, PITSchemaError
+from tradingagents.picker.pit_dates import parse_yyyymmdd
 from tradingagents.picker.pit_models import Dataset, PartitionKey, PITSnapshot
 
 _MIN_LISTING_SESSIONS = 60
@@ -49,7 +49,7 @@ def build_snapshot_from_frames(
     minimum_coverage: float = 0.95,
 ) -> PITSnapshot:
     """Build one point-in-time universe from already normalized local frames."""
-    as_of = _validated_date(as_of)
+    as_of = parse_yyyymmdd(as_of, "as_of").strftime("%Y%m%d")
     minimum_coverage = _validated_coverage(minimum_coverage)
     _validate_frames(frames)
 
@@ -141,7 +141,7 @@ def build_snapshot(
     minimum_coverage: float = 0.95,
 ) -> PITSnapshot:
     """Load verified local cache partitions and reconstruct one PIT snapshot."""
-    as_of = _validated_date(as_of)
+    as_of = parse_yyyymmdd(as_of, "as_of").strftime("%Y%m%d")
     minimum_coverage = _validated_coverage(minimum_coverage)
 
     calendars, open_dates = _load_calendar_history(cache, as_of)
@@ -192,16 +192,6 @@ def build_snapshot(
         "trailing_amounts": trailing_amounts,
     }
     return build_snapshot_from_frames(frames, as_of, minimum_coverage)
-
-
-def _validated_date(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("as_of must be a date in YYYYMMDD format")
-    try:
-        parsed = datetime.strptime(value, "%Y%m%d")
-    except ValueError as exc:
-        raise ValueError("as_of must be a valid date in YYYYMMDD format") from exc
-    return parsed.strftime("%Y%m%d")
 
 
 def _validated_coverage(value: float) -> float:

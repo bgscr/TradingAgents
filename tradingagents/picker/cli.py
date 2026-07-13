@@ -11,6 +11,7 @@ from tradingagents.picker.cache import PITCache
 from tradingagents.picker.errors import PITError
 from tradingagents.picker.ingestion import PITIngestor
 from tradingagents.picker.pit_config import PITConfig
+from tradingagents.picker.pit_dates import parse_yyyymmdd, validate_date_range
 from tradingagents.picker.rate_limit import RetryPolicy, TokenBucketLimiter
 from tradingagents.picker.snapshot import build_snapshot
 from tradingagents.picker.tushare_provider import TushareProvider
@@ -34,6 +35,7 @@ def run_backfill(
     calls_per_minute: int | None,
     refresh: bool,
 ) -> tuple[int, int, int, str]:
+    validate_date_range(start_date, end_date)
     config = PITConfig.from_env(cache_dir, calls_per_minute)
     provider = TushareProvider.create(config)
     cache = PITCache(config.cache_dir)
@@ -53,6 +55,7 @@ def run_backfill(
 
 
 def snapshot_summary(*, date: str, cache_dir: Path | None) -> dict[str, object]:
+    date = parse_yyyymmdd(date, "date").strftime("%Y%m%d")
     config = PITConfig.from_env(cache_dir)
     result = build_snapshot(PITCache(config.cache_dir), date)
     return {
