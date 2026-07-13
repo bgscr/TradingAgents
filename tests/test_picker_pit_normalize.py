@@ -109,6 +109,25 @@ def test_circ_mv_reconciliation_uses_declared_units():
         normalize_partition(Dataset.DAILY_BASIC, daily_basic_row(circ_mv=800_000.0))
 
 
+def test_daily_basic_rejects_non_finite_canonical_and_reconciliation_outputs():
+    raw = daily_basic_row(
+        close=1e308,
+        total_share=1e308,
+        float_share=1e308,
+        free_share=1e308,
+        circ_mv=1e308,
+    )
+
+    with pytest.raises(PITSchemaError) as exc_info:
+        normalize_partition(Dataset.DAILY_BASIC, raw)
+
+    message = str(exc_info.value)
+    assert "non-finite" in message
+    assert "circ_market_cap_cny" in message
+    assert "free_float_market_cap_cny" in message
+    assert "derived_circ_market_cap_cny" in message
+
+
 def test_daily_amount_is_converted_from_thousand_cny():
     raw = pd.DataFrame(
         {
@@ -127,6 +146,11 @@ def test_daily_amount_is_converted_from_thousand_cny():
     )
     out = normalize_partition(Dataset.DAILY, raw)
     assert out.loc[0, "amount_cny"] == 123_000.0
+
+
+def test_daily_rejects_non_finite_converted_amount():
+    with pytest.raises(PITSchemaError, match="amount_cny.*non-finite"):
+        normalize_partition(Dataset.DAILY, daily_row(amount=1e308))
 
 
 def test_empty_suspend_partition_is_valid():

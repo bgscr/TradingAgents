@@ -4,6 +4,7 @@ import math
 import re
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 
 from .errors import PITSchemaError
@@ -204,7 +205,11 @@ def normalize_partition(dataset: Dataset, frame: pd.DataFrame) -> pd.DataFrame:
     _reject_infinite_numbers(dataset, out)
 
     if dataset is Dataset.DAILY:
-        out["amount_cny"] = out["amount"] * 1_000.0
+        with np.errstate(over="ignore", invalid="ignore"):
+            out["amount_cny"] = out["amount"] * 1_000.0
+        _reject_non_finite_derived(
+            dataset, {"amount_cny": out["amount_cny"]}
+        )
     elif dataset is Dataset.DAILY_BASIC:
         _normalize_daily_basic(out)
 
@@ -294,21 +299,46 @@ def _normalize_daily_basic(out: pd.DataFrame) -> None:
     if invalid_order.any():
         raise PITSchemaError("daily_basic share count ordering is invalid")
 
-    out["circ_market_cap_cny"] = out["circ_mv"] * 10_000.0
-    out["free_float_market_cap_cny"] = (
-        out["free_share"] * out["close"] * 10_000.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        out["circ_market_cap_cny"] = out["circ_mv"] * 10_000.0
+        out["free_float_market_cap_cny"] = (
+            out["free_share"] * out["close"] * 10_000.0
+        )
+        derived_circ = out["float_share"] * out["close"] * 10_000.0
+        tolerance = pd.concat(
+            [
+                pd.Series(10_000.0, index=out.index),
+                out["circ_market_cap_cny"].abs() * 0.001,
+            ],
+            axis=1,
+        ).max(axis=1)
+    _reject_non_finite_derived(
+        Dataset.DAILY_BASIC,
+        {
+            "circ_market_cap_cny": out["circ_market_cap_cny"],
+            "free_float_market_cap_cny": out["free_float_market_cap_cny"],
+            "derived_circ_market_cap_cny": derived_circ,
+            "circ_market_cap_tolerance_cny": tolerance,
+        },
     )
-    derived_circ = out["float_share"] * out["close"] * 10_000.0
-    tolerance = pd.concat(
-        [
-            pd.Series(10_000.0, index=out.index),
-            out["circ_market_cap_cny"].abs() * 0.001,
-        ],
-        axis=1,
-    ).max(axis=1)
     if ((derived_circ - out["circ_market_cap_cny"]).abs() > tolerance).any():
         raise PITSchemaError(
             "daily_basic circ_market_cap_cny does not reconcile with float_share and close"
+        )
+
+
+def _reject_non_finite_derived(
+    dataset: Dataset, values: dict[str, pd.Series]
+) -> None:
+    failures = []
+    for name, series in values.items():
+        invalid = ~pd.Series(np.isfinite(series.to_numpy()), index=series.index)
+        if invalid.any():
+            rows = ", ".join(str(index) for index in series.index[invalid].tolist())
+            failures.append(f"{name} at rows: {rows}")
+    if failures:
+        raise PITSchemaError(
+            f"{dataset.value} {'; '.join(failures)} contain non-finite derived values"
         )
 
 
