@@ -166,3 +166,17 @@ Use CodeGraph first for:
 * Indexed file-structure lookup
 
 Do not start with grep, find, or broad file reads for structural questions. Use shell search only as a fallback when CodeGraph output is missing, stale, incomplete, or ambiguous.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Uses the default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout using root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
