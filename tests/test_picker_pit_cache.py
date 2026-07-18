@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from dataclasses import replace
 
 import pandas as pd
@@ -12,8 +13,118 @@ from tradingagents.picker.pit_models import (
     Dataset,
     IngestionRunManifest,
     PartitionKey,
+    PartitionRecord,
     PartitionStatus,
 )
+
+
+def test_partition_state_uses_sqlite_and_reopens_without_mutable_json(tmp_path):
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    cache = PITCache(tmp_path)
+
+    cache.mark_pending(key)
+
+    assert (tmp_path / "state.sqlite3").is_file()
+    assert not (tmp_path / "manifest.json").exists()
+    reopened = PITCache(tmp_path)
+    assert reopened.records()[key.storage_key].status is PartitionStatus.PENDING
+
+
+def test_legacy_json_manifest_migrates_once_then_sqlite_is_authoritative(tmp_path):
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    legacy_manifest = {
+        "partitions": {
+            key.storage_key: {
+                "dataset": key.dataset.value,
+                "partition": key.partition,
+                "status": "pending",
+                "raw_sha256": None,
+                "normalized_sha256": None,
+                "row_count": 0,
+                "fetched_at": None,
+                "schema_version": "1",
+                "error": None,
+                "raw_path": None,
+                "normalized_path": None,
+            }
+        }
+    }
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(legacy_manifest), encoding="utf-8"
+    )
+
+    migrated = PITCache(tmp_path)
+    assert migrated.records()[key.storage_key].status is PartitionStatus.PENDING
+    migrated.mark_failed(key, "new database state")
+
+    reopened = PITCache(tmp_path)
+    record = reopened.records()[key.storage_key]
+    assert record.status is PartitionStatus.FAILED
+    assert record.error == "new database state"
+
+
+def test_interrupted_run_reopens_from_sqlite_and_emits_one_final_manifest(tmp_path):
+    cache = PITCache(tmp_path)
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    running = IngestionRunManifest(
+        run_id="run-sqlite-resume",
+        requested_start="20260710",
+        requested_end="20260710",
+        effective_start="20260312",
+        effective_end="20260710",
+        created_at="2026-07-17T00:00:00Z",
+        partitions=(),
+        status="running",
+    )
+    record = PartitionRecord(key=key, status=PartitionStatus.PENDING)
+
+    cache.start_run(running)
+    cache.record_run_partition(running.run_id, record)
+    assert not (tmp_path / "runs" / f"{running.run_id}.json").exists()
+    cache.close()
+
+    reopened = PITCache(tmp_path)
+    finalized = reopened.finalize_run(
+        running.run_id, "interrupted", "KeyboardInterrupt: stopped"
+    )
+
+    assert finalized.status == "interrupted"
+    assert finalized.partitions == (record,)
+    final_path = tmp_path / "runs" / f"{running.run_id}.json"
+    assert json.loads(final_path.read_text(encoding="utf-8"))["status"] == "interrupted"
+    with pytest.raises(PITSchemaError, match="immutable"):
+        reopened.finalize_run(running.run_id, "complete")
+
+
+def test_final_manifest_write_can_retry_from_terminal_sqlite_state(
+    monkeypatch, tmp_path
+):
+    cache = PITCache(tmp_path)
+    running = IngestionRunManifest(
+        run_id="run-final-retry",
+        requested_start="20260710",
+        requested_end="20260710",
+        effective_start="20260312",
+        effective_end="20260710",
+        created_at="2026-07-17T00:00:00Z",
+        partitions=(),
+        status="running",
+    )
+    cache.start_run(running)
+    atomic_write = cache._atomic_write_json
+
+    def fail_once(path, value):
+        raise OSError("final manifest write failed")
+
+    monkeypatch.setattr(cache, "_atomic_write_json", fail_once)
+    with pytest.raises(OSError, match="final manifest write failed"):
+        cache.finalize_run(running.run_id, "complete")
+
+    monkeypatch.setattr(cache, "_atomic_write_json", atomic_write)
+    finalized = cache.finalize_run(running.run_id, "complete")
+
+    assert finalized.status == "complete"
+    assert (tmp_path / "runs" / "run-final-retry.json").is_file()
 
 
 def test_store_complete_round_trips_and_verifies_checksums(tmp_path):
@@ -35,8 +146,34 @@ def test_store_complete_round_trips_and_verifies_checksums(tmp_path):
     pd.testing.assert_frame_equal(cache.load_frame(key), frame)
 
 
+def test_ordinary_resume_uses_metadata_and_explicit_audit_hashes_payloads(
+    monkeypatch, tmp_path
+):
+    cache = PITCache(tmp_path)
+    key = PartitionKey(Dataset.DAILY_BASIC, "20260710")
+    cache.store_complete(
+        key,
+        b'[{"ts_code":"000001.SZ"}]',
+        pd.DataFrame({"ts_code": ["000001.SZ"]}),
+        "1",
+    )
+    original_sha256_file = cache._sha256_file
+    hashed_paths = []
+
+    def counted_sha256(path):
+        hashed_paths.append(path)
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(cache, "_sha256_file", counted_sha256)
+
+    assert cache.is_complete(key)
+    assert hashed_paths == []
+    assert cache.verify_integrity() == {}
+    assert len(hashed_paths) == 2
+
+
 @pytest.mark.parametrize("kind", ["raw", "normalized"])
-def test_corrupt_file_is_not_resumable(tmp_path, kind):
+def test_corrupt_file_requires_explicit_integrity_audit(tmp_path, kind):
     cache = PITCache(tmp_path)
     key = PartitionKey(Dataset.DAILY, "20260710")
     frame = pd.DataFrame({"ts_code": ["000001.SZ"], "close": [10.0]})
@@ -44,7 +181,9 @@ def test_corrupt_file_is_not_resumable(tmp_path, kind):
 
     getattr(cache, f"{kind}_path")(key).write_bytes(b"corrupt")
 
-    assert not cache.is_complete(key)
+    assert cache.is_complete(key)
+    failures = cache.verify_integrity()
+    assert "checksum mismatch" in "; ".join(failures[key.storage_key])
     with pytest.raises(PITSchemaError, match=kind):
         cache.load_frame(key)
 
@@ -119,26 +258,32 @@ def test_running_run_manifest_can_be_finalized_only_once(tmp_path, terminal_stat
     terminal = replace(running, status=terminal_status)
 
     cache.write_run_manifest(running)
+    assert not (tmp_path / "runs" / "run-1.json").exists()
     cache.write_run_manifest(terminal)
 
     with pytest.raises(PITSchemaError, match="immutable"):
         cache.write_run_manifest(terminal)
 
 
-def test_atomic_write_failure_leaves_no_temporary_files_or_record(tmp_path, monkeypatch):
+def test_sqlite_state_failure_leaves_no_partition_record(tmp_path):
     cache = PITCache(tmp_path)
     key = PartitionKey(Dataset.DAILY, "20260710")
+    cache._connection.executescript(
+        """
+        CREATE TRIGGER fail_partition_insert
+        BEFORE INSERT ON partition_records
+        BEGIN
+            SELECT RAISE(ABORT, 'simulated state failure');
+        END;
+        """
+    )
 
-    def fail_replace(source, target):
-        raise OSError("simulated replace failure")
-
-    monkeypatch.setattr("tradingagents.picker.cache.os.replace", fail_replace)
-
-    with pytest.raises(OSError, match="simulated"):
+    with pytest.raises(sqlite3.IntegrityError, match="simulated state failure"):
         cache.mark_pending(key)
 
     assert cache.records() == {}
-    assert list(tmp_path.rglob("*.tmp")) == []
+    cache.close()
+    assert PITCache(tmp_path).records() == {}
 
 
 def test_unknown_or_unsafe_pinned_version_is_rejected(tmp_path):
@@ -152,21 +297,25 @@ def test_unknown_or_unsafe_pinned_version_is_rejected(tmp_path):
         cache.load_frame(key, "../manifest")
 
 
-def test_malformed_manifest_fields_fail_as_schema_errors(tmp_path):
+def test_malformed_sqlite_fields_fail_as_schema_errors(tmp_path):
     cache = PITCache(tmp_path)
     key = PartitionKey(Dataset.DAILY, "20260710")
     cache.mark_pending(key)
-    manifest_path = tmp_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    raw_record = manifest["partitions"][key.storage_key]
-    raw_record.update(
-        status="complete",
-        raw_path=17,
-        raw_sha256=17,
-        normalized_path="normalized/daily/20260710/missing.parquet",
-        normalized_sha256="a" * 64,
+    cache._connection.execute(
+        """
+        UPDATE partition_records
+        SET status = 'complete', raw_path = 17, raw_sha256 = 17,
+            normalized_path = ?, normalized_sha256 = ?
+        WHERE storage_key = ?
+        """,
+        (
+            "normalized/daily/20260710/missing.parquet",
+            "a" * 64,
+            key.storage_key,
+        ),
     )
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    cache._connection.commit()
+    cache.close()
     malformed = PITCache(tmp_path)
 
     assert not malformed.is_complete(key)
@@ -284,23 +433,19 @@ def test_store_failure_after_normalized_install_rolls_back_only_new_content(
     )
 
 
-def test_store_failure_during_manifest_replace_rolls_back_only_new_content(
-    tmp_path, monkeypatch
-):
+def test_store_failure_during_sqlite_update_rolls_back_only_new_content(tmp_path):
     cache, key, record, preserved = _cache_with_existing_version(tmp_path)
-    real_replace = os.replace
-    replacements = 0
+    cache._connection.executescript(
+        """
+        CREATE TRIGGER fail_partition_update
+        BEFORE UPDATE ON partition_records
+        BEGIN
+            SELECT RAISE(ABORT, 'state update failed');
+        END;
+        """
+    )
 
-    def fail_manifest_replace(source, target):
-        nonlocal replacements
-        replacements += 1
-        if replacements == 3:
-            raise OSError("manifest replace failed")
-        real_replace(source, target)
-
-    monkeypatch.setattr("tradingagents.picker.cache.os.replace", fail_manifest_replace)
-
-    with pytest.raises(OSError, match="manifest replace failed"):
+    with pytest.raises(sqlite3.IntegrityError, match="state update failed"):
         cache.store_complete(key, b'[{"v": 2}]', pd.DataFrame({"v": [2]}), "1")
 
     _assert_failed_store_preserved_existing_version(

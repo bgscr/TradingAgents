@@ -15,6 +15,7 @@ from stockstats import wrap
 
 from .akshare_data import INDICATOR_DESCRIPTIONS
 from .errors import NoMarketDataError, VendorNotConfiguredError
+from .market_snapshot import validate_ohlcv_frame
 from .stockstats_utils import _assert_ohlcv_not_stale
 from .symbol_utils import resolve_china_a_symbol
 
@@ -63,16 +64,14 @@ def _rows_to_frame(rows: list[list[str]], symbol: str, canonical: str) -> pd.Dat
     )
     frame = frame[["Date", "Open", "High", "Low", "Close", "Volume", "Amount"]]
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    frame = frame.dropna(subset=["Date"])
     for col in ["Open", "High", "Low", "Close", "Volume", "Amount"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame = frame.dropna(subset=["Close"])
     if frame.empty:
         raise NoMarketDataError(symbol, canonical, "Baostock returned no usable rows")
     return frame.sort_values("Date")
 
 
-def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
+def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     instrument = resolve_china_a_symbol(symbol)
     if instrument is None:
         raise NoMarketDataError(symbol, symbol, "Baostock supports China A-share symbols only")
@@ -93,7 +92,16 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
             rows.append(rs.get_row_data())
 
     frame = _rows_to_frame(rows, symbol, instrument.yahoo_symbol)
+    frame = validate_ohlcv_frame(frame, end_date)
     _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
+    return frame
+
+
+def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
+    instrument = resolve_china_a_symbol(symbol)
+    if instrument is None:
+        raise NoMarketDataError(symbol, symbol, "Baostock supports China A-share symbols only")
+    frame = load_ohlcv_range(symbol, start_date, end_date)
     out = frame.copy()
     out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
     header = f"# Stock data for {instrument.yahoo_symbol} from {start_date} to {end_date}\n"

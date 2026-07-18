@@ -67,6 +67,21 @@ def snapshot_summary(*, date: str, cache_dir: Path | None) -> dict[str, object]:
     }
 
 
+def integrity_summary(*, cache_dir: Path | None) -> dict[str, object]:
+    """Run the explicit full-checksum audit for every cached partition."""
+    config = PITConfig.from_env(cache_dir)
+    cache = PITCache(config.cache_dir)
+    try:
+        failures = cache.verify_integrity()
+        return {
+            "partitions": len(cache.records()),
+            "failed": len(failures),
+            "failures": failures,
+        }
+    finally:
+        cache.close()
+
+
 @app.command()
 def backfill(
     start_date: Annotated[str, typer.Option("--start-date")],
@@ -110,3 +125,21 @@ def snapshot(
         typer.echo(f"PIT snapshot failed: {error}", err=True)
         raise typer.Exit(code=1)
     typer.echo(json.dumps(summary, sort_keys=True))
+
+
+@app.command()
+def verify(
+    cache_dir: Annotated[Path | None, typer.Option("--cache-dir")] = None,
+) -> None:
+    """Hash all PIT payloads and report integrity failures."""
+    error: str | None = None
+    try:
+        summary = integrity_summary(cache_dir=cache_dir)
+    except PITError as exc:
+        error = _safe_error(exc)
+    if error is not None:
+        typer.echo(f"PIT integrity audit failed: {error}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(summary, sort_keys=True))
+    if summary["failed"]:
+        raise typer.Exit(code=1)

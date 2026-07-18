@@ -14,6 +14,14 @@ def test_is_china_a_ticker_accepts_mainland_forms():
 
 
 @pytest.mark.unit
+def test_mainland_fund_uses_market_date_without_company_enhancements():
+    import cli.main as m
+
+    assert m.is_mainland_ticker("512210.SH") is True
+    assert m.is_china_a_ticker("512210.SH") is False
+
+
+@pytest.mark.unit
 def test_is_china_a_ticker_rejects_non_mainland_forms():
     import cli.main as m
 
@@ -91,6 +99,21 @@ def test_china_a_same_beijing_date_allowed_when_local_date_is_behind(monkeypatch
 
     assert m.get_analysis_date("600895.SS") == "2026-06-30"
     assert any("may be incomplete" in line for line in printed)
+
+
+@pytest.mark.unit
+def test_mainland_fund_same_day_warning_does_not_call_it_an_a_share(monkeypatch):
+    import cli.main as m
+
+    monkeypatch.setattr(m.datetime, "datetime", FixedDateTime)
+    monkeypatch.setattr(m.typer, "prompt", lambda *a, **k: "2026-06-30")
+
+    printed = []
+    monkeypatch.setattr(m.console, "print", lambda *args, **kwargs: printed.append(str(args[0])))
+
+    assert m.get_analysis_date("512210.SH") == "2026-06-30"
+    assert any("Mainland-market same-day data" in line for line in printed)
+    assert all("A-share" not in line for line in printed)
 
 
 @pytest.mark.unit

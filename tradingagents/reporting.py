@@ -67,6 +67,13 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     if trader_plan:
         _write_markdown(save_path / "3_trading" / "trader.md", trader_plan)
 
+    analysis_outcome = final_state.get("analysis_outcome")
+    if analysis_outcome:
+        _write_markdown(
+            save_path / "5_portfolio" / "analysis_outcome.md",
+            analysis_outcome,
+        )
+
     portfolio_decision = None
     if final_state.get("risk_debate_state"):
         risk_dir = save_path / "4_risk"
@@ -83,11 +90,13 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             path = risk_dir / "neutral.md"
             _write_markdown(path, risk["neutral_history"])
             appendix_entries.append(_appendix_entry("Neutral analyst full history", path, save_path))
-        if risk.get("judge_decision"):
+        if risk.get("judge_decision") and not analysis_outcome:
             portfolio_decision = risk["judge_decision"]
             _write_markdown(save_path / "5_portfolio" / "decision.md", portfolio_decision)
 
-    if portfolio_decision:
+    if analysis_outcome:
+        complete_sections.append(f"## I. Analysis Outcome\n\n{analysis_outcome}")
+    elif portfolio_decision:
         complete_sections.append(
             f"## I. Portfolio Manager Decision\n\n### Portfolio Manager\n{portfolio_decision}"
         )

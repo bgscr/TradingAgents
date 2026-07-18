@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _CN_A_SHANGHAI_PREFIXES = ("600", "601", "603", "605", "688", "900")
 _CN_A_SHENZHEN_PREFIXES = ("000", "001", "002", "003", "300", "301", "200")
+_MAINLAND_SHANGHAI_INDEX_PREFIXES = ("000", "880", "930", "931", "932")
+_MAINLAND_SHENZHEN_INDEX_PREFIXES = ("399",)
 _CN_A_RE = re.compile(r"^(?P<code>\d{6})(?:\.(?P<suffix>SS|SH|SZ))?$")
 
 
@@ -44,6 +46,12 @@ class ChinaAInstrument:
     baostock_code: str
     market: str
     exchange: str
+
+
+@dataclass(frozen=True)
+class MainlandInstrument(ChinaAInstrument):
+    instrument_kind: str
+    capabilities: frozenset[str]
 
 
 # ISO-4217 codes common enough to appear in retail forex pairs. A bare
@@ -108,32 +116,85 @@ def _infer_china_a_exchange(code: str, suffix: str | None) -> str | None:
     return None
 
 
-def resolve_china_a_symbol(raw: str) -> ChinaAInstrument | None:
-    """Return structured China A-share identifiers, or None for non A-shares."""
+def resolve_mainland_instrument(raw: str) -> MainlandInstrument | None:
     if not isinstance(raw, str) or not raw.strip():
         return None
-
     original = raw.strip()
-    s = original.upper().rstrip("+")
-    match = _CN_A_RE.fullmatch(s)
-    if not match:
+    match = _CN_A_RE.fullmatch(original.upper().rstrip("+"))
+    if match is None:
         return None
-
     code = match.group("code")
     suffix = match.group("suffix")
-    exchange = _infer_china_a_exchange(code, suffix)
-    if exchange is None:
-        return None
-
+    if suffix in {"SH", "SS"} and code.startswith(
+        _MAINLAND_SHANGHAI_INDEX_PREFIXES
+    ):
+        exchange = "shanghai"
+        instrument_kind = "index"
+    elif suffix == "SZ" and code.startswith(_MAINLAND_SHENZHEN_INDEX_PREFIXES):
+        exchange = "shenzhen"
+        instrument_kind = "index"
+    elif code.startswith("5") and suffix in {None, "SH", "SS"}:
+        exchange = "shanghai"
+        instrument_kind = "fund"
+    elif code.startswith(("15", "16")) and suffix in {None, "SZ"}:
+        exchange = "shenzhen"
+        instrument_kind = "fund"
+    else:
+        exchange = _infer_china_a_exchange(code, suffix)
+        if exchange is None:
+            if suffix in {"SH", "SS"}:
+                exchange = "shanghai"
+            elif suffix == "SZ":
+                exchange = "shenzhen"
+            else:
+                return None
+            instrument_kind = "unknown"
+        else:
+            instrument_kind = "equity"
     yahoo_suffix = ".SS" if exchange == "shanghai" else ".SZ"
     baostock_prefix = "sh" if exchange == "shanghai" else "sz"
-    return ChinaAInstrument(
+    return MainlandInstrument(
         raw_input=original,
         yahoo_symbol=f"{code}{yahoo_suffix}",
         akshare_code=code,
         baostock_code=f"{baostock_prefix}.{code}",
         market="cn_a",
         exchange=exchange,
+        instrument_kind=instrument_kind,
+        capabilities=(
+            frozenset({"ohlcv", "technical_indicators"})
+            if instrument_kind in {"fund", "index", "unknown"}
+            else frozenset(
+                {
+                    "ohlcv",
+                    "technical_indicators",
+                    "fundamentals",
+                    "china_enhancements",
+                }
+            )
+        ),
+    )
+
+
+def resolve_china_a_symbol(raw: str) -> ChinaAInstrument | None:
+    """Compatibility path for callers migrating to ``resolve_mainland_instrument``.
+
+    Existing equities retain the original ``ChinaAInstrument`` value shape;
+    funds and other explicitly suffixed mainland instruments return the richer
+    subclass so capability-aware callers can route them safely.
+    """
+    resolved = resolve_mainland_instrument(raw)
+    if resolved is None:
+        return None
+    if resolved.instrument_kind != "equity":
+        return resolved
+    return ChinaAInstrument(
+        raw_input=resolved.raw_input,
+        yahoo_symbol=resolved.yahoo_symbol,
+        akshare_code=resolved.akshare_code,
+        baostock_code=resolved.baostock_code,
+        market=resolved.market,
+        exchange=resolved.exchange,
     )
 
 

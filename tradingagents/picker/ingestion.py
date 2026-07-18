@@ -4,7 +4,6 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from typing import TypeVar
 
@@ -142,7 +141,7 @@ class PITIngestor:
             partitions=(),
             status="running",
         )
-        self.cache.write_run_manifest(self._active_manifest)
+        self.cache.start_run(self._active_manifest)
 
         failure: Exception | None = None
         try:
@@ -247,17 +246,15 @@ class PITIngestor:
     def _record_partition(self, record: PartitionRecord) -> None:
         if self._active_manifest is None:
             return
-        self._active_manifest = replace(
-            self._active_manifest,
-            partitions=(*self._active_manifest.partitions, record),
+        self.cache.record_run_partition(
+            self._active_manifest.run_id,
+            record,
         )
-        self.cache.write_run_manifest(self._active_manifest)
 
     def _finalize_run(self, status: str, error: str | None = None) -> None:
         if self._active_manifest is None:
             return
-        finalized = replace(self._active_manifest, status=status, error=error)
-        self.cache.write_run_manifest(finalized)
+        self.cache.finalize_run(self._active_manifest.run_id, status, error)
         self._active_manifest = None
 
     @staticmethod

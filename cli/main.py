@@ -3,9 +3,10 @@ import json
 import os
 import time
 from collections import deque
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from functools import wraps
 from pathlib import Path
+from typing import Annotated
 from zoneinfo import ZoneInfo
 
 import typer
@@ -18,6 +19,11 @@ from rich.rule import Rule
 from cli.announcements import display_announcements, fetch_announcements
 from cli.run_display import create_run_display
 from cli.run_progress import StateProgressTracker, message_key
+from cli.runtime_artifacts import (
+    ActiveRuntimeArtifactRunError,
+    RuntimeArtifactWriter,
+    collect_runtime_artifacts,
+)
 from cli.stats_handler import StatsCallbackHandler
 from cli.utils import (
     ask_anthropic_effort,
@@ -39,7 +45,8 @@ from cli.utils import (
     select_research_depth,
     select_shallow_thinking_agent,
 )
-from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
+from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
+from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
@@ -56,6 +63,8 @@ app = typer.Typer(
     name="TradingAgents",
     help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
     add_completion=True,  # Enable shell completion
+    invoke_without_command=True,
+    no_args_is_help=False,
 )
 
 
@@ -78,11 +87,21 @@ CHINA_A_ENHANCEMENT_ALIASES = {
 CHINA_A_B_SHARE_PREFIXES = ("900", "200")
 
 
-def is_china_a_ticker(ticker: str) -> bool:
-    instrument = resolve_china_a_symbol(ticker)
+def is_mainland_ticker(ticker: str) -> bool:
+    instrument = resolve_mainland_instrument(ticker)
     if instrument is None:
         return False
     return not instrument.akshare_code.startswith(CHINA_A_B_SHARE_PREFIXES)
+
+
+def is_china_a_ticker(ticker: str) -> bool:
+    """Return whether company-only China equity enhancements apply."""
+    instrument = resolve_mainland_instrument(ticker)
+    return (
+        instrument is not None
+        and instrument.instrument_kind == "equity"
+        and is_mainland_ticker(ticker)
+    )
 
 
 def select_china_a_enhancement_preset() -> str:
@@ -134,6 +153,7 @@ class MessageBuffer:
         "investment_plan": (None, "Research Manager"),
         "trader_investment_plan": (None, "Trader"),
         "final_trade_decision": (None, "Portfolio Manager"),
+        "analysis_outcome": (None, "Portfolio Manager"),
     }
 
     def __init__(self, max_length=100):
@@ -246,6 +266,7 @@ class MessageBuffer:
                 "investment_plan": "Research Team Decision",
                 "trader_investment_plan": "Trading Team Plan",
                 "final_trade_decision": "Portfolio Management Decision",
+                "analysis_outcome": "Analysis Outcome",
             }
             self.current_report = (
                 f"### {section_titles[latest_section]}\n{latest_content}"
@@ -288,8 +309,11 @@ class MessageBuffer:
             report_parts.append("## Trading Team Plan")
             report_parts.append(f"{self.report_sections['trader_investment_plan']}")
 
-        # Portfolio Management Decision
-        if self.report_sections.get("final_trade_decision"):
+        # Analysis outcome or Portfolio Management Decision
+        if self.report_sections.get("analysis_outcome"):
+            report_parts.append("## Analysis Outcome")
+            report_parts.append(f"{self.report_sections['analysis_outcome']}")
+        elif self.report_sections.get("final_trade_decision"):
             report_parts.append("## Portfolio Management Decision")
             report_parts.append(f"{self.report_sections['final_trade_decision']}")
 
@@ -413,7 +437,7 @@ def get_user_selections():
             "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
         )
     )
-    selected_analysts = select_analysts(asset_type)
+    selected_analysts = select_analysts(asset_type, selected_ticker)
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
@@ -562,7 +586,7 @@ def get_user_selections():
 
 
 def _analysis_date_limit(ticker: str | None = None) -> tuple[datetime.date, str]:
-    if ticker and is_china_a_ticker(ticker):
+    if ticker and is_mainland_ticker(ticker):
         return datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date(), "Beijing"
     return datetime.datetime.now().date(), "local"
 
@@ -580,9 +604,9 @@ def get_analysis_date(ticker: str | None = None):
                     f"(max {limit_label} date: {limit_date:%Y-%m-%d})[/red]"
                 )
                 continue
-            if ticker and is_china_a_ticker(ticker) and analysis_date.date() == limit_date:
+            if ticker and is_mainland_ticker(ticker) and analysis_date.date() == limit_date:
                 console.print(
-                    "[yellow]China A-share same-day data may be incomplete until "
+                        "[yellow]Mainland-market same-day data may be incomplete until "
                     "mainland markets close and vendors finish publishing.[/yellow]"
                 )
             return date_str
@@ -796,6 +820,55 @@ def classify_message_type(message) -> tuple[str, str | None]:
     return ("System", content)
 
 
+_RUNTIME_GRAPH_PHASES = (
+    "analysis",
+    "research_debate",
+    "trading",
+    "risk_debate",
+    "portfolio_synthesis",
+)
+
+
+def _runtime_graph_phase_for_chunk(chunk: dict) -> str:
+    if chunk.get("final_trade_decision") or chunk.get("analysis_outcome"):
+        return "portfolio_synthesis"
+
+    risk_state = chunk.get("risk_debate_state")
+    if isinstance(risk_state, dict) and any(
+        risk_state.get(key)
+        for key in (
+            "current_aggressive_response",
+            "current_conservative_response",
+            "current_neutral_response",
+            "aggressive_history",
+            "conservative_history",
+            "neutral_history",
+            "judge_decision",
+        )
+    ):
+        return "risk_debate"
+
+    if chunk.get("trader_investment_plan"):
+        return "trading"
+
+    debate_state = chunk.get("investment_debate_state")
+    if chunk.get("investment_plan") or (
+        isinstance(debate_state, dict)
+        and any(
+            debate_state.get(key)
+            for key in (
+                "current_response",
+                "bull_history",
+                "bear_history",
+                "judge_decision",
+            )
+        )
+    ):
+        return "research_debate"
+
+    return "analysis"
+
+
 def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     """Assemble the run config from interactive selections, honoring env precedence.
 
@@ -904,10 +977,17 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
         "log_file": log_file,
         "latest_log_file": latest_log_file,
         "status_file": status_file,
+        "artifact_root": Path(config["results_dir"]) / "runtime_artifacts",
+        "metrics_file": run_dir / "runtime_metrics.json",
     }
 
 
 def _update_run_status(artifacts: dict, **updates) -> None:
+    runtime_writer = artifacts.get("runtime_writer")
+    current_phase = updates.get("current_phase")
+    terminal = updates.get("status") in {"completed", "failed"}
+    if runtime_writer is not None and current_phase and not terminal:
+        runtime_writer.transition_phase(current_phase)
     status_file = artifacts["status_file"]
     payload = _read_run_status(status_file)
     payload.update(updates)
@@ -915,6 +995,8 @@ def _update_run_status(artifacts: dict, **updates) -> None:
     if updates.get("status") == "completed":
         payload["completed_at"] = payload["updated_at"]
     _write_run_status(status_file, payload)
+    if runtime_writer is not None and terminal:
+        runtime_writer.finish_phases()
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -936,15 +1018,31 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             error_summary=summary,
         )
     with suppress(Exception):
-        _append_line_to_run_logs(
-            [artifacts["log_file"], artifacts["latest_log_file"]],
-            f"{datetime.datetime.now().strftime('%H:%M:%S')} "
-            f"[System] Run failed during {current_phase}: {summary}\n",
-        )
+        runtime_writer = artifacts.get("runtime_writer")
+        if runtime_writer is not None:
+            runtime_writer.record_critical(
+                datetime.datetime.now().strftime("%H:%M:%S"),
+                "System",
+                f"Run failed during {current_phase}: {summary}",
+            )
+        else:
+            _append_line_to_run_logs(
+                [artifacts["log_file"], artifacts["latest_log_file"]],
+                f"{datetime.datetime.now().strftime('%H:%M:%S')} "
+                f"[System] Run failed during {current_phase}: {summary}\n",
+            )
 
 
 def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
+    started_at = time.monotonic()
     report_file = save_report_to_disk(final_state, ticker, artifacts["report_dir"])
+    runtime_writer = artifacts.get("runtime_writer")
+    if runtime_writer is not None:
+        runtime_writer.record_duration(
+            "report",
+            "complete_report",
+            time.monotonic() - started_at,
+        )
     _update_run_status(
         artifacts,
         status="completed",
@@ -969,9 +1067,6 @@ def run_analysis(checkpoint: bool | None = None):
     artifacts = None
     current_phase = "setup"
 
-    # Create stats callback handler for tracking LLM/tool calls
-    stats_handler = StatsCallbackHandler()
-
     # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
     selected_set = {analyst.value for analyst in selections["analysts"]}
     selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
@@ -979,12 +1074,16 @@ def run_analysis(checkpoint: bool | None = None):
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
     artifacts = _prepare_run_artifacts(config, selections)
+    runtime_writer = RuntimeArtifactWriter(
+        artifact_root=artifacts["artifact_root"],
+        log_paths=[artifacts["log_file"], artifacts["latest_log_file"]],
+        metrics_path=artifacts["metrics_file"],
+    )
+    artifacts["runtime_writer"] = runtime_writer
+    stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
     current_phase = "graph_initializing"
     _update_run_status(artifacts, current_phase="graph_initializing")
     report_dir = artifacts["report_dir"]
-    log_file = artifacts["log_file"]
-    latest_log_file = artifacts["latest_log_file"]
-    run_log_paths = [log_file, latest_log_file]
 
     try:
         # Initialize the graph with callbacks bound to LLMs
@@ -999,6 +1098,8 @@ def run_analysis(checkpoint: bool | None = None):
         message_buffer.init_for_analysis(selected_analyst_keys)
     except BaseException as exc:
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        with suppress(Exception):
+            runtime_writer.close()
         raise
 
     # Track start time for elapsed display
@@ -1011,11 +1112,10 @@ def run_analysis(checkpoint: bool | None = None):
         def wrapper(*args, **kwargs):
             func(*args, **kwargs)
             timestamp, message_type, content = obj.messages[-1]
-            content = content.replace("\n", " ")  # Replace newlines with spaces
-            _append_line_to_run_logs(
-                run_log_paths,
-                f"{timestamp} [{message_type}] {content}\n",
-            )
+            if message_type == "Data":
+                runtime_writer.record_tool_result(timestamp, content)
+            else:
+                runtime_writer.record_message(timestamp, message_type, content)
 
         return wrapper
 
@@ -1026,11 +1126,7 @@ def run_analysis(checkpoint: bool | None = None):
         def wrapper(*args, **kwargs):
             func(*args, **kwargs)
             timestamp, tool_name, args = obj.tool_calls[-1]
-            args_str = ", ".join(f"{k}={v}" for k, v in args.items())
-            _append_line_to_run_logs(
-                run_log_paths,
-                f"{timestamp} [Tool Call] {tool_name}({args_str})\n",
-            )
+            runtime_writer.record_tool_call(timestamp, tool_name, args)
 
         return wrapper
 
@@ -1045,6 +1141,7 @@ def run_analysis(checkpoint: bool | None = None):
 
             stored = obj.report_sections[section_name]
             if stored:
+                started_at = time.monotonic()
                 file_name = f"{section_name}.md"
                 text = (
                     "\n".join(str(item) for item in stored) if isinstance(stored, list) else stored
@@ -1053,17 +1150,40 @@ def run_analysis(checkpoint: bool | None = None):
                 with open(path, "w", encoding="utf-8") as report_file:
                     report_file.write(text)
                 display.report_ready(section_name, text, path)
+                runtime_writer.record_duration(
+                    "report",
+                    section_name,
+                    time.monotonic() - started_at,
+                )
             return True
 
         return wrapper
 
-    display = create_run_display(
-        console,
-        message_buffer,
-        stats_handler,
-        start_time,
-    )
+    try:
+        display = create_run_display(
+            console,
+            message_buffer,
+            stats_handler,
+            start_time,
+        )
+    except BaseException as exc:
+        _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        with suppress(Exception):
+            runtime_writer.close()
+        raise
 
+    base_add_message = MessageBuffer.add_message.__get__(message_buffer, MessageBuffer)
+    base_add_tool_call = MessageBuffer.add_tool_call.__get__(
+        message_buffer,
+        MessageBuffer,
+    )
+    base_update_report_section = MessageBuffer.update_report_section.__get__(
+        message_buffer,
+        MessageBuffer,
+    )
+    message_buffer.add_message = base_add_message
+    message_buffer.add_tool_call = base_add_tool_call
+    message_buffer.update_report_section = base_update_report_section
     message_buffer.add_message = save_message_decorator(message_buffer, "add_message")
     message_buffer.add_tool_call = save_tool_call_decorator(message_buffer, "add_tool_call")
     message_buffer.update_report_section = save_report_section_decorator(
@@ -1072,8 +1192,10 @@ def run_analysis(checkpoint: bool | None = None):
     )
 
     spinner_text = f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
-    display.start()
+    snapshot_scope = ExitStack()
+    snapshot_scope.enter_context(authoritative_snapshot_run())
     try:
+        display.start()
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
         if selections["asset_type"] != "stock":
@@ -1100,11 +1222,15 @@ def run_analysis(checkpoint: bool | None = None):
         instrument_context = graph.resolve_instrument_context(
             selections["ticker"], selections["asset_type"]
         )
+        evidence_state = graph.resolve_evidence_state(
+            selections["ticker"], selections["analysis_date"]
+        )
         init_agent_state = graph.propagator.create_initial_state(
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
             instrument_context=instrument_context,
+            evidence_state=evidence_state,
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
@@ -1113,9 +1239,17 @@ def run_analysis(checkpoint: bool | None = None):
         # Stream the analysis
         current_phase = "graph_stream"
         _update_run_status(artifacts, current_phase=current_phase)
+        runtime_graph_phase = "analysis"
+        runtime_writer.transition_phase(runtime_graph_phase)
         tracker = StateProgressTracker()
         latest_state = {}
         for chunk in graph.graph.stream(init_agent_state, **args):
+            observed_phase = _runtime_graph_phase_for_chunk(chunk)
+            if _RUNTIME_GRAPH_PHASES.index(observed_phase) > _RUNTIME_GRAPH_PHASES.index(
+                runtime_graph_phase
+            ):
+                runtime_graph_phase = observed_phase
+                runtime_writer.transition_phase(runtime_graph_phase)
             for message in chunk.get("messages", []):
                 key = message_key(message)
                 if key in message_buffer._processed_message_ids:
@@ -1216,8 +1350,12 @@ def run_analysis(checkpoint: bool | None = None):
                 message_buffer.update_report_section(
                     "final_trade_decision", chunk["final_trade_decision"]
                 )
+            if chunk.get("analysis_outcome"):
+                message_buffer.update_report_section(
+                    "analysis_outcome", chunk["analysis_outcome"]
+                )
 
-            latest_state = chunk
+            latest_state.update(chunk)
             display.refresh(spinner_text)
 
         final_state = latest_state
@@ -1245,7 +1383,13 @@ def run_analysis(checkpoint: bool | None = None):
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         raise
     finally:
+        snapshot_scope.close()
         display.close()
+        message_buffer.add_message = base_add_message
+        message_buffer.add_tool_call = base_add_tool_call
+        message_buffer.update_report_section = base_update_report_section
+        with suppress(Exception):
+            runtime_writer.close()
 
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
@@ -1272,6 +1416,61 @@ def run_analysis(checkpoint: bool | None = None):
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
         display_complete_report(final_state)
+
+
+@app.callback()
+def default_analysis_command(
+    ctx: typer.Context,
+    checkpoint: bool | None = typer.Option(
+        None,
+        "--checkpoint/--no-checkpoint",
+        help="Enable/disable checkpoint-resume. Omit to honor configuration.",
+    ),
+    clear_checkpoints: bool = typer.Option(
+        False,
+        "--clear-checkpoints",
+        help="Delete all saved checkpoints before running.",
+    ),
+) -> None:
+    """Run the legacy default analysis when no subcommand is supplied."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if clear_checkpoints:
+        from tradingagents.graph.checkpointer import clear_all_checkpoints
+
+        count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
+        console.print(f"[yellow]Cleared {count} checkpoint(s).[/yellow]")
+    run_analysis(checkpoint=checkpoint)
+
+
+@app.command("runtime-artifacts-gc")
+def runtime_artifacts_gc(
+    results_root: Annotated[
+        Path,
+        typer.Argument(help="Results root containing runtime_artifacts and run logs."),
+    ],
+    delete: bool = typer.Option(
+        False,
+        "--delete",
+        help="Delete unreferenced artifacts; the default is a dry run.",
+    ),
+) -> None:
+    """Collect unreferenced runtime payloads outside active analyses."""
+    try:
+        report = collect_runtime_artifacts(results_root, dry_run=not delete)
+    except ActiveRuntimeArtifactRunError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    mode = "DELETE" if delete else "DRY RUN"
+    typer.echo(
+        f"{mode} scanned={report.scanned_artifacts} "
+        f"referenced={report.referenced_artifacts} "
+        f"removable={report.removable_artifacts} "
+        f"removed={report.removed_artifacts} "
+        f"bytes={report.removable_bytes}"
+    )
+    for candidate in report.candidates:
+        typer.echo(str(candidate))
 
 
 @app.command()

@@ -5,6 +5,7 @@ import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
+from .market_snapshot import validate_ohlcv_frame
 from .stockstats_utils import (
     StockstatsUtils,
     _assert_ohlcv_not_stale,
@@ -46,6 +47,14 @@ def get_YFin_data_online(
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
 
+    validation_frame = data.reset_index()
+    if "Date" not in validation_frame.columns and "index" in validation_frame.columns:
+        validation_frame = validation_frame.rename(columns={"index": "Date"})
+    try:
+        validate_ohlcv_frame(validation_frame, end_date)
+    except ValueError as exc:
+        raise NoMarketDataError(symbol, canonical, str(exc)) from exc
+
     # Reject a stale frame (e.g. a year-old partial response) before it is
     # formatted into the report. Raises NoMarketDataError, which the router
     # turns into one clear unavailable signal (#1021).
@@ -68,6 +77,22 @@ def get_YFin_data_online(
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
     return header + csv_string
+
+
+def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    canonical = normalize_symbol(symbol)
+    ticker = yf.Ticker(canonical)
+    end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
+    data = yf_retry(lambda: ticker.history(start=start_date, end=end_inclusive))
+    if data.empty:
+        raise NoMarketDataError(
+            symbol, canonical, f"no rows between {start_date} and {end_date}"
+        )
+    if data.index.tz is not None:
+        data.index = data.index.tz_localize(None)
+    return data.reset_index()
 
 def get_stock_stats_indicators_window(
     symbol: Annotated[str, "ticker symbol of the company"],

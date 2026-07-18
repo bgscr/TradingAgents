@@ -1,7 +1,11 @@
 import unittest
 
 from cli.models import AnalystType, AssetType
-from cli.utils import detect_asset_type, filter_analysts_for_asset_type
+from cli.utils import (
+    detect_asset_type,
+    filter_analysts_for_asset_type,
+    filter_analysts_for_instrument,
+)
 from tradingagents.graph.propagation import Propagator
 
 
@@ -42,6 +46,27 @@ class CryptoAssetModeTests(unittest.TestCase):
         self.assertEqual(
             filter_analysts_for_asset_type(analysts, AssetType.STOCK),
             analysts,
+        )
+
+    def test_filters_out_company_fundamentals_for_mainland_fund(self):
+        analysts = [
+            AnalystType.MARKET,
+            AnalystType.SOCIAL,
+            AnalystType.NEWS,
+            AnalystType.FUNDAMENTALS,
+        ]
+
+        self.assertEqual(
+            filter_analysts_for_instrument(
+                analysts,
+                ticker="512210.SH",
+                asset_type=AssetType.STOCK,
+            ),
+            [
+                AnalystType.MARKET,
+                AnalystType.SOCIAL,
+                AnalystType.NEWS,
+            ],
         )
 
     def test_propagator_includes_asset_type_in_initial_state(self):

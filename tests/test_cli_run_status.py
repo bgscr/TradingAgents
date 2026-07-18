@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -156,6 +157,17 @@ def test_run_analysis_marks_failed_when_graph_initialization_fails(
 def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     tmp_path, monkeypatch
 ):
+    snapshot_scope_events = []
+
+    @contextmanager
+    def snapshot_scope():
+        snapshot_scope_events.append("entered")
+        try:
+            yield
+        finally:
+            snapshot_scope_events.append("exited")
+
+    monkeypatch.setattr(cli_main, "authoritative_snapshot_run", snapshot_scope)
     monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
     monkeypatch.setattr(
         cli_main,
@@ -183,6 +195,9 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
         def resolve_instrument_context(self, *args, **kwargs):
             return "resolved identity"
 
+        def resolve_evidence_state(self, *args, **kwargs):
+            return None
+
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
     display = NoOpDisplay()
     monkeypatch.setattr(cli_main, "create_run_display", lambda *args, **kwargs: display)
@@ -197,3 +212,95 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     assert payload["current_phase"] == "graph_stream"
     assert payload["error_summary"] == "KeyboardInterrupt: ctrl-c"
     assert display.closed is True
+    assert snapshot_scope_events == ["entered", "exited"]
+
+
+@pytest.mark.unit
+def test_run_analysis_marks_failed_when_display_start_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
+    monkeypatch.setattr(
+        cli_main,
+        "DEFAULT_CONFIG",
+        dict(cli_main.DEFAULT_CONFIG, results_dir=str(tmp_path)),
+    )
+
+    class FakePropagator:
+        def create_initial_state(self, *args, **kwargs):
+            return {}
+
+        def get_graph_args(self, *args, **kwargs):
+            return {}
+
+    class FakeStream:
+        def stream(self, *args, **kwargs):
+            yield {}
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, *args, **kwargs):
+            self.propagator = FakePropagator()
+            self.graph = FakeStream()
+
+        def resolve_instrument_context(self, *args, **kwargs):
+            return "resolved identity"
+
+        def resolve_evidence_state(self, *args, **kwargs):
+            return None
+
+    class FailingDisplay(NoOpDisplay):
+        def start(self):
+            raise RuntimeError("display failed")
+
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
+    monkeypatch.setattr(
+        cli_main,
+        "create_run_display",
+        lambda *args, **kwargs: FailingDisplay(),
+    )
+
+    with pytest.raises(RuntimeError, match="display failed"):
+        cli_main.run_analysis()
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    payload = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["error_summary"] == "RuntimeError: display failed"
+    assert "Run failed during graph_initializing" in (
+        run_dir / "message_tool.log"
+    ).read_text(encoding="utf-8")
+    assert (run_dir / "runtime_metrics.json").exists()
+
+
+@pytest.mark.unit
+def test_run_analysis_marks_failed_when_display_construction_fails(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
+    monkeypatch.setattr(
+        cli_main,
+        "DEFAULT_CONFIG",
+        dict(cli_main.DEFAULT_CONFIG, results_dir=str(tmp_path)),
+    )
+
+    class FakeTradingAgentsGraph:
+        def __init__(self, *args, **kwargs):
+            self.propagator = SimpleNamespace()
+            self.graph = SimpleNamespace()
+
+    def fail_display(*args, **kwargs):
+        raise RuntimeError("display construction failed")
+
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
+    monkeypatch.setattr(cli_main, "create_run_display", fail_display)
+
+    with pytest.raises(RuntimeError, match="display construction failed"):
+        cli_main.run_analysis()
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    payload = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["error_summary"] == "RuntimeError: display construction failed"
+    assert "Run failed during graph_initializing" in (
+        run_dir / "message_tool.log"
+    ).read_text(encoding="utf-8")
+    assert (run_dir / "runtime_metrics.json").exists()

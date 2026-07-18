@@ -1,3 +1,4 @@
+from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.utils.agent_utils import (
@@ -7,6 +8,12 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
     get_verified_market_snapshot,
 )
+from tradingagents.evidence import (
+    AnalystEvidenceReport,
+    evidence_sources_from_tool_messages,
+    merge_evidence_sources,
+    merge_material_claims,
+)
 
 
 def create_market_analyst(llm):
@@ -15,11 +22,12 @@ def create_market_analyst(llm):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
 
-        tools = [
+        data_tools = [
             get_stock_data,
             get_indicators,
             get_verified_market_snapshot,
         ]
+        tools = [*data_tools, AnalystEvidenceReport]
 
         system_message = (
             """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
@@ -50,7 +58,9 @@ Volume-Based Indicators:
 
 Before writing the final report, call get_verified_market_snapshot for this ticker and the current date, and treat it as the source of truth for any exact OHLCV, price-level, or indicator-value claim. If another tool's output conflicts with the verified snapshot, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless they are directly supported by tool output with concrete dates and prices. For mainland China A-shares, get_stock_data may include a source-labeled China A-share enhancement snapshot; treat it as supplemental short-term flow and attention context, not as a replacement for OHLCV or verified indicator values.
 
-Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
+Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions.
+
+When the analysis is complete, submit it through AnalystEvidenceReport. Put the human-readable Markdown in report_markdown and list every decision-relevant factual premise as a MaterialClaim with source_refs. Do not submit unsupported claims or precision."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
@@ -72,7 +82,12 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
         )
 
         prompt = prompt.partial(system_message=system_message)
-        prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
+        prompt = prompt.partial(
+            tool_names=", ".join(
+                [tool.name for tool in data_tools]
+                + [AnalystEvidenceReport.__name__]
+            )
+        )
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
@@ -82,12 +97,39 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
 
         report = ""
 
-        if len(result.tool_calls) == 0:
+        report_submission = next(
+            (
+                tool_call
+                for tool_call in result.tool_calls
+                if tool_call["name"] == AnalystEvidenceReport.__name__
+            ),
+            None,
+        )
+        if report_submission is not None:
+            submitted = AnalystEvidenceReport.model_validate(report_submission["args"])
+            claims = tuple(
+                claim.model_copy(update={"analyst": "market"})
+                for claim in submitted.material_claims
+            )
+            report = submitted.report_markdown
+            result = AIMessage(content=report)
+        elif len(result.tool_calls) == 0:
             report = result.content
 
-        return {
+        update = {
             "messages": [result],
             "market_report": report,
         }
+        if report_submission is not None:
+            merged_evidence = merge_material_claims(
+                state.get("evidence_state"),
+                claims,
+            )
+            merged_evidence = merge_evidence_sources(
+                merged_evidence,
+                evidence_sources_from_tool_messages(state["messages"], claims),
+            )
+            update["evidence_state"] = merged_evidence.model_dump(mode="json")
+        return update
 
     return market_analyst_node

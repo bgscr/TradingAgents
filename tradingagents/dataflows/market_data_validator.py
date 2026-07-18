@@ -15,7 +15,9 @@ from collections.abc import Iterable
 import pandas as pd
 from stockstats import wrap
 
+from tradingagents.dataflows.market_snapshot import get_authoritative_market_snapshot
 from tradingagents.dataflows.stockstats_utils import load_ohlcv
+from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
@@ -69,7 +71,17 @@ def build_verified_market_snapshot(
     # `df` keeps the original capitalized OHLCV columns (Open/High/Low/Close/
     # Volume); stockstats `wrap()` lowercases columns and adds indicator
     # columns, so read raw prices from `df` and indicators from `stock_df`.
-    df = _verified_rows(symbol, curr_date)
+    authoritative = None
+    if resolve_china_a_symbol(symbol) is not None:
+        start_date = (
+            pd.Timestamp(curr_date) - pd.DateOffset(years=5)
+        ).strftime("%Y-%m-%d")
+        authoritative = get_authoritative_market_snapshot(
+            symbol, start_date, curr_date
+        )
+        df = authoritative.frame.copy()
+    else:
+        df = _verified_rows(symbol, curr_date)
     stock_df = wrap(df.copy())
 
     selected = tuple(indicators or DEFAULT_SNAPSHOT_INDICATORS)
@@ -92,12 +104,24 @@ def build_verified_market_snapshot(
         f"- Requested analysis date: {curr_date}",
         f"- Latest trading row used: {latest_date}",
         "- Rows after the requested analysis date are excluded before verification.",
-        "",
-        "### Latest verified OHLCV row",
-        "",
-        "| Field | Value |",
-        "|---|---:|",
     ]
+    if authoritative is not None:
+        lines.extend(
+            [
+                f"- Provider: {authoritative.provider}",
+                f"- Adjustment basis: {authoritative.adjustment_basis}",
+                f"- Retrieved at: {authoritative.retrieved_at}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "### Latest verified OHLCV row",
+            "",
+            "| Field | Value |",
+            "|---|---:|",
+        ]
+    )
     for field in ("Open", "High", "Low", "Close", "Volume"):
         lines.append(f"| {field} | {_fmt(latest.get(field))} |")
 

@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from langgraph.graph import MessagesState
 from typing_extensions import TypedDict
@@ -48,6 +48,11 @@ class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
     instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
+    evidence_state: Annotated[dict[str, Any], "Validated shared evidence for gates"]
+    admission_gate: Annotated[dict[str, Any], "Deterministic admission-gate result"]
+    analysis_outcome: Annotated[str, "Non-directional outcome when evidence blocks"]
+    draft_thesis: Annotated[dict[str, Any], "Structured directional thesis draft"]
+    decision_gate: Annotated[dict[str, Any], "Deterministic decision-gate result"]
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]

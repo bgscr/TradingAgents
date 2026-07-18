@@ -99,6 +99,28 @@ def filter_analysts_for_asset_type(
     ]
 
 
+def filter_analysts_for_instrument(
+    analysts: list[AnalystType],
+    ticker: str | None,
+    asset_type: AssetType,
+) -> list[AnalystType]:
+    """Keep only analysts supported by the resolved instrument."""
+    filtered = filter_analysts_for_asset_type(analysts, asset_type)
+    if asset_type == AssetType.CRYPTO or ticker is None:
+        return filtered
+
+    from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
+
+    instrument = resolve_mainland_instrument(ticker)
+    if instrument is None or "fundamentals" in instrument.capabilities:
+        return filtered
+    return [
+        analyst
+        for analyst in filtered
+        if analyst != AnalystType.FUNDAMENTALS
+    ]
+
+
 def get_analysis_date() -> str:
     """Prompt the user to enter a date in YYYY-MM-DD format."""
     import re
@@ -132,10 +154,14 @@ def get_analysis_date() -> str:
     return date.strip()
 
 
-def select_analysts(asset_type: AssetType = AssetType.STOCK) -> list[AnalystType]:
+def select_analysts(
+    asset_type: AssetType = AssetType.STOCK,
+    ticker: str | None = None,
+) -> list[AnalystType]:
     """Select analysts using an interactive checkbox."""
-    available_analysts = filter_analysts_for_asset_type(
+    available_analysts = filter_analysts_for_instrument(
         [value for _, value in ANALYST_ORDER],
+        ticker,
         asset_type,
     )
     choices = questionary.checkbox(

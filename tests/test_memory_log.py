@@ -8,6 +8,12 @@ import pytest
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.evidence import (
+    EvidenceState,
+    InstrumentIdentityEvidence,
+    MarketSnapshotEvidence,
+    MaterialClaim,
+)
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.reflection import Reflector
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -82,6 +88,32 @@ def _make_pm_state(past_context=""):
         "investment_plan": "Research plan.",
         "trader_investment_plan": "Trader plan.",
     }
+
+
+def _decision_ready_pm_evidence() -> dict:
+    return EvidenceState(
+        instrument_identity=InstrumentIdentityEvidence(symbol="NVDA", name="NVIDIA"),
+        market_snapshot=MarketSnapshotEvidence(
+            symbol="NVDA",
+            provider="yfinance",
+            retrieved_at="2026-01-10T12:00:00+00:00",
+            adjustment_basis="auto_adjusted",
+            requested_date="2026-01-10",
+            effective_trading_date="2026-01-09",
+            history_rows=250,
+        ),
+        material_claims=(
+            MaterialClaim(
+                claim_id="market.ai_capex_cycle",
+                analyst="market",
+                statement=(
+                    "AI capex cycle remains intact and supports a 215.0 price "
+                    "target over 3-6 months."
+                ),
+                source_refs=("snapshot:NVDA:2026-01-09",),
+            ),
+        ),
+    ).model_dump(mode="json")
 
 
 def _structured_pm_llm(captured: dict, decision: PortfolioDecision | None = None):
@@ -716,10 +748,13 @@ class TestPortfolioManagerInjection:
             investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
             price_target=215.0,
             time_horizon="3-6 months",
+            material_claim_ids=("market.ai_capex_cycle",),
         )
         llm = _structured_pm_llm(captured, decision)
         pm_node = create_portfolio_manager(llm)
-        result = pm_node(_make_pm_state())
+        state = _make_pm_state()
+        state["evidence_state"] = _decision_ready_pm_evidence()
+        result = pm_node(state)
         md = result["final_trade_decision"]
         assert "**Rating**: Overweight" in md
         assert "**Executive Summary**: Build position gradually" in md
@@ -727,17 +762,20 @@ class TestPortfolioManagerInjection:
         assert "**Price Target**: 215.0" in md
         assert "**Time Horizon**: 3-6 months" in md
 
-    def test_pm_falls_back_to_freetext_when_structured_unavailable(self):
+    def test_pm_freetext_fallback_requires_explicit_shadow_override(self):
         """If a provider does not support with_structured_output, the agent
-        falls back to a plain invoke and returns whatever prose the model
-        produced, so the pipeline never blocks."""
+        can use the explicitly labeled legacy override without weakening the
+        default evidence-enforced path."""
         plain_response = "**Rating**: Sell\n\nExit ahead of guidance."
         llm = MagicMock()
         llm.with_structured_output.side_effect = NotImplementedError("provider unsupported")
         llm.invoke.return_value = MagicMock(content=plain_response)
-        pm_node = create_portfolio_manager(llm)
+        pm_node = create_portfolio_manager(llm, evidence_gate_mode="shadow")
         result = pm_node(_make_pm_state())
-        assert result["final_trade_decision"] == plain_response
+        assert result["final_trade_decision"].startswith(
+            "> **Evidence Gate:** UNENFORCED (shadow mode)"
+        )
+        assert result["final_trade_decision"].endswith(plain_response)
 
     # get_past_context ordering and limits
 

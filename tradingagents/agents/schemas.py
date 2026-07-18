@@ -23,6 +23,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from tradingagents.evidence import DecisionConfidence, MaterialClaim
+
 # LLMs sometimes write a placeholder string ("None", "N/A", ...) into an optional
 # numeric field instead of omitting it. Coerce those to None so the structured
 # call validates instead of erroring (#1058). Pydantic still parses real numeric
@@ -213,6 +215,13 @@ class PortfolioDecision(BaseModel):
             "incorporate them; otherwise rely solely on the current analysis."
         ),
     )
+    material_claim_ids: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "IDs of the source-linked material claims actually used by the "
+            "investment thesis. Include every decision-relevant premise."
+        ),
+    )
     price_target: float | None = Field(
         default=None,
         description="Optional target price in the instrument's quote currency.",
@@ -228,7 +237,12 @@ class PortfolioDecision(BaseModel):
         return _coerce_optional_float(v)
 
 
-def render_pm_decision(decision: PortfolioDecision) -> str:
+def render_pm_decision(
+    decision: PortfolioDecision,
+    *,
+    confidence: DecisionConfidence | None = None,
+    evidence_coverage: float | None = None,
+) -> str:
     """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
 
     Memory log, CLI display, and saved report files all read this markdown,
@@ -247,6 +261,10 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         parts.extend(["", f"**Price Target**: {decision.price_target}"])
     if decision.time_horizon:
         parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+    if confidence is not None:
+        parts.extend(["", f"**Decision Confidence**: {confidence.value.capitalize()}"])
+    if evidence_coverage is not None:
+        parts.extend(["", f"**Evidence Coverage**: {evidence_coverage:.1%}"])
     return "\n".join(parts)
 
 
@@ -321,6 +339,13 @@ class SentimentReport(BaseModel):
             "direction, source, and supporting evidence. "
             "Keep it informative and substantive: develop each section thoroughly "
             "with concrete evidence so every point adds new signal for the trader."
+        ),
+    )
+    material_claims: tuple[MaterialClaim, ...] = Field(
+        default=(),
+        description=(
+            "Source-linked material premises used in the narrative. Omit claims "
+            "that are not decision-relevant; never include a claim without a source ref."
         ),
     )
 

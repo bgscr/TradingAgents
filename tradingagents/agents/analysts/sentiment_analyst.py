@@ -46,6 +46,12 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
+from tradingagents.evidence import (
+    EvidenceSource,
+    EvidenceStatus,
+    merge_evidence_sources,
+    merge_material_claims,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +103,40 @@ def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> di
         "reddit_block": fetch_reddit_posts(ticker),
         "local_sentiment_block": "",
     }
+
+
+def _evidence_sources_for_blocks(
+    ticker: str,
+    blocks: dict[str, str],
+) -> tuple[EvidenceSource, ...]:
+    is_china = resolve_china_a_symbol(ticker) is not None
+    source_blocks = [
+        ("sentiment.news", blocks["news_block"]),
+        (
+            "sentiment.china_local" if is_china else "sentiment.stocktwits",
+            blocks["local_sentiment_block"] if is_china else blocks["stocktwits_block"],
+        ),
+    ]
+    if not is_china:
+        source_blocks.append(("sentiment.reddit", blocks["reddit_block"]))
+
+    sources = []
+    for source_id, block in source_blocks:
+        normalized = block.strip().upper()
+        unavailable = not normalized or "UNAVAILABLE" in normalized
+        sources.append(
+            EvidenceSource(
+                source_id=source_id,
+                status=(
+                    EvidenceStatus.UNAVAILABLE
+                    if unavailable
+                    else EvidenceStatus.AVAILABLE
+                ),
+                required=False,
+                detail="source returned unavailable" if unavailable else "",
+            )
+        )
+    return tuple(sources)
 
 
 def create_sentiment_analyst(llm):
@@ -151,18 +191,36 @@ def create_sentiment_analyst(llm):
         # data is already in the prompt.
         formatted_messages = prompt.format_messages(messages=state["messages"])
 
+        material_claims = ()
+
+        def render_report(report):
+            nonlocal material_claims
+            material_claims = report.material_claims
+            return render_sentiment_report(report)
+
         report_text = invoke_structured_or_freetext(
             structured_llm,
             llm,
             formatted_messages,
-            render_sentiment_report,
+            render_report,
             "Sentiment Analyst",
         )
 
-        return {
+        update = {
             "messages": [AIMessage(content=report_text)],
             "sentiment_report": report_text,
         }
+        sources = _evidence_sources_for_blocks(ticker, blocks)
+        if material_claims or sources:
+            merged_evidence = merge_material_claims(
+                state.get("evidence_state"),
+                material_claims,
+            )
+            update["evidence_state"] = merge_evidence_sources(
+                merged_evidence,
+                sources,
+            ).model_dump(mode="json")
+        return update
 
     return sentiment_analyst_node
 
@@ -241,6 +299,7 @@ Fill the following fields:
 - **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
 - **confidence**: low / medium / high, based on data quality and sample size.
 - **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
+- **material_claims**: Decision-relevant factual premises only. Use source_refs from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local exactly as applicable above; never cite a skipped or unavailable source.
 
 {get_language_instruction()}"""
 

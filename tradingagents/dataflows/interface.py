@@ -31,7 +31,7 @@ from .errors import (
 )
 from .fred import get_macro_data as get_fred_macro_data
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
-from .symbol_utils import resolve_china_a_symbol
+from .symbol_utils import resolve_china_a_symbol, resolve_mainland_instrument
 from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -255,6 +255,12 @@ def append_china_a_enhancement(method: str, result: str, args: tuple, kwargs: di
     symbol = _first_symbol_arg(args, kwargs)
     if not isinstance(symbol, str) or resolve_china_a_symbol(symbol) is None:
         return result
+    mainland = resolve_mainland_instrument(symbol)
+    if (
+        mainland is not None
+        and "china_enhancements" not in mainland.capabilities
+    ):
+        return result
     curr_date = _date_for_enhancement(method, args, kwargs)
     if not curr_date:
         return result
@@ -299,6 +305,19 @@ def get_vendor(category: str, method: str = None, market: str | None = None) -> 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
+    symbol = _first_symbol_arg(args, kwargs)
+    mainland = (
+        resolve_mainland_instrument(symbol) if isinstance(symbol, str) else None
+    )
+    if (
+        mainland is not None
+        and category == "fundamental_data"
+        and "fundamentals" not in mainland.capabilities
+    ):
+        return (
+            "NOT_APPLICABLE: company fundamentals require a mainland equity; "
+            f"{mainland.yahoo_symbol} is a {mainland.instrument_kind}."
+        )
     market = _get_market_for_call(method, args, kwargs)
     vendor_config = get_vendor(category, method, market)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]

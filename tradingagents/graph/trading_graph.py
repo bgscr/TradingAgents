@@ -29,8 +29,10 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.evidence import EvidenceState, acquire_run_evidence
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
 
@@ -129,6 +131,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
+            evidence_gate_mode=self.config.get("evidence_gate_mode", "enforce"),
         )
 
         self.propagator = Propagator(
@@ -345,6 +348,11 @@ class TradingAgentsGraph:
         identity = resolve_instrument_identity(ticker)
         return build_instrument_context(ticker, asset_type, identity)
 
+    @staticmethod
+    def resolve_evidence_state(ticker: str, trade_date: str) -> EvidenceState:
+        """Acquire the typed identity and market evidence for one analysis run."""
+        return acquire_run_evidence(ticker, trade_date)
+
     def _run_signature(self, asset_type: str) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
 
@@ -357,6 +365,7 @@ class TradingAgentsGraph:
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
+            f"evidence_gate={self.config.get('evidence_gate_mode', 'enforce')}",
         ])
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
@@ -394,7 +403,12 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            with authoritative_snapshot_run():
+                return self._run_graph(
+                    company_name,
+                    trade_date,
+                    asset_type=asset_type,
+                )
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
@@ -422,12 +436,14 @@ class TradingAgentsGraph:
         # deterministically resolved instrument identity for all agents.
         past_context = self.memory_log.get_past_context(company_name)
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
+        evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
         init_agent_state = self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
             past_context=past_context,
             instrument_context=instrument_context,
+            evidence_state=evidence_state,
         )
         args = self.propagator.get_graph_args()
 
@@ -465,12 +481,18 @@ class TradingAgentsGraph:
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
-        # Store decision for deferred reflection on the next same-ticker run.
-        self.memory_log.store_decision(
-            ticker=company_name,
-            trade_date=trade_date,
-            final_trade_decision=final_state["final_trade_decision"],
-        )
+        analysis_outcome = final_state.get("analysis_outcome")
+        if analysis_outcome:
+            processed_signal = None
+        else:
+            final_trade_decision = final_state["final_trade_decision"]
+            # Store decision for deferred reflection on the next same-ticker run.
+            self.memory_log.store_decision(
+                ticker=company_name,
+                trade_date=trade_date,
+                final_trade_decision=final_trade_decision,
+            )
+            processed_signal = self.process_signal(final_trade_decision)
 
         # Clear checkpoint on successful completion to avoid stale state.
         if self.config.get("checkpoint_enabled"):
@@ -479,39 +501,67 @@ class TradingAgentsGraph:
                 self._run_signature(asset_type),
             )
 
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        return final_state, processed_signal
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
+        logged_state = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
-            "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
-            },
-            "trader_investment_decision": final_state["trader_investment_plan"],
-            "risk_debate_state": {
-                "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
-                "conservative_history": final_state["risk_debate_state"]["conservative_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
-            },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
         }
+        if final_state.get("analysis_outcome"):
+            logged_state.update(
+                {
+                    "evidence_state": final_state.get("evidence_state", {}),
+                    "admission_gate": final_state.get("admission_gate", {}),
+                    "analysis_outcome": final_state["analysis_outcome"],
+                }
+            )
+        else:
+            logged_state.update(
+                {
+                    "investment_debate_state": {
+                        "bull_history": final_state["investment_debate_state"][
+                            "bull_history"
+                        ],
+                        "bear_history": final_state["investment_debate_state"][
+                            "bear_history"
+                        ],
+                        "history": final_state["investment_debate_state"]["history"],
+                        "current_response": final_state["investment_debate_state"][
+                            "current_response"
+                        ],
+                        "judge_decision": final_state["investment_debate_state"][
+                            "judge_decision"
+                        ],
+                    },
+                    "trader_investment_decision": final_state[
+                        "trader_investment_plan"
+                    ],
+                    "risk_debate_state": {
+                        "aggressive_history": final_state["risk_debate_state"][
+                            "aggressive_history"
+                        ],
+                        "conservative_history": final_state["risk_debate_state"][
+                            "conservative_history"
+                        ],
+                        "neutral_history": final_state["risk_debate_state"][
+                            "neutral_history"
+                        ],
+                        "history": final_state["risk_debate_state"]["history"],
+                        "judge_decision": final_state["risk_debate_state"][
+                            "judge_decision"
+                        ],
+                    },
+                    "investment_plan": final_state["investment_plan"],
+                    "final_trade_decision": final_state["final_trade_decision"],
+                }
+            )
+        self.log_states_dict[str(trade_date)] = logged_state
 
         # Save to file. Reject ticker values that would escape the
         # results directory when joined as a path component.

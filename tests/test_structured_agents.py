@@ -11,8 +11,11 @@ import inspect
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
+from tradingagents.agents.analysts import sentiment_analyst as sentiment_module
 from tradingagents.agents.analysts.fundamentals_analyst import (
     create_fundamentals_analyst,
 )
@@ -33,6 +36,12 @@ from tradingagents.agents.schemas import (
     render_trader_proposal,
 )
 from tradingagents.agents.trader.trader import create_trader
+from tradingagents.evidence import (
+    EvidenceSource,
+    EvidenceState,
+    EvidenceStatus,
+    MaterialClaim,
+)
 
 # ---------------------------------------------------------------------------
 # Render functions
@@ -50,6 +59,317 @@ def test_analyst_prompts_do_not_expose_final_transaction_proposal_signal():
 
     for factory in analyst_factories:
         assert "FINAL TRANSACTION PROPOSAL" not in inspect.getsource(factory)
+
+
+@pytest.mark.unit
+def test_market_analyst_submits_typed_claims_to_shared_evidence():
+    claim = MaterialClaim(
+        claim_id="market.latest_close",
+        analyst="market",
+        statement="The effective-date close was USD 189.50.",
+        source_refs=("snapshot:NVDA:2026-01-15",),
+    )
+    indicator_claim = MaterialClaim(
+        claim_id="market.rsi",
+        analyst="market",
+        statement="The effective-date RSI was 55.",
+        source_refs=("get_indicators:NVDA:2026-01-15",),
+    )
+    submission = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "AnalystEvidenceReport",
+                "args": {
+                    "report_markdown": "## Market Analysis\n\nMomentum remained constructive.",
+                    "material_claims": [
+                        claim.model_dump(mode="json"),
+                        indicator_claim.model_dump(mode="json"),
+                    ],
+                },
+                "id": "market-report",
+                "type": "tool_call",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: submission)
+    analyst = create_market_analyst(llm)
+
+    result = analyst(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [
+                ToolMessage(
+                    content=(
+                        "Authoritative snapshot for NVDA on 2026-01-15: "
+                        "Close 189.50."
+                    ),
+                    tool_call_id="snapshot-tool-call",
+                    name="get_verified_market_snapshot",
+                ),
+                ToolMessage(
+                    content="The effective-date RSI was 55.",
+                    tool_call_id="indicator-tool-call",
+                    name="get_indicators",
+                )
+            ],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    assert result["market_report"] == "## Market Analysis\n\nMomentum remained constructive."
+    assert result["messages"][0].content == result["market_report"]
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert evidence.material_claims == (claim, indicator_claim)
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="snapshot:NVDA:2026-01-15",
+            status=EvidenceStatus.AVAILABLE,
+            required=False,
+        ),
+        EvidenceSource(
+            source_id="get_indicators:NVDA:2026-01-15",
+            status=EvidenceStatus.AVAILABLE,
+            required=False,
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_market_analyst_conflicts_numeric_claim_absent_from_its_source():
+    claim = MaterialClaim(
+        claim_id="market.rsi",
+        analyst="market",
+        statement="The effective-date RSI was 72.",
+        source_refs=("get_indicators:NVDA:2026-01-15",),
+    )
+    submission = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "AnalystEvidenceReport",
+                "args": {
+                    "report_markdown": "## Market Analysis\n\nMomentum looked elevated.",
+                    "material_claims": [claim.model_dump(mode="json")],
+                },
+                "id": "market-report",
+                "type": "tool_call",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: submission)
+    analyst = create_market_analyst(llm)
+
+    result = analyst(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [
+                ToolMessage(
+                    content="The effective-date RSI was 55.",
+                    tool_call_id="indicator-tool-call",
+                    name="get_indicators",
+                )
+            ],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="get_indicators:NVDA:2026-01-15",
+            status=EvidenceStatus.CONFLICTED,
+            required=False,
+            detail="source does not contain numeric claim(s): 72",
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_market_analyst_marks_claim_without_matching_tool_result_unavailable():
+    claim = MaterialClaim(
+        claim_id="market.rsi",
+        analyst="market",
+        statement="The effective-date RSI was 55.",
+        source_refs=("get_indicators:NVDA:2026-01-15",),
+    )
+    submission = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "AnalystEvidenceReport",
+                "args": {
+                    "report_markdown": "## Market Analysis\n\nMomentum was constructive.",
+                    "material_claims": [claim.model_dump(mode="json")],
+                },
+                "id": "market-report",
+                "type": "tool_call",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: submission)
+    analyst = create_market_analyst(llm)
+
+    result = analyst(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="get_indicators:NVDA:2026-01-15",
+            status=EvidenceStatus.UNAVAILABLE,
+            required=False,
+            detail="no matching tool result",
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_news_analyst_submits_typed_claims_to_shared_evidence():
+    claim = MaterialClaim(
+        claim_id="news.guidance_update",
+        analyst="news",
+        statement="Management raised full-year revenue guidance.",
+        source_refs=("get_news:NVDA:2026-01-15",),
+    )
+    submission = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "AnalystEvidenceReport",
+                "args": {
+                    "report_markdown": "## News Analysis\n\nGuidance improved.",
+                    "material_claims": [claim.model_dump(mode="json")],
+                },
+                "id": "news-report",
+                "type": "tool_call",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: submission)
+    analyst = create_news_analyst(llm)
+
+    result = analyst(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [
+                ToolMessage(
+                    content="Management raised full-year revenue guidance.",
+                    tool_call_id="news-tool-call",
+                    name="get_news",
+                )
+            ],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    assert result["news_report"] == "## News Analysis\n\nGuidance improved."
+    assert result["messages"][0].content == result["news_report"]
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert evidence.material_claims == (claim,)
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="get_news:NVDA:2026-01-15",
+            status=EvidenceStatus.AVAILABLE,
+            required=False,
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_fundamentals_analyst_skips_company_analysis_for_mainland_fund():
+    llm = MagicMock()
+    llm.bind_tools.side_effect = AssertionError(
+        "fund company-analysis LLM must not be invoked"
+    )
+    analyst = create_fundamentals_analyst(llm)
+
+    result = analyst({
+        "company_of_interest": "512210.SH",
+        "trade_date": "2026-07-15",
+        "asset_type": "stock",
+        "messages": [],
+    })
+
+    assert result["fundamentals_report"] == (
+        "NOT_APPLICABLE: company fundamentals require a mainland equity; "
+        "512210.SS is a fund."
+    )
+    assert result["messages"][0].content == result["fundamentals_report"]
+
+
+@pytest.mark.unit
+def test_fundamentals_analyst_submits_typed_claims_to_shared_evidence():
+    claim = MaterialClaim(
+        claim_id="fundamentals.revenue_growth",
+        analyst="fundamentals",
+        statement="Reported revenue grew 18% year over year.",
+        source_refs=("get_income_statement:NVDA:2026-01-15",),
+    )
+    submission = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "AnalystEvidenceReport",
+                "args": {
+                    "report_markdown": "## Fundamentals\n\nRevenue growth remained strong.",
+                    "material_claims": [claim.model_dump(mode="json")],
+                },
+                "id": "fundamentals-report",
+                "type": "tool_call",
+            }
+        ],
+    )
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: submission)
+    analyst = create_fundamentals_analyst(llm)
+
+    result = analyst(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [
+                ToolMessage(
+                    content="Reported revenue grew 18% year over year.",
+                    tool_call_id="income-statement-tool-call",
+                    name="get_income_statement",
+                )
+            ],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    assert result["fundamentals_report"] == (
+        "## Fundamentals\n\nRevenue growth remained strong."
+    )
+    assert result["messages"][0].content == result["fundamentals_report"]
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert evidence.material_claims == (claim,)
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="get_income_statement:NVDA:2026-01-15",
+            status=EvidenceStatus.AVAILABLE,
+            required=False,
+        ),
+    )
 
 
 @pytest.mark.unit
@@ -404,6 +724,66 @@ class TestSentimentAnalystAgent:
         result = analyst(_make_sentiment_state())
         assert len(result["messages"]) == 1
         assert result["sentiment_report"] == result["messages"][0].content
+
+    def test_structured_material_claims_merge_into_shared_evidence(self, monkeypatch):
+        monkeypatch.setattr(
+            sentiment_module,
+            "_collect_sentiment_blocks",
+            lambda *args: {
+                "news_block": "Two constructive headlines.",
+                "stocktwits_block": "75% bullish across 20 messages.",
+                "reddit_block": "<reddit unavailable: rate limited>",
+                "local_sentiment_block": "",
+            },
+        )
+        existing_claim = MaterialClaim(
+            claim_id="market.latest_close",
+            analyst="market",
+            statement="The effective-date close was USD 189.50.",
+            source_refs=("snapshot:NVDA:2026-01-15",),
+        )
+        sentiment_claim = MaterialClaim(
+            claim_id="sentiment.stocktwits_bullish_share",
+            analyst="sentiment",
+            statement="StockTwits messages were 75% bullish.",
+            source_refs=("sentiment.stocktwits",),
+        )
+        report = SentimentReport(
+            overall_band=SentimentBand.BULLISH,
+            overall_score=7.5,
+            confidence="high",
+            narrative="StockTwits sentiment was constructive.",
+            material_claims=(sentiment_claim,),
+        )
+        state = _make_sentiment_state()
+        state["evidence_state"] = EvidenceState(
+            material_claims=(existing_claim,)
+        ).model_dump(mode="json")
+
+        result = create_sentiment_analyst(
+            _structured_sentiment_llm({}, report)
+        )(state)
+
+        evidence = EvidenceState.model_validate(result["evidence_state"])
+        assert evidence.material_claims == (existing_claim, sentiment_claim)
+        assert evidence.sources == (
+            EvidenceSource(
+                source_id="sentiment.news",
+                status=EvidenceStatus.AVAILABLE,
+                required=False,
+            ),
+            EvidenceSource(
+                source_id="sentiment.stocktwits",
+                status=EvidenceStatus.AVAILABLE,
+                required=False,
+            ),
+            EvidenceSource(
+                source_id="sentiment.reddit",
+                status=EvidenceStatus.UNAVAILABLE,
+                required=False,
+                detail="source returned unavailable",
+            ),
+        )
 
     def test_prompt_contains_ticker(self):
         captured = {}

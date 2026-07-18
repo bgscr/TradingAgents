@@ -9,6 +9,8 @@ from dateutil.relativedelta import relativedelta
 from stockstats import wrap
 
 from .errors import NoMarketDataError
+from .market_snapshot import validate_ohlcv_frame
+from .monetary_facts import extract_chinese_monetary_facts, render_monetary_source_facts
 from .stockstats_utils import _assert_ohlcv_not_stale
 from .symbol_utils import resolve_china_a_symbol
 
@@ -45,6 +47,12 @@ def _require_china_a(symbol: str):
     instrument = resolve_china_a_symbol(symbol)
     if instrument is None:
         raise NoMarketDataError(symbol, symbol, "AKShare supports China A-share symbols only")
+    if getattr(instrument, "instrument_kind", "equity") == "index":
+        raise NoMarketDataError(
+            symbol,
+            instrument.yahoo_symbol,
+            "AKShare mainland index acquisition does not use the equity endpoint",
+        )
     return instrument
 
 
@@ -77,10 +85,8 @@ def _normalize_hist_frame(data: pd.DataFrame, symbol: str, canonical: str) -> pd
     keep = ["Date", "Open", "High", "Low", "Close", "Volume", "Amount"]
     frame = frame[keep]
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    frame = frame.dropna(subset=["Date"])
     for col in ["Open", "High", "Low", "Close", "Volume", "Amount"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame = frame.dropna(subset=["Close"])
     frame = frame.sort_values("Date")
     if frame.empty:
         raise NoMarketDataError(symbol, canonical, "AKShare returned no usable rows")
@@ -97,6 +103,7 @@ def _fetch_hist(symbol: str, start_date: str, end_date: str) -> tuple[str, pd.Da
         adjust="qfq",
     )
     frame = _normalize_hist_frame(raw, symbol, instrument.yahoo_symbol)
+    frame = validate_ohlcv_frame(frame, end_date)
     _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
     return instrument.yahoo_symbol, frame
 
@@ -111,6 +118,10 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     header += f"# Total records: {len(out)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     return header + out.to_csv(index=False)
+
+
+def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    return _fetch_hist(symbol, start_date, end_date)[1].copy()
 
 
 @lru_cache(maxsize=64)
@@ -235,17 +246,38 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
         "Source: AKShare stock_news_em",
         "",
     ]
+    monetary_facts = []
     for _, row in frame.iterrows():
         title = row.get("新闻标题", "No title")
         source = row.get("文章来源", "Unknown")
         lines.append(f"### {title} (source: {source})")
         content = row.get("新闻内容")
         if isinstance(content, str) and content.strip():
-            lines.append(content.strip())
+            content = content.strip()
+            lines.append(content)
         link = row.get("新闻链接")
         if isinstance(link, str) and link.strip():
-            lines.append(f"Link: {link.strip()}")
+            link = link.strip()
+            lines.append(f"Link: {link}")
+        else:
+            link = str(title)
+        if isinstance(title, str):
+            monetary_facts.extend(
+                extract_chinese_monetary_facts(
+                    title,
+                    source_ref=f"AKShare stock_news_em:{link}#title",
+                )
+            )
+        if isinstance(content, str):
+            monetary_facts.extend(
+                extract_chinese_monetary_facts(
+                    content,
+                    source_ref=f"AKShare stock_news_em:{link}#content",
+                )
+            )
         lines.append("")
+    if monetary_facts:
+        lines.append(render_monetary_source_facts(tuple(monetary_facts)))
     return "\n".join(lines)
 
 
@@ -316,23 +348,42 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
         "",
     ]
     degraded: list[str] = []
+    monetary_facts = []
 
-    for builder in (
-        lambda: _business_section(instrument.akshare_code),
-        lambda: _financial_abstract_section(instrument.akshare_code),
-        lambda: _fund_flow_section(instrument.akshare_code, instrument.exchange),
-        lambda: _yahoo_supplemental_section(instrument.yahoo_symbol, curr_date),
+    for source_ref, builder in (
+        (
+            f"AKShare stock_zyjs_ths:{instrument.akshare_code}:{curr_date or 'unknown'}",
+            lambda: _business_section(instrument.akshare_code),
+        ),
+        (
+            f"AKShare stock_financial_abstract:{instrument.akshare_code}:{curr_date or 'unknown'}",
+            lambda: _financial_abstract_section(instrument.akshare_code),
+        ),
+        (
+            f"AKShare stock_individual_fund_flow:{instrument.akshare_code}:{curr_date or 'unknown'}",
+            lambda: _fund_flow_section(instrument.akshare_code, instrument.exchange),
+        ),
+        (
+            f"Yahoo fundamentals:{instrument.yahoo_symbol}:{curr_date or 'unknown'}",
+            lambda: _yahoo_supplemental_section(instrument.yahoo_symbol, curr_date),
+        ),
     ):
         lines, errors = builder()
         if lines:
             sections.extend(lines)
             sections.append("")
+            monetary_facts.extend(
+                extract_chinese_monetary_facts("\n".join(lines), source_ref=source_ref)
+            )
         degraded.extend(errors)
 
     if degraded:
         sections.append("## Degraded Fields")
         sections.extend(degraded)
         sections.append("Do not fabricate degraded or missing AKShare values.")
+
+    if monetary_facts:
+        sections.append(render_monetary_source_facts(tuple(monetary_facts)))
 
     return "\n".join(sections)
 

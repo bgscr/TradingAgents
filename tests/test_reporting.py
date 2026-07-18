@@ -75,6 +75,39 @@ def test_complete_report_is_summary_first_and_links_full_histories(tmp_path):
 
 
 @pytest.mark.unit
+def test_blocked_analysis_writes_non_directional_outcome_report(tmp_path):
+    outcome = (
+        "**Analysis Outcome:** Insufficient Evidence\n"
+        "**Evidence Coverage:** 50.0%\n\n"
+        "Analysis stopped before thesis synthesis.\n\n"
+        "No Trading Decision was issued.\n\n"
+        "### Diagnostics\n\n"
+        "- Required evidence missing: Authoritative Market Snapshot."
+    )
+
+    out = write_report_tree(
+        {
+            "market_report": "MKT",
+            "analysis_outcome": outcome,
+            "risk_debate_state": {
+                "judge_decision": "**Rating**: Buy\n\n**Price Target**: 225.0",
+            },
+        },
+        "AAPL",
+        tmp_path,
+    )
+
+    assert (tmp_path / "5_portfolio" / "analysis_outcome.md").read_text() == outcome
+    assert not (tmp_path / "5_portfolio" / "decision.md").exists()
+    complete = out.read_text()
+    assert "## I. Analysis Outcome" in complete
+    assert outcome in complete
+    assert "Portfolio Manager Decision" not in complete
+    for directional_field in ("Rating:", "Price Target:", "Entry:", "Stop:", "Position Size:"):
+        assert directional_field not in complete
+
+
+@pytest.mark.unit
 def test_save_reports_explicit_path(tmp_path):
     # Unbound: with an explicit save_path, the method doesn't touch self/config.
     out = TradingAgentsGraph.save_reports(None, _state(), "AAPL", save_path=tmp_path)

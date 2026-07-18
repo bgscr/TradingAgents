@@ -6,6 +6,7 @@ from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.evidence import EvidenceState
 
 
 class Propagator:
@@ -22,6 +23,7 @@ class Propagator:
         asset_type: str = "stock",
         past_context: str = "",
         instrument_context: str = "",
+        evidence_state: EvidenceState | None = None,
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph.
 
@@ -38,6 +40,7 @@ class Propagator:
             "instrument_context": instrument_context,
             "trade_date": str(trade_date),
             "past_context": past_context,
+            "evidence_state": (evidence_state or EvidenceState()).model_dump(mode="json"),
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",

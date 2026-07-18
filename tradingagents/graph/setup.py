@@ -24,6 +24,7 @@ from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+from .evidence_gate import create_admission_gate_node, route_after_admission
 
 # Every target a shared conditional router can return. Each edge driven by the
 # router maps all of them, so a fall-through return (e.g. under prompt/i18n/
@@ -51,12 +52,19 @@ class GraphSetup:
         deep_thinking_llm: Any,
         tool_nodes: dict[str, ToolNode],
         conditional_logic: ConditionalLogic,
+        evidence_gate_mode: str = "enforce",
     ):
         """Initialize with required components."""
+        if evidence_gate_mode not in {"enforce", "shadow"}:
+            raise ValueError(
+                "evidence_gate_mode must be one of: enforce, shadow; "
+                f"got {evidence_gate_mode!r}"
+            )
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
+        self.evidence_gate_mode = evidence_gate_mode
 
     def setup_graph(
         self, selected_analysts=("market", "social", "news", "fundamentals")
@@ -89,7 +97,10 @@ class GraphSetup:
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        portfolio_manager_node = create_portfolio_manager(
+            self.deep_thinking_llm,
+            evidence_gate_mode=self.evidence_gate_mode,
+        )
 
         # Create workflow
         workflow = StateGraph(AgentState)
@@ -109,6 +120,12 @@ class GraphSetup:
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node(
+            "Evidence Admission",
+            create_admission_gate_node(
+                emit_blocked_outcome=self.evidence_gate_mode == "enforce"
+            ),
+        )
 
         # Define edges
         # Start with the first analyst
@@ -132,7 +149,18 @@ class GraphSetup:
             if i < len(plan.specs) - 1:
                 workflow.add_edge(current_clear, plan.specs[i + 1].agent_node)
             else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+                workflow.add_edge(current_clear, "Evidence Admission")
+
+        admission_router = (
+            route_after_admission
+            if self.evidence_gate_mode == "enforce"
+            else lambda state: "admitted"
+        )
+        workflow.add_conditional_edges(
+            "Evidence Admission",
+            admission_router,
+            {"admitted": "Bull Researcher", "blocked": END},
+        )
 
         # Both research-debate edges share the complete DEBATE_PATH_MAP (#1088).
         for debate_node in ("Bull Researcher", "Bear Researcher"):

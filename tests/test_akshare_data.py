@@ -138,6 +138,42 @@ def test_get_news_excludes_next_day_midnight(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_news_exposes_structured_monetary_facts_before_llm_consumption(monkeypatch):
+    news = pd.DataFrame({
+        "新闻标题": ["业绩预告"],
+        "新闻内容": ["预计收入50亿元~55亿元。"],
+        "发布时间": ["2026-06-29 12:00:00"],
+        "文章来源": ["source a"],
+        "新闻链接": ["https://example.test/monetary"],
+    })
+    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+
+    out = akshare_data.get_news("000725.SZ", "2026-06-20", "2026-06-29")
+
+    assert "## Structured Monetary Source Facts" in out
+    assert '"value":"5000000000"' in out
+    assert '"upper_value":"5500000000"' in out
+    assert "AKShare stock_news_em:https://example.test/monetary#content" in out
+
+
+@pytest.mark.unit
+def test_get_news_extracts_monetary_fact_from_headline(monkeypatch):
+    news = pd.DataFrame({
+        "新闻标题": ["拟签署50亿元合同"],
+        "新闻内容": [""],
+        "发布时间": ["2026-06-29 12:00:00"],
+        "文章来源": ["source a"],
+        "新闻链接": ["https://example.test/headline"],
+    })
+    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+
+    out = akshare_data.get_news("000725.SZ", "2026-06-20", "2026-06-29")
+
+    assert '"value":"5000000000"' in out
+    assert "AKShare stock_news_em:https://example.test/headline#title" in out
+
+
+@pytest.mark.unit
 def test_get_fundamentals_degrades_failed_optional_endpoint(monkeypatch):
     monkeypatch.setattr(
         akshare_data.ak,
@@ -209,6 +245,36 @@ def test_get_fundamentals_degrades_yahoo_supplemental_error(monkeypatch):
 
     assert "Yahoo Supplemental Profile" not in out
     assert "DATA_DEGRADED: Yahoo supplemental fundamentals unavailable" in out
+
+
+@pytest.mark.unit
+def test_get_fundamentals_exposes_structured_monetary_facts(monkeypatch):
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_zyjs_ths",
+        lambda symbol: pd.DataFrame({"经营范围": ["注册资本200.62亿元"]}),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_financial_abstract",
+        lambda symbol: pd.DataFrame({"选项": ["common"], "指标": ["profit"], "20260331": ["100"]}),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_individual_fund_flow",
+        lambda stock, market: pd.DataFrame({"日期": ["2026-06-29"], "收盘价": [10]}),
+    )
+    monkeypatch.setattr(
+        akshare_data,
+        "_get_yfinance_fundamentals",
+        lambda ticker, curr_date: "Name: Example",
+    )
+
+    out = akshare_data.get_fundamentals("000021.SZ", "2026-06-29")
+
+    assert "## Structured Monetary Source Facts" in out
+    assert '"value":"20062000000"' in out
+    assert "AKShare stock_zyjs_ths:000021:2026-06-29" in out
 
 
 @pytest.mark.unit

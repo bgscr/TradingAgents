@@ -18,7 +18,12 @@ from tradingagents.picker.ingestion import (
     plan_bootstrap_partitions,
     plan_daily_partitions,
 )
-from tradingagents.picker.pit_models import Dataset, PartitionKey, PartitionStatus
+from tradingagents.picker.pit_models import (
+    Dataset,
+    IngestionRunManifest,
+    PartitionKey,
+    PartitionStatus,
+)
 from tradingagents.picker.rate_limit import RetryPolicy
 from tradingagents.picker.tushare_provider import TushareProvider
 
@@ -75,16 +80,6 @@ class NoWaitLimiter:
         self.penalties += 1
         if self.events is not None:
             self.events.append("penalize")
-
-
-class RecordingCache(PITCache):
-    def __init__(self, root):
-        super().__init__(root)
-        self.run_writes = []
-
-    def write_run_manifest(self, manifest):
-        self.run_writes.append(manifest)
-        super().write_run_manifest(manifest)
 
 
 def frame(code="000001.SZ"):
@@ -243,13 +238,15 @@ def test_completed_partition_is_skipped_on_resume(tmp_path):
     assert cache.records()[key.storage_key] == original
 
 
-def test_corrupt_complete_partition_is_not_skipped(tmp_path, monkeypatch):
+def test_ordinary_resume_skips_by_metadata_and_audit_finds_corruption(
+    tmp_path, monkeypatch
+):
     identity_normalizer(monkeypatch)
     cache = PITCache(tmp_path)
     key = PartitionKey(Dataset.DAILY, "20260710")
     cache.store_complete(key, b"[]", frame(), "1")
     cache.raw_path(key).write_bytes(b"corrupt")
-    provider = FakeProvider([frame("000002.SZ")])
+    provider = FakeProvider([])
     limiter = NoWaitLimiter()
 
     summary = PITIngestor(
@@ -260,8 +257,9 @@ def test_corrupt_complete_partition_is_not_skipped(tmp_path, monkeypatch):
         sleeper=lambda _: None,
     )._ingest_keys([key])
 
-    assert summary.completed == 1
-    assert provider.calls == [key]
+    assert summary.skipped == 1
+    assert provider.calls == []
+    assert key.storage_key in cache.verify_integrity()
 
 
 def test_refresh_fetches_new_content_addressed_version(tmp_path, monkeypatch):
@@ -600,11 +598,52 @@ def test_raw_table_json_is_captured_before_normalization(tmp_path, monkeypatch):
     assert cache.load_frame(key).loc[0, "close"] == 99.0
 
 
-def test_ingest_writes_ordered_running_updates_and_complete_manifest(
+def test_ingest_emits_run_json_only_after_finalization(tmp_path, monkeypatch):
+    identity_normalizer(monkeypatch)
+    cache = PITCache(tmp_path)
+
+    class ObservingProvider(FakeProvider):
+        def fetch(self, key, call_with_retry):
+            assert list((cache.root / "runs").glob("*.json")) == []
+            return super().fetch(key, call_with_retry)
+
+    provider = ObservingProvider(
+        [
+            frame(),
+            frame(),
+            calendar_frame("20260710"),
+            frame(),
+            frame(),
+            frame(),
+        ]
+    )
+    ingestor = PITIngestor(
+        provider,
+        cache,
+        lambda endpoint: NoWaitLimiter(),
+        RetryPolicy(),
+        sleeper=lambda _: None,
+    )
+
+    summary = ingestor.ingest("20260710", "20260710")
+
+    stored = load_only_run(cache)
+    expected_keys = plan_bootstrap_partitions(
+        "20260710", "20260710"
+    ) + plan_daily_partitions(["20260710"])
+    assert stored["status"] == "complete"
+    assert [
+        f'{record["dataset"]}/{record["partition"]}'
+        for record in stored["partitions"]
+    ] == [key.storage_key for key in expected_keys]
+    assert stored["run_id"] == summary.run_id
+
+
+def test_ingest_records_ordered_partitions_in_complete_manifest(
     tmp_path, monkeypatch
 ):
     identity_normalizer(monkeypatch)
-    cache = RecordingCache(tmp_path)
+    cache = PITCache(tmp_path)
     provider = FakeProvider(
         [
             frame(),
@@ -633,23 +672,17 @@ def test_ingest_writes_ordered_running_updates_and_complete_manifest(
     assert summary.skipped == 0
     assert summary.failed == 0
     assert summary.run_id is not None
-    assert [write.status for write in cache.run_writes] == [
-        "running",
-        "running",
-        "running",
-        "running",
-        "running",
-        "running",
-        "running",
-        "complete",
+    stored = load_only_run(cache)
+    stored_keys = [
+        PartitionKey(Dataset(record["dataset"]), record["partition"])
+        for record in stored["partitions"]
     ]
-    assert [len(write.partitions) for write in cache.run_writes] == list(range(7)) + [6]
-    assert [record.key for record in cache.run_writes[-1].partitions] == expected_keys
+    assert stored_keys == expected_keys
+    finalized = IngestionRunManifest.from_dict(stored)
     assert all(
         record == cache.records()[record.key.storage_key]
-        for record in cache.run_writes[-1].partitions
+        for record in finalized.partitions
     )
-    stored = load_only_run(cache)
     assert stored["requested_start"] == "20260710"
     assert stored["requested_end"] == "20260710"
     assert stored["effective_start"] == "20260312"

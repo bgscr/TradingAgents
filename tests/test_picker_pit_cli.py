@@ -1,3 +1,4 @@
+import json
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,9 +7,26 @@ import pytest
 from typer.testing import CliRunner
 
 from tradingagents.picker import cli
+from tradingagents.picker.cache import PITCache
 from tradingagents.picker.errors import PITError
+from tradingagents.picker.pit_models import Dataset, PartitionKey
 
 runner = CliRunner()
+
+
+def test_verify_command_runs_explicit_integrity_audit(tmp_path):
+    key = PartitionKey(Dataset.DAILY, "20260710")
+    cache = PITCache(tmp_path)
+    cache.mark_pending(key)
+    cache.close()
+
+    result = runner.invoke(cli.app, ["verify", "--cache-dir", str(tmp_path)])
+
+    assert result.exit_code == 1
+    summary = json.loads(result.stdout)
+    assert summary["partitions"] == 1
+    assert summary["failed"] == 1
+    assert "status is pending" in summary["failures"][key.storage_key][0]
 
 
 def test_backfill_reports_summary_without_printing_token(monkeypatch, tmp_path):

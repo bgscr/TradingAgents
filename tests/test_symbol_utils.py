@@ -10,6 +10,7 @@ from tradingagents.dataflows.symbol_utils import (
     is_yahoo_safe,
     normalize_symbol,
     resolve_china_a_symbol,
+    resolve_mainland_instrument,
 )
 
 
@@ -56,6 +57,95 @@ class TestNormalizeSymbol(unittest.TestCase):
 
 @pytest.mark.unit
 class TestChinaASymbols(unittest.TestCase):
+    def test_shanghai_fund_resolves_with_market_only_capabilities(self):
+        instrument = resolve_mainland_instrument("512210.SH")
+
+        self.assertIsNotNone(instrument)
+        self.assertEqual(instrument.yahoo_symbol, "512210.SS")
+        self.assertEqual(instrument.akshare_code, "512210")
+        self.assertEqual(instrument.baostock_code, "sh.512210")
+        self.assertEqual(instrument.exchange, "shanghai")
+        self.assertEqual(instrument.instrument_kind, "fund")
+        self.assertEqual(
+            instrument.capabilities,
+            frozenset({"ohlcv", "technical_indicators"}),
+        )
+
+    def test_bare_shanghai_fund_prefix_resolves_without_guessing_company_kind(self):
+        instrument = resolve_mainland_instrument("512210")
+
+        self.assertIsNotNone(instrument)
+        self.assertEqual(instrument.yahoo_symbol, "512210.SS")
+        self.assertEqual(instrument.instrument_kind, "fund")
+
+    def test_bare_shenzhen_fund_prefix_resolves_as_fund(self):
+        instrument = resolve_mainland_instrument("159915")
+
+        self.assertIsNotNone(instrument)
+        self.assertEqual(instrument.yahoo_symbol, "159915.SZ")
+        self.assertEqual(instrument.akshare_code, "159915")
+        self.assertEqual(instrument.baostock_code, "sz.159915")
+        self.assertEqual(instrument.exchange, "shenzhen")
+        self.assertEqual(instrument.instrument_kind, "fund")
+
+    def test_explicit_mainland_indices_resolve_without_company_capabilities(self):
+        expected = {
+            "000001.SH": ("000001.SS", "shanghai"),
+            "399001.SZ": ("399001.SZ", "shenzhen"),
+        }
+
+        for raw, (yahoo_symbol, exchange) in expected.items():
+            with self.subTest(raw=raw):
+                instrument = resolve_mainland_instrument(raw)
+
+                self.assertIsNotNone(instrument)
+                self.assertEqual(instrument.yahoo_symbol, yahoo_symbol)
+                self.assertEqual(instrument.exchange, exchange)
+                self.assertEqual(instrument.instrument_kind, "index")
+                self.assertEqual(
+                    instrument.capabilities,
+                    frozenset({"ohlcv", "technical_indicators"}),
+                )
+
+    def test_generalized_equity_resolution_preserves_legacy_identifiers(self):
+        generalized = resolve_mainland_instrument("601138.SH")
+        legacy = resolve_china_a_symbol("601138.SH")
+
+        self.assertIsNotNone(generalized)
+        self.assertEqual(generalized.yahoo_symbol, legacy.yahoo_symbol)
+        self.assertEqual(generalized.akshare_code, legacy.akshare_code)
+        self.assertEqual(generalized.baostock_code, legacy.baostock_code)
+        self.assertEqual(generalized.exchange, legacy.exchange)
+        self.assertEqual(generalized.instrument_kind, "equity")
+        self.assertEqual(
+            generalized.capabilities,
+            frozenset({
+                "ohlcv",
+                "technical_indicators",
+                "fundamentals",
+                "china_enhancements",
+            }),
+        )
+
+    def test_explicit_exchange_suffix_is_authoritative_for_unknown_prefix(self):
+        instrument = resolve_mainland_instrument("123456.SH")
+
+        self.assertIsNotNone(instrument)
+        self.assertEqual(instrument.yahoo_symbol, "123456.SS")
+        self.assertEqual(instrument.exchange, "shanghai")
+        self.assertEqual(instrument.instrument_kind, "unknown")
+        self.assertEqual(
+            instrument.capabilities,
+            frozenset({"ohlcv", "technical_indicators"}),
+        )
+
+    def test_compatibility_resolver_delegates_funds_during_migration(self):
+        instrument = resolve_china_a_symbol("512210.SS")
+
+        self.assertIsNotNone(instrument)
+        self.assertEqual(instrument.yahoo_symbol, "512210.SS")
+        self.assertEqual(instrument.instrument_kind, "fund")
+
     def test_shanghai_suffixes_resolve_to_same_instrument(self):
         for raw in ("601138.SS", "601138.SH", "601138"):
             instrument = resolve_china_a_symbol(raw)
@@ -90,10 +180,13 @@ class TestChinaASymbols(unittest.TestCase):
         self.assertIsNone(resolve_china_a_symbol("123456"))
         self.assertEqual(normalize_symbol("123456"), "123456")
 
-    def test_invalid_suffixed_six_digit_code_is_not_resolved(self):
-        for raw in ("123456.SH", "123456.SZ"):
-            self.assertIsNone(resolve_china_a_symbol(raw))
-            self.assertEqual(normalize_symbol(raw), raw)
+    def test_explicit_suffix_resolves_unknown_code_without_guessing_kind(self):
+        expected = {"123456.SH": "123456.SS", "123456.SZ": "123456.SZ"}
+        for raw, canonical in expected.items():
+            instrument = resolve_china_a_symbol(raw)
+            self.assertIsNotNone(instrument)
+            self.assertEqual(instrument.instrument_kind, "unknown")
+            self.assertEqual(normalize_symbol(raw), canonical)
 
     def test_existing_non_china_symbols_keep_current_behavior(self):
         self.assertEqual(normalize_symbol("XAUUSD"), "GC=F")

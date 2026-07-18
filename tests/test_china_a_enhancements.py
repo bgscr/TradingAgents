@@ -179,6 +179,36 @@ def test_category_filter_omits_unrequested_sections(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_announcement_output_exposes_structured_monetary_facts(monkeypatch, tmp_path):
+    import tradingagents.dataflows.config as config_module
+    from tradingagents.dataflows import china_a_enhancements as enh
+    from tradingagents.dataflows.config import set_config
+
+    config_module._config = None
+    set_config({"data_cache_dir": str(tmp_path)})
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_individual_notice_report",
+        lambda **kwargs: pd.DataFrame(
+            {"title": ["重大合同金额3.5万元公告"], "date": ["2026-06-20"]}
+        ),
+    )
+    monkeypatch.setattr(
+        enh.ak,
+        "stock_zh_a_disclosure_report_cninfo",
+        lambda **kwargs: pd.DataFrame(),
+    )
+
+    out = enh.get_china_a_enhancements_for_categories(
+        "600895.SS", "2026-06-30", "announcements", {"announcements"}
+    )
+
+    assert "## Structured Monetary Source Facts" in out
+    assert '"value":"35000"' in out
+    assert "stock_individual_notice_report:2026-06-30" in out
+
+
+@pytest.mark.unit
 def test_cache_avoids_repeat_source_calls_within_ttl(monkeypatch, tmp_path):
     import tradingagents.dataflows.config as config_module
     from tradingagents.dataflows import china_a_enhancements as enh

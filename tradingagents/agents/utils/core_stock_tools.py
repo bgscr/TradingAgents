@@ -3,6 +3,8 @@ from typing import Annotated
 from langchain_core.tools import tool
 
 from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.market_snapshot import render_authoritative_market_data
+from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 
 
 @tool
@@ -21,4 +23,6 @@ def get_stock_data(
     Returns:
         str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
     """
+    if resolve_china_a_symbol(symbol) is not None:
+        return render_authoritative_market_data(symbol, start_date, end_date)
     return route_to_vendor("get_stock_data", symbol, start_date, end_date)

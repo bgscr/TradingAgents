@@ -14,6 +14,7 @@ import akshare as ak
 import pandas as pd
 
 from .config import get_config
+from .monetary_facts import extract_chinese_monetary_facts, render_monetary_source_facts
 from .symbol_utils import resolve_china_a_symbol
 
 CATEGORY_FLOW_SENTIMENT = "flow_sentiment"
@@ -206,11 +207,24 @@ def _truncate_text(text: str, limit: int = MAX_SOURCE_LINE_CHARS) -> str:
 
 def _format_result(result: SourceResult) -> list[str]:
     if result.status == STATUS_OK:
-        return [
-            f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; "
-            f"{_truncate_text(record)}"
-            for record in result.records
-        ]
+        lines = []
+        monetary_facts = []
+        for index, record in enumerate(result.records):
+            lines.append(
+                f"- Source: {result.source}; as_of: {result.as_of or 'unknown'}; "
+                f"{_truncate_text(record)}"
+            )
+            monetary_facts.extend(
+                extract_chinese_monetary_facts(
+                    record,
+                    source_ref=(
+                        f"{result.source}:{result.as_of or 'unknown'}:record-{index}"
+                    ),
+                )
+            )
+        if monetary_facts:
+            lines.append(render_monetary_source_facts(tuple(monetary_facts)))
+        return lines
     return [
         f"- Source unavailable: {result.source} "
         f"({_truncate_text(result.error or 'unknown error')})."

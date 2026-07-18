@@ -162,6 +162,48 @@ class VendorRoutingTests(unittest.TestCase):
         self.assertEqual(result, "AK_DATA")
         self.assertEqual(calls, [("akshare", "601138.SH")])
 
+    def test_mainland_fund_fundamentals_are_not_applicable_without_provider_call(self):
+        set_config({"data_vendors": {"fundamental_data": "akshare"}})
+        calls = []
+
+        def company_fundamentals(*args, **kwargs):
+            calls.append(args)
+            return "SHOULD_NOT_BE_RETURNED"
+
+        with self._route_method(
+            "get_fundamentals", {"akshare": company_fundamentals}
+        ):
+            result = interface.route_to_vendor(
+                "get_fundamentals", "512210.SH", "2026-07-15"
+            )
+
+        self.assertIn("NOT_APPLICABLE", result)
+        self.assertIn("512210.SS is a fund", result)
+        self.assertEqual(calls, [])
+
+    def test_mainland_fund_market_data_omits_company_enhancements(self):
+        set_config({
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "akshare"}
+            },
+            "china_a_enhancement_preset": "all",
+        })
+        enhancement_calls = []
+
+        with self._route_method(
+            "get_stock_data", {"akshare": _returns("FUND_MARKET_DATA")}
+        ), mock.patch.object(
+            interface,
+            "get_china_a_enhancements_for_categories",
+            side_effect=lambda *args: enhancement_calls.append(args) or "APPENDIX",
+        ):
+            result = interface.route_to_vendor(
+                "get_stock_data", "512210.SH", "2026-07-01", "2026-07-15"
+            )
+
+        self.assertEqual(result, "FUND_MARKET_DATA")
+        self.assertEqual(enhancement_calls, [])
+
     def test_china_a_market_chain_falls_back_in_order(self):
         set_config({
             "market_data_vendors": {
