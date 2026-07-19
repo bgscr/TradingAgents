@@ -1,58 +1,48 @@
-# AGENTS.md — Codex Project Guidelines
+# AGENTS.md — Codex System Prompt
 
-## Tooling & Navigation
-- Always prefer **CodeGraph** (symbols, callers, impact analysis) for code exploration; use shell search only as a fallback.
-- Rust-specific: use Rust Token Killer (`@RTK.md`).
+## Tooling Matrix
+- **Code Exploration:** ALWAYS use `CodeGraph`. Shell search is FALLBACK only.
+- **Rust Context:** Load `@RTK.md`.
 
-## Subagent Routing
-Delegate non-trivial work to the `.codex/agents/` specialists below. Keep trivial edits, formatting, simple lookups, and isolated obvious fixes in the primary task.
+## Routing & Delegation Rules
+- **Scope:** Trivial/formatting edits -> Primary Agent. Non-trivial -> Subagent.
+- **Constraints:** Max 1 writing agent + 1 read-only agent concurrently. Investigation BEFORE implementation.
+- **Authority:** Primary agent retains synthesis, conflict resolution, and final user communication.
+- **Reasoning Effort:** Default only. `xhigh` allowed ONLY for cross-module ambiguity, evidence integrity, or security boundaries. NEVER use `max`/`ultra`.
 
-| Agent | Trigger |
+### Model Allocation Matrix
+- `gpt-5.6-sol` (Sol): Complex, open-ended, or structural tasks.
+- `gpt-5.6-terra` (Terra): Everyday reasoning and tool-heavy tasks.
+- `gpt-5.6-luna` (Luna): Deterministic, repeatable, or explicit success-criteria tasks.
+
+### Agent Registry
+| Agent | Trigger Condition (Strict) |
 |---|---|
-| `python-pro` | Non-trivial Python runtime, packaging, typing, or framework work |
-| `data-engineer` | Vendor routing, ingestion, PIT data, cache, schemas, lineage, or data quality |
-| `cli-developer` | Typer/Rich CLI, config precedence, output contracts, arguments, or exit behavior |
-| `llm-architect` | LangGraph topology, prompts, tools, structured outputs, model clients, or fallbacks |
-| `quant-analyst` | Indicators, rankings, simulations, lookahead bias, or trading/risk mathematics |
-| `reviewer` | Final review of non-trivial changes after implementation and tests |
-| `debugger` | Cross-layer, intermittent, ambiguous, or hard-to-reproduce failures |
-| `security-auditor` | Secrets, untrusted inputs, network exposure, logging, dependencies, or supply-chain risk |
-| `model-risk-manager` | LLM failure modes affecting evidence, recommendations, oversight, or fail-closed behavior |
-| `test-automator` | Regression tests, fixtures, test harnesses, or multi-path coverage |
-| `prompt-regression-tester` | Prompt, model, tool-selection, schema, or orchestration behavior changes |
-| `docs-researcher` | Version-specific external API or framework behavior requiring primary-source verification |
+| `python-pro` | Non-trivial Python runtime, packaging, typing, or frameworks |
+| `data-engineer` | Ingestion, PIT data, cache, schemas, lineage, or data quality |
+| `cli-developer` | Typer/Rich CLI, config precedence, output contracts, exit behaviors |
+| `llm-architect` | LangGraph topology, prompts, tool definitions, structured outputs |
+| `quant-analyst` | Trading indicators, rankings, simulations, lookahead bias, risk math |
+| `debugger` | Cross-layer, intermittent, or hard-to-reproduce failures |
+| `test-engineer` | Regression tests, fixtures, multi-path coverage, prompt/schema testing |
+| `risk-auditor` | Secrets, untrusted inputs, LLM failure modes, safety/security boundaries |
+| `reviewer` | Final post-implementation compliance and code quality review |
+| `docs-researcher`| External API or framework version verification via primary sources |
 
-### Delegation Rules
-- Default to **one** matching specialist. At most **two** read-only specialists in parallel, and only when their scopes are independent.
-- Run investigation/research agents **before** implementation agents. Allow only **one** workspace-writing agent per overlapping code area.
-- Every subagent must follow this `AGENTS.md`, use CodeGraph before shell search, cite concrete evidence, and return a bounded handoff to the primary agent.
-- The primary agent owns synthesis, conflict resolution, user communication, and the final completion decision.
-- Agent files define default reasoning effort. Raise to `xhigh` only for exceptional cross-module ambiguity involving evidence integrity, trading decisions, or a concrete security boundary — never default these agents to `max` or `ultra`.
-- Models must stay within the **GPT-5.6 family**:
-  - **Sol** (`gpt-5.6` / `gpt-5.6-sol`) — complex or open-ended work
-  - **Terra** (`gpt-5.6-terra`) — everyday work needing strong reasoning + tool use
-  - **Luna** (`gpt-5.6-luna`) — clear, repeatable tasks with explicit success criteria
+### Composed Workflow Pipelines
+- **Hard Bug:** `debugger` -> [Implementer] -> `test-engineer`
+- **Trading LLM Workflow:** `llm-architect` + `risk-auditor` -> [Implementer] -> `test-engineer`
+- **Market Data / PIT:** `data-engineer` (+ `quant-analyst` if logic/math affected)
+- **Framework Uncertainty:** `docs-researcher` -> [Implementation]
+- **Verification:** [Implementation] -> `reviewer` (Stage 1: Spec Compliance -> Stage 2: Quality)
 
-### Composed Workflows
-- **Hard bug:** `debugger` → matching implementer → `test-automator`
-- **LLM workflow affecting trading decisions:** `llm-architect` + `model-risk-manager` → matching implementer → `prompt-regression-tester`
-- **Market-data / PIT change:** `data-engineer` (+ `quant-analyst` if calculations, leakage, or decision semantics are affected)
-- **External provider/framework uncertainty:** `docs-researcher` before implementation
-- **Completed non-trivial change:** `reviewer` after tests (Stage 1 spec compliance before Stage 2 code quality)
-- **Security-sensitive change:** add `security-auditor` only when a concrete security boundary is involved
+## Review Protocol
+1. **Stage 1 (Spec Compliance):** Verify interfaces and contract matching before code quality.
+2. **Stage 2 (Code Quality):** Check error handling, transaction boundaries, and test coverage.
+3. **Findings Classification:** `Critical` | `Important` | `Minor`.
+4. **Feedback Loop:** Verify codebase before applying edits. Push back if spec conflicts.
 
-## Code Review Process
-1. **Stage 1 — Spec Compliance:** verify interfaces, architecture, data, and contracts match requirements before reviewing quality.
-2. **Stage 2 — Code Quality:** boundary separation & error handling; clear state/transaction boundaries; relevant success/failure tests; flag unnecessary abstractions or out-of-scope changes.
-
-Classify all findings: **Critical / Important / Minor**.
-
-## Feedback Handling
-- Verify feedback against the codebase before applying it.
-- Do not blindly agree — push back if it conflicts with spec.
-- Clarify ambiguity before making changes.
-
-## References
-- **Issue Tracker:** issues/specs live as markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
-- **Triage Labels:** `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-- **Domain Docs:** single-context layout using root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+## Project References
+- **Issues:** `.scratch/<feature-slug>/`
+- **Triage Labels:** `needs-triage` | `needs-info` | `ready-for-agent` | `ready-for-human` | `wontfix`
+- **Context Maps:** Root `CONTEXT.md` & `docs/adr/`
