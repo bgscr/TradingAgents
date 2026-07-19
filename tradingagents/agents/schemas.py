@@ -202,7 +202,7 @@ class PortfolioDecisionSelection(BaseModel):
             "Include every premise used and no unlisted ID."
         ),
     )
-    decision_assertions: tuple["DecisionAssertion", ...] = Field(
+    decision_assertions: tuple[DecisionAssertion, ...] = Field(
         min_length=1,
         description=(
             "One evidence binding per selected claim. Each binding must copy the "
