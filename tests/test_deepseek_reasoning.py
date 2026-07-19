@@ -18,6 +18,11 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompt_values import ChatPromptValue
 from pydantic import BaseModel
 
+from tradingagents.agents.utils.structured import (
+    RequiredStructuredBinding,
+    bind_required_structured,
+    invoke_required_structured,
+)
 from tradingagents.llm_clients.openai_client import (
     DeepSeekChatOpenAI,
     NormalizedChatOpenAI,
@@ -122,7 +127,11 @@ class TestDeepSeekReasoningContent:
 
 def _bound_kwargs(runnable):
     """Extract bind() kwargs from a with_structured_output result."""
+    runnable = getattr(runnable, "runnable", runnable)
     first = runnable.steps[0] if hasattr(runnable, "steps") else runnable
+    raw_step = getattr(first, "steps__", {}).get("raw")
+    if raw_step is not None:
+        first = raw_step
     return getattr(first, "kwargs", {})
 
 
@@ -178,6 +187,43 @@ class TestStructuredOutputCapabilityDispatch:
             t.get("function", {}).get("name") == "_Sample" for t in tools
         ), f"schema not bound as a tool: {tools}"
 
+    @pytest.mark.parametrize("model", ("deepseek-v4-flash", "deepseek-v4-pro"))
+    def test_required_v4_finalizer_uses_json_mode_without_tool_choice(self, model):
+        bound = bind_required_structured(
+            self._client(model),
+            self._Sample,
+            "Evidence Finalizer",
+        )
+
+        kwargs = _bound_kwargs(bound)
+        assert kwargs["response_format"] == {"type": "json_object"}
+        assert "tool_choice" not in kwargs
+        assert bound.method == "json_mode"
+
+    def test_required_v4_binding_injects_json_instruction(self):
+        runnable = type("CaptureRunnable", (), {})()
+        captured = {}
+        runnable.invoke = lambda prompt: captured.setdefault("prompt", prompt)
+        bound = RequiredStructuredBinding(
+            runnable,
+            "_Sample",
+            "deepseek-v4-flash",
+            "json_mode",
+        )
+        bound.invoke([HumanMessage(content="Analyze the evidence.")])
+
+        assert "Return JSON only" in captured["prompt"][-1].content
+        assert "_Sample" in captured["prompt"][-1].content
+
+    def test_required_reasoner_finalizer_does_not_force_tool_choice(self):
+        bound = bind_required_structured(
+            self._client("deepseek-reasoner"),
+            self._Sample,
+            "Evidence Finalizer",
+        )
+
+        assert _bound_kwargs(bound).get("tool_choice") is None
+
 
 # ---------------------------------------------------------------------------
 # Live API: structured output round-trips against the real DeepSeek backend
@@ -213,14 +259,16 @@ class TestDeepSeekLiveStructuredOutput:
             base_url="https://api.deepseek.com",
             timeout=60,
         )
-        bound = client.with_structured_output(self._Pick)
-        result = bound.invoke(
-            "Pick BUY or SELL or HOLD for a tech stock with strong earnings. "
-            "Confidence is a float between 0 and 1."
+        bound = bind_required_structured(client, self._Pick, "Live Probe")
+        result = invoke_required_structured(
+            bound,
+            "Return exactly one JSON object with action set to BUY, SELL, or HOLD "
+            "and confidence set to a float between 0 and 1. Return no prose.",
+            "Live Probe",
         )
-        assert isinstance(result, self._Pick)
-        assert result.action in {"BUY", "SELL", "HOLD"}
-        assert 0.0 <= result.confidence <= 1.0
+        assert isinstance(result.value, self._Pick)
+        assert result.value.action in {"BUY", "SELL", "HOLD"}
+        assert 0.0 <= result.value.confidence <= 1.0
 
 
 # ---------------------------------------------------------------------------

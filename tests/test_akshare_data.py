@@ -59,6 +59,66 @@ def test_get_stock_data_empty_frame_raises_no_market_data(monkeypatch):
 
 
 @pytest.mark.unit
+def test_mainland_fund_uses_etf_history_endpoint(monkeypatch):
+    stock_calls = []
+    etf_calls = []
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "stock_zh_a_hist",
+        lambda **kwargs: stock_calls.append(kwargs) or _hist_frame(),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "fund_etf_hist_em",
+        lambda **kwargs: etf_calls.append(kwargs) or _hist_frame(),
+    )
+
+    out = akshare_data.get_stock_data("510500.SS", "2026-06-01", "2026-06-29")
+
+    assert stock_calls == []
+    assert etf_calls == [
+        {
+            "symbol": "510500",
+            "period": "daily",
+            "start_date": "20260601",
+            "end_date": "20260629",
+            "adjust": "qfq",
+        }
+    ]
+    assert "# Primary source: AKShare fund_etf_hist_em" in out
+
+
+@pytest.mark.unit
+def test_mainland_lof_uses_lof_history_endpoint(monkeypatch):
+    etf_calls = []
+    lof_calls = []
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "fund_etf_hist_em",
+        lambda **kwargs: etf_calls.append(kwargs) or _hist_frame(),
+    )
+    monkeypatch.setattr(
+        akshare_data.ak,
+        "fund_lof_hist_em",
+        lambda **kwargs: lof_calls.append(kwargs) or _hist_frame(),
+    )
+
+    out = akshare_data.get_stock_data("166009.SZ", "2026-06-01", "2026-06-29")
+
+    assert etf_calls == []
+    assert lof_calls == [
+        {
+            "symbol": "166009",
+            "period": "daily",
+            "start_date": "20260601",
+            "end_date": "20260629",
+            "adjust": "qfq",
+        }
+    ]
+    assert "# Primary source: AKShare fund_lof_hist_em" in out
+
+
+@pytest.mark.unit
 def test_indicator_uses_akshare_ohlcv(monkeypatch):
     monkeypatch.setattr(
         akshare_data.ak,

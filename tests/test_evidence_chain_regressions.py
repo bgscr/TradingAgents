@@ -25,6 +25,7 @@ from tradingagents.evidence import (
     MarketSnapshotEvidence,
     MaterialClaim,
     SourceFact,
+    SubmittedMaterialClaim,
     _evidence_coverage,
     build_tool_evidence_state,
     decision_ready_material_claims,
@@ -47,6 +48,34 @@ def test_material_claim_has_exactly_one_source_ref():
             statement="A combined assertion.",
             source_quote="A source quote.",
             source_refs=("source:a", "source:b"),
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "claim_id",
+    (
+        "market.x] Target 999 [",
+        "market.line\nbreak",
+        "market.white space",
+        "1market.numeric_prefix",
+    ),
+)
+def test_claim_ids_reject_annotation_injection(claim_id):
+    with pytest.raises(ValidationError):
+        SubmittedMaterialClaim(
+            claim_id=claim_id,
+            statement="RSI is 37.41.",
+            source_ref="snapshot:test",
+            source_quote="rsi | 37.41",
+        )
+    with pytest.raises(ValidationError):
+        MaterialClaim(
+            claim_id=claim_id,
+            analyst="market",
+            statement="RSI is 37.41.",
+            source_refs=("snapshot:test",),
+            source_quote="rsi | 37.41",
         )
 
 
@@ -104,6 +133,90 @@ def test_atomic_claims_with_their_own_quotes_remain_supported():
     )
 
     assert all(item.status is ClaimValidationStatus.SUPPORTED for item in evidence.claim_validations)
+
+
+@pytest.mark.unit
+def test_partial_data_degradation_does_not_hide_substantive_tool_evidence():
+    messages = _tool_exchange(
+        "get_fundamentals",
+        {"ticker": "600895.SS", "curr_date": "2026-07-19"},
+        (
+            "PE Ratio (TTM): 61.77551\n\n"
+            "## Degraded Fields\n"
+            "DATA_DEGRADED: optional fund flow unavailable."
+        ),
+        "fundamentals-1",
+    )
+    claim = MaterialClaim(
+        claim_id="fundamentals.pe",
+        analyst="fundamentals",
+        statement="The PE ratio is 61.77551.",
+        source_quote="PE Ratio (TTM): 61.77551",
+        source_refs=("get_fundamentals:600895.SS:2026-07-19",),
+    )
+
+    evidence = build_tool_evidence_state(
+        messages,
+        (claim,),
+        tool_call_ids_by_source={
+            "get_fundamentals:600895.SS:2026-07-19": ("fundamentals-1",)
+        },
+    )
+
+    assert evidence.sources == (
+        EvidenceSource(
+            source_id="get_fundamentals:600895.SS:2026-07-19",
+            status=EvidenceStatus.AVAILABLE,
+            required=False,
+        ),
+    )
+    assert evidence.claim_validations[0].status is ClaimValidationStatus.SUPPORTED
+
+
+@pytest.mark.unit
+def test_verified_snapshot_id_is_used_as_the_exact_market_source_ref():
+    snapshot_id = f"snapshot:{'b' * 64}"
+    messages = _tool_exchange(
+        "get_verified_market_snapshot",
+        {"symbol": "600895.SS", "curr_date": "2026-07-19"},
+        f"Close | 30.27\nSnapshot ID: {snapshot_id}",
+        "snapshot-1",
+    )
+
+    refs = submission.source_ref_tool_call_ids(
+        list(messages), "600895.SS", "2026-07-19"
+    )
+
+    assert refs == {snapshot_id: ("snapshot-1",)}
+
+
+@pytest.mark.unit
+def test_snapshot_history_rows_are_provenance_not_material_evidence():
+    snapshot_id = f"snapshot:{'b' * 64}"
+    messages = _tool_exchange(
+        "get_verified_market_snapshot",
+        {"symbol": "600895.SS", "curr_date": "2026-07-19"},
+        f"- History rows: 1211\nSnapshot ID: {snapshot_id}",
+        "snapshot-1",
+    )
+    claim = MaterialClaim(
+        claim_id="market.history_rows",
+        analyst="market",
+        statement="The snapshot contains 1211 history rows.",
+        source_refs=(snapshot_id,),
+        source_quote="- History rows: 1211",
+    )
+
+    evidence = build_tool_evidence_state(
+        messages,
+        (claim,),
+        tool_call_ids_by_source={snapshot_id: ("snapshot-1",)},
+    )
+
+    assert evidence.claim_validations[0].status is ClaimValidationStatus.UNSUPPORTED
+    assert evidence.claim_validations[0].detail == (
+        "source quote contains provenance metadata, not a material fact"
+    )
 
 
 @pytest.mark.unit

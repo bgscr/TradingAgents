@@ -12,12 +12,13 @@ from hashlib import sha256
 from typing import Any
 
 from dateutil.relativedelta import relativedelta
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _NUMERIC_CLAIM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
     r"(?![A-Za-z0-9_])"
 )
+_CLAIM_ID_PATTERN = r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
 
 _NUMERIC_TRANSLATION = str.maketrans(
     {
@@ -93,7 +94,8 @@ def _source_quote_is_unavailable(quote: str) -> bool:
 
 
 def _source_quote_is_metadata(quote: str) -> bool:
-    normalized = quote.strip().casefold().lstrip("#").strip()
+    normalized = quote.strip().casefold()
+    normalized = re.sub(r"^(?:#{1,6}|[-*+>])\s*", "", normalized).strip()
     return any(
         normalized.startswith(prefix)
         for prefix in (
@@ -105,6 +107,7 @@ def _source_quote_is_metadata(quote: str) -> bool:
             "frame sha-256:",
             "snapshot id:",
             "total records:",
+            "history rows:",
         )
     )
 
@@ -158,7 +161,7 @@ class MarketSnapshotEvidence(BaseModel):
 class MaterialClaim(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    claim_id: str
+    claim_id: str = Field(pattern=_CLAIM_ID_PATTERN)
     analyst: str
     statement: str
     source_refs: tuple[str, ...] = Field(min_length=1, max_length=1)
@@ -178,6 +181,62 @@ class MaterialClaim(BaseModel):
             "calculation; use the exact indicator warmup, or 1 for observations."
         ),
     )
+
+
+class SubmittedMaterialClaim(BaseModel):
+    """Minimal claim DTO exposed to an LLM structured-output schema.
+
+    Provenance-derived fields on :class:`MaterialClaim` are deliberately absent:
+    the application, not the model, assigns the analyst, materializes fact IDs,
+    and computes indicator history requirements after exact quote validation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    claim_id: str = Field(
+        pattern=_CLAIM_ID_PATTERN,
+        description=(
+            "Stable claim ID using only letters, digits, underscore, dot, colon, "
+            "or hyphen; it must start with a letter."
+        ),
+    )
+    statement: str
+    source_ref: str = Field(min_length=1)
+    source_quote: str = Field(
+        min_length=1,
+        description="Exact contiguous source-language quotation from source_ref.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_internal_claim_for_programmatic_compatibility(cls, value: Any) -> Any:
+        # This compatibility path does not alter the JSON schema shown to the
+        # model. It only avoids breaking programmatic callers that already hold
+        # a fully validated internal MaterialClaim.
+        if isinstance(value, MaterialClaim):
+            return {
+                "claim_id": value.claim_id,
+                "statement": value.statement,
+                "source_ref": value.source_refs[0],
+                "source_quote": value.source_quote,
+            }
+        if (
+            isinstance(value, Mapping)
+            and "source_ref" not in value
+            and "source_refs" in value
+        ):
+            source_refs = value.get("source_refs")
+            if isinstance(source_refs, (list, tuple)) and len(source_refs) == 1:
+                # Legacy direct-tool payloads may still include internal fields.
+                # Copy only the four submission fields; analyst/fact/history data
+                # is never trusted and is deterministically rebuilt downstream.
+                return {
+                    "claim_id": value.get("claim_id"),
+                    "statement": value.get("statement"),
+                    "source_ref": source_refs[0],
+                    "source_quote": value.get("source_quote"),
+                }
+        return value
 
 
 class SourceFact(BaseModel):
@@ -222,7 +281,7 @@ class AnalystEvidenceReport(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     report_markdown: str
-    material_claims: tuple[MaterialClaim, ...] = ()
+    material_claims: tuple[SubmittedMaterialClaim, ...] = ()
 
 
 class EvidenceSource(BaseModel):
@@ -443,8 +502,15 @@ def build_tool_evidence_state(
     allowed_refs = frozenset(tool_call_ids_by_source)
 
     def message_is_unavailable(message: Any) -> bool:
-        return getattr(message, "status", None) == "error" or any(
-            marker in str(getattr(message, "content", "")).upper()
+        if getattr(message, "status", None) == "error":
+            return True
+        content = "\n".join(
+            line
+            for line in str(getattr(message, "content", "")).upper().splitlines()
+            if not line.lstrip().startswith("DATA_DEGRADED:")
+        )
+        return any(
+            marker in content
             for marker in (
                 "DATA_UNAVAILABLE",
                 "NOT_AVAILABLE",
@@ -1179,9 +1245,15 @@ def evaluate_decision_gate(
         )
         for token in _numeric_claim_tokens(source_text)
     }
+    numeric_narrative = draft.narrative
+    for claim_id in draft.material_claim_ids:
+        # The closed-ledger renderer annotates each premise as ``[claim_id]``.
+        # Digits inside that immutable identifier are provenance, not a factual
+        # assertion in the thesis, and must not be compared with source values.
+        numeric_narrative = numeric_narrative.replace(f"[{claim_id}]", "")
     unsupported_numeric_claims = tuple(
         token
-        for token in _numeric_claim_tokens(draft.narrative)
+        for token in _numeric_claim_tokens(numeric_narrative)
         if not _numeric_token_supported(token, supported_numeric_claims)
     )
     if unsupported_numeric_claims:

@@ -23,7 +23,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from tradingagents.evidence import DecisionConfidence, MaterialClaim
+from tradingagents.evidence import (
+    DecisionConfidence,
+    SubmittedMaterialClaim,
+)
 
 # LLMs sometimes write a placeholder string ("None", "N/A", ...) into an optional
 # numeric field instead of omitting it. Coerce those to None so the structured
@@ -392,11 +395,12 @@ class SentimentReport(BaseModel):
             "with concrete evidence so every point adds new signal for the trader."
         ),
     )
-    material_claims: tuple[MaterialClaim, ...] = Field(
+    material_claims: tuple[SubmittedMaterialClaim, ...] = Field(
         default=(),
         description=(
             "Source-linked material premises used in the narrative. Omit claims "
-            "that are not decision-relevant; never include a claim without a source ref."
+            "that are not decision-relevant; never include a claim without a source ref. "
+            "Every claim_id must be unique and begin with 'sentiment.'."
         ),
     )
 

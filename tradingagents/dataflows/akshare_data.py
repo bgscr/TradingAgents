@@ -93,9 +93,25 @@ def _normalize_hist_frame(data: pd.DataFrame, symbol: str, canonical: str) -> pd
     return frame
 
 
-def _fetch_hist(symbol: str, start_date: str, end_date: str) -> tuple[str, pd.DataFrame]:
+def _history_endpoint_name(instrument) -> str:
+    if getattr(instrument, "instrument_kind", "equity") != "fund":
+        return "stock_zh_a_hist"
+    code = instrument.akshare_code
+    is_lof = code.startswith(("501", "502")) or (
+        instrument.exchange == "shenzhen" and code.startswith("16")
+    )
+    return "fund_lof_hist_em" if is_lof else "fund_etf_hist_em"
+
+
+def _fetch_hist(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> tuple[str, pd.DataFrame, str]:
     instrument = _require_china_a(symbol)
-    raw = ak.stock_zh_a_hist(
+    endpoint_name = _history_endpoint_name(instrument)
+    endpoint = getattr(ak, endpoint_name)
+    raw = endpoint(
         symbol=instrument.akshare_code,
         period="daily",
         start_date=_date_for_akshare(start_date),
@@ -105,15 +121,15 @@ def _fetch_hist(symbol: str, start_date: str, end_date: str) -> tuple[str, pd.Da
     frame = _normalize_hist_frame(raw, symbol, instrument.yahoo_symbol)
     frame = validate_ohlcv_frame(frame, end_date)
     _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
-    return instrument.yahoo_symbol, frame
+    return instrument.yahoo_symbol, frame, endpoint_name
 
 
 def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
-    canonical, frame = _fetch_hist(symbol, start_date, end_date)
+    canonical, frame, endpoint_name = _fetch_hist(symbol, start_date, end_date)
     out = frame.copy()
     out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
     header = f"# Stock data for {canonical} from {start_date} to {end_date}\n"
-    header += "# Primary source: AKShare stock_zh_a_hist\n"
+    header += f"# Primary source: AKShare {endpoint_name}\n"
     header += "# Fallback source used: none\n"
     header += f"# Total records: {len(out)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -128,7 +144,7 @@ def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFram
 def _load_ohlcv_cached(symbol: str, curr_date: str, years: int) -> pd.DataFrame:
     curr = pd.to_datetime(curr_date)
     start = (curr - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
-    canonical, frame = _fetch_hist(symbol, start, curr.strftime("%Y-%m-%d"))
+    canonical, frame, _ = _fetch_hist(symbol, start, curr.strftime("%Y-%m-%d"))
     filtered = frame[frame["Date"] <= curr].copy()
     _assert_ohlcv_not_stale(filtered, curr_date, symbol, canonical)
     return filtered
@@ -171,10 +187,12 @@ def get_stock_stats_indicators_window(
         lines.append(f"{date_str}: {values.get(date_str, 'N/A: Not a trading day (weekend or holiday)')}")
         current = current - relativedelta(days=1)
 
+    instrument = _require_china_a(symbol)
+    endpoint_name = _history_endpoint_name(instrument)
     return (
         f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {curr_date}:\n\n"
         + "\n".join(lines)
-        + "\n\nSource: AKShare stock_zh_a_hist\n\n"
+        + f"\n\nSource: AKShare {endpoint_name}\n\n"
         + INDICATOR_DESCRIPTIONS[indicator]
     )
 

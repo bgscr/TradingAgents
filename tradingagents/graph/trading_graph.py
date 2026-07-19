@@ -29,6 +29,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.decision_audit import (
@@ -66,6 +67,14 @@ def _coerce_max_retries(value):
     if n < 0:
         raise ValueError(f"llm_max_retries must be >= 0, got {n}")
     return n
+
+
+def _render_recoverable_vendor_error(exc: VendorError) -> str:
+    """Render only typed vendor exhaustion as bounded, non-evidentiary data."""
+    return (
+        "DATA_UNAVAILABLE: the requested data source did not return usable data "
+        f"({type(exc).__name__})."
+    )
 
 
 class TradingAgentsGraph:
@@ -205,7 +214,8 @@ class TradingAgentsGraph:
                     # LLM and required by its prompt; must be executable here or
                     # the call fails and the model reports it "unavailable").
                     get_verified_market_snapshot,
-                ]
+                ],
+                handle_tool_errors=_render_recoverable_vendor_error,
             ),
             "social": ToolNode(
                 [

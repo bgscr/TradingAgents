@@ -111,6 +111,9 @@ def build_verified_market_snapshot(
                 f"- Provider: {authoritative.provider}",
                 f"- Adjustment basis: {authoritative.adjustment_basis}",
                 f"- Retrieved at: {authoritative.retrieved_at}",
+                f"- History rows: {len(authoritative.frame)}",
+                f"Frame SHA-256: {authoritative.frame_sha256}",
+                f"Snapshot ID: {authoritative.snapshot_id}",
             ]
         )
     lines.extend(

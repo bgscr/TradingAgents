@@ -69,7 +69,7 @@ def create_fundamentals_analyst(llm):
             + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
             + " For mainland China A-shares, fundamentals may include source-labeled disclosure snapshots; treat them as supplemental company-event context and do not invent missing filing details."
-            + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims with source_refs."
+            + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote."
             + get_language_instruction()
         )
         system_message += "\n\n" + render_allowed_source_ref_catalog(

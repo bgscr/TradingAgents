@@ -61,6 +61,26 @@ from tradingagents.evidence import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_sentiment_submission(value):
+    report = SentimentReport.model_validate(value)
+    claim_ids = tuple(claim.claim_id for claim in report.material_claims)
+    if len(set(claim_ids)) != len(claim_ids) or any(
+        not claim_id.startswith("sentiment.") for claim_id in claim_ids
+    ):
+        raise ValueError("sentiment claims require unique sentiment.* IDs")
+    claims = tuple(
+        MaterialClaim(
+            claim_id=claim.claim_id,
+            analyst="sentiment",
+            statement=claim.statement,
+            source_refs=(claim.source_ref,),
+            source_quote=claim.source_quote,
+        )
+        for claim in report.material_claims
+    )
+    return report, claims
+
+
 def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
 
@@ -194,29 +214,13 @@ def create_sentiment_analyst(llm):
             structured_llm,
             formatted_messages,
             "Sentiment Analyst",
+            validator=_normalize_sentiment_submission,
         )
         material_claims = ()
         failure_reason = structured_result.reason
         if structured_result.value is not None:
-            try:
-                report = SentimentReport.model_validate(structured_result.value)
-                claim_ids = tuple(
-                    claim.claim_id for claim in report.material_claims
-                )
-                if len(set(claim_ids)) != len(claim_ids) or any(
-                    not claim_id.startswith("sentiment.")
-                    for claim_id in claim_ids
-                ):
-                    raise ValueError(
-                        "sentiment claims require unique sentiment.* IDs"
-                    )
-                material_claims = tuple(
-                    claim.model_copy(update={"analyst": "sentiment"})
-                    for claim in report.material_claims
-                )
-                report_text = render_sentiment_report(report)
-            except (ValueError, TypeError):
-                failure_reason = "validation_error"
+            report, material_claims = structured_result.value
+            report_text = render_sentiment_report(report)
         if failure_reason is not None:
             report_text = (
                 "ANALYSIS_UNAVAILABLE: The Sentiment Analyst did not produce a "
@@ -350,7 +354,7 @@ Fill the following fields:
 - **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
 - **confidence**: low / medium / high, based on data quality and sample size.
 - **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
-- **material_claims**: Decision-relevant factual premises only. Use source_refs from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local exactly as applicable above; never cite a skipped or unavailable source. Each claim's source_quote must copy one exact contiguous source-language phrase from the cited source block. The statement may be a localized paraphrase, but source_quote must not be translated or rewritten.
+- **material_claims**: Decision-relevant factual premises only. Each claim contains only claim_id, statement, one source_ref, and source_quote. Every claim_id must be unique within this report and must begin with `sentiment.` (for example, `sentiment.local_attention`). Copy source_ref exactly from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local as applicable above; never cite a skipped or unavailable source. Each source_quote must copy one exact contiguous source-language phrase from the cited source block. The statement may be a localized paraphrase, but source_quote must not be translated or rewritten.
 
 {get_language_instruction()}"""
 

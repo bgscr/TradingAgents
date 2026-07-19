@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import tradingagents.dataflows.market_data_validator as validator
+from tradingagents.dataflows.market_snapshot import AuthoritativeMarketSnapshot
 
 
 def _sample_ohlcv() -> pd.DataFrame:
@@ -61,6 +62,35 @@ class TestVerifiedSnapshot:
         # last-N closes table has at most 30 data rows
         close_rows = [ln for ln in snap.splitlines() if ln.startswith("| 2026-")]
         assert 0 < len(close_rows) <= 30
+
+    def test_china_snapshot_exposes_immutable_authoritative_identity(self, monkeypatch):
+        frame = _sample_ohlcv()
+        snapshot_id = f"snapshot:{'b' * 64}"
+        authoritative = AuthoritativeMarketSnapshot(
+            symbol="600895.SS",
+            frame=frame,
+            provider="baostock",
+            retrieved_at="2026-05-20T12:00:00+00:00",
+            adjustment_basis="qfq",
+            requested_date="2026-05-20",
+            effective_trading_date="2026-05-20",
+            frame_sha256="a" * 64,
+            snapshot_id=snapshot_id,
+        )
+        monkeypatch.setattr(validator, "resolve_china_a_symbol", lambda _: object())
+        monkeypatch.setattr(
+            validator,
+            "get_authoritative_market_snapshot",
+            lambda *args: authoritative,
+        )
+
+        rendered = validator.build_verified_market_snapshot(
+            "600895.SS", "2026-05-20"
+        )
+
+        assert f"History rows: {len(frame)}" in rendered
+        assert "Frame SHA-256: " + "a" * 64 in rendered
+        assert f"Snapshot ID: {snapshot_id}" in rendered
 
 
 @pytest.mark.unit

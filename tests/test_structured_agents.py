@@ -36,6 +36,10 @@ from tradingagents.agents.schemas import (
     render_trader_proposal,
 )
 from tradingagents.agents.trader.trader import create_trader
+from tradingagents.agents.utils.structured import (
+    bind_required_structured,
+    invoke_required_structured,
+)
 from tradingagents.evidence import (
     AnalystEvidenceReport,
     ClaimValidationStatus,
@@ -45,6 +49,7 @@ from tradingagents.evidence import (
     InstrumentIdentityEvidence,
     MarketSnapshotEvidence,
     MaterialClaim,
+    SubmittedMaterialClaim,
     evaluate_admission_gate,
 )
 
@@ -85,6 +90,62 @@ def _tool_exchange(tool_name, args, content, call_id):
             name=tool_name,
         ),
     ]
+
+
+@pytest.mark.unit
+def test_required_structured_binding_runtime_failure_is_fail_closed():
+    llm = MagicMock()
+    llm.with_structured_output.side_effect = RuntimeError(
+        "provider response format is unavailable"
+    )
+
+    assert bind_required_structured(llm, SentimentReport, "Sentiment Analyst") is None
+
+
+@pytest.mark.unit
+def test_required_structured_raw_envelope_repairs_without_logging_payload(caplog):
+    secret_payload = "PRIVATE_PROVIDER_PAYLOAD"
+    valid = SentimentReport(
+        overall_band=SentimentBand.NEUTRAL,
+        overall_score=5.0,
+        confidence="low",
+        narrative="Neutral evidence.",
+    )
+    binding = MagicMock()
+    binding.schema_name = "SentimentReport"
+    binding.model_name = "deepseek-v4-flash"
+    binding.invoke.side_effect = [
+        {
+            "raw": AIMessage(
+                content=secret_payload,
+                response_metadata={"finish_reason": "stop"},
+            ),
+            "parsed": None,
+            "parsing_error": ValueError(secret_payload),
+        },
+        {
+            "raw": AIMessage(
+                content="",
+                response_metadata={"finish_reason": "tool_calls"},
+            ),
+            "parsed": valid,
+            "parsing_error": None,
+        },
+    ]
+
+    with caplog.at_level("INFO"):
+        result = invoke_required_structured(
+            binding,
+            "original prompt",
+            "Sentiment Analyst",
+        )
+
+    assert result.value == valid
+    assert result.attempts == 2
+    assert binding.invoke.call_count == 2
+    assert "finish_reason=stop" in caplog.text
+    assert "finish_reason=tool_calls" in caplog.text
+    assert secret_payload not in caplog.text
 
 
 @pytest.mark.unit
@@ -510,12 +571,11 @@ def test_tool_analyst_plain_text_gets_one_structured_finalization(
     structured.invoke.return_value = AnalystEvidenceReport(
         report_markdown=f"## {analyst_name.title()} Analysis\n\nValidated report.",
         material_claims=(
-            MaterialClaim(
+            SubmittedMaterialClaim(
                 claim_id=f"{analyst_name}.signal",
-                analyst="model-supplied-value",
                 statement="The observed signal was 55.",
                 source_quote="The observed signal was 55.",
-                source_refs=(source_ref,),
+                source_ref=source_ref,
             ),
         ),
     )
@@ -586,6 +646,68 @@ def test_tool_analyst_finalizer_failure_is_explicitly_unavailable():
         required=True,
         detail="validation_error",
     ) in evidence.sources
+    assert structured.invoke.call_count == 2
+
+
+@pytest.mark.unit
+def test_tool_analyst_repairs_none_parsed_once_without_admitting_draft():
+    structured = MagicMock()
+    structured.invoke.side_effect = [
+        None,
+        AnalystEvidenceReport(
+            report_markdown="## News Analysis\n\nValidated report.",
+            material_claims=(),
+        ),
+    ]
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(
+        lambda _: AIMessage(content="BUY from unvalidated prose")
+    )
+    llm.with_structured_output.return_value = structured
+
+    result = create_news_analyst(llm)(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    assert result["news_report"] == "## News Analysis\n\nValidated report."
+    assert "BUY" not in result["news_report"]
+    assert structured.invoke.call_count == 2
+    assert "Previous structured attempt failed" in structured.invoke.call_args.args[0]
+    evidence = EvidenceState.model_validate(result["evidence_state"])
+    assert EvidenceSource(
+        source_id="analyst.news.submission",
+        status=EvidenceStatus.AVAILABLE,
+        required=True,
+        detail="finalized_structured",
+    ) in evidence.sources
+
+
+@pytest.mark.unit
+def test_tool_analyst_does_not_retry_transport_failure():
+    structured = MagicMock()
+    structured.invoke.side_effect = RuntimeError("provider timeout")
+    llm = MagicMock()
+    llm.bind_tools.return_value = RunnableLambda(lambda _: AIMessage(content="draft"))
+    llm.with_structured_output.return_value = structured
+
+    result = create_news_analyst(llm)(
+        {
+            "company_of_interest": "NVDA",
+            "trade_date": "2026-01-15",
+            "asset_type": "stock",
+            "messages": [],
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
+    )
+
+    assert result["news_report"].startswith("ANALYSIS_UNAVAILABLE:")
+    assert structured.invoke.call_count == 1
 
 
 @pytest.mark.unit
@@ -600,7 +722,14 @@ def test_tool_analyst_rejects_source_ref_outside_exact_catalog(completion_mode):
     )
     submitted = AnalystEvidenceReport(
         report_markdown="## Market Analysis\n\nMomentum was constructive.",
-        material_claims=(claim,),
+        material_claims=(
+            SubmittedMaterialClaim(
+                claim_id=claim.claim_id,
+                statement=claim.statement,
+                source_ref=claim.source_refs[0],
+                source_quote=claim.source_quote,
+            ),
+        ),
     )
     if completion_mode == "direct_tool":
         response = AIMessage(
@@ -1283,6 +1412,75 @@ class TestSentimentAnalystAgent:
         assert len(result["messages"]) == 1
         assert result["sentiment_report"] == result["messages"][0].content
 
+    def test_prompt_states_claim_id_contract_enforced_by_validator(self):
+        captured = {}
+        analyst = create_sentiment_analyst(_structured_sentiment_llm(captured))
+
+        analyst(_make_sentiment_state())
+
+        prompt_text = "\n".join(str(message.content) for message in captured["prompt"])
+        assert "claim_id must be unique" in prompt_text
+        assert "must begin with `sentiment.`" in prompt_text
+
+        claim_schema = SentimentReport.model_json_schema()["properties"][
+            "material_claims"
+        ]
+        assert "unique" in claim_schema["description"]
+        assert "'sentiment.'" in claim_schema["description"]
+
+    def test_invalid_claim_namespace_is_repaired_once(self, monkeypatch):
+        monkeypatch.setattr(
+            sentiment_module,
+            "_collect_sentiment_blocks",
+            lambda *args: {
+                "news_block": "One neutral headline.",
+                "stocktwits_block": "75% bullish across 20 messages.",
+                "reddit_block": "DATA_UNAVAILABLE",
+                "local_sentiment_block": "",
+            },
+        )
+        invalid_claim = SubmittedMaterialClaim(
+            claim_id="claim_1",
+            statement="StockTwits messages were 75% bullish.",
+            source_ref="sentiment.stocktwits",
+            source_quote="75% bullish across 20 messages.",
+        )
+        valid_claim = invalid_claim.model_copy(
+            update={"claim_id": "sentiment.stocktwits_bullish_share"}
+        )
+        invalid_report = SentimentReport(
+            overall_band=SentimentBand.BULLISH,
+            overall_score=7.0,
+            confidence="medium",
+            narrative="Retail sentiment was constructive.",
+            material_claims=(invalid_claim,),
+        )
+        valid_report = invalid_report.model_copy(
+            update={"material_claims": (valid_claim,)}
+        )
+        structured = MagicMock()
+        structured.invoke.side_effect = [invalid_report, valid_report]
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+
+        result = create_sentiment_analyst(llm)(_make_sentiment_state())
+
+        assert structured.invoke.call_count == 2
+        assert "Previous structured attempt failed" in str(
+            structured.invoke.call_args.args[0][-1].content
+        )
+        evidence = EvidenceState.model_validate(result["evidence_state"])
+        assert any(
+            claim.claim_id == "sentiment.stocktwits_bullish_share"
+            for claim in evidence.material_claims
+        )
+        assert EvidenceSource(
+            source_id="analyst.sentiment.submission",
+            status=EvidenceStatus.AVAILABLE,
+            required=True,
+            detail="direct_structured",
+        ) in evidence.sources
+
     def test_structured_material_claims_merge_into_shared_evidence(self, monkeypatch):
         monkeypatch.setattr(
             sentiment_module,
@@ -1517,3 +1715,39 @@ class TestSentimentAnalystAgent:
             detail="validation_error",
         ) in evidence.sources
         llm.invoke.assert_not_called()
+        assert structured.invoke.call_count == 2
+
+    def test_none_parsed_sentiment_is_repaired_once(self, monkeypatch):
+        monkeypatch.setattr(
+            sentiment_module,
+            "_collect_sentiment_blocks",
+            lambda *args: {
+                "news_block": "One neutral headline.",
+                "stocktwits_block": "DATA_UNAVAILABLE",
+                "reddit_block": "DATA_UNAVAILABLE",
+                "local_sentiment_block": "",
+            },
+        )
+        report = SentimentReport(
+            overall_band=SentimentBand.NEUTRAL,
+            overall_score=5.0,
+            confidence="low",
+            narrative="Available news was neutral.",
+            material_claims=(),
+        )
+        structured = MagicMock()
+        structured.invoke.side_effect = [None, report]
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+
+        result = create_sentiment_analyst(llm)(_make_sentiment_state())
+
+        assert result["sentiment_report"].startswith("**Overall Sentiment:** **Neutral**")
+        assert structured.invoke.call_count == 2
+        evidence = EvidenceState.model_validate(result["evidence_state"])
+        assert EvidenceSource(
+            source_id="analyst.sentiment.submission",
+            status=EvidenceStatus.AVAILABLE,
+            required=True,
+            detail="direct_structured",
+        ) in evidence.sources

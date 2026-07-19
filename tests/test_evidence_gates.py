@@ -882,6 +882,40 @@ def test_decision_gate_blocks_unsupported_numeric_claim_in_narrative():
 
 
 @pytest.mark.unit
+def test_decision_gate_ignores_digits_in_selected_claim_id_annotations():
+    claim = MaterialClaim(
+        claim_id="fundamentals.006",
+        analyst="fundamentals",
+        statement="The trailing PE ratio is 61.77551.",
+        source_quote="PE Ratio (TTM): 61.77551",
+        source_refs=("get_fundamentals:600895.SS:2026-07-19",),
+    )
+    evidence = _evidence_with_supported_claims(
+        claim,
+        sources=(
+            EvidenceSource(
+                source_id="get_fundamentals:600895.SS:2026-07-19",
+                status=EvidenceStatus.AVAILABLE,
+                required=False,
+            ),
+        ),
+    )
+    draft = evidence_module.DraftThesis(
+        rating="Underweight",
+        narrative=(
+            "**Investment Thesis**: - [fundamentals.006] "
+            "PE Ratio (TTM): 61.77551"
+        ),
+        material_claim_ids=("fundamentals.006",),
+    )
+
+    result = evidence_module.evaluate_decision_gate(draft, evidence)
+
+    assert result.permitted is True
+    assert result.diagnostics == ()
+
+
+@pytest.mark.unit
 def test_decision_gate_permits_hold_with_degraded_coverage_and_constrained_confidence():
     claim = MaterialClaim(
         claim_id="market.latest_close",

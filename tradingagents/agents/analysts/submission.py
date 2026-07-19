@@ -11,6 +11,10 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
+from tradingagents.agents.utils.structured import (
+    bind_required_structured,
+    invoke_required_structured,
+)
 from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
     get_active_authoritative_market_snapshot,
@@ -45,15 +49,12 @@ class AnalystSubmissionResult:
 
 
 def bind_analyst_finalizer(llm: Any, analyst: str) -> Any | None:
-    """Bind the one-shot structured finalizer when the provider supports it."""
-    try:
-        return llm.with_structured_output(AnalystEvidenceReport)
-    except (NotImplementedError, AttributeError, ValueError, TypeError):
-        logger.warning(
-            "%s Analyst: structured finalization is unsupported by the provider",
-            analyst.title(),
-        )
-        return None
+    """Bind the required structured finalizer when the provider supports it."""
+    return bind_required_structured(
+        llm,
+        AnalystEvidenceReport,
+        f"{analyst.title()} Analyst",
+    )
 
 
 def _submission_source(
@@ -208,12 +209,17 @@ def _finalization_prompt(
     return (
         f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
         "Return exactly one AnalystEvidenceReport. Preserve only claims supported "
-        "by the source catalog. Every material claim must use source_refs copied "
+        "by the source catalog. Every material claim must use one source_ref copied "
         "verbatim from the allowed list; inventing a source ref is forbidden. "
         "Each MaterialClaim.source_quote must copy one exact contiguous "
         "source-language phrase from the cited tool evidence. The statement may "
         "be a localized paraphrase, but source_quote must not be translated or "
-        "rewritten. "
+        "rewritten. Return one JSON object shaped exactly as "
+        '{"report_markdown":"...","material_claims":['
+        '{"claim_id":"' + analyst + '.unique_id","statement":"...",'
+        '"source_ref":"one allowed ref","source_quote":"exact quote"}]}. '
+        "Do not add analyst, source_refs, fact_ids, or minimum_history_rows; "
+        "the application derives those fields. "
         "If no listed source supports a decision-relevant premise, omit that claim.\n\n"
         "Allowed source refs and collected evidence:\n"
         f"{source_catalog}\n\n"
@@ -243,16 +249,16 @@ def _normalize_submission(
             f"{analyst} material claim IDs must use the {analyst}. namespace"
         )
     claims = tuple(
-        claim.model_copy(update={"analyst": analyst})
+        MaterialClaim(
+            claim_id=claim.claim_id,
+            analyst=analyst,
+            statement=claim.statement,
+            source_refs=(claim.source_ref,),
+            source_quote=claim.source_quote,
+        )
         for claim in validated.material_claims
     )
     return report, claims
-
-
-def _failure_reason(exc: Exception) -> str:
-    if isinstance(exc, (ValidationError, ValueError, TypeError)):
-        return "validation_error"
-    return "transport_error"
 
 
 def _apply_deterministic_history_requirements(
@@ -299,7 +305,7 @@ def _unavailable_result(analyst: str, reason: str) -> AnalystSubmissionResult:
     )
 
 
-def _finalize_once(
+def _finalize_required(
     *,
     finalizer: Any | None,
     analyst: str,
@@ -317,19 +323,18 @@ def _finalize_once(
         draft=draft,
         messages=messages,
     )
-    try:
-        submitted = finalizer.invoke(prompt)
-        if submitted is None:
-            return _unavailable_result(analyst, "none_parsed")
-        report, claims = _normalize_submission(submitted, analyst)
-    except Exception as exc:  # noqa: BLE001 - classified without provider payloads
-        reason = _failure_reason(exc)
-        logger.warning(
-            "%s Analyst: structured finalization failed (%s)",
-            analyst.title(),
-            reason,
+    structured_result = invoke_required_structured(
+        finalizer,
+        prompt,
+        f"{analyst.title()} Analyst",
+        validator=lambda submitted: _normalize_submission(submitted, analyst),
+    )
+    if structured_result.value is None:
+        return _unavailable_result(
+            analyst,
+            structured_result.reason or "none_parsed",
         )
-        return _unavailable_result(analyst, reason)
+    report, claims = structured_result.value
     return AnalystSubmissionResult(
         message=AIMessage(content=report),
         report=report,
@@ -372,7 +377,7 @@ def process_analyst_response(
         try:
             report, claims = _normalize_submission(report_calls[0]["args"], analyst)
         except (ValidationError, ValueError, TypeError):
-            return _finalize_once(
+            return _finalize_required(
                 finalizer=finalizer,
                 analyst=analyst,
                 ticker=ticker,
@@ -391,7 +396,7 @@ def process_analyst_response(
             ),
         )
 
-    return _finalize_once(
+    return _finalize_required(
         finalizer=finalizer,
         analyst=analyst,
         ticker=ticker,

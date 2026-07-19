@@ -61,7 +61,7 @@ Before writing the final report, call get_verified_market_snapshot for this tick
 
 Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions.
 
-When the analysis is complete, submit it through AnalystEvidenceReport. Put the human-readable Markdown in report_markdown and list every decision-relevant factual premise as a MaterialClaim with source_refs. For each calculated claim, set minimum_history_rows to its exact warmup requirement (for example 200 only for close_200_sma); use 1 for direct observations. Do not submit an unavailable calculation as a material claim, and do not submit unsupported claims or precision."""
+When the analysis is complete, submit it through AnalystEvidenceReport. Put the human-readable Markdown in report_markdown and list every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote. The application derives fact IDs and indicator history requirements deterministically. Do not submit an unavailable calculation as a material claim, and do not submit unsupported claims or precision."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
