@@ -1,18 +1,29 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
+from hashlib import sha256
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
-from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
+from tradingagents.agents.schemas import (
+    DecisionAssertion,
+    PortfolioDecisionSelection,
+    PortfolioRating,
+)
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.evidence import (
+    ClaimValidation,
+    ClaimValidationStatus,
+    EvidenceSource,
     EvidenceState,
+    EvidenceStatus,
     InstrumentIdentityEvidence,
     MarketSnapshotEvidence,
     MaterialClaim,
+    SourceArtifact,
+    SourceFact,
 )
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.reflection import Reflector
@@ -26,6 +37,16 @@ DECISION_OVERWEIGHT = (
     "Executive Summary: Moderate position, await confirmation.\n"
     "Investment Thesis: Strong fundamentals but near-term headwinds."
 )
+
+
+def _decision_assertions(*claim_ids: str) -> tuple[DecisionAssertion, ...]:
+    return tuple(
+        DecisionAssertion(
+            claim_id=claim_id,
+            fact_ids=(f"fact:test:{claim_id}",),
+        )
+        for claim_id in claim_ids
+    )
 DECISION_SELL = "Rating: Sell\nExit position immediately."
 DECISION_NO_RATING = (
     "Executive Summary: Complex situation with multiple competing factors.\n"
@@ -91,6 +112,12 @@ def _make_pm_state(past_context=""):
 
 
 def _decision_ready_pm_evidence() -> dict:
+    source_ref = "snapshot:NVDA:2026-01-09"
+    fact_id = "fact:test:market.ai_capex_cycle"
+    source_quote = (
+        "AI capex cycle remains intact and supports a 215.0 price "
+        "target over 3-6 months."
+    )
     return EvidenceState(
         instrument_identity=InstrumentIdentityEvidence(symbol="NVDA", name="NVIDIA"),
         market_snapshot=MarketSnapshotEvidence(
@@ -110,21 +137,56 @@ def _decision_ready_pm_evidence() -> dict:
                     "AI capex cycle remains intact and supports a 215.0 price "
                     "target over 3-6 months."
                 ),
-                source_refs=("snapshot:NVDA:2026-01-09",),
+                source_quote=source_quote,
+                source_refs=(source_ref,),
+                fact_ids=(fact_id,),
+            ),
+        ),
+        source_facts=(
+            SourceFact(
+                fact_id=fact_id,
+                source_ref=source_ref,
+                tool_call_id="test-call:market.ai_capex_cycle",
+                tool_name="test_source",
+                artifact_sha256=sha256(source_quote.encode()).hexdigest(),
+                raw_text=source_quote,
+                source_span_start=0,
+                source_span_end=len(source_quote),
+            ),
+        ),
+        source_artifacts=(
+            SourceArtifact(
+                artifact_sha256=sha256(source_quote.encode()).hexdigest(),
+                source_ref=source_ref,
+                tool_call_id="test-call:market.ai_capex_cycle",
+                tool_name="test_source",
+                raw_text=source_quote,
+            ),
+        ),
+        claim_validations=(
+            ClaimValidation(
+                claim_id="market.ai_capex_cycle",
+                status=ClaimValidationStatus.SUPPORTED,
+                fact_ids=(fact_id,),
+            ),
+        ),
+        sources=(
+            EvidenceSource(
+                source_id=source_ref,
+                status=EvidenceStatus.AVAILABLE,
+                required=False,
             ),
         ),
     ).model_dump(mode="json")
 
 
-def _structured_pm_llm(captured: dict, decision: PortfolioDecision | None = None):
-    """Build a MagicMock LLM whose with_structured_output binding captures the
-    prompt and returns a real PortfolioDecision (so render_pm_decision works).
-    """
+def _structured_pm_llm(captured: dict, decision: PortfolioDecisionSelection | None = None):
+    """Build a PM model returning only the evidence-bound selection schema."""
     if decision is None:
-        decision = PortfolioDecision(
+        decision = PortfolioDecisionSelection(
             rating=PortfolioRating.HOLD,
-            executive_summary="Hold the position; await catalyst.",
-            investment_thesis="Balanced view; neither side carried the debate.",
+            material_claim_ids=("market.ai_capex_cycle",),
+            decision_assertions=_decision_assertions("market.ai_capex_cycle"),
         )
     structured = MagicMock()
     structured.invoke.side_effect = lambda prompt: (
@@ -725,7 +787,7 @@ class TestPortfolioManagerInjection:
         pm_node = create_portfolio_manager(llm)
         state = _make_pm_state(past_context="[2026-01-05 | NVDA | Buy | +5.0% | +2.0% | 5d]\nGreat call.")
         pm_node(state)
-        assert "Lessons from prior decisions and outcomes" in captured["prompt"]
+        assert "Untrusted prior-decision context (not evidence)" in captured["prompt"]
         assert "Great call." in captured["prompt"]
 
     def test_pm_no_past_context_no_section(self):
@@ -735,20 +797,74 @@ class TestPortfolioManagerInjection:
         pm_node = create_portfolio_manager(llm)
         state = _make_pm_state(past_context="")
         pm_node(state)
-        assert "Lessons from prior decisions" not in captured["prompt"]
+        assert "Untrusted prior-decision context" not in captured["prompt"]
+
+    def test_pm_prompt_includes_canonical_allowed_claim_ledger(self):
+        captured = {}
+        decision = PortfolioDecisionSelection(
+            rating=PortfolioRating.HOLD,
+            material_claim_ids=("market.ai_capex_cycle",),
+            decision_assertions=_decision_assertions("market.ai_capex_cycle"),
+        )
+        pm_node = create_portfolio_manager(_structured_pm_llm(captured, decision))
+        state = _make_pm_state()
+        state["evidence_state"] = _decision_ready_pm_evidence()
+
+        pm_node(state)
+
+        assert "Decision-ready material claim ledger (closed vocabulary):" in captured["prompt"]
+        assert (
+            "- market.ai_capex_cycle | analyst=market | "
+            "sources=snapshot:NVDA:2026-01-09 | "
+            "facts=fact:test:market.ai_capex_cycle | "
+            "statement="
+            "AI capex cycle remains intact and supports a 215.0 price target "
+            "over 3-6 months."
+        ) in captured["prompt"]
+
+    def test_pm_selection_retry_limits_ids_to_decision_ready_ledger(self):
+        first_decision = PortfolioDecisionSelection(
+            rating=PortfolioRating.HOLD,
+            material_claim_ids=("market.fabricated",),
+            decision_assertions=_decision_assertions("market.fabricated"),
+        )
+        corrected_decision = PortfolioDecisionSelection(
+            rating=PortfolioRating.HOLD,
+            material_claim_ids=("market.ai_capex_cycle",),
+            decision_assertions=_decision_assertions("market.ai_capex_cycle"),
+        )
+        captured_prompts = []
+        structured = MagicMock()
+        structured.invoke.side_effect = lambda prompt: (
+            captured_prompts.append(prompt)
+            or (first_decision if len(captured_prompts) == 1 else corrected_decision)
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        pm_node = create_portfolio_manager(llm)
+        state = _make_pm_state()
+        state["evidence_state"] = _decision_ready_pm_evidence()
+
+        pm_node(state)
+
+        assert len(captured_prompts) == 2
+        retry_prompt = captured_prompts[1]
+        assert (
+            "Return exactly one corrected PortfolioDecisionSelection using only "
+            "the immutable decision-ready claim ledger above. Keep the rating "
+            "unchanged as Hold."
+        ) in retry_prompt
+        assert "market.ai_capex_cycle" in retry_prompt
 
     def test_pm_returns_rendered_markdown_with_rating(self):
-        """The structured PortfolioDecision is rendered to markdown that
+        """The structured selection is rendered deterministically from evidence that
         downstream consumers (memory log, signal processor, CLI display)
         can parse without any extra LLM call."""
         captured = {}
-        decision = PortfolioDecision(
+        decision = PortfolioDecisionSelection(
             rating=PortfolioRating.OVERWEIGHT,
-            executive_summary="Build position gradually over the next two weeks.",
-            investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
-            price_target=215.0,
-            time_horizon="3-6 months",
             material_claim_ids=("market.ai_capex_cycle",),
+            decision_assertions=_decision_assertions("market.ai_capex_cycle"),
         )
         llm = _structured_pm_llm(captured, decision)
         pm_node = create_portfolio_manager(llm)
@@ -757,10 +873,10 @@ class TestPortfolioManagerInjection:
         result = pm_node(state)
         md = result["final_trade_decision"]
         assert "**Rating**: Overweight" in md
-        assert "**Executive Summary**: Build position gradually" in md
-        assert "**Investment Thesis**: AI capex cycle" in md
-        assert "**Price Target**: 215.0" in md
-        assert "**Time Horizon**: 3-6 months" in md
+        assert "**Executive Summary**: The Overweight rating is based exclusively" in md
+        assert "[market.ai_capex_cycle] AI capex cycle remains intact" in md
+        assert "**Price Target**" not in md
+        assert "**Time Horizon**" not in md
 
     def test_pm_freetext_fallback_requires_explicit_shadow_override(self):
         """If a provider does not support with_structured_output, the agent

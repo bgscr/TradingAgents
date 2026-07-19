@@ -3,23 +3,109 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
+from hashlib import sha256
 from typing import Any
 
 from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel, ConfigDict, Field
 
 _NUMERIC_CLAIM_PATTERN = re.compile(
-    r"(?<!\w)[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?!\w)"
+    r"(?<![A-Za-z0-9_])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
+    r"(?![A-Za-z0-9_])"
 )
+
+_NUMERIC_TRANSLATION = str.maketrans(
+    {
+        "\u2212": "-",
+        "\ufe63": "-",
+        "\uff0d": "-",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\uff0b": "+",
+    }
+)
+
+
+def _normalize_numeric_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(_NUMERIC_TRANSLATION)
 
 
 def _numeric_claim_tokens(text: str) -> tuple[str, ...]:
     return tuple(
         match.group(0).replace(",", "").removeprefix("+")
-        for match in _NUMERIC_CLAIM_PATTERN.finditer(text)
+        for match in _NUMERIC_CLAIM_PATTERN.finditer(_normalize_numeric_text(text))
+    )
+
+
+def _numeric_token_parts(token: str) -> tuple[Decimal, int, bool] | None:
+    normalized = token.replace(",", "").removeprefix("+")
+    is_percent = normalized.endswith("%")
+    number = normalized.removesuffix("%")
+    try:
+        value = Decimal(number)
+    except InvalidOperation:
+        return None
+    decimals = len(number.partition(".")[2]) if "." in number else 0
+    return value, decimals, is_percent
+
+
+def _numeric_token_supported(claim_token: str, source_tokens: Iterable[str]) -> bool:
+    claim_parts = _numeric_token_parts(claim_token)
+    if claim_parts is None:
+        return False
+    claim_value, claim_decimals, claim_percent = claim_parts
+    for source_token in source_tokens:
+        source_parts = _numeric_token_parts(source_token)
+        if source_parts is None:
+            continue
+        source_value, _, source_percent = source_parts
+        if claim_percent != source_percent:
+            continue
+        if claim_value == source_value:
+            return True
+        if claim_decimals > 0:
+            tolerance = Decimal(5).scaleb(-(claim_decimals + 1))
+            if abs(claim_value - source_value) <= tolerance:
+                return True
+    return False
+
+
+def _source_quote_is_unavailable(quote: str) -> bool:
+    normalized = quote.strip().upper()
+    return normalized == "N/A" or any(
+        marker in normalized
+        for marker in (
+            "DATA_UNAVAILABLE",
+            "NOT_AVAILABLE",
+            "UNAVAILABLE",
+            "N/A: INSUFFICIENT HISTORY",
+            "N/A: NOT A TRADING DAY",
+        )
+    )
+
+
+def _source_quote_is_metadata(quote: str) -> bool:
+    normalized = quote.strip().casefold().lstrip("#").strip()
+    return any(
+        normalized.startswith(prefix)
+        for prefix in (
+            "source:",
+            "provider:",
+            "adjustment basis:",
+            "effective trading date:",
+            "retrieved at:",
+            "frame sha-256:",
+            "snapshot id:",
+            "total records:",
+        )
     )
 
 
@@ -27,6 +113,7 @@ class EvidenceStatus(str, Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
     CONFLICTED = "conflicted"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class EvidenceReadiness(str, Enum):
@@ -34,6 +121,11 @@ class EvidenceReadiness(str, Enum):
     DEGRADED = "degraded"
     INSUFFICIENT = "insufficient"
     CONFLICTED = "conflicted"
+
+
+class ClaimValidationStatus(str, Enum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
 
 
 class DecisionConfidence(str, Enum):
@@ -59,6 +151,8 @@ class MarketSnapshotEvidence(BaseModel):
     requested_date: str
     effective_trading_date: str
     history_rows: int = Field(ge=0)
+    frame_sha256: str = ""
+    snapshot_id: str = ""
 
 
 class MaterialClaim(BaseModel):
@@ -67,7 +161,59 @@ class MaterialClaim(BaseModel):
     claim_id: str
     analyst: str
     statement: str
-    source_refs: tuple[str, ...] = Field(min_length=1)
+    source_refs: tuple[str, ...] = Field(min_length=1, max_length=1)
+    source_quote: str = Field(
+        min_length=1,
+        description=(
+            "Exact source-language quotation copied from one cited source. "
+            "The localized statement may paraphrase this quote."
+        ),
+    )
+    fact_ids: tuple[str, ...] = ()
+    minimum_history_rows: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Minimum accepted snapshot history needed to support this claim's "
+            "calculation; use the exact indicator warmup, or 1 for observations."
+        ),
+    )
+
+
+class SourceFact(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    fact_id: str
+    source_ref: str
+    tool_call_id: str
+    tool_name: str = ""
+    artifact_sha256: str
+    raw_text: str
+    source_span_start: int = Field(ge=0)
+    source_span_end: int = Field(ge=0)
+    normalized_numeric_tokens: tuple[str, ...] = ()
+    calculation_ids: tuple[str, ...] = ()
+
+
+class SourceArtifact(BaseModel):
+    """Exact immutable tool result whose digest is cited by Source Facts."""
+
+    model_config = ConfigDict(frozen=True)
+
+    artifact_sha256: str
+    source_ref: str
+    tool_call_id: str
+    tool_name: str
+    raw_text: str
+
+
+class ClaimValidation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    claim_id: str
+    status: ClaimValidationStatus
+    detail: str = ""
+    fact_ids: tuple[str, ...] = ()
 
 
 class AnalystEvidenceReport(BaseModel):
@@ -94,6 +240,9 @@ class EvidenceState(BaseModel):
     instrument_identity: InstrumentIdentityEvidence | None = None
     market_snapshot: MarketSnapshotEvidence | None = None
     material_claims: tuple[MaterialClaim, ...] = ()
+    source_facts: tuple[SourceFact, ...] = ()
+    source_artifacts: tuple[SourceArtifact, ...] = ()
+    claim_validations: tuple[ClaimValidation, ...] = ()
     sources: tuple[EvidenceSource, ...] = ()
 
 
@@ -108,8 +257,78 @@ def merge_material_claims(
         else EvidenceState.model_validate(evidence or {})
     )
     merged = {claim.claim_id: claim for claim in current.material_claims}
-    merged.update((claim.claim_id, claim) for claim in claims)
+    for claim in claims:
+        existing = merged.get(claim.claim_id)
+        if existing is not None and existing != claim:
+            raise ValueError(
+                f"Material claim ID {claim.claim_id!r} was redefined; claim IDs are immutable."
+            )
+        merged[claim.claim_id] = claim
     return current.model_copy(update={"material_claims": tuple(merged.values())})
+
+
+def merge_source_facts(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    facts: Iterable[SourceFact],
+) -> EvidenceState:
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+    merged = {fact.fact_id: fact for fact in current.source_facts}
+    for fact in facts:
+        existing = merged.get(fact.fact_id)
+        if existing is not None and existing != fact:
+            raise ValueError(f"Source fact ID {fact.fact_id!r} was redefined.")
+        merged[fact.fact_id] = fact
+    return current.model_copy(update={"source_facts": tuple(merged.values())})
+
+
+def merge_source_artifacts(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    artifacts: Iterable[SourceArtifact],
+) -> EvidenceState:
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+    merged = {
+        (artifact.tool_call_id, artifact.source_ref): artifact
+        for artifact in current.source_artifacts
+    }
+    for artifact in artifacts:
+        key = (artifact.tool_call_id, artifact.source_ref)
+        existing = merged.get(key)
+        if existing is not None and existing != artifact:
+            raise ValueError(
+                f"Source artifact {artifact.artifact_sha256!r} was redefined."
+            )
+        merged[key] = artifact
+    return current.model_copy(update={"source_artifacts": tuple(merged.values())})
+
+
+def merge_claim_validations(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    validations: Iterable[ClaimValidation],
+) -> EvidenceState:
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+    merged = {
+        validation.claim_id: validation for validation in current.claim_validations
+    }
+    for validation in validations:
+        existing = merged.get(validation.claim_id)
+        if existing is not None and existing != validation:
+            raise ValueError(
+                f"Claim validation for {validation.claim_id!r} was redefined."
+            )
+        merged[validation.claim_id] = validation
+    return current.model_copy(update={"claim_validations": tuple(merged.values())})
 
 
 def merge_evidence_sources(
@@ -124,6 +343,7 @@ def merge_evidence_sources(
     )
     merged = {source.source_id: source for source in current.sources}
     severity = {
+        EvidenceStatus.NOT_APPLICABLE: -1,
         EvidenceStatus.AVAILABLE: 0,
         EvidenceStatus.UNAVAILABLE: 1,
         EvidenceStatus.CONFLICTED: 2,
@@ -147,19 +367,80 @@ def merge_evidence_sources(
 def evidence_sources_from_tool_messages(
     messages: Iterable[Any],
     claims: Iterable[MaterialClaim],
+    *,
+    tool_call_ids_by_source: Mapping[str, Iterable[str]],
 ) -> tuple[EvidenceSource, ...]:
-    """Register claim refs only when their named tool actually returned a message."""
+    """Compatibility wrapper returning source availability from paired results.
+
+    Claim support is deliberately represented separately in
+    ``EvidenceState.claim_validations`` so one bad claim cannot poison every
+    other claim that cites the same available source.
+    """
+    return build_tool_evidence_state(
+        messages,
+        claims,
+        tool_call_ids_by_source=tool_call_ids_by_source,
+    ).sources
+
+
+def build_tool_evidence_state(
+    messages: Iterable[Any],
+    claims: Iterable[MaterialClaim],
+    *,
+    tool_call_ids_by_source: Mapping[str, Iterable[str]],
+    tool_calls_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> EvidenceState:
+    """Materialize immutable source facts and per-claim validation results."""
+    message_list = tuple(messages)
+    claim_list = tuple(claims)
+    call_catalog = tool_calls_by_id or {}
+
+    def calculation_ids_for_span(
+        message: Any,
+        content: str,
+        span_start: int,
+    ) -> tuple[str, ...]:
+        if getattr(message, "name", None) != "get_indicators":
+            return ()
+        call = call_catalog.get(str(getattr(message, "tool_call_id", "")))
+        if call is None:
+            return ()
+        args = call.get("args") or {}
+        raw_indicators = args.get("indicator", "") if isinstance(args, Mapping) else ""
+        indicators = tuple(
+            indicator.strip().casefold()
+            for indicator in str(raw_indicators).split(",")
+            if indicator.strip()
+        )
+        section_starts = []
+        for indicator in indicators:
+            match = re.search(
+                rf"(?mi)^##\s+{re.escape(indicator)}\s+values\b",
+                content,
+            )
+            if match:
+                section_starts.append((match.start(), indicator))
+        section_starts.sort()
+        for index, (section_start, indicator) in enumerate(section_starts):
+            section_end = (
+                section_starts[index + 1][0]
+                if index + 1 < len(section_starts)
+                else len(content)
+            )
+            if section_start <= span_start < section_end:
+                return (indicator,)
+        return ()
     tool_messages: dict[str, list[Any]] = {}
-    for message in messages:
-        tool_name = getattr(message, "name", None)
+    for message in message_list:
         tool_call_id = getattr(message, "tool_call_id", None)
-        if tool_name and tool_call_id:
-            tool_messages.setdefault(tool_name, []).append(message)
+        if getattr(message, "name", None) and tool_call_id:
+            tool_messages.setdefault(str(tool_call_id), []).append(message)
 
     claims_by_source: dict[str, list[MaterialClaim]] = {}
     for claim in claims:
         for source_ref in claim.source_refs:
             claims_by_source.setdefault(source_ref, []).append(claim)
+    allowed_refs = frozenset(tool_call_ids_by_source)
 
     def message_is_unavailable(message: Any) -> bool:
         return getattr(message, "status", None) == "error" or any(
@@ -172,12 +453,31 @@ def evidence_sources_from_tool_messages(
             )
         )
 
-    sources = []
-    for source_ref, referenced_claims in claims_by_source.items():
-        tool_name = source_ref.partition(":")[0]
-        if tool_name == "snapshot":
-            tool_name = "get_verified_market_snapshot"
-        matching_messages = tool_messages.get(tool_name, [])
+    sources: list[EvidenceSource] = []
+    available_messages_by_source: dict[str, tuple[Any, ...]] = {}
+    for source_ref in claims_by_source:
+        if source_ref not in allowed_refs:
+            sources.append(
+                EvidenceSource(
+                    source_id=source_ref,
+                    status=EvidenceStatus.UNAVAILABLE,
+                    required=False,
+                    detail="source ref is not in allowed catalog",
+                )
+            )
+            continue
+        source_kind = source_ref.partition(":")[0]
+        allowed_tool_names = (
+            {"get_verified_market_snapshot", "get_indicators"}
+            if source_kind == "snapshot"
+            else {source_kind}
+        )
+        matching_messages = tuple(
+            message
+            for tool_call_id in tool_call_ids_by_source[source_ref]
+            for message in tool_messages.get(str(tool_call_id), ())
+            if getattr(message, "name", None) in allowed_tool_names
+        )
         if not matching_messages:
             sources.append(
                 EvidenceSource(
@@ -201,37 +501,7 @@ def evidence_sources_from_tool_messages(
                 )
             )
             continue
-
-        message_token_sets = tuple(
-            set(_numeric_claim_tokens(str(getattr(message, "content", ""))))
-            for message in available_messages
-        )
-        unsupported_tokens = []
-        for claim in referenced_claims:
-            claim_tokens = _numeric_claim_tokens(claim.statement)
-            if claim_tokens and not any(
-                set(claim_tokens).issubset(message_tokens)
-                for message_tokens in message_token_sets
-            ):
-                unsupported_tokens.extend(
-                    token
-                    for token in claim_tokens
-                    if token not in unsupported_tokens
-                    and not any(token in tokens for tokens in message_token_sets)
-                )
-        if unsupported_tokens:
-            sources.append(
-                EvidenceSource(
-                    source_id=source_ref,
-                    status=EvidenceStatus.CONFLICTED,
-                    required=False,
-                    detail=(
-                        "source does not contain numeric claim(s): "
-                        + ", ".join(unsupported_tokens)
-                    ),
-                )
-            )
-            continue
+        available_messages_by_source[source_ref] = available_messages
         sources.append(
             EvidenceSource(
                 source_id=source_ref,
@@ -239,7 +509,423 @@ def evidence_sources_from_tool_messages(
                 required=False,
             )
         )
-    return tuple(sources)
+
+    facts: list[SourceFact] = []
+    artifacts: dict[tuple[str, str, str], SourceArtifact] = {}
+    validations: list[ClaimValidation] = []
+    enriched_claims: list[MaterialClaim] = []
+    for claim in claim_list:
+        claim_facts: list[SourceFact] = []
+        unavailable_refs: list[str] = []
+        numeric_diagnostics: list[str] = []
+        ambiguous_quote = False
+        quote = claim.source_quote.strip() or claim.statement.strip()
+        for source_ref in claim.source_refs:
+            available_messages = available_messages_by_source.get(source_ref, ())
+            if not available_messages:
+                unavailable_refs.append(source_ref)
+                continue
+            for message in available_messages:
+                content = str(getattr(message, "content", ""))
+                if quote and content.count(quote) > 1:
+                    ambiguous_quote = True
+                    continue
+                span_start = content.find(quote) if quote else -1
+                if span_start < 0:
+                    continue
+                tool_call_id = str(getattr(message, "tool_call_id", ""))
+                artifact_digest = sha256(content.encode()).hexdigest()
+                artifact_key = (artifact_digest, tool_call_id, source_ref)
+                artifacts[artifact_key] = SourceArtifact(
+                    artifact_sha256=artifact_digest,
+                    source_ref=source_ref,
+                    tool_call_id=tool_call_id,
+                    tool_name=str(getattr(message, "name", "")),
+                    raw_text=content,
+                )
+                fact_digest = sha256(
+                    f"{source_ref}\0{tool_call_id}\0{quote}".encode()
+                ).hexdigest()
+                claim_facts.append(
+                    SourceFact(
+                        fact_id=f"fact:{fact_digest}",
+                        source_ref=source_ref,
+                        tool_call_id=tool_call_id,
+                        tool_name=str(getattr(message, "name", "")),
+                        artifact_sha256=artifact_digest,
+                        raw_text=quote,
+                        source_span_start=span_start,
+                        source_span_end=span_start + len(quote),
+                        normalized_numeric_tokens=_numeric_claim_tokens(quote),
+                        calculation_ids=calculation_ids_for_span(
+                            message,
+                            content,
+                            span_start,
+                        ),
+                    )
+                )
+                break
+
+        unique_facts = {fact.fact_id: fact for fact in claim_facts}
+        claim_fact_ids = tuple(unique_facts)
+        if claim_fact_ids:
+            unsupported_tokens = unsupported_numeric_claim_tokens((claim,), (quote,))
+            numeric_diagnostics.extend(
+                token for token in unsupported_tokens if token not in numeric_diagnostics
+            )
+        if not claim_fact_ids:
+            if unavailable_refs and len(unavailable_refs) == len(claim.source_refs):
+                detail = "cited source unavailable: " + ", ".join(unavailable_refs)
+            elif ambiguous_quote:
+                detail = "source quote is ambiguous within the cited tool result"
+            else:
+                detail = "source quote is absent from the cited tool result"
+            validations.append(
+                ClaimValidation(
+                    claim_id=claim.claim_id,
+                    status=ClaimValidationStatus.UNSUPPORTED,
+                    detail=detail,
+                )
+            )
+        elif _source_quote_is_unavailable(quote):
+            validations.append(
+                ClaimValidation(
+                    claim_id=claim.claim_id,
+                    status=ClaimValidationStatus.UNSUPPORTED,
+                    detail="source quote reports unavailable evidence",
+                    fact_ids=claim_fact_ids,
+                )
+            )
+        elif _source_quote_is_metadata(quote):
+            validations.append(
+                ClaimValidation(
+                    claim_id=claim.claim_id,
+                    status=ClaimValidationStatus.UNSUPPORTED,
+                    detail="source quote contains provenance metadata, not a material fact",
+                    fact_ids=claim_fact_ids,
+                )
+            )
+        elif numeric_diagnostics:
+            validations.append(
+                ClaimValidation(
+                    claim_id=claim.claim_id,
+                    status=ClaimValidationStatus.UNSUPPORTED,
+                    detail=(
+                        "source does not contain numeric claim(s): "
+                        + ", ".join(numeric_diagnostics)
+                    ),
+                    fact_ids=claim_fact_ids,
+                )
+            )
+        else:
+            validations.append(
+                ClaimValidation(
+                    claim_id=claim.claim_id,
+                    status=ClaimValidationStatus.SUPPORTED,
+                    fact_ids=claim_fact_ids,
+                )
+            )
+        facts.extend(unique_facts.values())
+        enriched_claims.append(claim.model_copy(update={"fact_ids": claim_fact_ids}))
+
+    return EvidenceState(
+        material_claims=tuple(enriched_claims),
+        source_facts=tuple({fact.fact_id: fact for fact in facts}.values()),
+        source_artifacts=tuple(artifacts.values()),
+        claim_validations=tuple(validations),
+        sources=tuple(sources),
+    )
+
+
+def build_inline_evidence_state(
+    source_text_by_ref: Mapping[str, str | None],
+    claims: Iterable[MaterialClaim],
+) -> EvidenceState:
+    """Validate claims against pre-fetched source blocks kept in the prompt."""
+    claim_list = tuple(claims)
+    normalized_sources = {
+        source_ref: text if text is not None and text.strip() else None
+        for source_ref, text in source_text_by_ref.items()
+    }
+    sources = tuple(
+        EvidenceSource(
+            source_id=source_ref,
+            status=(
+                EvidenceStatus.AVAILABLE
+                if text is not None
+                else EvidenceStatus.UNAVAILABLE
+            ),
+            required=False,
+            detail="" if text is not None else "source returned unavailable",
+        )
+        for source_ref, text in normalized_sources.items()
+    )
+    facts: list[SourceFact] = []
+    artifacts: dict[tuple[str, str, str], SourceArtifact] = {}
+    validations: list[ClaimValidation] = []
+    enriched_claims: list[MaterialClaim] = []
+    for claim in claim_list:
+        quote = claim.source_quote.strip() or claim.statement.strip()
+        claim_facts: dict[str, SourceFact] = {}
+        unavailable_refs: list[str] = []
+        numeric_diagnostics: list[str] = []
+        ambiguous_quote = False
+        for source_ref in claim.source_refs:
+            content = normalized_sources.get(source_ref)
+            if content is None:
+                unavailable_refs.append(source_ref)
+                continue
+            numeric_diagnostics.extend(
+                token
+                for token in unsupported_numeric_claim_tokens((claim,), (content,))
+                if token not in numeric_diagnostics
+            )
+            if quote and content.count(quote) > 1:
+                ambiguous_quote = True
+                continue
+            span_start = content.find(quote) if quote else -1
+            if span_start < 0:
+                continue
+            artifact_digest = sha256(content.encode()).hexdigest()
+            tool_call_id = f"inline:{source_ref}"
+            artifact_key = (artifact_digest, tool_call_id, source_ref)
+            artifacts[artifact_key] = SourceArtifact(
+                artifact_sha256=artifact_digest,
+                source_ref=source_ref,
+                tool_call_id=tool_call_id,
+                tool_name="inline_source",
+                raw_text=content,
+            )
+            fact_digest = sha256(
+                f"{source_ref}\0{artifact_digest}\0{quote}".encode()
+            ).hexdigest()
+            fact = SourceFact(
+                fact_id=f"fact:{fact_digest}",
+                source_ref=source_ref,
+                tool_call_id=tool_call_id,
+                tool_name="inline_source",
+                artifact_sha256=artifact_digest,
+                raw_text=quote,
+                source_span_start=span_start,
+                source_span_end=span_start + len(quote),
+                normalized_numeric_tokens=_numeric_claim_tokens(quote),
+            )
+            claim_facts[fact.fact_id] = fact
+
+        claim_fact_ids = tuple(claim_facts)
+        if not claim.source_refs:
+            detail = "claim cites no source refs"
+            status = ClaimValidationStatus.UNSUPPORTED
+        elif not claim_fact_ids:
+            status = ClaimValidationStatus.UNSUPPORTED
+            detail = (
+                "cited source unavailable: " + ", ".join(unavailable_refs)
+                if unavailable_refs and len(unavailable_refs) == len(claim.source_refs)
+                else (
+                    "source quote is ambiguous within the cited source block"
+                    if ambiguous_quote
+                    else "source quote is absent from the cited source block"
+                )
+            )
+        elif _source_quote_is_unavailable(quote):
+            status = ClaimValidationStatus.UNSUPPORTED
+            detail = "source quote reports unavailable evidence"
+        elif _source_quote_is_metadata(quote):
+            status = ClaimValidationStatus.UNSUPPORTED
+            detail = "source quote contains provenance metadata, not a material fact"
+        elif numeric_diagnostics:
+            status = ClaimValidationStatus.UNSUPPORTED
+            detail = (
+                "source does not contain numeric claim(s): "
+                + ", ".join(numeric_diagnostics)
+            )
+        else:
+            status = ClaimValidationStatus.SUPPORTED
+            detail = ""
+        validations.append(
+            ClaimValidation(
+                claim_id=claim.claim_id,
+                status=status,
+                detail=detail,
+                fact_ids=claim_fact_ids,
+            )
+        )
+        facts.extend(claim_facts.values())
+        enriched_claims.append(claim.model_copy(update={"fact_ids": claim_fact_ids}))
+
+    known_source_ids = set(normalized_sources)
+    unknown_source_ids = tuple(
+        dict.fromkeys(
+            source_ref
+            for claim in claim_list
+            for source_ref in claim.source_refs
+            if source_ref not in known_source_ids
+        )
+    )
+    return EvidenceState(
+        material_claims=tuple(enriched_claims),
+        source_facts=tuple({fact.fact_id: fact for fact in facts}.values()),
+        source_artifacts=tuple(artifacts.values()),
+        claim_validations=tuple(validations),
+        sources=(
+            *sources,
+            *(
+                EvidenceSource(
+                    source_id=source_ref,
+                    status=EvidenceStatus.UNAVAILABLE,
+                    required=False,
+                    detail="source ref is not in allowed catalog",
+                )
+                for source_ref in unknown_source_ids
+            ),
+        ),
+    )
+
+
+def unsupported_numeric_claim_tokens(
+    claims: Iterable[MaterialClaim],
+    source_texts: Iterable[str],
+) -> tuple[str, ...]:
+    """Return numeric claim tokens absent from every supplied source text."""
+    source_tokens = tuple(
+        token
+        for source_text in source_texts
+        for token in _numeric_claim_tokens(source_text)
+    )
+    unsupported = []
+    for claim in claims:
+        claim_tokens = _numeric_claim_tokens(claim.statement)
+        unsupported.extend(
+            token
+            for token in claim_tokens
+            if token not in unsupported
+            and not _numeric_token_supported(token, source_tokens)
+        )
+    return tuple(unsupported)
+
+
+def _normalize_material_text(text: str) -> str:
+    tokens = re.findall(r"\w+(?:\.\w+)*|[%+-]", text.casefold())
+    return " ".join(tokens)
+
+
+def unsupported_material_claim_ids(
+    claims: Iterable[MaterialClaim],
+    source_texts: Iterable[str],
+) -> tuple[str, ...]:
+    """Return claims whose source-expressed statement is absent from all sources."""
+    normalized_sources = tuple(
+        _normalize_material_text(source_text) for source_text in source_texts
+    )
+    unsupported = []
+    for claim in claims:
+        source_expression = _normalize_material_text(
+            claim.source_quote or claim.statement
+        )
+        if not source_expression or not any(
+            source_expression in source_text for source_text in normalized_sources
+        ):
+            unsupported.append(claim.claim_id)
+    return tuple(unsupported)
+
+
+def _claim_provenance_failure(
+    claim: MaterialClaim,
+    evidence: EvidenceState,
+) -> str | None:
+    validations = {
+        validation.claim_id: validation for validation in evidence.claim_validations
+    }
+    validation = validations.get(claim.claim_id)
+    if validation is None:
+        return "claim has no deterministic validation record"
+    if validation.status is not ClaimValidationStatus.SUPPORTED:
+        return validation.detail or "claim validation is unsupported"
+    if not claim.fact_ids or set(validation.fact_ids) != set(claim.fact_ids):
+        return "claim validation is not bound to immutable Source Facts"
+    facts = {fact.fact_id: fact for fact in evidence.source_facts}
+    artifacts = {
+        (artifact.artifact_sha256, artifact.tool_call_id, artifact.source_ref): artifact
+        for artifact in evidence.source_artifacts
+    }
+    bound_facts = tuple(facts.get(fact_id) for fact_id in claim.fact_ids)
+    if any(fact is None for fact in bound_facts):
+        return "claim cites an unregistered Source Fact"
+    calculation_ids: list[str] = []
+    for fact in bound_facts:
+        assert fact is not None
+        if (
+            fact.source_ref not in claim.source_refs
+            or fact.raw_text != claim.source_quote
+            or not fact.tool_call_id.strip()
+            or not fact.tool_name.strip()
+            or len(fact.artifact_sha256) != 64
+            or fact.source_span_end - fact.source_span_start != len(fact.raw_text)
+        ):
+            return "claim Source Fact lacks an exact call, artifact, source, or span binding"
+        artifact = artifacts.get(
+            (fact.artifact_sha256, fact.tool_call_id, fact.source_ref)
+        )
+        if (
+            artifact is None
+            or artifact.tool_name != fact.tool_name
+            or sha256(artifact.raw_text.encode()).hexdigest()
+            != artifact.artifact_sha256
+            or fact.source_span_end > len(artifact.raw_text)
+            or artifact.raw_text[fact.source_span_start : fact.source_span_end]
+            != fact.raw_text
+        ):
+            return (
+                "claim Source Fact is not verifiable against its immutable "
+                "Source Artifact"
+            )
+        calculation_ids.extend(fact.calculation_ids)
+    if calculation_ids:
+        from tradingagents.dataflows.market_snapshot import (
+            _minimum_history_for_indicator,
+        )
+
+        required_rows = max(
+            _minimum_history_for_indicator(calculation_id)
+            for calculation_id in calculation_ids
+        )
+        if claim.minimum_history_rows < required_rows:
+            return (
+                "claim understates calculation history: "
+                f"{claim.minimum_history_rows} declared; {required_rows} required"
+            )
+    return None
+
+
+def decision_ready_material_claims(
+    evidence: EvidenceState | Mapping[str, Any],
+) -> tuple[MaterialClaim, ...]:
+    """Return claims whose individual validation and cited sources permit use."""
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence)
+    )
+    sources = {source.source_id: source for source in current.sources}
+
+    def source_is_ready(source_ref: str) -> bool:
+        snapshot = current.market_snapshot
+        if (
+            snapshot is not None
+            and snapshot.snapshot_id
+            and source_ref.startswith("snapshot:")
+            and source_ref != snapshot.snapshot_id
+        ):
+            return False
+        source = sources.get(source_ref)
+        return source is not None and source.status is EvidenceStatus.AVAILABLE
+
+    return tuple(
+        claim
+        for claim in current.material_claims
+        if _claim_provenance_failure(claim, current) is None
+        and all(source_is_ready(source_ref) for source_ref in claim.source_refs)
+    )
 
 
 class AdmissionGateResult(BaseModel):
@@ -272,6 +958,39 @@ class DecisionGateResult(BaseModel):
     revision_applied: bool = False
 
 
+def _evidence_coverage(evidence: EvidenceState) -> float:
+    snapshot = evidence.market_snapshot
+    authoritative_snapshot_ids = (
+        {
+            snapshot.snapshot_id,
+            f"snapshot:{snapshot.symbol}:{snapshot.effective_trading_date}",
+        }
+        if snapshot is not None
+        else set()
+    )
+    authoritative_snapshot_ids.discard("")
+    applicable_sources = tuple(
+        source
+        for source in evidence.sources
+        if source.status is not EvidenceStatus.NOT_APPLICABLE
+        and not (
+            any(
+                source.source_id == snapshot_id
+                or source.source_id.startswith(f"{snapshot_id}:")
+                for snapshot_id in authoritative_snapshot_ids
+            )
+        )
+    )
+    total_evidence = 2 + len(applicable_sources)
+    available_evidence = int(evidence.instrument_identity is not None) + int(
+        evidence.market_snapshot is not None
+    )
+    available_evidence += sum(
+        source.status is EvidenceStatus.AVAILABLE for source in applicable_sources
+    )
+    return available_evidence / total_evidence
+
+
 def evaluate_decision_gate(
     draft: DraftThesis,
     evidence: EvidenceState,
@@ -279,14 +998,7 @@ def evaluate_decision_gate(
     original_draft: DraftThesis | None = None,
 ) -> DecisionGateResult:
     """Validate the material premises used by a directional draft thesis."""
-    total_evidence = 2 + len(evidence.sources)
-    available_evidence = int(evidence.instrument_identity is not None) + int(
-        evidence.market_snapshot is not None
-    )
-    available_evidence += sum(
-        source.status is EvidenceStatus.AVAILABLE for source in evidence.sources
-    )
-    evidence_coverage = available_evidence / total_evidence
+    evidence_coverage = _evidence_coverage(evidence)
     if original_draft is not None and draft.rating != original_draft.rating:
         return DecisionGateResult(
             permitted=False,
@@ -344,7 +1056,51 @@ def evaluate_decision_gate(
                 for claim_id in missing_claim_ids
             ),
         )
+    unsupported_claims = tuple(
+        (claims_by_id[claim_id], detail)
+        for claim_id in draft.material_claim_ids
+        for detail in (_claim_provenance_failure(claims_by_id[claim_id], evidence),)
+        if detail is not None
+    )
+    if unsupported_claims:
+        return DecisionGateResult(
+            permitted=False,
+            readiness=EvidenceReadiness.INSUFFICIENT,
+            evidence_coverage=evidence_coverage,
+            confidence=DecisionConfidence.LOW,
+            diagnostics=tuple(
+                f"Draft premise {claim.claim_id} is unsupported"
+                f" ({detail})."
+                for claim, detail in unsupported_claims
+            ),
+            revision_applied=original_draft is not None,
+        )
     sources_by_id = {source.source_id: source for source in evidence.sources}
+    authoritative_snapshot_id = (
+        evidence.market_snapshot.snapshot_id if evidence.market_snapshot else ""
+    )
+    snapshot_mismatches = tuple(
+        (claim, source_ref)
+        for claim_id in draft.material_claim_ids
+        for claim in (claims_by_id[claim_id],)
+        for source_ref in claim.source_refs
+        if authoritative_snapshot_id
+        and source_ref.startswith("snapshot:")
+        and source_ref != authoritative_snapshot_id
+    )
+    if snapshot_mismatches:
+        return DecisionGateResult(
+            permitted=False,
+            readiness=EvidenceReadiness.CONFLICTED,
+            evidence_coverage=evidence_coverage,
+            confidence=DecisionConfidence.LOW,
+            diagnostics=tuple(
+                f"Draft premise {claim.claim_id} cites snapshot {source_ref}, not "
+                f"the Authoritative Market Snapshot {authoritative_snapshot_id}."
+                for claim, source_ref in snapshot_mismatches
+            ),
+            revision_applied=original_draft is not None,
+        )
     conflicted_sources = tuple(
         (claim, source)
         for claim_id in draft.material_claim_ids
@@ -417,12 +1173,16 @@ def evaluate_decision_gate(
     supported_numeric_claims = {
         token
         for claim_id in draft.material_claim_ids
-        for token in _numeric_claim_tokens(claims_by_id[claim_id].statement)
+        for source_text in (
+            claims_by_id[claim_id].statement,
+            claims_by_id[claim_id].source_quote,
+        )
+        for token in _numeric_claim_tokens(source_text)
     }
     unsupported_numeric_claims = tuple(
         token
         for token in _numeric_claim_tokens(draft.narrative)
-        if token not in supported_numeric_claims
+        if not _numeric_token_supported(token, supported_numeric_claims)
     )
     if unsupported_numeric_claims:
         return DecisionGateResult(
@@ -482,6 +1242,8 @@ def build_evidence_state(
             requested_date=snapshot.requested_date,
             effective_trading_date=snapshot.effective_trading_date,
             history_rows=len(snapshot.frame),
+            frame_sha256=snapshot.frame_sha256,
+            snapshot_id=snapshot.snapshot_id,
         )
     return EvidenceState(
         instrument_identity=instrument_identity,
@@ -505,6 +1267,7 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
             symbol,
             start_date,
             requested_date,
+            minimum_history_rows=1,
         )
     except NoMarketDataError:
         snapshot = None
@@ -546,17 +1309,10 @@ def render_analysis_outcome(outcome: AnalysisOutcome) -> str:
 
 def evaluate_admission_gate(
     evidence: EvidenceState,
-    minimum_history_rows: int = 200,
+    minimum_history_rows: int = 1,
 ) -> AdmissionGateResult:
     """Evaluate whether acquired evidence may proceed to thesis synthesis."""
-    total_evidence = 2 + len(evidence.sources)
-    available_evidence = int(evidence.instrument_identity is not None) + int(
-        evidence.market_snapshot is not None
-    )
-    available_evidence += sum(
-        source.status is EvidenceStatus.AVAILABLE for source in evidence.sources
-    )
-    coverage = available_evidence / total_evidence
+    coverage = _evidence_coverage(evidence)
 
     if evidence.instrument_identity is None:
         return AdmissionGateResult(
@@ -598,7 +1354,36 @@ def evaluate_admission_gate(
             ),
         )
 
-    if evidence.market_snapshot.history_rows < minimum_history_rows:
+    if (
+        len(evidence.market_snapshot.frame_sha256) != 64
+        or not evidence.market_snapshot.snapshot_id.startswith("snapshot:")
+    ):
+        return AdmissionGateResult(
+            admitted=False,
+            readiness=EvidenceReadiness.INSUFFICIENT,
+            coverage=coverage,
+            diagnostics=(
+                "Required evidence missing: immutable Authoritative Market "
+                "Snapshot ID and frame digest.",
+            ),
+        )
+
+    ready_claims = decision_ready_material_claims(evidence)
+    required_history_rows = max(
+        (claim.minimum_history_rows for claim in ready_claims),
+        default=minimum_history_rows,
+    )
+    required_history_rows = max(required_history_rows, minimum_history_rows)
+    if evidence.market_snapshot.history_rows < required_history_rows:
+        calculations = tuple(
+            claim.claim_id
+            for claim in ready_claims
+            if claim.minimum_history_rows == required_history_rows
+            and claim.minimum_history_rows > minimum_history_rows
+        )
+        calculation_suffix = (
+            f" by {', '.join(calculations)}" if calculations else ""
+        )
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
@@ -606,7 +1391,7 @@ def evaluate_admission_gate(
             diagnostics=(
                 "Insufficient market history: "
                 f"{evidence.market_snapshot.history_rows} rows available; "
-                f"{minimum_history_rows} required.",
+                f"{required_history_rows} required{calculation_suffix}.",
             ),
         )
 

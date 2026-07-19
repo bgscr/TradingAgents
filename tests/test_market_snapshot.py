@@ -21,11 +21,189 @@ from tradingagents.dataflows import (
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.market_snapshot import (
+    AuthoritativeMarketSnapshot,
     SnapshotProvider,
     authoritative_snapshot_run,
+    build_authoritative_indicator_window,
     get_authoritative_market_snapshot,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+
+def _valid_history(rows: int) -> pd.DataFrame:
+    dates = pd.bdate_range(end="2026-07-17", periods=rows)
+    return pd.DataFrame({
+        "Date": dates,
+        "Open": [10.0] * rows,
+        "High": [10.5] * rows,
+        "Low": [9.5] * rows,
+        "Close": [10.0] * rows,
+        "Volume": [1_000_000] * rows,
+    })
+
+
+@pytest.mark.unit
+def test_insufficient_history_falls_through_to_next_provider(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "short,long"},
+        }
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "short": SnapshotProvider(lambda *args: _valid_history(129), "qfq"),
+            "long": SnapshotProvider(lambda *args: _valid_history(250), "auto_adjusted"),
+        },
+    )
+
+    snapshot = get_authoritative_market_snapshot(
+        "510500.SS",
+        "2021-07-18",
+        "2026-07-18",
+        minimum_history_rows=200,
+    )
+
+    assert snapshot.provider == "long"
+    assert len(snapshot.frame) == 250
+    assert snapshot.quarantined[0].provider == "short"
+    assert "129 rows available; 200 required" in snapshot.quarantined[0].reason
+
+
+@pytest.mark.unit
+def test_accepted_129_row_snapshot_is_authoritative_without_a_200_period_calculation(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {"cn_a": {"core_stock_apis": "baostock"}}
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {"baostock": SnapshotProvider(lambda *args: _valid_history(129), "qfq")},
+    )
+
+    snapshot = get_authoritative_market_snapshot(
+        "510500.SS", "2021-07-18", "2026-07-18"
+    )
+
+    assert len(snapshot.frame) == 129
+    assert snapshot.provider == "baostock"
+    assert snapshot.quarantined == ()
+
+
+@pytest.mark.unit
+def test_snapshot_id_and_frame_digest_are_stable_and_rendered(monkeypatch):
+    frame = _valid_history(129)
+    snapshot = AuthoritativeMarketSnapshot(
+        symbol="510500.SS", frame=frame, provider="baostock",
+        retrieved_at="2026-07-18T08:00:00+00:00", adjustment_basis="qfq",
+        requested_date="2026-07-18", effective_trading_date="2026-07-17",
+    )
+    same_snapshot = AuthoritativeMarketSnapshot(
+        symbol="510500.SS", frame=frame.copy(), provider="baostock",
+        retrieved_at="2026-07-18T09:00:00+00:00", adjustment_basis="qfq",
+        requested_date="2026-07-18", effective_trading_date="2026-07-17",
+    )
+    monkeypatch.setattr(
+        market_snapshot, "get_authoritative_market_snapshot", lambda *args, **kwargs: snapshot
+    )
+
+    rendered = build_authoritative_indicator_window("510500.SS", "rsi", "2026-07-18", 1)
+
+    assert snapshot.frame_sha256 == same_snapshot.frame_sha256
+    assert snapshot.snapshot_id == same_snapshot.snapshot_id
+    assert f"Frame SHA-256: {snapshot.frame_sha256}" in rendered
+    assert f"Snapshot ID: {snapshot.snapshot_id}" in rendered
+
+
+@pytest.mark.unit
+def test_indicator_requires_a_complete_warmup_window(monkeypatch):
+    frame = _valid_history(129)
+    snapshot = AuthoritativeMarketSnapshot(
+        symbol="510500.SS",
+        frame=frame,
+        provider="baostock",
+        retrieved_at="2026-07-18T08:00:00+00:00",
+        adjustment_basis="qfq",
+        requested_date="2026-07-18",
+        effective_trading_date="2026-07-17",
+    )
+    monkeypatch.setattr(
+        market_snapshot,
+        "get_authoritative_market_snapshot",
+        lambda *args, **kwargs: snapshot,
+    )
+
+    rendered = build_authoritative_indicator_window(
+        "510500.SS",
+        "close_200_sma",
+        "2026-07-18",
+        2,
+    )
+
+    assert "N/A: insufficient history (129 rows available; 200 required)" in rendered
+    assert "2026-07-17: 10.0" not in rendered
+
+
+@pytest.mark.unit
+def test_default_vwma_uses_stockstats_fourteen_row_window(monkeypatch):
+    frame = _valid_history(13)
+    snapshot = AuthoritativeMarketSnapshot(
+        symbol="510500.SS",
+        frame=frame,
+        provider="baostock",
+        retrieved_at="2026-07-18T08:00:00+00:00",
+        adjustment_basis="qfq",
+        requested_date="2026-07-18",
+        effective_trading_date="2026-07-17",
+    )
+    monkeypatch.setattr(
+        market_snapshot,
+        "get_authoritative_market_snapshot",
+        lambda *args, **kwargs: snapshot,
+    )
+
+    rendered = build_authoritative_indicator_window(
+        "510500.SS",
+        "vwma",
+        "2026-07-18",
+        2,
+    )
+
+    assert "N/A: insufficient history (13 rows available; 14 required)" in rendered
+
+
+@pytest.mark.unit
+def test_indicator_history_requirement_triggers_provider_fallback(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "short,long"},
+        }
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "short": SnapshotProvider(lambda *args: _valid_history(129), "qfq"),
+            "long": SnapshotProvider(
+                lambda *args: _valid_history(250),
+                "auto_adjusted",
+            ),
+        },
+    )
+
+    rendered = build_authoritative_indicator_window(
+        "510500.SS",
+        "close_200_sma",
+        "2026-07-18",
+        2,
+    )
+
+    assert "Provider: long" in rendered
+    assert "2026-07-17: 10.0" in rendered
 
 
 @pytest.mark.unit
@@ -512,7 +690,7 @@ def test_china_indicator_tool_derives_from_accepted_core_snapshot(monkeypatch):
     assert "Provider: baostock" in result
     assert "Adjustment basis: qfq" in result
     assert "999" not in result
-    assert "2026-07-15: 12.58" in result
+    assert "N/A: insufficient history (1 rows available; 10 required)" in result
 
 
 @pytest.mark.unit
@@ -705,13 +883,14 @@ def test_analysis_run_reuses_one_snapshot_for_prices_and_indicators(monkeypatch)
     def changing_provider(*args):
         provider_calls.append(args)
         close = 12.58 if len(provider_calls) == 1 else 99.0
+        dates = pd.bdate_range(end="2026-07-15", periods=10)
         return pd.DataFrame({
-            "Date": ["2026-07-15"],
-            "Open": [12.55],
-            "High": [100.0],
-            "Low": [12.40],
-            "Close": [close],
-            "Volume": [1_000_000],
+            "Date": dates,
+            "Open": [12.55] * len(dates),
+            "High": [100.0] * len(dates),
+            "Low": [12.40] * len(dates),
+            "Close": [close] * len(dates),
+            "Volume": [1_000_000] * len(dates),
         })
 
     monkeypatch.setattr(
@@ -751,13 +930,14 @@ def test_programmatic_analysis_opens_an_authoritative_snapshot_run(monkeypatch):
 
     def changing_provider(*args):
         provider_calls.append(args)
+        dates = pd.bdate_range(end="2026-07-15", periods=10)
         return pd.DataFrame({
-            "Date": ["2026-07-15"],
-            "Open": [12.55],
-            "High": [13.10],
-            "Low": [12.40],
-            "Close": [12.58],
-            "Volume": [1_000_000],
+            "Date": dates,
+            "Open": [12.55] * len(dates),
+            "High": [13.10] * len(dates),
+            "Low": [12.40] * len(dates),
+            "Close": [12.58] * len(dates),
+            "Volume": [1_000_000] * len(dates),
         })
 
     monkeypatch.setattr(

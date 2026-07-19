@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from hashlib import sha256
 
 import numpy as np
 import pandas as pd
@@ -46,12 +48,67 @@ class AuthoritativeMarketSnapshot:
     adjustment_basis: str
     requested_date: str
     effective_trading_date: str
+    frame_sha256: str = ""
+    snapshot_id: str = ""
     quarantined: tuple[QuarantinedSnapshot, ...] = ()
+
+    def __post_init__(self) -> None:
+        frame_digest = self.frame_sha256 or _frame_sha256(self.frame)
+        identity = self.snapshot_id or _snapshot_id(
+            symbol=self.symbol,
+            provider=self.provider,
+            adjustment_basis=self.adjustment_basis,
+            requested_date=self.requested_date,
+            effective_trading_date=self.effective_trading_date,
+            frame_sha256=frame_digest,
+            history_rows=len(self.frame),
+        )
+        object.__setattr__(self, "frame_sha256", frame_digest)
+        object.__setattr__(self, "snapshot_id", identity)
+
+
+def _frame_sha256(frame: pd.DataFrame) -> str:
+    canonical = frame.copy()
+    if "Date" in canonical:
+        canonical["Date"] = pd.to_datetime(canonical["Date"]).dt.strftime("%Y-%m-%d")
+    encoded = canonical.to_csv(
+        index=False,
+        lineterminator="\n",
+        float_format="%.17g",
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _snapshot_id(
+    *,
+    symbol: str,
+    provider: str,
+    adjustment_basis: str,
+    requested_date: str,
+    effective_trading_date: str,
+    frame_sha256: str,
+    history_rows: int,
+) -> str:
+    identity = "\0".join(
+        (
+            symbol.strip().upper(),
+            provider,
+            adjustment_basis,
+            requested_date,
+            effective_trading_date,
+            frame_sha256,
+            str(history_rows),
+        )
+    )
+    return f"snapshot:{sha256(identity.encode('utf-8')).hexdigest()}"
 
 
 @dataclass
 class _AuthoritativeSnapshotRun:
     snapshots: dict[tuple[str, str, str], AuthoritativeMarketSnapshot] = field(
+        default_factory=dict
+    )
+    latest_snapshots: dict[tuple[str, str], AuthoritativeMarketSnapshot] = field(
         default_factory=dict
     )
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -100,6 +157,19 @@ SNAPSHOT_PROVIDERS: dict[str, SnapshotProvider] = {
     "akshare": SnapshotProvider(_load_akshare, "qfq"),
     "baostock": SnapshotProvider(_load_baostock, "qfq"),
     "yfinance": SnapshotProvider(_load_yfinance, "auto_adjusted"),
+}
+
+
+_INDICATOR_MINIMUM_HISTORY = {
+    "macd": 26,
+    "macds": 35,
+    "macdh": 35,
+    "rsi": 14,
+    "boll": 20,
+    "boll_ub": 20,
+    "boll_lb": 20,
+    "atr": 14,
+    "vwma": 14,
 }
 
 
@@ -183,9 +253,16 @@ def validate_ohlcv_frame(
 
 
 def _acquire_authoritative_market_snapshot(
-    symbol: str, start_date: str, end_date: str
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    minimum_history_rows: int = 1,
 ) -> AuthoritativeMarketSnapshot:
+    if minimum_history_rows < 1:
+        raise ValueError("minimum_history_rows must be positive")
     quarantined = []
+    insufficient_candidates = []
     for provider_name in _provider_chain(symbol):
         provider = SNAPSHOT_PROVIDERS.get(provider_name)
         if provider is None:
@@ -200,6 +277,17 @@ def _acquire_authoritative_market_snapshot(
                 QuarantinedSnapshot(provider_name, str(exc), tuple(row_indices))
             )
             continue
+        if len(frame) < minimum_history_rows:
+            rejection = QuarantinedSnapshot(
+                provider_name,
+                "insufficient history: "
+                f"{len(frame)} rows available; {minimum_history_rows} required",
+            )
+            quarantined.append(rejection)
+            insufficient_candidates.append(
+                (provider_name, provider, frame, rejection)
+            )
+            continue
         effective_date = frame["Date"].max().strftime("%Y-%m-%d")
         return AuthoritativeMarketSnapshot(
             symbol=symbol,
@@ -211,28 +299,87 @@ def _acquire_authoritative_market_snapshot(
             effective_trading_date=effective_date,
             quarantined=tuple(quarantined),
         )
+    if insufficient_candidates:
+        # Preserve the best valid frame so admission can report the actual row
+        # count when no provider meets the requirement. Exclude the selected
+        # provider from the quarantine list because it remains authoritative.
+        provider_name, provider, frame, selected_rejection = max(
+            insufficient_candidates,
+            key=lambda candidate: len(candidate[2]),
+        )
+        effective_date = frame["Date"].max().strftime("%Y-%m-%d")
+        return AuthoritativeMarketSnapshot(
+            symbol=symbol,
+            frame=frame,
+            provider=provider_name,
+            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            adjustment_basis=provider.adjustment_basis,
+            requested_date=end_date,
+            effective_trading_date=effective_date,
+            quarantined=tuple(
+                item for item in quarantined if item is not selected_rejection
+            ),
+        )
     detail = "; ".join(f"{item.provider}: {item.reason}" for item in quarantined)
     raise NoMarketDataError(symbol, symbol, detail or "no configured snapshot provider")
 
 
 def get_authoritative_market_snapshot(
-    symbol: str, start_date: str, end_date: str
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    minimum_history_rows: int = 1,
 ) -> AuthoritativeMarketSnapshot:
     active = _ACTIVE_SNAPSHOT_RUN.get()
     if active is None:
-        return _acquire_authoritative_market_snapshot(symbol, start_date, end_date)
+        return _acquire_authoritative_market_snapshot(
+            symbol,
+            start_date,
+            end_date,
+            minimum_history_rows=minimum_history_rows,
+        )
 
     key = (symbol, start_date, end_date)
     with active.lock:
         snapshot = active.snapshots.get(key)
-        if snapshot is None:
+        if snapshot is None or len(snapshot.frame) < minimum_history_rows:
             snapshot = _acquire_authoritative_market_snapshot(
                 symbol,
                 start_date,
                 end_date,
+                minimum_history_rows=minimum_history_rows,
             )
             active.snapshots[key] = snapshot
+        latest_key = (symbol.strip().upper(), str(end_date))
+        latest = active.latest_snapshots.get(latest_key)
+        if latest is None or len(snapshot.frame) > len(latest.frame):
+            active.latest_snapshots[latest_key] = snapshot
     return replace(snapshot, frame=snapshot.frame.copy(deep=True))
+
+
+def get_active_authoritative_market_snapshot(
+    symbol: str,
+    end_date: str,
+) -> AuthoritativeMarketSnapshot | None:
+    """Return the newest run-scoped snapshot so shared evidence can follow it."""
+    active = _ACTIVE_SNAPSHOT_RUN.get()
+    if active is None:
+        return None
+    with active.lock:
+        snapshot = active.latest_snapshots.get(
+            (symbol.strip().upper(), str(end_date))
+        )
+        if snapshot is None:
+            return None
+        return replace(snapshot, frame=snapshot.frame.copy(deep=True))
+
+
+def _minimum_history_for_indicator(indicator: str) -> int:
+    moving_average = re.fullmatch(r"close_(\d+)_(?:sma|ema)", indicator)
+    if moving_average:
+        return int(moving_average.group(1))
+    return _INDICATOR_MINIMUM_HISTORY.get(indicator, 1)
 
 
 def build_authoritative_indicator_window(
@@ -247,12 +394,29 @@ def build_authoritative_indicator_window(
         )
     current = datetime.strptime(curr_date, "%Y-%m-%d")
     history_start = (current - relativedelta(years=5)).strftime("%Y-%m-%d")
-    snapshot = get_authoritative_market_snapshot(symbol, history_start, curr_date)
+    minimum_history = _minimum_history_for_indicator(indicator)
+    snapshot = get_authoritative_market_snapshot(
+        symbol,
+        history_start,
+        curr_date,
+        minimum_history_rows=minimum_history,
+    )
     stock_frame = wrap(snapshot.frame.copy())
     stock_frame["Date"] = pd.to_datetime(stock_frame["Date"]).dt.strftime("%Y-%m-%d")
     stock_frame[indicator]
+    if minimum_history > 1:
+        warmup_indices = stock_frame.index[: minimum_history - 1]
+        stock_frame.loc[warmup_indices, indicator] = np.nan
+    insufficient_history = (
+        "N/A: insufficient history "
+        f"({len(stock_frame)} rows available; {minimum_history} required)"
+    )
     values = {
-        row["Date"]: "N/A" if pd.isna(row[indicator]) else str(row[indicator])
+        row["Date"]: (
+            insufficient_history
+            if pd.isna(row[indicator]) and len(stock_frame) < minimum_history
+            else ("N/A" if pd.isna(row[indicator]) else str(row[indicator]))
+        )
         for _, row in stock_frame.iterrows()
     }
     before = current - relativedelta(days=look_back_days)
@@ -271,6 +435,8 @@ def build_authoritative_indicator_window(
         f"Provider: {snapshot.provider}\n"
         f"Adjustment basis: {snapshot.adjustment_basis}\n"
         f"Effective trading date: {snapshot.effective_trading_date}\n\n"
+        f"Frame SHA-256: {snapshot.frame_sha256}\n"
+        f"Snapshot ID: {snapshot.snapshot_id}\n\n"
         + INDICATOR_DESCRIPTIONS[indicator]
     )
 
@@ -295,6 +461,8 @@ def render_authoritative_market_data(
         f"# Requested date: {snapshot.requested_date}",
         f"# Effective trading date: {snapshot.effective_trading_date}",
         f"# Retrieved at: {snapshot.retrieved_at}",
+        f"# Frame SHA-256: {snapshot.frame_sha256}",
+        f"# Snapshot ID: {snapshot.snapshot_id}",
         f"# Total records: {len(out)}",
     ]
     for rejected in snapshot.quarantined:

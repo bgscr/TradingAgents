@@ -6,8 +6,11 @@ CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
 run produces the same on-disk report tree a CLI run does.
 """
 
+import shutil
 from datetime import datetime
 from pathlib import Path
+
+from tradingagents.decision_audit import write_immutable_decision_audit
 
 
 def _write_markdown(path: Path, text: str) -> None:
@@ -20,10 +23,32 @@ def _appendix_entry(label: str, path: Path, root: Path) -> str:
     return f"- {label}: [{rel_path}]({rel_path})"
 
 
+def _remove_directional_outputs(root: Path) -> None:
+    """Remove unpublished drafts when the final result is non-directional."""
+    for relative in ("1_analysts", "2_research", "3_trading", "4_risk"):
+        path = root / relative
+        if path.is_dir():
+            shutil.rmtree(path)
+    for relative in (
+        "market_report.md",
+        "sentiment_report.md",
+        "news_report.md",
+        "fundamentals_report.md",
+        "investment_plan.md",
+        "trader_investment_plan.md",
+        "final_trade_decision.md",
+        "5_portfolio/decision.md",
+    ):
+        (root / relative).unlink(missing_ok=True)
+
+
 def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     """Save a completed run's reports to ``save_path``; return the complete-report path."""
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
+    # Persist the evidence/decision audit before publishing user-facing output.
+    # A failure here aborts report publication in enforce mode.
+    write_immutable_decision_audit(final_state, save_path)
     complete_sections = []
     appendix_entries = []
 
@@ -46,6 +71,28 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
         _write_markdown(path, final_state["fundamentals_report"])
         analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
 
+    analysis_outcome = final_state.get("analysis_outcome")
+    if analysis_outcome:
+        # Research, trader, and risk outputs are pre-gate working drafts. Once
+        # enforcement produces a non-directional outcome they must not remain in
+        # the user-facing report tree, even if the CLI streamed them earlier.
+        _remove_directional_outputs(save_path)
+        _write_markdown(
+            save_path / "5_portfolio" / "analysis_outcome.md",
+            analysis_outcome,
+        )
+        complete_sections.append(f"## I. Analysis Outcome\n\n{analysis_outcome}")
+        header = (
+            f"# Trading Analysis Report: {ticker}\n\n"
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        )
+        complete_path = save_path / "complete_report.md"
+        complete_path.write_text(
+            header + "\n\n".join(complete_sections),
+            encoding="utf-8",
+        )
+        return complete_path
+
     research_manager = None
     if final_state.get("investment_debate_state"):
         research_dir = save_path / "2_research"
@@ -67,13 +114,6 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     if trader_plan:
         _write_markdown(save_path / "3_trading" / "trader.md", trader_plan)
 
-    analysis_outcome = final_state.get("analysis_outcome")
-    if analysis_outcome:
-        _write_markdown(
-            save_path / "5_portfolio" / "analysis_outcome.md",
-            analysis_outcome,
-        )
-
     portfolio_decision = None
     if final_state.get("risk_debate_state"):
         risk_dir = save_path / "4_risk"
@@ -90,13 +130,11 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             path = risk_dir / "neutral.md"
             _write_markdown(path, risk["neutral_history"])
             appendix_entries.append(_appendix_entry("Neutral analyst full history", path, save_path))
-        if risk.get("judge_decision") and not analysis_outcome:
+        if risk.get("judge_decision"):
             portfolio_decision = risk["judge_decision"]
             _write_markdown(save_path / "5_portfolio" / "decision.md", portfolio_decision)
 
-    if analysis_outcome:
-        complete_sections.append(f"## I. Analysis Outcome\n\n{analysis_outcome}")
-    elif portfolio_decision:
+    if portfolio_decision:
         complete_sections.append(
             f"## I. Portfolio Manager Decision\n\n### Portfolio Manager\n{portfolio_decision}"
         )

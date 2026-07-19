@@ -17,7 +17,7 @@ def route_after_admission(state: dict) -> str:
 
 
 def create_admission_gate_node(
-    minimum_history_rows: int = 200,
+    minimum_history_rows: int = 1,
     *,
     emit_blocked_outcome: bool = True,
 ):

@@ -53,6 +53,13 @@ class AgentState(MessagesState):
     analysis_outcome: Annotated[str, "Non-directional outcome when evidence blocks"]
     draft_thesis: Annotated[dict[str, Any], "Structured directional thesis draft"]
     decision_gate: Annotated[dict[str, Any], "Deterministic decision-gate result"]
+    original_draft_thesis: Annotated[dict[str, Any], "Original PM thesis draft"]
+    original_decision_gate: Annotated[dict[str, Any], "Original PM gate result"]
+    revised_draft_thesis: Annotated[dict[str, Any], "Removal-only revised PM draft"]
+    revised_decision_gate: Annotated[dict[str, Any], "Revised PM gate result"]
+    pm_original_selection: Annotated[dict[str, Any] | None, "Raw structured PM selection"]
+    pm_revision: Annotated[dict[str, Any] | None, "Raw removal-only PM revision"]
+    evidence_gate_mode: Annotated[str, "Enforced or explicit legacy gate mode"]
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]

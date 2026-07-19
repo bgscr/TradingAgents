@@ -80,6 +80,140 @@ def test_prepare_run_artifacts_writes_running_status(tmp_path):
 
 
 @pytest.mark.unit
+def test_run_artifacts_record_sanitized_model_observability(tmp_path):
+    config = {
+        "results_dir": str(tmp_path),
+        "llm_provider": "OpenAI",
+        "quick_think_llm": "gpt-5-mini-2026-07-01",
+        "deep_think_llm": "gpt-5-2026-07-01",
+        "backend_url": "https://user:secret@example.test:8443/v1?api_key=secret",
+    }
+
+    artifacts = cli_main._prepare_run_artifacts(config, _selections())
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+
+    assert payload["llm_provider"] == "openai"
+    assert payload["quick_think_model"] == "gpt-5-mini-2026-07-01"
+    assert payload["deep_think_model"] == "gpt-5-2026-07-01"
+    assert payload["backend_url_host"] == "example.test"
+    assert payload["structured_output_policy_version"] == "analyst_submission_evidence_v1"
+    assert "secret" not in json.dumps(payload)
+
+
+@pytest.mark.unit
+def test_submission_observability_records_only_safe_reason_classes(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+
+    cli_main._record_analyst_submission_observability(
+        artifacts,
+        {
+            "sources": [
+                {
+                    "source_id": "analyst.market.submission",
+                    "status": "unavailable",
+                    "required": True,
+                    "detail": "validation_error: provider body must not persist",
+                },
+                {
+                    "source_id": "analyst.news.submission",
+                    "status": "available",
+                    "required": True,
+                    "detail": "finalized_structured",
+                }
+            ]
+        },
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    assert payload["analyst_submissions"] == {
+        "market": {"status": "unavailable", "reason_class": "validation_error"},
+        "news": {"status": "available", "mode": "finalized_structured"},
+    }
+    assert payload["structured_output"]["fallback_reason_classes"] == {
+        "market": "validation_error"
+    }
+    assert "provider body" not in json.dumps(payload)
+
+
+@pytest.mark.unit
+def test_unavailable_submission_never_marks_analyst_completed_or_finished(tmp_path):
+    buffer = cli_main.MessageBuffer()
+    buffer.init_for_analysis(["market", "social"])
+    tracker = cli_main.AnalystWallTimeTracker(
+        cli_main.build_analyst_execution_plan(["market", "social"])
+    )
+
+    cli_main.update_analyst_statuses(
+        buffer,
+        {
+            "market_report": "ANALYSIS_UNAVAILABLE: structured submission failed.",
+            "evidence_state": {
+                "sources": [
+                    {
+                        "source_id": "analyst.market.submission",
+                        "status": "unavailable",
+                        "required": True,
+                        "detail": "validation_error",
+                    }
+                ]
+            },
+        },
+        wall_time_tracker=tracker,
+    )
+
+    assert buffer.agent_status["Market Analyst"] == "failed"
+    assert buffer.agent_status["Sentiment Analyst"] == "in_progress"
+    assert "market" not in tracker.get_wall_times()
+
+    # Later LangGraph chunks may omit evidence_state; the terminal submission
+    # failure must remain authoritative over the accumulated report text.
+    cli_main.update_analyst_statuses(
+        buffer,
+        {"investment_debate_state": {"bull_history": "draft"}},
+        wall_time_tracker=tracker,
+    )
+    assert buffer.agent_status["Market Analyst"] == "failed"
+    assert buffer.agent_status["Sentiment Analyst"] == "in_progress"
+
+    cli_main._complete_non_analyst_agents(buffer, admission_blocked=True)
+    assert buffer.agent_status["Market Analyst"] == "failed"
+    assert buffer.agent_status["Bull Researcher"] == "skipped"
+
+
+@pytest.mark.unit
+def test_sentiment_submission_uses_social_wire_key_without_legacy_fallback():
+    buffer = cli_main.MessageBuffer()
+    buffer.init_for_analysis(["social"])
+    tracker = cli_main.AnalystWallTimeTracker(
+        cli_main.build_analyst_execution_plan(["social"])
+    )
+
+    cli_main.update_analyst_statuses(
+        buffer,
+        {
+            "sentiment_report": "ANALYSIS_UNAVAILABLE: structured output unsupported.",
+            "evidence_state": {
+                "sources": [
+                    {
+                        "source_id": "analyst.sentiment.submission",
+                        "status": "unavailable",
+                        "required": True,
+                        "detail": "unsupported",
+                    }
+                ]
+            },
+        },
+        wall_time_tracker=tracker,
+    )
+
+    assert buffer.agent_status["Sentiment Analyst"] == "unavailable"
+    assert "social" not in tracker.get_wall_times()
+
+
+@pytest.mark.unit
 def test_update_run_status_marks_completed(tmp_path):
     artifacts = cli_main._prepare_run_artifacts(
         {"results_dir": str(tmp_path)},

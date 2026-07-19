@@ -31,6 +31,10 @@ from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.utils import safe_ticker_component
+from tradingagents.decision_audit import (
+    build_decision_audit,
+    write_immutable_decision_audit,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState, acquire_run_evidence
 from tradingagents.llm_clients import create_llm_client
@@ -366,6 +370,7 @@ class TradingAgentsGraph:
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
             f"evidence_gate={self.config.get('evidence_gate_mode', 'enforce')}",
+            "evidence_schema=2",
         ])
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
@@ -475,6 +480,26 @@ class TradingAgentsGraph:
         else:
             final_state = self.graph.invoke(init_agent_state, **args)
 
+        # The audit is a critical terminal artifact: publish it before exposing
+        # a directional decision to memory, signal processing, or the caller.
+        final_state["graph_signature"] = self._run_signature(asset_type)
+        audit_payload = build_decision_audit(final_state)
+        audit_directory = (
+            Path(self.config["results_dir"])
+            / safe_ticker_component(company_name)
+            / "TradingAgentsStrategy_logs"
+            / "decision_audits"
+        )
+        audit_path = write_immutable_decision_audit(
+            final_state,
+            audit_directory,
+            filename=(
+                f"decision-audit-{trade_date}-"
+                f"{audit_payload['audit_sha256'][:16]}.json"
+            ),
+        )
+        final_state["decision_audit_path"] = str(audit_path)
+
         # Store current state for reflection.
         self.curr_state = final_state
 
@@ -508,16 +533,33 @@ class TradingAgentsGraph:
         logged_state = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
+            "asset_type": final_state.get("asset_type"),
+            "graph_signature": final_state.get("graph_signature"),
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
+            "evidence_state": final_state.get("evidence_state", {}),
+            "admission_gate": final_state.get("admission_gate"),
+            "pm_original_selection": final_state.get("pm_original_selection"),
+            "pm_selection_retry": final_state.get("pm_selection_retry"),
+            "pm_revision": final_state.get("pm_revision"),
+            "pm_revision_retry": final_state.get("pm_revision_retry"),
+            "original_draft_thesis": final_state.get("original_draft_thesis"),
+            "original_decision_gate": final_state.get("original_decision_gate"),
+            "revised_draft_thesis": final_state.get("revised_draft_thesis"),
+            "revised_decision_gate": final_state.get("revised_decision_gate"),
+            "draft_thesis": final_state.get("draft_thesis"),
+            "decision_gate": final_state.get("decision_gate"),
+            "evidence_gate_mode": final_state.get("evidence_gate_mode", "enforce"),
+            "decision_audit_created_at": final_state.get(
+                "decision_audit_created_at"
+            ),
+            "decision_audit_path": final_state.get("decision_audit_path"),
         }
         if final_state.get("analysis_outcome"):
             logged_state.update(
                 {
-                    "evidence_state": final_state.get("evidence_state", {}),
-                    "admission_gate": final_state.get("admission_gate", {}),
                     "analysis_outcome": final_state["analysis_outcome"],
                 }
             )

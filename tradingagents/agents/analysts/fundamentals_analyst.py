@@ -1,6 +1,12 @@
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
+from tradingagents.agents.analysts.submission import (
+    bind_analyst_finalizer,
+    build_analyst_update,
+    process_analyst_response,
+    render_allowed_source_ref_catalog,
+)
 from tradingagents.agents.utils.agent_utils import (
     get_balance_sheet,
     get_cashflow,
@@ -12,13 +18,15 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.evidence import (
     AnalystEvidenceReport,
-    evidence_sources_from_tool_messages,
+    EvidenceSource,
+    EvidenceStatus,
     merge_evidence_sources,
-    merge_material_claims,
 )
 
 
 def create_fundamentals_analyst(llm):
+    finalizer = bind_analyst_finalizer(llm, "fundamentals")
+
     def fundamentals_analyst_node(state):
         instrument = resolve_mainland_instrument(state["company_of_interest"])
         if instrument is not None and "fundamentals" not in instrument.capabilities:
@@ -29,6 +37,20 @@ def create_fundamentals_analyst(llm):
             return {
                 "messages": [AIMessage(content=report)],
                 "fundamentals_report": report,
+                "evidence_state": merge_evidence_sources(
+                    state.get("evidence_state"),
+                    (
+                        EvidenceSource(
+                            source_id="analyst.fundamentals.submission",
+                            status=EvidenceStatus.NOT_APPLICABLE,
+                            required=False,
+                            detail=(
+                                "company fundamentals are not applicable to "
+                                f"instrument kind {instrument.instrument_kind}"
+                            ),
+                        ),
+                    ),
+                ).model_dump(mode="json"),
             }
 
         current_date = state["trade_date"]
@@ -48,7 +70,12 @@ def create_fundamentals_analyst(llm):
             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
             + " For mainland China A-shares, fundamentals may include source-labeled disclosure snapshots; treat them as supplemental company-event context and do not invent missing filing details."
             + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims with source_refs."
-            + get_language_instruction(),
+            + get_language_instruction()
+        )
+        system_message += "\n\n" + render_allowed_source_ref_catalog(
+            state["messages"],
+            state["company_of_interest"],
+            current_date,
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -79,43 +106,15 @@ def create_fundamentals_analyst(llm):
 
         chain = prompt | llm.bind_tools(tools)
 
-        result = chain.invoke(state["messages"])
-
-        report = ""
-
-        report_submission = next(
-            (
-                tool_call
-                for tool_call in result.tool_calls
-                if tool_call["name"] == AnalystEvidenceReport.__name__
-            ),
-            None,
+        response = chain.invoke(state["messages"])
+        result = process_analyst_response(
+            response,
+            finalizer=finalizer,
+            analyst="fundamentals",
+            ticker=state["company_of_interest"],
+            trade_date=current_date,
+            messages=state["messages"],
         )
-        if report_submission is not None:
-            submitted = AnalystEvidenceReport.model_validate(report_submission["args"])
-            claims = tuple(
-                claim.model_copy(update={"analyst": "fundamentals"})
-                for claim in submitted.material_claims
-            )
-            report = submitted.report_markdown
-            result = AIMessage(content=report)
-        elif len(result.tool_calls) == 0:
-            report = result.content
-
-        update = {
-            "messages": [result],
-            "fundamentals_report": report,
-        }
-        if report_submission is not None:
-            merged_evidence = merge_material_claims(
-                state.get("evidence_state"),
-                claims,
-            )
-            merged_evidence = merge_evidence_sources(
-                merged_evidence,
-                evidence_sources_from_tool_messages(state["messages"], claims),
-            )
-            update["evidence_state"] = merged_evidence.model_dump(mode="json")
-        return update
+        return build_analyst_update(state, result, "fundamentals_report")
 
     return fundamentals_analyst_node

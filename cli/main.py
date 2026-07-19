@@ -1,12 +1,14 @@
 import datetime
 import json
 import os
+import re
 import time
 from collections import deque
 from contextlib import ExitStack, suppress
 from functools import wraps
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import typer
@@ -52,7 +54,6 @@ from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
     get_initial_analyst_node,
-    sync_analyst_tracker_from_chunk,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.reporting import write_report_tree
@@ -164,6 +165,7 @@ class MessageBuffer:
         self.agent_status = {}
         self.current_agent = None
         self.report_sections = {}
+        self.analyst_submissions = {}
         self.selected_analysts = []
         self._processed_message_ids = set()
 
@@ -190,6 +192,7 @@ class MessageBuffer:
 
         # Build report_sections dynamically
         self.report_sections = {}
+        self.analyst_submissions = {}
         for section, (analyst_key, _) in self.REPORT_SECTIONS.items():
             if analyst_key is None or analyst_key in self.selected_analysts:
                 self.report_sections[section] = None
@@ -704,6 +707,127 @@ ANALYST_REPORT_MAP = {
     "fundamentals": "fundamentals_report",
 }
 
+_ANALYST_SUBMISSION_PREFIX = "analyst."
+_ANALYST_SUBMISSION_NAMES = {"social": "sentiment"}
+_SAFE_SUBMISSION_REASON_CLASSES = frozenset(
+    {"unsupported", "none_parsed", "validation_error", "transport_error"}
+)
+_SAFE_SUBMISSION_MODES = frozenset(
+    {"direct_tool", "direct_structured", "finalized_structured"}
+)
+_STRUCTURED_OUTPUT_POLICY_VERSION = "analyst_submission_evidence_v1"
+
+
+def _value_from_mapping_or_object(value, key, default=None):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _analyst_submission_source(evidence_state, analyst_key: str):
+    """Return the required submission source for an analyst, when recorded.
+
+    Evidence sources are the authoritative success signal for structured analyst
+    submissions. Missing sources deliberately retain the legacy report-content
+    behavior for old checkpoints and graph states.
+    """
+    if evidence_state is None:
+        return None
+    sources = _value_from_mapping_or_object(evidence_state, "sources", ()) or ()
+    submission_name = _ANALYST_SUBMISSION_NAMES.get(analyst_key, analyst_key)
+    expected_id = f"{_ANALYST_SUBMISSION_PREFIX}{submission_name}.submission"
+    for source in sources:
+        if _value_from_mapping_or_object(source, "source_id") != expected_id:
+            continue
+        if not _value_from_mapping_or_object(source, "required", False):
+            continue
+        status = _value_from_mapping_or_object(source, "status", "unavailable")
+        status = getattr(status, "value", status)
+        return {
+            "status": str(status).lower(),
+            "reason_class": _safe_submission_reason_class(
+                _value_from_mapping_or_object(source, "detail", "")
+            ),
+            "mode": _safe_submission_mode(
+                _value_from_mapping_or_object(source, "detail", "")
+            ),
+        }
+    return None
+
+
+def _safe_submission_reason_class(detail) -> str | None:
+    """Keep only a classified fallback reason, never provider error text."""
+    candidate = str(detail or "").strip().lower().split(":", maxsplit=1)[0]
+    return candidate if candidate in _SAFE_SUBMISSION_REASON_CLASSES else None
+
+
+def _safe_submission_mode(detail) -> str | None:
+    candidate = str(detail or "").strip().lower()
+    return candidate if candidate in _SAFE_SUBMISSION_MODES else None
+
+
+def _submission_agent_status(submission: dict | None) -> str | None:
+    if submission is None:
+        return None
+    if submission["status"] == "available":
+        return "completed"
+    reason_class = submission.get("reason_class")
+    if reason_class == "transport_error":
+        return "degraded"
+    if reason_class == "validation_error":
+        return "failed"
+    return "unavailable"
+
+
+def _sync_analyst_wall_time_from_chunk(
+    tracker: AnalystWallTimeTracker,
+    chunk: dict,
+    known_submissions: dict[str, dict] | None = None,
+) -> None:
+    """Record analyst wall time only after a validated submission is available."""
+    current_time = time.monotonic()
+    active_found = False
+    evidence_state = chunk.get("evidence_state")
+    for spec in tracker.plan.specs:
+        submission = (known_submissions or {}).get(spec.key)
+        if submission is None:
+            submission = _analyst_submission_source(evidence_state, spec.key)
+        if submission is not None:
+            if submission["status"] != "available":
+                # A terminal unavailable submission must not accrue completed
+                # wall time or prevent the next analyst from becoming active.
+                continue
+            tracker.mark_started(spec.key, started_at=current_time)
+            tracker.mark_completed(spec.key, completed_at=current_time)
+        elif chunk.get(spec.report_key):
+            # Backward compatibility for checkpoints created before submission
+            # evidence was persisted.
+            tracker.mark_started(spec.key, started_at=current_time)
+            tracker.mark_completed(spec.key, completed_at=current_time)
+        elif not active_found:
+            tracker.mark_started(spec.key, started_at=current_time)
+            active_found = True
+
+
+def _complete_non_analyst_agents(
+    buffer: MessageBuffer,
+    *,
+    admission_blocked: bool = False,
+) -> None:
+    """Finish or skip downstream statuses without hiding analyst failures."""
+    analyst_names = set(ANALYST_AGENT_NAMES.values())
+    for agent in buffer.agent_status:
+        if agent not in analyst_names:
+            buffer.update_agent_status(
+                agent,
+                "skipped" if admission_blocked else "completed",
+            )
+
+
+def _admission_was_blocked(final_state: dict) -> bool:
+    admission = final_state.get("admission_gate") or {}
+    return _value_from_mapping_or_object(admission, "admitted") is False
+
 
 def update_analyst_statuses(message_buffer, chunk, wall_time_tracker=None):
     """Update analyst statuses based on accumulated report state.
@@ -719,8 +843,17 @@ def update_analyst_statuses(message_buffer, chunk, wall_time_tracker=None):
     selected = message_buffer.selected_analysts
     found_active = False
 
+    evidence_state = chunk.get("evidence_state")
+    for analyst_key in selected:
+        submission = _analyst_submission_source(evidence_state, analyst_key)
+        if submission is not None:
+            message_buffer.analyst_submissions[analyst_key] = submission
     if wall_time_tracker is not None:
-        sync_analyst_tracker_from_chunk(wall_time_tracker, chunk)
+        _sync_analyst_wall_time_from_chunk(
+            wall_time_tracker,
+            chunk,
+            message_buffer.analyst_submissions,
+        )
 
     for analyst_key in ANALYST_ORDER:
         if analyst_key not in selected:
@@ -733,10 +866,18 @@ def update_analyst_statuses(message_buffer, chunk, wall_time_tracker=None):
         if chunk.get(report_key):
             message_buffer.update_report_section(report_key, chunk[report_key])
 
-        # Determine status from accumulated sections, not just current chunk
+        # Required submission evidence supersedes report text. In particular, a
+        # non-directional ANALYSIS_UNAVAILABLE report is useful for the user but
+        # must not look like a completed analyst result.
         has_report = bool(message_buffer.report_sections.get(report_key))
+        submission = message_buffer.analyst_submissions.get(analyst_key)
+        status_from_submission = _submission_agent_status(submission)
 
-        if has_report:
+        if status_from_submission is not None:
+            message_buffer.update_agent_status(agent_name, status_from_submission)
+        elif has_report:
+            # Legacy checkpoints and graph states did not expose submission
+            # sources, so preserve their original report-content behavior.
             message_buffer.update_agent_status(agent_name, "completed")
         elif not found_active:
             message_buffer.update_agent_status(agent_name, "in_progress")
@@ -917,6 +1058,57 @@ def _analyst_values(analysts=None) -> list[str]:
     return [analyst.value if hasattr(analyst, "value") else str(analyst) for analyst in analysts]
 
 
+def _safe_provider_name(provider) -> str | None:
+    """Return a compact provider identifier suitable for a durable artifact."""
+    if provider is None:
+        return None
+    normalized = re.sub(r"[^a-z0-9_.-]+", "_", str(provider).strip().lower())
+    return normalized[:80] or None
+
+
+def _safe_backend_host(backend_url) -> str | None:
+    """Persist only a backend host, never credentials, paths, or query data."""
+    if not backend_url:
+        return None
+    parsed = urlsplit(str(backend_url))
+    if not parsed.hostname and "://" not in str(backend_url):
+        parsed = urlsplit(f"//{backend_url}")
+    return parsed.hostname.lower() if parsed.hostname else None
+
+
+def _record_analyst_submission_observability(artifacts: dict, evidence_state) -> None:
+    """Append safe structured-output outcome classes to the run status artifact."""
+    if evidence_state is None:
+        return
+    status_file = artifacts["status_file"]
+    payload = _read_run_status(status_file)
+    submissions = dict(payload.get("analyst_submissions") or {})
+    structured_output = dict(payload.get("structured_output") or {})
+    fallback_reason_classes = dict(
+        structured_output.get("fallback_reason_classes") or {}
+    )
+
+    for analyst_key in ANALYST_ORDER:
+        submission = _analyst_submission_source(evidence_state, analyst_key)
+        if submission is None:
+            continue
+        entry = {"status": submission["status"]}
+        reason_class = submission.get("reason_class")
+        mode = submission.get("mode")
+        if submission["status"] == "available" and mode is not None:
+            entry["mode"] = mode
+        if submission["status"] != "available" and reason_class is not None:
+            entry["reason_class"] = reason_class
+            fallback_reason_classes[analyst_key] = reason_class
+        submissions[analyst_key] = entry
+
+    payload["analyst_submissions"] = submissions
+    structured_output["fallback_reason_classes"] = fallback_reason_classes
+    payload["structured_output"] = structured_output
+    payload["updated_at"] = _now_iso()
+    _write_run_status(status_file, payload)
+
+
 def _write_run_status(status_file: Path, payload: dict) -> None:
     status_file.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
@@ -954,6 +1146,15 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
         {
             "run_id": run_id,
             "ticker": selections["ticker"],
+            "llm_provider": _safe_provider_name(
+                config.get("llm_provider", selections.get("llm_provider"))
+            ),
+            "quick_think_model": config.get("quick_think_llm"),
+            "deep_think_model": config.get("deep_think_llm"),
+            "backend_url_host": _safe_backend_host(config.get("backend_url")),
+            "structured_output_policy_version": _STRUCTURED_OUTPUT_POLICY_VERSION,
+            "analyst_submissions": {},
+            "structured_output": {"fallback_reason_classes": {}},
             "analysis_date": selections["analysis_date"],
             "asset_type": selections["asset_type"],
             "selected_analysts": _analyst_values(selections.get("analysts")),
@@ -1285,6 +1486,10 @@ def run_analysis(checkpoint: bool | None = None):
                 chunk,
                 wall_time_tracker=analyst_wall_time_tracker,
             )
+            _record_analyst_submission_observability(
+                artifacts,
+                chunk.get("evidence_state"),
+            )
 
             # Research Team - Handle Investment Debate State
             if chunk.get("investment_debate_state"):
@@ -1359,10 +1564,18 @@ def run_analysis(checkpoint: bool | None = None):
             display.refresh(spinner_text)
 
         final_state = latest_state
+        signature_builder = getattr(graph, "_run_signature", None)
+        if callable(signature_builder):
+            final_state["graph_signature"] = signature_builder(
+                selections["asset_type"]
+            )
 
-        # Update all agent statuses to completed
-        for agent in message_buffer.agent_status:
-            message_buffer.update_agent_status(agent, "completed")
+        # Keep analyst statuses evidence-derived. A non-directional fallback
+        # report must remain visibly unavailable/degraded/failed at completion.
+        _complete_non_analyst_agents(
+            message_buffer,
+            admission_blocked=_admission_was_blocked(final_state),
+        )
 
         message_buffer.add_message(
             "System", f"Completed analysis for {selections['analysis_date']}"

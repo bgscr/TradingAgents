@@ -309,7 +309,10 @@ def test_blocked_analysis_outcome_is_published_and_saved_without_decision(
 
 
 @pytest.mark.unit
-def test_blocked_cli_report_merges_streamed_state_deltas(tmp_path, monkeypatch):
+def test_blocked_cli_report_enforces_boundary_across_streamed_state_deltas(
+    tmp_path,
+    monkeypatch,
+):
     outcome = (
         "**Analysis Outcome:** Insufficient Evidence\n\n"
         "No Trading Decision was issued."
@@ -328,8 +331,10 @@ def test_blocked_cli_report_merges_streamed_state_deltas(tmp_path, monkeypatch):
     complete = (run_dir / "reports" / "complete_report.md").read_text(
         encoding="utf-8"
     )
-    assert "Market report body" in complete
+    assert "Market report body" not in complete
     assert outcome in complete
+    assert not (run_dir / "reports" / "1_analysts").exists()
+    assert not (run_dir / "reports" / "market_report.md").exists()
 
 
 @pytest.mark.unit

@@ -15,10 +15,9 @@ the LLM is invoked and injects them into the prompt as structured blocks:
 
 The agent does not use tool-calling; the data is in the prompt from
 turn 0. Output uses the structured-output pattern (json_schema for
-OpenAI/xAI, response_schema for Gemini, tool-use for Anthropic), falling
-back to free-text generation for providers that lack native support, so
-the sentiment header (band + score + confidence) is deterministic across
-runs and providers instead of free-form per-model prose.
+OpenAI/xAI, response_schema for Gemini, tool-use for Anthropic). Providers
+that cannot return the schema produce an explicit unavailable submission;
+free text is never treated as decision evidence.
 
 See: https://github.com/TauricResearch/TradingAgents/issues/557
 See: https://github.com/TauricResearch/TradingAgents/issues/796
@@ -37,8 +36,8 @@ from tradingagents.agents.utils.agent_utils import (
     get_news,
 )
 from tradingagents.agents.utils.structured import (
-    bind_structured,
-    invoke_structured_or_freetext,
+    bind_required_structured,
+    invoke_required_structured,
 )
 from tradingagents.dataflows.china_a_enhancements import get_china_a_enhancements_for_categories
 from tradingagents.dataflows.china_sentiment import get_china_a_local_sentiment
@@ -48,9 +47,15 @@ from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 from tradingagents.evidence import (
     EvidenceSource,
+    EvidenceState,
     EvidenceStatus,
+    MaterialClaim,
+    build_inline_evidence_state,
+    merge_claim_validations,
     merge_evidence_sources,
     merge_material_claims,
+    merge_source_artifacts,
+    merge_source_facts,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,10 +110,11 @@ def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> di
     }
 
 
-def _evidence_sources_for_blocks(
+def _evidence_for_blocks(
     ticker: str,
     blocks: dict[str, str],
-) -> tuple[EvidenceSource, ...]:
+    claims: tuple[MaterialClaim, ...] = (),
+) -> EvidenceState:
     is_china = resolve_china_a_symbol(ticker) is not None
     source_blocks = [
         ("sentiment.news", blocks["news_block"]),
@@ -120,23 +126,13 @@ def _evidence_sources_for_blocks(
     if not is_china:
         source_blocks.append(("sentiment.reddit", blocks["reddit_block"]))
 
-    sources = []
+    source_text_by_ref: dict[str, str | None] = {}
     for source_id, block in source_blocks:
         normalized = block.strip().upper()
-        unavailable = not normalized or "UNAVAILABLE" in normalized
-        sources.append(
-            EvidenceSource(
-                source_id=source_id,
-                status=(
-                    EvidenceStatus.UNAVAILABLE
-                    if unavailable
-                    else EvidenceStatus.AVAILABLE
-                ),
-                required=False,
-                detail="source returned unavailable" if unavailable else "",
-            )
+        source_text_by_ref[source_id] = (
+            None if not normalized or "UNAVAILABLE" in normalized else block
         )
-    return tuple(sources)
+    return build_inline_evidence_state(source_text_by_ref, claims)
 
 
 def create_sentiment_analyst(llm):
@@ -144,10 +140,13 @@ def create_sentiment_analyst(llm):
 
     Pre-fetches news + StockTwits + Reddit data, injects them into the
     prompt as structured blocks, and produces a deterministic sentiment
-    report via structured output (with a free-text fallback for providers
-    that do not support it).
+    report via required structured output.
     """
-    structured_llm = bind_structured(llm, SentimentReport, "Sentiment Analyst")
+    structured_llm = bind_required_structured(
+        llm,
+        SentimentReport,
+        "Sentiment Analyst",
+    )
 
     def sentiment_analyst_node(state):
         ticker = state["company_of_interest"]
@@ -191,34 +190,86 @@ def create_sentiment_analyst(llm):
         # data is already in the prompt.
         formatted_messages = prompt.format_messages(messages=state["messages"])
 
-        material_claims = ()
-
-        def render_report(report):
-            nonlocal material_claims
-            material_claims = report.material_claims
-            return render_sentiment_report(report)
-
-        report_text = invoke_structured_or_freetext(
+        structured_result = invoke_required_structured(
             structured_llm,
-            llm,
             formatted_messages,
-            render_report,
             "Sentiment Analyst",
         )
+        material_claims = ()
+        failure_reason = structured_result.reason
+        if structured_result.value is not None:
+            try:
+                report = SentimentReport.model_validate(structured_result.value)
+                claim_ids = tuple(
+                    claim.claim_id for claim in report.material_claims
+                )
+                if len(set(claim_ids)) != len(claim_ids) or any(
+                    not claim_id.startswith("sentiment.")
+                    for claim_id in claim_ids
+                ):
+                    raise ValueError(
+                        "sentiment claims require unique sentiment.* IDs"
+                    )
+                material_claims = tuple(
+                    claim.model_copy(update={"analyst": "sentiment"})
+                    for claim in report.material_claims
+                )
+                report_text = render_sentiment_report(report)
+            except (ValueError, TypeError):
+                failure_reason = "validation_error"
+        if failure_reason is not None:
+            report_text = (
+                "ANALYSIS_UNAVAILABLE: The Sentiment Analyst did not produce a "
+                "validated structured evidence report. No directional conclusion "
+                "was issued."
+            )
 
         update = {
             "messages": [AIMessage(content=report_text)],
             "sentiment_report": report_text,
         }
-        sources = _evidence_sources_for_blocks(ticker, blocks)
-        if material_claims or sources:
-            merged_evidence = merge_material_claims(
-                state.get("evidence_state"),
-                material_claims,
-            )
+        submission_source = EvidenceSource(
+            source_id="analyst.sentiment.submission",
+            status=(
+                EvidenceStatus.UNAVAILABLE
+                if failure_reason is not None
+                else EvidenceStatus.AVAILABLE
+            ),
+            required=True,
+            detail=failure_reason or "direct_structured",
+        )
+        inline_evidence = _evidence_for_blocks(ticker, blocks, material_claims)
+        if material_claims or inline_evidence.sources:
+            try:
+                merged_evidence = merge_material_claims(
+                    state.get("evidence_state"),
+                    inline_evidence.material_claims,
+                )
+                merged_evidence = merge_source_facts(
+                    merged_evidence,
+                    inline_evidence.source_facts,
+                )
+                merged_evidence = merge_source_artifacts(
+                    merged_evidence,
+                    inline_evidence.source_artifacts,
+                )
+                merged_evidence = merge_claim_validations(
+                    merged_evidence,
+                    inline_evidence.claim_validations,
+                )
+            except ValueError:
+                merged_evidence = EvidenceState.model_validate(
+                    state.get("evidence_state", {})
+                )
+                submission_source = submission_source.model_copy(
+                    update={
+                        "status": EvidenceStatus.CONFLICTED,
+                        "detail": "immutable claim or fact ID was redefined",
+                    }
+                )
             update["evidence_state"] = merge_evidence_sources(
                 merged_evidence,
-                sources,
+                (submission_source, *inline_evidence.sources),
             ).model_dump(mode="json")
         return update
 
@@ -299,7 +350,7 @@ Fill the following fields:
 - **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
 - **confidence**: low / medium / high, based on data quality and sample size.
 - **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
-- **material_claims**: Decision-relevant factual premises only. Use source_refs from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local exactly as applicable above; never cite a skipped or unavailable source.
+- **material_claims**: Decision-relevant factual premises only. Use source_refs from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local exactly as applicable above; never cite a skipped or unavailable source. Each claim's source_quote must copy one exact contiguous source-language phrase from the cited source block. The statement may be a localized paraphrase, but source_quote must not be translated or rewritten.
 
 {get_language_instruction()}"""
 

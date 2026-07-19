@@ -21,7 +21,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from tradingagents.evidence import DecisionConfidence, MaterialClaim
 
@@ -185,6 +185,57 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
 # ---------------------------------------------------------------------------
 # Portfolio Manager
 # ---------------------------------------------------------------------------
+
+
+class PortfolioDecisionSelection(BaseModel):
+    """Evidence-bound PM selection; prose is rendered from the claim ledger."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rating: PortfolioRating = Field(
+        description="Final Buy / Overweight / Hold / Underweight / Sell rating.",
+    )
+    material_claim_ids: tuple[str, ...] = Field(
+        min_length=1,
+        description=(
+            "Exact IDs from the allowed evidence ledger that determine the rating. "
+            "Include every premise used and no unlisted ID."
+        ),
+    )
+    decision_assertions: tuple["DecisionAssertion", ...] = Field(
+        min_length=1,
+        description=(
+            "One evidence binding per selected claim. Each binding must copy the "
+            "claim ID and exact Source Fact IDs shown in the ledger."
+        ),
+    )
+
+
+class DecisionAssertion(BaseModel):
+    """Explicit mapping from a PM rating premise to immutable Source Facts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str
+    fact_ids: tuple[str, ...] = Field(
+        description=(
+            "Exact Source Fact IDs supporting this selected claim. Legacy test "
+            "claims without v2 facts use an empty tuple; enforced v2 claims may not."
+        ),
+    )
+
+
+class PortfolioDecisionRevision(BaseModel):
+    """Removal-only revision of an already selected evidence set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    retained_material_claim_ids: tuple[str, ...] = Field(
+        description=(
+            "Subset of the original material claim IDs to retain after removing "
+            "unsupported premises. No prose, rating, new ID, or new value may be added."
+        ),
+    )
 
 
 class PortfolioDecision(BaseModel):
