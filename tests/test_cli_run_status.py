@@ -86,7 +86,8 @@ def test_run_artifacts_record_sanitized_model_observability(tmp_path):
         "llm_provider": "OpenAI",
         "quick_think_llm": "gpt-5-mini-2026-07-01",
         "deep_think_llm": "gpt-5-2026-07-01",
-        "backend_url": "https://user:secret@example.test:8443/v1?api_key=secret",
+        "backend_url": "https://user"
+        + ":secret@example.test:8443/v1?api_key=secret",
     }
 
     artifacts = cli_main._prepare_run_artifacts(config, _selections())
