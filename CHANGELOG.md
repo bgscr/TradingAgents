@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.3.2] — 2026-07-18
+
+Evidence-integrity patch: analysis now fails closed when its supporting chain is
+ambiguous, stale, incomplete, or cannot be reproduced from persisted artifacts.
+
+### Changed
+
+- **Claims are atomic and source-bound.** Every factual or numeric claim must map
+  to one source, an exact supporting quote, and valid calculation history before
+  it can contribute to coverage or a trading decision.
+- **Decision audits are reproducible.** Runs retain immutable source artifacts,
+  cryptographic bindings, creation time, retry history, and repeated same-source
+  tool results across state-log round trips.
+- **Portfolio decisions retry precisely.** Invalid claim references, unsupported
+  revisions, and broken fact bindings receive constrained repair attempts instead
+  of producing an unclear recommendation.
+
+### Fixed
+
+- **Snapshot refreshes cannot weaken evidence.** Expired or incomplete market
+  snapshots are reacquired and propagated through shared state while monotonic
+  authority prevents a lower-quality refresh from replacing stronger evidence.
+- **Coverage no longer double-counts snapshots.** Repeated observations remain
+  available for audit without inflating independent-source coverage.
+- **Operators can diagnose evidence failures.** CLI status and generated reports
+  expose the authoritative evidence and decision-audit state needed to trace why
+  a run concluded, retried, or failed closed.
+
 ## [0.3.1] — 2026-07-05
 
 Correctness and stability patch: data look-ahead, graph-router crash-safety,
