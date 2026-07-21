@@ -1,5 +1,9 @@
+import json
 import logging
 
+from tradingagents.evidence import AcquisitionUnavailableReason
+
+from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
 from .akshare_data import (
     get_fundamentals as get_akshare_fundamentals,
     get_news as get_akshare_news,
@@ -30,6 +34,7 @@ from .errors import (
     VendorRateLimitError,
 )
 from .fred import get_macro_data as get_fred_macro_data
+from .market_snapshot import get_active_acquisition_controller
 from .polymarket import get_prediction_markets as get_polymarket_prediction_markets
 from .symbol_utils import resolve_china_a_symbol, resolve_mainland_instrument
 from .y_finance import (
@@ -421,3 +426,85 @@ def route_to_vendor(method: str, *args, **kwargs):
         raise first_error
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+def route_to_vendor_acquired(
+    method: str,
+    *args,
+    tool_call_id: str,
+    source_ref: str,
+    capability: str,
+    **kwargs,
+):
+    """Acquire through the run controller without invoking the legacy router."""
+    category = get_category_for_method(method)
+    market = _get_market_for_call(method, args, kwargs)
+    configured = get_vendor(category, method, market)
+    requested = [token.strip() for token in configured.split(",")]
+    available = VENDOR_METHODS[method]
+    explicit = [token for token in requested if token and token != "default"]
+    vendor_names = explicit or list(available)
+
+    def acquired_provider(vendor_name, impl):
+        def call(_request):
+            try:
+                if method == "get_news" and impl is get_news_yfinance:
+                    return impl(*args, **kwargs, _acquired=True)
+                return impl(*args, **kwargs)
+            except VendorRateLimitError as error:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.RATE_LIMITED,
+                    status_code=error.status_code,
+                    retry_after_seconds=error.retry_after_seconds,
+                ) from None
+            except VendorNotConfiguredError:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.NOT_CONFIGURED
+                ) from None
+            except NoMarketDataError:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.NO_DATA
+                ) from None
+            except TimeoutError:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.TIMEOUT
+                ) from None
+
+        return vendor_name, call
+
+    def not_configured(_request):
+        raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NOT_CONFIGURED)
+
+    providers = tuple(
+        acquired_provider(name, available[name])
+        if name in available
+        else (name, not_configured)
+        for name in vendor_names
+    )
+    controller = get_active_acquisition_controller() or AcquisitionController(
+        providers=()
+    )
+    def validate_news(value):
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, dict):
+            feed = value.get("feed")
+            if isinstance(feed, list) and feed:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if isinstance(feed, list):
+                raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NO_DATA)
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE
+        )
+
+    return controller.acquire(
+        AcquisitionRequest(
+            capability="get_news" if method == "get_news" else capability,
+            source_ref=source_ref,
+            tool_call_id=tool_call_id,
+            tool_name=method,
+        ),
+        providers=providers,
+        validator=validate_news,
+        serializer=lambda value: value,
+    )

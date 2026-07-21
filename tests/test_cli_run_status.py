@@ -73,7 +73,10 @@ def test_prepare_run_artifacts_writes_running_status(tmp_path):
     assert payload["analysis_date"] == "2026-07-01"
     assert payload["selected_analysts"] == ["market", "social"]
     assert payload["status"] == "running"
+    assert payload["lifecycle_status"] == "running"
     assert payload["current_phase"] == "artifacts_prepared"
+    assert payload["active_phase"] == "artifacts_prepared"
+    assert payload["terminal_outcome_kind"] is None
     assert payload["completed_at"] is None
     assert payload["error_summary"] is None
     assert payload["reports_written"] == []
@@ -225,14 +228,59 @@ def test_update_run_status_marks_completed(tmp_path):
         artifacts,
         status="completed",
         current_phase="report_writing",
+        terminal_outcome_kind="analysis_outcome",
+        evidence_integrity_status="insufficient",
         reports_written=["reports/complete_report.md"],
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
     assert payload["status"] == "completed"
-    assert payload["current_phase"] == "report_writing"
+    assert payload["lifecycle_status"] == "completed"
+    assert payload["current_phase"] is None
+    assert payload["active_phase"] is None
+    assert payload["terminal_outcome_kind"] == "analysis_outcome"
+    assert payload["evidence_integrity_status"] == "insufficient"
     assert payload["completed_at"] is not None
+    assert payload["terminal_at"] == payload["completed_at"]
     assert payload["reports_written"] == ["reports/complete_report.md"]
+
+
+@pytest.mark.unit
+def test_write_run_reports_publishes_canonical_terminal_identity(
+    tmp_path,
+    monkeypatch,
+):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path), "evidence_gate_mode": "enforce"},
+        _selections(),
+    )
+    report_file = artifacts["report_dir"] / "complete_report.md"
+
+    def fake_save(final_state, ticker, report_dir):
+        assert final_state["configuration_digest"] == artifacts["configuration_digest"]
+        assert ticker == "688519.SS"
+        assert report_dir == artifacts["report_dir"]
+        final_state.update(
+            {
+                "lifecycle_status": "completed",
+                "terminal_outcome_kind": "analysis_outcome",
+                "evidence_integrity_status": "insufficient",
+                "run_id": "run:" + "a" * 64,
+                "decision_audit_sha256": "b" * 64,
+            }
+        )
+        return report_file
+
+    monkeypatch.setattr(cli_main, "save_report_to_disk", fake_save)
+    cli_main._write_run_reports({}, "688519.SS", artifacts)
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    assert payload["status"] == "completed"
+    assert payload["active_phase"] is None
+    assert payload["canonical_run_id"] == "run:" + "a" * 64
+    assert payload["audit_digest"] == "b" * 64
+    assert payload["terminal_outcome_kind"] == "analysis_outcome"
+    assert payload["evidence_integrity_status"] == "insufficient"
 
 
 @pytest.mark.unit
@@ -250,8 +298,15 @@ def test_mark_run_failed_records_error_summary(tmp_path):
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert payload["current_phase"] == "graph_stream"
+    assert payload["lifecycle_status"] == "failed"
+    assert payload["current_phase"] is None
+    assert payload["active_phase"] is None
+    assert payload["failed_phase"] == "graph_stream"
+    assert payload["terminal_outcome_kind"] == "operational_failure"
+    assert payload["operational_error_category"] == "graph_execution"
     assert payload["completed_at"] is None
+    assert payload["failed_at"] is not None
+    assert payload["terminal_at"] == payload["failed_at"]
     assert payload["error_summary"] == "RuntimeError: stream stopped"
     assert "Run failed during graph_stream: RuntimeError: stream stopped" in artifacts[
         "log_file"
@@ -284,7 +339,9 @@ def test_run_analysis_marks_failed_when_graph_initialization_fails(
     assert len(status_files) == 1
     payload = json.loads(status_files[0].read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert payload["current_phase"] == "graph_initializing"
+    assert payload["current_phase"] is None
+    assert payload["failed_phase"] == "graph_initializing"
+    assert payload["operational_error_category"] == "configuration"
     assert payload["error_summary"] == "RuntimeError: graph boot failed"
 
 
@@ -344,7 +401,9 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     assert len(status_files) == 1
     payload = json.loads(status_files[0].read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert payload["current_phase"] == "graph_stream"
+    assert payload["current_phase"] is None
+    assert payload["failed_phase"] == "graph_stream"
+    assert payload["operational_error_category"] == "graph_execution"
     assert payload["error_summary"] == "KeyboardInterrupt: ctrl-c"
     assert display.closed is True
     assert snapshot_scope_events == ["entered", "exited"]

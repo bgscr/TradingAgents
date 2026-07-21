@@ -49,8 +49,14 @@ class AgentState(MessagesState):
     asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
     instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
     evidence_state: Annotated[dict[str, Any], "Validated shared evidence for gates"]
+    evidence_preflight: Annotated[
+        dict[str, Any], "Deterministic baseline-evidence preflight result"
+    ]
     admission_gate: Annotated[dict[str, Any], "Deterministic admission-gate result"]
     analysis_outcome: Annotated[str, "Non-directional outcome when evidence blocks"]
+    analysis_outcome_contract: Annotated[
+        dict[str, Any] | None, "Typed non-directional terminal outcome"
+    ]
     draft_thesis: Annotated[dict[str, Any], "Structured directional thesis draft"]
     decision_gate: Annotated[dict[str, Any], "Deterministic decision-gate result"]
     original_draft_thesis: Annotated[dict[str, Any], "Original PM thesis draft"]
@@ -60,6 +66,24 @@ class AgentState(MessagesState):
     pm_original_selection: Annotated[dict[str, Any] | None, "Raw structured PM selection"]
     pm_revision: Annotated[dict[str, Any] | None, "Raw removal-only PM revision"]
     evidence_gate_mode: Annotated[str, "Enforced or explicit legacy gate mode"]
+    strategy_rule_applications: Annotated[
+        list[dict[str, Any]], "Rule applications proposed for deterministic validation"
+    ]
+    validated_decision_context: Annotated[
+        dict[str, Any] | None, "Closed, rule-backed decision context"
+    ]
+    direction_selector_diagnostics: Annotated[
+        dict[str, Any] | None, "Payload-free selector failure diagnostics"
+    ]
+    direction_selection: Annotated[
+        dict[str, Any] | None, "Structured model direction proposal"
+    ]
+    decision_gate_v2: Annotated[
+        dict[str, Any], "Versioned deterministic decision-gate result"
+    ]
+    trading_decision: Annotated[
+        dict[str, Any] | None, "Published structured trading decision when permitted"
+    ]
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]
@@ -84,5 +108,7 @@ class AgentState(MessagesState):
     risk_debate_state: Annotated[
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
-    final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+    final_trade_decision: Annotated[
+        str | None, "Final decision made by the Risk Analysts"
+    ]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]

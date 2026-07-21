@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+from hashlib import sha256
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pandas as pd
+import pytest
+
+import tradingagents.dataflows.config as config_module
+import tradingagents.default_config as default_config
+from tradingagents.agents.utils.agent_utils import resolve_instrument_identity
+from tradingagents.dataflows import market_snapshot
+from tradingagents.dataflows.acquisition import AcquisitionFailure
+from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.instrument_identity import (
+    IdentityRegistryAvailable,
+    IdentityRegistryUnavailable,
+    RegistryFailureReason,
+    resolve_authoritative_instrument_identity,
+)
+from tradingagents.dataflows.market_snapshot import SnapshotProvider, authoritative_snapshot_run
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    SourceAcquisitionAvailable,
+    SourceAcquisitionUnavailable,
+    acquire_run_evidence,
+    stable_acquisition_source_ref,
+)
+from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+FIXTURE = Path(__file__).parent / "fixtures" / "identity_registry_510500.synthetic.json"
+
+
+def _fixture_digest() -> str:
+    return sha256(FIXTURE.read_bytes()).hexdigest()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("alias", ["510500", "510500.SH", "510500.SS"])
+def test_aliases_resolve_to_the_same_digest_pinned_identity(alias):
+    result = resolve_authoritative_instrument_identity(
+        alias,
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+
+    assert isinstance(result, IdentityRegistryAvailable)
+    assert result.identity.canonical_symbol == "510500.SS"
+    assert result.identity.venue == "XSHG"
+    assert result.identity.instrument_kind == "fund"
+    assert result.identity.currency == "CNY"
+    assert result.identity.artifact_sha256 == _fixture_digest()
+
+
+@pytest.mark.unit
+def test_routing_normalization_does_not_establish_authority_without_registry():
+    result = resolve_authoritative_instrument_identity(
+        "510500.SH",
+        registry_path="",
+        expected_sha256="",
+    )
+
+    assert isinstance(result, IdentityRegistryUnavailable)
+    assert result.reason is RegistryFailureReason.NOT_CONFIGURED
+
+
+@pytest.mark.unit
+def test_wrong_digest_fails_closed_before_parsing_registry():
+    result = resolve_authoritative_instrument_identity(
+        "510500.SS",
+        registry_path=FIXTURE,
+        expected_sha256="0" * 64,
+    )
+
+    assert isinstance(result, IdentityRegistryUnavailable)
+    assert result.reason is RegistryFailureReason.INTEGRITY_FAILURE
+
+
+@pytest.mark.unit
+def test_yahoo_exception_continues_mainland_enrichment_without_authority():
+    resolve_instrument_identity.cache_clear()
+    unavailable = IdentityRegistryUnavailable(
+        reason=RegistryFailureReason.NOT_CONFIGURED,
+        source_ref="identity-registry:unconfigured",
+        diagnostic_code="registry_path_or_digest_missing",
+    )
+    with (
+        patch(
+            "tradingagents.agents.utils.agent_utils.resolve_authoritative_instrument_identity",
+            return_value=unavailable,
+        ),
+        patch(
+            "tradingagents.agents.utils.agent_utils.yf.Ticker",
+            side_effect=RuntimeError("rate limited"),
+        ),
+        patch(
+            "tradingagents.agents.utils.agent_utils.get_china_a_identity",
+            return_value={
+                "company_name": "Provider label only",
+                "industry": "Provider description",
+                "exchange": "shanghai",
+            },
+        ) as mainland,
+    ):
+        identity = resolve_instrument_identity("510500.SH")
+
+    mainland.assert_called_once_with("510500.SH")
+    assert identity["company_name"] == "Provider label only"
+    assert "canonical_symbol" not in identity
+    assert "provenance" not in identity
+
+
+@pytest.mark.unit
+def test_acquisition_uses_canonical_symbol_and_preserves_registry_artifact():
+    lookup = resolve_authoritative_instrument_identity(
+        "510500",
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+    assert isinstance(lookup, IdentityRegistryAvailable)
+    frame = pd.DataFrame(
+        {
+            "Date": [pd.Timestamp("2026-07-17")],
+            "Open": [1.0],
+            "High": [1.1],
+            "Low": [0.9],
+            "Close": [1.05],
+            "Volume": [100.0],
+        }
+    )
+    snapshot = SimpleNamespace(
+        symbol="510500.SS",
+        provider="synthetic-market-provider",
+        retrieved_at="2026-07-19T01:00:00+00:00",
+        adjustment_basis="qfq",
+        requested_date="2026-07-19",
+        effective_trading_date="2026-07-17",
+        frame=frame,
+        frame_sha256="a" * 64,
+        snapshot_id="snapshot:synthetic",
+    )
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch(
+            "tradingagents.dataflows.market_snapshot.get_authoritative_market_snapshot",
+            return_value=snapshot,
+        ) as market,
+    ):
+        evidence = acquire_run_evidence("510500", "2026-07-19")
+
+    assert market.call_args.args[0] == "510500.SS"
+    assert evidence.instrument_identity is not None
+    assert evidence.instrument_identity.symbol == "510500.SS"
+    assert evidence.instrument_identity.is_authoritative
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.symbol == "510500.SS"
+    assert len(evidence.source_artifacts) == 1
+    assert isinstance(evidence.acquisition_outcomes[0], SourceAcquisitionAvailable)
+    with patch(
+        "tradingagents.graph.trading_graph.resolve_instrument_identity"
+    ) as enrichment:
+        context = TradingAgentsGraph.resolve_instrument_context(
+            SimpleNamespace(),
+            "510500",
+            evidence_state=evidence,
+        )
+    enrichment.assert_not_called()
+    assert "authoritative canonical symbol `510500.SS`" in context
+    assert "Instrument kind: fund" in context
+
+
+@pytest.mark.unit
+def test_unresolved_identity_has_typed_outcome_and_skips_market_acquisition():
+    unavailable = IdentityRegistryUnavailable(
+        reason=RegistryFailureReason.NOT_FOUND,
+        source_ref=str(FIXTURE),
+        diagnostic_code="identity_row_not_found",
+    )
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=unavailable,
+        ),
+        patch(
+            "tradingagents.agents.utils.agent_utils.resolve_instrument_identity",
+            return_value={},
+        ) as enrichment,
+        patch(
+            "tradingagents.dataflows.market_snapshot.get_authoritative_market_snapshot"
+        ) as market,
+    ):
+        evidence = acquire_run_evidence("UNKNOWN", "2026-07-19")
+
+    market.assert_not_called()
+    enrichment.assert_not_called()
+    assert evidence.instrument_identity is None
+    assert evidence.market_snapshot is None
+    assert evidence.source_artifacts == ()
+    outcome = evidence.acquisition_outcomes[0]
+    assert isinstance(outcome, SourceAcquisitionUnavailable)
+    assert outcome.reason is AcquisitionUnavailableReason.IDENTITY_NOT_FOUND
+    assert outcome.retryable is False
+    assert outcome.source_ref == stable_acquisition_source_ref(
+        "identity-registry",
+        str(FIXTURE),
+        RegistryFailureReason.NOT_FOUND.value,
+    )
+
+
+@pytest.mark.unit
+def test_run_evidence_preserves_total_market_rate_limit_without_artifact_or_available():
+    lookup = resolve_authoritative_instrument_identity(
+        "510500",
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+    assert isinstance(lookup, IdentityRegistryAvailable)
+    config_module._config = default_config.DEFAULT_CONFIG.copy()
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "primary,secondary"},
+        }
+    })
+
+    def rate_limited(*_args):
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.RATE_LIMITED,
+            status_code=429,
+        )
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "primary": SnapshotProvider(rate_limited, "qfq"),
+                "secondary": SnapshotProvider(rate_limited, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("510500", "2026-07-19")
+
+    market_outcomes = [
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_snapshot"
+    ]
+    assert [outcome.reason for outcome in market_outcomes] == [
+        AcquisitionUnavailableReason.RATE_LIMITED,
+        AcquisitionUnavailableReason.RATE_LIMITED,
+    ]
+    assert evidence.market_snapshot is None
+    assert all(
+        artifact.tool_name != "authoritative_market_snapshot_normalized_frame_v1"
+        for artifact in evidence.source_artifacts
+    )
+    assert not any(
+        outcome.outcome == "available" for outcome in market_outcomes
+    )
+
+
+@pytest.mark.unit
+def test_run_evidence_contains_exact_normalized_snapshot_artifact_before_preflight():
+    lookup = resolve_authoritative_instrument_identity(
+        "510500",
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+    assert isinstance(lookup, IdentityRegistryAvailable)
+    config_module._config = default_config.DEFAULT_CONFIG.copy()
+    set_config({
+        "market_data_vendors": {"cn_a": {"core_stock_apis": "synthetic"}}
+    })
+    frame = pd.DataFrame({
+        "Date": ["2026-07-17"],
+        "Open": [1.0],
+        "High": [1.1],
+        "Low": [0.9],
+        "Close": [1.05],
+        "Volume": [100.0],
+    })
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {"synthetic": SnapshotProvider(lambda *_args: frame, "qfq")},
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("510500", "2026-07-19")
+
+    assert evidence.market_snapshot is not None
+    market_outcome = next(
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_snapshot"
+    )
+    assert isinstance(market_outcome, SourceAcquisitionAvailable)
+    assert market_outcome.artifact.tool_name == (
+        "authoritative_market_snapshot_normalized_frame_v1"
+    )
+    assert market_outcome.artifact.raw_text == (
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-07-17,1,1.1000000000000001,0.90000000000000002,"
+        "1.05,100\n"
+    )
+    assert market_outcome.artifact.artifact_sha256 == (
+        evidence.market_snapshot.frame_sha256
+    )
+    assert sum(
+        artifact.artifact_sha256 == evidence.market_snapshot.frame_sha256
+        for artifact in evidence.source_artifacts
+    ) == 1

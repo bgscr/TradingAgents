@@ -1,16 +1,47 @@
 from typing import Annotated
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId, tool
 
-from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.interface import route_to_vendor, route_to_vendor_acquired
+from tradingagents.evidence import (
+    ToolExecutionEvidenceEnvelope,
+    stable_acquisition_source_ref,
+)
 
 
-@tool
+def get_news_legacy(ticker: str, start_date: str, end_date: str) -> str:
+    """Legacy plain-content path for direct, non-ToolNode sentiment collection."""
+    return route_to_vendor("get_news", ticker, start_date, end_date)
+
+
+def acquire_news(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    tool_call_id: str,
+    source_ref: str,
+    capability: str,
+):
+    """Acquire news through the run-owned controller for non-ToolNode callers."""
+    return route_to_vendor_acquired(
+        "get_news",
+        ticker,
+        start_date,
+        end_date,
+        tool_call_id=tool_call_id,
+        source_ref=source_ref,
+        capability=capability,
+    )
+
+
+@tool(response_format="content_and_artifact")
 def get_news(
     ticker: Annotated[str, "Ticker symbol"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
-) -> str:
+    tool_call_id: Annotated[str, InjectedToolCallId()],
+) -> tuple[str, dict[str, object]]:
     """
     Retrieve news data for a given ticker symbol.
     Uses the configured news_data vendor.
@@ -21,7 +52,33 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    return route_to_vendor("get_news", ticker, start_date, end_date)
+    source_ref = stable_acquisition_source_ref(
+        "news",
+        ticker,
+        start_date,
+        end_date,
+    )
+    result = acquire_news(
+        ticker,
+        start_date,
+        end_date,
+        tool_call_id=tool_call_id,
+        source_ref=source_ref,
+        capability="get_news",
+    )
+    content = result.value
+    if content is None:
+        reason = result.outcomes[-1].reason.value if result.outcomes else "provider_error"
+        content = f"DATA_UNAVAILABLE: news acquisition unavailable ({reason})."
+    envelope = ToolExecutionEvidenceEnvelope(
+        tool_call_id=tool_call_id,
+        tool_name="get_news",
+        source_ref=source_ref,
+        capability="get_news",
+        acquisition_outcomes=result.outcomes,
+        selected_artifact=result.artifact,
+    )
+    return content, envelope.model_dump(mode="json")
 
 @tool
 def get_global_news(

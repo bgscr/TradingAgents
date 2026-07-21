@@ -14,6 +14,11 @@ from urllib.error import HTTPError
 import pytest
 
 from tradingagents.dataflows import stocktwits
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    SourceAcquisitionAvailable,
+    SourceAcquisitionUnavailable,
+)
 
 
 def _raise(exc):
@@ -44,6 +49,36 @@ class TestStockTwitsResilience:
             out = stocktwits.fetch_stocktwits_messages("NVDA")
         assert "unavailable" in out.lower()
         assert out.startswith("<stocktwits unavailable")
+
+    def test_acquired_empty_stream_is_typed_no_data(self):
+        class EmptyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"messages": []}'
+
+        with patch.object(stocktwits, "urlopen", return_value=EmptyResponse()):
+            result = stocktwits.acquire_stocktwits_messages(
+                "NVDA",
+                30,
+                tool_call_id="sentiment-stocktwits:test",
+                source_ref="stocktwits:NVDA",
+                capability="sentiment_stocktwits",
+            )
+
+        assert result.value is None
+        assert result.artifact is None
+        assert len(result.outcomes) == 1
+        assert isinstance(result.outcomes[0], SourceAcquisitionUnavailable)
+        assert result.outcomes[0].reason is AcquisitionUnavailableReason.NO_DATA
+        assert not any(
+            isinstance(outcome, SourceAcquisitionAvailable)
+            for outcome in result.outcomes
+        )
 
 
 @pytest.mark.unit

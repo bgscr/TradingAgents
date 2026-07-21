@@ -1,0 +1,3 @@
+# Require registered strategy rules for directional assertions
+
+Strict typing and provenance can establish what a Source Fact means and where it came from, but they cannot establish that the fact justifies Buy, Hold, or Underweight. Every Decision Assertion used by an automated Trading Decision must therefore identify a versioned Strategy Rule whose applicability and predicate can be recomputed deterministically from registered Source Facts. Models may select fact and rule identifiers and produce advisory interpretation, but they cannot invent directional rules; an interpretation without a registered applicable rule remains non-directional, and absence of rule-backed support yields an Analysis Outcome.

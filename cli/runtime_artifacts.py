@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -116,6 +116,15 @@ class RuntimeArtifactWriter:
         self._durations: dict[str, dict[str, dict[str, float | int]]] = defaultdict(
             dict
         )
+        self._stage_activity: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {
+                "model_calls": 0,
+                "model_seconds": 0.0,
+                "tool_calls": 0,
+                "tool_seconds": 0.0,
+            }
+        )
+        self._terminal_summary: dict[str, Any] = {}
         self._payload_uncompressed_bytes = 0
         self._payload_compressed_bytes = 0
         self._primary_log_bytes = 0
@@ -198,6 +207,86 @@ class RuntimeArtifactWriter:
             item["count"] += 1
             item["total_seconds"] += seconds
             item["max_seconds"] = max(float(item["max_seconds"]), seconds)
+            if category in {"model", "tool"}:
+                stage = self._current_phase or "unassigned"
+                stage_item = self._stage_activity[stage]
+                stage_item[f"{category}_calls"] += 1
+                stage_item[f"{category}_seconds"] += seconds
+
+    def record_terminal_summary(
+        self,
+        *,
+        terminal_route: str,
+        stats: Mapping[str, Any] | None = None,
+        acquisition_outcomes: Iterable[Any] = (),
+    ) -> None:
+        """Persist aggregate cost/call/retry telemetry without provider payloads."""
+
+        usage = dict(stats or {})
+        attempts = 0
+        available = 0
+        unavailable = 0
+        retryable = 0
+        reasons: Counter[str] = Counter()
+        maximum_attempts: dict[tuple[str, str, str], int] = {}
+        circuit_breaker_events = 0
+        for raw_outcome in acquisition_outcomes:
+            if hasattr(raw_outcome, "model_dump"):
+                outcome = raw_outcome.model_dump(mode="json")
+            elif isinstance(raw_outcome, Mapping):
+                outcome = dict(raw_outcome)
+            else:
+                continue
+            attempts += 1
+            outcome_kind = str(outcome.get("outcome", "unknown"))
+            if outcome_kind == "available":
+                available += 1
+            elif outcome_kind == "unavailable":
+                unavailable += 1
+            if outcome.get("retryable") is True:
+                retryable += 1
+            reason = outcome.get("reason")
+            if reason:
+                reasons[str(reason)] += 1
+                if str(reason) == "circuit_open":
+                    circuit_breaker_events += 1
+            key = (
+                str(outcome.get("provider", "unknown")),
+                str(outcome.get("capability", "unknown")),
+                str(outcome.get("source_ref", "unknown")),
+            )
+            try:
+                attempt = max(1, int(outcome.get("attempt", 1)))
+            except (TypeError, ValueError):
+                attempt = 1
+            maximum_attempts[key] = max(maximum_attempts.get(key, 0), attempt)
+        cost_usd = usage.get("cost_usd")
+        summary = {
+            "terminal_route": terminal_route,
+            "model": {
+                "calls": int(usage.get("llm_calls", 0) or 0),
+                "tokens_in": int(usage.get("tokens_in", 0) or 0),
+                "tokens_out": int(usage.get("tokens_out", 0) or 0),
+            },
+            "tool": {"calls": int(usage.get("tool_calls", 0) or 0)},
+            "cost": {
+                "available": cost_usd is not None,
+                "amount_usd": float(cost_usd) if cost_usd is not None else None,
+            },
+            "acquisition": {
+                "attempts": attempts,
+                "available": available,
+                "unavailable": unavailable,
+                "retryable_unavailable": retryable,
+                "retry_events": sum(
+                    max(0, attempt - 1) for attempt in maximum_attempts.values()
+                ),
+                "circuit_breaker_events": circuit_breaker_events,
+                "unavailable_reasons": dict(sorted(reasons.items())),
+            },
+        }
+        with self._metrics_lock:
+            self._terminal_summary = summary
 
     def transition_phase(self, phase: str, *, at: float | None = None) -> None:
         boundary = time.monotonic() if at is None else at
@@ -237,6 +326,10 @@ class RuntimeArtifactWriter:
                 }
                 for category, names in self._durations.items()
             }
+            stage_activity = {
+                stage: dict(values)
+                for stage, values in self._stage_activity.items()
+            }
             saturation = {
                 "dropped_events": sum(self._dropped_by_kind.values()),
                 "coalesced_events": sum(self._coalesced_by_kind.values()),
@@ -245,6 +338,8 @@ class RuntimeArtifactWriter:
             }
             metrics = {
                 "durations": durations,
+                "stage_activity": stage_activity,
+                "terminal": dict(self._terminal_summary),
                 "queue": {
                     "capacity": self._queue_capacity,
                     "max_depth": self._max_queue_depth,

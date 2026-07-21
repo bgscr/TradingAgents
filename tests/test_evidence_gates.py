@@ -1,11 +1,13 @@
 import functools
 import json
 from hashlib import sha256
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from pydantic import ValidationError
 
 import tradingagents.evidence as evidence_module
 from tradingagents.agents.managers import portfolio_manager as portfolio_manager_module
@@ -28,9 +30,12 @@ from tradingagents.dataflows.market_snapshot import (
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import (
+    AnalysisDiagnosticCode,
     AnalysisOutcome,
+    AnalysisOutcomeReason,
     ClaimValidation,
     ClaimValidationStatus,
+    EvidencePreflightResult,
     EvidenceReadiness,
     EvidenceSource,
     EvidenceState,
@@ -38,8 +43,10 @@ from tradingagents.evidence import (
     InstrumentIdentityEvidence,
     MarketSnapshotEvidence,
     MaterialClaim,
+    SourceAcquisitionAvailable,
     SourceArtifact,
     SourceFact,
+    ToolExecutionEvidenceEnvelope,
     build_evidence_state,
     build_tool_evidence_state,
     decision_ready_material_claims,
@@ -56,6 +63,52 @@ from tradingagents.graph.evidence_gate import (
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.setup import GraphSetup
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.terminal_contract import TerminalContract
+
+
+def _trusted_tool_message(
+    *,
+    content: str,
+    name: str,
+    tool_call_id: str,
+    source_ref: str,
+    attempt: int = 1,
+) -> ToolMessage:
+    capability = (
+        "market_snapshot"
+        if source_ref.startswith("snapshot:")
+        else source_ref.partition(":")[0]
+    )
+    artifact = SourceArtifact(
+        artifact_sha256=sha256(content.encode("utf-8")).hexdigest(),
+        source_ref=source_ref,
+        tool_call_id=tool_call_id,
+        tool_name=name,
+        raw_text=content,
+    )
+    envelope = ToolExecutionEvidenceEnvelope(
+        tool_call_id=tool_call_id,
+        tool_name=name,
+        source_ref=source_ref,
+        capability=capability,
+        acquisition_outcomes=(
+            SourceAcquisitionAvailable(
+                provider="fixture-provider",
+                capability=capability,
+                source_ref=source_ref,
+                attempt=attempt,
+                retrieved_at="2026-07-19T00:00:00+00:00",
+                artifact=artifact,
+            ),
+        ),
+        selected_artifact=artifact,
+    ).model_dump(mode="json")
+    return ToolMessage(
+        content=content,
+        name=name,
+        tool_call_id=tool_call_id,
+        artifact=envelope,
+    )
 
 
 def _decision_assertions(*claim_ids: str) -> tuple[DecisionAssertion, ...]:
@@ -66,7 +119,7 @@ def _decision_assertions(*claim_ids: str) -> tuple[DecisionAssertion, ...]:
 
 
 def _test_fact_id(claim_id: str) -> str:
-    return f"fact:test:{claim_id}"
+    return f"fact:{sha256(f'test-fact:{claim_id}'.encode()).hexdigest()}"
 
 
 def _evidence_with_supported_claims(
@@ -169,7 +222,6 @@ def test_missing_optional_evidence_degrades_without_blocking_admission():
 
     assert result.admitted is True
     assert result.readiness is EvidenceReadiness.DEGRADED
-    assert 0.0 < result.coverage < 1.0
     assert result.diagnostics == ("Optional evidence unavailable: reddit (rate limited).",)
 
 
@@ -312,10 +364,11 @@ def test_chinese_numeric_claims_preserve_signed_decimal_tokens():
 
     evidence = build_tool_evidence_state(
         [
-            ToolMessage(
+            _trusted_tool_message(
                 content="| rsi | 37.41 |\n| macd | -0.56 |",
                 name="get_verified_market_snapshot",
                 tool_call_id="call-1",
+                source_ref=ref,
             )
         ],
         (claim,),
@@ -345,10 +398,11 @@ def test_unsupported_claim_does_not_poison_supported_claim_sharing_source():
     )
     evidence = build_tool_evidence_state(
         [
-            ToolMessage(
+            _trusted_tool_message(
                 content="| Close | 30.27 |\n| rsi | 37.41 |",
                 name="get_verified_market_snapshot",
                 tool_call_id="call-1",
+                source_ref=ref,
             )
         ],
         (supported, unsupported),
@@ -411,8 +465,19 @@ def test_same_source_ref_binds_each_claim_to_its_exact_tool_call_artifact():
     )
     evidence = build_tool_evidence_state(
         (
-            ToolMessage(content=first, name="get_verified_market_snapshot", tool_call_id="call-close"),
-            ToolMessage(content=second, name="get_verified_market_snapshot", tool_call_id="call-rsi"),
+            _trusted_tool_message(
+                content=first,
+                name="get_verified_market_snapshot",
+                tool_call_id="call-close",
+                source_ref=ref,
+            ),
+            _trusted_tool_message(
+                content=second,
+                name="get_verified_market_snapshot",
+                tool_call_id="call-rsi",
+                source_ref=ref,
+                attempt=2,
+            ),
         ),
         claims,
         tool_call_ids_by_source={ref: ("call-close", "call-rsi")},
@@ -443,10 +508,11 @@ def test_localized_claim_validates_through_exact_source_quote():
 
     evidence = build_tool_evidence_state(
         [
-            ToolMessage(
+            _trusted_tool_message(
                 content="The latest close declined.",
                 name="get_verified_market_snapshot",
                 tool_call_id="call-1",
+                source_ref=ref,
             )
         ],
         (claim,),
@@ -617,6 +683,44 @@ def test_unavailable_required_evidence_blocks_admission():
     assert result.readiness is EvidenceReadiness.INSUFFICIENT
     assert result.diagnostics == (
         "Required evidence unavailable: issuer_filing (filing payload missing).",
+    )
+
+
+@pytest.mark.unit
+def test_not_applicable_required_evidence_is_a_blocking_configuration_error():
+    evidence = EvidenceState(
+        instrument_identity=InstrumentIdentityEvidence(
+            symbol="000725.SZ",
+            name="BOE Technology Group",
+        ),
+        market_snapshot=MarketSnapshotEvidence(
+            symbol="000725.SZ",
+            provider="akshare",
+            retrieved_at="2026-07-17T04:00:00+00:00",
+            adjustment_basis="qfq",
+            requested_date="2026-07-16",
+            effective_trading_date="2026-07-16",
+            history_rows=1200,
+            frame_sha256="f" * 64,
+            snapshot_id="snapshot:test",
+        ),
+        sources=(
+            EvidenceSource(
+                source_id="required.company_financials",
+                status=EvidenceStatus.NOT_APPLICABLE,
+                required=True,
+                detail="profile and required source disagree",
+            ),
+        ),
+    )
+
+    result = evaluate_admission_gate(evidence)
+
+    assert result.admitted is False
+    assert result.readiness is EvidenceReadiness.INSUFFICIENT
+    assert result.diagnostics == (
+        "Required evidence configuration invalid: required.company_financials "
+        "(profile and required source disagree) is marked not applicable.",
     )
 
 
@@ -1339,8 +1443,16 @@ def test_pm_revision_with_extra_fields_blocks_fail_closed(monkeypatch):
     )
 
     assert "final_trade_decision" not in result
-    assert "**Analysis Outcome:** Insufficient Evidence" in result["analysis_outcome"]
-    assert "Portfolio Manager removal-only revision was invalid" in result["analysis_outcome"]
+    outcome = AnalysisOutcome.model_validate(result["analysis_outcome_contract"])
+    assert outcome.reason is AnalysisOutcomeReason.PORTFOLIO_GATE_BLOCKED
+    assert {
+        AnalysisDiagnosticCode.STRUCTURED_OUTPUT_INVALID,
+        AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED,
+    }.issubset(outcome.diagnostic_codes)
+    assert result["analysis_outcome"] == render_analysis_outcome(outcome)
+    assert "Portfolio Manager removal-only revision was invalid" not in result[
+        "analysis_outcome"
+    ]
     assert "Fabricated qualitative premise" not in result["analysis_outcome"]
 
 
@@ -1494,7 +1606,7 @@ def test_pm_retries_revision_that_adds_an_id_before_building_a_draft(monkeypatch
 
 
 @pytest.mark.unit
-def test_explicit_shadow_override_labels_directional_output_unenforced():
+def test_shadow_portfolio_output_is_diagnostic_only_and_non_directional():
     llm = MagicMock()
     llm.with_structured_output.side_effect = NotImplementedError(
         "provider has no structured output"
@@ -1526,28 +1638,68 @@ def test_explicit_shadow_override_labels_directional_output_unenforced():
 
     result = manager(state)
 
-    rendered = result["final_trade_decision"]
-    assert rendered.startswith("> **Evidence Gate:** UNENFORCED (shadow mode)")
-    assert "**Rating**: Buy" in rendered
-    assert result["risk_debate_state"]["judge_decision"] == rendered
+    assert result["decision_gate"]["permitted"] is False
+    assert result["shadow_diagnostics"] == {
+        "status": "non_directional",
+        "model_output_kind": "free_text",
+    }
+    outcome = AnalysisOutcome.model_validate(result["analysis_outcome_contract"])
+    assert result["analysis_outcome"] == render_analysis_outcome(outcome)
+    assert "final_trade_decision" not in result
+    assert "risk_debate_state" not in result
+
+
+@pytest.mark.unit
+def test_analysis_outcome_rejects_freeform_publication_prose():
+    secret = "Authorization: Bearer TOP_SECRET_ANALYSIS_OUTCOME"
+
+    with pytest.raises(ValidationError):
+        AnalysisOutcome(
+            readiness=EvidenceReadiness.INSUFFICIENT,
+            summary=secret,
+            diagnostics=(secret,),
+        )
+
+
+@pytest.mark.unit
+def test_analysis_outcome_codes_are_duplicate_and_permutation_invariant():
+    first = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+        diagnostic_codes=(
+            AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE,
+            AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE,
+            AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE,
+        ),
+    )
+    second = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+        diagnostic_codes=(
+            AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE,
+            AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE,
+        ),
+    )
+
+    assert first.model_dump_json() == second.model_dump_json()
 
 
 @pytest.mark.unit
 def test_insufficient_outcome_renders_diagnostics_without_directional_fields():
     outcome = AnalysisOutcome(
         readiness=EvidenceReadiness.INSUFFICIENT,
-        summary="A trustworthy market snapshot was not available.",
-        diagnostics=(
-            "Required evidence missing: Authoritative Market Snapshot.",
+        reason=AnalysisOutcomeReason.ADMISSION_BLOCKED,
+        diagnostic_codes=(
+            AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE,
         ),
-        evidence_coverage=0.5,
     )
 
     rendered = render_analysis_outcome(outcome)
 
     assert "**Analysis Outcome:** Insufficient Evidence" in rendered
-    assert "**Evidence Coverage:** 50.0%" in rendered
-    assert "Required evidence missing: Authoritative Market Snapshot." in rendered
+    assert "**Evidence Coverage:**" not in rendered
+    assert "`snapshot_unavailable`" in rendered
+    assert "The authoritative market snapshot was unavailable." in rendered
     assert "No Trading Decision was issued." in rendered
     for forbidden_field in (
         "**Rating**",
@@ -1654,7 +1806,7 @@ def test_acquired_identity_and_snapshot_become_shared_evidence():
 
 
 @pytest.mark.unit
-def test_run_evidence_is_acquired_from_identity_and_market_boundaries(monkeypatch):
+def test_unpinned_identity_enrichment_does_not_trigger_market_acquisition(monkeypatch):
     frame = pd.DataFrame({
         "Date": pd.to_datetime(["2026-07-15", "2026-07-16"]),
         "Open": [4.20, 4.25],
@@ -1690,9 +1842,10 @@ def test_run_evidence_is_acquired_from_identity_and_market_boundaries(monkeypatc
         "2026-07-16",
     )
 
-    assert evidence.instrument_identity.name == "BOE Technology Group"
-    assert evidence.market_snapshot.provider == "akshare"
-    assert evidence.market_snapshot.history_rows == 2
+    assert evidence.instrument_identity is None
+    assert evidence.market_snapshot is None
+    assert evidence.source_artifacts == ()
+    assert evidence.acquisition_outcomes[0].reason.value == "registry_not_configured"
 
 
 @pytest.mark.unit
@@ -1739,7 +1892,7 @@ def test_graph_setup_rejects_unknown_evidence_gate_mode():
 
 
 @pytest.mark.unit
-def test_shadow_admission_records_block_without_terminal_outcome():
+def test_admission_block_emits_terminal_outcome():
     evidence = EvidenceState(
         instrument_identity=InstrumentIdentityEvidence(
             symbol="000725.SZ",
@@ -1748,12 +1901,12 @@ def test_shadow_admission_records_block_without_terminal_outcome():
         market_snapshot=None,
     )
 
-    update = create_admission_gate_node(emit_blocked_outcome=False)({
+    update = create_admission_gate_node()({
         "evidence_state": evidence.model_dump(mode="json"),
     })
 
     assert update["admission_gate"]["admitted"] is False
-    assert "analysis_outcome" not in update
+    assert "analysis_outcome" in update
 
 
 @pytest.mark.unit
@@ -1763,12 +1916,19 @@ def test_evidence_gate_defaults_to_enforcement_after_replay_review():
 
 @pytest.mark.unit
 def test_programmatic_enforced_block_returns_outcome_without_decision(tmp_path):
-    outcome = (
-        "**Analysis Outcome:** Insufficient Evidence\n\n"
-        "No Trading Decision was issued."
+    outcome_contract = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
     )
+    outcome = render_analysis_outcome(outcome_contract)
     final_state = Propagator().create_initial_state("NVDA", "2026-01-10")
+    final_state["evidence_preflight"] = EvidencePreflightResult(
+        passed=False,
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        blockers=("authoritative instrument identity is missing",),
+    ).model_dump(mode="json")
     final_state["analysis_outcome"] = outcome
+    final_state["analysis_outcome_contract"] = outcome_contract.model_dump(mode="json")
 
     graph = MagicMock()
     graph.memory_log = TradingMemoryLog(
@@ -1787,10 +1947,7 @@ def test_programmatic_enforced_block_returns_outcome_without_decision(tmp_path):
     graph.resolve_instrument_context.return_value = "resolved identity"
     graph.resolve_evidence_state.return_value = EvidenceState()
     graph._run_signature.return_value = "test-graph-signature"
-    graph._resolve_pending_entries = functools.partial(
-        TradingAgentsGraph._resolve_pending_entries,
-        graph,
-    )
+    graph._resolve_pending_entries = MagicMock()
     graph._log_state = functools.partial(TradingAgentsGraph._log_state, graph)
     graph._run_graph = functools.partial(TradingAgentsGraph._run_graph, graph)
 
@@ -1803,6 +1960,8 @@ def test_programmatic_enforced_block_returns_outcome_without_decision(tmp_path):
     assert returned_state["analysis_outcome"] == outcome
     assert signal is None
     assert graph.memory_log.load_entries() == []
+    graph.resolve_instrument_context.assert_called_once()
+    graph._resolve_pending_entries.assert_not_called()
     graph.process_signal.assert_not_called()
     log_path = (
         tmp_path
@@ -1811,5 +1970,110 @@ def test_programmatic_enforced_block_returns_outcome_without_decision(tmp_path):
         / "full_states_log_2026-01-10.json"
     )
     logged_state = json.loads(log_path.read_text(encoding="utf-8"))
-    assert logged_state["analysis_outcome"] == outcome
+    audit = json.loads(
+        Path(returned_state["decision_audit_path"]).read_text(encoding="utf-8")
+    )
+    assert audit["evidence_preflight"]["passed"] is False
+    assert audit["evidence_preflight"]["readiness"] == "insufficient"
+    assert audit["admission_gate"] is None
+    assert audit["decision_gate"] is None
+    assert logged_state["evidence_audit_projection"] == audit["evidence_state"]
+    assert logged_state["decision_audit_sha256"] == audit["audit_sha256"]
+    assert "analysis_outcome" not in logged_state
+    assert "analysis_outcome_contract" not in logged_state
     assert "final_trade_decision" not in logged_state
+
+
+@pytest.mark.unit
+def test_programmatic_debug_stream_preserves_initial_state_and_terminal_audit(
+    tmp_path,
+):
+    evidence = EvidenceState(
+        instrument_identity=InstrumentIdentityEvidence(
+            symbol="NVDA",
+            name="NVIDIA Corporation",
+        )
+    )
+    instrument_context = "Instrument: NVDA (NASDAQ equity, USD)"
+    past_context = "Prior audited context."
+    outcome_contract = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+    )
+    terminal_delta = {
+        "messages": [AIMessage(content="Terminal analysis outcome.")],
+        "analysis_outcome": render_analysis_outcome(outcome_contract),
+        "analysis_outcome_contract": outcome_contract.model_dump(mode="json"),
+        "evidence_preflight": None,
+        "admission_gate": None,
+        "decision_gate": None,
+        "decision_gate_v2": None,
+        "decision_audit_created_at": "2026-07-20T12:00:00+00:00",
+    }
+
+    def wired_graph(*, debug: bool, results_dir: Path) -> TradingAgentsGraph:
+        graph = object.__new__(TradingAgentsGraph)
+        graph.debug = debug
+        graph.config = {
+            "checkpoint_enabled": False,
+            "evidence_gate_mode": "enforce",
+            "results_dir": str(results_dir),
+        }
+        graph._checkpointer_ctx = None
+        graph.propagator = Propagator()
+        graph.memory_log = MagicMock()
+        graph.memory_log.get_past_context.return_value = past_context
+        graph.resolve_evidence_state = lambda *_args: evidence
+        graph.resolve_instrument_context = lambda *_args, **_kwargs: instrument_context
+        graph._run_signature = lambda _asset_type: "test-graph-signature"
+        graph.log_states_dict = {}
+        graph.process_signal = MagicMock()
+        graph._resolve_pending_entries = MagicMock()
+        graph._log_state = functools.partial(TradingAgentsGraph._log_state, graph)
+        graph._run_graph = functools.partial(TradingAgentsGraph._run_graph, graph)
+        graph.graph = MagicMock()
+        if debug:
+            graph.graph.stream.return_value = (dict(terminal_delta),)
+        else:
+            graph.graph.invoke.side_effect = lambda initial_state, **_kwargs: {
+                **initial_state,
+                **terminal_delta,
+            }
+        return graph
+
+    invoked_state, invoked_signal = TradingAgentsGraph.propagate(
+        wired_graph(debug=False, results_dir=tmp_path / "invoke"),
+        "NVDA",
+        "2026-07-20",
+        asset_type="stock",
+    )
+    debug_state, debug_signal = TradingAgentsGraph.propagate(
+        wired_graph(debug=True, results_dir=tmp_path / "debug"),
+        "NVDA",
+        "2026-07-20",
+        asset_type="stock",
+    )
+
+    for field in (
+        "company_of_interest",
+        "trade_date",
+        "asset_type",
+        "instrument_context",
+        "past_context",
+        "evidence_state",
+    ):
+        assert debug_state[field] == invoked_state[field]
+    assert invoked_signal is debug_signal is None
+    assert TerminalContract.model_validate(
+        debug_state["terminal_contract"]
+    ) == TerminalContract.model_validate(invoked_state["terminal_contract"])
+
+    invoked_audit = json.loads(
+        Path(invoked_state["decision_audit_path"]).read_text(encoding="utf-8")
+    )
+    debug_audit = json.loads(
+        Path(debug_state["decision_audit_path"]).read_text(encoding="utf-8")
+    )
+    assert debug_audit["run"] == invoked_audit["run"]
+    assert debug_audit["terminal"] == invoked_audit["terminal"]
+    assert debug_audit["audit_sha256"] == invoked_audit["audit_sha256"]

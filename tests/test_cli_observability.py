@@ -11,6 +11,21 @@ from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.run_display import PlainRunDisplay
+from tradingagents.evidence import (
+    AnalysisOutcome,
+    AnalysisOutcomeReason,
+    EvidenceReadiness,
+    EvidenceState,
+    render_analysis_outcome,
+)
+from tradingagents.reporting import write_report_tree
+
+_INSUFFICIENT_OUTCOME_MODEL = AnalysisOutcome(
+    readiness=EvidenceReadiness.INSUFFICIENT,
+    reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+)
+_INSUFFICIENT_OUTCOME = render_analysis_outcome(_INSUFFICIENT_OUTCOME_MODEL)
+_INSUFFICIENT_OUTCOME_CONTRACT = _INSUFFICIENT_OUTCOME_MODEL.model_dump(mode="json")
 
 
 @pytest.mark.unit
@@ -42,7 +57,15 @@ def _run_selections():
     }
 
 
-def _run_with_chunks(tmp_path, monkeypatch, chunks, *, invoke_cli=False):
+def _run_with_chunks(
+    tmp_path,
+    monkeypatch,
+    chunks,
+    *,
+    invoke_cli=False,
+    evidence_gate_mode="enforce",
+    initial_state=None,
+):
     class FakeStream:
         def __init__(self):
             self.finished = False
@@ -55,7 +78,15 @@ def _run_with_chunks(tmp_path, monkeypatch, chunks, *, invoke_cli=False):
 
     class FakePropagator:
         def create_initial_state(self, *args, **kwargs):
-            return {}
+            if initial_state is not None:
+                return dict(initial_state)
+            return {
+                "company_of_interest": args[0],
+                "trade_date": args[1],
+                "asset_type": kwargs["asset_type"],
+                "evidence_state": EvidenceState().model_dump(mode="json"),
+                "messages": [],
+            }
 
         def get_graph_args(self, *args, **kwargs):
             return {}
@@ -98,7 +129,11 @@ def _run_with_chunks(tmp_path, monkeypatch, chunks, *, invoke_cli=False):
     monkeypatch.setattr(
         cli_main,
         "DEFAULT_CONFIG",
-        dict(cli_main.DEFAULT_CONFIG, results_dir=str(tmp_path)),
+        dict(
+            cli_main.DEFAULT_CONFIG,
+            results_dir=str(tmp_path),
+            evidence_gate_mode=evidence_gate_mode,
+        ),
     )
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
     monkeypatch.setattr(cli_main, "create_run_display", lambda *args, **kwargs: display)
@@ -110,6 +145,88 @@ def _run_with_chunks(tmp_path, monkeypatch, chunks, *, invoke_cli=False):
     else:
         cli_main.run_analysis()
     return display
+
+
+@pytest.mark.unit
+def test_cli_terminal_audit_matches_equivalent_programmatic_publication(
+    tmp_path,
+    monkeypatch,
+):
+    from tradingagents.terminal_contract import apply_terminal_contract
+
+    outcome = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+    )
+    rendered_outcome = render_analysis_outcome(outcome)
+    initial_state = {
+        "company_of_interest": "601658.SS",
+        "ticker": "601658.SS",
+        "trade_date": "2026-07-09",
+        "asset_type": "stock",
+        "evidence_state": EvidenceState().model_dump(mode="json"),
+        "decision_audit_created_at": "2026-07-09T00:00:00Z",
+    }
+    terminal_chunk = {
+        "messages": [],
+        "analysis_outcome": rendered_outcome,
+        "analysis_outcome_contract": outcome.model_dump(mode="json"),
+    }
+
+    _run_with_chunks(
+        tmp_path / "cli",
+        monkeypatch,
+        [terminal_chunk],
+        initial_state=initial_state,
+    )
+    cli_audit_path = next((tmp_path / "cli").rglob("decision-audit.json"))
+    cli_audit = json.loads(cli_audit_path.read_text(encoding="utf-8"))
+
+    programmatic_state = {**initial_state, **terminal_chunk}
+    programmatic_state.update(
+        {
+            "evidence_gate_mode": "enforce",
+            "configuration_digest": cli_audit["run"]["configuration_digest"],
+        }
+    )
+    apply_terminal_contract(programmatic_state)
+    write_report_tree(
+        programmatic_state,
+        "601658.SS",
+        tmp_path / "programmatic",
+    )
+    programmatic_audit_path = next(
+        (tmp_path / "programmatic").rglob("decision-audit.json")
+    )
+    programmatic_audit = json.loads(
+        programmatic_audit_path.read_text(encoding="utf-8")
+    )
+
+    assert cli_audit["terminal"] == programmatic_audit["terminal"]
+    assert cli_audit["run"] == programmatic_audit["run"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("evidence_gate_mode", ("enforce", "shadow"))
+def test_cli_audit_preserves_configured_evidence_gate_mode(
+    tmp_path,
+    monkeypatch,
+    evidence_gate_mode,
+):
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [{
+            "messages": [],
+            "analysis_outcome": _INSUFFICIENT_OUTCOME,
+            "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+        }],
+        evidence_gate_mode=evidence_gate_mode,
+    )
+
+    audit_path = next(tmp_path.rglob("decision-audit.json"))
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["run"]["evidence_gate_mode"] == evidence_gate_mode
 
 
 @pytest.mark.unit
@@ -133,6 +250,8 @@ def test_run_analysis_attributes_tool_before_same_chunk_status_advance(
         {
             "messages": [tool_message],
             "market_report": "Market report body",
+            "analysis_outcome": _INSUFFICIENT_OUTCOME,
+            "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
         }
     ]
 
@@ -141,8 +260,14 @@ def test_run_analysis_attributes_tool_before_same_chunk_status_advance(
             yield from chunks
 
     class FakePropagator:
-        def create_initial_state(self, *args, **kwargs):
-            return {}
+        def create_initial_state(self, company_name, trade_date, **kwargs):
+            return {
+                "messages": [("human", company_name)],
+                "company_of_interest": company_name,
+                "trade_date": str(trade_date),
+                "asset_type": kwargs.get("asset_type", "stock"),
+                "evidence_state": EvidenceState().model_dump(mode="json"),
+            }
 
         def get_graph_args(self, *args, **kwargs):
             return {}
@@ -211,7 +336,18 @@ def test_debate_only_chunks_emit_progress_without_finalized_report_artifacts(
         },
     }
 
-    display = _run_with_chunks(tmp_path, monkeypatch, [debate_state])
+    display = _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            debate_state,
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            },
+        ],
+    )
 
     assert ("Research", "Bull Researcher updated investment debate") in display.events
     assert ("Risk", "Aggressive Analyst updated risk debate") in display.events
@@ -252,7 +388,8 @@ def test_finalized_reports_are_published_exactly_before_stream_exhaustion(
             "judge_decision": "Provisional risk judge text",
             "count": 1,
         },
-        "final_trade_decision": "**Rating**: Underweight\n\nReduce exposure.",
+        "analysis_outcome": _INSUFFICIENT_OUTCOME,
+        "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
     }
 
     display = _run_with_chunks(tmp_path, monkeypatch, [finalized_state])
@@ -260,15 +397,11 @@ def test_finalized_reports_are_published_exactly_before_stream_exhaustion(
     finalized_calls = [
         call
         for call in display.report_calls
-        if call[0] in {"investment_plan", "final_trade_decision"}
+        if call[0] in {"investment_plan", "analysis_outcome"}
     ]
     assert [(call[0], call[1], call[3]) for call in finalized_calls] == [
         ("investment_plan", "**Recommendation**: Underweight", False),
-        (
-            "final_trade_decision",
-            "**Rating**: Underweight\n\nReduce exposure.",
-            False,
-        ),
+        ("analysis_outcome", _INSUFFICIENT_OUTCOME, False),
     ]
 
 
@@ -277,10 +410,7 @@ def test_blocked_analysis_outcome_is_published_and_saved_without_decision(
     tmp_path,
     monkeypatch,
 ):
-    outcome = (
-        "**Analysis Outcome:** Insufficient Evidence\n\n"
-        "No Trading Decision was issued."
-    )
+    outcome = _INSUFFICIENT_OUTCOME
 
     display = _run_with_chunks(
         tmp_path,
@@ -290,6 +420,7 @@ def test_blocked_analysis_outcome_is_published_and_saved_without_decision(
                 "messages": [],
                 "market_report": "Market report body",
                 "analysis_outcome": outcome,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
             }
         ],
     )
@@ -302,9 +433,13 @@ def test_blocked_analysis_outcome_is_published_and_saved_without_decision(
         call for call in display.report_calls if call[0] == "final_trade_decision"
     ]
     run_dir = next(tmp_path.rglob("run_status.json")).parent
-    assert (
+    saved_outcome = (
         run_dir / "reports" / "5_portfolio" / "analysis_outcome.md"
-    ).read_text(encoding="utf-8") == outcome
+    ).read_text(encoding="utf-8")
+    assert outcome in saved_outcome
+    assert "Source Availability Coverage" in saved_outcome
+    assert "Validated Fact Coverage" in saved_outcome
+    assert "Decision Assertion Coverage" in saved_outcome
     assert not (run_dir / "reports" / "5_portfolio" / "decision.md").exists()
 
 
@@ -313,17 +448,18 @@ def test_blocked_cli_report_enforces_boundary_across_streamed_state_deltas(
     tmp_path,
     monkeypatch,
 ):
-    outcome = (
-        "**Analysis Outcome:** Insufficient Evidence\n\n"
-        "No Trading Decision was issued."
-    )
+    outcome = _INSUFFICIENT_OUTCOME
 
     _run_with_chunks(
         tmp_path,
         monkeypatch,
         [
             {"messages": [], "market_report": "Market report body"},
-            {"messages": [], "analysis_outcome": outcome},
+            {
+                "messages": [],
+                "analysis_outcome": outcome,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            },
         ],
     )
 
@@ -362,7 +498,8 @@ def test_repeated_full_state_writes_each_finalized_report_once(tmp_path, monkeyp
             "judge_decision": "Provisional risk judge text",
             "count": 3,
         },
-        "final_trade_decision": "**Rating**: Underweight\n\nReduce exposure.",
+        "analysis_outcome": _INSUFFICIENT_OUTCOME,
+        "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
     }
 
     display = _run_with_chunks(tmp_path, monkeypatch, [full_state, full_state])
@@ -376,22 +513,21 @@ def test_repeated_full_state_writes_each_finalized_report_once(tmp_path, monkeyp
         ("investment_plan", "**Recommendation**: Underweight")
     ) == 1
     assert report_calls.count(("trader_investment_plan", "**Action**: Sell")) == 1
-    assert report_calls.count(
-        ("final_trade_decision", "**Rating**: Underweight\n\nReduce exposure.")
-    ) == 1
+    assert report_calls.count(("analysis_outcome", _INSUFFICIENT_OUTCOME)) == 1
     assert len(report_calls) == 4
 
     assert ("Research", "Research Manager produced investment plan") in display.events
-    assert ("Portfolio", "Final decision ready: Underweight") in display.events
+    assert (
+        "Portfolio",
+        "Analysis completed without a Trading Decision",
+    ) in display.events
 
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     log_text = (run_dir / "message_tool.log").read_text(encoding="utf-8")
     assert log_text.count("Market report body") == 1
     assert "[Research] Research Manager produced investment plan" in log_text
-    assert "[Portfolio] Final decision ready: Underweight" in log_text
-    assert (run_dir / "reports" / "market_report.md").read_text(
-        encoding="utf-8"
-    ) == "Market report body"
+    assert "[Portfolio] Analysis completed without a Trading Decision" in log_text
+    assert not (run_dir / "reports" / "market_report.md").exists()
 
 
 @pytest.mark.unit
@@ -416,7 +552,14 @@ def test_run_analysis_emits_bounded_logs_artifacts_and_runtime_metrics(
     _run_with_chunks(
         tmp_path,
         monkeypatch,
-        [{"messages": [tool_message], "market_report": "Market report body"}],
+        [
+            {
+                "messages": [tool_message],
+                "market_report": "Market report body",
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
     )
 
     run_dir = next(tmp_path.rglob("run_status.json")).parent
@@ -453,7 +596,14 @@ def test_run_analysis_artifactizes_complete_tool_results(tmp_path, monkeypatch):
     _run_with_chunks(
         tmp_path,
         monkeypatch,
-        [{"messages": [result_message], "market_report": "Market report body"}],
+        [
+            {
+                "messages": [result_message],
+                "market_report": "Market report body",
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
     )
 
     run_dir = next(tmp_path.rglob("run_status.json")).parent
@@ -480,7 +630,14 @@ def test_cli_without_subcommand_preserves_default_analysis(tmp_path, monkeypatch
     _run_with_chunks(
         tmp_path,
         monkeypatch,
-        [{"messages": [], "market_report": "Market report body"}],
+        [
+            {
+                "messages": [],
+                "market_report": "Market report body",
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
         invoke_cli=True,
     )
 
@@ -515,7 +672,11 @@ def test_runtime_metrics_attribute_each_post_analyst_graph_phase(
                     "aggressive_history": "Aggressive Analyst: reduce risk",
                 },
             },
-            {"messages": [], "final_trade_decision": "**Rating**: Hold"},
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            },
         ],
     )
 

@@ -24,6 +24,10 @@ from tradingagents.agents.utils.news_data_tools import (
 from tradingagents.agents.utils.prediction_markets_tools import get_prediction_markets
 from tradingagents.agents.utils.technical_indicators_tools import get_indicators
 from tradingagents.dataflows.akshare_data import get_china_a_identity
+from tradingagents.dataflows.instrument_identity import (
+    IdentityRegistryAvailable,
+    resolve_authoritative_instrument_identity,
+)
 
 # Public surface: the data tools are imported here so agents and the graph
 # import them from one place, plus the instrument/language helpers defined below.
@@ -78,7 +82,7 @@ def _clean_identity_value(value: Any) -> str | None:
 
 @functools.lru_cache(maxsize=256)
 def resolve_instrument_identity(ticker: str) -> dict:
-    """Resolve deterministic identity metadata (company name, sector, …) for a ticker.
+    """Resolve authoritative identity plus best-effort descriptive enrichment.
 
     This exists to stop the pipeline from hallucinating a *different* company
     when a chart pattern suggests a different industry than the real one
@@ -86,28 +90,40 @@ def resolve_instrument_identity(ticker: str) -> dict:
     the price action to a narrative and invent an identity that then cascaded
     through every downstream agent.
 
-    Best-effort by design: if yfinance is unavailable, rate-limited, or doesn't
-    recognise the ticker, we return ``{}`` and the caller falls back to
-    ticker-only context rather than failing before analysis starts. Cached so
-    the lookup happens at most once per ticker per process.
+    Canonical symbol, venue, kind, currency, and provenance can come only from
+    the configured digest-pinned registry. Yahoo and AKShare metadata may enrich
+    the prompt, but cannot upgrade an unresolved ticker into authoritative
+    identity. Cached so provider enrichment happens at most once per ticker per
+    process.
 
     The symbol is normalized first (e.g. ``XAUUSD`` -> ``GC=F``) so identity
     resolves for the same instrument the price path actually fetches (#983).
     """
-    from tradingagents.dataflows.symbol_utils import normalize_symbol
+    from tradingagents.dataflows.symbol_utils import (
+        normalize_symbol,
+        resolve_mainland_instrument,
+    )
 
+    registry_result = resolve_authoritative_instrument_identity(ticker)
+    identity: dict[str, object] = {}
+    if isinstance(registry_result, IdentityRegistryAvailable):
+        identity.update(registry_result.identity.as_mapping())
+        identity["exchange"] = registry_result.identity.venue
+
+    provider_identity: dict[str, str] = {}
+    yahoo_failed = False
     try:
         info = yf.Ticker(normalize_symbol(ticker)).info or {}
     except Exception as exc:  # noqa: BLE001 — fail open, never block the run
         logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)
-        return {}
+        info = {}
+        yahoo_failed = True
 
-    identity: dict[str, str] = {}
     company_name = _clean_identity_value(info.get("longName")) or _clean_identity_value(
         info.get("shortName")
     )
     if company_name:
-        identity["company_name"] = company_name
+        provider_identity["company_name"] = company_name
     for source_key, target_key in (
         ("sector", "sector"),
         ("industry", "industry"),
@@ -116,9 +132,26 @@ def resolve_instrument_identity(ticker: str) -> dict:
     ):
         value = _clean_identity_value(info.get(source_key))
         if value:
-            identity[target_key] = value
-    if not identity:
-        identity.update(get_china_a_identity(ticker))
+            provider_identity[target_key] = value
+
+    # Continue the mainland enrichment fallback after Yahoo exceptions (and
+    # when Yahoo supplied no descriptive fields). Prefix/suffix routing only
+    # decides whether this enrichment is applicable; it supplies no authority.
+    if resolve_mainland_instrument(ticker) is not None and (
+        yahoo_failed or not provider_identity
+    ):
+        try:
+            mainland_enrichment = get_china_a_identity(ticker)
+        except Exception as exc:  # noqa: BLE001 — descriptive enrichment is optional
+            logger.debug("Could not enrich mainland identity for %s: %s", ticker, exc)
+        else:
+            for key in ("company_name", "sector", "industry", "exchange"):
+                value = _clean_identity_value(mainland_enrichment.get(key))
+                if value:
+                    provider_identity.setdefault(key, value)
+
+    for key, value in provider_identity.items():
+        identity.setdefault(key, value)
     return identity
 
 
@@ -136,10 +169,21 @@ def build_instrument_context(
     """
     is_crypto = asset_type == "crypto"
     instrument_label = "asset" if is_crypto else "instrument"
+    canonical_symbol = (
+        str(identity.get("canonical_symbol"))
+        if identity and identity.get("canonical_symbol")
+        else ticker
+    )
+    if canonical_symbol == ticker:
+        symbol_context = f"The {instrument_label} to analyze is `{ticker}`."
+    else:
+        symbol_context = (
+            f"The requested {instrument_label} `{ticker}` has authoritative canonical "
+            f"symbol `{canonical_symbol}`."
+        )
     context = (
-        f"The {instrument_label} to analyze is `{ticker}`. "
-        "Use this exact ticker in every tool call, report, and recommendation, "
-        "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`, `-USD`)."
+        f"{symbol_context} Use `{canonical_symbol}` in every tool call, report, and "
+        "recommendation, preserving its exchange suffix."
     )
 
     details = []
@@ -156,6 +200,10 @@ def build_instrument_context(
             details.append(f"Industry: {industry}")
         if identity.get("exchange"):
             details.append(f"Exchange: {identity['exchange']}")
+        if identity.get("instrument_kind"):
+            details.append(f"Instrument kind: {identity['instrument_kind']}")
+        if identity.get("currency"):
+            details.append(f"Currency: {identity['currency']}")
 
     if details:
         context += (

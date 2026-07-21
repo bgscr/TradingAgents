@@ -33,8 +33,8 @@ from tradingagents.agents.schemas import SentimentReport, render_sentiment_repor
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
-    get_news,
 )
+from tradingagents.agents.utils.news_data_tools import acquire_news, get_news_legacy
 from tradingagents.agents.utils.structured import (
     bind_required_structured,
     invoke_required_structured,
@@ -42,8 +42,15 @@ from tradingagents.agents.utils.structured import (
 from tradingagents.dataflows.china_a_enhancements import get_china_a_enhancements_for_categories
 from tradingagents.dataflows.china_sentiment import get_china_a_local_sentiment
 from tradingagents.dataflows.config import get_config
-from tradingagents.dataflows.reddit import fetch_reddit_posts
-from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.reddit import (
+    DEFAULT_SUBREDDITS,
+    acquire_reddit_posts,
+    fetch_reddit_posts,
+)
+from tradingagents.dataflows.stocktwits import (
+    acquire_stocktwits_messages,
+    fetch_stocktwits_messages,
+)
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 from tradingagents.evidence import (
     EvidenceSource,
@@ -54,8 +61,10 @@ from tradingagents.evidence import (
     merge_claim_validations,
     merge_evidence_sources,
     merge_material_claims,
+    merge_source_acquisition_outcomes,
     merge_source_artifacts,
     merge_source_facts,
+    stable_acquisition_source_ref,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,8 +94,16 @@ def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
 
 
-def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> dict[str, str]:
-    news_block = get_news.func(ticker, start_date, end_date)
+def _collect_sentiment_blocks(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    news_block: str | None = None,
+    stocktwits_block: str | None = None,
+    reddit_block: str | None = None,
+) -> dict[str, str]:
+    if news_block is None:
+        news_block = get_news_legacy(ticker, start_date, end_date)
     if resolve_china_a_symbol(ticker) is not None:
         local_sentiment = get_china_a_local_sentiment(ticker, start_date, end_date)
         preset = get_config().get("china_a_enhancement_preset", "basic")
@@ -124,8 +141,12 @@ def _collect_sentiment_blocks(ticker: str, start_date: str, end_date: str) -> di
 
     return {
         "news_block": news_block,
-        "stocktwits_block": fetch_stocktwits_messages(ticker, limit=30),
-        "reddit_block": fetch_reddit_posts(ticker),
+        "stocktwits_block": stocktwits_block
+        if stocktwits_block is not None
+        else fetch_stocktwits_messages(ticker, limit=30),
+        "reddit_block": reddit_block
+        if reddit_block is not None
+        else fetch_reddit_posts(ticker),
         "local_sentiment_block": "",
     }
 
@@ -134,25 +155,77 @@ def _evidence_for_blocks(
     ticker: str,
     blocks: dict[str, str],
     claims: tuple[MaterialClaim, ...] = (),
+    news_acquisition=None,
+    stocktwits_acquisition=None,
+    reddit_acquisition=None,
 ) -> EvidenceState:
     is_china = resolve_china_a_symbol(ticker) is not None
-    source_blocks = [
-        ("sentiment.news", blocks["news_block"]),
-        (
-            "sentiment.china_local" if is_china else "sentiment.stocktwits",
-            blocks["local_sentiment_block"] if is_china else blocks["stocktwits_block"],
-        ),
-    ]
-    if not is_china:
+    source_blocks = []
+    if news_acquisition is None:
+        source_blocks.append(("sentiment.news", blocks["news_block"]))
+    if not is_china and stocktwits_acquisition is None:
+        source_blocks.append(("sentiment.stocktwits", blocks["stocktwits_block"]))
+    if not is_china and reddit_acquisition is None:
         source_blocks.append(("sentiment.reddit", blocks["reddit_block"]))
 
     source_text_by_ref: dict[str, str | None] = {}
     for source_id, block in source_blocks:
-        normalized = block.strip().upper()
-        source_text_by_ref[source_id] = (
-            None if not normalized or "UNAVAILABLE" in normalized else block
-        )
-    return build_inline_evidence_state(source_text_by_ref, claims)
+        source_text_by_ref[source_id] = block if block.strip() else None
+    direct_acquisitions = (
+        ("sentiment.news", "acquired_news", news_acquisition),
+        ("sentiment.stocktwits", "acquired_stocktwits", stocktwits_acquisition),
+        ("sentiment.reddit", "acquired_reddit", reddit_acquisition),
+    )
+    direct_acquisitions = tuple(
+        item for item in direct_acquisitions if item[2] is not None
+    )
+    inline_evidence = build_inline_evidence_state(
+        source_text_by_ref,
+        claims,
+        source_artifact_by_ref={
+            source_id: acquisition.artifact
+            for source_id, _, acquisition in direct_acquisitions
+            if acquisition.artifact is not None
+        },
+    )
+    if not direct_acquisitions:
+        return inline_evidence
+    return inline_evidence.model_copy(
+        update={
+            "sources": (
+                *inline_evidence.sources,
+                *(
+                    EvidenceSource(
+                        source_id=source_id,
+                        status=(
+                            EvidenceStatus.AVAILABLE
+                            if acquisition.artifact is not None
+                            else EvidenceStatus.UNAVAILABLE
+                        ),
+                        required=True,
+                        detail=detail,
+                    )
+                    for source_id, detail, acquisition in direct_acquisitions
+                ),
+            ),
+            "source_artifacts": (
+                *inline_evidence.source_artifacts,
+                *(
+                    acquisition.artifact
+                    for _, _, acquisition in direct_acquisitions
+                    if acquisition.artifact is not None
+                ),
+            ),
+            "acquisition_outcomes": (
+                *inline_evidence.acquisition_outcomes,
+                *(
+                    outcome
+                    for _, _, acquisition in direct_acquisitions
+                    for outcome in acquisition.outcomes
+                ),
+            ),
+        }
+    )
 
 
 def create_sentiment_analyst(llm):
@@ -174,10 +247,88 @@ def create_sentiment_analyst(llm):
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
 
-        # Pre-fetch sources. Each fetcher degrades gracefully and
-        # returns a string (no exceptions surface from here), so the LLM
-        # always sees something — either real data or a clear placeholder.
-        blocks = _collect_sentiment_blocks(ticker, start_date, end_date)
+        news_source_ref = stable_acquisition_source_ref(
+            "sentiment.news", ticker, start_date, end_date
+        )
+        news_acquisition = acquire_news(
+            ticker,
+            start_date,
+            end_date,
+            tool_call_id=f"sentiment-news:{news_source_ref}",
+            source_ref=news_source_ref,
+            capability="sentiment_news",
+        )
+        news_block = news_acquisition.value
+        if news_block is None:
+            reason = (
+                news_acquisition.outcomes[-1].reason.value
+                if news_acquisition.outcomes
+                else "provider_error"
+            )
+            news_block = f"DATA_UNAVAILABLE: news acquisition unavailable ({reason})."
+
+        stocktwits_acquisition = None
+        stocktwits_block = None
+        if resolve_china_a_symbol(ticker) is None:
+            stocktwits_source_ref = stable_acquisition_source_ref(
+                "sentiment.stocktwits", ticker, 30
+            )
+            stocktwits_acquisition = acquire_stocktwits_messages(
+                ticker,
+                30,
+                tool_call_id=f"sentiment-stocktwits:{stocktwits_source_ref}",
+                source_ref=stocktwits_source_ref,
+                capability="sentiment_stocktwits",
+            )
+            stocktwits_block = stocktwits_acquisition.value
+            if stocktwits_block is None:
+                reason = (
+                    stocktwits_acquisition.outcomes[-1].reason.value
+                    if stocktwits_acquisition.outcomes
+                    else "provider_error"
+                )
+                stocktwits_block = (
+                    "DATA_UNAVAILABLE: StockTwits acquisition unavailable "
+                    f"({reason})."
+                )
+
+        reddit_acquisition = None
+        reddit_block = None
+        if resolve_china_a_symbol(ticker) is None:
+            reddit_source_ref = stable_acquisition_source_ref(
+                "sentiment.reddit", ticker, *DEFAULT_SUBREDDITS, 5
+            )
+            reddit_acquisition = acquire_reddit_posts(
+                ticker,
+                DEFAULT_SUBREDDITS,
+                5,
+                tool_call_id=f"sentiment-reddit:{reddit_source_ref}",
+                source_ref=reddit_source_ref,
+                capability="sentiment_reddit",
+            )
+            reddit_block = reddit_acquisition.value
+            if reddit_block is None:
+                reason = (
+                    reddit_acquisition.outcomes[-1].reason.value
+                    if reddit_acquisition.outcomes
+                    else "provider_error"
+                )
+                reddit_block = (
+                    "DATA_UNAVAILABLE: Reddit acquisition unavailable "
+                    f"({reason})."
+                )
+
+        # Render typed acquisition results into prompt blocks. Unavailable
+        # outcomes become prompt-only placeholders and remain diagnostics,
+        # never evidence artifacts or Source Facts.
+        blocks = _collect_sentiment_blocks(
+            ticker,
+            start_date,
+            end_date,
+            news_block,
+            stocktwits_block,
+            reddit_block,
+        )
 
         system_message = _build_system_message(
             ticker=ticker,
@@ -242,7 +393,14 @@ def create_sentiment_analyst(llm):
             required=True,
             detail=failure_reason or "direct_structured",
         )
-        inline_evidence = _evidence_for_blocks(ticker, blocks, material_claims)
+        inline_evidence = _evidence_for_blocks(
+            ticker,
+            blocks,
+            material_claims,
+            news_acquisition=news_acquisition,
+            stocktwits_acquisition=stocktwits_acquisition,
+            reddit_acquisition=reddit_acquisition,
+        )
         if material_claims or inline_evidence.sources:
             try:
                 merged_evidence = merge_material_claims(
@@ -260,6 +418,10 @@ def create_sentiment_analyst(llm):
                 merged_evidence = merge_claim_validations(
                     merged_evidence,
                     inline_evidence.claim_validations,
+                )
+                merged_evidence = merge_source_acquisition_outcomes(
+                    merged_evidence,
+                    inline_evidence.acquisition_outcomes,
                 )
             except ValueError:
                 merged_evidence = EvidenceState.model_validate(
@@ -296,6 +458,7 @@ def _build_system_message(
         local_section = f"""
 ### China A-share local sentiment — AKShare/Eastmoney
 Mainland-market retail attention, stock comment, and northbound-holding context. This section replaces US-centric retail/social sources when the ticker is a China A-share.
+This block is advisory context only because its provider calls do not yet emit run-owned acquisition artifacts. Do not cite `sentiment.china_local` in material_claims; use it only in the advisory narrative.
 
 <start_of_china_local_sentiment>
 {local_sentiment_block}
@@ -340,7 +503,7 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, Reddit was rate-limited, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If a source is marked skipped or not applicable for China A-shares, do not count it as a data failure; rely on the China A-share local sentiment block instead.
+6. **Be honest about data limits.** If StockTwits returned only a handful of messages, Reddit was rate-limited, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If a source is marked skipped or not applicable for China A-shares, do not count it as a data failure; the China A-share local sentiment block may inform advisory narrative but is not material evidence.
 
 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
 
@@ -354,7 +517,7 @@ Fill the following fields:
 - **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
 - **confidence**: low / medium / high, based on data quality and sample size.
 - **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
-- **material_claims**: Decision-relevant factual premises only. Each claim contains only claim_id, statement, one source_ref, and source_quote. Every claim_id must be unique within this report and must begin with `sentiment.` (for example, `sentiment.local_attention`). Copy source_ref exactly from sentiment.news, sentiment.stocktwits, sentiment.reddit, or sentiment.china_local as applicable above; never cite a skipped or unavailable source. Each source_quote must copy one exact contiguous source-language phrase from the cited source block. The statement may be a localized paraphrase, but source_quote must not be translated or rewritten.
+- **material_claims**: Decision-relevant factual premises only. Each claim contains only claim_id, statement, one source_ref, and source_quote. Every claim_id must be unique within this report and must begin with `sentiment.` (for example, `sentiment.news_guidance`). Copy source_ref exactly from sentiment.news, sentiment.stocktwits, or sentiment.reddit as applicable above; never cite a skipped, unavailable, or advisory-only source. In particular, never cite sentiment.china_local until it has run-owned acquisition provenance. Each source_quote must copy one exact contiguous source-language phrase from the cited source block. The statement may be a localized paraphrase, but source_quote must not be translated or rewritten.
 
 {get_language_instruction()}"""
 

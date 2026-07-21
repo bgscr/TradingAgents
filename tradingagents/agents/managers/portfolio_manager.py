@@ -25,13 +25,15 @@ from tradingagents.agents.utils.structured import (
 )
 from tradingagents.evidence import (
     AnalysisOutcome,
+    AnalysisOutcomeReason,
     DecisionGateResult,
     DraftThesis,
     EvidenceReadiness,
     EvidenceState,
+    analysis_diagnostic_codes,
+    analysis_outcome_publication,
     decision_ready_material_claims,
     evaluate_decision_gate,
-    render_analysis_outcome,
 )
 
 
@@ -261,18 +263,14 @@ def _blocked_result(
 ) -> dict[str, Any]:
     outcome = AnalysisOutcome(
         readiness=gate.readiness,
-        summary=(
-            "Analysis completed without a Trading Decision because the "
-            "Portfolio Manager could not produce a decision-ready evidence chain."
-        ),
-        diagnostics=gate.diagnostics,
-        evidence_coverage=gate.evidence_coverage,
+        reason=AnalysisOutcomeReason.PORTFOLIO_GATE_BLOCKED,
+        diagnostic_codes=analysis_diagnostic_codes(gate.diagnostics),
     )
     return {
         **audit_fields,
         "draft_thesis": draft.model_dump(mode="json"),
         "decision_gate": gate.model_dump(mode="json"),
-        "analysis_outcome": render_analysis_outcome(outcome),
+        **analysis_outcome_publication(outcome),
     }
 
 
@@ -351,19 +349,25 @@ def create_portfolio_manager(llm, evidence_gate_mode: str = "enforce"):
                     else ()
                 ),
             )
-            gate = evaluate_decision_gate(draft, evidence)
-            final_decision = (
-                "> **Evidence Gate:** UNENFORCED (shadow mode)\n"
-                "> This Trading Decision was produced with the explicit legacy "
-                "override and was not fail-closed by the evidence gates.\n\n"
-                + rendered
+            gate = _classified_gate_failure(
+                evaluate_decision_gate(draft, evidence),
+                "Shadow evidence mode is diagnostic-only and cannot publish direction.",
+            )
+            outcome = AnalysisOutcome(
+                readiness=gate.readiness,
+                reason=AnalysisOutcomeReason.SHADOW_MODE_BLOCKED,
+                diagnostic_codes=analysis_diagnostic_codes(gate.diagnostics),
             )
             return {
-                "risk_debate_state": _risk_state_with_decision(state, final_decision),
-                "final_trade_decision": final_decision,
-                "draft_thesis": draft.model_dump(mode="json"),
                 "decision_gate": gate.model_dump(mode="json"),
+                **analysis_outcome_publication(outcome),
                 "evidence_gate_mode": "shadow",
+                "shadow_diagnostics": {
+                    "status": "non_directional",
+                    "model_output_kind": (
+                        "structured" if captured_decision is not None else "free_text"
+                    ),
+                },
             }
 
         initial_result = invoke_required_structured(

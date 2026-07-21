@@ -18,6 +18,7 @@ from tradingagents.agents.utils.structured import (
 from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
     get_active_authoritative_market_snapshot,
+    get_active_market_snapshot_acquisition_record,
 )
 from tradingagents.evidence import (
     AnalystEvidenceReport,
@@ -26,10 +27,12 @@ from tradingagents.evidence import (
     EvidenceStatus,
     MarketSnapshotEvidence,
     MaterialClaim,
+    ToolExecutionEvidenceEnvelope,
     build_tool_evidence_state,
     merge_claim_validations,
     merge_evidence_sources,
     merge_material_claims,
+    merge_source_acquisition_outcomes,
     merge_source_artifacts,
     merge_source_facts,
 )
@@ -107,6 +110,17 @@ def _source_ref(
     called_date = args.get("curr_date", args.get("end_date"))
     if called_date is not None and str(called_date) != str(trade_date):
         return None
+    raw_envelope = getattr(message, "artifact", None)
+    if raw_envelope is None and isinstance(message, Mapping):
+        raw_envelope = message.get("artifact")
+    if raw_envelope is not None:
+        try:
+            envelope = ToolExecutionEvidenceEnvelope.model_validate(raw_envelope)
+        except (TypeError, ValidationError, ValueError):
+            return None
+        if envelope.tool_call_id != str(tool_call_id) or envelope.tool_name != tool_name:
+            return None
+        return envelope.source_ref
     if tool_name in {"get_verified_market_snapshot", "get_indicators"}:
         snapshot_match = re.search(
             r"(?mi)^#?\s*Snapshot ID:\s*(snapshot:[0-9a-f]{64})\s*$",
@@ -451,6 +465,18 @@ def build_analyst_update(
                 )
             }
         )
+        snapshot_record = get_active_market_snapshot_acquisition_record(
+            str(state["company_of_interest"]),
+            str(state["trade_date"]),
+        )
+        if snapshot_record is not None:
+            if snapshot_record.source_artifact is not None:
+                evidence = merge_source_artifacts(
+                    evidence, (snapshot_record.source_artifact,)
+                )
+            evidence = merge_source_acquisition_outcomes(
+                evidence, snapshot_record.outcomes
+            )
     try:
         evidence = merge_material_claims(
             evidence,
@@ -460,6 +486,10 @@ def build_analyst_update(
         evidence = merge_source_artifacts(
             evidence,
             tool_evidence.source_artifacts,
+        )
+        evidence = merge_source_acquisition_outcomes(
+            evidence,
+            tool_evidence.acquisition_outcomes,
         )
         evidence = merge_claim_validations(evidence, tool_evidence.claim_validations)
     except ValueError:

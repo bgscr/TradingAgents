@@ -18,6 +18,7 @@ from tradingagents.dataflows import (
     stockstats_utils,
     y_finance,
 )
+from tradingagents.dataflows.acquisition import AcquisitionFailure
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.market_snapshot import (
@@ -27,6 +28,7 @@ from tradingagents.dataflows.market_snapshot import (
     build_authoritative_indicator_window,
     get_authoritative_market_snapshot,
 )
+from tradingagents.evidence import AcquisitionUnavailableReason
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 
@@ -40,6 +42,165 @@ def _valid_history(rows: int) -> pd.DataFrame:
         "Close": [10.0] * rows,
         "Volume": [1_000_000] * rows,
     })
+
+
+@pytest.mark.unit
+def test_snapshot_preserves_rate_limit_before_ordered_secondary_success(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "primary,secondary"},
+        }
+    })
+
+    def rate_limited(*_args):
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.RATE_LIMITED,
+            status_code=429,
+            retry_after_seconds=3,
+        )
+
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "primary": SnapshotProvider(rate_limited, "qfq"),
+            "secondary": SnapshotProvider(lambda *_args: _valid_history(10), "qfq"),
+        },
+    )
+
+    with authoritative_snapshot_run():
+        snapshot = get_authoritative_market_snapshot(
+            "510500.SS", "2026-06-01", "2026-07-18"
+        )
+
+    assert snapshot.provider == "secondary"
+    assert [outcome.outcome for outcome in snapshot.acquisition_outcomes] == [
+        "unavailable",
+        "available",
+    ]
+    primary = snapshot.acquisition_outcomes[0]
+    assert primary.provider == "primary"
+    assert primary.reason is AcquisitionUnavailableReason.RATE_LIMITED
+    assert primary.retry_after_seconds == 3
+    assert snapshot.acquisition_outcomes[1].provider == "secondary"
+    assert snapshot.source_artifact is snapshot.acquisition_outcomes[1].artifact
+    assert snapshot.source_artifact.tool_name == (
+        "authoritative_market_snapshot_normalized_frame_v1"
+    )
+    assert snapshot.source_artifact.artifact_sha256 == snapshot.frame_sha256
+
+
+@pytest.mark.unit
+def test_snapshot_selects_largest_valid_short_candidate_without_malforming_it(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "first,largest,last"},
+        }
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "first": SnapshotProvider(lambda *_args: _valid_history(8), "qfq"),
+            "largest": SnapshotProvider(lambda *_args: _valid_history(12), "qfq"),
+            "last": SnapshotProvider(lambda *_args: _valid_history(12), "qfq"),
+        },
+    )
+
+    with authoritative_snapshot_run():
+        snapshot = get_authoritative_market_snapshot(
+            "510500.SS",
+            "2026-06-01",
+            "2026-07-18",
+            minimum_history_rows=20,
+        )
+
+    assert snapshot.provider == "largest"
+    assert len(snapshot.frame) == 12
+    assert [outcome.outcome for outcome in snapshot.acquisition_outcomes] == [
+        "available",
+        "available",
+        "available",
+    ]
+    assert "largest" not in {item.provider for item in snapshot.quarantined}
+
+
+@pytest.mark.unit
+def test_snapshot_run_circuit_survives_request_range_variants(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "primary,secondary"},
+        }
+    })
+    primary_calls = []
+
+    def rate_limited(*args):
+        primary_calls.append(args)
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.RATE_LIMITED,
+            status_code=429,
+        )
+
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "primary": SnapshotProvider(rate_limited, "qfq"),
+            "secondary": SnapshotProvider(lambda *_args: _valid_history(10), "qfq"),
+        },
+    )
+
+    with authoritative_snapshot_run():
+        get_authoritative_market_snapshot(
+            "510500.SS", "2026-06-01", "2026-07-18"
+        )
+        second = get_authoritative_market_snapshot(
+            "510500.SS", "2026-05-01", "2026-07-18"
+        )
+
+    assert len(primary_calls) == 1
+    assert second.acquisition_outcomes[0].provider == "primary"
+    assert second.acquisition_outcomes[0].reason is (
+        AcquisitionUnavailableReason.CIRCUIT_OPEN
+    )
+    assert second.acquisition_outcomes[1].provider == "secondary"
+    assert second.acquisition_outcomes[1].outcome == "available"
+
+
+@pytest.mark.unit
+def test_unknown_configured_snapshot_provider_does_not_erase_later_known_provider(
+    monkeypatch,
+):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "unknown,known"},
+        }
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {"known": SnapshotProvider(lambda *_args: _valid_history(10), "qfq")},
+    )
+
+    with authoritative_snapshot_run():
+        snapshot = get_authoritative_market_snapshot(
+            "510500.SS", "2026-06-01", "2026-07-18"
+        )
+
+    assert snapshot.provider == "known"
+    assert snapshot.acquisition_outcomes[0].provider == "unknown"
+    assert snapshot.acquisition_outcomes[0].reason is (
+        AcquisitionUnavailableReason.NOT_CONFIGURED
+    )
+    assert snapshot.acquisition_outcomes[0].diagnostic == (
+        "not_configured code=provider_not_configured"
+    )
+    assert snapshot.acquisition_outcomes[1].provider == "known"
+    assert snapshot.acquisition_outcomes[1].outcome == "available"
 
 
 @pytest.mark.unit

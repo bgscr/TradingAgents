@@ -1,0 +1,3 @@
+# Route evidence and strategy by instrument kind
+
+Company-style `symbol + name` resolution incorrectly rejected the valid mainland ETF `510500.SS` and allowed a generic stock label to drive the rest of the workflow. Instrument Identity will instead require an authoritative canonical symbol, venue, instrument kind, currency, and provenance while treating display name as optional metadata. The instrument kind selects a Capability Profile that controls required evidence, analysts, and Strategy Rules, so funds use fund-specific benchmark, NAV, exposure, tracking, and liquidity semantics rather than inheriting company-fundamentals assumptions.

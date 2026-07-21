@@ -164,8 +164,17 @@ class StateProgressTracker:
                 trader_plan,
             )
 
+        analysis_outcome = _text(chunk.get("analysis_outcome"))
         final_decision = _text(chunk.get("final_trade_decision"))
-        if final_decision:
+        if analysis_outcome:
+            self._add(
+                events,
+                "Portfolio",
+                "Analysis completed without a Trading Decision",
+                "analysis_outcome",
+                analysis_outcome,
+            )
+        elif final_decision:
             self._add(
                 events,
                 "Portfolio",

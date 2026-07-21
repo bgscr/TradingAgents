@@ -41,6 +41,20 @@ class Propagator:
             "trade_date": str(trade_date),
             "past_context": past_context,
             "evidence_state": (evidence_state or EvidenceState()).model_dump(mode="json"),
+            # Gate and selector payloads stay JSON-compatible because LangGraph
+            # checkpoints serialize state independently of the in-memory models.
+            "evidence_preflight": {},
+            "admission_gate": {},
+            "analysis_outcome": "",
+            "analysis_outcome_contract": None,
+            "strategy_rule_applications": [],
+            "validated_decision_context": None,
+            "direction_selector_diagnostics": None,
+            "direction_selection": None,
+            "decision_gate": {},
+            "decision_gate_v2": {},
+            "trading_decision": None,
+            "final_trade_decision": None,
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",

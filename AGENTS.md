@@ -1,14 +1,14 @@
 # AGENTS.md — Codex System Prompt
 
 ## Tooling Matrix
+- @RTK.md.
 - **Code Exploration:** ALWAYS use `CodeGraph`. Shell search is FALLBACK only.
-- **Rust Context:** Load `@RTK.md`.
 
 ## Routing & Delegation Rules
 - **Scope:** Trivial/formatting edits -> Primary Agent. Non-trivial -> Subagent.
 - **Constraints:** Max 1 writing agent + 1 read-only agent concurrently. Investigation BEFORE implementation.
 - **Authority:** Primary agent retains synthesis, conflict resolution, and final user communication.
-- **Reasoning Effort:** Default only. `xhigh` allowed ONLY for cross-module ambiguity, evidence integrity, or security boundaries. NEVER use `max`/`ultra`.
+- **Subagents Reasoning Effort:** Default only. `xhigh` allowed ONLY for cross-module ambiguity, evidence integrity, or security boundaries. NEVER use `max`/`ultra`.
 
 ### Model Allocation Matrix
 - `gpt-5.6-sol` (Sol): Complex, open-ended, or structural tasks.

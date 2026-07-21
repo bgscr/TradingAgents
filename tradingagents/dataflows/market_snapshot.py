@@ -14,6 +14,14 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from stockstats import wrap
 
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    SourceAcquisitionOutcome,
+    SourceArtifact,
+    stable_acquisition_source_ref,
+)
+
+from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
 from .config import get_config
 from .errors import NoMarketDataError
 from .stockstats_utils import MAX_OHLCV_STALE_DAYS
@@ -51,6 +59,8 @@ class AuthoritativeMarketSnapshot:
     frame_sha256: str = ""
     snapshot_id: str = ""
     quarantined: tuple[QuarantinedSnapshot, ...] = ()
+    acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
+    source_artifact: SourceArtifact | None = None
 
     def __post_init__(self) -> None:
         frame_digest = self.frame_sha256 or _frame_sha256(self.frame)
@@ -67,16 +77,26 @@ class AuthoritativeMarketSnapshot:
         object.__setattr__(self, "snapshot_id", identity)
 
 
-def _frame_sha256(frame: pd.DataFrame) -> str:
+@dataclass(frozen=True)
+class MarketSnapshotAcquisitionRecord:
+    snapshot: AuthoritativeMarketSnapshot | None
+    outcomes: tuple[SourceAcquisitionOutcome, ...]
+    source_artifact: SourceArtifact | None
+
+
+def _normalized_frame_text(frame: pd.DataFrame) -> str:
     canonical = frame.copy()
     if "Date" in canonical:
         canonical["Date"] = pd.to_datetime(canonical["Date"]).dt.strftime("%Y-%m-%d")
-    encoded = canonical.to_csv(
+    return canonical.to_csv(
         index=False,
         lineterminator="\n",
         float_format="%.17g",
-    ).encode("utf-8")
-    return sha256(encoded).hexdigest()
+    )
+
+
+def _frame_sha256(frame: pd.DataFrame) -> str:
+    return sha256(_normalized_frame_text(frame).encode("utf-8")).hexdigest()
 
 
 def _snapshot_id(
@@ -111,6 +131,15 @@ class _AuthoritativeSnapshotRun:
     latest_snapshots: dict[tuple[str, str], AuthoritativeMarketSnapshot] = field(
         default_factory=dict
     )
+    acquisition_controller: AcquisitionController = field(
+        default_factory=lambda: AcquisitionController(providers=())
+    )
+    acquisition_records: dict[
+        tuple[str, str, str], MarketSnapshotAcquisitionRecord
+    ] = field(default_factory=dict)
+    latest_acquisition_records: dict[
+        tuple[str, str], MarketSnapshotAcquisitionRecord
+    ] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -133,6 +162,12 @@ def authoritative_snapshot_run():
         yield
     finally:
         _ACTIVE_SNAPSHOT_RUN.reset(token)
+
+
+def get_active_acquisition_controller() -> AcquisitionController | None:
+    """Return the controller owned by the active analysis run, when present."""
+    active = _ACTIVE_SNAPSHOT_RUN.get()
+    return None if active is None else active.acquisition_controller
 
 
 def _load_akshare(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -261,35 +296,116 @@ def _acquire_authoritative_market_snapshot(
 ) -> AuthoritativeMarketSnapshot:
     if minimum_history_rows < 1:
         raise ValueError("minimum_history_rows must be positive")
-    quarantined = []
-    insufficient_candidates = []
-    for provider_name in _provider_chain(symbol):
+    active = _ACTIVE_SNAPSHOT_RUN.get()
+    controller = (
+        active.acquisition_controller
+        if active is not None
+        else AcquisitionController(providers=())
+    )
+    provider_chain = _provider_chain(symbol)
+    validation_quarantine: dict[str, QuarantinedSnapshot] = {}
+    validated_frames: dict[str, pd.DataFrame] = {}
+
+    def load_and_validate(
+        provider_name: str, provider: SnapshotProvider
+    ) -> pd.DataFrame:
+        try:
+            raw_frame = provider.load(symbol, start_date, end_date)
+        except (NoMarketDataError, ValueError) as exc:
+            validation_quarantine[provider_name] = QuarantinedSnapshot(
+                provider_name,
+                str(exc),
+                tuple(getattr(exc, "row_indices", ())),
+            )
+            reason = (
+                AcquisitionUnavailableReason.NO_DATA
+                if isinstance(exc, NoMarketDataError)
+                else AcquisitionUnavailableReason.MALFORMED_RESPONSE
+            )
+            raise AcquisitionFailure(reason=reason) from exc
+        try:
+            validated = validate_ohlcv_frame(raw_frame, end_date, start_date)
+            validated_frames[provider_name] = validated
+            return validated
+        except ValueError as exc:
+            validation_quarantine[provider_name] = QuarantinedSnapshot(
+                provider_name,
+                str(exc),
+                tuple(getattr(exc, "row_indices", ())),
+            )
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE
+            ) from exc
+
+    provider_callables = []
+    for provider_name in provider_chain:
         provider = SNAPSHOT_PROVIDERS.get(provider_name)
         if provider is None:
-            continue
-        try:
-            frame = validate_ohlcv_frame(
-                provider.load(symbol, start_date, end_date), end_date, start_date
+            def not_configured(_request, provider_name=provider_name):
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
+                )
+
+            provider_callables.append((provider_name, not_configured))
+        else:
+            provider_callables.append(
+                (
+                    provider_name,
+                    lambda _request, provider_name=provider_name, provider=provider: (
+                        load_and_validate(provider_name, provider)
+                    ),
+                )
             )
-        except Exception as exc:  # noqa: BLE001 - invalid providers are quarantined
-            row_indices = getattr(exc, "row_indices", ())
-            quarantined.append(
-                QuarantinedSnapshot(provider_name, str(exc), tuple(row_indices))
-            )
-            continue
-        if len(frame) < minimum_history_rows:
-            rejection = QuarantinedSnapshot(
-                provider_name,
-                "insufficient history: "
-                f"{len(frame)} rows available; {minimum_history_rows} required",
-            )
-            quarantined.append(rejection)
-            insufficient_candidates.append(
-                (provider_name, provider, frame, rejection)
-            )
-            continue
+    providers = tuple(provider_callables)
+    source_ref = stable_acquisition_source_ref(
+        "market-snapshot",
+        symbol,
+        start_date,
+        end_date,
+    )
+    result = controller.acquire(
+        AcquisitionRequest(
+            capability="market_snapshot",
+            source_ref=source_ref,
+            tool_call_id=source_ref,
+            tool_name="authoritative_market_snapshot_normalized_frame_v1",
+        ),
+        providers=providers,
+        validator=lambda value: value,
+        serializer=_normalized_frame_text,
+        accept_candidate=lambda frame: len(frame) >= minimum_history_rows,
+        fallback_candidate_index=lambda frames: max(
+            range(len(frames)), key=lambda index: len(frames[index])
+        ),
+    )
+    if result.value is not None and result.artifact is not None:
+        provider_name = result.provider
+        assert provider_name is not None
+        provider = SNAPSHOT_PROVIDERS[provider_name]
+        frame = result.value
         effective_date = frame["Date"].max().strftime("%Y-%m-%d")
-        return AuthoritativeMarketSnapshot(
+        quarantined_items: list[QuarantinedSnapshot] = []
+        for outcome in result.outcomes:
+            if outcome.outcome == "unavailable":
+                quarantined_items.append(
+                    validation_quarantine.get(
+                        outcome.provider,
+                        QuarantinedSnapshot(outcome.provider, outcome.reason.value),
+                    )
+                )
+            elif outcome.provider != provider_name:
+                candidate = validated_frames[outcome.provider]
+                if len(candidate) < minimum_history_rows:
+                    quarantined_items.append(
+                        QuarantinedSnapshot(
+                            outcome.provider,
+                            "insufficient history: "
+                            f"{len(candidate)} rows available; "
+                            f"{minimum_history_rows} required",
+                        )
+                    )
+        quarantined = tuple(quarantined_items)
+        snapshot = AuthoritativeMarketSnapshot(
             symbol=symbol,
             frame=frame,
             provider=provider_name,
@@ -297,8 +413,45 @@ def _acquire_authoritative_market_snapshot(
             adjustment_basis=provider.adjustment_basis,
             requested_date=end_date,
             effective_trading_date=effective_date,
-            quarantined=tuple(quarantined),
+            quarantined=quarantined,
+            acquisition_outcomes=result.outcomes,
+            source_artifact=result.artifact,
         )
+        if active is not None:
+            record = MarketSnapshotAcquisitionRecord(
+                snapshot=snapshot,
+                outcomes=result.outcomes,
+                source_artifact=result.artifact,
+            )
+            key = (symbol, start_date, end_date)
+            active.acquisition_records[key] = record
+            latest_key = (symbol.strip().upper(), str(end_date))
+            latest = active.latest_acquisition_records.get(latest_key)
+            if (
+                latest is None
+                or latest.snapshot is None
+                or len(snapshot.frame) > len(latest.snapshot.frame)
+            ):
+                active.latest_acquisition_records[latest_key] = record
+        return snapshot
+    quarantined = [
+        validation_quarantine.get(
+            outcome.provider,
+            QuarantinedSnapshot(outcome.provider, outcome.reason.value),
+        )
+        for outcome in result.outcomes
+        if outcome.outcome == "unavailable"
+    ]
+    insufficient_candidates = []
+    if active is not None:
+        record = MarketSnapshotAcquisitionRecord(
+            snapshot=None,
+            outcomes=result.outcomes,
+            source_artifact=None,
+        )
+        active.acquisition_records[(symbol, start_date, end_date)] = record
+        latest_key = (symbol.strip().upper(), str(end_date))
+        active.latest_acquisition_records.setdefault(latest_key, record)
     if insufficient_candidates:
         # Preserve the best valid frame so admission can report the actual row
         # count when no provider meets the requirement. Exclude the selected
@@ -373,6 +526,20 @@ def get_active_authoritative_market_snapshot(
         if snapshot is None:
             return None
         return replace(snapshot, frame=snapshot.frame.copy(deep=True))
+
+
+def get_active_market_snapshot_acquisition_record(
+    symbol: str,
+    end_date: str,
+) -> MarketSnapshotAcquisitionRecord | None:
+    """Return the immutable latest run acquisition record, including failures."""
+    active = _ACTIVE_SNAPSHOT_RUN.get()
+    if active is None:
+        return None
+    with active.lock:
+        return active.latest_acquisition_records.get(
+            (symbol.strip().upper(), str(end_date))
+        )
 
 
 def _minimum_history_for_indicator(indicator: str) -> int:

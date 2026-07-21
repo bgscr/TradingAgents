@@ -1,11 +1,7 @@
-"""Tests for the shared rating heuristic and the SignalProcessor adapter.
+"""Rating-parser utilities and authorized signal-publication coverage.
 
-The Portfolio Manager produces a typed PortfolioDecision via structured
-output and renders it to markdown that always contains a ``**Rating**: X``
-header.  The deterministic heuristic in ``tradingagents.agents.utils.rating``
-is therefore sufficient to extract the rating downstream — no second LLM
-call is needed — and SignalProcessor is now a thin adapter that delegates
-to it.
+Rating parsing remains an isolated utility; the public signal sink requires
+an audited terminal publication and never parses rendered prose.
 """
 
 import pytest
@@ -62,16 +58,17 @@ class TestParseRating:
 
 
 # ---------------------------------------------------------------------------
-# SignalProcessor: thin adapter over the heuristic
+# SignalProcessor: authorization boundary
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 class TestSignalProcessor:
-    def test_returns_rating_from_pm_markdown(self):
+    def test_rejects_rating_from_pm_markdown(self):
         sp = SignalProcessor()
         md = "**Rating**: Overweight\n\n**Executive Summary**: Build gradually."
-        assert sp.process_signal(md) == "Overweight"
+        with pytest.raises((TypeError, ValueError)):
+            sp.process_signal(md)
 
     def test_makes_no_llm_calls(self):
         """SignalProcessor must not invoke the LLM it was constructed with —
@@ -80,10 +77,12 @@ class TestSignalProcessor:
 
         llm = MagicMock()
         sp = SignalProcessor(llm)
-        sp.process_signal("Rating: Buy\nDetails.")
+        with pytest.raises((TypeError, ValueError)):
+            sp.process_signal("Rating: Buy\nDetails.")
         llm.invoke.assert_not_called()
         llm.with_structured_output.assert_not_called()
 
-    def test_default_when_no_rating_present(self):
+    def test_plain_prose_cannot_synthesize_a_default_hold(self):
         sp = SignalProcessor()
-        assert sp.process_signal("Plain prose without a recommendation.") == "Hold"
+        with pytest.raises((TypeError, ValueError)):
+            sp.process_signal("Plain prose without a recommendation.")

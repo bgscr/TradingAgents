@@ -13,6 +13,7 @@ from tradingagents.agents.schemas import (
     PortfolioRating,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.rating import parse_rating
 from tradingagents.evidence import (
     ClaimValidation,
     ClaimValidationStatus,
@@ -43,7 +44,9 @@ def _decision_assertions(*claim_ids: str) -> tuple[DecisionAssertion, ...]:
     return tuple(
         DecisionAssertion(
             claim_id=claim_id,
-            fact_ids=(f"fact:test:{claim_id}",),
+            fact_ids=(
+                f"fact:{sha256(f'test-fact:{claim_id}'.encode()).hexdigest()}",
+            ),
         )
         for claim_id in claim_ids
     )
@@ -58,9 +61,21 @@ DECISION_NO_RATING = (
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+class _LegacyMemoryFixture(TradingMemoryLog):
+    """Test-only writer for constructing historical raw log fixtures."""
+
+    def store_decision(self, ticker, trade_date, final_trade_decision):
+        self._store_rendered_decision(
+            ticker=ticker,
+            trade_date=trade_date,
+            final_trade_decision=final_trade_decision,
+            rating=parse_rating(final_trade_decision),
+        )
+
+
 def make_log(tmp_path, filename="trading_memory.md"):
     config = {"memory_log_path": str(tmp_path / filename)}
-    return TradingMemoryLog(config)
+    return _LegacyMemoryFixture(config)
 
 
 def _seed_completed(tmp_path, ticker, date, decision_text, reflection_text, filename="trading_memory.md"):
@@ -113,7 +128,7 @@ def _make_pm_state(past_context=""):
 
 def _decision_ready_pm_evidence() -> dict:
     source_ref = "snapshot:NVDA:2026-01-09"
-    fact_id = "fact:test:market.ai_capex_cycle"
+    fact_id = f"fact:{sha256(b'test-fact:market.ai_capex_cycle').hexdigest()}"
     source_quote = (
         "AI capex cycle remains intact and supports a 215.0 price "
         "target over 3-6 months."
@@ -202,6 +217,16 @@ def _structured_pm_llm(captured: dict, decision: PortfolioDecisionSelection | No
 # ---------------------------------------------------------------------------
 
 class TestTradingMemoryLogCore:
+
+    def test_store_decision_rejects_unauthorized_prose(self, tmp_path):
+        log = TradingMemoryLog(
+            {"memory_log_path": str(tmp_path / "trading_memory.md")}
+        )
+
+        with pytest.raises(ValueError, match="authorized final state"):
+            log.store_decision("NVDA", "2026-01-10", "Rating: Buy")
+
+        assert not (tmp_path / "trading_memory.md").exists()
 
     def test_store_creates_file(self, tmp_path):
         log = make_log(tmp_path)
@@ -382,7 +407,8 @@ class TestTradingMemoryLogCore:
 
     def test_no_log_path_is_noop(self):
         log = TradingMemoryLog(config=None)
-        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        with pytest.raises(ValueError, match="authorized final state"):
+            log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         assert log.load_entries() == []
         assert log.get_past_context("NVDA") == ""
 
@@ -397,7 +423,7 @@ class TestTradingMemoryLogCore:
 
     def test_rotation_prunes_oldest_resolved(self, tmp_path):
         """When max_entries is set and exceeded, oldest resolved entries are pruned."""
-        log = TradingMemoryLog({
+        log = _LegacyMemoryFixture({
             "memory_log_path": str(tmp_path / "trading_memory.md"),
             "memory_log_max_entries": 3,
         })
@@ -412,7 +438,7 @@ class TestTradingMemoryLogCore:
 
     def test_rotation_never_prunes_pending(self, tmp_path):
         """Pending entries (unresolved) are kept regardless of the cap."""
-        log = TradingMemoryLog({
+        log = _LegacyMemoryFixture({
             "memory_log_path": str(tmp_path / "trading_memory.md"),
             "memory_log_max_entries": 2,
         })
@@ -431,7 +457,7 @@ class TestTradingMemoryLogCore:
 
     def test_rotation_under_cap_is_noop(self, tmp_path):
         """No rotation when resolved count <= max_entries."""
-        log = TradingMemoryLog({
+        log = _LegacyMemoryFixture({
             "memory_log_path": str(tmp_path / "trading_memory.md"),
             "memory_log_max_entries": 10,
         })
@@ -816,7 +842,7 @@ class TestPortfolioManagerInjection:
         assert (
             "- market.ai_capex_cycle | analyst=market | "
             "sources=snapshot:NVDA:2026-01-09 | "
-            "facts=fact:test:market.ai_capex_cycle | "
+            "facts=fact:d1219ee55a4e782c6217c07e095e518cfe8dbea9a4ee0d1fe21a5fc2f8857f85 | "
             "statement="
             "AI capex cycle remains intact and supports a 215.0 price target "
             "over 3-6 months."
@@ -878,20 +904,22 @@ class TestPortfolioManagerInjection:
         assert "**Price Target**" not in md
         assert "**Time Horizon**" not in md
 
-    def test_pm_freetext_fallback_requires_explicit_shadow_override(self):
-        """If a provider does not support with_structured_output, the agent
-        can use the explicitly labeled legacy override without weakening the
-        default evidence-enforced path."""
+    def test_pm_freetext_shadow_output_cannot_reach_directional_sinks(self):
+        """Legacy free text remains diagnostic-only in explicit shadow mode."""
         plain_response = "**Rating**: Sell\n\nExit ahead of guidance."
         llm = MagicMock()
         llm.with_structured_output.side_effect = NotImplementedError("provider unsupported")
         llm.invoke.return_value = MagicMock(content=plain_response)
         pm_node = create_portfolio_manager(llm, evidence_gate_mode="shadow")
         result = pm_node(_make_pm_state())
-        assert result["final_trade_decision"].startswith(
-            "> **Evidence Gate:** UNENFORCED (shadow mode)"
-        )
-        assert result["final_trade_decision"].endswith(plain_response)
+        assert result["shadow_diagnostics"] == {
+            "status": "non_directional",
+            "model_output_kind": "free_text",
+        }
+        assert "analysis_outcome" in result
+        assert "final_trade_decision" not in result
+        assert "risk_debate_state" not in result
+        assert plain_response not in str(result)
 
     # get_past_context ordering and limits
 
@@ -979,8 +1007,8 @@ class TestLegacyRemoval:
         with pytest.raises(TypeError):
             create_portfolio_manager(mock_llm, memory=MagicMock())
 
-    def test_full_pipeline_no_regression(self, tmp_path):
-        """propagate() completes and stores the decision after the redesign."""
+    def test_legacy_prose_only_pipeline_fails_closed(self, tmp_path):
+        """Rendered prose cannot authorize a signal or decision-memory write."""
         import functools
 
         fake_state = {
@@ -1009,17 +1037,18 @@ class TestLegacyRemoval:
         mock_graph.log_states_dict = {}
         mock_graph.debug = False
         mock_graph.config = {"results_dir": str(tmp_path)}
+        mock_graph._checkpointer_ctx = None
+        mock_graph._run_signature.return_value = "test-graph-signature"
         mock_graph.graph.invoke.return_value = fake_state
         mock_graph.propagator.create_initial_state.return_value = fake_state
         mock_graph.propagator.get_graph_args.return_value = {}
-        mock_graph.signal_processor.process_signal.return_value = "Buy"
         # Bind the real _run_graph so propagate's call to self._run_graph executes
         # the actual write path instead of the auto-MagicMock.
         mock_graph._run_graph = functools.partial(
             TradingAgentsGraph._run_graph, mock_graph
         )
-        TradingAgentsGraph.propagate(mock_graph, "NVDA", "2026-01-10")
-        entries = mock_graph.memory_log.load_entries()
-        assert len(entries) == 1
-        assert entries[0]["ticker"] == "NVDA"
-        assert entries[0]["pending"] is True
+        with pytest.raises(ValueError, match="neither a validated Trading Decision"):
+            TradingAgentsGraph.propagate(mock_graph, "NVDA", "2026-01-10")
+
+        assert mock_graph.memory_log.load_entries() == []
+        mock_graph.signal_processor.process_decision.assert_not_called()

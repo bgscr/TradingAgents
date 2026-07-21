@@ -15,7 +15,10 @@ from collections.abc import Iterable
 import pandas as pd
 from stockstats import wrap
 
-from tradingagents.dataflows.market_snapshot import get_authoritative_market_snapshot
+from tradingagents.dataflows.market_snapshot import (
+    _minimum_history_for_indicator,
+    get_authoritative_market_snapshot,
+)
 from tradingagents.dataflows.stockstats_utils import load_ohlcv
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 
@@ -87,6 +90,13 @@ def build_verified_market_snapshot(
     selected = tuple(indicators or DEFAULT_SNAPSHOT_INDICATORS)
     indicator_values: dict[str, str] = {}
     for name in selected:
+        minimum_history = _minimum_history_for_indicator(name)
+        if len(df) < minimum_history:
+            indicator_values[name] = (
+                "N/A: insufficient history "
+                f"({len(df)} rows available; {minimum_history} required)"
+            )
+            continue
         try:
             stock_df[name]  # triggers stockstats calculation
             indicator_values[name] = _fmt(stock_df.iloc[-1][name])

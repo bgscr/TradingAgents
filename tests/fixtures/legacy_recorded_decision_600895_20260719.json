@@ -1,0 +1,57 @@
+{
+  "fixture_kind": "legacy_recorded_input",
+  "fixture_version": "1.0",
+  "source_report": "reports/600895.SS_20260719_050442/decision-audit.json",
+  "source_audit_schema_version": "1.0",
+  "ticker": "600895.SS",
+  "trade_date": "2026-07-19",
+  "selection": {
+    "rating": "Underweight",
+    "material_claim_ids": [
+      "fundamentals.007",
+      "market.6"
+    ],
+    "decision_assertions": [
+      {
+        "claim_id": "fundamentals.007",
+        "fact_ids": [
+          "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982"
+        ]
+      },
+      {
+        "claim_id": "market.6",
+        "fact_ids": [
+          "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef"
+        ]
+      }
+    ]
+  },
+  "selected_claims": [
+    {
+      "claim_id": "fundamentals.007",
+      "analyst": "fundamentals",
+      "statement": "当前市盈率（TTM）为61.78倍。",
+      "source_refs": [
+        "get_fundamentals:600895.SS:2026-07-19"
+      ],
+      "source_quote": "PE Ratio (TTM): 61.77551",
+      "fact_ids": [
+        "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982"
+      ],
+      "minimum_history_rows": 1
+    },
+    {
+      "claim_id": "market.6",
+      "analyst": "market",
+      "statement": "RSI为37.41",
+      "source_refs": [
+        "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+      ],
+      "source_quote": "| rsi | 37.41 |",
+      "fact_ids": [
+        "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef"
+      ],
+      "minimum_history_rows": 1
+    }
+  ]
+}

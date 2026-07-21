@@ -1,6 +1,18 @@
-from collections.abc import Iterable
+import json
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from time import monotonic
+from typing import Any
+
+from langchain_core.messages import AIMessage
+
+from tradingagents.evidence import (
+    EvidenceCapability,
+    EvidenceSource,
+    EvidenceState,
+    EvidenceStatus,
+    capability_profile_for,
+)
 
 
 @dataclass(frozen=True)
@@ -10,6 +22,7 @@ class AnalystNodeSpec:
     clear_node: str
     tool_node: str
     report_key: str
+    required_capabilities: tuple[EvidenceCapability, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -24,6 +37,7 @@ ANALYST_NODE_SPECS: dict[str, AnalystNodeSpec] = {
         clear_node="Msg Clear Market",
         tool_node="tools_market",
         report_key="market_report",
+        required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
     ),
     "social": AnalystNodeSpec(
         # Wire key stays "social" for saved-config back-compat; the
@@ -49,15 +63,93 @@ ANALYST_NODE_SPECS: dict[str, AnalystNodeSpec] = {
         clear_node="Msg Clear Fundamentals",
         tool_node="tools_fundamentals",
         report_key="fundamentals_report",
+        required_capabilities=(EvidenceCapability.COMPANY_FINANCIALS,),
     ),
 }
+
+
+def create_capability_guarded_analyst_node(
+    spec: AnalystNodeSpec,
+    analyst_factory: Callable[[], Callable[[dict[str, Any]], dict[str, Any]]],
+):
+    """Create a lazy analyst node governed only by authoritative run evidence."""
+
+    analyst_node = None
+
+    def guarded_node(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal analyst_node
+        evidence = EvidenceState()
+        try:
+            raw_evidence = state.get("evidence_state", {})
+            evidence = (
+                raw_evidence
+                if isinstance(raw_evidence, EvidenceState)
+                else EvidenceState.model_validate_json(json.dumps(raw_evidence or {}))
+            )
+            identity = evidence.instrument_identity
+            if identity is None or not identity.is_authoritative:
+                raise ValueError("authoritative instrument identity is unavailable")
+            profile = capability_profile_for(identity.instrument_kind)
+        except (TypeError, ValueError):
+            status = EvidenceStatus.UNAVAILABLE
+            required = True
+            report = (
+                "ANALYSIS_UNAVAILABLE: authoritative instrument identity and a "
+                "registered capability profile are required for analyst routing."
+            )
+            detail = "authoritative identity or capability profile unavailable"
+        else:
+            applicable = (
+                spec.key in profile.applicable_analysts
+                and set(spec.required_capabilities).issubset(profile.all_capabilities)
+            )
+            if applicable:
+                if analyst_node is None:
+                    analyst_node = analyst_factory()
+                return analyst_node(state)
+            status = EvidenceStatus.NOT_APPLICABLE
+            required = False
+            report = (
+                f"NOT_APPLICABLE: {spec.agent_node} is not applicable under "
+                f"capability profile {profile.profile_id}."
+            )
+            detail = f"not applicable under capability profile {profile.profile_id}"
+
+        source_id = f"analyst.{spec.key}.submission"
+        source = EvidenceSource(
+            source_id=source_id,
+            status=status,
+            required=required,
+            detail=detail,
+        )
+        updated = evidence.model_copy(
+            update={
+                "sources": tuple(
+                    existing
+                    for existing in evidence.sources
+                    if existing.source_id != source_id
+                )
+                + (source,)
+            }
+        )
+        return {
+            "messages": [AIMessage(content=report)],
+            spec.report_key: report,
+            "evidence_state": updated.model_dump(mode="json"),
+        }
+
+    return guarded_node
 
 
 def build_analyst_execution_plan(
     selected_analysts: Iterable[str],
 ) -> AnalystExecutionPlan:
     specs: list[AnalystNodeSpec] = []
+    seen: set[str] = set()
     for analyst_key in selected_analysts:
+        if analyst_key in seen:
+            raise ValueError(f"duplicate analyst key: {analyst_key}")
+        seen.add(analyst_key)
         spec = ANALYST_NODE_SPECS.get(analyst_key)
         if spec is None:
             raise ValueError(f"unknown analyst key: {analyst_key}")

@@ -1,0 +1,3 @@
+# Require versioned lineage for derived facts
+
+The latest authoritative snapshot contained 129 observations yet exposed a field named `close_200_sma`, and snapshot-derived claims bypassed history enforcement with `minimum_history_rows=1`. Every derived Source Fact will therefore bind to a versioned Calculation Definition and record its exact authoritative input artifact, range, observation count, adjustment basis, implementation version, and result digest. When the registered history or warmup requirement is unmet, acquisition yields `insufficient_history` rather than a partial-window value under the same field identity; externally supplied indicators remain distinct facts and cannot impersonate an internal calculation with unknown lineage.

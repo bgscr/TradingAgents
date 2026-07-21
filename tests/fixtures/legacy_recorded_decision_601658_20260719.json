@@ -1,0 +1,77 @@
+{
+  "fixture_kind": "legacy_recorded_input",
+  "fixture_version": "1.0",
+  "source_report": "reports/601658.SS_20260719_052607/decision-audit.json",
+  "source_audit_schema_version": "1.0",
+  "ticker": "601658.SS",
+  "trade_date": "2026-07-19",
+  "selection": {
+    "rating": "Buy",
+    "material_claim_ids": [
+      "fundamentals.18",
+      "fundamentals.20",
+      "market.010"
+    ],
+    "decision_assertions": [
+      {
+        "claim_id": "fundamentals.18",
+        "fact_ids": [
+          "fact:3e57bc313dbc7d96353b7cfd16efae062684fd8d464ddda53466c287033cc34e"
+        ]
+      },
+      {
+        "claim_id": "fundamentals.20",
+        "fact_ids": [
+          "fact:a2e9e53c68fd6f1b0151ddaf3aa5e7a462575ce6149f4e7ce4235d477d1bed23"
+        ]
+      },
+      {
+        "claim_id": "market.010",
+        "fact_ids": [
+          "fact:95a15bb6d085f20d3650db4cdeaca1588e9220298ca66b966adaee987a67d994"
+        ]
+      }
+    ]
+  },
+  "selected_claims": [
+    {
+      "claim_id": "fundamentals.18",
+      "analyst": "fundamentals",
+      "statement": "市净率为0.59倍。",
+      "source_refs": [
+        "get_fundamentals:601658.SS:2026-07-19"
+      ],
+      "source_quote": "0.592067",
+      "fact_ids": [
+        "fact:3e57bc313dbc7d96353b7cfd16efae062684fd8d464ddda53466c287033cc34e"
+      ],
+      "minimum_history_rows": 1
+    },
+    {
+      "claim_id": "fundamentals.20",
+      "analyst": "fundamentals",
+      "statement": "Beta值为0.386。",
+      "source_refs": [
+        "get_fundamentals:601658.SS:2026-07-19"
+      ],
+      "source_quote": "0.386",
+      "fact_ids": [
+        "fact:a2e9e53c68fd6f1b0151ddaf3aa5e7a462575ce6149f4e7ce4235d477d1bed23"
+      ],
+      "minimum_history_rows": 1
+    },
+    {
+      "claim_id": "market.010",
+      "analyst": "market",
+      "statement": "The MACD histogram is 0.02.",
+      "source_refs": [
+        "snapshot:3d5b690831a09e0ed31510bcc0e7c1957af60088064fc16afb43592be029fbab"
+      ],
+      "source_quote": "macdh | 0.02",
+      "fact_ids": [
+        "fact:95a15bb6d085f20d3650db4cdeaca1588e9220298ca66b966adaee987a67d994"
+      ],
+      "minimum_history_rows": 1
+    }
+  ]
+}

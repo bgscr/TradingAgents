@@ -1,0 +1,3 @@
+# Short-circuit analysis through three fail-closed gates
+
+To avoid spending model calls after deterministic blockers and to prevent advisory prose from bypassing the evidence trust boundary, the compiled LangGraph will contain three fail-closed gates shared by CLI and programmatic execution: Evidence Preflight before model-mediated analysis, Evidence Admission after evidence collection and before thesis synthesis, and a final Decision Gate before any directional publication, signal, or memory write. A blocked branch ends with a non-directional Analysis Outcome; optional-source loss degrades evidence and activates bounded retry controls rather than automatically blocking, and shadow diagnostics cannot publish a Trading Decision.

@@ -32,14 +32,22 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.utils import safe_ticker_component
-from tradingagents.decision_audit import (
-    build_decision_audit,
-    write_immutable_decision_audit,
+from tradingagents.decision_audit import write_immutable_decision_audit
+from tradingagents.decision_policy import (
+    DecisionHorizon,
+    DecisionPolicyEngine,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState, acquire_run_evidence
+from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
+from tradingagents.terminal_contract import (
+    RunLifecycleStatus,
+    TerminalContract,
+    TerminalOutcomeKind,
+    authorized_trading_decision_from_state,
+)
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
@@ -86,6 +94,8 @@ class TradingAgentsGraph:
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        decision_policy: DecisionPolicyEngine | None = None,
+        decision_horizon: DecisionHorizon | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -94,10 +104,16 @@ class TradingAgentsGraph:
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
+            decision_policy: Optional deterministic registry for final decisions.
+            decision_horizon: Required horizon for rule-backed decisions.
         """
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.decision_policy = (
+            decision_policy if decision_policy is not None else DecisionPolicyEngine()
+        )
+        self.decision_horizon = decision_horizon
 
         # Update the interface's config
         set_config(self.config)
@@ -145,6 +161,8 @@ class TradingAgentsGraph:
             self.tool_nodes,
             self.conditional_logic,
             evidence_gate_mode=self.config.get("evidence_gate_mode", "enforce"),
+            decision_policy=self.decision_policy,
+            decision_horizon=self.decision_horizon,
         )
 
         self.propagator = Propagator(
@@ -350,16 +368,34 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
-        """Resolve ticker identity once and return the full instrument context.
+    def resolve_instrument_context(
+        self,
+        ticker: str,
+        asset_type: str = "stock",
+        *,
+        evidence_state: EvidenceState | None = None,
+    ) -> str:
+        """Render instrument context from trusted run evidence when available.
 
-        Deterministic yfinance lookup (cached, fail-open) injected into a
-        context string so every agent anchors to the real company instead of
-        hallucinating one from the price chart (#814). Both the propagate()
-        path and the CLI call this so the resolved identity reaches the whole
-        graph regardless of entry point.
+        The production CLI and programmatic paths pass the already-acquired
+        ``EvidenceState`` so a deterministic preflight blocker never triggers
+        optional Yahoo/AKShare enrichment first.  The legacy lookup remains only
+        for direct compatibility callers that do not have run evidence.
         """
-        identity = resolve_instrument_identity(ticker)
+        if evidence_state is None:
+            identity = resolve_instrument_identity(ticker)
+            return build_instrument_context(ticker, asset_type, identity)
+
+        resolved = evidence_state.instrument_identity
+        identity = None
+        if resolved is not None:
+            identity = {
+                "canonical_symbol": resolved.symbol,
+                "company_name": resolved.display_name,
+                "exchange": resolved.venue,
+                "instrument_kind": resolved.instrument_kind.value,
+                "currency": resolved.currency,
+            }
         return build_instrument_context(ticker, asset_type, identity)
 
     @staticmethod
@@ -374,13 +410,25 @@ class TradingAgentsGraph:
         selection, debate/risk depth, or asset mode starts fresh instead of
         silently continuing the previous graph (#1089).
         """
+        config = getattr(self, "config", {}) or {}
+        policy = getattr(self, "decision_policy", None)
+        horizon = getattr(self, "decision_horizon", None)
+        registry_digest = getattr(policy, "registry_digest", "none")
+        if horizon is None:
+            horizon_signature = "none"
+        else:
+            unit = getattr(horizon.unit, "value", horizon.unit)
+            horizon_signature = f"{horizon.count}:{unit}"
         return "|".join([
-            "analysts=" + ",".join(self.selected_analysts),
-            f"debate={self.config['max_debate_rounds']}",
-            f"risk={self.config['max_risk_discuss_rounds']}",
+            "analysts=" + ",".join(getattr(self, "selected_analysts", ())),
+            f"debate={config.get('max_debate_rounds', 0)}",
+            f"risk={config.get('max_risk_discuss_rounds', 0)}",
             f"asset={asset_type}",
-            f"evidence_gate={self.config.get('evidence_gate_mode', 'enforce')}",
-            "evidence_schema=2",
+            f"evidence_gate={config.get('evidence_gate_mode', 'enforce')}",
+            "evidence_schema=4",
+            "decision_schema=1",
+            f"registry={registry_digest}",
+            f"horizon={horizon_signature}",
         ])
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
@@ -394,9 +442,6 @@ class TradingAgentsGraph:
         successful node on a subsequent invocation with the same ticker+date.
         """
         self.ticker = company_name
-
-        # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
 
         # Recompile with a checkpointer if the user opted in.
         if self.config.get("checkpoint_enabled"):
@@ -447,11 +492,16 @@ class TradingAgentsGraph:
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
         """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM and the
-        # deterministically resolved instrument identity for all agents.
+        # Acquire trusted baseline evidence before any optional provider enrichment
+        # or model-mediated work.  A missing registry identity must reach Evidence
+        # Preflight without first spending Yahoo/AKShare or reflection calls.
         past_context = self.memory_log.get_past_context(company_name)
-        instrument_context = self.resolve_instrument_context(company_name, asset_type)
         evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
+        instrument_context = self.resolve_instrument_context(
+            company_name,
+            asset_type,
+            evidence_state=evidence_state,
+        )
         init_agent_state = self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -484,7 +534,7 @@ class TradingAgentsGraph:
                     trace.append(chunk)
             # Streamed chunks are per-node deltas. Merge them so the returned
             # state matches what graph.invoke() yields in the non-debug path.
-            final_state = {}
+            final_state = dict(init_agent_state)
             for chunk in trace:
                 final_state.update(chunk)
         else:
@@ -493,7 +543,10 @@ class TradingAgentsGraph:
         # The audit is a critical terminal artifact: publish it before exposing
         # a directional decision to memory, signal processing, or the caller.
         final_state["graph_signature"] = self._run_signature(asset_type)
-        audit_payload = build_decision_audit(final_state)
+        final_state["evidence_gate_mode"] = self.config.get(
+            "evidence_gate_mode",
+            "enforce",
+        )
         audit_directory = (
             Path(self.config["results_dir"])
             / safe_ticker_component(company_name)
@@ -503,12 +556,16 @@ class TradingAgentsGraph:
         audit_path = write_immutable_decision_audit(
             final_state,
             audit_directory,
-            filename=(
-                f"decision-audit-{trade_date}-"
-                f"{audit_payload['audit_sha256'][:16]}.json"
-            ),
+            filename=None,
+            config=self.config,
         )
         final_state["decision_audit_path"] = str(audit_path)
+        terminal = TerminalContract.model_validate(final_state["terminal_contract"])
+        decision = (
+            authorized_trading_decision_from_state(final_state)
+            if terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION
+            else None
+        )
 
         # Store current state for reflection.
         self.curr_state = final_state
@@ -516,21 +573,35 @@ class TradingAgentsGraph:
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
-        analysis_outcome = final_state.get("analysis_outcome")
-        if analysis_outcome:
-            processed_signal = None
-        else:
-            final_trade_decision = final_state["final_trade_decision"]
+        processed_signal = None
+        if terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
+            if decision is None:  # Defensive: terminal validation requires one.
+                raise ValueError("Trading Decision terminal is missing its contract")
+            processed_signal = self.process_signal(final_state)
+            # Reflection is model-mediated and must not run ahead of deterministic
+            # graph gates. Resolve older pending outcomes only after this run has
+            # produced a permitted Trading Decision, and before storing this run so
+            # the new entry cannot be selected for immediate reflection.
+            try:
+                self._resolve_pending_entries(company_name)
+            except Exception as exc:  # noqa: BLE001 - reflection is non-critical
+                logger.warning(
+                    "Could not resolve older pending reflections for %s: %s",
+                    company_name,
+                    exc,
+                )
             # Store decision for deferred reflection on the next same-ticker run.
-            self.memory_log.store_decision(
+            self.memory_log.store_trading_decision(
                 ticker=company_name,
                 trade_date=trade_date,
-                final_trade_decision=final_trade_decision,
+                final_state=final_state,
             )
-            processed_signal = self.process_signal(final_trade_decision)
 
         # Clear checkpoint on successful completion to avoid stale state.
-        if self.config.get("checkpoint_enabled"):
+        if (
+            self.config.get("checkpoint_enabled")
+            and terminal.lifecycle_status is RunLifecycleStatus.COMPLETED
+        ):
             clear_checkpoint(
                 self.config["data_cache_dir"], company_name, str(trade_date),
                 self._run_signature(asset_type),
@@ -539,80 +610,34 @@ class TradingAgentsGraph:
         return final_state, processed_signal
 
     def _log_state(self, trade_date, final_state):
-        """Log the final state to a JSON file."""
+        """Log terminal identity and the prose-free audit evidence projection."""
+        TerminalContract.model_validate(final_state["terminal_contract"])
+        evidence_projection = AuditEvidenceProjection.model_validate_json(
+            json.dumps(final_state.get("evidence_audit_projection"))
+        )
         logged_state = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "asset_type": final_state.get("asset_type"),
             "graph_signature": final_state.get("graph_signature"),
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
-            "evidence_state": final_state.get("evidence_state", {}),
-            "admission_gate": final_state.get("admission_gate"),
-            "pm_original_selection": final_state.get("pm_original_selection"),
-            "pm_selection_retry": final_state.get("pm_selection_retry"),
-            "pm_revision": final_state.get("pm_revision"),
-            "pm_revision_retry": final_state.get("pm_revision_retry"),
-            "original_draft_thesis": final_state.get("original_draft_thesis"),
-            "original_decision_gate": final_state.get("original_decision_gate"),
-            "revised_draft_thesis": final_state.get("revised_draft_thesis"),
-            "revised_decision_gate": final_state.get("revised_decision_gate"),
-            "draft_thesis": final_state.get("draft_thesis"),
-            "decision_gate": final_state.get("decision_gate"),
+            "evidence_audit_projection": evidence_projection.model_dump(mode="json"),
             "evidence_gate_mode": final_state.get("evidence_gate_mode", "enforce"),
+            "terminal_contract": final_state["terminal_contract"],
+            "lifecycle_status": final_state["lifecycle_status"],
+            "terminal_outcome_kind": final_state["terminal_outcome_kind"],
+            "evidence_integrity_status": final_state[
+                "evidence_integrity_status"
+            ],
+            "active_phase": final_state.get("active_phase"),
+            "run_identity": final_state["run_identity"],
+            "run_id": final_state["run_id"],
+            "configuration_digest": final_state["configuration_digest"],
             "decision_audit_created_at": final_state.get(
                 "decision_audit_created_at"
             ),
+            "decision_audit_sha256": final_state.get("decision_audit_sha256"),
             "decision_audit_path": final_state.get("decision_audit_path"),
         }
-        if final_state.get("analysis_outcome"):
-            logged_state.update(
-                {
-                    "analysis_outcome": final_state["analysis_outcome"],
-                }
-            )
-        else:
-            logged_state.update(
-                {
-                    "investment_debate_state": {
-                        "bull_history": final_state["investment_debate_state"][
-                            "bull_history"
-                        ],
-                        "bear_history": final_state["investment_debate_state"][
-                            "bear_history"
-                        ],
-                        "history": final_state["investment_debate_state"]["history"],
-                        "current_response": final_state["investment_debate_state"][
-                            "current_response"
-                        ],
-                        "judge_decision": final_state["investment_debate_state"][
-                            "judge_decision"
-                        ],
-                    },
-                    "trader_investment_decision": final_state[
-                        "trader_investment_plan"
-                    ],
-                    "risk_debate_state": {
-                        "aggressive_history": final_state["risk_debate_state"][
-                            "aggressive_history"
-                        ],
-                        "conservative_history": final_state["risk_debate_state"][
-                            "conservative_history"
-                        ],
-                        "neutral_history": final_state["risk_debate_state"][
-                            "neutral_history"
-                        ],
-                        "history": final_state["risk_debate_state"]["history"],
-                        "judge_decision": final_state["risk_debate_state"][
-                            "judge_decision"
-                        ],
-                    },
-                    "investment_plan": final_state["investment_plan"],
-                    "final_trade_decision": final_state["final_trade_decision"],
-                }
-            )
         self.log_states_dict[str(trade_date)] = logged_state
 
         # Save to file. Reject ticker values that would escape the
@@ -625,6 +650,9 @@ class TradingAgentsGraph:
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict[str(trade_date)], f, indent=4)
 
-    def process_signal(self, full_signal):
-        """Process a signal to extract the core decision."""
-        return self.signal_processor.process_signal(full_signal)
+    def process_signal(
+        self,
+        final_state: dict[str, Any],
+    ) -> str:
+        """Extract a signal only from an audited terminal publication."""
+        return self.signal_processor.process_signal(final_state)

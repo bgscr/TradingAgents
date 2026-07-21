@@ -1,0 +1,3 @@
+# Use boundary-strict versioned evidence contracts
+
+Trading evidence crosses untrusted provider, checkpoint, and LLM boundaries. We will preserve raw provider artifacts separately while requiring versioned, closed canonical models at trusted boundaries: unknown fields are forbidden, domain scalars and local invariants are validated, and LLMs select registered identifiers rather than authoring Source Fact semantics. We reject blanket strict validation over the entire LangGraph state because JSON checkpoint round-trips legitimately change Python container and enum representations; explicit serialization adapters and migrations will handle those representations, while deterministic gates remain responsible for cross-record provenance and directional validity.

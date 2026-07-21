@@ -1,0 +1,3 @@
+# Render decision reports from the validated contract
+
+Successful reports currently preserve forensic provenance in an audit while presenting bare source values without the field labels, comparators, or rules needed for human oversight. The Decision Report will be rendered deterministically from the validated Trading Decision contract and will expose each assertion's canonical meaning, Strategy Rule, evaluated predicate, horizon, source and calculation lineage, Evidence Integrity Status, coverage dimensions, and material degradation. Model-authored prose may be retained only as separately labeled Advisory Commentary outside the Validated Decision Context and cannot determine the rating, signal, or memory update.

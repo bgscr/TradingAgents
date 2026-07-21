@@ -30,6 +30,14 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from tradingagents.dataflows.acquisition import (
+    AcquisitionController,
+    AcquisitionFailure,
+    AcquisitionRequest,
+)
+from tradingagents.dataflows.market_snapshot import get_active_acquisition_controller
+from tradingagents.evidence import AcquisitionUnavailableReason
+
 from .symbol_utils import crypto_base
 
 logger = logging.getLogger(__name__)
@@ -82,49 +90,26 @@ def _strip_html(content: str) -> str:
 
 
 def _retry_after_seconds(exc: HTTPError) -> float | None:
-    """Seconds to wait from a 429's ``Retry-After`` header, capped at 30s."""
+    """Return a nonnegative numeric ``Retry-After`` header when present."""
     try:
         val = exc.headers.get("Retry-After") if getattr(exc, "headers", None) else None
-        return min(float(val), 30.0) if val else None
+        value = float(val) if val is not None else None
+        return value if value is None or value >= 0 else None
     except (ValueError, TypeError, AttributeError):
         return None
 
 
-def _fetch_subreddit_rss(
+def _fetch_subreddit_rss_raw(
     ticker: str,
     sub: str,
     limit: int,
     timeout: float,
-    _retry: bool = True,
 ) -> list[dict]:
-    """Default path: parse the public Atom search feed for a subreddit.
-
-    Carries no score / comment counts, so those fields are left None and the
-    post is tagged ``source="rss"`` for honest display. On a 429 (Reddit's
-    per-IP rate limit) we back off once — honouring ``Retry-After`` when
-    present — before giving up, so a transient burst doesn't blank the feed.
-    """
+    """Parse one RSS feed while preserving transport and parse failures."""
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            root = ET.fromstring(resp.read())
-    except HTTPError as exc:
-        if exc.code == 429 and _retry:
-            wait = _retry_after_seconds(exc) or 5.0
-            logger.warning(
-                "Reddit RSS 429 for r/%s · %s — backing off %.1fs then retrying once",
-                sub, ticker, wait,
-            )
-            time.sleep(wait)
-            return _fetch_subreddit_rss(ticker, sub, limit, timeout, _retry=False)
-        logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
-    except (OSError, http.client.HTTPException, ET.ParseError) as exc:
-        # OSError covers URLError/TimeoutError/connection resets; HTTPException
-        # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
-        logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
+    with urlopen(req, timeout=timeout) as resp:
+        root = ET.fromstring(resp.read())
 
     posts = []
     for entry in root.findall("atom:entry", _ATOM_NS)[:limit]:
@@ -142,6 +127,20 @@ def _fetch_subreddit_rss(
             "source": "rss",
         })
     return posts
+
+
+def _fetch_subreddit_rss(
+    ticker: str,
+    sub: str,
+    limit: int,
+    timeout: float,
+) -> list[dict]:
+    """Legacy graceful RSS retrieval without local retry or sleeping."""
+    try:
+        return _fetch_subreddit_rss_raw(ticker, sub, limit, timeout)
+    except (OSError, http.client.HTTPException, ET.ParseError) as exc:
+        logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
+        return []
 
 
 def _fetch_subreddit_json(
@@ -188,29 +187,15 @@ def _fetch_subreddit(
     return _fetch_subreddit_rss(ticker, sub, limit, timeout)
 
 
-def fetch_reddit_posts(
+def _format_reddit_posts(
     ticker: str,
-    subreddits: Iterable[str] = DEFAULT_SUBREDDITS,
-    limit_per_sub: int = 5,
-    timeout: float = 10.0,
-    inter_request_delay: float = 1.0,
+    subreddit_posts: Iterable[tuple[str, list[dict]]],
 ) -> str:
-    """Fetch recent Reddit posts mentioning ``ticker`` across finance
-    subreddits and return them as a formatted plaintext block.
-
-    ``inter_request_delay`` paces the (now RSS-only) per-subreddit requests to
-    stay under Reddit's public per-IP rate limit; combined with the RSS-first
-    path it makes 429s rare even when several analyses run back-to-back.
-    """
-    # Crypto reaches us as a Yahoo pair (BTC-USD); search Reddit for the base
-    # ("BTC") so the query actually matches discussion instead of near-nothing.
-    ticker = crypto_base(ticker) or ticker
     blocks = []
     total_posts = 0
-    for i, sub in enumerate(subreddits):
-        if i > 0:
-            time.sleep(inter_request_delay)
-        posts = _fetch_subreddit(ticker, sub, limit_per_sub, timeout)
+    subreddits = []
+    for sub, posts in subreddit_posts:
+        subreddits.append(sub)
         total_posts += len(posts)
         if not posts:
             blocks.append(f"r/{sub}: <no posts found mentioning {ticker.upper()} in the past 7 days>")
@@ -248,3 +233,108 @@ def fetch_reddit_posts(
             f"{', '.join(f'r/{s}' for s in subreddits)} in the past 7 days>"
         )
     return "\n\n".join(blocks)
+
+
+def _fetch_reddit_posts_raw(
+    ticker: str,
+    subreddits: tuple[str, ...],
+    limit_per_sub: int,
+    timeout: float,
+) -> str:
+    """Aggregate RSS results without converting provider failures to text."""
+    ticker = crypto_base(ticker) or ticker
+    return _format_reddit_posts(
+        ticker,
+        (
+            (sub, _fetch_subreddit_rss_raw(ticker, sub, limit_per_sub, timeout))
+            for sub in subreddits
+        ),
+    )
+
+
+def fetch_reddit_posts(
+    ticker: str,
+    subreddits: Iterable[str] = DEFAULT_SUBREDDITS,
+    limit_per_sub: int = 5,
+    timeout: float = 10.0,
+    inter_request_delay: float = 1.0,
+) -> str:
+    """Fetch Reddit posts with legacy graceful degradation and no local pacing."""
+    del inter_request_delay
+    normalized_ticker = crypto_base(ticker) or ticker
+    subreddit_list = tuple(subreddits)
+    return _format_reddit_posts(
+        normalized_ticker,
+        (
+            (
+                sub,
+                _fetch_subreddit(normalized_ticker, sub, limit_per_sub, timeout),
+            )
+            for sub in subreddit_list
+        ),
+    )
+
+
+def acquire_reddit_posts(
+    ticker: str,
+    subreddits: Iterable[str],
+    limit_per_sub: int,
+    *,
+    tool_call_id: str,
+    source_ref: str,
+    capability: str,
+):
+    """Acquire aggregated Reddit RSS through the run-owned controller."""
+    subreddit_list = tuple(subreddits)
+
+    def provider(_request: AcquisitionRequest) -> str:
+        try:
+            value = _fetch_reddit_posts_raw(
+                ticker, subreddit_list, limit_per_sub, timeout=10.0
+            )
+            if value.startswith("<no Reddit posts found mentioning "):
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.NO_DATA
+                )
+            return value
+        except HTTPError as error:
+            if error.code == 429:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.RATE_LIMITED,
+                    status_code=error.code,
+                    retry_after_seconds=_retry_after_seconds(error),
+                ) from None
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+                status_code=error.code,
+            ) from None
+        except TimeoutError:
+            raise AcquisitionFailure(reason=AcquisitionUnavailableReason.TIMEOUT) from None
+        except ET.ParseError:
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE
+            ) from None
+        except (OSError, http.client.HTTPException, json.JSONDecodeError):
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.PROVIDER_ERROR
+            ) from None
+
+    def validate(value: object) -> str:
+        if isinstance(value, str) and value.strip():
+            return value
+        raise AcquisitionFailure(reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE)
+
+    controller = get_active_acquisition_controller() or AcquisitionController(
+        providers=()
+    )
+    return controller.acquire(
+        AcquisitionRequest(
+            capability=capability,
+            source_ref=source_ref,
+            tool_call_id=tool_call_id,
+            tool_name="fetch_reddit_posts",
+        ),
+        providers=(("reddit_rss", provider),),
+        validator=validate,
+        serializer=lambda value: value,
+    )

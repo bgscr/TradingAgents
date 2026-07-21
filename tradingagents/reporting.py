@@ -1,30 +1,36 @@
-"""Reusable report-tree writer shared by the CLI and the programmatic API.
+"""Deterministic report publication for validated terminal outcomes."""
 
-Writes a run's per-section markdown (analysts, research, trading, risk,
-portfolio) plus a consolidated ``complete_report.md`` under ``save_path``. The
-CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
-run produces the same on-disk report tree a CLI run does.
-"""
+from __future__ import annotations
 
 import shutil
-from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from tradingagents.decision_audit import write_immutable_decision_audit
+from tradingagents.decision_policy import TradingDecisionContract
+from tradingagents.evidence import (
+    AnalysisOutcome,
+    EvidenceState,
+    SourceAcquisitionUnavailable,
+    render_analysis_outcome,
+)
+from tradingagents.terminal_contract import (
+    CanonicalRunIdentity,
+    DecisionCoverage,
+    TerminalContract,
+    TerminalOutcomeKind,
+)
 
 
 def _write_markdown(path: Path, text: str) -> None:
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
 
-def _appendix_entry(label: str, path: Path, root: Path) -> str:
-    rel_path = path.relative_to(root).as_posix()
-    return f"- {label}: [{rel_path}]({rel_path})"
+def _remove_unvalidated_outputs(root: Path) -> None:
+    """Remove stale/model-authored files that are not terminal contracts."""
 
-
-def _remove_directional_outputs(root: Path) -> None:
-    """Remove unpublished drafts when the final result is non-directional."""
     for relative in ("1_analysts", "2_research", "3_trading", "4_risk"):
         path = root / relative
         if path.is_dir():
@@ -38,122 +44,281 @@ def _remove_directional_outputs(root: Path) -> None:
         "trader_investment_plan.md",
         "final_trade_decision.md",
         "5_portfolio/decision.md",
+        "5_portfolio/analysis_outcome.md",
     ):
         (root / relative).unlink(missing_ok=True)
 
 
+def _format_scalar(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _format_coverage(coverage: DecisionCoverage) -> list[str]:
+    rows = (
+        ("Source Availability Coverage", coverage.source_availability),
+        ("Validated Fact Coverage", coverage.validated_facts),
+        ("Decision Assertion Coverage", coverage.decision_assertions),
+    )
+    return [
+        (
+            f"- **{label}:** {measure.ratio:.1%} "
+            f"({measure.covered_count}/{measure.total_count})"
+        )
+        for label, measure in rows
+    ]
+
+
+def _render_fact(index: int, fact) -> list[str]:
+    value = _format_scalar(fact.normalized_value)
+    rendered_value = f"{value} {fact.unit}".strip()
+    lines = [
+        f"### Fact {index}: `{fact.canonical_field}`",
+        "",
+        f"- **Canonical value:** {rendered_value}",
+        f"- **Instrument:** `{fact.instrument_symbol}`",
+        f"- **Effective date:** {fact.effective_date}",
+        f"- **Fact ID:** `{fact.fact_id}`",
+        f"- **Artifact:** `artifact=sha256:{fact.artifact_sha256}`",
+        (
+            "- **Source span:** "
+            f"{fact.source_span_start}:{fact.source_span_end}"
+        ),
+    ]
+    lineage = fact.calculation_lineage
+    if lineage is None:
+        lines.append("- **Calculation lineage:** direct source observation")
+    else:
+        lines.extend(
+            [
+                (
+                    "- **Calculation:** "
+                    f"`{lineage.calculation_id}@{lineage.calculation_version}`"
+                ),
+                f"- **Input snapshot:** `{lineage.input_snapshot_id}`",
+                (
+                    "- **Effective range:** "
+                    f"{lineage.effective_range_start} to {lineage.effective_range_end}"
+                ),
+                f"- **Observations used:** {lineage.observations_used}",
+                f"- **Adjustment basis:** {lineage.adjustment_basis}",
+                f"- **Implementation:** `{lineage.implementation_version}`",
+                f"- **Result digest:** `{lineage.result_digest}`",
+            ]
+        )
+    return lines
+
+
+def _render_assertion(index: int, assertion) -> list[str]:
+    predicate = f"`{assertion.predicate_id}` ({assertion.comparator}"
+    if assertion.threshold is not None:
+        predicate += f" {_format_scalar(assertion.threshold)}"
+    predicate += ")"
+    return [
+        f"### Assertion {index}: `{assertion.assertion_id}`",
+        "",
+        f"- **Strategy Rule:** `{assertion.rule_id}@{assertion.rule_version}`",
+        f"- **Target rating:** {assertion.target_rating.value}",
+        f"- **Polarity:** {assertion.polarity.value}",
+        f"- **Predicate:** {predicate}",
+        (
+            "- **Horizon:** "
+            f"{assertion.horizon.count} {assertion.horizon.unit.value}"
+        ),
+        "- **Source Fact IDs:** " + ", ".join(f"`{item}`" for item in assertion.fact_ids),
+        f"- **Evaluation digest:** `{assertion.evaluation_digest}`",
+    ]
+
+
+def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
+    lines = ["## Acquisition Outcomes", ""]
+    outcomes = sorted(
+        evidence.acquisition_outcomes,
+        key=lambda outcome: (
+            outcome.provider,
+            outcome.capability,
+            outcome.attempt,
+            outcome.retrieved_at,
+            outcome.outcome,
+            outcome.source_ref,
+        ),
+    )
+    if not outcomes:
+        return [*lines, "No acquisition outcomes were recorded.", ""]
+    for index, outcome in enumerate(outcomes, 1):
+        if isinstance(outcome, SourceAcquisitionUnavailable):
+            reason = outcome.reason.value
+            retry_after = (
+                f"{outcome.retry_after_seconds:g} seconds"
+                if outcome.retry_after_seconds is not None
+                else "not provided"
+            )
+        else:
+            reason = "not applicable"
+            retry_after = "not provided"
+        lines.extend(
+            [
+                f"### Acquisition {index}",
+                "",
+                f"- **Provider:** `{outcome.provider}`",
+                f"- **Capability:** `{outcome.capability}`",
+                f"- **Attempt:** {outcome.attempt}",
+                f"- **Retrieved at:** {outcome.retrieved_at}",
+                f"- **Outcome:** {outcome.outcome}",
+                f"- **Unavailable reason:** {reason}",
+                f"- **Retryable:** {_format_scalar(outcome.retryable)}",
+                f"- **Retry-After:** {retry_after}",
+                "",
+            ]
+        )
+    return lines
+
+
+def render_decision_report(
+    decision: TradingDecisionContract,
+    terminal: TerminalContract,
+    evidence: EvidenceState | None = None,
+) -> str:
+    """Render only canonical facts and rule semantics from the gated decision."""
+
+    lines = [
+        "# Validated Trading Decision",
+        "",
+        f"- **Rating:** {decision.rating.value}",
+        f"- **Decision ID:** `{decision.decision_id}`",
+        f"- **Context ID:** `{decision.context_id}`",
+        (
+            "- **Instrument:** "
+            f"`{decision.instrument.symbol}` on {decision.instrument.venue} "
+            f"({decision.instrument.instrument_kind.value}, "
+            f"{decision.instrument.currency})"
+        ),
+        f"- **As of:** {decision.as_of_date.isoformat()}",
+        (
+            "- **Decision horizon:** "
+            f"{decision.horizon.count} {decision.horizon.unit.value}"
+        ),
+        f"- **Evidence Integrity Status:** {decision.integrity_status.value}",
+        f"- **Strategy Rule Registry:** `{decision.registry_digest}`",
+        f"- **Calculation Registry:** `{decision.calculation_registry_digest}`",
+        "",
+        "## Coverage",
+        "",
+        *_format_coverage(terminal.coverage),
+        "",
+        "No predictive-confidence score is reported because no out-of-sample "
+        "calibration is available.",
+        "",
+    ]
+    if evidence is not None:
+        lines.extend(_render_acquisition_outcomes(evidence))
+    lines.extend(["## Canonical Source Facts", ""])
+    for index, fact in enumerate(sorted(decision.facts, key=lambda item: item.fact_id), 1):
+        lines.extend(_render_fact(index, fact))
+        lines.append("")
+    lines.extend(["## Decision Assertions", ""])
+    for index, assertion in enumerate(
+        sorted(decision.assertions, key=lambda item: item.assertion_id),
+        1,
+    ):
+        lines.extend(_render_assertion(index, assertion))
+        lines.append("")
+    if decision.integrity_status.value == "degraded":
+        lines.extend(
+            [
+                "## Material Degradation",
+                "",
+                "Optional evidence was unavailable. The validated facts and every "
+                "directional assertion above nevertheless passed the Decision Gate.",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_analysis_outcome_report(
+    outcome: AnalysisOutcome,
+    terminal: TerminalContract,
+    evidence: EvidenceState | None = None,
+) -> str:
+    outcome = AnalysisOutcome.model_validate(outcome)
+    lines = [
+        "# Non-Directional Analysis Outcome",
+        "",
+        f"- **Evidence Integrity Status:** {terminal.evidence_integrity_status.value}",
+        "- **Terminal Outcome Kind:** analysis_outcome",
+        "",
+        "## Coverage",
+        "",
+        *_format_coverage(terminal.coverage),
+        "",
+    ]
+    if evidence is not None:
+        lines.extend(_render_acquisition_outcomes(evidence))
+    lines.extend([render_analysis_outcome(outcome), ""])
+    return "\n".join(lines)
+
+
+def _report_header(
+    ticker: str,
+    terminal: TerminalContract,
+    identity: CanonicalRunIdentity,
+    created_at: str,
+) -> str:
+    return "\n".join(
+        [
+            f"# Trading Analysis Report: {ticker}",
+            "",
+            f"- **Run ID:** `{identity.run_id}`",
+            f"- **Audit SHA-256:** `{identity.audit_digest}`",
+            f"- **Audit created:** {created_at}",
+            f"- **Lifecycle Status:** {terminal.lifecycle_status.value}",
+            f"- **Terminal Outcome Kind:** {terminal.terminal_outcome_kind.value}",
+            (
+                "- **Evidence Integrity Status:** "
+                f"{terminal.evidence_integrity_status.value}"
+            ),
+            f"- **Configuration Digest:** `{identity.configuration_digest}`",
+            "",
+        ]
+    )
+
+
 def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
-    """Save a completed run's reports to ``save_path``; return the complete-report path."""
+    """Publish one validated terminal report and its immutable decision audit."""
+
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
-    # Persist the evidence/decision audit before publishing user-facing output.
-    # A failure here aborts report publication in enforce mode.
     write_immutable_decision_audit(final_state, save_path)
-    complete_sections = []
-    appendix_entries = []
+    terminal = TerminalContract.model_validate(final_state["terminal_contract"])
+    identity = CanonicalRunIdentity.model_validate(final_state["run_identity"])
+    evidence = EvidenceState.model_validate(final_state["evidence_state"])
+    if identity.audit_digest is None:
+        raise ValueError("canonical export identity is missing its audit digest")
 
-    analysts_dir = save_path / "1_analysts"
-    analyst_parts = []
-    if final_state.get("market_report"):
-        path = analysts_dir / "market.md"
-        _write_markdown(path, final_state["market_report"])
-        analyst_parts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        path = analysts_dir / "sentiment.md"
-        _write_markdown(path, final_state["sentiment_report"])
-        analyst_parts.append(("Sentiment Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        path = analysts_dir / "news.md"
-        _write_markdown(path, final_state["news_report"])
-        analyst_parts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        path = analysts_dir / "fundamentals.md"
-        _write_markdown(path, final_state["fundamentals_report"])
-        analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
-
-    analysis_outcome = final_state.get("analysis_outcome")
-    if analysis_outcome:
-        # Research, trader, and risk outputs are pre-gate working drafts. Once
-        # enforcement produces a non-directional outcome they must not remain in
-        # the user-facing report tree, even if the CLI streamed them earlier.
-        _remove_directional_outputs(save_path)
-        _write_markdown(
-            save_path / "5_portfolio" / "analysis_outcome.md",
-            analysis_outcome,
+    _remove_unvalidated_outputs(save_path)
+    if terminal.terminal_outcome_kind is TerminalOutcomeKind.ANALYSIS_OUTCOME:
+        outcome = AnalysisOutcome.model_validate(
+            final_state["analysis_outcome_contract"]
         )
-        complete_sections.append(f"## I. Analysis Outcome\n\n{analysis_outcome}")
-        header = (
-            f"# Trading Analysis Report: {ticker}\n\n"
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        )
-        complete_path = save_path / "complete_report.md"
-        complete_path.write_text(
-            header + "\n\n".join(complete_sections),
-            encoding="utf-8",
-        )
-        return complete_path
+        body = render_analysis_outcome_report(outcome, terminal, evidence)
+        _write_markdown(save_path / "5_portfolio" / "analysis_outcome.md", body)
+    elif terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
+        decision = TradingDecisionContract.model_validate(final_state["trading_decision"])
+        body = render_decision_report(decision, terminal, evidence)
+        _write_markdown(save_path / "5_portfolio" / "decision.md", body)
+    else:
+        raise ValueError("operational failures cannot be published as decision reports")
 
-    research_manager = None
-    if final_state.get("investment_debate_state"):
-        research_dir = save_path / "2_research"
-        debate = final_state["investment_debate_state"]
-        if debate.get("bull_history"):
-            path = research_dir / "bull.md"
-            _write_markdown(path, debate["bull_history"])
-            appendix_entries.append(_appendix_entry("Bull researcher full history", path, save_path))
-        if debate.get("bear_history"):
-            path = research_dir / "bear.md"
-            _write_markdown(path, debate["bear_history"])
-            appendix_entries.append(_appendix_entry("Bear researcher full history", path, save_path))
-        if debate.get("judge_decision"):
-            path = research_dir / "manager.md"
-            _write_markdown(path, debate["judge_decision"])
-            research_manager = debate["judge_decision"]
-
-    trader_plan = final_state.get("trader_investment_plan")
-    if trader_plan:
-        _write_markdown(save_path / "3_trading" / "trader.md", trader_plan)
-
-    portfolio_decision = None
-    if final_state.get("risk_debate_state"):
-        risk_dir = save_path / "4_risk"
-        risk = final_state["risk_debate_state"]
-        if risk.get("aggressive_history"):
-            path = risk_dir / "aggressive.md"
-            _write_markdown(path, risk["aggressive_history"])
-            appendix_entries.append(_appendix_entry("Aggressive analyst full history", path, save_path))
-        if risk.get("conservative_history"):
-            path = risk_dir / "conservative.md"
-            _write_markdown(path, risk["conservative_history"])
-            appendix_entries.append(_appendix_entry("Conservative analyst full history", path, save_path))
-        if risk.get("neutral_history"):
-            path = risk_dir / "neutral.md"
-            _write_markdown(path, risk["neutral_history"])
-            appendix_entries.append(_appendix_entry("Neutral analyst full history", path, save_path))
-        if risk.get("judge_decision"):
-            portfolio_decision = risk["judge_decision"]
-            _write_markdown(save_path / "5_portfolio" / "decision.md", portfolio_decision)
-
-    if portfolio_decision:
-        complete_sections.append(
-            f"## I. Portfolio Manager Decision\n\n### Portfolio Manager\n{portfolio_decision}"
-        )
-    if trader_plan:
-        complete_sections.append(f"## II. Trading Team Plan\n\n### Trader\n{trader_plan}")
-    if research_manager:
-        complete_sections.append(
-            f"## III. Research Manager Decision\n\n### Research Manager\n{research_manager}"
-        )
-    if analyst_parts:
-        content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
-        complete_sections.append(f"## IV. Analyst Team Reports\n\n{content}")
-    if appendix_entries:
-        complete_sections.append("## Appendix: Full Debate Files\n\n" + "\n".join(appendix_entries))
-
-    # Write consolidated report
-    header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(
-        header + "\n\n".join(complete_sections),
-        encoding="utf-8",
+    header = _report_header(
+        ticker,
+        terminal,
+        identity,
+        str(final_state["decision_audit_created_at"]),
     )
-    return save_path / "complete_report.md"
+    complete_path = save_path / "complete_report.md"
+    complete_path.write_text(header + body, encoding="utf-8")
+    return complete_path

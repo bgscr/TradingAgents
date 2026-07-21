@@ -57,6 +57,7 @@ from tradingagents.graph.analyst_execution import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.reporting import write_report_tree
+from tradingagents.terminal_contract import configuration_digest
 
 console = Console()
 
@@ -1122,6 +1123,7 @@ def _read_run_status(status_file: Path) -> dict:
 
 def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | str]:
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    config_digest = configuration_digest(config)
     results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
     run_dir = results_dir / "runs" / run_id
     report_dir = run_dir / "reports"
@@ -1145,6 +1147,9 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
         status_file,
         {
             "run_id": run_id,
+            "artifact_run_id": run_id,
+            "canonical_run_id": None,
+            "configuration_digest": config_digest,
             "ticker": selections["ticker"],
             "llm_provider": _safe_provider_name(
                 config.get("llm_provider", selections.get("llm_provider"))
@@ -1164,8 +1169,17 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
             "started_at": now,
             "updated_at": now,
             "completed_at": None,
+            "failed_at": None,
+            "terminal_at": None,
             "status": "running",
+            "lifecycle_status": "running",
+            "terminal_outcome_kind": None,
+            "evidence_integrity_status": None,
             "current_phase": "artifacts_prepared",
+            "active_phase": "artifacts_prepared",
+            "failed_phase": None,
+            "operational_error_category": None,
+            "audit_digest": None,
             "error_summary": None,
             "reports_written": [],
         },
@@ -1180,6 +1194,7 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
         "status_file": status_file,
         "artifact_root": Path(config["results_dir"]) / "runtime_artifacts",
         "metrics_file": run_dir / "runtime_metrics.json",
+        "configuration_digest": config_digest,
     }
 
 
@@ -1191,12 +1206,35 @@ def _update_run_status(artifacts: dict, **updates) -> None:
         runtime_writer.transition_phase(current_phase)
     status_file = artifacts["status_file"]
     payload = _read_run_status(status_file)
+    if terminal:
+        updates["current_phase"] = None
+        updates["active_phase"] = None
+    elif current_phase:
+        updates["active_phase"] = current_phase
+    if updates.get("status") is not None:
+        updates.setdefault("lifecycle_status", updates["status"])
     payload.update(updates)
     payload["updated_at"] = _now_iso()
     if updates.get("status") == "completed":
         payload["completed_at"] = payload["updated_at"]
+    if updates.get("status") == "failed":
+        payload["failed_at"] = payload["updated_at"]
+    if terminal:
+        payload["terminal_at"] = payload["updated_at"]
     _write_run_status(status_file, payload)
     if runtime_writer is not None and terminal:
+        stats_handler = artifacts.get("stats_handler")
+        stats = stats_handler.get_stats() if stats_handler is not None else {}
+        runtime_writer.record_terminal_summary(
+            terminal_route=str(
+                updates.get("terminal_outcome_kind") or "operational_failure"
+            ),
+            stats=stats,
+            acquisition_outcomes=artifacts.get(
+                "terminal_acquisition_outcomes",
+                (),
+            ),
+        )
         runtime_writer.finish_phases()
 
 
@@ -1215,7 +1253,18 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
         _update_run_status(
             artifacts,
             status="failed",
-            current_phase=current_phase,
+            current_phase=None,
+            failed_phase=current_phase,
+            terminal_outcome_kind="operational_failure",
+            operational_error_category=(
+                "report_publication"
+                if current_phase == "report_writing"
+                else (
+                    "configuration"
+                    if current_phase in {"setup", "graph_initializing"}
+                    else "graph_execution"
+                )
+            ),
             error_summary=summary,
         )
     with suppress(Exception):
@@ -1236,6 +1285,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
 
 def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
     started_at = time.monotonic()
+    final_state["configuration_digest"] = artifacts["configuration_digest"]
     report_file = save_report_to_disk(final_state, ticker, artifacts["report_dir"])
     runtime_writer = artifacts.get("runtime_writer")
     if runtime_writer is not None:
@@ -1244,10 +1294,22 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
             "complete_report",
             time.monotonic() - started_at,
         )
+    evidence_state = final_state.get("evidence_state")
+    if isinstance(evidence_state, dict):
+        artifacts["terminal_acquisition_outcomes"] = evidence_state.get(
+            "acquisition_outcomes",
+            (),
+        )
     _update_run_status(
         artifacts,
         status="completed",
-        current_phase="report_writing",
+        current_phase=None,
+        lifecycle_status=final_state["lifecycle_status"],
+        terminal_outcome_kind=final_state["terminal_outcome_kind"],
+        evidence_integrity_status=final_state["evidence_integrity_status"],
+        canonical_run_id=final_state["run_id"],
+        configuration_digest=final_state["configuration_digest"],
+        audit_digest=final_state["decision_audit_sha256"],
         reports_written=[str(report_file)],
     )
     return report_file
@@ -1282,6 +1344,7 @@ def run_analysis(checkpoint: bool | None = None):
     )
     artifacts["runtime_writer"] = runtime_writer
     stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
+    artifacts["stats_handler"] = stats_handler
     current_phase = "graph_initializing"
     _update_run_status(artifacts, current_phase="graph_initializing")
     report_dir = artifacts["report_dir"]
@@ -1416,15 +1479,16 @@ def run_analysis(checkpoint: bool | None = None):
         analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
         display.refresh(spinner_text)
 
-        # Initialize state and get graph args with callbacks.
-        # Resolve the instrument identity once here so all agents anchor to
-        # the real company (#814); the CLI builds state directly rather than
-        # going through propagate(), so this must happen on the CLI path too.
-        instrument_context = graph.resolve_instrument_context(
-            selections["ticker"], selections["asset_type"]
-        )
+        # Initialize state and get graph args with callbacks. Acquire trusted
+        # evidence first so a missing registry identity can short-circuit without
+        # optional provider enrichment or model-mediated work.
         evidence_state = graph.resolve_evidence_state(
             selections["ticker"], selections["analysis_date"]
+        )
+        instrument_context = graph.resolve_instrument_context(
+            selections["ticker"],
+            selections["asset_type"],
+            evidence_state=evidence_state,
         )
         init_agent_state = graph.propagator.create_initial_state(
             selections["ticker"],
@@ -1443,7 +1507,7 @@ def run_analysis(checkpoint: bool | None = None):
         runtime_graph_phase = "analysis"
         runtime_writer.transition_phase(runtime_graph_phase)
         tracker = StateProgressTracker()
-        latest_state = {}
+        latest_state = dict(init_agent_state)
         for chunk in graph.graph.stream(init_agent_state, **args):
             observed_phase = _runtime_graph_phase_for_chunk(chunk)
             if _RUNTIME_GRAPH_PHASES.index(observed_phase) > _RUNTIME_GRAPH_PHASES.index(
@@ -1564,6 +1628,10 @@ def run_analysis(checkpoint: bool | None = None):
             display.refresh(spinner_text)
 
         final_state = latest_state
+        final_state["evidence_gate_mode"] = config.get(
+            "evidence_gate_mode",
+            "enforce",
+        )
         signature_builder = getattr(graph, "_run_signature", None)
         if callable(signature_builder):
             final_state["graph_signature"] = signature_builder(

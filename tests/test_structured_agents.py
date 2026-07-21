@@ -8,6 +8,7 @@ so they share the same deterministic output shape.
 """
 
 import inspect
+from hashlib import sha256
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,17 +41,21 @@ from tradingagents.agents.utils.structured import (
     bind_required_structured,
     invoke_required_structured,
 )
+from tradingagents.dataflows.acquisition import AcquisitionResult
 from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
     AnalystEvidenceReport,
     ClaimValidationStatus,
     EvidenceSource,
     EvidenceState,
     EvidenceStatus,
-    InstrumentIdentityEvidence,
-    MarketSnapshotEvidence,
     MaterialClaim,
+    SourceAcquisitionAvailable,
+    SourceAcquisitionUnavailable,
+    SourceArtifact,
     SubmittedMaterialClaim,
-    evaluate_admission_gate,
+    ToolExecutionEvidenceEnvelope,
+    make_source_acquisition_outcome,
 )
 
 # ---------------------------------------------------------------------------
@@ -72,6 +77,34 @@ def test_analyst_prompts_do_not_expose_final_transaction_proposal_signal():
 
 
 def _tool_exchange(tool_name, args, content, call_id):
+    symbol = args.get("ticker") or args.get("symbol")
+    trade_date = args.get("curr_date") or args.get("end_date")
+    source_kind = "snapshot" if tool_name == "get_verified_market_snapshot" else tool_name
+    source_ref = f"{source_kind}:{symbol}:{trade_date}"
+    capability = "market_snapshot" if source_kind == "snapshot" else source_kind
+    outcome = make_source_acquisition_outcome(
+        provider="fixture-provider",
+        capability=capability,
+        attempt=1,
+        retrieved_at="2026-07-19T00:00:00+00:00",
+        source_ref=source_ref,
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        content=content,
+        status="success",
+    )
+    envelope = ToolExecutionEvidenceEnvelope(
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        source_ref=source_ref,
+        capability=capability,
+        acquisition_outcomes=(outcome,),
+        selected_artifact=(
+            outcome.artifact
+            if isinstance(outcome, SourceAcquisitionAvailable)
+            else None
+        ),
+    ).model_dump(mode="json")
     return [
         AIMessage(
             content="",
@@ -88,6 +121,7 @@ def _tool_exchange(tool_name, args, content, call_id):
             content=content,
             tool_call_id=call_id,
             name=tool_name,
+            artifact=envelope,
         ),
     ]
 
@@ -415,56 +449,6 @@ def test_news_analyst_submits_typed_claims_to_shared_evidence():
             required=False,
         ),
     )
-
-
-@pytest.mark.unit
-def test_fundamentals_analyst_skips_company_analysis_for_mainland_fund():
-    llm = MagicMock()
-    llm.bind_tools.side_effect = AssertionError(
-        "fund company-analysis LLM must not be invoked"
-    )
-    analyst = create_fundamentals_analyst(llm)
-
-    result = analyst({
-        "company_of_interest": "512210.SH",
-        "trade_date": "2026-07-15",
-        "asset_type": "stock",
-        "messages": [],
-    })
-
-    assert result["fundamentals_report"] == (
-        "NOT_APPLICABLE: company fundamentals require a mainland equity; "
-        "512210.SS is a fund."
-    )
-    assert result["messages"][0].content == result["fundamentals_report"]
-
-
-@pytest.mark.unit
-def test_fund_not_applicable_fundamentals_do_not_reduce_coverage_or_block_admission():
-    analyst = create_fundamentals_analyst(MagicMock())
-    result = analyst({
-        "company_of_interest": "512210.SH", "trade_date": "2026-07-15",
-        "asset_type": "stock", "messages": [],
-        "evidence_state": EvidenceState(
-            instrument_identity=InstrumentIdentityEvidence(
-                symbol="512210.SS", name="CSI 300 ETF"
-            ),
-            market_snapshot=MarketSnapshotEvidence(
-                symbol="512210.SS", provider="baostock",
-                retrieved_at="2026-07-16T00:00:00+00:00", adjustment_basis="qfq",
-                requested_date="2026-07-15", effective_trading_date="2026-07-15",
-                history_rows=129, frame_sha256="f" * 64,
-                snapshot_id="snapshot:fund-case",
-            ),
-        ).model_dump(mode="json"),
-    })
-
-    evidence = EvidenceState.model_validate(result["evidence_state"])
-    source = next(item for item in evidence.sources if item.source_id == "analyst.fundamentals.submission")
-    admission = evaluate_admission_gate(evidence)
-    assert source.status is EvidenceStatus.NOT_APPLICABLE
-    assert admission.admitted is True
-    assert admission.coverage == 1.0
 
 
 @pytest.mark.unit
@@ -1363,6 +1347,20 @@ class TestRenderSentimentReport:
                 confidence="high", narrative="n",
             )
 
+    def test_unknown_fields_are_rejected_by_the_structured_output_contract(self):
+        payload = {
+            "overall_band": "Neutral",
+            "overall_score": 5.0,
+            "confidence": "low",
+            "narrative": "Available evidence was neutral.",
+        }
+
+        with pytest.raises(ValidationError):
+            SentimentReport.model_validate(
+                {**payload, "unknown_field": "must not be ignored"}
+            )
+        assert SentimentReport.model_json_schema()["additionalProperties"] is False
+
 
 def _make_sentiment_state():
     return {
@@ -1393,6 +1391,118 @@ def _structured_sentiment_llm(captured: dict, report: SentimentReport | None = N
 
 @pytest.mark.unit
 class TestSentimentAnalystAgent:
+    @pytest.fixture(autouse=True)
+    def sentiment_acquisition_blocks(self, monkeypatch):
+        blocks: dict[str, str | None] = {
+            "news": "One neutral headline.",
+            "stocktwits": "StockTwits sentiment was neutral.",
+            "reddit": None,
+        }
+        retrieved_at = "2026-01-15T00:00:00+00:00"
+
+        def acquisition_result(
+            source: str,
+            *,
+            tool_name: str,
+            tool_call_id: str,
+            source_ref: str,
+            capability: str,
+        ) -> AcquisitionResult[str]:
+            provider = f"fixture-{source}"
+            block = blocks[source]
+            if block is None:
+                unavailable = SourceAcquisitionUnavailable(
+                    provider=provider,
+                    capability=capability,
+                    source_ref=source_ref,
+                    attempt=1,
+                    retrieved_at=retrieved_at,
+                    retryable=False,
+                    reason=AcquisitionUnavailableReason.NO_DATA,
+                )
+                return AcquisitionResult(
+                    value=None,
+                    artifact=None,
+                    outcomes=(unavailable,),
+                    provider=provider,
+                )
+
+            artifact = SourceArtifact(
+                artifact_sha256=sha256(block.encode("utf-8")).hexdigest(),
+                source_ref=source_ref,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                raw_text=block,
+            )
+            available = SourceAcquisitionAvailable(
+                provider=provider,
+                capability=capability,
+                source_ref=source_ref,
+                attempt=1,
+                retrieved_at=retrieved_at,
+                artifact=artifact,
+            )
+            return AcquisitionResult(
+                value=block,
+                artifact=artifact,
+                outcomes=(available,),
+                provider=provider,
+            )
+
+        def acquire_news(
+            *_args,
+            tool_call_id: str,
+            source_ref: str,
+            capability: str,
+            **_kwargs,
+        ) -> AcquisitionResult[str]:
+            return acquisition_result(
+                "news",
+                tool_name="get_news",
+                tool_call_id=tool_call_id,
+                source_ref=source_ref,
+                capability=capability,
+            )
+
+        def acquire_stocktwits(
+            *_args,
+            tool_call_id: str,
+            source_ref: str,
+            capability: str,
+            **_kwargs,
+        ) -> AcquisitionResult[str]:
+            return acquisition_result(
+                "stocktwits",
+                tool_name="fetch_stocktwits_messages",
+                tool_call_id=tool_call_id,
+                source_ref=source_ref,
+                capability=capability,
+            )
+
+        def acquire_reddit(
+            *_args,
+            tool_call_id: str,
+            source_ref: str,
+            capability: str,
+            **_kwargs,
+        ) -> AcquisitionResult[str]:
+            return acquisition_result(
+                "reddit",
+                tool_name="fetch_reddit_posts",
+                tool_call_id=tool_call_id,
+                source_ref=source_ref,
+                capability=capability,
+            )
+
+        monkeypatch.setattr(sentiment_module, "acquire_news", acquire_news)
+        monkeypatch.setattr(
+            sentiment_module,
+            "acquire_stocktwits_messages",
+            acquire_stocktwits,
+        )
+        monkeypatch.setattr(sentiment_module, "acquire_reddit_posts", acquire_reddit)
+        return blocks
+
     def test_structured_path_produces_rendered_markdown(self):
         captured = {}
         report = SentimentReport(
@@ -1428,16 +1538,16 @@ class TestSentimentAnalystAgent:
         assert "unique" in claim_schema["description"]
         assert "'sentiment.'" in claim_schema["description"]
 
-    def test_invalid_claim_namespace_is_repaired_once(self, monkeypatch):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "One neutral headline.",
-                "stocktwits_block": "75% bullish across 20 messages.",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+    def test_invalid_claim_namespace_is_repaired_once(
+        self,
+        sentiment_acquisition_blocks,
+    ):
+        sentiment_acquisition_blocks.update(
+            {
+                "news": "One neutral headline.",
+                "stocktwits": "75% bullish across 20 messages.",
+                "reddit": None,
+            }
         )
         invalid_claim = SubmittedMaterialClaim(
             claim_id="claim_1",
@@ -1481,18 +1591,18 @@ class TestSentimentAnalystAgent:
             detail="direct_structured",
         ) in evidence.sources
 
-    def test_structured_material_claims_merge_into_shared_evidence(self, monkeypatch):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "Two constructive headlines.",
-                "stocktwits_block": (
+    def test_structured_material_claims_merge_into_shared_evidence(
+        self,
+        sentiment_acquisition_blocks,
+    ):
+        sentiment_acquisition_blocks.update(
+            {
+                "news": "Two constructive headlines.",
+                "stocktwits": (
                     "StockTwits messages were 75% bullish across 20 messages."
                 ),
-                "reddit_block": "<reddit unavailable: rate limited>",
-                "local_sentiment_block": "",
-            },
+                "reddit": None,
+            }
         )
         existing_claim = MaterialClaim(
             claim_id="market.latest_close",
@@ -1536,31 +1646,33 @@ class TestSentimentAnalystAgent:
             EvidenceSource(
                 source_id="sentiment.news",
                 status=EvidenceStatus.AVAILABLE,
-                required=False,
+                required=True,
+                detail="",
             ),
             EvidenceSource(
                 source_id="sentiment.stocktwits",
                 status=EvidenceStatus.AVAILABLE,
-                required=False,
+                required=True,
+                detail="",
             ),
             EvidenceSource(
                 source_id="sentiment.reddit",
                 status=EvidenceStatus.UNAVAILABLE,
-                required=False,
-                detail="source returned unavailable",
+                required=True,
+                detail="acquired_reddit",
             ),
         )
 
-    def test_numeric_claim_absent_from_sentiment_block_is_conflicted(self, monkeypatch):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "Two constructive headlines.",
-                "stocktwits_block": "75% bullish across 20 messages.",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+    def test_numeric_claim_absent_from_sentiment_block_is_conflicted(
+        self,
+        sentiment_acquisition_blocks,
+    ):
+        sentiment_acquisition_blocks.update(
+            {
+                "news": "Two constructive headlines.",
+                "stocktwits": "75% bullish across 20 messages.",
+                "reddit": None,
+            }
         )
         fabricated = MaterialClaim(
             claim_id="sentiment.stocktwits_bullish_share",
@@ -1597,17 +1709,14 @@ class TestSentimentAnalystAgent:
 
     def test_nonnumeric_claim_absent_from_sentiment_block_is_conflicted(
         self,
-        monkeypatch,
+        sentiment_acquisition_blocks,
     ):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "Two constructive headlines.",
-                "stocktwits_block": "StockTwits sentiment was bullish.",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+        sentiment_acquisition_blocks.update(
+            {
+                "news": "Two constructive headlines.",
+                "stocktwits": "StockTwits sentiment was bullish.",
+                "reddit": None,
+            }
         )
         fabricated = MaterialClaim(
             claim_id="sentiment.stocktwits_direction",
@@ -1656,18 +1765,15 @@ class TestSentimentAnalystAgent:
     )
     def test_structured_unavailable_is_explicitly_unavailable(
         self,
-        monkeypatch,
+        sentiment_acquisition_blocks,
         bind_error,
     ):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "DATA_UNAVAILABLE",
-                "stocktwits_block": "DATA_UNAVAILABLE",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+        sentiment_acquisition_blocks.update(
+            {
+                "news": None,
+                "stocktwits": None,
+                "reddit": None,
+            }
         )
         plain = "**Overall Sentiment:** **Bearish** (Score: 3.0/10)\n**Confidence:** Low\n\nLimited data."
         llm = MagicMock()
@@ -1686,16 +1792,16 @@ class TestSentimentAnalystAgent:
         ) in evidence.sources
         llm.invoke.assert_not_called()
 
-    def test_structured_call_failure_is_explicitly_unavailable(self, monkeypatch):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "DATA_UNAVAILABLE",
-                "stocktwits_block": "DATA_UNAVAILABLE",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+    def test_structured_call_failure_is_explicitly_unavailable(
+        self,
+        sentiment_acquisition_blocks,
+    ):
+        sentiment_acquisition_blocks.update(
+            {
+                "news": None,
+                "stocktwits": None,
+                "reddit": None,
+            }
         )
         plain = "Fallback free-text sentiment."
         structured = MagicMock()
@@ -1717,16 +1823,16 @@ class TestSentimentAnalystAgent:
         llm.invoke.assert_not_called()
         assert structured.invoke.call_count == 2
 
-    def test_none_parsed_sentiment_is_repaired_once(self, monkeypatch):
-        monkeypatch.setattr(
-            sentiment_module,
-            "_collect_sentiment_blocks",
-            lambda *args: {
-                "news_block": "One neutral headline.",
-                "stocktwits_block": "DATA_UNAVAILABLE",
-                "reddit_block": "DATA_UNAVAILABLE",
-                "local_sentiment_block": "",
-            },
+    def test_none_parsed_sentiment_is_repaired_once(
+        self,
+        sentiment_acquisition_blocks,
+    ):
+        sentiment_acquisition_blocks.update(
+            {
+                "news": "One neutral headline.",
+                "stocktwits": None,
+                "reddit": None,
+            }
         )
         report = SentimentReport(
             overall_band=SentimentBand.NEUTRAL,

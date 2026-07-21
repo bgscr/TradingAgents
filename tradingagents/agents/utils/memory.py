@@ -1,9 +1,11 @@
 """Append-only markdown decision log for TradingAgents."""
 
-import re
-from pathlib import Path
+from __future__ import annotations
 
-from tradingagents.agents.utils.rating import parse_rating
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
 
 
 class TradingMemoryLog:
@@ -33,7 +35,44 @@ class TradingMemoryLog:
         trade_date: str,
         final_trade_decision: str,
     ) -> None:
-        """Append pending entry at end of propagate(). No LLM call."""
+        """Reject legacy prose-only writes at the public memory boundary."""
+
+        raise ValueError(
+            "decision memory requires an authorized final state; rendered prose "
+            "cannot authorize a write"
+        )
+
+    def store_trading_decision(
+        self,
+        ticker: str,
+        trade_date: str,
+        final_state: Mapping[str, Any],
+    ) -> None:
+        """Append a pending entry only from an audited terminal publication."""
+        from tradingagents.agents.managers.direction_selector import (
+            render_trading_decision,
+        )
+        from tradingagents.terminal_contract import (
+            authorized_trading_decision_from_state,
+        )
+
+        validated = authorized_trading_decision_from_state(final_state)
+        self._store_rendered_decision(
+            ticker=ticker,
+            trade_date=trade_date,
+            final_trade_decision=render_trading_decision(validated),
+            rating=validated.rating.value,
+        )
+
+    def _store_rendered_decision(
+        self,
+        *,
+        ticker: str,
+        trade_date: str,
+        final_trade_decision: str,
+        rating: str,
+    ) -> None:
+        """Append one deterministic pending decision without model calls."""
         if not self._log_path:
             return
         # Idempotency guard: fast raw-text scan instead of full parse
@@ -42,7 +81,6 @@ class TradingMemoryLog:
             for line in raw.splitlines():
                 if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
                     return
-        rating = parse_rating(final_trade_decision)
         tag = f"[{trade_date} | {ticker} | {rating} | pending]"
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
         with open(self._log_path, "a", encoding="utf-8") as f:

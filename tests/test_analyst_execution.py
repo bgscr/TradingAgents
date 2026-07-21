@@ -1,5 +1,6 @@
 import unittest
 
+from tradingagents.evidence import EvidenceCapability
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
@@ -21,6 +22,10 @@ class AnalystExecutionPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_analyst_execution_plan(["market", "macro"])
 
+    def test_rejects_duplicate_analyst_keys(self):
+        with self.assertRaisesRegex(ValueError, "duplicate analyst key"):
+            build_analyst_execution_plan(["market", "market"])
+
     def test_get_initial_analyst_node_uses_plan_metadata(self):
         plan = build_analyst_execution_plan(["fundamentals", "news"])
 
@@ -39,6 +44,21 @@ class AnalystExecutionPlanTests(unittest.TestCase):
         self.assertEqual(spec.key, "social")
         self.assertEqual(spec.agent_node, "Sentiment Analyst")
         self.assertEqual(spec.report_key, "sentiment_report")
+
+    def test_plan_declares_each_analysts_required_evidence_capabilities(self):
+        plan = build_analyst_execution_plan(
+            ["market", "social", "news", "fundamentals"]
+        )
+
+        self.assertEqual(
+            {spec.key: spec.required_capabilities for spec in plan.specs},
+            {
+                "market": (EvidenceCapability.MARKET_SNAPSHOT,),
+                "social": (),
+                "news": (),
+                "fundamentals": (EvidenceCapability.COMPANY_FINANCIALS,),
+            },
+        )
 
 
 class AnalystWallTimeTrackerTests(unittest.TestCase):

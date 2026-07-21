@@ -5,14 +5,42 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from dateutil.relativedelta import relativedelta
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+EVIDENCE_CONTRACT_VERSION = "1.0"
+ANALYSIS_OUTCOME_CONTRACT_VERSION = "2.0"
+ACQUISITION_TOKEN_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+_CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
+_ACQUISITION_NAMESPACE_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+)
+
+
+def stable_acquisition_source_ref(namespace: str, *components: object) -> str:
+    """Return a versioned opaque locator without retaining raw source metadata."""
+
+    if _ACQUISITION_NAMESPACE_PATTERN.fullmatch(namespace) is None:
+        raise ValueError("acquisition source-ref namespace is invalid")
+    digest = sha256()
+    for component in components:
+        encoded = str(component).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"acq.v1:{namespace}:{digest.hexdigest()}"
 
 _NUMERIC_CLAIM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
@@ -37,6 +65,21 @@ _NUMERIC_TRANSLATION = str.maketrans(
 
 def _normalize_numeric_text(text: str) -> str:
     return unicodedata.normalize("NFKC", text).translate(_NUMERIC_TRANSLATION)
+
+
+def _require_concrete_utc_timestamp(value: str) -> str:
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            "retrieved_at must be a concrete ISO-8601 UTC timestamp"
+        ) from exc
+    if (
+        instant.tzinfo is None
+        or instant.utcoffset() != timezone.utc.utcoffset(instant)
+    ):
+        raise ValueError("retrieved_at must be a concrete ISO-8601 UTC timestamp")
+    return value
 
 
 def _numeric_claim_tokens(text: str) -> tuple[str, ...]:
@@ -137,16 +180,154 @@ class DecisionConfidence(str, Enum):
     HIGH = "high"
 
 
-class InstrumentIdentityEvidence(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class InstrumentKind(str, Enum):
+    UNKNOWN = "unknown"
+    EQUITY = "equity"
+    FUND = "fund"
+    INDEX = "index"
+    BOND = "bond"
+    CRYPTO = "crypto"
 
+
+class EvidenceCapability(str, Enum):
+    MARKET_SNAPSHOT = "market_snapshot"
+    COMPANY_FINANCIALS = "company_financials"
+    VALUATION = "valuation"
+    CORPORATE_ACTIONS = "corporate_actions"
+    BENCHMARK = "benchmark"
+    NAV_PREMIUM = "nav_premium"
+    HOLDINGS_EXPOSURE = "holdings_exposure"
+    TRACKING_ERROR = "tracking_error"
+    LIQUIDITY = "liquidity"
+
+
+class IdentityProvenance(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    provider: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    retrieved_at: str = Field(min_length=1)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CapabilityProfile(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    profile_id: str = Field(min_length=1)
+    instrument_kind: InstrumentKind
+    required_capabilities: tuple[EvidenceCapability, ...]
+    optional_capabilities: tuple[EvidenceCapability, ...] = ()
+    applicable_analysts: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _validate_unique_disjoint_members(self) -> CapabilityProfile:
+        if len(set(self.required_capabilities)) != len(self.required_capabilities):
+            raise ValueError("required capabilities must be unique")
+        if len(set(self.optional_capabilities)) != len(self.optional_capabilities):
+            raise ValueError("optional capabilities must be unique")
+        if set(self.required_capabilities) & set(self.optional_capabilities):
+            raise ValueError("required and optional capabilities must be disjoint")
+        if len(set(self.applicable_analysts)) != len(self.applicable_analysts):
+            raise ValueError("applicable analysts must be unique")
+        if any(not analyst.strip() for analyst in self.applicable_analysts):
+            raise ValueError("applicable analysts must be nonblank")
+        return self
+
+    @property
+    def all_capabilities(self) -> frozenset[EvidenceCapability]:
+        return frozenset((*self.required_capabilities, *self.optional_capabilities))
+
+
+_CAPABILITY_PROFILES = {
+    InstrumentKind.EQUITY: CapabilityProfile(
+        profile_id="equity.v1",
+        instrument_kind=InstrumentKind.EQUITY,
+        required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
+        optional_capabilities=(
+            EvidenceCapability.COMPANY_FINANCIALS,
+            EvidenceCapability.VALUATION,
+            EvidenceCapability.CORPORATE_ACTIONS,
+        ),
+        applicable_analysts=("market", "social", "news", "fundamentals"),
+    ),
+    InstrumentKind.FUND: CapabilityProfile(
+        profile_id="fund.v1",
+        instrument_kind=InstrumentKind.FUND,
+        required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
+        optional_capabilities=(
+            EvidenceCapability.BENCHMARK,
+            EvidenceCapability.NAV_PREMIUM,
+            EvidenceCapability.HOLDINGS_EXPOSURE,
+            EvidenceCapability.TRACKING_ERROR,
+            EvidenceCapability.LIQUIDITY,
+        ),
+        applicable_analysts=("market", "social", "news"),
+    ),
+}
+
+
+def capability_profile_for(instrument_kind: InstrumentKind | str) -> CapabilityProfile:
+    """Return the registered evidence capability profile for an instrument kind."""
+    normalized = InstrumentKind(instrument_kind)
+    try:
+        return _CAPABILITY_PROFILES[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"no capability profile is registered for instrument kind {normalized.value!r}"
+        ) from exc
+
+
+class InstrumentIdentityEvidence(BaseModel):
+    """Versioned identity with a compatibility path for legacy checkpoints.
+
+    Legacy ``symbol + name`` payloads remain parseable, but ``is_authoritative``
+    stays false until venue, kind, currency, and provenance are supplied by an
+    authoritative registry. No ticker-shape inference is performed here.
+    """
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     symbol: str
-    name: str
+    venue: str = ""
+    instrument_kind: InstrumentKind = InstrumentKind.UNKNOWN
+    currency: str = ""
+    provenance: IdentityProvenance | None = None
+    display_name: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_name(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping) or "name" not in value:
+            return value
+        migrated = dict(value)
+        legacy_name = migrated.pop("name")
+        migrated.setdefault("display_name", legacy_name)
+        return migrated
+
+    @property
+    def name(self) -> str | None:
+        """Deprecated compatibility alias for ``display_name``."""
+        return self.display_name
+
+    @property
+    def is_authoritative(self) -> bool:
+        return bool(
+            self.symbol.strip()
+            and self.venue.strip()
+            and self.instrument_kind is not InstrumentKind.UNKNOWN
+            and self.currency.strip()
+            and self.provenance is not None
+            and bool(self.provenance.artifact_sha256)
+        )
 
 
 class MarketSnapshotEvidence(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     symbol: str
     provider: str
     retrieved_at: str
@@ -159,8 +340,9 @@ class MarketSnapshotEvidence(BaseModel):
 
 
 class MaterialClaim(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     claim_id: str = Field(pattern=_CLAIM_ID_PATTERN)
     analyst: str
     statement: str
@@ -239,36 +421,514 @@ class SubmittedMaterialClaim(BaseModel):
         return value
 
 
-class SourceFact(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class MissingValuePolicy(str, Enum):
+    FAIL = "fail"
+    DROP = "drop"
+    FORWARD_FILL = "forward_fill"
 
-    fact_id: str
-    source_ref: str
-    tool_call_id: str
-    tool_name: str = ""
-    artifact_sha256: str
+
+class CalculationDefinition(BaseModel):
+    """Registered deterministic semantics for one derived canonical field."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    calculation_id: str = Field(pattern=_CLAIM_ID_PATTERN)
+    version: str = Field(min_length=1)
+    input_fields: tuple[str, ...] = Field(min_length=1)
+    input_frequency: str = Field(min_length=1)
+    minimum_history_rows: int = Field(ge=1)
+    warmup_rows: int = Field(ge=0)
+    adjustment_basis: str = Field(min_length=1)
+    missing_value_policy: MissingValuePolicy
+    formula: str = Field(min_length=1)
+    implementation_version: str = Field(min_length=1)
+    output_field: str = Field(min_length=1)
+    output_unit: str = Field(min_length=1)
+    precision: int = Field(ge=0)
+
+    @property
+    def required_observations(self) -> int:
+        return max(self.minimum_history_rows, self.warmup_rows + 1)
+
+
+class CalculationLineage(BaseModel):
+    """Exact authoritative inputs and implementation used for a derived fact."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    calculation_id: str = Field(pattern=_CLAIM_ID_PATTERN)
+    calculation_version: str = Field(min_length=1)
+    input_artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    input_snapshot_id: str = Field(min_length=1)
+    effective_range_start: str = Field(min_length=1)
+    effective_range_end: str = Field(min_length=1)
+    observations_used: int = Field(ge=1)
+    adjustment_basis: str = Field(min_length=1)
+    implementation_version: str = Field(min_length=1)
+    result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def validate_calculation_lineage(
+    definition: CalculationDefinition,
+    lineage: CalculationLineage,
+) -> None:
+    """Fail closed when recorded lineage cannot represent the definition."""
+    if lineage.calculation_id != definition.calculation_id:
+        raise ValueError("calculation lineage references a different definition")
+    if lineage.calculation_version != definition.version:
+        raise ValueError("calculation lineage references a different definition version")
+    if lineage.implementation_version != definition.implementation_version:
+        raise ValueError("calculation lineage implementation version does not match")
+    if lineage.adjustment_basis != definition.adjustment_basis:
+        raise ValueError("calculation lineage adjustment basis does not match")
+    if lineage.observations_used < definition.required_observations:
+        raise ValueError(
+            "calculation lineage has insufficient history: "
+            f"{lineage.observations_used} < {definition.required_observations}"
+        )
+    try:
+        range_start = datetime.fromisoformat(lineage.effective_range_start)
+        range_end = datetime.fromisoformat(lineage.effective_range_end)
+    except ValueError as exc:
+        raise ValueError("calculation lineage effective range is not ISO-8601") from exc
+    if range_start > range_end:
+        raise ValueError("calculation lineage effective range is reversed")
+
+
+def stable_source_fact_id(
+    *,
+    source_ref: str,
+    artifact_sha256: str,
+    source_span_start: int,
+    source_span_end: int,
+    canonical_field: str = "",
+    instrument_symbol: str = "",
+    effective_date: str = "",
+) -> str:
+    """Derive a fact ID from source-bound semantics, never runtime/model IDs."""
+    canonical_identity = "\0".join(
+        (
+            source_ref,
+            artifact_sha256,
+            str(source_span_start),
+            str(source_span_end),
+            canonical_field,
+            instrument_symbol,
+            effective_date,
+        )
+    )
+    return f"fact:{sha256(canonical_identity.encode()).hexdigest()}"
+
+
+class SourceFact(BaseModel):
+    """Canonical observation bound to, but separate from, a raw source artifact.
+
+    ``raw_text`` is retained as the legacy name for the exact cited excerpt; the
+    complete provider payload exists only on :class:`SourceArtifact`.
+    """
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    fact_kind: Literal["excerpt", "canonical"] = "excerpt"
+    fact_id: str = Field(pattern=r"^fact:[0-9a-f]{64}$")
+    source_ref: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_name: str = Field(min_length=1, pattern=r".*\S.*")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_text: str
     source_span_start: int = Field(ge=0)
     source_span_end: int = Field(ge=0)
     normalized_numeric_tokens: tuple[str, ...] = ()
     calculation_ids: tuple[str, ...] = ()
+    canonical_field: str = ""
+    normalized_value: Decimal | str | int | bool | None = None
+    unit: str = ""
+    instrument_symbol: str = ""
+    effective_date: str = ""
+    calculation_lineage: CalculationLineage | None = None
+
+    @model_validator(mode="after")
+    def _validate_semantics(self) -> SourceFact:
+        if not self.raw_text.strip():
+            raise ValueError("Source Fact raw_text must be a nonblank exact excerpt")
+        if (
+            self.source_span_end <= self.source_span_start
+            or self.source_span_end - self.source_span_start != len(self.raw_text)
+        ):
+            raise ValueError("Source Fact source span must match its exact excerpt")
+        if self.fact_kind == "canonical":
+            required_text = {
+                "canonical_field": self.canonical_field,
+                "unit": self.unit,
+                "instrument_symbol": self.instrument_symbol,
+                "effective_date": self.effective_date,
+            }
+            missing = tuple(name for name, value in required_text.items() if not value.strip())
+            if missing:
+                raise ValueError(
+                    "canonical Source Fact requires nonblank " + ", ".join(missing)
+                )
+            if self.normalized_value is None:
+                raise ValueError("canonical Source Fact requires normalized_value")
+            try:
+                datetime.fromisoformat(self.effective_date)
+            except ValueError as exc:
+                raise ValueError(
+                    "canonical Source Fact effective_date must be ISO-8601"
+                ) from exc
+        return self
 
 
 class SourceArtifact(BaseModel):
     """Exact immutable tool result whose digest is cited by Source Facts."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
-    artifact_sha256: str
-    source_ref: str
-    tool_call_id: str
-    tool_name: str
-    raw_text: str
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_ref: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_name: str = Field(min_length=1, pattern=r".*\S.*")
+    raw_text: str = Field(min_length=1, pattern=r".*\S.*")
+
+    @model_validator(mode="after")
+    def _validate_content_digest(self) -> SourceArtifact:
+        expected = sha256(self.raw_text.encode("utf-8")).hexdigest()
+        if self.artifact_sha256 != expected:
+            raise ValueError("artifact_sha256 does not match exact UTF-8 raw_text")
+        return self
+
+
+class AcquisitionUnavailableReason(str, Enum):
+    RATE_LIMITED = "rate_limited"
+    TIMEOUT = "timeout"
+    NOT_CONFIGURED = "not_configured"
+    NO_DATA = "no_data"
+    AUTHENTICATION = "authentication"
+    MALFORMED_RESPONSE = "malformed_response"
+    INSUFFICIENT_HISTORY = "insufficient_history"
+    PROVIDER_ERROR = "provider_error"
+    REGISTRY_NOT_CONFIGURED = "registry_not_configured"
+    REGISTRY_UNAVAILABLE = "registry_unavailable"
+    IDENTITY_NOT_FOUND = "identity_not_found"
+    INTEGRITY_FAILURE = "integrity_failure"
+    CIRCUIT_OPEN = "circuit_open"
+
+
+class SourceAcquisitionAvailable(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    outcome: Literal["available"] = "available"
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    provider_order: int = Field(default=0, ge=0)
+    capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    attempt: int = Field(ge=1)
+    retrieved_at: str = Field(min_length=1)
+    retryable: Literal[False] = False
+    artifact: SourceArtifact
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def _validate_retrieved_at(cls, value: str) -> str:
+        return _require_concrete_utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def _validate_artifact_binding(self) -> SourceAcquisitionAvailable:
+        if self.artifact.source_ref != self.source_ref:
+            raise ValueError("available artifact source_ref does not match outcome")
+        return self
+
+
+class CalculationReadinessDiagnostic(BaseModel):
+    """Closed, payload-free metadata for a rejected deterministic calculation."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    calculation_id: str = Field(min_length=1)
+    required_observations: int = Field(ge=0)
+    available_observations: int = Field(ge=0)
+    input_artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SourceAcquisitionUnavailable(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    outcome: Literal["unavailable"] = "unavailable"
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    provider_order: int = Field(default=0, ge=0)
+    capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    attempt: int = Field(ge=1)
+    retrieved_at: str = Field(min_length=1)
+    retryable: bool
+    reason: AcquisitionUnavailableReason
+    retry_after_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    calculation_readiness: CalculationReadinessDiagnostic | None = None
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def _validate_retrieved_at(cls, value: str) -> str:
+        return _require_concrete_utc_timestamp(value)
+
+
+SourceAcquisitionOutcome = Annotated[
+    SourceAcquisitionAvailable | SourceAcquisitionUnavailable,
+    Field(discriminator="outcome"),
+]
+
+
+def _canonicalize_source_acquisition_outcomes(
+    outcomes: Iterable[SourceAcquisitionOutcome],
+) -> tuple[SourceAcquisitionOutcome, ...]:
+    by_attempt: dict[tuple[str, str, str, int], SourceAcquisitionOutcome] = {}
+    for outcome in outcomes:
+        identity = (
+            outcome.provider,
+            outcome.capability,
+            outcome.source_ref,
+            outcome.attempt,
+        )
+        existing = by_attempt.get(identity)
+        if existing is not None and existing != outcome:
+            raise ValueError(
+                "source acquisition attempt was redefined for "
+                f"{outcome.provider}:{outcome.capability}:{outcome.attempt}"
+            )
+        by_attempt[identity] = outcome
+    return tuple(
+        sorted(
+            by_attempt.values(),
+            key=lambda outcome: (
+                outcome.capability,
+                outcome.source_ref,
+                outcome.provider_order,
+                outcome.attempt,
+                outcome.provider,
+                outcome.retrieved_at,
+                outcome.outcome,
+            ),
+        )
+    )
+
+
+class ToolExecutionEvidenceEnvelope(BaseModel):
+    """Checkpoint-safe provenance emitted alongside one exact tool result."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = Field(min_length=1)
+    selected_artifact: SourceArtifact | None = None
+
+    @model_validator(mode="after")
+    def _validate_local_bindings(self) -> ToolExecutionEvidenceEnvelope:
+        available = tuple(
+            outcome
+            for outcome in self.acquisition_outcomes
+            if isinstance(outcome, SourceAcquisitionAvailable)
+        )
+        for outcome in self.acquisition_outcomes:
+            if outcome.source_ref != self.source_ref:
+                raise ValueError("acquisition outcome source_ref does not match envelope")
+            if outcome.capability != self.capability:
+                raise ValueError("acquisition outcome capability does not match envelope")
+        if len(available) > 1:
+            raise ValueError("envelope may select at most one available acquisition outcome")
+        if not available:
+            if self.selected_artifact is not None:
+                raise ValueError("unavailable-only envelope cannot expose an artifact")
+            return self
+        if self.selected_artifact is None:
+            raise ValueError("available envelope must expose its selected artifact")
+        if available[0].artifact != self.selected_artifact:
+            raise ValueError("selected artifact does not match available acquisition outcome")
+        artifact = self.selected_artifact
+        if artifact.tool_call_id != self.tool_call_id:
+            raise ValueError("selected artifact tool_call_id does not match envelope")
+        if artifact.tool_name != self.tool_name:
+            raise ValueError("selected artifact tool_name does not match envelope")
+        if artifact.source_ref != self.source_ref:
+            raise ValueError("selected artifact source_ref does not match envelope")
+        return self
+
+
+def _unavailable_reason_for_text(content: str) -> AcquisitionUnavailableReason:
+    normalized = content.casefold()
+    if (
+        "too many requests" in normalized
+        or "rate limit" in normalized
+        or re.search(r"\b(?:http\s*)?429\b", normalized)
+    ):
+        return AcquisitionUnavailableReason.RATE_LIMITED
+    if (
+        "timeout" in normalized
+        or "timed out" in normalized
+        or re.search(r"\b(?:http\s*)?408\b", normalized)
+    ):
+        return AcquisitionUnavailableReason.TIMEOUT
+    if "not configured" in normalized or "missing configuration" in normalized:
+        return AcquisitionUnavailableReason.NOT_CONFIGURED
+    if (
+        "unauthorized" in normalized
+        or "authentication" in normalized
+        or "forbidden" in normalized
+        or re.search(r"\b(?:http\s*)?(?:401|403)\b", normalized)
+    ):
+        return AcquisitionUnavailableReason.AUTHENTICATION
+    if "malformed" in normalized or "invalid response" in normalized:
+        return AcquisitionUnavailableReason.MALFORMED_RESPONSE
+    if "no data" in normalized or "unavailable" in normalized or "not_available" in normalized:
+        return AcquisitionUnavailableReason.NO_DATA
+    return AcquisitionUnavailableReason.PROVIDER_ERROR
+
+
+def make_source_acquisition_outcome(
+    *,
+    provider: str,
+    capability: str,
+    attempt: int,
+    retrieved_at: str,
+    source_ref: str,
+    tool_call_id: str,
+    tool_name: str,
+    content: str,
+    status: str,
+    retry_after_seconds: float | None = None,
+) -> SourceAcquisitionOutcome:
+    """Convert a provider attempt into evidence or a diagnostic, never both."""
+    normalized_status = status.strip().casefold()
+    availability_content = "\n".join(
+        line
+        for line in content.splitlines()
+        if not line.lstrip().casefold().startswith("data_degraded:")
+    )
+    unavailable_marker = _source_quote_is_unavailable(availability_content) or any(
+        marker in availability_content.casefold()
+        for marker in (
+            "too many requests",
+            "rate limit",
+            "data_unavailable",
+            "timed out",
+            "timeout",
+            "unauthorized",
+            "forbidden",
+            "not configured",
+            "missing configuration",
+            "invalid response",
+            "malformed response",
+        )
+    )
+    unavailable_marker = unavailable_marker or bool(
+        re.search(
+            r"\b(?:http\s*)?(?:401|403|408|429|5\d{2})\b",
+            availability_content,
+            re.IGNORECASE,
+        )
+    )
+    if normalized_status in {"error", "failed", "unavailable"} or unavailable_marker:
+        reason = _unavailable_reason_for_text(content)
+        status_match = re.search(r"\b([1-5]\d{2})\b", content)
+        return SourceAcquisitionUnavailable(
+            provider=provider,
+            capability=capability,
+            source_ref=source_ref,
+            attempt=attempt,
+            retrieved_at=retrieved_at,
+            retryable=reason
+            in {
+                AcquisitionUnavailableReason.RATE_LIMITED,
+                AcquisitionUnavailableReason.TIMEOUT,
+                AcquisitionUnavailableReason.PROVIDER_ERROR,
+            },
+            reason=reason,
+            retry_after_seconds=retry_after_seconds,
+            http_status=int(status_match.group(1)) if status_match else None,
+        )
+    artifact_digest = sha256(content.encode()).hexdigest()
+    return SourceAcquisitionAvailable(
+        provider=provider,
+        capability=capability,
+        source_ref=source_ref,
+        attempt=attempt,
+        retrieved_at=retrieved_at,
+        artifact=SourceArtifact(
+            artifact_sha256=artifact_digest,
+            source_ref=source_ref,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            raw_text=content,
+        ),
+    )
+
+
+def calculation_readiness_outcome(
+    definition: CalculationDefinition,
+    *,
+    observations_available: int,
+    adjustment_basis: str,
+    input_artifact_sha256: str,
+    provider: str,
+    attempt: int,
+    retrieved_at: str,
+) -> SourceAcquisitionUnavailable | None:
+    """Return a typed diagnostic instead of computing with invalid inputs."""
+    readiness = CalculationReadinessDiagnostic(
+        calculation_id=definition.calculation_id,
+        required_observations=definition.required_observations,
+        available_observations=observations_available,
+        input_artifact_sha256=input_artifact_sha256,
+    )
+    source_ref = stable_acquisition_source_ref(
+        "calculation",
+        definition.calculation_id,
+        definition.version,
+    )
+    if observations_available < definition.required_observations:
+        return SourceAcquisitionUnavailable(
+            provider=provider,
+            capability=definition.output_field,
+            source_ref=source_ref,
+            attempt=attempt,
+            retrieved_at=retrieved_at,
+            # A calculation for a fixed historical snapshot cannot gain rows by
+            # retrying the same acquisition within the run.
+            retryable=False,
+            reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
+            calculation_readiness=readiness,
+        )
+    if adjustment_basis != definition.adjustment_basis:
+        return SourceAcquisitionUnavailable(
+            provider=provider,
+            capability=definition.output_field,
+            source_ref=source_ref,
+            attempt=attempt,
+            retrieved_at=retrieved_at,
+            retryable=False,
+            reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+            calculation_readiness=readiness,
+        )
+    return None
 
 
 class ClaimValidation(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     claim_id: str
     status: ClaimValidationStatus
     detail: str = ""
@@ -278,24 +938,48 @@ class ClaimValidation(BaseModel):
 class AnalystEvidenceReport(BaseModel):
     """Typed final payload emitted by a tool-calling analyst."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     report_markdown: str
     material_claims: tuple[SubmittedMaterialClaim, ...] = ()
 
 
 class EvidenceSource(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
-    source_id: str
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    source_id: str = Field(min_length=1, pattern=r".*\S.*")
     status: EvidenceStatus
     required: bool
     detail: str = ""
 
 
-class EvidenceState(BaseModel):
-    model_config = ConfigDict(frozen=True)
+def _canonicalize_source_facts(
+    facts: Iterable[SourceFact],
+) -> tuple[SourceFact, ...]:
+    first_seen: dict[str, SourceFact] = {}
+    canonical: list[SourceFact] = []
+    for fact in facts:
+        existing = first_seen.get(fact.fact_id)
+        if existing is None:
+            first_seen[fact.fact_id] = fact
+            canonical.append(fact)
+        elif existing.model_dump(
+            mode="python",
+            exclude={"tool_call_id"},
+        ) != fact.model_dump(
+            mode="python",
+            exclude={"tool_call_id"},
+        ):
+            raise ValueError(f"Source fact ID {fact.fact_id!r} was redefined.")
+    return tuple(canonical)
 
+
+class EvidenceState(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     instrument_identity: InstrumentIdentityEvidence | None = None
     market_snapshot: MarketSnapshotEvidence | None = None
     material_claims: tuple[MaterialClaim, ...] = ()
@@ -303,6 +987,23 @@ class EvidenceState(BaseModel):
     source_artifacts: tuple[SourceArtifact, ...] = ()
     claim_validations: tuple[ClaimValidation, ...] = ()
     sources: tuple[EvidenceSource, ...] = ()
+    acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
+
+    @model_validator(mode="after")
+    def _canonicalize_source_fact_collection(self) -> EvidenceState:
+        canonical_facts = _canonicalize_source_facts(self.source_facts)
+        if canonical_facts != self.source_facts:
+            object.__setattr__(self, "source_facts", canonical_facts)
+        return self
+
+    @model_validator(mode="after")
+    def _canonicalize_acquisition_outcomes(self) -> EvidenceState:
+        canonical = _canonicalize_source_acquisition_outcomes(
+            self.acquisition_outcomes
+        )
+        if canonical == self.acquisition_outcomes:
+            return self
+        return self.model_copy(update={"acquisition_outcomes": canonical})
 
 
 def merge_material_claims(
@@ -335,13 +1036,8 @@ def merge_source_facts(
         if isinstance(evidence, EvidenceState)
         else EvidenceState.model_validate(evidence or {})
     )
-    merged = {fact.fact_id: fact for fact in current.source_facts}
-    for fact in facts:
-        existing = merged.get(fact.fact_id)
-        if existing is not None and existing != fact:
-            raise ValueError(f"Source fact ID {fact.fact_id!r} was redefined.")
-        merged[fact.fact_id] = fact
-    return current.model_copy(update={"source_facts": tuple(merged.values())})
+    canonical = _canonicalize_source_facts((*current.source_facts, *facts))
+    return current.model_copy(update={"source_facts": canonical})
 
 
 def merge_source_artifacts(
@@ -366,6 +1062,23 @@ def merge_source_artifacts(
             )
         merged[key] = artifact
     return current.model_copy(update={"source_artifacts": tuple(merged.values())})
+
+
+def merge_source_acquisition_outcomes(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    outcomes: Iterable[SourceAcquisitionOutcome],
+) -> EvidenceState:
+    """Merge attempt outcomes idempotently without turning failures into evidence."""
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+
+    canonical = _canonicalize_source_acquisition_outcomes(
+        (*current.acquisition_outcomes, *outcomes)
+    )
+    return current.model_copy(update={"acquisition_outcomes": canonical})
 
 
 def merge_claim_validations(
@@ -501,26 +1214,10 @@ def build_tool_evidence_state(
             claims_by_source.setdefault(source_ref, []).append(claim)
     allowed_refs = frozenset(tool_call_ids_by_source)
 
-    def message_is_unavailable(message: Any) -> bool:
-        if getattr(message, "status", None) == "error":
-            return True
-        content = "\n".join(
-            line
-            for line in str(getattr(message, "content", "")).upper().splitlines()
-            if not line.lstrip().startswith("DATA_DEGRADED:")
-        )
-        return any(
-            marker in content
-            for marker in (
-                "DATA_UNAVAILABLE",
-                "NOT_AVAILABLE",
-                "NOT APPLICABLE",
-                "UNAVAILABLE",
-            )
-        )
-
     sources: list[EvidenceSource] = []
+    acquisition_outcomes: list[SourceAcquisitionOutcome] = []
     available_messages_by_source: dict[str, tuple[Any, ...]] = {}
+    selected_artifacts_by_source_call: dict[tuple[str, str], SourceArtifact] = {}
     for source_ref in claims_by_source:
         if source_ref not in allowed_refs:
             sources.append(
@@ -534,15 +1231,37 @@ def build_tool_evidence_state(
             continue
         source_kind = source_ref.partition(":")[0]
         allowed_tool_names = (
-            {"get_verified_market_snapshot", "get_indicators"}
+            frozenset({"get_verified_market_snapshot", "get_indicators"})
             if source_kind == "snapshot"
-            else {source_kind}
+            else frozenset({source_kind})
         )
+
+        def message_matches_source(
+            message: Any,
+            bound_tool_names: frozenset[str] = allowed_tool_names,
+            bound_source_ref: str = source_ref,
+        ) -> bool:
+            message_tool_name = str(getattr(message, "name", ""))
+            if message_tool_name in bound_tool_names:
+                return True
+            try:
+                envelope = ToolExecutionEvidenceEnvelope.model_validate(
+                    getattr(message, "artifact", None)
+                )
+            except ValidationError:
+                return False
+            return (
+                envelope.source_ref == bound_source_ref
+                and envelope.tool_call_id
+                == str(getattr(message, "tool_call_id", ""))
+                and envelope.tool_name == message_tool_name
+            )
+
         matching_messages = tuple(
             message
             for tool_call_id in tool_call_ids_by_source[source_ref]
             for message in tool_messages.get(str(tool_call_id), ())
-            if getattr(message, "name", None) in allowed_tool_names
+            if message_matches_source(message)
         )
         if not matching_messages:
             sources.append(
@@ -554,8 +1273,71 @@ def build_tool_evidence_state(
                 )
             )
             continue
+        envelopes: list[tuple[Any, ToolExecutionEvidenceEnvelope]] = []
+        envelopes_by_call_id: dict[str, ToolExecutionEvidenceEnvelope] = {}
+        envelope_error = False
+        for message in sorted(
+            matching_messages,
+            key=lambda item: str(getattr(item, "tool_call_id", "")),
+        ):
+            try:
+                envelope = ToolExecutionEvidenceEnvelope.model_validate(
+                    getattr(message, "artifact", None)
+                )
+            except ValidationError:
+                envelope_error = True
+                break
+            message_tool_call_id = str(getattr(message, "tool_call_id", ""))
+            message_tool_name = str(getattr(message, "name", ""))
+            expected_capability = (
+                envelope.capability
+                if source_ref.startswith("acq.v1:")
+                else (
+                    EvidenceCapability.MARKET_SNAPSHOT.value
+                    if source_kind == "snapshot"
+                    and message_tool_name == "get_verified_market_snapshot"
+                    else (
+                        message_tool_name if source_kind == "snapshot" else source_kind
+                    )
+                )
+            )
+            selected = envelope.selected_artifact
+            previous = envelopes_by_call_id.get(message_tool_call_id)
+            if (
+                (previous is not None and previous != envelope)
+                or envelope.tool_call_id != message_tool_call_id
+                or envelope.tool_name != message_tool_name
+                or envelope.source_ref != source_ref
+                or envelope.capability != expected_capability
+                or (
+                    selected is not None
+                    and selected.raw_text != str(getattr(message, "content", ""))
+                )
+            ):
+                envelope_error = True
+                break
+            envelopes_by_call_id[message_tool_call_id] = envelope
+            envelopes.append((message, envelope))
+        if envelope_error or not envelopes:
+            sources.append(
+                EvidenceSource(
+                    source_id=source_ref,
+                    status=EvidenceStatus.UNAVAILABLE,
+                    required=False,
+                    detail="trusted acquisition metadata not exposed",
+                )
+            )
+            continue
+        attempt_outcomes = tuple(
+            outcome
+            for _, envelope in envelopes
+            for outcome in envelope.acquisition_outcomes
+        )
+        acquisition_outcomes.extend(attempt_outcomes)
         available_messages = tuple(
-            message for message in matching_messages if not message_is_unavailable(message)
+            message
+            for message, envelope in envelopes
+            if envelope.selected_artifact is not None
         )
         if not available_messages:
             sources.append(
@@ -568,6 +1350,13 @@ def build_tool_evidence_state(
             )
             continue
         available_messages_by_source[source_ref] = available_messages
+        selected_artifacts_by_source_call.update(
+            {
+                (source_ref, envelope.tool_call_id): envelope.selected_artifact
+                for _, envelope in envelopes
+                if envelope.selected_artifact is not None
+            }
+        )
         sources.append(
             EvidenceSource(
                 source_id=source_ref,
@@ -600,21 +1389,19 @@ def build_tool_evidence_state(
                 if span_start < 0:
                     continue
                 tool_call_id = str(getattr(message, "tool_call_id", ""))
-                artifact_digest = sha256(content.encode()).hexdigest()
+                artifact = selected_artifacts_by_source_call[(source_ref, tool_call_id)]
+                artifact_digest = artifact.artifact_sha256
                 artifact_key = (artifact_digest, tool_call_id, source_ref)
-                artifacts[artifact_key] = SourceArtifact(
-                    artifact_sha256=artifact_digest,
+                artifacts[artifact_key] = artifact
+                fact_id = stable_source_fact_id(
                     source_ref=source_ref,
-                    tool_call_id=tool_call_id,
-                    tool_name=str(getattr(message, "name", "")),
-                    raw_text=content,
+                    artifact_sha256=artifact_digest,
+                    source_span_start=span_start,
+                    source_span_end=span_start + len(quote),
                 )
-                fact_digest = sha256(
-                    f"{source_ref}\0{tool_call_id}\0{quote}".encode()
-                ).hexdigest()
                 claim_facts.append(
                     SourceFact(
-                        fact_id=f"fact:{fact_digest}",
+                        fact_id=fact_id,
                         source_ref=source_ref,
                         tool_call_id=tool_call_id,
                         tool_name=str(getattr(message, "name", "")),
@@ -700,19 +1487,50 @@ def build_tool_evidence_state(
         source_artifacts=tuple(artifacts.values()),
         claim_validations=tuple(validations),
         sources=tuple(sources),
+        acquisition_outcomes=tuple(acquisition_outcomes),
     )
 
 
 def build_inline_evidence_state(
     source_text_by_ref: Mapping[str, str | None],
     claims: Iterable[MaterialClaim],
+    *,
+    source_artifact_by_ref: Mapping[str, SourceArtifact] | None = None,
 ) -> EvidenceState:
-    """Validate claims against pre-fetched source blocks kept in the prompt."""
+    """Validate claims against pre-fetched source blocks kept in the prompt.
+
+    ``source_artifact_by_ref`` binds a prompt-facing source ref to the exact
+    acquired artifact that supplied its text, without minting alias provenance.
+    """
     claim_list = tuple(claims)
-    normalized_sources = {
-        source_ref: text if text is not None and text.strip() else None
-        for source_ref, text in source_text_by_ref.items()
-    }
+    bound_artifacts = dict(source_artifact_by_ref or {})
+    normalized_sources: dict[str, str | None] = {}
+    acquisition_outcomes: list[SourceAcquisitionOutcome] = []
+    for source_ref, text in source_text_by_ref.items():
+        bound_artifact = bound_artifacts.get(source_ref)
+        if bound_artifact is not None:
+            normalized_sources[source_ref] = bound_artifact.raw_text
+            continue
+        content = text if text is not None else ""
+        outcome = make_source_acquisition_outcome(
+            provider=source_ref.partition(".")[2] or "inline",
+            capability=source_ref,
+            attempt=1,
+            retrieved_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            source_ref=source_ref,
+            tool_call_id=f"inline:{source_ref}",
+            tool_name="inline_source",
+            content=content,
+            status="success" if content.strip() else "unavailable",
+        )
+        acquisition_outcomes.append(outcome)
+        normalized_sources[source_ref] = (
+            outcome.artifact.raw_text
+            if isinstance(outcome, SourceAcquisitionAvailable)
+            else None
+        )
+    for source_ref, artifact in bound_artifacts.items():
+        normalized_sources.setdefault(source_ref, artifact.raw_text)
     sources = tuple(
         EvidenceSource(
             source_id=source_ref,
@@ -727,7 +1545,10 @@ def build_inline_evidence_state(
         for source_ref, text in normalized_sources.items()
     )
     facts: list[SourceFact] = []
-    artifacts: dict[tuple[str, str, str], SourceArtifact] = {}
+    artifacts: dict[tuple[str, str, str], SourceArtifact] = {
+        (artifact.artifact_sha256, artifact.tool_call_id, artifact.source_ref): artifact
+        for artifact in bound_artifacts.values()
+    }
     validations: list[ClaimValidation] = []
     enriched_claims: list[MaterialClaim] = []
     for claim in claim_list:
@@ -752,24 +1573,35 @@ def build_inline_evidence_state(
             span_start = content.find(quote) if quote else -1
             if span_start < 0:
                 continue
-            artifact_digest = sha256(content.encode()).hexdigest()
-            tool_call_id = f"inline:{source_ref}"
-            artifact_key = (artifact_digest, tool_call_id, source_ref)
-            artifacts[artifact_key] = SourceArtifact(
-                artifact_sha256=artifact_digest,
-                source_ref=source_ref,
-                tool_call_id=tool_call_id,
-                tool_name="inline_source",
-                raw_text=content,
-            )
-            fact_digest = sha256(
-                f"{source_ref}\0{artifact_digest}\0{quote}".encode()
-            ).hexdigest()
+            bound_artifact = bound_artifacts.get(source_ref)
+            if bound_artifact is None:
+                artifact_digest = sha256(content.encode()).hexdigest()
+                artifact_source_ref = source_ref
+                tool_call_id = f"inline:{source_ref}"
+                tool_name = "inline_source"
+                artifact_key = (artifact_digest, tool_call_id, artifact_source_ref)
+                artifacts[artifact_key] = SourceArtifact(
+                    artifact_sha256=artifact_digest,
+                    source_ref=artifact_source_ref,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    raw_text=content,
+                )
+            else:
+                artifact_digest = bound_artifact.artifact_sha256
+                artifact_source_ref = bound_artifact.source_ref
+                tool_call_id = bound_artifact.tool_call_id
+                tool_name = bound_artifact.tool_name
             fact = SourceFact(
-                fact_id=f"fact:{fact_digest}",
-                source_ref=source_ref,
+                fact_id=stable_source_fact_id(
+                    source_ref=artifact_source_ref,
+                    artifact_sha256=artifact_digest,
+                    source_span_start=span_start,
+                    source_span_end=span_start + len(quote),
+                ),
+                source_ref=artifact_source_ref,
                 tool_call_id=tool_call_id,
-                tool_name="inline_source",
+                tool_name=tool_name,
                 artifact_sha256=artifact_digest,
                 raw_text=quote,
                 source_span_start=span_start,
@@ -845,6 +1677,7 @@ def build_inline_evidence_state(
                 for source_ref in unknown_source_ids
             ),
         ),
+        acquisition_outcomes=tuple(acquisition_outcomes),
     )
 
 
@@ -995,12 +1828,23 @@ def decision_ready_material_claims(
 
 
 class AdmissionGateResult(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     admitted: bool
     readiness: EvidenceReadiness
-    coverage: float = Field(ge=0.0, le=1.0)
     diagnostics: tuple[str, ...] = ()
+
+
+class EvidencePreflightResult(BaseModel):
+    """Baseline evidence validation before any model-mediated analysis."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    passed: bool
+    readiness: EvidenceReadiness
+    blockers: tuple[str, ...] = ()
 
 
 class DraftThesis(BaseModel):
@@ -1296,14 +2140,36 @@ def evaluate_decision_gate(
 def build_evidence_state(
     *,
     symbol: str,
-    identity: Mapping[str, str],
+    identity: Mapping[str, Any],
     snapshot: Any | None,
 ) -> EvidenceState:
     """Convert acquired identity and snapshot data into checkpoint-safe evidence."""
     name = identity.get("company_name") or identity.get("name")
-    instrument_identity = (
-        InstrumentIdentityEvidence(symbol=symbol, name=name) if name else None
-    )
+    raw_kind = str(
+        identity.get("instrument_kind") or identity.get("quote_type") or "unknown"
+    ).strip().casefold()
+    kind_aliases = {
+        "stock": InstrumentKind.EQUITY,
+        "equity": InstrumentKind.EQUITY,
+        "etf": InstrumentKind.FUND,
+        "fund": InstrumentKind.FUND,
+        "mutualfund": InstrumentKind.FUND,
+        "index": InstrumentKind.INDEX,
+        "bond": InstrumentKind.BOND,
+        "cryptocurrency": InstrumentKind.CRYPTO,
+        "crypto": InstrumentKind.CRYPTO,
+    }
+    provenance_value = identity.get("provenance")
+    instrument_identity = None
+    if identity:
+        instrument_identity = InstrumentIdentityEvidence(
+            symbol=str(identity.get("canonical_symbol") or symbol),
+            venue=str(identity.get("venue") or identity.get("exchange") or ""),
+            instrument_kind=kind_aliases.get(raw_kind, InstrumentKind.UNKNOWN),
+            currency=str(identity.get("currency") or ""),
+            provenance=provenance_value,
+            display_name=str(name) if name else None,
+        )
     market_snapshot = None
     if snapshot is not None:
         market_snapshot = MarketSnapshotEvidence(
@@ -1325,38 +2191,278 @@ def build_evidence_state(
 
 def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
     """Acquire run identity and the validated five-year market snapshot."""
-    from tradingagents.agents.utils.agent_utils import resolve_instrument_identity
     from tradingagents.dataflows.errors import NoMarketDataError
+    from tradingagents.dataflows.instrument_identity import (
+        IdentityRegistryAvailable,
+        RegistryFailureReason,
+        resolve_authoritative_instrument_identity,
+    )
     from tradingagents.dataflows.market_snapshot import (
+        get_active_market_snapshot_acquisition_record,
         get_authoritative_market_snapshot,
     )
 
     requested = datetime.strptime(requested_date, "%Y-%m-%d")
     start_date = (requested - relativedelta(years=5)).strftime("%Y-%m-%d")
-    identity = resolve_instrument_identity(symbol)
-    try:
-        snapshot = get_authoritative_market_snapshot(
-            symbol,
-            start_date,
-            requested_date,
-            minimum_history_rows=1,
+    registry_result = resolve_authoritative_instrument_identity(symbol)
+    identity: dict[str, Any] = {}
+    acquired_at = datetime.now(timezone.utc).isoformat()
+
+    if isinstance(registry_result, IdentityRegistryAvailable):
+        canonical_symbol = registry_result.identity.canonical_symbol
+        identity = registry_result.identity.as_mapping()
+        identity["exchange"] = registry_result.identity.venue
+        try:
+            snapshot = get_authoritative_market_snapshot(
+                canonical_symbol,
+                start_date,
+                requested_date,
+                minimum_history_rows=1,
+            )
+        except NoMarketDataError:
+            snapshot = None
+        snapshot_record = get_active_market_snapshot_acquisition_record(
+            canonical_symbol, requested_date
         )
-    except NoMarketDataError:
+        identity_source_ref = stable_acquisition_source_ref(
+            "identity-registry",
+            registry_result.registry_source_ref,
+            registry_result.registry_sha256,
+        )
+        artifact = SourceArtifact(
+            artifact_sha256=registry_result.registry_sha256,
+            source_ref=identity_source_ref,
+            tool_call_id="identity-registry",
+            tool_name="instrument_identity_registry",
+            raw_text=registry_result.raw_artifact,
+        )
+        identity_outcome: SourceAcquisitionOutcome = SourceAcquisitionAvailable(
+            provider="instrument-identity-registry",
+            capability="instrument_identity",
+            source_ref=identity_source_ref,
+            attempt=1,
+            retrieved_at=acquired_at,
+            artifact=artifact,
+        )
+        market_artifact = (
+            snapshot_record.source_artifact
+            if snapshot_record is not None
+            else getattr(snapshot, "source_artifact", None)
+        )
+        artifacts = (artifact,) + (
+            (market_artifact,) if market_artifact is not None else ()
+        )
+        market_outcomes = (
+            snapshot_record.outcomes
+            if snapshot_record is not None
+            else tuple(getattr(snapshot, "acquisition_outcomes", ()))
+        )
+    else:
+        # Identity failure is deterministic for this registry configuration.
+        # Do not spend market-data calls on a run that preflight must reject.
         snapshot = None
-    return build_evidence_state(
+        reason_map = {
+            RegistryFailureReason.NOT_CONFIGURED: (
+                AcquisitionUnavailableReason.REGISTRY_NOT_CONFIGURED
+            ),
+            RegistryFailureReason.NOT_FOUND: AcquisitionUnavailableReason.IDENTITY_NOT_FOUND,
+            RegistryFailureReason.MALFORMED: (
+                AcquisitionUnavailableReason.MALFORMED_RESPONSE
+            ),
+            RegistryFailureReason.INTEGRITY_FAILURE: (
+                AcquisitionUnavailableReason.INTEGRITY_FAILURE
+            ),
+            RegistryFailureReason.UNAVAILABLE: (
+                AcquisitionUnavailableReason.REGISTRY_UNAVAILABLE
+            ),
+        }
+        identity_outcome = SourceAcquisitionUnavailable(
+            provider="instrument-identity-registry",
+            capability="instrument_identity",
+            source_ref=stable_acquisition_source_ref(
+                "identity-registry",
+                registry_result.source_ref,
+                registry_result.reason.value,
+            ),
+            attempt=1,
+            retrieved_at=acquired_at,
+            retryable=False,
+            reason=reason_map[registry_result.reason],
+        )
+        artifacts = ()
+        market_outcomes = ()
+
+    state = build_evidence_state(
         symbol=symbol,
         identity=identity,
         snapshot=snapshot,
     )
+    return state.model_copy(
+        update={
+            "source_artifacts": artifacts,
+            "acquisition_outcomes": (identity_outcome, *market_outcomes),
+        }
+    )
+
+
+class AnalysisOutcomeReason(str, Enum):
+    PREFLIGHT_BLOCKED = "preflight_blocked"
+    ADMISSION_BLOCKED = "admission_blocked"
+    DECISION_GATE_BLOCKED = "decision_gate_blocked"
+    PORTFOLIO_GATE_BLOCKED = "portfolio_gate_blocked"
+    SHADOW_MODE_BLOCKED = "shadow_mode_blocked"
+
+
+class AnalysisDiagnosticCode(str, Enum):
+    IDENTITY_UNAVAILABLE = "identity_unavailable"
+    SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
+    SNAPSHOT_INVALID = "snapshot_invalid"
+    HISTORY_INSUFFICIENT = "history_insufficient"
+    REQUIRED_EVIDENCE_UNAVAILABLE = "required_evidence_unavailable"
+    REQUIRED_EVIDENCE_CONFLICTED = "required_evidence_conflicted"
+    DECISION_CONFIGURATION_INVALID = "decision_configuration_invalid"
+    STRATEGY_RULE_INVALID = "strategy_rule_invalid"
+    DIRECTION_SELECTION_INVALID = "direction_selection_invalid"
+    DECISION_ASSERTION_INVALID = "decision_assertion_invalid"
+    STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
+    SHADOW_MODE = "shadow_mode"
+    DETERMINISTIC_GATE_REJECTED = "deterministic_gate_rejected"
 
 
 class AnalysisOutcome(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = _CLOSED_MODEL_CONFIG
 
+    contract_version: Literal["2.0"] = ANALYSIS_OUTCOME_CONTRACT_VERSION
     readiness: EvidenceReadiness
-    summary: str
-    diagnostics: tuple[str, ...]
-    evidence_coverage: float = Field(ge=0.0, le=1.0)
+    reason: AnalysisOutcomeReason
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
+
+    @field_validator("diagnostic_codes")
+    @classmethod
+    def _canonicalize_diagnostic_codes(
+        cls,
+        value: tuple[AnalysisDiagnosticCode, ...],
+    ) -> tuple[AnalysisDiagnosticCode, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
+
+
+_ANALYSIS_OUTCOME_SUMMARIES = {
+    AnalysisOutcomeReason.PREFLIGHT_BLOCKED: (
+        "Analysis stopped before model-mediated work because required baseline "
+        "evidence or deterministic decision configuration was not decision-ready."
+    ),
+    AnalysisOutcomeReason.ADMISSION_BLOCKED: (
+        "Analysis stopped before thesis synthesis because required evidence and "
+        "rule-backed assertions were not decision-ready."
+    ),
+    AnalysisOutcomeReason.DECISION_GATE_BLOCKED: (
+        "Analysis completed without a Trading Decision because the final direction "
+        "proposal did not satisfy the deterministic Decision Gate."
+    ),
+    AnalysisOutcomeReason.PORTFOLIO_GATE_BLOCKED: (
+        "Analysis completed without a Trading Decision because the Portfolio Manager "
+        "could not produce a decision-ready evidence chain."
+    ),
+    AnalysisOutcomeReason.SHADOW_MODE_BLOCKED: (
+        "Analysis completed without a Trading Decision because shadow evidence mode "
+        "is diagnostic-only."
+    ),
+}
+
+_ANALYSIS_DIAGNOSTIC_LABELS = {
+    AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE: (
+        "Authoritative instrument identity was unavailable or invalid."
+    ),
+    AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE: (
+        "The authoritative market snapshot was unavailable."
+    ),
+    AnalysisDiagnosticCode.SNAPSHOT_INVALID: (
+        "The authoritative market snapshot failed deterministic validation."
+    ),
+    AnalysisDiagnosticCode.HISTORY_INSUFFICIENT: (
+        "The authoritative snapshot did not contain enough usable history."
+    ),
+    AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE: (
+        "A required evidence capability was unavailable or not applicable."
+    ),
+    AnalysisDiagnosticCode.REQUIRED_EVIDENCE_CONFLICTED: (
+        "Required evidence contained an unresolved material conflict."
+    ),
+    AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID: (
+        "Deterministic decision configuration was unavailable or invalid."
+    ),
+    AnalysisDiagnosticCode.STRATEGY_RULE_INVALID: (
+        "No valid registered Strategy Rule application could authorize direction."
+    ),
+    AnalysisDiagnosticCode.DIRECTION_SELECTION_INVALID: (
+        "The direction selection was unavailable or incompatible with its context."
+    ),
+    AnalysisDiagnosticCode.DECISION_ASSERTION_INVALID: (
+        "A decision assertion failed deterministic validation."
+    ),
+    AnalysisDiagnosticCode.STRUCTURED_OUTPUT_INVALID: (
+        "Required structured portfolio output was unavailable or invalid."
+    ),
+    AnalysisDiagnosticCode.SHADOW_MODE: (
+        "Shadow evidence mode cannot publish a directional decision."
+    ),
+    AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED: (
+        "A deterministic trust-boundary check rejected publication."
+    ),
+}
+
+
+def analysis_diagnostic_codes(
+    diagnostics: Iterable[str],
+) -> tuple[AnalysisDiagnosticCode, ...]:
+    """Collapse internal blocker details into a closed, publication-safe taxonomy."""
+
+    codes: set[AnalysisDiagnosticCode] = set()
+    for diagnostic in diagnostics:
+        normalized = " ".join(str(diagnostic).replace("_", " ").casefold().split())
+        if "shadow" in normalized:
+            code = AnalysisDiagnosticCode.SHADOW_MODE
+        elif "identity" in normalized:
+            code = AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE
+        elif "history" in normalized or " rows" in normalized:
+            code = AnalysisDiagnosticCode.HISTORY_INSUFFICIENT
+        elif "snapshot" in normalized and any(
+            marker in normalized for marker in ("missing", "unavailable")
+        ):
+            code = AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE
+        elif "snapshot" in normalized:
+            code = AnalysisDiagnosticCode.SNAPSHOT_INVALID
+        elif "conflict" in normalized:
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_CONFLICTED
+        elif "required evidence" in normalized or "required capability" in normalized:
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE
+        elif any(
+            marker in normalized
+            for marker in (
+                "configuration",
+                "not configured",
+                "registry",
+                "calculation",
+                "resolver",
+                "evaluator",
+            )
+        ):
+            code = AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+        elif "strategy rule" in normalized:
+            code = AnalysisDiagnosticCode.STRATEGY_RULE_INVALID
+        elif "direction" in normalized or "rating" in normalized:
+            code = AnalysisDiagnosticCode.DIRECTION_SELECTION_INVALID
+        elif "assertion" in normalized:
+            code = AnalysisDiagnosticCode.DECISION_ASSERTION_INVALID
+        elif any(
+            marker in normalized
+            for marker in ("structured", "portfolio manager", "revision", "selection")
+        ):
+            code = AnalysisDiagnosticCode.STRUCTURED_OUTPUT_INVALID
+        else:
+            code = AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED
+        codes.add(code)
+    return tuple(sorted(codes, key=lambda item: item.value))
 
 
 def render_analysis_outcome(outcome: AnalysisOutcome) -> str:
@@ -1367,16 +2473,113 @@ def render_analysis_outcome(outcome: AnalysisOutcome) -> str:
     }
     lines = [
         f"**Analysis Outcome:** {labels[outcome.readiness]}",
-        f"**Evidence Coverage:** {outcome.evidence_coverage:.1%}",
         "",
-        outcome.summary,
+        f"**Reason Code:** `{outcome.reason.value}`",
+        "",
+        _ANALYSIS_OUTCOME_SUMMARIES[outcome.reason],
         "",
         "No Trading Decision was issued.",
     ]
-    if outcome.diagnostics:
-        lines.extend(["", "### Diagnostics", ""])
-        lines.extend(f"- {diagnostic}" for diagnostic in outcome.diagnostics)
+    if outcome.diagnostic_codes:
+        lines.extend(["", "### Deterministic Blockers", ""])
+        lines.extend(
+            f"- `{code.value}`: {_ANALYSIS_DIAGNOSTIC_LABELS[code]}"
+            for code in sorted(outcome.diagnostic_codes, key=lambda item: item.value)
+        )
     return "\n".join(lines)
+
+
+def analysis_outcome_publication(outcome: AnalysisOutcome) -> dict[str, Any]:
+    """Publish the typed outcome and its sole deterministic prose rendering."""
+
+    return {
+        "analysis_outcome_contract": outcome.model_dump(mode="json"),
+        "analysis_outcome": render_analysis_outcome(outcome),
+    }
+
+
+def evaluate_preflight_gate(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    *,
+    minimum_history_rows: int = 1,
+) -> EvidencePreflightResult:
+    """Validate authoritative baseline evidence without requiring analyst output."""
+    if minimum_history_rows < 1:
+        raise ValueError("minimum_history_rows must be at least 1")
+    state = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+    blockers: list[str] = []
+    identity = state.instrument_identity
+    snapshot = state.market_snapshot
+    profile = None
+
+    if identity is None:
+        blockers.append("authoritative instrument identity is missing")
+    elif not identity.is_authoritative:
+        blockers.append(
+            "instrument identity requires canonical symbol, venue, kind, currency, "
+            "and provenance"
+        )
+    else:
+        try:
+            profile = capability_profile_for(identity.instrument_kind)
+        except ValueError as exc:
+            blockers.append(str(exc))
+
+    if profile is not None:
+        unsupported_required = set(profile.required_capabilities) - {
+            EvidenceCapability.MARKET_SNAPSHOT
+        }
+        blockers.extend(
+            "unsupported required capability: " + capability.value
+            for capability in sorted(unsupported_required, key=lambda item: item.value)
+        )
+
+    if snapshot is None:
+        blockers.append("authoritative market snapshot is missing")
+    else:
+        if identity is not None and snapshot.symbol != identity.symbol:
+            blockers.append("instrument identity and market snapshot symbols differ")
+        unknown_adjustment = snapshot.adjustment_basis.strip().casefold() in {
+            "",
+            "unknown",
+            "none",
+            "n/a",
+        }
+        if unknown_adjustment:
+            blockers.append("authoritative market snapshot adjustment basis is unknown")
+        try:
+            requested_date = datetime.fromisoformat(snapshot.requested_date)
+            effective_date = datetime.fromisoformat(snapshot.effective_trading_date)
+        except ValueError:
+            blockers.append("authoritative market snapshot dates must be ISO-8601")
+        else:
+            if effective_date > requested_date:
+                blockers.append(
+                    "effective trading date cannot be later than the requested date"
+                )
+        if not re.fullmatch(r"[0-9a-f]{64}", snapshot.frame_sha256):
+            blockers.append("authoritative market snapshot frame digest is invalid")
+        if not snapshot.snapshot_id.strip():
+            blockers.append("authoritative market snapshot ID is missing")
+        if snapshot.history_rows < minimum_history_rows:
+            blockers.append(
+                "authoritative market snapshot has "
+                f"{snapshot.history_rows} rows; at least {minimum_history_rows} are required"
+            )
+
+    return EvidencePreflightResult(
+        passed=not blockers,
+        readiness=(
+            EvidenceReadiness.DECISION_READY
+            if not blockers
+            else EvidenceReadiness.INSUFFICIENT
+        ),
+        blockers=tuple(blockers),
+    )
 
 
 def evaluate_admission_gate(
@@ -1384,13 +2587,10 @@ def evaluate_admission_gate(
     minimum_history_rows: int = 1,
 ) -> AdmissionGateResult:
     """Evaluate whether acquired evidence may proceed to thesis synthesis."""
-    coverage = _evidence_coverage(evidence)
-
     if evidence.instrument_identity is None:
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Required evidence missing: resolved instrument identity.",
             ),
@@ -1400,7 +2600,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Required evidence missing: Authoritative Market Snapshot.",
             ),
@@ -1410,7 +2609,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Required evidence missing: known Adjustment Basis.",
             ),
@@ -1420,7 +2618,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Required evidence missing: Effective Trading Date.",
             ),
@@ -1433,7 +2630,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Required evidence missing: immutable Authoritative Market "
                 "Snapshot ID and frame digest.",
@@ -1459,11 +2655,28 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=(
                 "Insufficient market history: "
                 f"{evidence.market_snapshot.history_rows} rows available; "
                 f"{required_history_rows} required{calculation_suffix}.",
+            ),
+        )
+
+    required_not_applicable = tuple(
+        source
+        for source in evidence.sources
+        if source.required and source.status is EvidenceStatus.NOT_APPLICABLE
+    )
+    if required_not_applicable:
+        return AdmissionGateResult(
+            admitted=False,
+            readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostics=tuple(
+                "Required evidence configuration invalid: "
+                f"{source.source_id}"
+                f"{f' ({source.detail})' if source.detail else ''} "
+                "is marked not applicable."
+                for source in required_not_applicable
             ),
         )
 
@@ -1476,7 +2689,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.CONFLICTED,
-            coverage=coverage,
             diagnostics=tuple(
                 "Required evidence conflicted: "
                 f"{source.source_id}{f' ({source.detail})' if source.detail else ''}."
@@ -1493,7 +2705,6 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
-            coverage=coverage,
             diagnostics=tuple(
                 "Required evidence unavailable: "
                 f"{source.source_id}{f' ({source.detail})' if source.detail else ''}."
@@ -1519,6 +2730,5 @@ def evaluate_admission_gate(
             if optional_unavailable
             else EvidenceReadiness.DECISION_READY
         ),
-        coverage=coverage,
         diagnostics=diagnostics,
     )

@@ -138,12 +138,14 @@ def test_final_metrics_cover_runtime_costs_and_queue_health(tmp_path):
         log_paths=[log_path],
         metrics_path=metrics_path,
     )
+    writer.transition_phase("analysis", at=1.0)
     writer.record_duration("graph_phase", "graph_stream", 1.25)
     writer.record_duration("tool", "get_stock_data", 0.4)
     writer.record_duration("model", "gpt-5-mini", 0.8)
     writer.record_duration("report", "market_report", 0.05)
     writer.record_tool_call("12:00:00", "get_stock_data", {"rows": [1, 2, 3]})
     writer.flush()
+    writer.finish_phases(at=2.0)
     writer.close()
 
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -159,6 +161,12 @@ def test_final_metrics_cover_runtime_costs_and_queue_health(tmp_path):
     assert metrics["durations"]["report"]["market_report"][
         "total_seconds"
     ] == pytest.approx(0.05)
+    assert metrics["stage_activity"]["analysis"] == {
+        "model_calls": 1,
+        "model_seconds": pytest.approx(0.8),
+        "tool_calls": 1,
+        "tool_seconds": pytest.approx(0.4),
+    }
     assert metrics["queue"]["max_depth"] >= 1
     assert metrics["queue"]["current_depth"] == 0
     assert metrics["bytes"]["payload_uncompressed"] > 0
@@ -171,6 +179,75 @@ def test_final_metrics_cover_runtime_costs_and_queue_health(tmp_path):
         "coalesced_events": 0,
         "dropped_by_kind": {},
         "dropped_events": 0,
+    }
+
+
+@pytest.mark.unit
+def test_terminal_metrics_aggregate_calls_cost_retries_and_routing(tmp_path):
+    from cli.runtime_artifacts import RuntimeArtifactWriter
+
+    metrics_path = tmp_path / "runtime_metrics.json"
+    writer = RuntimeArtifactWriter(
+        artifact_root=tmp_path / "runtime_artifacts",
+        log_paths=[tmp_path / "message_tool.log"],
+        metrics_path=metrics_path,
+    )
+    writer.record_terminal_summary(
+        terminal_route="analysis_outcome",
+        stats={
+            "llm_calls": 3,
+            "tool_calls": 4,
+            "tokens_in": 100,
+            "tokens_out": 20,
+        },
+        acquisition_outcomes=(
+            {
+                "outcome": "unavailable",
+                "provider": "news-primary",
+                "capability": "sentiment.news",
+                "source_ref": "sentiment.news",
+                "attempt": 1,
+                "retryable": True,
+                "reason": "rate_limited",
+            },
+            {
+                "outcome": "unavailable",
+                "provider": "news-primary",
+                "capability": "sentiment.news",
+                "source_ref": "sentiment.news",
+                "attempt": 2,
+                "retryable": False,
+                "reason": "circuit_open",
+            },
+            {
+                "outcome": "available",
+                "provider": "news-fallback",
+                "capability": "sentiment.news",
+                "source_ref": "sentiment.news",
+                "attempt": 1,
+                "retryable": False,
+            },
+        ),
+    )
+    writer.close()
+
+    terminal = json.loads(metrics_path.read_text(encoding="utf-8"))["terminal"]
+    assert terminal["terminal_route"] == "analysis_outcome"
+    assert terminal["model"] == {
+        "calls": 3,
+        "tokens_in": 100,
+        "tokens_out": 20,
+    }
+    assert terminal["tool"] == {"calls": 4}
+    assert terminal["cost"] == {"available": False, "amount_usd": None}
+    assert terminal["acquisition"] == {
+        "attempts": 3,
+        "available": 1,
+        "unavailable": 2,
+        "retryable_unavailable": 1,
+        "retry_events": 1,
+        "circuit_breaker_events": 1,
+        "unavailable_reasons": {"circuit_open": 1, "rate_limited": 1},
     }
 
 

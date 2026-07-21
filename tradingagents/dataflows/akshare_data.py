@@ -245,7 +245,9 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     instrument = _require_china_a(ticker)
     raw = ak.stock_news_em(symbol=instrument.akshare_code)
     if raw is None or raw.empty:
-        return f"No news found for {ticker} (resolved to {instrument.yahoo_symbol})"
+        raise NoMarketDataError(
+            ticker, instrument.yahoo_symbol, "AKShare returned no news rows"
+        )
 
     frame = raw.copy()
     frame["发布时间"] = pd.to_datetime(frame["发布时间"], errors="coerce")
@@ -253,9 +255,10 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
     frame = frame[(frame["发布时间"] >= start) & (frame["发布时间"] < end)]
     if frame.empty:
-        return (
-            f"No news found for {ticker} (resolved to {instrument.yahoo_symbol}) "
-            f"between {start_date} and {end_date}"
+        raise NoMarketDataError(
+            ticker,
+            instrument.yahoo_symbol,
+            f"AKShare returned no news between {start_date} and {end_date}",
         )
 
     lines = [

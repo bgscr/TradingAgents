@@ -17,6 +17,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_EVIDENCE_GATE_MODE":   "evidence_gate_mode",
+    "TRADINGAGENTS_IDENTITY_REGISTRY_PATH": "instrument_identity_registry_path",
+    "TRADINGAGENTS_IDENTITY_REGISTRY_SHA256": "instrument_identity_registry_sha256",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
@@ -107,6 +109,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Fail closed by default. "shadow" is an explicit temporary legacy override
     # whose directional output is visibly labeled as unenforced.
     "evidence_gate_mode": "enforce",
+    # A registry is authoritative only when both its path and expected digest
+    # are configured. Provider metadata may still enrich prompts but cannot
+    # establish identity when this network-free trust anchor is absent.
+    "instrument_identity_registry_path": None,
+    "instrument_identity_registry_sha256": None,
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",

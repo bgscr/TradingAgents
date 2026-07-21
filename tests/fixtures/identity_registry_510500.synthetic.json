@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "registry_id": "synthetic-test-registry-v1",
+  "rows": [
+    {
+      "canonical_symbol": "510500.SS",
+      "aliases": ["510500", "510500.SH"],
+      "venue": "XSHG",
+      "instrument_kind": "fund",
+      "currency": "CNY",
+      "display_name": "SYNTHETIC 510500 TEST FUND",
+      "provenance": {
+        "provider": "synthetic-test-registry",
+        "source_ref": "fixture://identity/510500",
+        "retrieved_at": "2026-07-19T00:00:00+00:00"
+      }
+    }
+  ]
+}

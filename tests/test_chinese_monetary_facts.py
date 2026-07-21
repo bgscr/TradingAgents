@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from hypothesis import given, strategies as st
 
 from tradingagents.dataflows.monetary_facts import (
     extract_chinese_monetary_facts,
@@ -121,3 +122,41 @@ def test_rendered_normalized_values_are_canonical_across_source_precision():
     rendered = render_monetary_source_facts(facts)
 
     assert rendered.count('"value":"5000000000"') == 2
+
+
+_FULLWIDTH_NUMERIC_TRANSLATION = str.maketrans(
+    "0123456789,",
+    "０１２３４５６７８９，",
+)
+
+
+@pytest.mark.unit
+@given(yi_yuan=st.integers(min_value=1_000, max_value=999_999))
+def test_equivalent_units_and_locale_forms_have_identical_canonical_value(yi_yuan):
+    expected_value = Decimal(yi_yuan) * Decimal("100000000")
+    forms = []
+    for unit, numeric_value in (
+        ("元", yi_yuan * 100_000_000),
+        ("万元", yi_yuan * 10_000),
+        ("亿元", yi_yuan),
+    ):
+        ascii_plain = str(numeric_value)
+        ascii_grouped = f"{numeric_value:,}"
+        fullwidth_grouped = ascii_grouped.translate(_FULLWIDTH_NUMERIC_TRANSLATION)
+        forms.extend(
+            f"{numeric_token}{unit}"
+            for numeric_token in (ascii_plain, ascii_grouped, fullwidth_grouped)
+        )
+
+    text = "、".join(forms)
+    facts = extract_chinese_monetary_facts(text, source_ref="source:locale-property")
+
+    assert [fact.value for fact in facts] == [expected_value] * len(forms)
+    assert [fact.raw_text for fact in facts] == forms
+
+    expected_spans = []
+    cursor = 0
+    for raw_text in forms:
+        expected_spans.append((cursor, cursor + len(raw_text)))
+        cursor += len(raw_text) + 1
+    assert [fact.span for fact in facts] == expected_spans

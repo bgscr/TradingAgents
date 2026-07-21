@@ -46,6 +46,17 @@ class NoMarketDataError(VendorError):
 class VendorRateLimitError(VendorError):
     """A vendor throttled the request; the router skips to the next vendor."""
 
+    def __init__(
+        self,
+        message: str = "vendor rate limited",
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message)
+
 
 class VendorNotConfiguredError(VendorError, ValueError):
     """A vendor was selected but its API key/configuration is missing.

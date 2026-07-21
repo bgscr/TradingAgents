@@ -1,4 +1,3 @@
-from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.analysts.submission import (
@@ -15,44 +14,13 @@ from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
 )
-from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
-from tradingagents.evidence import (
-    AnalystEvidenceReport,
-    EvidenceSource,
-    EvidenceStatus,
-    merge_evidence_sources,
-)
+from tradingagents.evidence import AnalystEvidenceReport
 
 
 def create_fundamentals_analyst(llm):
     finalizer = bind_analyst_finalizer(llm, "fundamentals")
 
     def fundamentals_analyst_node(state):
-        instrument = resolve_mainland_instrument(state["company_of_interest"])
-        if instrument is not None and "fundamentals" not in instrument.capabilities:
-            report = (
-                "NOT_APPLICABLE: company fundamentals require a mainland equity; "
-                f"{instrument.yahoo_symbol} is a {instrument.instrument_kind}."
-            )
-            return {
-                "messages": [AIMessage(content=report)],
-                "fundamentals_report": report,
-                "evidence_state": merge_evidence_sources(
-                    state.get("evidence_state"),
-                    (
-                        EvidenceSource(
-                            source_id="analyst.fundamentals.submission",
-                            status=EvidenceStatus.NOT_APPLICABLE,
-                            required=False,
-                            detail=(
-                                "company fundamentals are not applicable to "
-                                f"instrument kind {instrument.instrument_kind}"
-                            ),
-                        ),
-                    ),
-                ).model_dump(mode="json"),
-            }
-
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
 

@@ -10,6 +10,11 @@ from urllib.error import HTTPError
 import pytest
 
 from tradingagents.dataflows import reddit
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    SourceAcquisitionAvailable,
+    SourceAcquisitionUnavailable,
+)
 
 _SAMPLE_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -122,30 +127,45 @@ class TestJsonPathFallsBackToRss:
 
 
 @pytest.mark.unit
-class TestRss429Backoff:
-    def test_429_then_success_retries_once(self):
+class TestRssSingleAttempt:
+    def test_429_degrades_without_retry_or_sleep(self):
         err = HTTPError("url", 429, "Too Many Requests", {}, None)
-        with patch.object(reddit, "urlopen", side_effect=[err, _atom_resp()]) as op, \
+        with patch.object(reddit, "urlopen", side_effect=err) as op, \
              patch.object(reddit.time, "sleep") as slept:
             posts = reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
-        assert op.call_count == 2          # original + exactly one retry
-        slept.assert_called_once()         # backed off before retrying
-        assert len(posts) == 2
-
-    def test_429_twice_gives_up_after_one_retry(self):
-        err = HTTPError("url", 429, "Too Many Requests", {}, None)
-        with patch.object(reddit, "urlopen", side_effect=[err, err]) as op, \
-             patch.object(reddit.time, "sleep"):
-            posts = reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
-        assert op.call_count == 2          # one retry, then gives up cleanly
+        op.assert_called_once()
+        slept.assert_not_called()
         assert posts == []
 
-    def test_retry_after_header_is_honoured(self):
-        err = HTTPError("url", 429, "Too Many Requests", {"Retry-After": "12"}, None)
-        with patch.object(reddit, "urlopen", side_effect=[err, _atom_resp()]), \
-             patch.object(reddit.time, "sleep") as slept:
-            reddit._fetch_subreddit_rss("NVDA", "stocks", 5, 5.0)
-        slept.assert_called_once_with(12.0)
+    def test_retry_after_header_is_parsed_without_local_cap(self):
+        err = HTTPError("url", 429, "Too Many Requests", {"Retry-After": "45"}, None)
+        assert reddit._retry_after_seconds(err) == 45.0
+
+    def test_acquired_empty_aggregate_is_typed_no_data(self):
+        empty_atom = b'<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+        with patch.object(
+            reddit,
+            "urlopen",
+            return_value=_resp(lambda: empty_atom),
+        ):
+            result = reddit.acquire_reddit_posts(
+                "NVDA",
+                ("stocks",),
+                5,
+                tool_call_id="sentiment-reddit:test",
+                source_ref="reddit:NVDA",
+                capability="sentiment_reddit",
+            )
+
+        assert result.value is None
+        assert result.artifact is None
+        assert len(result.outcomes) == 1
+        assert isinstance(result.outcomes[0], SourceAcquisitionUnavailable)
+        assert result.outcomes[0].reason is AcquisitionUnavailableReason.NO_DATA
+        assert not any(
+            isinstance(outcome, SourceAcquisitionAvailable)
+            for outcome in result.outcomes
+        )
 
 
 @pytest.mark.unit

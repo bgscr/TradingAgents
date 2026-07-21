@@ -13,9 +13,9 @@ Usage:
     ANTHROPIC_API_KEY=... python scripts/smoke_structured_output.py anthropic
     DEEPSEEK_API_KEY=... python scripts/smoke_structured_output.py deepseek
 
-The script does NOT call propagate(), to keep the surface tight and the
-cost low — it exercises only the three structured-output calls we just
-added, plus the heuristic SignalProcessor.
+The script does NOT call propagate(), so its Portfolio Manager output remains
+advisory test output. It deliberately does not publish a signal or memory entry;
+those sinks require the compiled graph's terminal contract and immutable audit.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ import sys
 from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.trader.trader import create_trader
-from tradingagents.graph.signal_processing import SignalProcessor
 from tradingagents.llm_clients import create_llm_client
 
 PROVIDER_DEFAULTS = {
@@ -141,12 +140,7 @@ def main() -> int:
     final_decision = pm_result["final_trade_decision"]
     _print_section("[3] Portfolio Manager — final_trade_decision", final_decision)
 
-    # 4) SignalProcessor extracts the rating with zero LLM calls.
-    sp = SignalProcessor()
-    rating = sp.process_signal(final_decision)
-    _print_section("[4] SignalProcessor → rating", rating)
-
-    # 5) Lightweight checks: each rendered output should carry the expected
+    # 4) Lightweight checks: each rendered output should carry the expected
     #    section headers so downstream consumers (memory log, CLI display,
     #    saved reports) keep working.
     checks = [

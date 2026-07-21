@@ -15,16 +15,28 @@ from tradingagents.agents import (
     create_msg_delete,
     create_neutral_debator,
     create_news_analyst,
-    create_portfolio_manager,
     create_research_manager,
     create_sentiment_analyst,
     create_trader,
 )
+from tradingagents.agents.managers.direction_selector import (
+    create_decision_gate_node,
+    create_direction_selector,
+)
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.decision_policy import DecisionHorizon, DecisionPolicyEngine
 
-from .analyst_execution import build_analyst_execution_plan
+from .analyst_execution import (
+    build_analyst_execution_plan,
+    create_capability_guarded_analyst_node,
+)
 from .conditional_logic import ConditionalLogic
-from .evidence_gate import create_admission_gate_node, route_after_admission
+from .evidence_gate import (
+    create_admission_gate_node,
+    create_preflight_gate_node,
+    route_after_admission,
+    route_after_preflight,
+)
 
 # Every target a shared conditional router can return. Each edge driven by the
 # router maps all of them, so a fall-through return (e.g. under prompt/i18n/
@@ -53,6 +65,8 @@ class GraphSetup:
         tool_nodes: dict[str, ToolNode],
         conditional_logic: ConditionalLogic,
         evidence_gate_mode: str = "enforce",
+        decision_policy: DecisionPolicyEngine | None = None,
+        decision_horizon: DecisionHorizon | None = None,
     ):
         """Initialize with required components."""
         if evidence_gate_mode not in {"enforce", "shadow"}:
@@ -65,6 +79,10 @@ class GraphSetup:
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
         self.evidence_gate_mode = evidence_gate_mode
+        self.decision_policy = (
+            decision_policy if decision_policy is not None else DecisionPolicyEngine()
+        )
+        self.decision_horizon = decision_horizon
 
     def setup_graph(
         self, selected_analysts=("market", "social", "news", "fundamentals")
@@ -97,8 +115,9 @@ class GraphSetup:
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(
-            self.deep_thinking_llm,
+        portfolio_manager_node = create_direction_selector(self.deep_thinking_llm)
+        decision_gate_node = create_decision_gate_node(
+            self.decision_policy,
             evidence_gate_mode=self.evidence_gate_mode,
         )
 
@@ -107,7 +126,13 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
+            workflow.add_node(
+                spec.agent_node,
+                create_capability_guarded_analyst_node(
+                    spec,
+                    analyst_factories[spec.key],
+                ),
+            )
             workflow.add_node(spec.clear_node, create_msg_delete())
             workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
 
@@ -120,16 +145,30 @@ class GraphSetup:
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node("Decision Gate", decision_gate_node)
+        workflow.add_node(
+            "Evidence Preflight",
+            create_preflight_gate_node(
+                self.decision_policy,
+                self.decision_horizon,
+            ),
+        )
         workflow.add_node(
             "Evidence Admission",
             create_admission_gate_node(
-                emit_blocked_outcome=self.evidence_gate_mode == "enforce"
+                self.decision_policy,
+                self.decision_horizon,
             ),
         )
 
         # Define edges
-        # Start with the first analyst
-        workflow.add_edge(START, plan.specs[0].agent_node)
+        # Validate authoritative baseline evidence before invoking any model.
+        workflow.add_edge(START, "Evidence Preflight")
+        workflow.add_conditional_edges(
+            "Evidence Preflight",
+            route_after_preflight,
+            {"admitted": plan.specs[0].agent_node, "blocked": END},
+        )
 
         # Connect analysts in sequence
         for i, spec in enumerate(plan.specs):
@@ -151,14 +190,9 @@ class GraphSetup:
             else:
                 workflow.add_edge(current_clear, "Evidence Admission")
 
-        admission_router = (
-            route_after_admission
-            if self.evidence_gate_mode == "enforce"
-            else lambda state: "admitted"
-        )
         workflow.add_conditional_edges(
             "Evidence Admission",
-            admission_router,
+            route_after_admission,
             {"admitted": "Bull Researcher", "blocked": END},
         )
 
@@ -179,6 +213,7 @@ class GraphSetup:
                 RISK_ANALYSIS_PATH_MAP,
             )
 
-        workflow.add_edge("Portfolio Manager", END)
+        workflow.add_edge("Portfolio Manager", "Decision Gate")
+        workflow.add_edge("Decision Gate", END)
 
         return workflow

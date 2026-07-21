@@ -1,0 +1,3 @@
+# Separate source failures from evidence and model retries
+
+The latest run admitted a news rate-limit message as both supported evidence and an available source, while model-directed retries repeated rate limits and timeouts without adding information. Every source attempt will produce a typed Source Acquisition Outcome that distinguishes validated artifacts from unavailable reasons, records retryability and attempt metadata, and categorically prevents operational error text from becoming a Source Fact. Deterministic acquisition policy—not a model—will own fallback, retry limits, backoff, `Retry-After`, and per-run circuit breakers; exhaustion degrades optional evidence and blocks only when the affected capability is required.

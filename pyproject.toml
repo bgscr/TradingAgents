@@ -19,6 +19,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2.0.0",
     "pandas>=2.3.0",
     "parsel>=1.10.0",
+    "pydantic>=2.10,<3",
     "python-dotenv>=1.0.0",
     "pytz>=2025.2",
     "questionary>=2.1.0",
@@ -40,6 +41,7 @@ build = [
     "pyinstaller>=6.10",
 ]
 dev = [
+    "hypothesis>=6.0",
     "ruff>=0.15",
     "pytest>=8.0",
     "pytest-subtests>=0.13",

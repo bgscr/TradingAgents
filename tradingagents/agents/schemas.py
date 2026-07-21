@@ -353,6 +353,8 @@ class SentimentReport(BaseModel):
     deterministic header so the saved report stays human-readable.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     overall_band: SentimentBand = Field(
         description=(
             "Overall sentiment direction. Exactly one of: "

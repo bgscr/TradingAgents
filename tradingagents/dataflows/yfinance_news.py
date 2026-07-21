@@ -5,8 +5,10 @@ from datetime import datetime
 
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
+from yfinance.exceptions import YFRateLimitError
 
 from .config import get_config
+from .errors import NoMarketDataError, VendorRateLimitError
 from .stockstats_utils import yf_retry
 from .symbol_utils import normalize_symbol
 
@@ -75,6 +77,8 @@ def get_news_yfinance(
     ticker: str,
     start_date: str,
     end_date: str,
+    *,
+    _acquired: bool = False,
 ) -> str:
     """
     Retrieve news for a specific stock ticker using yfinance.
@@ -95,9 +99,17 @@ def get_news_yfinance(
     resolved = "" if canonical == ticker else f" (resolved to {canonical})"
     try:
         stock = yf.Ticker(canonical)
-        news = yf_retry(lambda: stock.get_news(count=article_limit))
+        if _acquired:
+            try:
+                news = stock.get_news(count=article_limit)
+            except YFRateLimitError:
+                raise VendorRateLimitError(status_code=429) from None
+        else:
+            news = yf_retry(lambda: stock.get_news(count=article_limit))
 
         if not news:
+            if _acquired:
+                raise NoMarketDataError(ticker, canonical, "Yahoo returned no news rows")
             return f"No news found for {ticker}{resolved}"
 
         # Parse date range for filtering
@@ -123,11 +135,19 @@ def get_news_yfinance(
             filtered_count += 1
 
         if filtered_count == 0:
+            if _acquired:
+                raise NoMarketDataError(
+                    ticker,
+                    canonical,
+                    f"Yahoo returned no news between {start_date} and {end_date}",
+                )
             return f"No news found for {ticker}{resolved} between {start_date} and {end_date}"
 
         return f"## {ticker}{resolved} News, from {start_date} to {end_date}:\n\n{news_str}"
 
     except Exception as e:
+        if _acquired:
+            raise
         return f"Error fetching news for {ticker}: {str(e)}"
 
 

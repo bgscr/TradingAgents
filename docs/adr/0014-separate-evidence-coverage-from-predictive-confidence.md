@@ -1,0 +1,3 @@
+# Separate evidence coverage from predictive confidence
+
+The current coverage ratio primarily counts available sources and can remain high when required identity is absent, while the displayed Decision Confidence falls when optional sources are unavailable without measuring predictive reliability. We will replace that overloaded scalar and label with Source Availability Coverage, Validated Fact Coverage, Decision Assertion Coverage, and categorical Evidence Integrity Status. Duplicates cannot inflate the measures, assertion coverage must be complete for a Trading Decision, and predictive Decision Confidence will remain absent unless it is later calibrated against out-of-sample outcomes.

@@ -17,7 +17,16 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from tradingagents.dataflows.acquisition import (
+    AcquisitionController,
+    AcquisitionFailure,
+    AcquisitionRequest,
+)
+from tradingagents.dataflows.market_snapshot import get_active_acquisition_controller
+from tradingagents.evidence import AcquisitionUnavailableReason
 
 from .symbol_utils import crypto_base
 
@@ -38,24 +47,14 @@ def _stocktwits_symbol(ticker: str) -> str:
     return f"{base}.X" if base else ticker.strip().upper()
 
 
-def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.0) -> str:
-    """Fetch recent StockTwits messages for ``ticker`` and return them as a
-    formatted plaintext block ready for prompt injection.
-
-    Returns a placeholder string when the endpoint is unreachable, the
-    symbol has no messages, or the response shape is unexpected — the
-    caller never has to special-case None or exceptions.
-    """
+def _fetch_stocktwits_messages_raw(
+    ticker: str, limit: int = 30, timeout: float = 10.0
+) -> str:
+    """Fetch and format StockTwits messages, preserving transport failures."""
     url = _API.format(ticker=_stocktwits_symbol(ticker))
     req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        # OSError covers URLError/TimeoutError/connection resets; HTTPException
-        # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
-        logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
-        return f"<stocktwits unavailable: {type(exc).__name__}>"
+    with urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
 
     messages = data.get("messages", []) if isinstance(data, dict) else []
     if not messages:
@@ -94,3 +93,81 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
         f"Total: {total} most-recent messages"
     )
     return summary + "\n\n" + "\n".join(lines)
+
+
+def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.0) -> str:
+    """Fetch recent StockTwits messages with legacy graceful degradation."""
+    try:
+        return _fetch_stocktwits_messages_raw(ticker, limit=limit, timeout=timeout)
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
+        return f"<stocktwits unavailable: {type(exc).__name__}>"
+
+
+def _retry_after_seconds(error: HTTPError) -> float | None:
+    raw_value = error.headers.get("Retry-After") if error.headers else None
+    try:
+        value = float(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if value is None or value >= 0 else None
+
+
+def acquire_stocktwits_messages(
+    ticker: str,
+    limit: int,
+    *,
+    tool_call_id: str,
+    source_ref: str,
+    capability: str,
+):
+    """Acquire StockTwits through the run-owned controller when available."""
+
+    def provider(_request: AcquisitionRequest) -> str:
+        try:
+            value = _fetch_stocktwits_messages_raw(ticker, limit=limit)
+            if value == f"<no StockTwits messages found for ${ticker.upper()}>":
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.NO_DATA
+                )
+            return value
+        except HTTPError as error:
+            if error.code == 429:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.RATE_LIMITED,
+                    status_code=error.code,
+                    retry_after_seconds=_retry_after_seconds(error),
+                ) from None
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+                status_code=error.code,
+            ) from None
+        except TimeoutError:
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.TIMEOUT
+            ) from None
+        except (OSError, http.client.HTTPException, json.JSONDecodeError):
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.PROVIDER_ERROR
+            ) from None
+
+    controller = get_active_acquisition_controller() or AcquisitionController(
+        providers=()
+    )
+
+    def validate(value: object) -> str:
+        if isinstance(value, str) and value.strip():
+            return value
+        raise AcquisitionFailure(reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE)
+
+    return controller.acquire(
+        AcquisitionRequest(
+            capability=capability,
+            source_ref=source_ref,
+            tool_call_id=tool_call_id,
+            tool_name="fetch_stocktwits_messages",
+        ),
+        providers=(("stocktwits", provider),),
+        validator=validate,
+        serializer=lambda value: value,
+    )

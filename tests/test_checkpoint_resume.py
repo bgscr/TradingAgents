@@ -213,6 +213,26 @@ class TestCheckpointSignature(unittest.TestCase):
         g.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
         self.assertEqual(base, g._run_signature("stock"))
 
+    def test_run_signature_captures_policy_and_horizon_contract(self):
+        from tradingagents.decision_policy import DecisionHorizon, HorizonUnit
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        g = object.__new__(TradingAgentsGraph)
+        g.selected_analysts = ("market",)
+        g.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
+        g.decision_policy = type("Policy", (), {"registry_digest": "registry:a"})()
+        g.decision_horizon = None
+        without_horizon = g._run_signature("stock")
+
+        g.decision_horizon = DecisionHorizon(count=5, unit=HorizonUnit.TRADING_DAYS)
+        with_horizon = g._run_signature("stock")
+
+        self.assertIn("evidence_schema=4", with_horizon)
+        self.assertIn("decision_schema=1", with_horizon)
+        self.assertIn("registry=registry:a", with_horizon)
+        self.assertIn("horizon=5:trading_days", with_horizon)
+        self.assertNotEqual(without_horizon, with_horizon)
+
 
 if __name__ == "__main__":
     unittest.main()

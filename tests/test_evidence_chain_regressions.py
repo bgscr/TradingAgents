@@ -1,6 +1,8 @@
 """Focused regressions for claim-to-source evidence boundaries."""
 
 import copy
+import re
+from hashlib import sha256
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -24,18 +26,65 @@ from tradingagents.evidence import (
     InstrumentIdentityEvidence,
     MarketSnapshotEvidence,
     MaterialClaim,
+    SourceAcquisitionAvailable,
+    SourceArtifact,
     SourceFact,
     SubmittedMaterialClaim,
+    ToolExecutionEvidenceEnvelope,
     _evidence_coverage,
     build_tool_evidence_state,
     decision_ready_material_claims,
+    stable_source_fact_id,
 )
 
 
 def _tool_exchange(tool_name: str, args: dict, content: str, call_id: str):
+    snapshot_match = re.search(r"(?m)^Snapshot ID:\s*(\S+)", content)
+    source_ref = (
+        snapshot_match.group(1)
+        if snapshot_match
+        else f"{tool_name}:{args.get('ticker') or args.get('symbol')}:{args['curr_date']}"
+    )
+    capability = (
+        "market_snapshot"
+        if source_ref.startswith("snapshot:")
+        and tool_name == "get_verified_market_snapshot"
+        else tool_name
+        if source_ref.startswith("snapshot:")
+        else source_ref.partition(":")[0]
+    )
+    artifact = SourceArtifact(
+        artifact_sha256=sha256(content.encode("utf-8")).hexdigest(),
+        source_ref=source_ref,
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        raw_text=content,
+    )
+    envelope = ToolExecutionEvidenceEnvelope(
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        source_ref=source_ref,
+        capability=capability,
+        acquisition_outcomes=(
+            SourceAcquisitionAvailable(
+                provider="fixture-provider",
+                capability=capability,
+                source_ref=source_ref,
+                attempt=1,
+                retrieved_at="2026-07-19T00:00:00+00:00",
+                artifact=artifact,
+            ),
+        ),
+        selected_artifact=artifact,
+    ).model_dump(mode="json")
     return (
         AIMessage(content="", tool_calls=[{"name": tool_name, "args": args, "id": call_id, "type": "tool_call"}]),
-        ToolMessage(content=content, tool_call_id=call_id, name=tool_name),
+        ToolMessage(
+            content=content,
+            tool_call_id=call_id,
+            name=tool_name,
+            artifact=envelope,
+        ),
     )
 
 
@@ -221,11 +270,18 @@ def test_snapshot_history_rows_are_provenance_not_material_evidence():
 
 @pytest.mark.unit
 def test_history_requirement_is_derived_from_bound_facts_not_llm_inflation():
+    artifact_sha256 = sha256(b"RSI: 51").hexdigest()
     fact = SourceFact(
-        fact_id="fact:rsi",
+        fact_id=stable_source_fact_id(
+            source_ref="snapshot:abc",
+            artifact_sha256=artifact_sha256,
+            source_span_start=0,
+            source_span_end=7,
+        ),
         source_ref="snapshot:abc",
         tool_call_id="tool-1",
-        artifact_sha256="digest",
+        tool_name="get_indicators",
+        artifact_sha256=artifact_sha256,
         raw_text="RSI: 51",
         source_span_start=0,
         source_span_end=7,
@@ -409,6 +465,19 @@ def test_reacquired_snapshot_becomes_shared_authority_for_analyst_claims(monkeyp
     evidence = EvidenceState.model_validate(update["evidence_state"])
     assert evidence.market_snapshot is not None
     assert evidence.market_snapshot.snapshot_id == reacquired.snapshot_id
+    market_outcomes = [
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_snapshot"
+    ]
+    assert len(market_outcomes) == 1
+    assert isinstance(market_outcomes[0], SourceAcquisitionAvailable)
+    assert market_outcomes[0].provider == "only"
+    assert market_outcomes[0].artifact.artifact_sha256 == reacquired.frame_sha256
+    assert sum(
+        artifact.artifact_sha256 == reacquired.frame_sha256
+        for artifact in evidence.source_artifacts
+    ) == 1
     assert tuple(item.claim_id for item in decision_ready_material_claims(evidence)) == (
         "market.rsi",
     )

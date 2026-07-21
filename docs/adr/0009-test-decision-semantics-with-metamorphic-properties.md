@@ -1,0 +1,3 @@
+# Test decision semantics with metamorphic properties
+
+Exact-output tests are a poor assurance boundary for stochastic model prose and can pass while directional semantics remain unsafe. We will instead test decision semantics with deterministic metamorphic properties: invariance under irrelevant transformations and sensitivity under material evidence changes. Canonical runtime fixtures, fake model clients, graph call counters, and Hypothesis-backed generators will exercise schema, evidence, routing, and publication boundaries; recorded structured outputs will cover prompt regressions, while live-model evaluation remains separate and will not require byte-identical ratings or prose.

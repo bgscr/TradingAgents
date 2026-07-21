@@ -22,6 +22,19 @@ def _sample_ohlcv() -> pd.DataFrame:
     })
 
 
+def _ohlcv_with_rows(rows: int) -> pd.DataFrame:
+    dates = pd.bdate_range(end="2026-05-20", periods=rows)
+    closes = [100.0 + index for index in range(rows)]
+    return pd.DataFrame({
+        "Date": dates,
+        "Open": [close - 0.5 for close in closes],
+        "High": [close + 1.0 for close in closes],
+        "Low": [close - 1.0 for close in closes],
+        "Close": closes,
+        "Volume": [1_000_000 + index for index in range(rows)],
+    })
+
+
 @pytest.mark.unit
 class TestVerifiedSnapshot:
     def test_excludes_future_rows(self, monkeypatch):
@@ -91,6 +104,26 @@ class TestVerifiedSnapshot:
         assert f"History rows: {len(frame)}" in rendered
         assert "Frame SHA-256: " + "a" * 64 in rendered
         assert f"Snapshot ID: {snapshot_id}" in rendered
+
+    def test_insufficient_history_never_emits_partial_window_indicator(self, monkeypatch):
+        frame = _ohlcv_with_rows(129)
+        monkeypatch.setattr(validator, "load_ohlcv", lambda *_: frame)
+
+        rendered = validator.build_verified_market_snapshot(
+            "COF",
+            "2026-05-20",
+            indicators=("close_50_sma", "close_200_sma"),
+        )
+
+        indicator_rows = {
+            line.split("|")[1].strip(): line.split("|")[2].strip()
+            for line in rendered.splitlines()
+            if line.startswith("| close_")
+        }
+        assert indicator_rows["close_50_sma"] != "N/A"
+        assert indicator_rows["close_200_sma"] == (
+            "N/A: insufficient history (129 rows available; 200 required)"
+        )
 
 
 @pytest.mark.unit
