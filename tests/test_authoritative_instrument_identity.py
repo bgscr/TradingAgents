@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,12 @@ from tradingagents.evidence import (
     stable_acquisition_source_ref,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.strategy_registry import (
+    MARKET_RETURN_FIELD,
+    MARKET_RETURN_IMPLEMENTATION_VERSION,
+    MARKET_RETURN_OBSERVATIONS,
+    MARKET_RETURN_UNIT,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "identity_registry_510500.synthetic.json"
 
@@ -221,7 +229,7 @@ def test_run_evidence_preserves_total_market_rate_limit_without_artifact_or_avai
         expected_sha256=_fixture_digest(),
     )
     assert isinstance(lookup, IdentityRegistryAvailable)
-    config_module._config = default_config.DEFAULT_CONFIG.copy()
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     set_config({
         "market_data_vendors": {
             "cn_a": {"core_stock_apis": "primary,secondary"},
@@ -278,7 +286,7 @@ def test_run_evidence_contains_exact_normalized_snapshot_artifact_before_preflig
         expected_sha256=_fixture_digest(),
     )
     assert isinstance(lookup, IdentityRegistryAvailable)
-    config_module._config = default_config.DEFAULT_CONFIG.copy()
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     set_config({
         "market_data_vendors": {"cn_a": {"core_stock_apis": "synthetic"}}
     })
@@ -327,3 +335,73 @@ def test_run_evidence_contains_exact_normalized_snapshot_artifact_before_preflig
         artifact.artifact_sha256 == evidence.market_snapshot.frame_sha256
         for artifact in evidence.source_artifacts
     ) == 1
+    calculation_outcome = next(
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_return_20d"
+    )
+    assert isinstance(calculation_outcome, SourceAcquisitionUnavailable)
+    assert calculation_outcome.reason is AcquisitionUnavailableReason.INSUFFICIENT_HISTORY
+    assert calculation_outcome.calculation_readiness is not None
+    assert calculation_outcome.calculation_readiness.required_observations == (
+        MARKET_RETURN_OBSERVATIONS
+    )
+    assert calculation_outcome.calculation_readiness.available_observations == 1
+    assert not any(
+        fact.canonical_field == MARKET_RETURN_FIELD for fact in evidence.source_facts
+    )
+
+
+@pytest.mark.unit
+def test_run_evidence_establishes_canonical_market_return_at_source_boundary():
+    lookup = resolve_authoritative_instrument_identity(
+        "510500",
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+    assert isinstance(lookup, IdentityRegistryAvailable)
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {"cn_a": {"core_stock_apis": "synthetic"}}
+    })
+    closes = [100.0] * (MARKET_RETURN_OBSERVATIONS - 1) + [110.0]
+    frame = pd.DataFrame({
+        "Date": pd.bdate_range(end="2026-07-17", periods=MARKET_RETURN_OBSERVATIONS),
+        "Open": closes,
+        "High": [value + 1 for value in closes],
+        "Low": [value - 1 for value in closes],
+        "Close": closes,
+        "Volume": [100.0] * MARKET_RETURN_OBSERVATIONS,
+    })
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {"synthetic": SnapshotProvider(lambda *_args: frame, "qfq")},
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("510500", "2026-07-19")
+
+    fact = next(
+        fact
+        for fact in evidence.source_facts
+        if fact.canonical_field == MARKET_RETURN_FIELD
+    )
+    assert fact.fact_kind == "canonical"
+    assert fact.normalized_value == Decimal("0.10000000")
+    assert fact.unit == MARKET_RETURN_UNIT
+    assert fact.instrument_symbol == "510500.SS"
+    assert fact.effective_date == "2026-07-17"
+    assert fact.calculation_lineage is not None
+    assert fact.calculation_lineage.observations_used == MARKET_RETURN_OBSERVATIONS
+    assert (
+        fact.calculation_lineage.implementation_version
+        == MARKET_RETURN_IMPLEMENTATION_VERSION
+    )
+    assert fact.calculation_lineage.input_artifact_sha256 == fact.artifact_sha256

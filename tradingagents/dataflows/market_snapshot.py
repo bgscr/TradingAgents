@@ -19,6 +19,7 @@ from tradingagents.evidence import (
     SourceAcquisitionOutcome,
     SourceArtifact,
     stable_acquisition_source_ref,
+    stable_market_snapshot_id,
 )
 
 from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
@@ -109,18 +110,15 @@ def _snapshot_id(
     frame_sha256: str,
     history_rows: int,
 ) -> str:
-    identity = "\0".join(
-        (
-            symbol.strip().upper(),
-            provider,
-            adjustment_basis,
-            requested_date,
-            effective_trading_date,
-            frame_sha256,
-            str(history_rows),
-        )
+    return stable_market_snapshot_id(
+        symbol=symbol,
+        provider=provider,
+        adjustment_basis=adjustment_basis,
+        requested_date=requested_date,
+        effective_trading_date=effective_trading_date,
+        frame_sha256=frame_sha256,
+        history_rows=history_rows,
     )
-    return f"snapshot:{sha256(identity.encode('utf-8')).hexdigest()}"
 
 
 @dataclass

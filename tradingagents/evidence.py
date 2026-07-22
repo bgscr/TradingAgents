@@ -42,6 +42,32 @@ def stable_acquisition_source_ref(namespace: str, *components: object) -> str:
         digest.update(encoded)
     return f"acq.v1:{namespace}:{digest.hexdigest()}"
 
+
+def stable_market_snapshot_id(
+    *,
+    symbol: str,
+    provider: str,
+    adjustment_basis: str,
+    requested_date: str,
+    effective_trading_date: str,
+    frame_sha256: str,
+    history_rows: int,
+) -> str:
+    """Return the canonical identity of an authoritative market snapshot."""
+
+    identity = "\0".join(
+        (
+            symbol.strip().upper(),
+            provider,
+            adjustment_basis,
+            requested_date,
+            effective_trading_date,
+            frame_sha256,
+            str(history_rows),
+        )
+    )
+    return f"snapshot:{sha256(identity.encode('utf-8')).hexdigest()}"
+
 _NUMERIC_CLAIM_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?"
     r"(?![A-Za-z0-9_])"
@@ -191,6 +217,8 @@ class InstrumentKind(str, Enum):
 
 class EvidenceCapability(str, Enum):
     MARKET_SNAPSHOT = "market_snapshot"
+    INSTRUMENT_NEWS = "instrument_news"
+    SOCIAL_SENTIMENT = "social_sentiment"
     COMPANY_FINANCIALS = "company_financials"
     VALUATION = "valuation"
     CORPORATE_ACTIONS = "corporate_actions"
@@ -239,6 +267,11 @@ class CapabilityProfile(BaseModel):
     def all_capabilities(self) -> frozenset[EvidenceCapability]:
         return frozenset((*self.required_capabilities, *self.optional_capabilities))
 
+    def requires(self, capability: EvidenceCapability | str) -> bool:
+        """Return whether this profile makes a capability admission-critical."""
+
+        return EvidenceCapability(capability) in self.required_capabilities
+
 
 _CAPABILITY_PROFILES = {
     InstrumentKind.EQUITY: CapabilityProfile(
@@ -246,6 +279,8 @@ _CAPABILITY_PROFILES = {
         instrument_kind=InstrumentKind.EQUITY,
         required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
         optional_capabilities=(
+            EvidenceCapability.INSTRUMENT_NEWS,
+            EvidenceCapability.SOCIAL_SENTIMENT,
             EvidenceCapability.COMPANY_FINANCIALS,
             EvidenceCapability.VALUATION,
             EvidenceCapability.CORPORATE_ACTIONS,
@@ -257,6 +292,8 @@ _CAPABILITY_PROFILES = {
         instrument_kind=InstrumentKind.FUND,
         required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
         optional_capabilities=(
+            EvidenceCapability.INSTRUMENT_NEWS,
+            EvidenceCapability.SOCIAL_SENTIMENT,
             EvidenceCapability.BENCHMARK,
             EvidenceCapability.NAV_PREMIUM,
             EvidenceCapability.HOLDINGS_EXPOSURE,
@@ -1496,6 +1533,7 @@ def build_inline_evidence_state(
     claims: Iterable[MaterialClaim],
     *,
     source_artifact_by_ref: Mapping[str, SourceArtifact] | None = None,
+    required_source_refs: Iterable[str] = (),
 ) -> EvidenceState:
     """Validate claims against pre-fetched source blocks kept in the prompt.
 
@@ -1504,6 +1542,7 @@ def build_inline_evidence_state(
     """
     claim_list = tuple(claims)
     bound_artifacts = dict(source_artifact_by_ref or {})
+    required_refs = frozenset(required_source_refs)
     normalized_sources: dict[str, str | None] = {}
     acquisition_outcomes: list[SourceAcquisitionOutcome] = []
     for source_ref, text in source_text_by_ref.items():
@@ -1539,7 +1578,7 @@ def build_inline_evidence_state(
                 if text is not None
                 else EvidenceStatus.UNAVAILABLE
             ),
-            required=False,
+            required=source_ref in required_refs,
             detail="" if text is not None else "source returned unavailable",
         )
         for source_ref, text in normalized_sources.items()
@@ -2201,12 +2240,18 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
         get_active_market_snapshot_acquisition_record,
         get_authoritative_market_snapshot,
     )
+    from tradingagents.strategy_registry import (
+        MARKET_RETURN_OBSERVATIONS,
+        build_market_return_fact,
+        market_return_calculation_id,
+    )
 
     requested = datetime.strptime(requested_date, "%Y-%m-%d")
     start_date = (requested - relativedelta(years=5)).strftime("%Y-%m-%d")
     registry_result = resolve_authoritative_instrument_identity(symbol)
     identity: dict[str, Any] = {}
     acquired_at = datetime.now(timezone.utc).isoformat()
+    market_artifact: SourceArtifact | None = None
 
     if isinstance(registry_result, IdentityRegistryAvailable):
         canonical_symbol = registry_result.identity.canonical_symbol
@@ -2292,6 +2337,50 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
         artifacts = ()
         market_outcomes = ()
 
+    source_facts: tuple[SourceFact, ...] = ()
+    calculation_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
+    if snapshot is not None and market_artifact is not None:
+        calculation_source_ref = stable_acquisition_source_ref(
+            "calculation",
+            market_artifact.source_ref,
+            "market_return_20d",
+        )
+        if len(snapshot.frame) < MARKET_RETURN_OBSERVATIONS:
+            calculation_outcomes = (
+                SourceAcquisitionUnavailable(
+                    provider="deterministic-calculation",
+                    capability="market_return_20d",
+                    source_ref=calculation_source_ref,
+                    attempt=1,
+                    retrieved_at=acquired_at,
+                    retryable=False,
+                    reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
+                    calculation_readiness=CalculationReadinessDiagnostic(
+                        calculation_id=market_return_calculation_id(
+                            snapshot.adjustment_basis
+                        ),
+                        required_observations=MARKET_RETURN_OBSERVATIONS,
+                        available_observations=len(snapshot.frame),
+                        input_artifact_sha256=market_artifact.artifact_sha256,
+                    ),
+                ),
+            )
+        else:
+            try:
+                source_facts = (build_market_return_fact(snapshot, market_artifact),)
+            except ValueError:
+                calculation_outcomes = (
+                    SourceAcquisitionUnavailable(
+                        provider="deterministic-calculation",
+                        capability="market_return_20d",
+                        source_ref=calculation_source_ref,
+                        attempt=1,
+                        retrieved_at=acquired_at,
+                        retryable=False,
+                        reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+                    ),
+                )
+
     state = build_evidence_state(
         symbol=symbol,
         identity=identity,
@@ -2300,7 +2389,12 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
     return state.model_copy(
         update={
             "source_artifacts": artifacts,
-            "acquisition_outcomes": (identity_outcome, *market_outcomes),
+            "source_facts": source_facts,
+            "acquisition_outcomes": (
+                identity_outcome,
+                *market_outcomes,
+                *calculation_outcomes,
+            ),
         }
     )
 
@@ -2322,6 +2416,8 @@ class AnalysisDiagnosticCode(str, Enum):
     REQUIRED_EVIDENCE_CONFLICTED = "required_evidence_conflicted"
     DECISION_CONFIGURATION_INVALID = "decision_configuration_invalid"
     STRATEGY_RULE_INVALID = "strategy_rule_invalid"
+    DIRECTION_CONTEXT_INVALID = "direction_context_invalid"
+    DIRECTION_ASSERTIONS_CONFLICTED = "direction_assertions_conflicted"
     DIRECTION_SELECTION_INVALID = "direction_selection_invalid"
     DECISION_ASSERTION_INVALID = "decision_assertion_invalid"
     STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
@@ -2394,6 +2490,12 @@ _ANALYSIS_DIAGNOSTIC_LABELS = {
     AnalysisDiagnosticCode.STRATEGY_RULE_INVALID: (
         "No valid registered Strategy Rule application could authorize direction."
     ),
+    AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID: (
+        "The validated direction context was unavailable or invalid."
+    ),
+    AnalysisDiagnosticCode.DIRECTION_ASSERTIONS_CONFLICTED: (
+        "Validated Decision Assertions did not authorize one unambiguous rating."
+    ),
     AnalysisDiagnosticCode.DIRECTION_SELECTION_INVALID: (
         "The direction selection was unavailable or incompatible with its context."
     ),
@@ -2422,6 +2524,13 @@ def analysis_diagnostic_codes(
         normalized = " ".join(str(diagnostic).replace("_", " ").casefold().split())
         if "shadow" in normalized:
             code = AnalysisDiagnosticCode.SHADOW_MODE
+        elif "direction context" in normalized or "validated decision context" in normalized:
+            code = AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID
+        elif (
+            "direction assertion ids duplicate" in normalized
+            or "direction assertions target multiple ratings" in normalized
+        ):
+            code = AnalysisDiagnosticCode.DIRECTION_ASSERTIONS_CONFLICTED
         elif "identity" in normalized:
             code = AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE
         elif "history" in normalized or " rows" in normalized:

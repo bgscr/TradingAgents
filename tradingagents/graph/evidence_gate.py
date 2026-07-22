@@ -72,13 +72,37 @@ def create_preflight_gate_node(
 
     def preflight_gate_node(state: dict) -> dict:
         evidence = _evidence_from_state(state.get("evidence_state", {}))
+        effective_minimum_history_rows = minimum_history_rows
+        applicable_history_rows = None
+        if (
+            decision_horizon is not None
+            and evidence.instrument_identity is not None
+            and evidence.instrument_identity.is_authoritative
+        ):
+            applicable_history_rows = policy.preflight_minimum_history_rows(
+                evidence.instrument_identity.instrument_kind,
+                decision_horizon,
+            )
+            if applicable_history_rows is not None:
+                effective_minimum_history_rows = max(
+                    effective_minimum_history_rows,
+                    applicable_history_rows,
+                )
         result = evaluate_preflight_gate(
             evidence,
-            minimum_history_rows=minimum_history_rows,
+            minimum_history_rows=effective_minimum_history_rows,
         )
         configuration_blockers = list(policy.configuration_blockers)
         if decision_horizon is None:
             configuration_blockers.append("decision_horizon_not_configured")
+        elif (
+            evidence.instrument_identity is not None
+            and evidence.instrument_identity.is_authoritative
+            and applicable_history_rows is None
+        ):
+            configuration_blockers.append(
+                "no_applicable_registered_strategy_rule"
+            )
         blockers = tuple(sorted({*result.blockers, *configuration_blockers}))
         if blockers != result.blockers:
             result = result.model_copy(
@@ -176,7 +200,18 @@ def create_admission_gate_node(
                             ),
                         )
                         if isinstance(built, DecisionContextBuilt):
-                            context = built.context
+                            try:
+                                policy.register_admitted_evidence(
+                                    evidence,
+                                    built.context,
+                                )
+                            except (TypeError, ValueError):
+                                gate = blocked_gate(
+                                    gate,
+                                    ("trusted_evidence_admission_failed",),
+                                )
+                            else:
+                                context = built.context
                         else:
                             gate = blocked_gate(
                                 gate,

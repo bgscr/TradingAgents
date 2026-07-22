@@ -53,11 +53,14 @@ from tradingagents.dataflows.stocktwits import (
 )
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
 from tradingagents.evidence import (
+    EvidenceCapability,
     EvidenceSource,
     EvidenceState,
     EvidenceStatus,
+    InstrumentKind,
     MaterialClaim,
     build_inline_evidence_state,
+    capability_profile_for,
     merge_claim_validations,
     merge_evidence_sources,
     merge_material_claims,
@@ -68,6 +71,30 @@ from tradingagents.evidence import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SENTIMENT_SOURCE_CAPABILITIES = {
+    "sentiment.news": EvidenceCapability.INSTRUMENT_NEWS,
+    "sentiment.stocktwits": EvidenceCapability.SOCIAL_SENTIMENT,
+    "sentiment.reddit": EvidenceCapability.SOCIAL_SENTIMENT,
+}
+
+
+def _required_sentiment_source_ids(state) -> frozenset[str]:
+    """Resolve source requiredness from the authoritative Capability Profile."""
+
+    evidence = EvidenceState.model_validate(state.get("evidence_state", {}))
+    identity = evidence.instrument_identity
+    if identity is None or identity.instrument_kind is InstrumentKind.UNKNOWN:
+        # Evidence Preflight blocks this state in production. Keeping enrichment
+        # optional here preserves compatibility for isolated analyst callers.
+        return frozenset()
+    profile = capability_profile_for(identity.instrument_kind)
+    return frozenset(
+        source_id
+        for source_id, capability in _SENTIMENT_SOURCE_CAPABILITIES.items()
+        if profile.requires(capability)
+    )
 
 
 def _normalize_sentiment_submission(value):
@@ -155,6 +182,7 @@ def _evidence_for_blocks(
     ticker: str,
     blocks: dict[str, str],
     claims: tuple[MaterialClaim, ...] = (),
+    required_source_ids: frozenset[str] = frozenset(),
     news_acquisition=None,
     stocktwits_acquisition=None,
     reddit_acquisition=None,
@@ -187,6 +215,7 @@ def _evidence_for_blocks(
             for source_id, _, acquisition in direct_acquisitions
             if acquisition.artifact is not None
         },
+        required_source_refs=required_source_ids,
     )
     if not direct_acquisitions:
         return inline_evidence
@@ -202,7 +231,7 @@ def _evidence_for_blocks(
                             if acquisition.artifact is not None
                             else EvidenceStatus.UNAVAILABLE
                         ),
-                        required=True,
+                        required=source_id in required_source_ids,
                         detail=detail,
                     )
                     for source_id, detail, acquisition in direct_acquisitions
@@ -246,17 +275,26 @@ def create_sentiment_analyst(llm):
         end_date = state["trade_date"]
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
+        instrument_identity = EvidenceState.model_validate(
+            state.get("evidence_state", {})
+        ).instrument_identity
+        news_ticker = (
+            instrument_identity.symbol
+            if instrument_identity is not None
+            else ticker
+        )
 
         news_source_ref = stable_acquisition_source_ref(
-            "sentiment.news", ticker, start_date, end_date
+            "sentiment.news", news_ticker, start_date, end_date
         )
         news_acquisition = acquire_news(
-            ticker,
+            news_ticker,
             start_date,
             end_date,
             tool_call_id=f"sentiment-news:{news_source_ref}",
             source_ref=news_source_ref,
             capability="sentiment_news",
+            instrument_identity=instrument_identity,
         )
         news_block = news_acquisition.value
         if news_block is None:
@@ -397,6 +435,7 @@ def create_sentiment_analyst(llm):
             ticker,
             blocks,
             material_claims,
+            required_source_ids=_required_sentiment_source_ids(state),
             news_acquisition=news_acquisition,
             stocktwits_acquisition=stocktwits_acquisition,
             reddit_acquisition=reddit_acquisition,

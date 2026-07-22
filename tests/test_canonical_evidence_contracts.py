@@ -494,6 +494,9 @@ def test_legacy_identity_checkpoint_is_readable_but_not_authoritative():
 def test_instrument_kind_selects_fund_capabilities_without_company_assumptions():
     profile = capability_profile_for(InstrumentKind.FUND)
 
+    assert EvidenceCapability.INSTRUMENT_NEWS in profile.optional_capabilities
+    assert EvidenceCapability.SOCIAL_SENTIMENT in profile.optional_capabilities
+    assert profile.requires(EvidenceCapability.INSTRUMENT_NEWS) is False
     assert EvidenceCapability.NAV_PREMIUM in profile.all_capabilities
     assert EvidenceCapability.TRACKING_ERROR in profile.all_capabilities
     assert EvidenceCapability.COMPANY_FINANCIALS not in profile.all_capabilities
@@ -505,6 +508,9 @@ def test_capability_profile_closes_and_validates_runtime_analyst_applicability()
     equity = capability_profile_for(InstrumentKind.EQUITY)
     fund = capability_profile_for(InstrumentKind.FUND)
 
+    assert EvidenceCapability.INSTRUMENT_NEWS in equity.optional_capabilities
+    assert EvidenceCapability.SOCIAL_SENTIMENT in equity.optional_capabilities
+    assert equity.requires(EvidenceCapability.MARKET_SNAPSHOT) is True
     assert equity.applicable_analysts == (
         "market",
         "social",

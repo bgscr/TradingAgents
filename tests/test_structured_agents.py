@@ -1646,19 +1646,19 @@ class TestSentimentAnalystAgent:
             EvidenceSource(
                 source_id="sentiment.news",
                 status=EvidenceStatus.AVAILABLE,
-                required=True,
+                required=False,
                 detail="",
             ),
             EvidenceSource(
                 source_id="sentiment.stocktwits",
                 status=EvidenceStatus.AVAILABLE,
-                required=True,
+                required=False,
                 detail="",
             ),
             EvidenceSource(
                 source_id="sentiment.reddit",
                 status=EvidenceStatus.UNAVAILABLE,
-                required=True,
+                required=False,
                 detail="acquired_reddit",
             ),
         )

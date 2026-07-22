@@ -1,16 +1,99 @@
 """yfinance-based news data fetching functions."""
 
 import contextlib
+import re
+from collections.abc import Mapping
 from datetime import datetime
+from typing import Any
 
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 from yfinance.exceptions import YFRateLimitError
 
+from tradingagents.evidence import InstrumentIdentityEvidence
+
 from .config import get_config
 from .errors import NoMarketDataError, VendorRateLimitError
 from .stockstats_utils import yf_retry
-from .symbol_utils import normalize_symbol
+from .symbol_utils import normalize_symbol, resolve_china_a_symbol
+
+
+def _related_symbols(article: Mapping[str, Any]) -> frozenset[str]:
+    """Extract provider-declared instrument associations across Yahoo schemas."""
+
+    values: list[object] = []
+    values.extend(article.get("relatedTickers", ()) or ())
+    content = article.get("content")
+    if isinstance(content, Mapping):
+        values.extend(content.get("relatedTickers", ()) or ())
+        finance = content.get("finance")
+        if isinstance(finance, Mapping):
+            values.extend(finance.get("stockTickers", ()) or ())
+    symbols: set[str] = set()
+    for value in values:
+        if isinstance(value, Mapping):
+            value = value.get("symbol") or value.get("ticker")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        with contextlib.suppress(ValueError, TypeError):
+            symbols.add(normalize_symbol(value).upper())
+    return frozenset(symbols)
+
+
+def _instrument_aliases(
+    ticker: str,
+    canonical: str,
+    identity: InstrumentIdentityEvidence | None,
+) -> tuple[str, ...]:
+    aliases = {ticker.strip(), canonical.strip()}
+    china = resolve_china_a_symbol(canonical)
+    if china is not None:
+        aliases.update(
+            {
+                china.akshare_code,
+                china.yahoo_symbol,
+                f"{china.akshare_code}.SH"
+                if china.yahoo_symbol.endswith(".SS")
+                else f"{china.akshare_code}.SZ",
+            }
+        )
+    if identity is not None:
+        aliases.add(identity.symbol.strip())
+        if identity.display_name:
+            aliases.add(identity.display_name.strip())
+    return tuple(sorted(alias for alias in aliases if alias))
+
+
+def _alias_in_text(alias: str, text: str) -> bool:
+    if any("\u3400" <= character <= "\u9fff" for character in alias):
+        return alias.casefold() in text.casefold()
+    return re.search(
+        rf"(?<![A-Z0-9]){re.escape(alias.upper())}(?![A-Z0-9])",
+        text.upper(),
+    ) is not None
+
+
+def _article_is_relevant(
+    article: Mapping[str, Any],
+    data: Mapping[str, Any],
+    *,
+    ticker: str,
+    canonical: str,
+    identity: InstrumentIdentityEvidence | None,
+) -> bool:
+    provider_symbols = _related_symbols(article)
+    accepted_symbols = {
+        normalize_symbol(alias).upper()
+        for alias in _instrument_aliases(ticker, canonical, identity)
+        if re.fullmatch(r"[A-Za-z0-9.=+\-]+", alias)
+    }
+    if provider_symbols:
+        return not provider_symbols.isdisjoint(accepted_symbols)
+    text = f"{data.get('title', '')}\n{data.get('summary', '')}"
+    return any(
+        _alias_in_text(alias, text)
+        for alias in _instrument_aliases(ticker, canonical, identity)
+    )
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -79,6 +162,7 @@ def get_news_yfinance(
     end_date: str,
     *,
     _acquired: bool = False,
+    instrument_identity: InstrumentIdentityEvidence | None = None,
 ) -> str:
     """
     Retrieve news for a specific stock ticker using yfinance.
@@ -125,6 +209,14 @@ def get_news_yfinance(
             # Keep only articles within the requested window (look-ahead safe).
             if not _in_news_window(data["pub_date"], start_dt, end_dt):
                 continue
+            if _acquired and not _article_is_relevant(
+                article,
+                data,
+                ticker=ticker,
+                canonical=canonical,
+                identity=instrument_identity,
+            ):
+                continue
 
             news_str += f"### {data['title']} (source: {data['publisher']})\n"
             if data["summary"]:
@@ -139,7 +231,8 @@ def get_news_yfinance(
                 raise NoMarketDataError(
                     ticker,
                     canonical,
-                    f"Yahoo returned no news between {start_date} and {end_date}",
+                    "Yahoo returned no instrument-relevant news between "
+                    f"{start_date} and {end_date}",
                 )
             return f"No news found for {ticker}{resolved} between {start_date} and {end_date}"
 

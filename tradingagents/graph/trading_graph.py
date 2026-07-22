@@ -42,6 +42,10 @@ from tradingagents.evidence import EvidenceState, acquire_run_evidence
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
+from tradingagents.strategy_registry import (
+    DEFAULT_DECISION_HORIZON,
+    create_production_decision_policy,
+)
 from tradingagents.terminal_contract import (
     RunLifecycleStatus,
     TerminalContract,
@@ -111,9 +115,15 @@ class TradingAgentsGraph:
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
         self.decision_policy = (
-            decision_policy if decision_policy is not None else DecisionPolicyEngine()
+            decision_policy
+            if decision_policy is not None
+            else create_production_decision_policy()
         )
-        self.decision_horizon = decision_horizon
+        self.decision_horizon = (
+            decision_horizon
+            if decision_horizon is not None or decision_policy is not None
+            else DEFAULT_DECISION_HORIZON
+        )
 
         # Update the interface's config
         set_config(self.config)
@@ -398,10 +408,11 @@ class TradingAgentsGraph:
             }
         return build_instrument_context(ticker, asset_type, identity)
 
-    @staticmethod
-    def resolve_evidence_state(ticker: str, trade_date: str) -> EvidenceState:
+    def resolve_evidence_state(self, ticker: str, trade_date: str) -> EvidenceState:
         """Acquire the typed identity and market evidence for one analysis run."""
-        return acquire_run_evidence(ticker, trade_date)
+        evidence = acquire_run_evidence(ticker, trade_date)
+        self.decision_policy.register_trusted_evidence(evidence)
+        return evidence
 
     def _run_signature(self, asset_type: str) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
@@ -497,6 +508,7 @@ class TradingAgentsGraph:
         # Preflight without first spending Yahoo/AKShare or reflection calls.
         past_context = self.memory_log.get_past_context(company_name)
         evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
+        self.decision_policy.register_trusted_evidence(evidence_state)
         instrument_context = self.resolve_instrument_context(
             company_name,
             asset_type,

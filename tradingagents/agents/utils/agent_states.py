@@ -73,10 +73,13 @@ class AgentState(MessagesState):
         dict[str, Any] | None, "Closed, rule-backed decision context"
     ]
     direction_selector_diagnostics: Annotated[
-        dict[str, Any] | None, "Payload-free selector failure diagnostics"
+        dict[str, Any] | None, "Legacy selector failure diagnostics"
+    ]
+    direction_selection_diagnostics: Annotated[
+        dict[str, Any] | None, "Payload-free deterministic selection diagnostics"
     ]
     direction_selection: Annotated[
-        dict[str, Any] | None, "Structured model direction proposal"
+        dict[str, Any] | None, "Deterministic closed-context direction proposal"
     ]
     decision_gate_v2: Annotated[
         dict[str, Any], "Versioned deterministic decision-gate result"

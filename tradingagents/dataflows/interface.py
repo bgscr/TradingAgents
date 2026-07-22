@@ -1,7 +1,10 @@
 import json
 import logging
 
-from tradingagents.evidence import AcquisitionUnavailableReason
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    InstrumentIdentityEvidence,
+)
 
 from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
 from .akshare_data import (
@@ -434,6 +437,7 @@ def route_to_vendor_acquired(
     tool_call_id: str,
     source_ref: str,
     capability: str,
+    instrument_identity: InstrumentIdentityEvidence | None = None,
     **kwargs,
 ):
     """Acquire through the run controller without invoking the legacy router."""
@@ -449,7 +453,12 @@ def route_to_vendor_acquired(
         def call(_request):
             try:
                 if method == "get_news" and impl is get_news_yfinance:
-                    return impl(*args, **kwargs, _acquired=True)
+                    return impl(
+                        *args,
+                        **kwargs,
+                        _acquired=True,
+                        instrument_identity=instrument_identity,
+                    )
                 return impl(*args, **kwargs)
             except VendorRateLimitError as error:
                 raise AcquisitionFailure(

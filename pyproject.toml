@@ -15,7 +15,7 @@ dependencies = [
     "langchain-experimental>=0.3.4",
     "langchain-google-genai>=4.0.0",
     "langchain-openai>=0.3.23",
-    "langgraph>=0.4.8",
+    "langgraph>=1.2.9",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "pandas>=2.3.0",
     "parsel>=1.10.0",
@@ -29,11 +29,11 @@ dependencies = [
     "typer>=0.21.0",
     "setuptools>=80.9.0",
     "stockstats>=0.6.5",
-    "tqdm>=4.67.1",
-    "typing-extensions>=4.14.0",
-    "akshare>=1.18.64",
-    "baostock>=0.8.9",
-    "yfinance>=1.4.1",
+    "tqdm>=4.69.0",
+    "typing-extensions>=4.16.0",
+    "akshare>=1.18.73",
+    "baostock>=0.9.3",
+    "yfinance>=1.5.1",
 ]
 
 [project.optional-dependencies]
@@ -41,8 +41,8 @@ build = [
     "pyinstaller>=6.10",
 ]
 dev = [
-    "hypothesis>=6.0",
-    "ruff>=0.15",
+    "hypothesis>=6.159.0",
+    "ruff>=0.15.22",
     "pytest>=8.0",
     "pytest-subtests>=0.13",
 ]

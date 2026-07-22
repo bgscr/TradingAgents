@@ -31,6 +31,7 @@ from tradingagents.evidence import (
     SourceArtifact,
     SourceFact,
     capability_profile_for,
+    stable_market_snapshot_id,
     stable_source_fact_id,
     validate_calculation_lineage,
 )
@@ -140,6 +141,9 @@ class CanonicalFactAdapterResult(BaseModel):
     canonical_field: str = Field(min_length=1)
     normalized_value: Decimal | str | int | bool
     unit: str
+    effective_range_start: str | None = None
+    effective_range_end: str | None = None
+    observations_used: int | None = Field(default=None, ge=1)
 
 
 class DecisionFact(BaseModel):
@@ -240,7 +244,7 @@ DecisionContextBuildResult = Annotated[
 
 
 class DirectionSelection(BaseModel):
-    """Tiny model-facing proposal: identifiers only, with no factual prose."""
+    """Closed deterministic proposal: identifiers only, with no factual prose."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -248,6 +252,24 @@ class DirectionSelection(BaseModel):
     context_id: str = Field(min_length=1)
     rating: PortfolioRating
     assertion_ids: tuple[str, ...] = Field(min_length=1)
+
+
+def deterministic_direction_selection(
+    context: ValidatedDecisionContext,
+) -> DirectionSelection:
+    """Construct the sole valid selection encoded by a validated context."""
+
+    assertion_ids = tuple(assertion.assertion_id for assertion in context.assertions)
+    if len(assertion_ids) != len(set(assertion_ids)):
+        raise ValueError("direction_assertion_ids_duplicate")
+    target_ratings = {assertion.target_rating for assertion in context.assertions}
+    if len(target_ratings) != 1:
+        raise ValueError("direction_assertions_target_multiple_ratings")
+    return DirectionSelection(
+        context_id=context.context_id,
+        rating=target_ratings.pop(),
+        assertion_ids=tuple(sorted(assertion_ids)),
+    )
 
 
 class TradingDecisionContract(BaseModel):
@@ -406,6 +428,36 @@ def _context_payload(context: ValidatedDecisionContext) -> dict[str, Any]:
     return context.model_dump(mode="json", exclude={"context_id"})
 
 
+def _without_runtime_evidence_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _without_runtime_evidence_fields(item)
+            for key, item in value.items()
+            if key != "tool_call_id"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_runtime_evidence_fields(item) for item in value]
+    return value
+
+
+def _semantic_evidence_payload(evidence: EvidenceState) -> dict[str, Any]:
+    """Return order-independent evidence semantics without runtime call IDs."""
+
+    payload = _without_runtime_evidence_fields(evidence.model_dump(mode="json"))
+    for field in (
+        "material_claims",
+        "source_facts",
+        "source_artifacts",
+        "claim_validations",
+        "sources",
+        "acquisition_outcomes",
+    ):
+        payload[field] = tuple(
+            sorted({_canonical_json(item) for item in payload[field]})
+        )
+    return payload
+
+
 def _blocked(*codes: str) -> DecisionContextBlocked:
     unique = tuple(sorted(set(codes))) or ("decision_context_invalid",)
     diagnostics = tuple(code.replace("_", " ") for code in unique)
@@ -433,6 +485,8 @@ class DecisionPolicyEngine:
     _evaluators: Mapping[str, RuleEvaluator]
     _fact_adapters: Mapping[tuple[str, str], CanonicalFactAdapter]
     _artifact_resolver: ArtifactResolver | None
+    _trusted_run_evidence: EvidenceState | None
+    _trusted_admitted_evidence_by_context_id: Mapping[str, EvidenceState]
 
     def __init__(
         self,
@@ -505,6 +559,12 @@ class DecisionPolicyEngine:
             self, "_fact_adapters", MappingProxyType(fact_adapter_copy)
         )
         object.__setattr__(self, "_artifact_resolver", artifact_resolver)
+        object.__setattr__(self, "_trusted_run_evidence", None)
+        object.__setattr__(
+            self,
+            "_trusted_admitted_evidence_by_context_id",
+            MappingProxyType({}),
+        )
 
     @property
     def configuration_blockers(self) -> tuple[str, ...]:
@@ -519,9 +579,66 @@ class DecisionPolicyEngine:
             blockers.add("strategy_rule_evaluator_unavailable")
         if any(key not in self._fact_adapters for key in self._calculations_by_key):
             blockers.add("canonical_fact_adapter_required")
-        if self._artifact_resolver is None:
-            blockers.add("decision_artifact_resolver_required")
         return tuple(sorted(blockers))
+
+    def preflight_minimum_history_rows(
+        self,
+        instrument_kind: InstrumentKind,
+        horizon: DecisionHorizon,
+    ) -> int | None:
+        """Return the least history that can satisfy a registered rule path."""
+
+        applicable = tuple(
+            rule
+            for rule in self.rules
+            if instrument_kind in rule.applicable_instrument_kinds
+            and rule.horizon == horizon
+        )
+        if not applicable:
+            return None
+        return min(rule.minimum_history_rows for rule in applicable)
+
+    def register_trusted_evidence(self, evidence: EvidenceState) -> None:
+        """Bind one pre-checkpoint run ledger and clear prior admission state."""
+
+        trusted = EvidenceState.model_validate_json(evidence.model_dump_json())
+        object.__setattr__(self, "_trusted_run_evidence", trusted)
+        object.__setattr__(
+            self,
+            "_trusted_admitted_evidence_by_context_id",
+            MappingProxyType({}),
+        )
+
+    def register_admitted_evidence(
+        self,
+        evidence: EvidenceState,
+        context: ValidatedDecisionContext,
+    ) -> None:
+        """Promote evidence only after it preserves the trusted run ledger."""
+
+        admitted = EvidenceState.model_validate_json(evidence.model_dump_json())
+        binding_failure = self._trusted_run_binding_failure(admitted)
+        if binding_failure is not None:
+            raise ValueError(binding_failure)
+        if context.context_id != _digest("context", _context_payload(context)):
+            raise ValueError("validated_decision_context_digest_mismatch")
+        if self._integrity_status(admitted) is not context.integrity_status:
+            raise ValueError("validated_decision_context_integrity_mismatch")
+
+        admitted_by_context_id = dict(
+            self._trusted_admitted_evidence_by_context_id
+        )
+        existing = admitted_by_context_id.get(context.context_id)
+        if existing is not None and _semantic_evidence_payload(
+            existing
+        ) != _semantic_evidence_payload(admitted):
+            raise ValueError("trusted_admitted_evidence_redefined")
+        admitted_by_context_id[context.context_id] = admitted
+        object.__setattr__(
+            self,
+            "_trusted_admitted_evidence_by_context_id",
+            MappingProxyType(admitted_by_context_id),
+        )
 
     def candidate_applications(
         self,
@@ -792,7 +909,12 @@ class DecisionPolicyEngine:
         self,
         context: ValidatedDecisionContext,
         proposal: DirectionSelection,
+        *,
+        evidence: EvidenceState,
     ) -> DecisionGateResultV2:
+        checkpoint_evidence = EvidenceState.model_validate_json(
+            evidence.model_dump_json()
+        )
         diagnostics: list[str] = []
         if context.registry_digest != self.registry_digest:
             diagnostics.append("strategy rule registry digest mismatch")
@@ -832,6 +954,12 @@ class DecisionPolicyEngine:
         facts_by_id = {fact.fact_id: fact for fact in context.facts}
         if len(facts_by_id) != len(context.facts):
             diagnostics.append("validated context contains duplicate fact ids")
+        ledger_failure = self._gate_ledger_failure(context, checkpoint_evidence)
+        if ledger_failure is not None:
+            diagnostics.append(ledger_failure.replace("_", " "))
+        trusted_admitted_evidence = (
+            self._trusted_admitted_evidence_by_context_id.get(context.context_id)
+        )
         target_ratings: set[PortfolioRating] = set()
         for assertion in selected:
             target_ratings.add(assertion.target_rating)
@@ -891,7 +1019,10 @@ class DecisionPolicyEngine:
             if calculation_failure is not None:
                 diagnostics.append(calculation_failure.replace("_", " "))
                 continue
-            adapter_failure = self._gate_adapter_failure(facts)
+            adapter_failure = self._gate_adapter_failure(
+                facts,
+                trusted_admitted_evidence,
+            )
             if adapter_failure is not None:
                 diagnostics.append(adapter_failure.replace("_", " "))
                 continue
@@ -1108,18 +1239,104 @@ class DecisionPolicyEngine:
                 return failure.replace(" ", "_")
         return None
 
-    def _gate_adapter_failure(
-        self, facts: tuple[DecisionFact, ...]
+    def _trusted_run_binding_failure(
+        self,
+        admitted_evidence: EvidenceState,
     ) -> str | None:
-        if self._artifact_resolver is None:
-            return "decision_artifact_resolver_required"
+        trusted = self._trusted_run_evidence
+        if trusted is None:
+            return "trusted_run_evidence_unavailable"
+
+        trusted_payload = _semantic_evidence_payload(trusted)
+        admitted_payload = _semantic_evidence_payload(admitted_evidence)
+        for field in (
+            "contract_version",
+            "instrument_identity",
+            "market_snapshot",
+        ):
+            if admitted_payload[field] != trusted_payload[field]:
+                return f"trusted_run_{field}_mismatch"
+        for field in (
+            "material_claims",
+            "source_facts",
+            "source_artifacts",
+            "claim_validations",
+            "acquisition_outcomes",
+        ):
+            if not set(trusted_payload[field]).issubset(admitted_payload[field]):
+                return f"trusted_run_{field}_mismatch"
+
+        severity = {
+            EvidenceStatus.NOT_APPLICABLE: -1,
+            EvidenceStatus.AVAILABLE: 0,
+            EvidenceStatus.UNAVAILABLE: 1,
+            EvidenceStatus.CONFLICTED: 2,
+        }
+
+        def source_bindings(
+            evidence: EvidenceState,
+        ) -> dict[str, tuple[int, bool]]:
+            bindings: dict[str, tuple[int, bool]] = {}
+            for source in evidence.sources:
+                candidate = (severity[source.status], source.required)
+                prior = bindings.get(source.source_id)
+                if prior is None:
+                    bindings[source.source_id] = candidate
+                else:
+                    bindings[source.source_id] = (
+                        max(prior[0], candidate[0]),
+                        prior[1] or candidate[1],
+                    )
+            return bindings
+
+        admitted_sources = source_bindings(admitted_evidence)
+        for source_id, trusted_binding in source_bindings(trusted).items():
+            admitted_binding = admitted_sources.get(source_id)
+            if (
+                admitted_binding is None
+                or admitted_binding[0] < trusted_binding[0]
+                or (trusted_binding[1] and not admitted_binding[1])
+            ):
+                return "trusted_run_sources_mismatch"
+        return None
+
+    def _gate_adapter_failure(
+        self,
+        facts: tuple[DecisionFact, ...],
+        trusted: EvidenceState | None,
+    ) -> str | None:
+        resolver = self._artifact_resolver
         for fact in facts:
             lineage = fact.calculation_lineage
             if lineage is None:
                 return "canonical_fact_adapter_required"
-            artifact = self._artifact_resolver(fact.artifact_sha256, fact.source_ref)
+            if trusted is None:
+                return "decision_admitted_evidence_unavailable"
+            trusted_artifact = next(
+                (
+                    artifact
+                    for artifact in trusted.source_artifacts
+                    if (
+                        artifact.artifact_sha256,
+                        artifact.source_ref,
+                    )
+                    == (fact.artifact_sha256, fact.source_ref)
+                ),
+                None,
+            )
+            artifact = (
+                resolver(fact.artifact_sha256, fact.source_ref)
+                if resolver is not None
+                else trusted_artifact
+            )
             if artifact is None:
                 return "decision_source_artifact_unavailable"
+            if trusted_artifact is None or (
+                trusted_artifact.artifact_sha256 != artifact.artifact_sha256
+                or trusted_artifact.source_ref != artifact.source_ref
+                or trusted_artifact.raw_text != artifact.raw_text
+            ):
+                return "decision_source_artifact_mismatch"
             if (
                 artifact.artifact_sha256 != fact.artifact_sha256
                 or artifact.source_ref != fact.source_ref
@@ -1143,8 +1360,195 @@ class DecisionPolicyEngine:
                 result.canonical_field != fact.canonical_field
                 or result.normalized_value != fact.normalized_value
                 or result.unit != fact.unit
+                or (
+                    result.effective_range_start is not None
+                    and result.effective_range_start
+                    != lineage.effective_range_start
+                )
+                or (
+                    result.effective_range_end is not None
+                    and result.effective_range_end != lineage.effective_range_end
+                )
+                or (
+                    result.observations_used is not None
+                    and result.observations_used != lineage.observations_used
+                )
             ):
                 return "canonical_fact_adapter_output_mismatch"
+        return None
+
+    def _gate_ledger_failure(
+        self,
+        context: ValidatedDecisionContext,
+        checkpoint_evidence: EvidenceState,
+    ) -> str | None:
+        trusted = self._trusted_admitted_evidence_by_context_id.get(
+            context.context_id
+        )
+        if trusted is None:
+            return "decision_admitted_evidence_unavailable"
+        if _semantic_evidence_payload(
+            checkpoint_evidence
+        ) != _semantic_evidence_payload(trusted):
+            return "decision_admitted_evidence_mismatch"
+        if self._integrity_status(trusted) is not context.integrity_status:
+            return "decision_evidence_integrity_mismatch"
+        if (
+            trusted.market_snapshot is not None
+            and context.as_of_date.isoformat()
+            != trusted.market_snapshot.requested_date
+        ):
+            return "decision_as_of_date_mismatch"
+
+        source_facts_by_id: dict[str, SourceFact] = {}
+        for source_fact in checkpoint_evidence.source_facts:
+            prior = source_facts_by_id.get(source_fact.fact_id)
+            if prior is not None and prior.model_dump(
+                mode="python",
+                exclude={"tool_call_id"},
+            ) != source_fact.model_dump(
+                mode="python",
+                exclude={"tool_call_id"},
+            ):
+                return "decision_source_fact_ledger_conflict"
+            source_facts_by_id[source_fact.fact_id] = source_fact
+
+        artifacts_by_key: dict[tuple[str, str], SourceArtifact] = {}
+        for artifact in checkpoint_evidence.source_artifacts:
+            key = (artifact.artifact_sha256, artifact.source_ref)
+            prior = artifacts_by_key.get(key)
+            if prior is not None and prior.raw_text != artifact.raw_text:
+                return "decision_source_artifact_ledger_conflict"
+            artifacts_by_key[key] = artifact
+
+        for fact in context.facts:
+            source_fact = source_facts_by_id.get(fact.fact_id)
+            if source_fact is None:
+                return "decision_source_fact_unavailable"
+            trusted_source_fact = next(
+                (
+                    candidate
+                    for candidate in trusted.source_facts
+                    if candidate.fact_id == fact.fact_id
+                ),
+                None,
+            )
+            if (
+                trusted_source_fact is None
+                or source_fact.model_dump(
+                    mode="python",
+                    exclude={"tool_call_id"},
+                )
+                != trusted_source_fact.model_dump(
+                    mode="python",
+                    exclude={"tool_call_id"},
+                )
+                or _project_fact(trusted_source_fact) != fact
+            ):
+                return "decision_source_fact_mismatch"
+
+            identity = trusted.instrument_identity
+            if identity is None or not identity.is_authoritative:
+                return "decision_instrument_identity_unavailable"
+            if checkpoint_evidence.instrument_identity != identity:
+                return "decision_instrument_identity_mismatch"
+            if (
+                context.instrument.symbol != identity.symbol
+                or context.instrument.venue != identity.venue
+                or context.instrument.instrument_kind != identity.instrument_kind
+                or context.instrument.currency != identity.currency
+                or fact.instrument_symbol != identity.symbol
+            ):
+                return "decision_instrument_identity_mismatch"
+
+            expected_fact_id = stable_source_fact_id(
+                source_ref=trusted_source_fact.source_ref,
+                artifact_sha256=trusted_source_fact.artifact_sha256,
+                source_span_start=trusted_source_fact.source_span_start,
+                source_span_end=trusted_source_fact.source_span_end,
+                canonical_field=trusted_source_fact.canonical_field,
+                instrument_symbol=trusted_source_fact.instrument_symbol,
+                effective_date=trusted_source_fact.effective_date,
+            )
+            if trusted_source_fact.fact_id != expected_fact_id:
+                return "decision_source_fact_id_mismatch"
+            lineage = trusted_source_fact.calculation_lineage
+            if (
+                lineage is None
+                or lineage.calculation_id not in trusted_source_fact.calculation_ids
+            ):
+                return "decision_source_fact_lineage_mismatch"
+
+            artifact = artifacts_by_key.get(
+                (
+                    trusted_source_fact.artifact_sha256,
+                    trusted_source_fact.source_ref,
+                )
+            )
+            trusted_artifact = next(
+                (
+                    candidate
+                    for candidate in trusted.source_artifacts
+                    if (
+                        candidate.artifact_sha256,
+                        candidate.source_ref,
+                    )
+                    == (
+                        trusted_source_fact.artifact_sha256,
+                        trusted_source_fact.source_ref,
+                    )
+                ),
+                None,
+            )
+            if artifact is None or trusted_artifact is None:
+                return "decision_source_artifact_unavailable"
+            if (
+                artifact.artifact_sha256 != trusted_artifact.artifact_sha256
+                or artifact.source_ref != trusted_artifact.source_ref
+                or artifact.raw_text != trusted_artifact.raw_text
+            ):
+                return "decision_source_artifact_mismatch"
+            if trusted_source_fact.source_span_end > len(trusted_artifact.raw_text):
+                return "decision_source_fact_span_invalid"
+            excerpt = trusted_artifact.raw_text[
+                trusted_source_fact.source_span_start : trusted_source_fact.source_span_end
+            ]
+            if trusted_source_fact.raw_text != excerpt:
+                return "decision_source_fact_excerpt_mismatch"
+
+            definition = self._calculations_by_key.get(
+                (lineage.calculation_id, lineage.calculation_version)
+            )
+            if definition is None:
+                return "canonical_calculation_definition_required"
+            if definition.input_frequency != "trading_day":
+                continue
+            snapshot = trusted.market_snapshot
+            if snapshot is None:
+                return "decision_market_snapshot_unavailable"
+            if checkpoint_evidence.market_snapshot != snapshot:
+                return "decision_market_snapshot_mismatch"
+            expected_snapshot_id = stable_market_snapshot_id(
+                symbol=snapshot.symbol,
+                provider=snapshot.provider,
+                adjustment_basis=snapshot.adjustment_basis,
+                requested_date=snapshot.requested_date,
+                effective_trading_date=snapshot.effective_trading_date,
+                frame_sha256=snapshot.frame_sha256,
+                history_rows=snapshot.history_rows,
+            )
+            if snapshot.snapshot_id != expected_snapshot_id:
+                return "decision_market_snapshot_id_mismatch"
+            if (
+                snapshot.symbol != identity.symbol
+                or snapshot.frame_sha256 != lineage.input_artifact_sha256
+                or snapshot.snapshot_id != lineage.input_snapshot_id
+                or snapshot.adjustment_basis != lineage.adjustment_basis
+                or snapshot.effective_trading_date != fact.effective_date
+                or snapshot.effective_trading_date != lineage.effective_range_end
+                or snapshot.history_rows < lineage.observations_used
+            ):
+                return "decision_market_snapshot_binding_mismatch"
         return None
 
     @staticmethod
@@ -1210,6 +1614,7 @@ __all__ = [
     "DecisionInstrument",
     "DecisionPolicyEngine",
     "DirectionSelection",
+    "deterministic_direction_selection",
     "EvidenceIntegrityStatus",
     "HorizonUnit",
     "MissingFactBehavior",

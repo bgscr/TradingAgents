@@ -1837,7 +1837,9 @@ def test_unpinned_identity_enrichment_does_not_trigger_market_acquisition(monkey
     )
     agent_utils.resolve_instrument_identity.cache_clear()
 
-    evidence = TradingAgentsGraph.resolve_evidence_state(
+    graph = object.__new__(TradingAgentsGraph)
+    graph.decision_policy = MagicMock()
+    evidence = graph.resolve_evidence_state(
         "000725.SZ",
         "2026-07-16",
     )
@@ -2021,6 +2023,7 @@ def test_programmatic_debug_stream_preserves_initial_state_and_terminal_audit(
         }
         graph._checkpointer_ctx = None
         graph.propagator = Propagator()
+        graph.decision_policy = MagicMock()
         graph.memory_log = MagicMock()
         graph.memory_log.get_past_context.return_value = past_context
         graph.resolve_evidence_state = lambda *_args: evidence

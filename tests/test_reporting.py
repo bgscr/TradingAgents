@@ -630,7 +630,7 @@ def test_report_tree_writes_complete_immutable_audit(tmp_path, outcome):
     first_bytes = audit_path.read_bytes()
     audit = json.loads(first_bytes)
     expected = "analysis_outcome" if outcome else "trading_decision"
-    assert audit["schema_version"] == "3.0"
+    assert audit["schema_version"] == "3.1"
     assert audit["terminal"]["terminal_outcome_kind"] == expected
     assert audit["run"]["run_id"] == state["run_id"]
     assert audit["run"]["configuration_digest"] == state["configuration_digest"]

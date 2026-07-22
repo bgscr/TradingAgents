@@ -102,6 +102,15 @@ class _AuditTradingDecision(BaseModel):
     integrity_status: str
 
 
+class _AuditDirectionSelectionDiagnostics(BaseModel):
+    """Closed projection of model-neutral selection failure diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: str
+    reason: str
+
+
 def _canonical_json(value: Any) -> bytes:
     return canonical_json_bytes(value)
 
@@ -209,6 +218,32 @@ def _project_direction_selection(
         "rating": selection.rating.value,
         "assertion_ids": sorted(selection.assertion_ids),
     }
+
+
+def _project_direction_selection_diagnostics(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("direction selection diagnostics must be a mapping")
+    status = value.get("status")
+    reason = value.get("reason")
+    safe_reasons = {
+        "direction_context_invalid",
+        "validated_decision_context_invalid",
+        "direction_assertion_ids_duplicate",
+        "direction_assertions_target_multiple_ratings",
+        "direction_selection_invalid",
+        "direction_selection_unavailable",
+        "none_parsed",
+        "validation_error",
+        "transport_error",
+    }
+    if status != "blocked" or reason not in safe_reasons:
+        raise ValueError("direction selection diagnostics are not publication-safe")
+    return _AuditDirectionSelectionDiagnostics(
+        status="blocked",
+        reason=str(reason),
+    ).model_dump(mode="json")
 
 
 def _project_trading_decision(
@@ -348,7 +383,7 @@ def build_decision_audit(
     if not isinstance(graph_signature, str):
         graph_signature = None
     payload: dict[str, Any] = {
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "created_at": created_at,
         "run": {
             **run_identity.model_dump(mode="json", exclude={"audit_digest"}),
@@ -380,6 +415,10 @@ def build_decision_audit(
         "direction_selection": _project_direction_selection(
             final_state.get("direction_selection"),
             final_state.get("validated_decision_context"),
+        ),
+        "direction_selection_diagnostics": _project_direction_selection_diagnostics(
+            final_state.get("direction_selection_diagnostics")
+            or final_state.get("direction_selector_diagnostics")
         ),
         "decision_gate": _project_gate_diagnostics(
             final_state.get("decision_gate_v2") or final_state.get("decision_gate"),

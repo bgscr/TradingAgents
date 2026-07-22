@@ -1,0 +1,3 @@
+# Digest-pinned artifacts must have identical bytes on every platform.
+config/instrument_identity_registry.json text eol=lf
+config/instrument_identity_registry.sha256 text eol=lf

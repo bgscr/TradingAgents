@@ -226,7 +226,7 @@ def test_prepare_decision_audit_persists_raw_artifacts_and_returns_safe_projecti
     payload = decision_audit.prepare_decision_audit(state, tmp_path)
 
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    assert payload["schema_version"] == "3.0"
+    assert payload["schema_version"] == "3.1"
     assert raw_text not in serialized
     assert "TOP_SECRET_AUDIT_TOKEN" not in serialized
     for unsafe_key in ("raw_text", "source_ref", "tool_call_id"):
@@ -248,8 +248,52 @@ def test_prepare_decision_audit_persists_raw_artifacts_and_returns_safe_projecti
         / f"{digest}.utf8.gz"
     )
     assert gzip.decompress(stored.read_bytes()).decode("utf-8") == raw_text
+
+
+@pytest.mark.unit
+def test_prepare_decision_audit_persists_safe_direction_selection_diagnostics(
+    tmp_path,
+):
+    state, _ = _artifact_backed_outcome_state("blocked selection")
+    outcome = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.DECISION_GATE_BLOCKED,
+        diagnostic_codes=(
+            AnalysisDiagnosticCode.DIRECTION_ASSERTIONS_CONFLICTED,
+        ),
+    )
+    state["analysis_outcome_contract"] = outcome.model_dump(mode="json")
+    state["analysis_outcome"] = render_analysis_outcome(outcome)
+    state["direction_selection_diagnostics"] = {
+        "status": "blocked",
+        "reason": "direction_assertions_target_multiple_ratings",
+    }
+
+    payload = decision_audit.prepare_decision_audit(state, tmp_path)
+
+    assert payload["direction_selection_diagnostics"] == {
+        "status": "blocked",
+        "reason": "direction_assertions_target_multiple_ratings",
+    }
     assert state["decision_audit_sha256"] == payload["audit_sha256"]
     assert state["run_identity"]["audit_digest"] == payload["audit_sha256"]
+
+
+@pytest.mark.unit
+def test_prepare_decision_audit_accepts_legacy_selector_diagnostics(tmp_path):
+    state, _ = _artifact_backed_outcome_state("legacy blocked selection")
+    state["direction_selector_diagnostics"] = {
+        "status": "blocked",
+        "reason": "validated_decision_context_invalid",
+        "attempts": 0,
+    }
+
+    payload = decision_audit.prepare_decision_audit(state, tmp_path)
+
+    assert payload["direction_selection_diagnostics"] == {
+        "status": "blocked",
+        "reason": "validated_decision_context_invalid",
+    }
 
 
 @pytest.mark.unit
@@ -317,7 +361,7 @@ def test_write_immutable_decision_audit_prepares_a_safe_payload_by_default(tmp_p
 
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert target == tmp_path / "decision-audit.json"
-    assert payload["schema_version"] == "3.0"
+    assert payload["schema_version"] == "3.1"
     assert payload["audit_sha256"] == state["decision_audit_sha256"]
     assert raw_text not in json.dumps(payload, ensure_ascii=False, sort_keys=True)
     assert (

@@ -18,6 +18,8 @@ from tradingagents.evidence import (
     ClaimValidationStatus,
     EvidenceState,
     EvidenceStatus,
+    InstrumentIdentityEvidence,
+    InstrumentKind,
     MaterialClaim,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
@@ -329,15 +331,23 @@ def test_china_local_prompt_context_cannot_mint_synthetic_evidence(monkeypatch):
     local_text = "Northbound holdings increased by 12%."
     local_quote = "increased by 12%"
     captured = {}
+    identity = InstrumentIdentityEvidence(
+        symbol="600895.SS",
+        venue="XSHG",
+        instrument_kind=InstrumentKind.EQUITY,
+        currency="CNY",
+        display_name="上海张江高科技园区开发股份有限公司",
+    )
 
     def fake_acquire_news(
-        _ticker,
+        acquired_ticker,
         _start_date,
         _end_date,
         *,
         tool_call_id,
         source_ref,
         capability,
+        instrument_identity,
     ):
         artifact = SourceArtifact(
             artifact_sha256=sha256(news_text.encode()).hexdigest(),
@@ -355,6 +365,8 @@ def test_china_local_prompt_context_cannot_mint_synthetic_evidence(monkeypatch):
             artifact=artifact,
         )
         assert capability == "sentiment_news"
+        assert acquired_ticker == identity.symbol
+        assert instrument_identity == identity
         return AcquisitionResult(
             value=news_text,
             artifact=artifact,
@@ -401,11 +413,13 @@ def test_china_local_prompt_context_cannot_mint_synthetic_evidence(monkeypatch):
 
     update = sentiment_analyst.create_sentiment_analyst(llm)(
         {
-            "company_of_interest": "600895.SS",
+                "company_of_interest": "600895.SH",
             "trade_date": "2026-07-20",
             "instrument_context": "Instrument: 600895.SS",
             "messages": [],
-            "evidence_state": EvidenceState().model_dump(mode="json"),
+                "evidence_state": EvidenceState(
+                    instrument_identity=identity
+                ).model_dump(mode="json"),
         }
     )
 

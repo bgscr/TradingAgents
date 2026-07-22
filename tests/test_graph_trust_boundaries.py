@@ -33,6 +33,10 @@ from tradingagents.graph.evidence_gate import (
 )
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.setup import GraphSetup
+from tradingagents.strategy_registry import (
+    DEFAULT_DECISION_HORIZON,
+    create_production_decision_policy,
+)
 
 
 def _authoritative_baseline() -> EvidenceState:
@@ -290,6 +294,51 @@ def test_preflight_blocks_authoritative_baseline_without_policy_configuration():
     assert route_after_preflight(result) == "blocked"
     assert "decision_horizon_not_configured" in result["evidence_preflight"]["blockers"]
     assert "no_applicable_registered_strategy_rule" in result["evidence_preflight"]["blockers"]
+    assert "analysis_outcome" in result
+
+
+@pytest.mark.unit
+def test_production_policy_allows_authoritative_baseline_to_reach_analysts():
+    node = create_preflight_gate_node(
+        create_production_decision_policy(),
+        DEFAULT_DECISION_HORIZON,
+    )
+
+    result = node(
+        {"evidence_state": _authoritative_baseline().model_dump(mode="json")}
+    )
+
+    assert result["evidence_preflight"] == {
+        "contract_version": "1.0",
+        "passed": True,
+        "readiness": "decision_ready",
+        "blockers": [],
+    }
+    assert route_after_preflight(result) == "admitted"
+    assert "analysis_outcome" not in result
+
+
+@pytest.mark.unit
+def test_production_preflight_blocks_history_before_analyst_work():
+    short_history = _authoritative_baseline().model_copy(
+        update={
+            "market_snapshot": _authoritative_baseline().market_snapshot.model_copy(
+                update={"history_rows": 20}
+            )
+        }
+    )
+    node = create_preflight_gate_node(
+        create_production_decision_policy(),
+        DEFAULT_DECISION_HORIZON,
+    )
+
+    result = node({"evidence_state": short_history.model_dump(mode="json")})
+
+    assert result["evidence_preflight"]["passed"] is False
+    assert result["evidence_preflight"]["blockers"] == [
+        "authoritative market snapshot has 20 rows; at least 21 are required"
+    ]
+    assert route_after_preflight(result) == "blocked"
     assert "analysis_outcome" in result
 
 

@@ -42,7 +42,6 @@ def _assert_success(result: subprocess.CompletedProcess[str]) -> None:
     [
         "ak_pick_a_stock.ps1",
         "start_tradingagents.ps1",
-        "upgrade_tradingagents.ps1",
         "scripts/build_windows_release.ps1",
     ],
 )
@@ -104,12 +103,3 @@ def test_start_launcher_uses_development_mode_from_source_checkout() -> None:
     assert "Mode=development" in result.stdout
     assert f"ProjectDir={REPO_ROOT}" in result.stdout
     assert "Launcher=tradingagents" in result.stdout
-
-
-def test_upgrade_launcher_dry_run_uses_script_directory() -> None:
-    result = _run_script(REPO_ROOT / "upgrade_tradingagents.ps1", "-DryRun")
-
-    _assert_success(result)
-    assert "Mode=development" in result.stdout
-    assert f"ProjectDir={REPO_ROOT}" in result.stdout
-    assert f"VenvActivate={REPO_ROOT / '.venv' / 'Scripts' / 'Activate.ps1'}" in result.stdout

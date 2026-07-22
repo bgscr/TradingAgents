@@ -13,6 +13,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
+from tradingagents.agents.analysts import sentiment_analyst
 from tradingagents.agents.managers.direction_selector import (
     create_decision_gate_node,
     create_direction_selector,
@@ -20,10 +21,13 @@ from tradingagents.agents.managers.direction_selector import (
 from tradingagents.agents.schemas import (
     PortfolioRating,
     ResearchPlan,
+    SentimentBand,
+    SentimentReport,
     TraderAction,
     TraderProposal,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.dataflows.acquisition import AcquisitionResult
 from tradingagents.decision_policy import (
     CanonicalFactAdapterResult,
     DecisionAssertion,
@@ -46,17 +50,21 @@ from tradingagents.decision_policy import (
     stable_decision_value_digest,
 )
 from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
     AdmissionGateResult,
     AnalysisOutcome,
     CalculationDefinition,
     CalculationLineage,
     EvidenceReadiness,
+    EvidenceSource,
     EvidenceState,
+    EvidenceStatus,
     IdentityProvenance,
     InstrumentIdentityEvidence,
     InstrumentKind,
     MarketSnapshotEvidence,
     MissingValuePolicy,
+    SourceAcquisitionUnavailable,
     SourceArtifact,
     SourceFact,
     render_analysis_outcome,
@@ -110,7 +118,15 @@ def _selection(context: ValidatedDecisionContext) -> DirectionSelection:
     )
 
 
-def _permitted_policy_case() -> tuple[
+def _permitted_policy_case(
+    *,
+    symbol: str = "NVDA",
+    venue: str = "XNAS",
+    currency: str = "USD",
+    trade_date: str = "2026-01-10",
+    display_name: str | None = None,
+    sources: tuple[EvidenceSource, ...] = (),
+) -> tuple[
     DecisionPolicyEngine,
     ValidatedDecisionContext,
     DirectionSelection,
@@ -118,15 +134,15 @@ def _permitted_policy_case() -> tuple[
 ]:
     artifact_text = "P/E was 9.5;"
     artifact_sha256 = sha256(artifact_text.encode()).hexdigest()
-    source_ref = "market:NVDA:2026-01-10"
+    source_ref = f"market:{symbol}:{trade_date}"
     fact_id = stable_source_fact_id(
         source_ref=source_ref,
         artifact_sha256=artifact_sha256,
         source_span_start=0,
         source_span_end=len(artifact_text),
         canonical_field="pe_ratio",
-        instrument_symbol="NVDA",
-        effective_date="2026-01-10",
+        instrument_symbol=symbol,
+        effective_date=trade_date,
     )
     fact = SourceFact(
         fact_kind="canonical",
@@ -142,15 +158,15 @@ def _permitted_policy_case() -> tuple[
         canonical_field="pe_ratio",
         normalized_value=Decimal("9.5"),
         unit="ratio",
-        instrument_symbol="NVDA",
-        effective_date="2026-01-10",
+        instrument_symbol=symbol,
+        effective_date=trade_date,
         calculation_lineage=CalculationLineage(
             calculation_id="pe_ratio.adapter",
             calculation_version="1",
             input_artifact_sha256=artifact_sha256,
             input_snapshot_id="artifact-record",
-            effective_range_start="2026-01-10",
-            effective_range_end="2026-01-10",
+            effective_range_start=trade_date,
+            effective_range_end=trade_date,
             observations_used=1,
             adjustment_basis="source-reported",
             implementation_version="test-adapter-1",
@@ -168,11 +184,15 @@ def _permitted_policy_case() -> tuple[
         tool_name="provider",
         raw_text=artifact_text,
     )
-    identity_artifact_text = '{"symbol":"NVDA","venue":"XNAS"}'
+    identity_artifact_text = json.dumps(
+        {"symbol": symbol, "venue": venue},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     identity_artifact_sha256 = sha256(identity_artifact_text.encode()).hexdigest()
     identity_artifact = SourceArtifact(
         artifact_sha256=identity_artifact_sha256,
-        source_ref="nasdaq:NVDA",
+        source_ref=f"identity-registry:{symbol}",
         tool_call_id="identity-runtime-call",
         tool_name="security-master",
         raw_text=identity_artifact_text,
@@ -237,31 +257,34 @@ def _permitted_policy_case() -> tuple[
     )
     evidence = EvidenceState(
         instrument_identity=InstrumentIdentityEvidence(
-            symbol="NVDA",
-            venue="XNAS",
+            symbol=symbol,
+            venue=venue,
             instrument_kind=InstrumentKind.EQUITY,
-            currency="USD",
+            currency=currency,
+            display_name=display_name,
             provenance=IdentityProvenance(
-                provider="security-master",
-                source_ref="nasdaq:NVDA",
-                retrieved_at="2026-01-10T12:00:00+00:00",
+                provider="identity-registry",
+                source_ref=f"identity-registry:{symbol}",
+                retrieved_at=f"{trade_date}T12:00:00+00:00",
                 artifact_sha256=identity_artifact_sha256,
             ),
         ),
         market_snapshot=MarketSnapshotEvidence(
-            symbol="NVDA",
+            symbol=symbol,
             provider="test",
-            retrieved_at="2026-01-10T12:00:00+00:00",
+            retrieved_at=f"{trade_date}T12:00:00+00:00",
             adjustment_basis="adjusted",
-            requested_date="2026-01-10",
-            effective_trading_date="2026-01-10",
+            requested_date=trade_date,
+            effective_trading_date=trade_date,
             history_rows=250,
             frame_sha256="f" * 64,
-            snapshot_id="snapshot:test",
+            snapshot_id=f"snapshot:{symbol}:{trade_date}",
         ),
         source_facts=(fact,),
         source_artifacts=(artifact, identity_artifact),
+        sources=sources,
     )
+    policy.register_trusted_evidence(evidence)
     built = policy.build_context(
         evidence,
         (
@@ -272,7 +295,7 @@ def _permitted_policy_case() -> tuple[
             ),
         ),
         horizon=HORIZON,
-        as_of_date=date(2026, 1, 10),
+        as_of_date=date.fromisoformat(trade_date),
     )
     assert isinstance(built, DecisionContextBuilt)
     selection = DirectionSelection(
@@ -280,7 +303,12 @@ def _permitted_policy_case() -> tuple[
         rating=PortfolioRating.BUY,
         assertion_ids=(built.context.assertions[0].assertion_id,),
     )
-    assert policy.gate(built.context, selection).permitted is True
+    policy.register_admitted_evidence(evidence, built.context)
+    assert policy.gate(
+        built.context,
+        selection,
+        evidence=evidence,
+    ).permitted is True
     return policy, built.context, selection, evidence
 
 
@@ -311,8 +339,10 @@ class _FixtureBoundaryLLM:
 
     def __init__(self, selection: DirectionSelection):
         self.selection = selection
+        self.structured_schemas: list[type] = []
 
     def with_structured_output(self, schema, **_kwargs):
+        self.structured_schemas.append(schema)
         return _FixtureStructuredBinding(schema, self.selection)
 
     def bind_tools(self, _tools):
@@ -341,7 +371,16 @@ class _FixtureBoundaryLLM:
 
 
 class _PermittedPropagateHarness(TradingAgentsGraph):
-    def __init__(self, tmp_path, policy, selection, evidence):
+    def __init__(
+        self,
+        tmp_path,
+        policy,
+        selection,
+        evidence,
+        *,
+        ticker: str = "NVDA",
+        trade_date: str = "2026-01-10",
+    ):
         self.debug = False
         self.config = {
             "checkpoint_enabled": False,
@@ -356,6 +395,7 @@ class _PermittedPropagateHarness(TradingAgentsGraph):
         self.decision_horizon = HORIZON
         self.selected_analysts = ("market",)
         llm = _FixtureBoundaryLLM(selection)
+        self.boundary_llm = llm
         conditional_logic = ConditionalLogic(
             max_debate_rounds=0,
             max_risk_discuss_rounds=0,
@@ -387,9 +427,14 @@ class _PermittedPropagateHarness(TradingAgentsGraph):
         self.ticker = None
         self._checkpointer_ctx = None
         self._fixture_evidence = evidence
+        self._fixture_ticker = ticker
+        self._fixture_trade_date = trade_date
 
     def resolve_evidence_state(self, ticker: str, trade_date: str) -> EvidenceState:
-        assert (ticker, trade_date) == ("NVDA", "2026-01-10")
+        assert (ticker, trade_date) == (
+            self._fixture_ticker,
+            self._fixture_trade_date,
+        )
         return self._fixture_evidence
 
 
@@ -494,6 +539,7 @@ def test_admission_empty_applications_short_circuits_policy(monkeypatch):
     assert policy.build_context.call_args.kwargs[
         "tolerate_unsatisfied_applications"
     ] is True
+    policy.register_admitted_evidence.assert_not_called()
 
 
 @pytest.mark.unit
@@ -534,6 +580,7 @@ def test_admission_discovers_registered_candidates_when_state_selection_is_empty
     assert policy.build_context.call_args.kwargs[
         "tolerate_unsatisfied_applications"
     ] is True
+    policy.register_admitted_evidence.assert_called_once_with(evidence, context)
 
 
 @pytest.mark.unit
@@ -676,18 +723,162 @@ def test_public_propagate_publishes_audited_signal_and_memory(tmp_path):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("envelope", [False, True])
-def test_selector_uses_closed_context_for_direct_and_include_raw_results(envelope):
+def test_600895_optional_news_degrades_but_still_generates_valid_report(
+    tmp_path,
+    monkeypatch,
+):
+    policy, _context, selection, evidence = _permitted_policy_case(
+        symbol="600895.SS",
+        venue="XSHG",
+        currency="CNY",
+        trade_date="2026-07-18",
+        display_name="上海张江高科技园区开发股份有限公司",
+    )
+    identity = evidence.instrument_identity
+
+    def unavailable_news(
+        ticker,
+        _start_date,
+        _end_date,
+        *,
+        tool_call_id,
+        source_ref,
+        capability,
+        instrument_identity,
+    ):
+        assert ticker == "600895.SS"
+        assert instrument_identity == identity
+        return AcquisitionResult(
+            value=None,
+            artifact=None,
+            outcomes=(
+                SourceAcquisitionUnavailable(
+                    provider="fixture-news",
+                    capability=capability,
+                    source_ref=source_ref,
+                    attempt=1,
+                    retrieved_at="2026-07-18T12:00:00+00:00",
+                    retryable=False,
+                    reason=AcquisitionUnavailableReason.NO_DATA,
+                ),
+            ),
+            provider="fixture-news",
+        )
+
+    monkeypatch.setattr(sentiment_analyst, "acquire_news", unavailable_news)
+    monkeypatch.setattr(
+        sentiment_analyst,
+        "get_china_a_local_sentiment",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        sentiment_analyst,
+        "get_china_a_enhancements_for_categories",
+        lambda *_args, **_kwargs: "",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = SentimentReport(
+        overall_band=SentimentBand.NEUTRAL,
+        overall_score=5.0,
+        confidence="low",
+        narrative="No instrument-relevant news was available.",
+    )
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    sentiment_update = sentiment_analyst.create_sentiment_analyst(llm)(
+        {
+            "company_of_interest": "600895.SS",
+            "trade_date": "2026-07-18",
+            "instrument_context": "Instrument: 600895.SS",
+            "messages": [],
+            "evidence_state": evidence.model_dump(mode="json"),
+        }
+    )
+    evidence = EvidenceState.model_validate(sentiment_update["evidence_state"])
+    news_source = next(
+        source for source in evidence.sources if source.source_id == "sentiment.news"
+    )
+    graph = _PermittedPropagateHarness(
+        tmp_path,
+        policy,
+        selection,
+        evidence,
+        ticker="600895.SS",
+        trade_date="2026-07-18",
+    )
+
+    final_state, signal = graph.propagate("600895.SS", "2026-07-18")
+    admission = AdmissionGateResult.model_validate(final_state["admission_gate"])
+    terminal = TerminalContract.model_validate(final_state["terminal_contract"])
+    report_path = graph.save_reports(
+        final_state,
+        "600895.SS",
+        save_path=tmp_path / "600895-report",
+    )
+
+    assert news_source == EvidenceSource(
+        source_id="sentiment.news",
+        status=EvidenceStatus.UNAVAILABLE,
+        required=False,
+        detail="acquired_news",
+    )
+    assert admission.admitted is True
+    assert admission.readiness is EvidenceReadiness.DEGRADED
+    assert terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION
+    assert signal == PortfolioRating.BUY.value
+    assert report_path.exists()
+    assert "- **Rating:** Buy" in report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_601658_deterministic_selection_generates_report_without_selector_llm(tmp_path):
+    policy, _context, selection, evidence = _permitted_policy_case(
+        symbol="601658.SS",
+        venue="XSHG",
+        currency="CNY",
+        trade_date="2026-07-18",
+        display_name="中国邮政储蓄银行股份有限公司",
+    )
+    graph = _PermittedPropagateHarness(
+        tmp_path,
+        policy,
+        selection,
+        evidence,
+        ticker="601658.SS",
+        trade_date="2026-07-18",
+    )
+
+    final_state, signal = graph.propagate("601658.SS", "2026-07-18")
+    terminal = TerminalContract.model_validate(final_state["terminal_contract"])
+    report_path = graph.save_reports(
+        final_state,
+        "601658.SS",
+        save_path=tmp_path / "601658-report",
+    )
+
+    assert DirectionSelection not in graph.boundary_llm.structured_schemas
+    assert terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION
+    assert signal == PortfolioRating.BUY.value
+    assert report_path.exists()
+    assert "- **Rating:** Buy" in report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_selector_derives_direction_from_closed_context_without_invoking_llm():
     context = _context()
     selection = _selection(context)
-    result = (
-        {"raw": object(), "parsed": selection, "parsing_error": None}
-        if envelope
-        else selection
-    )
-    llm = _StructuredLLM(result)
+    llm = MagicMock()
     state = {
         "validated_decision_context": context.model_dump(mode="json"),
+        "direction_selection_diagnostics": {
+            "status": "blocked",
+            "reason": "direction_selection_invalid",
+        },
+        "direction_selector_diagnostics": {
+            "status": "blocked",
+            "reason": "validation_error",
+            "attempts": 2,
+        },
         "market_report": "SENTINEL MARKET PROSE",
         "risk_debate_state": {"history": "SENTINEL RISK PROSE"},
     }
@@ -695,9 +886,43 @@ def test_selector_uses_closed_context_for_direct_and_include_raw_results(envelop
     update = create_direction_selector(llm)(state)
 
     assert update["direction_selection"] == selection.model_dump(mode="json")
-    assert len(llm.prompts) == 1
-    assert "SENTINEL" not in llm.prompts[0]
-    assert context.context_id in llm.prompts[0]
+    assert update["direction_selection_diagnostics"] is None
+    assert update["direction_selector_diagnostics"] is None
+    llm.with_structured_output.assert_not_called()
+    llm.invoke.assert_not_called()
+
+
+@pytest.mark.unit
+def test_selector_blocks_context_with_multiple_target_ratings():
+    context = _context()
+    second = context.assertions[0].model_copy(
+        update={
+            "assertion_id": "assertion:second-rating",
+            "target_rating": PortfolioRating.SELL,
+        }
+    )
+    conflicted = context.model_copy(
+        update={"assertions": (*context.assertions, second)}
+    )
+
+    update = create_direction_selector()(
+        {
+            "validated_decision_context": conflicted.model_dump(mode="json"),
+            "direction_selection": _selection(context).model_dump(mode="json"),
+            "direction_selector_diagnostics": {
+                "status": "blocked",
+                "reason": "validation_error",
+                "attempts": 2,
+            },
+        }
+    )
+
+    assert update["direction_selection"] is None
+    assert update["direction_selection_diagnostics"] == {
+        "status": "blocked",
+        "reason": "direction_assertions_target_multiple_ratings",
+    }
+    assert update["direction_selector_diagnostics"] is None
 
 
 @pytest.mark.unit
@@ -715,10 +940,14 @@ def test_semantic_gate_rejection_does_not_retry_selector_or_publish():
     )
 
     update = create_decision_gate_node(policy)(
-        {"validated_decision_context": context.model_dump(mode="json"), "direction_selection": swapped}
+        {
+            "validated_decision_context": context.model_dump(mode="json"),
+            "direction_selection": swapped,
+            "evidence_state": EvidenceState().model_dump(mode="json"),
+        }
     )
 
-    assert len(llm.prompts) == 1
+    assert len(llm.prompts) == 0
     assert update["decision_gate"]["permitted"] is False
     gated_context = policy.gate.call_args.args[0]
     assert isinstance(gated_context.facts[0].normalized_value, Decimal)
@@ -747,6 +976,7 @@ def test_permitted_gate_publishes_only_deterministic_contract_and_render():
         {
             "validated_decision_context": context.model_dump(mode="json"),
             "direction_selection": _selection(context).model_dump(mode="json"),
+            "evidence_state": EvidenceState().model_dump(mode="json"),
         }
     )
 
@@ -798,7 +1028,8 @@ def test_json_safe_nullable_initial_state_and_topology_signature_contract():
     assert state["analysis_outcome_contract"] is None
     assert round_trip["analysis_outcome_contract"] is None
     for field in (
-        "validated_decision_context", "direction_selection", "direction_selector_diagnostics",
+        "validated_decision_context", "direction_selection",
+        "direction_selection_diagnostics", "direction_selector_diagnostics",
         "trading_decision", "final_trade_decision",
     ):
         assert state[field] is None

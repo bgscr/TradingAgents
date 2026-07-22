@@ -30,18 +30,24 @@ from tradingagents.decision_policy import (
     stable_decision_value_digest,
 )
 from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
     CalculationDefinition,
     CalculationLineage,
+    ClaimValidation,
+    ClaimValidationStatus,
     EvidenceSource,
     EvidenceState,
     EvidenceStatus,
     IdentityProvenance,
     InstrumentIdentityEvidence,
     InstrumentKind,
+    MarketSnapshotEvidence,
     MaterialClaim,
     MissingValuePolicy,
+    SourceAcquisitionUnavailable,
     SourceArtifact,
     SourceFact,
+    stable_market_snapshot_id,
     stable_source_fact_id,
 )
 
@@ -293,12 +299,18 @@ def _build(
     applications: tuple[RuleApplicationRequest, ...] | None = None,
     horizon: DecisionHorizon = HORIZON,
 ):
-    return (engine or _engine()).build_context(
-        evidence or _evidence(_fact()),
+    policy = engine or _engine()
+    run_evidence = evidence or _evidence(_fact())
+    policy.register_trusted_evidence(run_evidence)
+    result = policy.build_context(
+        run_evidence,
         applications or (_application(),),
         horizon=horizon,
         as_of_date=date(2026, 7, 19),
     )
+    if isinstance(result, DecisionContextBuilt):
+        policy.register_admitted_evidence(run_evidence, result.context)
+    return result
 
 
 def test_registry_digest_is_order_independent_and_duplicate_rules_are_rejected():
@@ -344,7 +356,6 @@ def test_empty_registry_fails_closed():
 
 def test_configuration_blockers_report_default_and_partial_wiring():
     assert DecisionPolicyEngine().configuration_blockers == (
-        "decision_artifact_resolver_required",
         "no_applicable_registered_strategy_rule",
         "no_registered_calculation_definition",
     )
@@ -354,7 +365,6 @@ def test_configuration_blockers_report_default_and_partial_wiring():
     )
     assert partial.configuration_blockers == (
         "canonical_fact_adapter_required",
-        "decision_artifact_resolver_required",
         "strategy_rule_evaluator_unavailable",
     )
 
@@ -667,6 +677,7 @@ def test_gate_accepts_only_the_rule_supported_rating():
             rating=PortfolioRating.BUY,
             assertion_ids=(assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     swapped = engine.gate(
         built.context,
@@ -675,6 +686,7 @@ def test_gate_accepts_only_the_rule_supported_rating():
             rating=PortfolioRating.SELL,
             assertion_ids=(assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     assert accepted.permitted is True
     assert accepted.decision is not None
@@ -682,6 +694,193 @@ def test_gate_accepts_only_the_rule_supported_rating():
     assert swapped.permitted is False
     assert swapped.decision is None
     assert "assertion does not support the proposed rating" in swapped.diagnostics
+
+
+def test_gate_uses_configured_artifact_resolver_with_trusted_ledger():
+    engine = _engine()
+    built = _build(engine=engine)
+    assert isinstance(built, DecisionContextBuilt)
+    assertion_id = built.context.assertions[0].assertion_id
+
+    result = engine.gate(
+        built.context,
+        DirectionSelection(
+            context_id=built.context.context_id,
+            rating=PortfolioRating.BUY,
+            assertion_ids=(assertion_id,),
+        ),
+        evidence=_evidence(_fact()),
+    )
+
+    assert result.permitted is True
+
+
+def test_gate_rejects_checkpoint_rewrite_of_required_source_conflict():
+    engine = _engine()
+    available_source = EvidenceSource(
+        source_id="required.market",
+        status=EvidenceStatus.AVAILABLE,
+        required=True,
+    )
+    checkpoint_evidence = _evidence(_fact()).model_copy(
+        update={"sources": (available_source,)}
+    )
+    built = engine.build_context(
+        checkpoint_evidence,
+        (_application(),),
+        horizon=HORIZON,
+        as_of_date=date(2026, 7, 19),
+    )
+    assert isinstance(built, DecisionContextBuilt)
+
+    trusted_evidence = checkpoint_evidence.model_copy(
+        update={
+            "sources": (
+                available_source.model_copy(
+                    update={
+                        "status": EvidenceStatus.CONFLICTED,
+                        "detail": "material provider contradiction",
+                    }
+                ),
+            )
+        }
+    )
+    engine.register_trusted_evidence(trusted_evidence)
+    with pytest.raises(ValueError, match="trusted_run_sources_mismatch"):
+        engine.register_admitted_evidence(checkpoint_evidence, built.context)
+    result = engine.gate(
+        built.context,
+        DirectionSelection(
+            context_id=built.context.context_id,
+            rating=PortfolioRating.BUY,
+            assertion_ids=(built.context.assertions[0].assertion_id,),
+        ),
+        evidence=checkpoint_evidence,
+    )
+
+    assert result.permitted is False
+    assert result.decision is None
+
+
+def test_gate_rejects_post_admission_evidence_ledger_rewrites():
+    engine = _engine()
+    optional_source = EvidenceSource(
+        source_id="optional.news",
+        status=EvidenceStatus.UNAVAILABLE,
+        required=False,
+        detail="provider timed out",
+    )
+    acquisition = SourceAcquisitionUnavailable(
+        provider="news-provider",
+        capability="news",
+        source_ref="source:news",
+        attempt=1,
+        retrieved_at="2026-07-19T12:00:00+00:00",
+        retryable=True,
+        reason=AcquisitionUnavailableReason.TIMEOUT,
+    )
+    validation = ClaimValidation(
+        claim_id="market.pe",
+        status=ClaimValidationStatus.SUPPORTED,
+        fact_ids=(PE_FACT_ID,),
+    )
+    admitted_evidence = _evidence(_fact()).model_copy(
+        update={
+            "sources": (optional_source,),
+            "acquisition_outcomes": (acquisition,),
+            "claim_validations": (validation,),
+        }
+    )
+    built = _build(engine=engine, evidence=admitted_evidence)
+    assert isinstance(built, DecisionContextBuilt)
+    proposal = DirectionSelection(
+        context_id=built.context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=(built.context.assertions[0].assertion_id,),
+    )
+
+    rewrites = (
+        admitted_evidence.model_copy(
+            update={
+                "sources": (
+                    optional_source.model_copy(
+                        update={"status": EvidenceStatus.AVAILABLE, "detail": ""}
+                    ),
+                )
+            }
+        ),
+        admitted_evidence.model_copy(
+            update={
+                "acquisition_outcomes": (
+                    acquisition.model_copy(
+                        update={"reason": AcquisitionUnavailableReason.NO_DATA}
+                    ),
+                )
+            }
+        ),
+        admitted_evidence.model_copy(
+            update={
+                "claim_validations": (
+                    validation.model_copy(
+                        update={"status": ClaimValidationStatus.UNSUPPORTED}
+                    ),
+                )
+            }
+        ),
+    )
+
+    for rewritten_evidence in rewrites:
+        result = engine.gate(
+            built.context,
+            proposal,
+            evidence=rewritten_evidence,
+        )
+        assert result.permitted is False
+        assert "decision admitted evidence mismatch" in result.diagnostics
+
+
+def test_gate_rejects_as_of_date_after_trusted_snapshot_request_date():
+    engine = _engine()
+    snapshot_fields = {
+        "symbol": "600895.SS",
+        "provider": "test-market",
+        "adjustment_basis": "adjusted",
+        "requested_date": "2026-07-19",
+        "effective_trading_date": "2026-07-18",
+        "frame_sha256": "f" * 64,
+        "history_rows": 250,
+    }
+    evidence = _evidence(_fact()).model_copy(
+        update={
+            "market_snapshot": MarketSnapshotEvidence(
+                retrieved_at="2026-07-19T12:00:00+00:00",
+                snapshot_id=stable_market_snapshot_id(**snapshot_fields),
+                **snapshot_fields,
+            )
+        }
+    )
+    engine.register_trusted_evidence(evidence)
+    built = engine.build_context(
+        evidence,
+        (_application(),),
+        horizon=HORIZON,
+        as_of_date=date(2026, 7, 20),
+    )
+    assert isinstance(built, DecisionContextBuilt)
+    engine.register_admitted_evidence(evidence, built.context)
+
+    result = engine.gate(
+        built.context,
+        DirectionSelection(
+            context_id=built.context.context_id,
+            rating=PortfolioRating.BUY,
+            assertion_ids=(built.context.assertions[0].assertion_id,),
+        ),
+        evidence=evidence,
+    )
+
+    assert result.permitted is False
+    assert result.decision is None
 
 
 def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
@@ -695,6 +894,7 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
             rating=PortfolioRating.BUY,
             assertion_ids=(opposing.context.assertions[0].assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     assert opposing_result.permitted is False
     assert "opposing assertions cannot authorize a rating" in opposing_result.diagnostics
@@ -719,6 +919,7 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
                 assertion.assertion_id for assertion in multiple.context.assertions
             ),
         ),
+        evidence=_evidence(_fact()),
     )
     assert multiple_result.permitted is False
     assert "selected assertions target multiple ratings" in multiple_result.diagnostics
@@ -730,6 +931,7 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
             rating=multiple.context.assertions[0].target_rating,
             assertion_ids=(multiple.context.assertions[0].assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     assert cherry_picked.permitted is False
     assert (
@@ -766,6 +968,7 @@ def test_gate_recomputes_and_rejects_changed_evaluation_digest():
             rating=PortfolioRating.BUY,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     assert result.permitted is False
     assert "decision assertion reevaluation mismatch" in result.diagnostics
@@ -790,6 +993,7 @@ def test_gate_rejects_duplicate_context_members_and_preserves_conflicted_status(
             rating=PortfolioRating.BUY,
             assertion_ids=(assertion.assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
     assert result.permitted is False
     assert result.integrity_status.value == "conflicted"
@@ -940,13 +1144,19 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
             "detail": unavailable_detail,
         }
     )
+    baseline_evidence = _evidence(_fact()).model_copy(
+        update={"sources": (available,)}
+    )
+    transformed_evidence = _evidence(_fact()).model_copy(
+        update={"sources": (unavailable,)}
+    )
     baseline = _build(
         engine=engine,
-        evidence=_evidence(_fact()).model_copy(update={"sources": (available,)}),
+        evidence=baseline_evidence,
     )
     transformed = _build(
         engine=engine,
-        evidence=_evidence(_fact()).model_copy(update={"sources": (unavailable,)}),
+        evidence=transformed_evidence,
     )
 
     assert isinstance(baseline, DecisionContextBuilt)
@@ -956,6 +1166,8 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
     assert transformed.context.facts == baseline.context.facts
     assert transformed.context.assertions == baseline.context.assertions
 
+    engine.register_trusted_evidence(baseline_evidence)
+    engine.register_admitted_evidence(baseline_evidence, baseline.context)
     baseline_gate = engine.gate(
         baseline.context,
         DirectionSelection(
@@ -963,7 +1175,10 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
             rating=PortfolioRating.BUY,
             assertion_ids=(baseline.context.assertions[0].assertion_id,),
         ),
+        evidence=baseline_evidence,
     )
+    engine.register_trusted_evidence(transformed_evidence)
+    engine.register_admitted_evidence(transformed_evidence, transformed.context)
     transformed_gate = engine.gate(
         transformed.context,
         DirectionSelection(
@@ -971,6 +1186,7 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
             rating=PortfolioRating.BUY,
             assertion_ids=(transformed.context.assertions[0].assertion_id,),
         ),
+        evidence=transformed_evidence,
     )
     assert baseline_gate.permitted is True
     assert transformed_gate.permitted is True
@@ -1187,6 +1403,7 @@ def test_metamorphic_gate_accepts_exactly_the_rule_supported_rating(proposed_rat
             rating=proposed_rating,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
+        evidence=_evidence(_fact()),
     )
 
     assert result.permitted is (proposed_rating is PortfolioRating.BUY)

@@ -115,7 +115,7 @@ class GraphSetup:
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_direction_selector(self.deep_thinking_llm)
+        portfolio_manager_node = create_direction_selector()
         decision_gate_node = create_decision_gate_node(
             self.decision_policy,
             evidence_gate_mode=self.evidence_gate_mode,

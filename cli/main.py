@@ -1754,6 +1754,91 @@ def runtime_artifacts_gc(
         typer.echo(str(candidate))
 
 
+@app.command("identity-registry-refresh")
+def identity_registry_refresh(
+    symbols: Annotated[
+        list[str],
+        typer.Argument(
+            help="Explicit mainland equity symbols such as 600895.SS or 000001.SZ."
+        ),
+    ],
+    registry_path: Annotated[
+        Path | None,
+        typer.Option(help="Registry JSON path; defaults to the production registry."),
+    ] = None,
+    checksum_path: Annotated[
+        Path | None,
+        typer.Option(help="SHA-256 manifest path; defaults beside the registry."),
+    ] = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option(help="Environment file updated with the registry path and digest."),
+    ] = None,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(min=1.0, help="Per-exchange request timeout."),
+    ] = 20.0,
+    full_tests: Annotated[
+        bool,
+        typer.Option("--full-tests", help="Run the complete test suite after refresh."),
+    ] = False,
+) -> None:
+    """From a source checkout, fetch identities, rebuild, pin, and test."""
+    from tradingagents.dataflows.identity_registry_refresh import (
+        DEFAULT_ENV_PATH,
+        DEFAULT_REGISTRY_PATH,
+        REGISTRY_PATH_ENV,
+        REGISTRY_SHA256_ENV,
+        RegistryRefreshError,
+        refresh_identity_registry,
+    )
+
+    resolved_registry_path = registry_path or DEFAULT_REGISTRY_PATH
+    try:
+        result = refresh_identity_registry(
+            symbols,
+            registry_path=resolved_registry_path,
+            checksum_path=checksum_path or resolved_registry_path.with_suffix(".sha256"),
+            env_path=env_file or DEFAULT_ENV_PATH,
+            timeout_seconds=timeout_seconds,
+            full_tests=full_tests,
+        )
+    except RegistryRefreshError as exc:
+        typer.echo(f"Registry refresh failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Registry refreshed "
+        f"added={len(result.added)} updated={len(result.updated)} "
+        f"unchanged={len(result.unchanged)}"
+    )
+    typer.echo(f"Registry: {result.registry_path}")
+    typer.echo(f"SHA-256: {result.digest}")
+    typer.echo(f"Environment: {result.env_path}")
+    typer.echo("Tests passed")
+
+    stale_overrides: list[str] = []
+    configured_path = os.environ.get(REGISTRY_PATH_ENV)
+    if configured_path:
+        try:
+            path_is_current = Path(configured_path).resolve() == result.registry_path
+        except (OSError, ValueError):
+            path_is_current = False
+        if not path_is_current:
+            stale_overrides.append(REGISTRY_PATH_ENV)
+    configured_digest = os.environ.get(REGISTRY_SHA256_ENV)
+    if configured_digest and configured_digest.strip().lower() != result.digest:
+        stale_overrides.append(REGISTRY_SHA256_ENV)
+    if stale_overrides:
+        typer.echo(
+            "Warning: stale process environment overrides detected: "
+            f"{', '.join(stale_overrides)}. If these variables are exported by "
+            "your shell or service, unset them before the next analysis so "
+            f"{result.env_path.name} can take effect.",
+            err=True,
+        )
+
+
 @app.command()
 def analyze(
     checkpoint: bool | None = typer.Option(

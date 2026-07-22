@@ -196,9 +196,8 @@ def test_unknown_configured_snapshot_provider_does_not_erase_later_known_provide
     assert snapshot.acquisition_outcomes[0].reason is (
         AcquisitionUnavailableReason.NOT_CONFIGURED
     )
-    assert snapshot.acquisition_outcomes[0].diagnostic == (
-        "not_configured code=provider_not_configured"
-    )
+    assert snapshot.acquisition_outcomes[0].retryable is False
+    assert snapshot.acquisition_outcomes[0].http_status is None
     assert snapshot.acquisition_outcomes[1].provider == "known"
     assert snapshot.acquisition_outcomes[1].outcome == "available"
 

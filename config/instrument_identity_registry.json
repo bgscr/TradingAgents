@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "registry_id": "mainland-exchange-identity-registry-v1",
+  "rows": [
+    {
+      "canonical_symbol": "600895.SS",
+      "aliases": [
+        "600895",
+        "600895.SH"
+      ],
+      "venue": "XSHG",
+      "instrument_kind": "equity",
+      "currency": "CNY",
+      "display_name": "上海张江高科技园区开发股份有限公司",
+      "provenance": {
+        "provider": "Shanghai Stock Exchange",
+        "source_ref": "https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE=600895",
+        "retrieved_at": "2026-07-22T06:49:29Z"
+      }
+    },
+    {
+      "canonical_symbol": "601658.SS",
+      "aliases": [
+        "601658",
+        "601658.SH"
+      ],
+      "venue": "XSHG",
+      "instrument_kind": "equity",
+      "currency": "CNY",
+      "display_name": "中国邮政储蓄银行股份有限公司",
+      "provenance": {
+        "provider": "Shanghai Stock Exchange",
+        "source_ref": "https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE=601658",
+        "retrieved_at": "2026-07-22T06:49:29Z"
+      }
+    }
+  ]
+}

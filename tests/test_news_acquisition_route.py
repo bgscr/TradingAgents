@@ -20,12 +20,146 @@ from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     EvidenceSource,
     EvidenceStatus,
+    IdentityProvenance,
+    InstrumentIdentityEvidence,
+    InstrumentKind,
     MaterialClaim,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
     build_tool_evidence_state,
     stable_acquisition_source_ref,
 )
+
+
+def _mainland_identity() -> InstrumentIdentityEvidence:
+    return InstrumentIdentityEvidence(
+        symbol="601658.SS",
+        venue="XSHG",
+        instrument_kind=InstrumentKind.EQUITY,
+        currency="CNY",
+        display_name="中国邮政储蓄银行股份有限公司",
+        provenance=IdentityProvenance(
+            provider="identity-registry",
+            source_ref="registry:601658.SS",
+            retrieved_at="2026-07-20T00:00:00+00:00",
+            artifact_sha256="a" * 64,
+        ),
+    )
+
+
+def _yahoo_article(
+    *,
+    title: str,
+    summary: str = "",
+    symbols: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    finance = (
+        {}
+        if symbols is None
+        else {"stockTickers": [{"symbol": symbol} for symbol in symbols]}
+    )
+    return {
+        "content": {
+            "title": title,
+            "summary": summary,
+            "provider": {"displayName": "Test Wire"},
+            "pubDate": "2026-07-18T08:00:00Z",
+            "canonicalUrl": {"url": "https://example.test/article"},
+            "finance": finance,
+        }
+    }
+
+
+@pytest.mark.unit
+def test_acquired_yfinance_news_requires_instrument_relevance_metadata():
+    stock = mock.Mock()
+    stock.get_news.return_value = [
+        _yahoo_article(
+            title="CXMT advances memory production",
+            symbols=("688256.SS",),
+        )
+    ]
+
+    with mock.patch.object(
+        yfinance_news.yf, "Ticker", return_value=stock
+    ), pytest.raises(NoMarketDataError, match="instrument-relevant"):
+        yfinance_news.get_news_yfinance(
+            "601658.SS",
+            "2026-07-01",
+            "2026-07-20",
+            _acquired=True,
+            instrument_identity=_mainland_identity(),
+        )
+
+
+@pytest.mark.unit
+def test_acquired_yfinance_news_accepts_provider_symbol_or_authoritative_name():
+    stock = mock.Mock()
+    stock.get_news.return_value = [
+        _yahoo_article(
+            title="Bank publishes an operating update",
+            symbols=("601658.SS",),
+        ),
+        _yahoo_article(
+            title="中国邮政储蓄银行股份有限公司发布公告",
+            symbols=None,
+        ),
+    ]
+
+    with mock.patch.object(yfinance_news.yf, "Ticker", return_value=stock):
+        result = yfinance_news.get_news_yfinance(
+            "601658.SS",
+            "2026-07-01",
+            "2026-07-20",
+            _acquired=True,
+            instrument_identity=_mainland_identity(),
+        )
+
+    assert "Bank publishes an operating update" in result
+    assert "中国邮政储蓄银行股份有限公司发布公告" in result
+
+
+@pytest.mark.unit
+def test_acquired_yfinance_news_does_not_accept_symbol_substrings():
+    stock = mock.Mock()
+    stock.get_news.return_value = [
+        _yahoo_article(title="Bond 1601658 completed an unrelated offering")
+    ]
+
+    with mock.patch.object(
+        yfinance_news.yf, "Ticker", return_value=stock
+    ), pytest.raises(NoMarketDataError):
+        yfinance_news.get_news_yfinance(
+            "601658.SS",
+            "2026-07-01",
+            "2026-07-20",
+            _acquired=True,
+            instrument_identity=_mainland_identity(),
+        )
+
+
+@pytest.mark.unit
+def test_irrelevant_yfinance_news_becomes_typed_no_data():
+    set_config({"tool_vendors": {"get_news": "yfinance"}})
+    stock = mock.Mock()
+    stock.get_news.return_value = [
+        _yahoo_article(title="CXMT expansion", symbols=("688256.SS",))
+    ]
+    with mock.patch.object(yfinance_news.yf, "Ticker", return_value=stock):
+        result = interface.route_to_vendor_acquired(
+            "get_news",
+            "601658.SS",
+            "2026-07-01",
+            "2026-07-20",
+            tool_call_id="call-irrelevant-news",
+            source_ref="get_news:601658.SS:2026-07-20",
+            capability="get_news",
+            instrument_identity=_mainland_identity(),
+        )
+
+    assert result.value is None
+    assert result.artifact is None
+    assert result.outcomes[-1].reason is AcquisitionUnavailableReason.NO_DATA
 
 
 @pytest.mark.unit

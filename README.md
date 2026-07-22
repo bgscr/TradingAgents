@@ -177,6 +177,27 @@ python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
 
+#### Refresh authoritative mainland identities
+
+Before analyzing a new Shanghai or Shenzhen A-share, add it to the digest-pinned
+identity registry with one command:
+
+```bash
+tradingagents identity-registry-refresh 600895.SS 601658.SS 000001.SZ
+```
+
+The command fetches identity data directly from SSE or SZSE, merges it with the
+existing registry, writes a deterministic JSON artifact and SHA-256 manifest,
+updates `.env.enterprise`, and runs the registry tests. Any fetch, validation,
+write, or test failure restores the prior files. Use `--full-tests` to run the
+complete test suite instead of the focused registry checks. Symbols must include
+an explicit `.SS`, `.SH`, or `.SZ` suffix. Run this maintenance command from a
+source checkout (an editable install is fine), because it intentionally executes
+the repository tests and rejects wheel-only installations before fetching or
+writing. No manual environment setup is normally needed; if the command warns
+about stale exported overrides, clear those named shell or service variables so
+the refreshed `.env.enterprise` values can take effect.
+
 ### Optional point-in-time A-share data
 
 For backtesting workflows that need a reproducible China A-share universe,

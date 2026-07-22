@@ -1,12 +1,25 @@
 from typing import Annotated
 
 from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
 
 from tradingagents.dataflows.interface import route_to_vendor, route_to_vendor_acquired
 from tradingagents.evidence import (
+    EvidenceState,
+    InstrumentIdentityEvidence,
     ToolExecutionEvidenceEnvelope,
     stable_acquisition_source_ref,
 )
+
+
+def _instrument_identity_from_state(
+    state: dict[str, object] | None,
+) -> InstrumentIdentityEvidence | None:
+    if not state:
+        return None
+    return EvidenceState.model_validate(
+        state.get("evidence_state", {})
+    ).instrument_identity
 
 
 def get_news_legacy(ticker: str, start_date: str, end_date: str) -> str:
@@ -22,6 +35,7 @@ def acquire_news(
     tool_call_id: str,
     source_ref: str,
     capability: str,
+    instrument_identity: InstrumentIdentityEvidence | None = None,
 ):
     """Acquire news through the run-owned controller for non-ToolNode callers."""
     return route_to_vendor_acquired(
@@ -32,6 +46,7 @@ def acquire_news(
         tool_call_id=tool_call_id,
         source_ref=source_ref,
         capability=capability,
+        instrument_identity=instrument_identity,
     )
 
 
@@ -41,6 +56,7 @@ def get_news(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
     tool_call_id: Annotated[str, InjectedToolCallId()],
+    state: Annotated[dict[str, object], InjectedState()],
 ) -> tuple[str, dict[str, object]]:
     """
     Retrieve news data for a given ticker symbol.
@@ -52,19 +68,22 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
+    identity = _instrument_identity_from_state(state)
+    requested_ticker = identity.symbol if identity is not None else ticker
     source_ref = stable_acquisition_source_ref(
         "news",
-        ticker,
+        requested_ticker,
         start_date,
         end_date,
     )
     result = acquire_news(
-        ticker,
+        requested_ticker,
         start_date,
         end_date,
         tool_call_id=tool_call_id,
         source_ref=source_ref,
         capability="get_news",
+        instrument_identity=identity,
     )
     content = result.value
     if content is None:

@@ -50,6 +50,7 @@ class Propagator:
             "strategy_rule_applications": [],
             "validated_decision_context": None,
             "direction_selector_diagnostics": None,
+            "direction_selection_diagnostics": None,
             "direction_selection": None,
             "decision_gate": {},
             "decision_gate_v2": {},
