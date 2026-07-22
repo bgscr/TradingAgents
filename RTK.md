@@ -1,33 +1,43 @@
-# RTK - Rust Token Killer (Codex CLI)
+# RTK — Optional Shell Output Compression
 
-**Usage**: Token-optimized CLI proxy for shell commands.
+RTK is a token-optimized proxy for supported external shell commands. It can reduce noisy command output, but it is not required for every shell operation.
 
-## Rule
+## Usage Policy
 
-1. Always prefix shell commands with `rtk`.
-2. **PowerShell Mandatory Rule**: Whenever you need to use PowerShell to execute a command, **you MUST use `pwsh`**. Do not use the legacy `powershell` command under any circumstances.
+1. Use RTK when the external command is supported and its output is likely to be large or repetitive.
+2. Run commands directly when:
+   - using PowerShell built-ins or pipelines;
+   - RTK does not support the command;
+   - exact, unfiltered output is required;
+   - RTK would add complexity without reducing output.
+3. If explicitly launching PowerShell as a subprocess, use `pwsh`. Do not launch legacy `powershell.exe`.
+4. If RTK is unavailable or fails to handle a command, continue with the direct command without treating that as a blocker.
 
-Examples:
+## Examples
 
-```bash
+```text
 rtk git status
-rtk cargo test
-rtk npm run build
 rtk pytest -q
+rtk ruff check .
+rtk rg "pattern" path
 ```
 
-## Meta Commands
+Direct execution remains appropriate for concise commands and PowerShell-native operations.
 
-```bash
-rtk gain            # Token savings analytics
-rtk gain --history  # Recent command savings history
-rtk proxy <cmd>     # Run raw command without filtering
+## Raw Output
+
+Use the proxy mode when RTK supports the command but its filtering is undesirable:
+
+```text
+rtk proxy <command>
 ```
 
-## Verification
+## Diagnostics
 
-```bash
+```text
 rtk --version
 rtk gain
-which rtk
+rtk gain --history
 ```
+
+`rtk gain` reports estimated token savings. These diagnostic commands are optional and should only be used when their information is relevant to the task.
