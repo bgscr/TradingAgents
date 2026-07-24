@@ -1,6 +1,6 @@
 # Shadow replay and enable fail-closed enforcement
 
-Status: ready-for-agent
+Status: completed
 
 Replay the audited runs and a representative recent-run sample through the new evidence system in shadow mode. Review all unexpected blocks, document justified rule changes, and then enable enforcement by default.
 

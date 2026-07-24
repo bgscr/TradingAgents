@@ -1,6 +1,6 @@
 # Generalize mainland instrument resolution
 
-Status: ready-for-agent
+Status: completed
 
 Introduce exchange and instrument-kind aware resolution while preserving existing equity outputs. Treat explicit `.SH`, `.SS`, and `.SZ` suffixes as authoritative, support relevant fund prefixes for bare symbols, and route capabilities by instrument kind.
 

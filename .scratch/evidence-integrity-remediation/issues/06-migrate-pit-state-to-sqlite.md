@@ -1,6 +1,6 @@
 # Benchmark and migrate PIT state to SQLite
 
-Status: ready-for-agent
+Status: completed
 
 Measure current manifest and resume costs on a representative ten-year backfill, migrate mutable state transactionally to SQLite, retain final immutable JSON output, and repeat the benchmark.
 

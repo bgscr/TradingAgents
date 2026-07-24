@@ -17,14 +17,17 @@ from tradingagents.dataflows import market_snapshot
 from tradingagents.dataflows.acquisition import AcquisitionFailure
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.instrument_identity import (
+    AuthoritativeInstrumentIdentity,
     IdentityRegistryAvailable,
     IdentityRegistryUnavailable,
     RegistryFailureReason,
     resolve_authoritative_instrument_identity,
 )
 from tradingagents.dataflows.market_snapshot import SnapshotProvider, authoritative_snapshot_run
+from tradingagents.decision_policy import DecisionPolicyEngine
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
+    InstrumentKind,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
     acquire_run_evidence,
@@ -32,10 +35,12 @@ from tradingagents.evidence import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.strategy_registry import (
+    DEFAULT_DECISION_HORIZON,
     MARKET_RETURN_FIELD,
     MARKET_RETURN_IMPLEMENTATION_VERSION,
     MARKET_RETURN_OBSERVATIONS,
     MARKET_RETURN_UNIT,
+    create_production_decision_policy,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "identity_registry_510500.synthetic.json"
@@ -43,6 +48,44 @@ FIXTURE = Path(__file__).parent / "fixtures" / "identity_registry_510500.synthet
 
 def _fixture_digest() -> str:
     return sha256(FIXTURE.read_bytes()).hexdigest()
+
+
+def _synthetic_registry_lookup(
+    *,
+    canonical_symbol: str,
+    instrument_kind: str,
+) -> IdentityRegistryAvailable:
+    raw_artifact = "{}"
+    registry_digest = sha256(raw_artifact.encode()).hexdigest()
+    return IdentityRegistryAvailable(
+        identity=AuthoritativeInstrumentIdentity(
+            canonical_symbol=canonical_symbol,
+            venue="XSHG",
+            instrument_kind=instrument_kind,
+            currency="CNY",
+            provenance_provider="synthetic-registry",
+            provenance_source_ref="registry:synthetic",
+            provenance_retrieved_at="2026-07-18T00:00:00+00:00",
+            artifact_sha256=registry_digest,
+        ),
+        registry_sha256=registry_digest,
+        registry_source_ref="registry:synthetic",
+        raw_artifact=raw_artifact,
+    )
+
+
+def _valid_market_frame(rows: int) -> pd.DataFrame:
+    closes = [100.0] * rows
+    return pd.DataFrame(
+        {
+            "Date": pd.bdate_range(end="2026-07-17", periods=rows),
+            "Open": closes,
+            "High": [value + 1 for value in closes],
+            "Low": [value - 1 for value in closes],
+            "Close": closes,
+            "Volume": [100.0] * rows,
+        }
+    )
 
 
 @pytest.mark.unit
@@ -279,6 +322,365 @@ def test_run_evidence_preserves_total_market_rate_limit_without_artifact_or_avai
 
 
 @pytest.mark.unit
+def test_equity_run_evidence_falls_back_until_strategy_history_is_satisfied():
+    registry_digest = sha256(b"{}").hexdigest()
+    lookup = IdentityRegistryAvailable(
+        identity=AuthoritativeInstrumentIdentity(
+            canonical_symbol="600895.SS",
+            venue="XSHG",
+            instrument_kind="equity",
+            currency="CNY",
+            provenance_provider="synthetic-registry",
+            provenance_source_ref="registry:synthetic",
+            provenance_retrieved_at="2026-07-18T00:00:00+00:00",
+            artifact_sha256=registry_digest,
+            display_name="Synthetic Equity",
+        ),
+        registry_sha256=registry_digest,
+        registry_source_ref="registry:synthetic",
+        raw_artifact="{}",
+    )
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "primary,secondary"},
+            }
+        }
+    )
+    provider_calls: list[str] = []
+
+    def frame(rows: int) -> pd.DataFrame:
+        closes = [100.0] * rows
+        return pd.DataFrame(
+            {
+                "Date": pd.bdate_range(end="2026-07-17", periods=rows),
+                "Open": closes,
+                "High": [value + 1 for value in closes],
+                "Low": [value - 1 for value in closes],
+                "Close": closes,
+                "Volume": [100.0] * rows,
+            }
+        )
+
+    def primary(*_args):
+        provider_calls.append("primary")
+        return frame(1)
+
+    def secondary(*_args):
+        provider_calls.append("secondary")
+        return frame(MARKET_RETURN_OBSERVATIONS)
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "primary": SnapshotProvider(primary, "qfq"),
+                "secondary": SnapshotProvider(secondary, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("600895", "2026-07-19")
+
+    assert provider_calls == ["primary", "secondary"]
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.provider == "secondary"
+    assert evidence.market_snapshot.history_rows == MARKET_RETURN_OBSERVATIONS
+    market_outcomes = [
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_snapshot"
+    ]
+    assert [outcome.provider for outcome in market_outcomes] == [
+        "primary",
+        "secondary",
+    ]
+    assert all(
+        isinstance(outcome, SourceAcquisitionAvailable)
+        for outcome in market_outcomes
+    )
+
+
+@pytest.mark.unit
+def test_graph_evidence_resolution_uses_its_injected_policy_history_floor():
+    registry_digest = sha256(b"{}").hexdigest()
+    lookup = IdentityRegistryAvailable(
+        identity=AuthoritativeInstrumentIdentity(
+            canonical_symbol="600895.SS",
+            venue="XSHG",
+            instrument_kind="equity",
+            currency="CNY",
+            provenance_provider="synthetic-registry",
+            provenance_source_ref="registry:synthetic",
+            provenance_retrieved_at="2026-07-18T00:00:00+00:00",
+            artifact_sha256=registry_digest,
+        ),
+        registry_sha256=registry_digest,
+        registry_source_ref="registry:synthetic",
+        raw_artifact="{}",
+    )
+    production_policy = create_production_decision_policy()
+    required_rows = MARKET_RETURN_OBSERVATIONS + 1
+    custom_policy = DecisionPolicyEngine(
+        rules=tuple(
+            rule.model_copy(update={"minimum_history_rows": required_rows})
+            for rule in production_policy.rules
+        )
+    )
+    graph = SimpleNamespace(
+        decision_policy=custom_policy,
+        decision_horizon=DEFAULT_DECISION_HORIZON,
+    )
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "primary,secondary"},
+            }
+        }
+    )
+    provider_calls: list[str] = []
+
+    def frame(rows: int) -> pd.DataFrame:
+        closes = [100.0] * rows
+        return pd.DataFrame(
+            {
+                "Date": pd.bdate_range(end="2026-07-17", periods=rows),
+                "Open": closes,
+                "High": [value + 1 for value in closes],
+                "Low": [value - 1 for value in closes],
+                "Close": closes,
+                "Volume": [100.0] * rows,
+            }
+        )
+
+    def primary(*_args):
+        provider_calls.append("primary")
+        return frame(MARKET_RETURN_OBSERVATIONS)
+
+    def secondary(*_args):
+        provider_calls.append("secondary")
+        return frame(required_rows)
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "primary": SnapshotProvider(primary, "qfq"),
+                "secondary": SnapshotProvider(secondary, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = TradingAgentsGraph.resolve_evidence_state(
+            graph,
+            "600895",
+            "2026-07-19",
+        )
+
+    assert provider_calls == ["primary", "secondary"]
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.provider == "secondary"
+    assert evidence.market_snapshot.history_rows == required_rows
+
+
+@pytest.mark.unit
+def test_equity_primary_with_exact_required_history_stops_fallback():
+    lookup = _synthetic_registry_lookup(
+        canonical_symbol="600895.SS",
+        instrument_kind="equity",
+    )
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "primary,secondary"},
+            }
+        }
+    )
+    provider_calls: list[str] = []
+
+    def primary(*_args):
+        provider_calls.append("primary")
+        return _valid_market_frame(MARKET_RETURN_OBSERVATIONS)
+
+    def secondary(*_args):
+        provider_calls.append("secondary")
+        return _valid_market_frame(MARKET_RETURN_OBSERVATIONS + 1)
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "primary": SnapshotProvider(primary, "qfq"),
+                "secondary": SnapshotProvider(secondary, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("600895", "2026-07-19")
+
+    assert provider_calls == ["primary"]
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.provider == "primary"
+    assert evidence.market_snapshot.history_rows == MARKET_RETURN_OBSERVATIONS
+
+
+@pytest.mark.unit
+def test_equity_fallback_skips_short_and_malformed_before_valid_candidate():
+    lookup = _synthetic_registry_lookup(
+        canonical_symbol="600895.SS",
+        instrument_kind="equity",
+    )
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "short,malformed,valid"},
+            }
+        }
+    )
+    provider_calls: list[str] = []
+
+    def short(*_args):
+        provider_calls.append("short")
+        return _valid_market_frame(1)
+
+    def malformed(*_args):
+        provider_calls.append("malformed")
+        return pd.DataFrame({"Date": ["2026-07-17"], "Open": [100.0]})
+
+    def valid(*_args):
+        provider_calls.append("valid")
+        return _valid_market_frame(MARKET_RETURN_OBSERVATIONS)
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "short": SnapshotProvider(short, "qfq"),
+                "malformed": SnapshotProvider(malformed, "qfq"),
+                "valid": SnapshotProvider(valid, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence("600895", "2026-07-19")
+
+    assert provider_calls == ["short", "malformed", "valid"]
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.provider == "valid"
+    market_outcomes = [
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_snapshot"
+    ]
+    assert [outcome.provider for outcome in market_outcomes] == [
+        "short",
+        "malformed",
+        "valid",
+    ]
+    assert isinstance(market_outcomes[0], SourceAcquisitionAvailable)
+    assert isinstance(market_outcomes[1], SourceAcquisitionUnavailable)
+    assert (
+        market_outcomes[1].reason
+        is AcquisitionUnavailableReason.MALFORMED_RESPONSE
+    )
+    assert isinstance(market_outcomes[2], SourceAcquisitionAvailable)
+
+
+@pytest.mark.unit
+def test_fund_without_strategy_rule_uses_baseline_acquisition_and_fails_closed():
+    lookup = _synthetic_registry_lookup(
+        canonical_symbol="510500.SS",
+        instrument_kind="fund",
+    )
+    policy = create_production_decision_policy()
+    assert (
+        policy.preflight_minimum_history_rows(
+            InstrumentKind.FUND,
+            DEFAULT_DECISION_HORIZON,
+        )
+        is None
+    )
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "market_data_vendors": {
+                "cn_a": {"core_stock_apis": "primary,secondary"},
+            }
+        }
+    )
+    provider_calls: list[str] = []
+
+    def primary(*_args):
+        provider_calls.append("primary")
+        return _valid_market_frame(1)
+
+    def secondary(*_args):
+        provider_calls.append("secondary")
+        return _valid_market_frame(MARKET_RETURN_OBSERVATIONS)
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {
+                "primary": SnapshotProvider(primary, "qfq"),
+                "secondary": SnapshotProvider(secondary, "qfq"),
+            },
+        ),
+        authoritative_snapshot_run(),
+    ):
+        evidence = acquire_run_evidence(
+            "510500",
+            "2026-07-19",
+            decision_policy=policy,
+            decision_horizon=DEFAULT_DECISION_HORIZON,
+        )
+
+    assert provider_calls == ["primary"]
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.provider == "primary"
+    assert evidence.market_snapshot.history_rows == 1
+    calculation_outcome = next(
+        outcome
+        for outcome in evidence.acquisition_outcomes
+        if outcome.capability == "market_return_20d"
+    )
+    assert isinstance(calculation_outcome, SourceAcquisitionUnavailable)
+    assert (
+        calculation_outcome.reason
+        is AcquisitionUnavailableReason.INSUFFICIENT_HISTORY
+    )
+
+
+@pytest.mark.unit
 def test_run_evidence_contains_exact_normalized_snapshot_artifact_before_preflight():
     lookup = resolve_authoritative_instrument_identity(
         "510500",
@@ -349,6 +751,56 @@ def test_run_evidence_contains_exact_normalized_snapshot_artifact_before_preflig
     assert calculation_outcome.calculation_readiness.available_observations == 1
     assert not any(
         fact.canonical_field == MARKET_RETURN_FIELD for fact in evidence.source_facts
+    )
+
+
+@pytest.mark.unit
+def test_run_telemetry_includes_identity_market_and_calculation_outcomes():
+    lookup = resolve_authoritative_instrument_identity(
+        "510500",
+        registry_path=FIXTURE,
+        expected_sha256=_fixture_digest(),
+    )
+    assert isinstance(lookup, IdentityRegistryAvailable)
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {"cn_a": {"core_stock_apis": "synthetic"}}
+    })
+    frame = pd.DataFrame({
+        "Date": ["2026-07-17"],
+        "Open": [1.0],
+        "High": [1.1],
+        "Low": [0.9],
+        "Close": [1.05],
+        "Volume": [100.0],
+    })
+
+    with (
+        patch(
+            "tradingagents.dataflows.instrument_identity.resolve_authoritative_instrument_identity",
+            return_value=lookup,
+        ),
+        patch.object(
+            market_snapshot,
+            "SNAPSHOT_PROVIDERS",
+            {"synthetic": SnapshotProvider(lambda *_args: frame, "qfq")},
+        ),
+        authoritative_snapshot_run() as run,
+    ):
+        evidence = acquire_run_evidence("510500", "2026-07-19")
+        telemetry = run.telemetry_ledger.finalize()
+
+    assert {
+        outcome.capability for outcome in evidence.acquisition_outcomes
+    } == {
+        event.outcome.capability for event in telemetry.acquisition.events
+    } == {
+        "instrument_identity",
+        "market_snapshot",
+        "market_return_20d",
+    }
+    assert telemetry.acquisition.summary.attempts == len(
+        evidence.acquisition_outcomes
     )
 
 

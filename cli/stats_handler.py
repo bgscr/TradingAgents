@@ -7,6 +7,8 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import LLMResult
 
+from tradingagents.run_telemetry import telemetry_stage_from_callback_metadata
+
 
 class StatsCallbackHandler(BaseCallbackHandler):
     """Callback handler that tracks LLM calls, tool calls, and token usage."""
@@ -15,18 +17,23 @@ class StatsCallbackHandler(BaseCallbackHandler):
         self,
         *,
         metrics_recorder: Any | None = None,
+        telemetry_recorder: Any | None = None,
         clock: Any = time.monotonic,
     ) -> None:
         super().__init__()
         self._lock = threading.Lock()
         self._metrics_recorder = metrics_recorder
+        self._telemetry_recorder = telemetry_recorder
         self._clock = clock
-        self._model_started: dict[UUID, tuple[float, str]] = {}
-        self._tool_started: dict[UUID, tuple[float, str]] = {}
+        self._model_started: dict[UUID, tuple[float, str, str]] = {}
+        self._tool_started: dict[UUID, tuple[float, str, str]] = {}
         self.llm_calls = 0
         self.tool_calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
+
+    def set_telemetry_recorder(self, recorder: Any) -> None:
+        self._telemetry_recorder = recorder
 
     def on_llm_start(
         self,
@@ -37,7 +44,12 @@ class StatsCallbackHandler(BaseCallbackHandler):
         """Increment LLM call counter when an LLM starts."""
         with self._lock:
             self.llm_calls += 1
-        self._start_timing("model", serialized, kwargs.get("run_id"))
+        self._start_timing(
+            "model",
+            serialized,
+            kwargs.get("run_id"),
+            kwargs.get("metadata"),
+        )
 
     def on_chat_model_start(
         self,
@@ -48,15 +60,20 @@ class StatsCallbackHandler(BaseCallbackHandler):
         """Increment LLM call counter when a chat model starts."""
         with self._lock:
             self.llm_calls += 1
-        self._start_timing("model", serialized, kwargs.get("run_id"))
+        self._start_timing(
+            "model",
+            serialized,
+            kwargs.get("run_id"),
+            kwargs.get("metadata"),
+        )
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """Extract token usage from LLM response."""
-        self._finish_timing("model", kwargs.get("run_id"))
+        finished = self._finish_timing("model", kwargs.get("run_id"))
         try:
             generation = response.generations[0][0]
         except (AttributeError, IndexError, TypeError):
-            return
+            generation = None
 
         usage_metadata = None
         if hasattr(generation, "message"):
@@ -68,6 +85,14 @@ class StatsCallbackHandler(BaseCallbackHandler):
             with self._lock:
                 self.tokens_in += usage_metadata.get("input_tokens", 0)
                 self.tokens_out += usage_metadata.get("output_tokens", 0)
+        if self._telemetry_recorder is not None and finished is not None:
+            elapsed, stage = finished
+            self._telemetry_recorder.record_model_activity(
+                stage=stage,
+                seconds=elapsed,
+                tokens_in=(usage_metadata or {}).get("input_tokens", 0),
+                tokens_out=(usage_metadata or {}).get("output_tokens", 0),
+            )
 
     def on_tool_start(
         self,
@@ -78,16 +103,41 @@ class StatsCallbackHandler(BaseCallbackHandler):
         """Increment tool call counter when a tool starts."""
         with self._lock:
             self.tool_calls += 1
-        self._start_timing("tool", serialized, kwargs.get("run_id"))
+        self._start_timing(
+            "tool",
+            serialized,
+            kwargs.get("run_id"),
+            kwargs.get("metadata"),
+        )
 
     def on_tool_end(self, output: Any, **kwargs: Any) -> None:
-        self._finish_timing("tool", kwargs.get("run_id"))
+        finished = self._finish_timing("tool", kwargs.get("run_id"))
+        if self._telemetry_recorder is not None and finished is not None:
+            elapsed, stage = finished
+            self._telemetry_recorder.record_tool_activity(
+                seconds=elapsed,
+                stage=stage,
+            )
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
-        self._finish_timing("model", kwargs.get("run_id"))
+        finished = self._finish_timing("model", kwargs.get("run_id"))
+        if self._telemetry_recorder is not None and finished is not None:
+            elapsed, stage = finished
+            self._telemetry_recorder.record_model_activity(
+                stage=stage,
+                seconds=elapsed,
+                tokens_in=0,
+                tokens_out=0,
+            )
 
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
-        self._finish_timing("tool", kwargs.get("run_id"))
+        finished = self._finish_timing("tool", kwargs.get("run_id"))
+        if self._telemetry_recorder is not None and finished is not None:
+            elapsed, stage = finished
+            self._telemetry_recorder.record_tool_activity(
+                seconds=elapsed,
+                stage=stage,
+            )
 
     @staticmethod
     def _operation_name(serialized: dict[str, Any]) -> str:
@@ -106,28 +156,39 @@ class StatsCallbackHandler(BaseCallbackHandler):
         category: str,
         serialized: dict[str, Any],
         run_id: UUID | None,
+        metadata: Any,
     ) -> None:
-        if self._metrics_recorder is None or run_id is None:
+        if (
+            self._metrics_recorder is None
+            and self._telemetry_recorder is None
+        ) or run_id is None:
             return
-        started = (self._clock(), self._operation_name(serialized))
+        started = (
+            self._clock(),
+            self._operation_name(serialized),
+            telemetry_stage_from_callback_metadata(metadata),
+        )
         with self._lock:
             target = self._model_started if category == "model" else self._tool_started
             target[run_id] = started
 
-    def _finish_timing(self, category: str, run_id: UUID | None) -> None:
-        if self._metrics_recorder is None or run_id is None:
-            return
+    def _finish_timing(
+        self,
+        category: str,
+        run_id: UUID | None,
+    ) -> tuple[float, str] | None:
+        if run_id is None:
+            return None
         with self._lock:
             target = self._model_started if category == "model" else self._tool_started
             started = target.pop(run_id, None)
         if started is None:
-            return
-        started_at, name = started
-        self._metrics_recorder.record_duration(
-            category,
-            name,
-            max(0.0, self._clock() - started_at),
-        )
+            return None
+        started_at, name, stage = started
+        elapsed = max(0.0, self._clock() - started_at)
+        if self._metrics_recorder is not None:
+            self._metrics_recorder.record_duration(category, name, elapsed)
+        return elapsed, stage
 
     def get_stats(self) -> dict[str, Any]:
         """Return current statistics."""

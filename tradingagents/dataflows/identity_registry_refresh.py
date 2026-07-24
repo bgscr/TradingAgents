@@ -41,6 +41,12 @@ _SSE_COMPANY_PAGE = (
     "https://www.sse.com.cn/assortment/stock/list/info/company/"
     "index.shtml?COMPANY_CODE={code}"
 )
+_SSE_FUND_ENDPOINT = "https://query.sse.com.cn/commonSoaQuery.do"
+_SSE_FUND_PAGE = (
+    "https://www.sse.com.cn/assortment/fund/list/etfinfo/"
+    "basic/index.shtml?FUNDID={code}"
+)
+_SSE_FUND_SUBCLASSES = ("01", "02", "03", "04", "06", "08", "09", "31")
 _SZSE_ENDPOINT = "https://www.szse.cn/api/report/ShowReport/data"
 _SZSE_COMPANY_PAGE = (
     "https://www.szse.cn/certificate/individual/index.html?code={code}"
@@ -285,9 +291,26 @@ def _fetch_sse_identity(
         and str(row.get("A_STOCK_CODE", "")).strip() == code
         and str(row.get("STOCK_TYPE", "")).strip() == "1"
     ]
-    if len(matches) != 1:
+    if len(matches) > 1:
         raise RegistryRefreshError(
             f"SSE returned {len(matches)} authoritative A-share rows for {symbol}"
+        )
+    fund_identity = _fetch_sse_fund_identity(
+        session,
+        symbol,
+        retrieved_at=retrieved_at,
+        timeout_seconds=timeout_seconds,
+    )
+    if matches and fund_identity is not None:
+        raise RegistryRefreshError(
+            f"SSE returned ambiguous authoritative categories for {symbol}: "
+            "equity, fund"
+        )
+    if fund_identity is not None:
+        return fund_identity
+    if not matches:
+        raise RegistryRefreshError(
+            f"SSE returned no authoritative equity or fund row for {symbol}"
         )
     row = matches[0]
     display_name = str(row.get("FULL_NAME") or row.get("SEC_NAME_CN") or "").strip()
@@ -303,6 +326,72 @@ def _fetch_sse_identity(
         "provenance": {
             "provider": "Shanghai Stock Exchange",
             "source_ref": _SSE_COMPANY_PAGE.format(code=code),
+            "retrieved_at": retrieved_at,
+        },
+    }
+
+
+def _fetch_sse_fund_identity(
+    session: requests.Session,
+    symbol: str,
+    *,
+    retrieved_at: str,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    code = symbol.removesuffix(".SS")
+    params = {
+        "sqlId": "FUND_LIST",
+        "fundType": "00",
+        "subClass": ",".join(_SSE_FUND_SUBCLASSES),
+        "isPagination": "false",
+    }
+    try:
+        response = session.get(
+            _SSE_FUND_ENDPOINT,
+            params=params,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Referer": "https://www.sse.com.cn/assortment/fund/etf/list/",
+                "User-Agent": "TradingAgents identity registry refresh/1.0",
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise RegistryRefreshError(f"SSE fund lookup failed for {symbol}: {exc}") from exc
+    rows = payload.get("result") if isinstance(payload, dict) else None
+    matches = [
+        row
+        for row in rows or ()
+        if isinstance(row, dict)
+        and str(row.get("fundCode", "")).strip() == code
+    ]
+    if len(matches) > 1:
+        raise RegistryRefreshError(
+            f"SSE returned {len(matches)} authoritative fund rows for {symbol}"
+        )
+    if not matches:
+        return None
+    row = matches[0]
+    subclass = str(row.get("subClass", "")).strip()
+    if subclass not in _SSE_FUND_SUBCLASSES:
+        raise RegistryRefreshError(
+            f"SSE returned unsupported SSE fund category {subclass!r} for {symbol}"
+        )
+    display_name = str(row.get("secNameFull") or "").strip()
+    if not display_name:
+        raise RegistryRefreshError(f"SSE returned no fund name for {symbol}")
+    return {
+        "canonical_symbol": symbol,
+        "aliases": [code, f"{code}.SH"],
+        "venue": "XSHG",
+        "instrument_kind": "fund",
+        "currency": "CNY",
+        "display_name": display_name,
+        "provenance": {
+            "provider": "Shanghai Stock Exchange",
+            "source_ref": _SSE_FUND_PAGE.format(code=code),
             "retrieved_at": retrieved_at,
         },
     }

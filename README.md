@@ -273,9 +273,35 @@ See `tradingagents/default_config.py` for all configuration options.
 
 TradingAgents persists two kinds of state across runs.
 
+### Runtime locations
+
+Runs started from a source checkout with `start_tradingagents.ps1` keep their
+state inside that checkout:
+
+- `logs/` contains the complete per-run bundle: message/tool logs, lifecycle
+  status, reports, metrics, runtime artifacts, decision audits, and graph-state
+  logs.
+- `data/cache/` contains reusable market-data caches, checkpoints, and picker
+  point-in-time state.
+- `data/memory/trading_memory.md` contains Trading Memory.
+
+`TRADINGAGENTS_RESULTS_DIR`, `TRADINGAGENTS_CACHE_DIR`, and
+`TRADINGAGENTS_MEMORY_LOG_PATH` override these locations. Values exported by
+the caller take precedence over values in the checkout's `.env`.
+
+Direct library or installed CLI use without the repository launcher retains
+the `~/.tradingagents` defaults. Portable Windows releases retain the
+release-local locations documented in
+[`docs/windows-portable-release.md`](docs/windows-portable-release.md).
+
 ### Decision log
 
-The decision log is always on. Each completed run appends its decision to `~/.tradingagents/memory/trading_memory.md`. On the next run for the same ticker, TradingAgents fetches the realised return (raw and alpha vs SPY), generates a one-paragraph reflection, and injects the most recent same-ticker decisions plus recent cross-ticker lessons into the Portfolio Manager prompt, so each analysis carries forward what worked and what didn't.
+The decision log is always on. Each completed run appends its decision to the
+configured Trading Memory path. On the next run for the same ticker,
+TradingAgents fetches the realised return (raw and alpha vs SPY), generates a
+one-paragraph reflection, and injects the most recent same-ticker decisions
+plus recent cross-ticker lessons into the Portfolio Manager prompt, so each
+analysis carries forward what worked and what didn't.
 
 Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
 
@@ -283,7 +309,10 @@ Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
 
 Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves state after each node so a crashed or interrupted run resumes from the last successful step instead of starting over. On a resume run you will see `Resuming from step N for <TICKER> on <date>` in the logs; on a new run you will see `Starting fresh`. Checkpoints are cleared automatically on successful completion.
 
-Per-ticker SQLite databases live at `~/.tradingagents/cache/checkpoints/<TICKER>.db` (override the base with `TRADINGAGENTS_CACHE_DIR`). Use `--clear-checkpoints` to reset all of them before a run.
+Per-ticker SQLite databases live under
+`<data_cache_dir>/checkpoints/<TICKER>.db`. Use
+`TRADINGAGENTS_CACHE_DIR` to override the base and `--clear-checkpoints` to
+reset all of them before a run.
 
 ```bash
 tradingagents analyze --checkpoint           # enable for this run

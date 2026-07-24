@@ -15,7 +15,10 @@ from tradingagents.agents.utils.news_data_tools import get_news
 from tradingagents.dataflows import akshare_data, interface, yfinance_news
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import NoMarketDataError, VendorRateLimitError
-from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
+from tradingagents.dataflows.market_snapshot import (
+    authoritative_snapshot_run,
+    get_active_run_telemetry,
+)
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     EvidenceSource,
@@ -333,6 +336,8 @@ def test_acquired_news_caller_labels_share_one_operational_circuit():
         {"primary": primary, "secondary": lambda *_a, **_k: "NEWS"},
         clear=False,
     ), authoritative_snapshot_run():
+        telemetry = get_active_run_telemetry()
+        assert telemetry is not None
         first = interface.route_to_vendor_acquired(
             "get_news", "AAPL", "2026-07-01", "2026-07-20",
             tool_call_id="call-1", source_ref="get_news:AAPL:2026-07-20",
@@ -343,9 +348,26 @@ def test_acquired_news_caller_labels_share_one_operational_circuit():
             tool_call_id="call-2", source_ref="sentiment.news:MSFT:2026-07-20",
             capability="sentiment_news",
         )
+        projection = telemetry.finalize()
 
     assert first.outcomes[0].reason is AcquisitionUnavailableReason.RATE_LIMITED
     assert sentiment_news.outcomes[0].reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
+    assert [outcome.capability for outcome in first.outcomes] == [
+        "get_news",
+        "get_news",
+    ]
+    assert [outcome.capability for outcome in sentiment_news.outcomes] == [
+        "sentiment_news",
+        "sentiment_news",
+    ]
+    assert [
+        event.outcome.capability for event in projection.acquisition.events
+    ] == [
+        "get_news",
+        "get_news",
+        "sentiment_news",
+        "sentiment_news",
+    ]
     assert primary_calls == 1
 
 

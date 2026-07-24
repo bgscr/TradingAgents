@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tradingagents.run_telemetry import (
+    RunTelemetryProjection,
+    acquisition_summary_from_projection,
+)
+
 
 @dataclass(frozen=True)
 class _QueuedEvent:
@@ -159,6 +164,14 @@ class RuntimeArtifactWriter:
         )
 
     def record_message(self, timestamp: str, message_type: str, content: str) -> None:
+        if message_type == "Advisory Commentary":
+            self._enqueue(
+                _QueuedEvent(
+                    "advisory",
+                    (timestamp, message_type, content),
+                )
+            )
+            return
         line = f"{timestamp} [{message_type}] {content.replace(chr(10), ' ')}\n"
         self._enqueue(_QueuedEvent("log", (line,)))
 
@@ -219,6 +232,7 @@ class RuntimeArtifactWriter:
         terminal_route: str,
         stats: Mapping[str, Any] | None = None,
         acquisition_outcomes: Iterable[Any] = (),
+        run_telemetry: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist aggregate cost/call/retry telemetry without provider payloads."""
 
@@ -285,6 +299,13 @@ class RuntimeArtifactWriter:
                 "unavailable_reasons": dict(sorted(reasons.items())),
             },
         }
+        if run_telemetry is not None:
+            projection = RunTelemetryProjection.model_validate(run_telemetry)
+            summary["acquisition"] = acquisition_summary_from_projection(projection)
+            summary["stages"] = {
+                name: stage.model_dump(mode="json")
+                for name, stage in projection.stages.items()
+            }
         with self._metrics_lock:
             self._terminal_summary = summary
 
@@ -330,6 +351,13 @@ class RuntimeArtifactWriter:
                 stage: dict(values)
                 for stage, values in self._stage_activity.items()
             }
+            terminal_stages = self._terminal_summary.get("stages")
+            if isinstance(terminal_stages, Mapping):
+                stage_activity = {
+                    str(stage): dict(values)
+                    for stage, values in terminal_stages.items()
+                    if isinstance(values, Mapping)
+                }
             saturation = {
                 "dropped_events": sum(self._dropped_by_kind.values()),
                 "coalesced_events": sum(self._coalesced_by_kind.values()),
@@ -388,6 +416,10 @@ class RuntimeArtifactWriter:
             self._queue.put_nowait(event)
             self._observe_queue_depth()
         except queue.Full:
+            if event.kind == "advisory":
+                self._queue.put(event, timeout=30.0)
+                self._observe_queue_depth()
+                return
             with self._metrics_lock:
                 if event.kind == "log":
                     self._pending_coalesced[event.kind] = event
@@ -462,6 +494,18 @@ class RuntimeArtifactWriter:
         for event in batch:
             if event.kind == "log":
                 log_lines.append(event.values[0])
+            elif event.kind == "advisory":
+                timestamp, message_type, content = event.values
+                encoded, digest = self._encode_payload(content)
+                compressed_size = self._persist_payload(encoded, digest)
+                preview = content[: self.preview_chars].replace("\n", " ")
+                if len(content) > self.preview_chars:
+                    preview += "…"
+                log_lines.append(
+                    f"{timestamp} [{message_type}] {preview} "
+                    f"artifact=sha256:{digest} bytes={len(encoded)} "
+                    f"compressed_bytes={compressed_size}\n"
+                )
             elif event.kind == "tool":
                 timestamp, tool_name, payload = event.values
                 encoded, digest = self._encode_payload(payload)

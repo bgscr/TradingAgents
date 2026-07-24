@@ -58,3 +58,28 @@ def test_production_registry_resolves_controlled_live_validation_equities(
         "https://www.sse.com.cn/assortment/stock/list/info/company/"
         f"index.shtml?COMPANY_CODE={symbol.removesuffix('.SS')}"
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("alias", ("510500", "510500.SH", "510500.SS"))
+def test_production_registry_resolves_510500_aliases_as_authoritative_fund(alias):
+    digest = _configured_digest()
+
+    result = resolve_authoritative_instrument_identity(
+        alias,
+        registry_path=PRODUCTION_REGISTRY,
+        expected_sha256=digest,
+    )
+
+    assert isinstance(result, IdentityRegistryAvailable)
+    assert result.registry_sha256 == digest
+    assert result.identity.canonical_symbol == "510500.SS"
+    assert result.identity.venue == "XSHG"
+    assert result.identity.instrument_kind == "fund"
+    assert result.identity.currency == "CNY"
+    assert result.identity.display_name == "中证500ETF南方"
+    assert result.identity.provenance_provider == "Shanghai Stock Exchange"
+    assert result.identity.provenance_source_ref.startswith(
+        "https://www.sse.com.cn/assortment/fund/"
+    )
+    assert "/stock/" not in result.identity.provenance_source_ref

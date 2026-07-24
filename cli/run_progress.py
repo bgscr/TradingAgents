@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
+
+from tradingagents.terminal_contract import validated_trading_decision_from_state
 
 
 @dataclass(frozen=True)
@@ -27,24 +28,6 @@ _RISK_SPEAKERS = {
     "Conservative": ("Conservative Analyst", "current_conservative_response"),
     "Neutral": ("Neutral Analyst", "current_neutral_response"),
 }
-
-_RATING_RE = re.compile(
-    r"^\*\*Rating\*\*\s*:\s*(Buy|Overweight|Hold|Underweight|Sell)\b",
-    re.IGNORECASE,
-)
-
-_CHINESE_RATING_RE = re.compile(
-    r"\*\*(?:最终交易决策|评级)\s*[:：]\s*(买入|增持|持有|减持|卖出)\*\*"
-)
-
-_CHINESE_RATINGS = {
-    "买入": "Buy",
-    "增持": "Overweight",
-    "持有": "Hold",
-    "减持": "Underweight",
-    "卖出": "Sell",
-}
-
 
 def stable_fingerprint(value: Any) -> str:
     try:
@@ -83,20 +66,20 @@ def _investment_speaker(text: str) -> str | None:
     return None
 
 
-def _decision_content(value: Any) -> str:
-    for line in _text(value).splitlines():
-        match = _RATING_RE.match(line.strip())
-        if match:
-            return f"Final decision ready: {match.group(1).title()}"
-        match = _CHINESE_RATING_RE.fullmatch(line.strip())
-        if match:
-            return f"Final decision ready: {_CHINESE_RATINGS[match.group(1)]}"
-    return "Final decision ready"
+def _decision_content(state: dict[str, Any]) -> str | None:
+    try:
+        decision = validated_trading_decision_from_state(state)
+    except (TypeError, ValueError):
+        return None
+    if decision is None:
+        return None
+    return f"Final decision ready: {decision.rating.value}"
 
 
 class StateProgressTracker:
     def __init__(self) -> None:
         self._seen: set[tuple[str, str]] = set()
+        self._state: dict[str, Any] = {}
 
     def _add(
         self,
@@ -124,6 +107,7 @@ class StateProgressTracker:
         if not isinstance(chunk, dict):
             return []
 
+        self._state.update(chunk)
         events: list[ProgressEvent] = []
 
         for source_key, content in _ANALYST_REPORT_EVENTS.items():
@@ -165,7 +149,7 @@ class StateProgressTracker:
             )
 
         analysis_outcome = _text(chunk.get("analysis_outcome"))
-        final_decision = _text(chunk.get("final_trade_decision"))
+        decision_content = _decision_content(self._state)
         if analysis_outcome:
             self._add(
                 events,
@@ -174,13 +158,13 @@ class StateProgressTracker:
                 "analysis_outcome",
                 analysis_outcome,
             )
-        elif final_decision:
+        elif decision_content:
             self._add(
                 events,
                 "Portfolio",
-                _decision_content(final_decision),
-                "final_trade_decision",
-                final_decision,
+                decision_content,
+                "trading_decision",
+                chunk["trading_decision"],
             )
         else:
             risk = chunk.get("risk_debate_state")

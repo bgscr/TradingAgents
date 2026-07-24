@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from hashlib import sha256
 
 import pytest
@@ -13,6 +14,7 @@ from tradingagents.evidence import (
     EVIDENCE_CONTRACT_VERSION,
     AcquisitionUnavailableReason,
     AdmissionGateResult,
+    AnalysisDiagnosticCode,
     AnalystEvidenceReport,
     CalculationDefinition,
     CalculationLineage,
@@ -242,6 +244,9 @@ def test_admission_result_is_versioned_closed_and_has_no_scalar_coverage():
         admitted=False,
         readiness=EvidenceReadiness.INSUFFICIENT,
         diagnostics=("required facts unavailable",),
+        diagnostic_codes=(
+            AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE,
+        ),
     )
 
     assert result.model_dump(mode="json") == {
@@ -249,6 +254,7 @@ def test_admission_result_is_versioned_closed_and_has_no_scalar_coverage():
         "admitted": False,
         "readiness": "insufficient",
         "diagnostics": ["required facts unavailable"],
+        "diagnostic_codes": ["required_evidence_unavailable"],
     }
     with pytest.raises(ValidationError):
         AdmissionGateResult.model_validate(
@@ -583,6 +589,39 @@ def test_source_acquisition_outcomes_keep_provider_errors_outside_artifacts():
 
 
 @pytest.mark.unit
+def test_evidence_state_canonicalizes_acquisition_outcomes_without_warnings():
+    primary = SourceAcquisitionUnavailable(
+        provider="primary",
+        provider_order=0,
+        capability="market_snapshot",
+        source_ref="acq.v1:market_snapshot:" + "a" * 64,
+        attempt=1,
+        retrieved_at="2026-07-19T12:00:00Z",
+        retryable=True,
+        reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+    )
+    fallback = SourceAcquisitionUnavailable(
+        provider="fallback",
+        provider_order=1,
+        capability="market_snapshot",
+        source_ref=primary.source_ref,
+        attempt=1,
+        retrieved_at="2026-07-19T12:00:01Z",
+        retryable=False,
+        reason=AcquisitionUnavailableReason.NO_DATA,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        direct = EvidenceState(acquisition_outcomes=(fallback, primary))
+        restored = EvidenceState.model_validate_json(direct.model_dump_json())
+
+    assert direct.acquisition_outcomes == (primary, fallback)
+    assert restored.acquisition_outcomes == direct.acquisition_outcomes
+    assert restored.model_dump(mode="json") == direct.model_dump(mode="json")
+
+
+@pytest.mark.unit
 def test_error_tool_text_cannot_materialize_a_source_fact():
     source_ref = "get_news:510500.SS:2026-07-19"
     messages = (
@@ -782,6 +821,9 @@ def test_preflight_checks_only_authoritative_baseline_evidence():
     assert result.blockers == (
         "authoritative market snapshot has 129 rows; at least 200 are required",
     )
+    assert result.diagnostic_codes == (
+        AnalysisDiagnosticCode.HISTORY_INSUFFICIENT,
+    )
     assert result.model_dump(mode="json")["passed"] is False
 
 
@@ -818,4 +860,7 @@ def test_preflight_fails_closed_when_identity_has_no_registered_profile():
     assert result.passed is False
     assert result.blockers == (
         "no capability profile is registered for instrument kind 'index'",
+    )
+    assert result.diagnostic_codes == (
+        AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,
     )

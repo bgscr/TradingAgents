@@ -1,0 +1,130 @@
+{
+  "matrix_version": "1.0",
+  "rows": [
+    {
+      "scenario": "`510500.SS` identity provider fails but authoritative fund registry resolves symbol/venue/kind",
+      "required_result": "Fund Capability Profile; no company-fundamentals requirement",
+      "tests": [
+        "tests/test_authoritative_instrument_identity.py::test_aliases_resolve_to_the_same_digest_pinned_identity",
+        "tests/test_canonical_evidence_contracts.py::test_instrument_kind_selects_fund_capabilities_without_company_assumptions"
+      ]
+    },
+    {
+      "scenario": "Required identity remains unresolved",
+      "required_result": "Preflight Analysis Outcome; zero analyst/model calls",
+      "tests": [
+        "tests/test_graph_trust_boundaries.py::test_missing_identity_guard_is_unavailable_without_constructing_analyst",
+        "tests/test_recorded_evidence_replay.py::test_recorded_510500_run_normalizes_rate_limit_and_insufficient_history"
+      ]
+    },
+    {
+      "scenario": "News returns HTTP 429 text",
+      "required_result": "Typed unavailable outcome; no artifact-derived fact; circuit breaker prevents immediate retry",
+      "tests": [
+        "tests/test_inline_sentiment_evidence.py::test_inline_http_429_is_unavailable_and_cannot_create_artifact_or_fact",
+        "tests/test_news_acquisition_route.py::test_acquired_news_caller_labels_share_one_operational_circuit"
+      ]
+    },
+    {
+      "scenario": "Snapshot contains 129 usable rows",
+      "required_result": "No valid SMA-200 fact; `insufficient_history` lineage outcome",
+      "tests": [
+        "tests/test_recorded_evidence_replay.py::test_recorded_510500_run_normalizes_rate_limit_and_insufficient_history"
+      ]
+    },
+    {
+      "scenario": "`0.592067` is relabeled from P/B to Beta",
+      "required_result": "Canonical field/fact validation rejects the binding",
+      "tests": [
+        "tests/test_decision_policy.py::test_metamorphic_canonical_field_semantic_swap_invalidates_fact_binding"
+      ]
+    },
+    {
+      "scenario": "P/E and RSI are offered for Underweight without an applicable Strategy Rule",
+      "required_result": "Decision Gate blocks direction",
+      "tests": [
+        "tests/test_decision_policy.py::test_legacy_recorded_claim_selection_replays_fail_closed_without_rules"
+      ]
+    },
+    {
+      "scenario": "Unsupported debate/report prose is reversed or made sensational",
+      "required_result": "Identical Validated Decision Context and normalized decision contract",
+      "tests": [
+        "tests/test_decision_policy.py::test_metamorphic_context_ignores_advisory_prose"
+      ]
+    },
+    {
+      "scenario": "Facts, assertions, and source records are permuted",
+      "required_result": "Identical normalized gate result and decision contract",
+      "tests": [
+        "tests/test_decision_policy.py::test_context_is_invariant_to_fact_and_application_permutation"
+      ]
+    },
+    {
+      "scenario": "Artifacts/facts are duplicated",
+      "required_result": "No coverage inflation or directional change",
+      "tests": [
+        "tests/test_decision_policy.py::test_metamorphic_context_ignores_duplicate_facts_and_applications",
+        "tests/test_reporting.py::test_coverage_is_invariant_to_duplicate_facts_and_runtime_call_ids"
+      ]
+    },
+    {
+      "scenario": "A selected material fact's value, sign, or date changes",
+      "required_result": "Prior assertion invalidates; recompute, change, or abstain",
+      "tests": [
+        "tests/test_decision_policy.py::test_forged_fact_content_identity_or_value_cannot_enter_context"
+      ]
+    },
+    {
+      "scenario": "Same evidence is paired with arbitrary ratings",
+      "required_result": "Only rule-supported directions can pass",
+      "tests": [
+        "tests/test_decision_policy.py::test_metamorphic_gate_accepts_exactly_the_rule_supported_rating"
+      ]
+    },
+    {
+      "scenario": "Optional unused source becomes unavailable",
+      "required_result": "Direction/assertions unchanged; availability/degradation only may change",
+      "tests": [
+        "tests/test_decision_policy.py::test_metamorphic_optional_unused_source_loss_preserves_direction"
+      ]
+    },
+    {
+      "scenario": "JSON checkpoint round-trip under current schema",
+      "required_result": "Boundary validation succeeds",
+      "tests": [
+        "tests/test_admitted_evidence_binding.py::test_admitted_evidence_binding_current_schema_json_round_trip"
+      ]
+    },
+    {
+      "scenario": "Old checkpoint signature is resumed",
+      "required_result": "Explicit migration or fail-closed rejection",
+      "tests": [
+        "tests/test_admitted_evidence_binding.py::test_old_or_open_admission_binding_schema_is_rejected",
+        "tests/test_checkpoint_resume.py::test_different_signature_starts_fresh"
+      ]
+    },
+    {
+      "scenario": "Decision Gate blocks",
+      "required_result": "No final decision, signal, position fields, or memory write",
+      "tests": [
+        "tests/test_decision_graph_v2.py::test_semantic_gate_rejection_does_not_retry_selector_or_publish",
+        "tests/test_recorded_evidence_replay.py::test_recorded_600895_run_fails_closed_before_any_model_or_directional_write"
+      ]
+    },
+    {
+      "scenario": "Completed non-directional run",
+      "required_result": "`lifecycle_status=completed`, `terminal_outcome_kind=analysis_outcome`",
+      "tests": [
+        "tests/test_recorded_evidence_replay.py::test_recorded_600895_run_fails_closed_before_any_model_or_directional_write"
+      ]
+    },
+    {
+      "scenario": "CLI and programmatic runners receive identical fixture",
+      "required_result": "Same terminal kind and validated contract",
+      "tests": [
+        "tests/test_recorded_evidence_replay.py::test_recorded_fixture_cli_matches_programmatic_terminal_contract"
+      ]
+    }
+  ]
+}

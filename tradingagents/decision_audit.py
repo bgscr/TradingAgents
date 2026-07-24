@@ -20,16 +20,17 @@ from tradingagents.decision_policy import (
     ValidatedDecisionContext,
 )
 from tradingagents.evidence import (
+    AnalysisDiagnosticCode,
     AnalysisOutcome,
     EvidenceReadiness,
     EvidenceState,
-    analysis_diagnostic_codes,
 )
 from tradingagents.evidence_artifacts import (
     AuditEvidenceProjection,
     persist_source_artifacts,
     project_evidence_for_audit,
 )
+from tradingagents.run_telemetry import RunTelemetryProjection
 from tradingagents.terminal_contract import (
     TerminalOutcomeKind,
     apply_terminal_contract,
@@ -135,11 +136,41 @@ def _project_gate_diagnostics(
     raw_diagnostics = value.get(diagnostic_field, ())
     if not isinstance(raw_diagnostics, (list, tuple)):
         raise ValueError("decision audit gate diagnostics must be a sequence")
+    raw_codes = value.get("diagnostic_codes")
+    if raw_codes is None:
+        if raw_diagnostics:
+            raise ValueError(
+                "decision audit gate diagnostics require typed diagnostic_codes"
+            )
+        diagnostic_codes = ()
+    else:
+        if not isinstance(raw_codes, (list, tuple)):
+            raise ValueError("decision audit gate diagnostic codes must be a sequence")
+        diagnostic_codes = tuple(
+            sorted(
+                {AnalysisDiagnosticCode(str(code)) for code in raw_codes},
+                key=lambda code: code.value,
+            )
+        )
+    if raw_diagnostics and not diagnostic_codes:
+        raise ValueError(
+            "decision audit gate diagnostics require typed diagnostic_codes"
+        )
+    if status:
+        permitted_codes = (
+            {AnalysisDiagnosticCode.OPTIONAL_EVIDENCE_UNAVAILABLE}
+            if status_field == "admitted"
+            else set()
+        )
+        if any(code not in permitted_codes for code in diagnostic_codes):
+            raise ValueError(
+                f"decision audit gate {status_field}=true cannot carry blocker codes"
+            )
     return {
         status_field: status,
         "readiness": readiness,
         "diagnostic_codes": [
-            code.value for code in analysis_diagnostic_codes(raw_diagnostics)
+            code.value for code in diagnostic_codes
         ],
     }
 
@@ -382,8 +413,18 @@ def build_decision_audit(
     graph_signature = final_state.get("graph_signature")
     if not isinstance(graph_signature, str):
         graph_signature = None
+    raw_telemetry = final_state.get("run_telemetry")
+    telemetry = (
+        RunTelemetryProjection.empty(
+            terminal_route=terminal.terminal_outcome_kind.value,
+        )
+        if raw_telemetry is None
+        else RunTelemetryProjection.model_validate(raw_telemetry)
+    )
+    if telemetry.terminal_route != terminal.terminal_outcome_kind.value:
+        raise ValueError("run telemetry terminal route does not match terminal contract")
     payload: dict[str, Any] = {
-        "schema_version": "3.1",
+        "schema_version": "4.0",
         "created_at": created_at,
         "run": {
             **run_identity.model_dump(mode="json", exclude={"audit_digest"}),
@@ -397,6 +438,7 @@ def build_decision_audit(
             **terminal.model_dump(mode="json"),
             "output_sha256": sha256(_canonical_json(terminal_output)).hexdigest(),
         },
+        "telemetry": telemetry.model_dump(mode="json"),
         "evidence_state": _evidence_projection.model_dump(mode="json"),
         "evidence_preflight": _project_gate_diagnostics(
             final_state.get("evidence_preflight"),

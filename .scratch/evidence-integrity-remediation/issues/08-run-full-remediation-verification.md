@@ -1,6 +1,6 @@
 # Run full remediation verification
 
-Status: ready-for-agent
+Status: completed
 
 Run all targeted regressions, the full PIT suite with the `pit` extra installed in an isolated environment, linting, diff checks, replay validation, and performance benchmarks before landing the complete remediation.
 

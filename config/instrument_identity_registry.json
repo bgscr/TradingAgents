@@ -3,6 +3,22 @@
   "registry_id": "mainland-exchange-identity-registry-v1",
   "rows": [
     {
+      "canonical_symbol": "510500.SS",
+      "aliases": [
+        "510500",
+        "510500.SH"
+      ],
+      "venue": "XSHG",
+      "instrument_kind": "fund",
+      "currency": "CNY",
+      "display_name": "中证500ETF南方",
+      "provenance": {
+        "provider": "Shanghai Stock Exchange",
+        "source_ref": "https://www.sse.com.cn/assortment/fund/list/etfinfo/basic/index.shtml?FUNDID=510500",
+        "retrieved_at": "2026-07-24T01:01:33Z"
+      }
+    },
+    {
       "canonical_symbol": "600895.SS",
       "aliases": [
         "600895",

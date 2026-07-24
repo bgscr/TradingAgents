@@ -73,6 +73,10 @@ Validator = Callable[[object], T]
 Serializer = Callable[[T], str]
 CandidateAcceptance = Callable[[T], bool]
 FallbackCandidateIndex = Callable[[tuple[T, ...]], int]
+AcquisitionOutcomeObserver = Callable[
+    [AcquisitionRequest, SourceAcquisitionOutcome],
+    None,
+]
 
 
 class AcquisitionController:
@@ -85,12 +89,24 @@ class AcquisitionController:
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
         retry_policy: RetryPolicy | None = None,
+        outcome_observer: AcquisitionOutcomeObserver | None = None,
     ) -> None:
         self._providers = providers
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleeper = sleeper or (lambda _seconds: None)
         self._retry_policy = retry_policy or RetryPolicy()
+        self._outcome_observer = outcome_observer
         self._open_circuits: set[tuple[str, str]] = set()
+
+    def _record_outcome(
+        self,
+        outcomes: list[SourceAcquisitionOutcome],
+        request: AcquisitionRequest,
+        outcome: SourceAcquisitionOutcome,
+    ) -> None:
+        outcomes.append(outcome)
+        if self._outcome_observer is not None:
+            self._outcome_observer(request, outcome)
 
     def acquire(
         self,
@@ -106,9 +122,11 @@ class AcquisitionController:
         candidates: list[tuple[str, T, SourceArtifact]] = []
         effective_providers = self._providers if providers is None else providers
         for provider_order, (provider_name, provider) in enumerate(effective_providers):
-            circuit_key = (provider_name, request.capability)
+            circuit_key = (provider_name, request.tool_name)
             if circuit_key in self._open_circuits:
-                outcomes.append(
+                self._record_outcome(
+                    outcomes,
+                    request,
                     SourceAcquisitionUnavailable(
                         provider=provider_name,
                         provider_order=provider_order,
@@ -118,7 +136,7 @@ class AcquisitionController:
                         retrieved_at=self._timestamp(),
                         retryable=False,
                         reason=AcquisitionUnavailableReason.CIRCUIT_OPEN,
-                    )
+                    ),
                 )
                 continue
             for attempt in range(1, self._retry_policy.max_attempts_per_provider + 1):
@@ -132,7 +150,9 @@ class AcquisitionController:
                         AcquisitionUnavailableReason.TIMEOUT,
                         AcquisitionUnavailableReason.PROVIDER_ERROR,
                     }
-                    outcomes.append(
+                    self._record_outcome(
+                        outcomes,
+                        request,
                         SourceAcquisitionUnavailable(
                             provider=provider_name,
                             provider_order=provider_order,
@@ -144,7 +164,7 @@ class AcquisitionController:
                             reason=failure.reason,
                             retry_after_seconds=failure.retry_after_seconds,
                             http_status=failure.status_code,
-                        )
+                        ),
                     )
                     if (
                         retryable
@@ -160,7 +180,9 @@ class AcquisitionController:
                     self._open_circuits.add(circuit_key)
                     break
                 except Exception:
-                    outcomes.append(
+                    self._record_outcome(
+                        outcomes,
+                        request,
                         SourceAcquisitionUnavailable(
                             provider=provider_name,
                             provider_order=provider_order,
@@ -170,7 +192,7 @@ class AcquisitionController:
                             retrieved_at=self._timestamp(),
                             retryable=False,
                             reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
-                        )
+                        ),
                     )
                     self._open_circuits.add(circuit_key)
                     break
@@ -191,7 +213,7 @@ class AcquisitionController:
                     retrieved_at=self._timestamp(),
                     artifact=artifact,
                 )
-                outcomes.append(available)
+                self._record_outcome(outcomes, request, available)
                 if accept_candidate is None or accept_candidate(value):
                     return AcquisitionResult(
                         value=value,

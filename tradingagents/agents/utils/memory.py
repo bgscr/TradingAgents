@@ -13,9 +13,19 @@ class TradingMemoryLog:
 
     # HTML comment: cannot appear in LLM prose output, safe as a hard delimiter
     _SEPARATOR = "\n\n<!-- ENTRY_END -->\n\n"
+    _ADVISORY_REFLECTION_HEADER = "ADVISORY COMMENTARY (REFLECTION)"
+    _REFLECTION_HEADER_PATTERN = (
+        rf"(?:{re.escape(_ADVISORY_REFLECTION_HEADER)}|REFLECTION)"
+    )
     # Precompiled patterns — avoids re-compilation on every load_entries() call
-    _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
-    _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+    _DECISION_RE = re.compile(
+        rf"DECISION:\n(.*?)(?=\n{_REFLECTION_HEADER_PATTERN}:|\Z)",
+        re.DOTALL,
+    )
+    _REFLECTION_RE = re.compile(
+        rf"{_REFLECTION_HEADER_PATTERN}:\n(.*?)$",
+        re.DOTALL,
+    )
 
     def __init__(self, config: dict = None):
         cfg = config or {}
@@ -184,7 +194,8 @@ class TradingMemoryLog:
                 )
                 rest = "\n".join(lines[1:])
                 new_blocks.append(
-                    f"{new_tag}\n\n{rest.lstrip()}\n\nREFLECTION:\n{reflection}"
+                    f"{new_tag}\n\n{rest.lstrip()}\n\n"
+                    f"{self._ADVISORY_REFLECTION_HEADER}:\n{reflection}"
                 )
                 updated = True
             else:
@@ -238,7 +249,8 @@ class TradingMemoryLog:
                     )
                     rest = "\n".join(lines[1:])
                     new_blocks.append(
-                        f"{new_tag}\n\n{rest.lstrip()}\n\nREFLECTION:\n{upd['reflection']}"
+                        f"{new_tag}\n\n{rest.lstrip()}\n\n"
+                        f"{self._ADVISORY_REFLECTION_HEADER}:\n{upd['reflection']}"
                     )
                     del update_map[(trade_date, ticker)]
                     matched = True
@@ -325,13 +337,18 @@ class TradingMemoryLog:
         tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw} | {alpha} | {holding}]"
         parts = [tag, f"DECISION:\n{e['decision']}"]
         if e["reflection"]:
-            parts.append(f"REFLECTION:\n{e['reflection']}")
+            parts.append(
+                f"{self._ADVISORY_REFLECTION_HEADER}:\n{e['reflection']}"
+            )
         return "\n\n".join(parts)
 
     def _format_reflection_only(self, e: dict) -> str:
         tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}]"
         if e["reflection"]:
-            return f"{tag}\n{e['reflection']}"
+            return (
+                f"{tag}\n{self._ADVISORY_REFLECTION_HEADER}:\n"
+                f"{e['reflection']}"
+            )
         text = e["decision"][:300]
         suffix = "..." if len(e["decision"]) > 300 else ""
         return f"{tag}\n{text}{suffix}"

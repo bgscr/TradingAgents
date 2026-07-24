@@ -5,10 +5,12 @@ import questionary
 from dotenv import find_dotenv, set_key
 from rich.console import Console
 
+from cli.console_encoding import configure_utf8_stdio
 from cli.models import AnalystType, AssetType
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
 
+configure_utf8_stdio()
 console = Console()
 
 TICKER_INPUT_EXAMPLES = "SPY, 0700.HK, BTC-USD"

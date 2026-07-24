@@ -1,0 +1,931 @@
+{
+  "evidence_state": {
+    "acquisition_outcomes": [
+      {
+        "artifact": {
+          "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+          "raw_text": "## Verified market data snapshot for 600895.SS\n\n- Requested analysis date: 2026-07-19\n- Latest trading row used: 2026-07-17\n- Rows after the requested analysis date are excluded before verification.\n- Provider: baostock\n- Adjustment basis: qfq\n- Retrieved at: 2026-07-19T11:46:11.844672+00:00\n- History rows: 1211\nFrame SHA-256: 78ba38401e5aaf2b02ae6aa19565e2ab40b81cafeda4c7972470de1e0cbeb42d\nSnapshot ID: snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e\n\n### Latest verified OHLCV row\n\n| Field | Value |\n|---|---:|\n| Open | 31.50 |\n| High | 31.79 |\n| Low | 30.06 |\n| Close | 30.27 |\n| Volume | 28674153 |\n\n### Verified technical indicators (latest row)\n\n| Indicator | Value |\n|---|---:|\n| close_10_ema | 33.03 |\n| close_50_sma | 34.55 |\n| close_200_sma | 39.11 |\n| rsi | 37.41 |\n| boll | 33.95 |\n| boll_ub | 37.55 |\n| boll_lb | 30.35 |\n| macd | -0.56 |\n| macds | -0.17 |\n| macdh | -0.40 |\n| atr | 2.12 |\n\n### Recent verified closes (last 30 rows)\n\n| Date | Close |\n|---|---:|\n| 2026-06-05 | 32.06 |\n| 2026-06-08 | 29.90 |\n| 2026-06-09 | 31.28 |\n| 2026-06-10 | 31.26 |\n| 2026-06-11 | 32.35 |\n| 2026-06-12 | 34.15 |\n| 2026-06-15 | 33.61 |\n| 2026-06-16 | 33.18 |\n| 2026-06-17 | 33.15 |\n| 2026-06-18 | 32.77 |\n| 2026-06-22 | 32.73 |\n| 2026-06-23 | 32.04 |\n| 2026-06-24 | 33.29 |\n| 2026-06-25 | 32.59 |\n| 2026-06-26 | 33.83 |\n| 2026-06-29 | 34.96 |\n| 2026-06-30 | 37.11 |\n| 2026-07-01 | 37.60 |\n| 2026-07-02 | 35.52 |\n| 2026-07-03 | 34.49 |\n| 2026-07-06 | 34.35 |\n| 2026-07-07 | 34.43 |\n| 2026-07-08 | 33.46 |\n| 2026-07-09 | 34.89 |\n| 2026-07-10 | 35.04 |\n| 2026-07-13 | 33.84 |\n| 2026-07-14 | 35.02 |\n| 2026-07-15 | 31.61 |\n| 2026-07-16 | 31.89 |\n| 2026-07-17 | 30.27 |\n\nUse this snapshot as the source of truth for exact OHLCV, price-level, and indicator-value claims. If another tool output conflicts with it, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless directly supported by tool output with concrete dates and prices.",
+          "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+          "tool_call_id": "recorded_call_001",
+          "tool_name": "get_verified_market_snapshot"
+        },
+        "attempt": 1,
+        "capability": "verified_market_snapshot",
+        "outcome": "available",
+        "provider": "baostock",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+        "retryable": false,
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+          "raw_text": "# Company Fundamentals for 600895.SS\n# Primary source: AKShare\n# Data retrieved on: 2026-07-19 04:50:03\n\n## Business Description\n主营业务: 受让地块内的土地转让、房产开发与销售、房产租赁、数据通信服务,创业投资。\n产品类型: 科技产业投资、集成电路全产业链服务、园区综合运营与服务\n产品名称: 科技产业投资、集成电路全产业链服务、园区综合运营与服务\n经营范围: 许可项目：房地产开发经营。（依法须经批准的项目，经相关部门批准后方可开展经营活动，具体经营项目以相关部门批准文件或许可证件为准）一般项目：以自有资金从事投资活动；投资管理；自有资金投资的资产管理服务；企业总部管理；非居住房地产租赁；住房租赁；本市范围内公共租赁住房的建设、租赁经营管理；土地整治服务；土地使用权租赁；园区管理服务；创业空间服务；物业管理；酒店管理；停车场服务；商业综合体管理服务；体育场地设施经营（不含高危险性体育运动）；市政设施管理；工程管理服务；信息系统集成服务；云计算装备技术服务；人工智能公共服务平台技术咨询服务；人工智能双创服务平台；集成电路销售；集成电路设计；工程和技术研究和试验发展；社会经济咨询服务；科技中介服务；市场营销策划；企业管理咨询；信息咨询服务（不含许可类信息咨询服务）；普通机械设备安装服务；机械设备销售；电子专用设备销售；建筑材料销售；租赁服务（不含许可类租赁服务）；房屋拆迁服务；国内贸易代理；销售代理；货物进出口；技术进出口；技术服务、技术开发、技术咨询、技术交流、技术转让、技术推广；人工智能公共数据平台。（除依法须经批准的项目外，凭营业执照依法自主开展经营活动）\n\n## Financial Abstract\n选项,指标,20260331,20251231,20250930,20250630\r\n常用指标,归母净利润,83513563.59,986121183.65,616573317.58,369146151.75\r\n常用指标,营业总收入,838011211.7,4181730883.59,2003710164.33,1703853688.95\r\n常用指标,营业成本,878700073.91,3419422914.6,1900921056.48,1557505029.74\r\n常用指标,净利润,42506452.43,975969519.16,581730562.0,348021157.33\r\n常用指标,扣非净利润,81882704.1,907014882.26,613895467.63,366934378.73\r\n常用指标,股东权益合计(净资产),19802373889.38,19707959985.42,19375780713.17,19253012655.07\r\n常用指标,商誉,,,,\r\n常用指标,经营现金流量净额,-690993227.58,396728175.24,-587227411.73,-934623685.3\r\n常用指标,基本每股收益,0.05,0.62,0.38,0.23\r\n常用指标,每股净资产,8.825075,8.814343,8.615795,8.527666\r\n常用指标,每股现金流,-0.446179,0.25617,-0.379176,-0.603493\r\n常用指标,净资产收益率(ROE),0.53,7.11,4.39,2.63\r\n常用指标,总资产报酬率(ROA),0.398149,2.776575,2.030504,1.276936\r\n常用指标,毛利率,25.696088,48.650072,39.871102,36.980836\r\n常用指标,销售净利率,5.072301,23.338888,29.03267,20.42553\r\n常用指标,期间费用率,20.671166,17.798498,24.517603,19.176751\r\n常用指标,资产负债率,68.673563,68.771631,67.932917,67.776111\r\n每股指标,基本每股收益,0.05,0.62,0.38,0.23\r\n每股指标,稀释每股收益,0.05,0.62,0.38,0.23\r\n每股指标,摊薄每股收益_最新股数,0.053925,0.636745,0.398125,0.23836\r\n\n\n## Yahoo Supplemental Profile\n# Company Fundamentals for 600895.SS\n# Data retrieved on: 2026-07-19 04:50:14\n\nName: Shanghai Zhangjiang Hi-Tech Park Development Co., Ltd.\nSector: Real Estate\nIndustry: Real Estate - Development\nMarket Cap: 46878834688\nPE Ratio (TTM): 61.77551\nForward PE: 38.316456\nPrice to Book: 3.4300284\nEPS (TTM): 0.49\nForward EPS: 0.79\nDividend Yield: 0.66\nBeta: 0.727\n52 Week High: 55.6\n52 Week Low: 26.4\n50 Day Average: 34.6682\n200 Day Average: 38.9537\nRevenue (TTM): 3800330752\nGross Profit: 1889361024\nEBITDA: 1718834304\nNet Income: 775173696\nProfit Margin: 0.20398001\nOperating Margin: 0.124639995\nReturn on Equity: 0.03748\nReturn on Assets: 0.012150001\nDebt to Equity: 148.72\nCurrent Ratio: 0.891\nBook Value: 8.825\nFree Cash Flow: 5785437184\n\n## Degraded Fields\nDATA_DEGRADED: AKShare stock_individual_fund_flow unavailable (('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))).\nDo not fabricate degraded or missing AKShare values.\n\n## China A-share Enhancement Snapshot\nTicker: 600895.SS\nAnalysis date: 2026-07-19\nPreset: all\nOverall status: partial\n\nUse this source-labeled snapshot as supplemental China-local context.\n\n### Announcements and disclosures\nSection status: partial\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-08; title=张江高科:2025年年度权益分派实施公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-07; title=张江高科:关于聘任董事会秘书的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-07; title=张江高科:第九届董事会第二十六次会议决议公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-30; title=张江高科:2025年年度股东会决议公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-27; title=张江高科:关于副总经理离任的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-19; title=张江高科:关于国有股份无偿划转及非公开协议转让的提示性公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-17; title=张江高科:关于2025年年度股东会增加临时提案的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-17; title=张江高科:关于非公开协议转让上海张江科学之门科技发展有限公司16.51%股权暨关联交易的公告",
+          "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+          "tool_call_id": "recorded_call_002",
+          "tool_name": "get_fundamentals"
+        },
+        "attempt": 1,
+        "capability": "fundamentals",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+        "retryable": false,
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19"
+      },
+      {
+        "attempt": 1,
+        "capability": "sentiment.news",
+        "outcome": "unavailable",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "reason": "no_data",
+        "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+        "retryable": false,
+        "source_ref": "sentiment.news"
+      },
+      {
+        "attempt": 1,
+        "capability": "sentiment.china_local",
+        "outcome": "unavailable",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "reason": "no_data",
+        "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+        "retryable": false,
+        "source_ref": "sentiment.china_local"
+      },
+      {
+        "attempt": 1,
+        "capability": "stock_individual_notice_report",
+        "outcome": "unavailable",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "reason": "no_data",
+        "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+        "retryable": false,
+        "source_ref": "stock_individual_notice_report"
+      }
+    ],
+    "claim_validations": [
+      {
+        "claim_id": "market.1",
+        "detail": "",
+        "fact_ids": [
+          "fact:36275e919b3c8fa6b75a3e627650213257d9c75677ecde62f8d0216eca0c1602"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.2",
+        "detail": "",
+        "fact_ids": [
+          "fact:dcc0129ef742f69b05e78393aef588b6cb0de34114593d0bfa4360c7fe143309"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.3",
+        "detail": "",
+        "fact_ids": [
+          "fact:f531596c7dcd73a742429c8b9c5fa08cd74b3444db40950f5006825b2b87cf40"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.4",
+        "detail": "",
+        "fact_ids": [
+          "fact:aa8893d36db8c7e9cb6baa6fab27074d7f655042fb7e51281cdc9459220cf925"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.5",
+        "detail": "",
+        "fact_ids": [
+          "fact:661babaea7b00288a53cb85db711f3691668559c87bda683138d6f0675b155bb"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.6",
+        "detail": "",
+        "fact_ids": [
+          "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.7",
+        "detail": "source does not contain numeric claim(s): 200",
+        "fact_ids": [
+          "fact:7f8d815cc1dad8552bd43c3aa37eb32318624bbd85c8949eaaf6ae950818d0c3"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.001",
+        "detail": "cited source unavailable: stock_individual_notice_report",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.002",
+        "detail": "cited source unavailable: stock_individual_notice_report",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.003",
+        "detail": "cited source unavailable: stock_individual_notice_report",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.004",
+        "detail": "cited source unavailable: stock_individual_notice_report",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.001",
+        "detail": "",
+        "fact_ids": [
+          "fact:8823cd2f652bf98b5965c8ba98b28d8e63e8973a1cbd49ce8d31711439bd0876"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "fundamentals.002",
+        "detail": "source does not contain numeric claim(s): 2026",
+        "fact_ids": [
+          "fact:a2bca74c54ac0f71c8bfaed56b3b076a06a21264623c885ee727a06f6882fab5"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.003",
+        "detail": "source does not contain numeric claim(s): 2025",
+        "fact_ids": [
+          "fact:64800ae2b21ddc1e5d250464174583c59898728811b10ec4940f2c538ca1bc72"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.004",
+        "detail": "source quote is ambiguous within the cited tool result",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.005",
+        "detail": "source does not contain numeric claim(s): 2025, 7.11%",
+        "fact_ids": [
+          "fact:eb4a61c5f10e44e8215c65e5e89756b1a9d377f2e87824c76daab087fa3f1d4d"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.006",
+        "detail": "source does not contain numeric claim(s): 2026, 68.67%",
+        "fact_ids": [
+          "fact:c30e38e2e722896e44bca58bca0e4169d826437df08ea38c8d52fd929bcbcdd7"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.007",
+        "detail": "",
+        "fact_ids": [
+          "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "fundamentals.008",
+        "detail": "",
+        "fact_ids": [
+          "fact:18d62514125fce9f51a84e0f4d42f0a6e7384ab3ee839926214dd4c7c5e80bc0"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "fundamentals.009",
+        "detail": "source quote is absent from the cited tool result",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "fundamentals.010",
+        "detail": "source does not contain numeric claim(s): 2026",
+        "fact_ids": [
+          "fact:ab67afa92407a4a6c2d7d095c76bc781c1362b79cda967538405c24c2425d017"
+        ],
+        "status": "unsupported"
+      }
+    ],
+    "instrument_identity": {
+      "name": "Shanghai Zhangjiang Hi-Tech Park Development Co., Ltd.",
+      "symbol": "600895.SS"
+    },
+    "market_snapshot": {
+      "adjustment_basis": "qfq",
+      "effective_trading_date": "2026-07-17",
+      "frame_sha256": "78ba38401e5aaf2b02ae6aa19565e2ab40b81cafeda4c7972470de1e0cbeb42d",
+      "history_rows": 1211,
+      "provider": "baostock",
+      "requested_date": "2026-07-19",
+      "retrieved_at": "2026-07-19T11:46:11.844672+00:00",
+      "snapshot_id": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+      "symbol": "600895.SS"
+    },
+    "material_claims": [
+      {
+        "analyst": "market",
+        "claim_id": "market.1",
+        "fact_ids": [
+          "fact:36275e919b3c8fa6b75a3e627650213257d9c75677ecde62f8d0216eca0c1602"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| Close | 30.27 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "最新收盘价为30.27元"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.2",
+        "fact_ids": [
+          "fact:dcc0129ef742f69b05e78393aef588b6cb0de34114593d0bfa4360c7fe143309"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| Open | 31.50 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "最新开盘价为31.50元"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.3",
+        "fact_ids": [
+          "fact:f531596c7dcd73a742429c8b9c5fa08cd74b3444db40950f5006825b2b87cf40"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| High | 31.79 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "最新最高价为31.79元"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.4",
+        "fact_ids": [
+          "fact:aa8893d36db8c7e9cb6baa6fab27074d7f655042fb7e51281cdc9459220cf925"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| Low | 30.06 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "最新最低价为30.06元"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.5",
+        "fact_ids": [
+          "fact:661babaea7b00288a53cb85db711f3691668559c87bda683138d6f0675b155bb"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| Volume | 28674153 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "成交量为28,674,153手"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.6",
+        "fact_ids": [
+          "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| rsi | 37.41 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "RSI为37.41"
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.7",
+        "fact_ids": [
+          "fact:7f8d815cc1dad8552bd43c3aa37eb32318624bbd85c8949eaaf6ae950818d0c3"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "| close_200_sma | 39.11 |",
+        "source_refs": [
+          "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+        ],
+        "statement": "200日简单移动平均线为39.11元"
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.001",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "张江高科:2025年年度权益分派实施公告",
+        "source_refs": [
+          "stock_individual_notice_report"
+        ],
+        "statement": "张江高科 announced the implementation plan for the 2025 annual equity distribution."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.002",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "张江高科:关于聘任董事会秘书的公告",
+        "source_refs": [
+          "stock_individual_notice_report"
+        ],
+        "statement": "张江高科 announced the appointment of a board secretary."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.003",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "张江高科:第九届董事会第二十六次会议决议公告",
+        "source_refs": [
+          "stock_individual_notice_report"
+        ],
+        "statement": "张江高科 disclosed the resolutions from the 26th meeting of the 9th Board of Directors."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.004",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "张江高科:2025年年度股东会决议公告",
+        "source_refs": [
+          "stock_individual_notice_report"
+        ],
+        "statement": "张江高ko published the resolutions from the 2025 annual shareholder meeting."
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.001",
+        "fact_ids": [
+          "fact:8823cd2f652bf98b5965c8ba98b28d8e63e8973a1cbd49ce8d31711439bd0876"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "主营业务: 受让地块内的土地转让、房产开发与销售、房产租赁、数据通信服务,创业投资。",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "公司主营业务为受让地块内的土地转让、房产开发与销售、房产租赁、数据通信服务、创业投资。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.002",
+        "fact_ids": [
+          "fact:a2bca74c54ac0f71c8bfaed56b3b076a06a21264623c885ee727a06f6882fab5"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "归母净利润,83513563.59",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2026年第一季度归母净利润为83,513,563.59元。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.003",
+        "fact_ids": [
+          "fact:64800ae2b21ddc1e5d250464174583c59898728811b10ec4940f2c538ca1bc72"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "986121183.65",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2025年全年归母净利润为986,121,183.65元。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.004",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "0.62",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2025年全年基本每股收益为0.62元。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.005",
+        "fact_ids": [
+          "fact:eb4a61c5f10e44e8215c65e5e89756b1a9d377f2e87824c76daab087fa3f1d4d"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "7.11",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2025年全年净资产收益率为7.11%。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.006",
+        "fact_ids": [
+          "fact:c30e38e2e722896e44bca58bca0e4169d826437df08ea38c8d52fd929bcbcdd7"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "资产负债率,68.673563",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2026年第一季度资产负债率为68.67%。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.007",
+        "fact_ids": [
+          "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "PE Ratio (TTM): 61.77551",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "当前市盈率（TTM）为61.78倍。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.008",
+        "fact_ids": [
+          "fact:18d62514125fce9f51a84e0f4d42f0a6e7384ab3ee839926214dd4c7c5e80bc0"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "Price to Book: 3.4300284",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "市净率为3.43倍。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.009",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "营业总收入,4181730883.59",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2025年全年营业总收入为4,181,730,883.59元。"
+      },
+      {
+        "analyst": "fundamentals",
+        "claim_id": "fundamentals.010",
+        "fact_ids": [
+          "fact:ab67afa92407a4a6c2d7d095c76bc781c1362b79cda967538405c24c2425d017"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "营业总收入,838011211.7",
+        "source_refs": [
+          "get_fundamentals:600895.SS:2026-07-19"
+        ],
+        "statement": "2026年第一季度营业总收入为838,011,211.70元。"
+      }
+    ],
+    "source_artifacts": [
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "raw_text": "## Verified market data snapshot for 600895.SS\n\n- Requested analysis date: 2026-07-19\n- Latest trading row used: 2026-07-17\n- Rows after the requested analysis date are excluded before verification.\n- Provider: baostock\n- Adjustment basis: qfq\n- Retrieved at: 2026-07-19T11:46:11.844672+00:00\n- History rows: 1211\nFrame SHA-256: 78ba38401e5aaf2b02ae6aa19565e2ab40b81cafeda4c7972470de1e0cbeb42d\nSnapshot ID: snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e\n\n### Latest verified OHLCV row\n\n| Field | Value |\n|---|---:|\n| Open | 31.50 |\n| High | 31.79 |\n| Low | 30.06 |\n| Close | 30.27 |\n| Volume | 28674153 |\n\n### Verified technical indicators (latest row)\n\n| Indicator | Value |\n|---|---:|\n| close_10_ema | 33.03 |\n| close_50_sma | 34.55 |\n| close_200_sma | 39.11 |\n| rsi | 37.41 |\n| boll | 33.95 |\n| boll_ub | 37.55 |\n| boll_lb | 30.35 |\n| macd | -0.56 |\n| macds | -0.17 |\n| macdh | -0.40 |\n| atr | 2.12 |\n\n### Recent verified closes (last 30 rows)\n\n| Date | Close |\n|---|---:|\n| 2026-06-05 | 32.06 |\n| 2026-06-08 | 29.90 |\n| 2026-06-09 | 31.28 |\n| 2026-06-10 | 31.26 |\n| 2026-06-11 | 32.35 |\n| 2026-06-12 | 34.15 |\n| 2026-06-15 | 33.61 |\n| 2026-06-16 | 33.18 |\n| 2026-06-17 | 33.15 |\n| 2026-06-18 | 32.77 |\n| 2026-06-22 | 32.73 |\n| 2026-06-23 | 32.04 |\n| 2026-06-24 | 33.29 |\n| 2026-06-25 | 32.59 |\n| 2026-06-26 | 33.83 |\n| 2026-06-29 | 34.96 |\n| 2026-06-30 | 37.11 |\n| 2026-07-01 | 37.60 |\n| 2026-07-02 | 35.52 |\n| 2026-07-03 | 34.49 |\n| 2026-07-06 | 34.35 |\n| 2026-07-07 | 34.43 |\n| 2026-07-08 | 33.46 |\n| 2026-07-09 | 34.89 |\n| 2026-07-10 | 35.04 |\n| 2026-07-13 | 33.84 |\n| 2026-07-14 | 35.02 |\n| 2026-07-15 | 31.61 |\n| 2026-07-16 | 31.89 |\n| 2026-07-17 | 30.27 |\n\nUse this snapshot as the source of truth for exact OHLCV, price-level, and indicator-value claims. If another tool output conflicts with it, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless directly supported by tool output with concrete dates and prices.",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "raw_text": "# Company Fundamentals for 600895.SS\n# Primary source: AKShare\n# Data retrieved on: 2026-07-19 04:50:03\n\n## Business Description\n主营业务: 受让地块内的土地转让、房产开发与销售、房产租赁、数据通信服务,创业投资。\n产品类型: 科技产业投资、集成电路全产业链服务、园区综合运营与服务\n产品名称: 科技产业投资、集成电路全产业链服务、园区综合运营与服务\n经营范围: 许可项目：房地产开发经营。（依法须经批准的项目，经相关部门批准后方可开展经营活动，具体经营项目以相关部门批准文件或许可证件为准）一般项目：以自有资金从事投资活动；投资管理；自有资金投资的资产管理服务；企业总部管理；非居住房地产租赁；住房租赁；本市范围内公共租赁住房的建设、租赁经营管理；土地整治服务；土地使用权租赁；园区管理服务；创业空间服务；物业管理；酒店管理；停车场服务；商业综合体管理服务；体育场地设施经营（不含高危险性体育运动）；市政设施管理；工程管理服务；信息系统集成服务；云计算装备技术服务；人工智能公共服务平台技术咨询服务；人工智能双创服务平台；集成电路销售；集成电路设计；工程和技术研究和试验发展；社会经济咨询服务；科技中介服务；市场营销策划；企业管理咨询；信息咨询服务（不含许可类信息咨询服务）；普通机械设备安装服务；机械设备销售；电子专用设备销售；建筑材料销售；租赁服务（不含许可类租赁服务）；房屋拆迁服务；国内贸易代理；销售代理；货物进出口；技术进出口；技术服务、技术开发、技术咨询、技术交流、技术转让、技术推广；人工智能公共数据平台。（除依法须经批准的项目外，凭营业执照依法自主开展经营活动）\n\n## Financial Abstract\n选项,指标,20260331,20251231,20250930,20250630\r\n常用指标,归母净利润,83513563.59,986121183.65,616573317.58,369146151.75\r\n常用指标,营业总收入,838011211.7,4181730883.59,2003710164.33,1703853688.95\r\n常用指标,营业成本,878700073.91,3419422914.6,1900921056.48,1557505029.74\r\n常用指标,净利润,42506452.43,975969519.16,581730562.0,348021157.33\r\n常用指标,扣非净利润,81882704.1,907014882.26,613895467.63,366934378.73\r\n常用指标,股东权益合计(净资产),19802373889.38,19707959985.42,19375780713.17,19253012655.07\r\n常用指标,商誉,,,,\r\n常用指标,经营现金流量净额,-690993227.58,396728175.24,-587227411.73,-934623685.3\r\n常用指标,基本每股收益,0.05,0.62,0.38,0.23\r\n常用指标,每股净资产,8.825075,8.814343,8.615795,8.527666\r\n常用指标,每股现金流,-0.446179,0.25617,-0.379176,-0.603493\r\n常用指标,净资产收益率(ROE),0.53,7.11,4.39,2.63\r\n常用指标,总资产报酬率(ROA),0.398149,2.776575,2.030504,1.276936\r\n常用指标,毛利率,25.696088,48.650072,39.871102,36.980836\r\n常用指标,销售净利率,5.072301,23.338888,29.03267,20.42553\r\n常用指标,期间费用率,20.671166,17.798498,24.517603,19.176751\r\n常用指标,资产负债率,68.673563,68.771631,67.932917,67.776111\r\n每股指标,基本每股收益,0.05,0.62,0.38,0.23\r\n每股指标,稀释每股收益,0.05,0.62,0.38,0.23\r\n每股指标,摊薄每股收益_最新股数,0.053925,0.636745,0.398125,0.23836\r\n\n\n## Yahoo Supplemental Profile\n# Company Fundamentals for 600895.SS\n# Data retrieved on: 2026-07-19 04:50:14\n\nName: Shanghai Zhangjiang Hi-Tech Park Development Co., Ltd.\nSector: Real Estate\nIndustry: Real Estate - Development\nMarket Cap: 46878834688\nPE Ratio (TTM): 61.77551\nForward PE: 38.316456\nPrice to Book: 3.4300284\nEPS (TTM): 0.49\nForward EPS: 0.79\nDividend Yield: 0.66\nBeta: 0.727\n52 Week High: 55.6\n52 Week Low: 26.4\n50 Day Average: 34.6682\n200 Day Average: 38.9537\nRevenue (TTM): 3800330752\nGross Profit: 1889361024\nEBITDA: 1718834304\nNet Income: 775173696\nProfit Margin: 0.20398001\nOperating Margin: 0.124639995\nReturn on Equity: 0.03748\nReturn on Assets: 0.012150001\nDebt to Equity: 148.72\nCurrent Ratio: 0.891\nBook Value: 8.825\nFree Cash Flow: 5785437184\n\n## Degraded Fields\nDATA_DEGRADED: AKShare stock_individual_fund_flow unavailable (('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))).\nDo not fabricate degraded or missing AKShare values.\n\n## China A-share Enhancement Snapshot\nTicker: 600895.SS\nAnalysis date: 2026-07-19\nPreset: all\nOverall status: partial\n\nUse this source-labeled snapshot as supplemental China-local context.\n\n### Announcements and disclosures\nSection status: partial\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-08; title=张江高科:2025年年度权益分派实施公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-07; title=张江高科:关于聘任董事会秘书的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-07-07; title=张江高科:第九届董事会第二十六次会议决议公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-30; title=张江高科:2025年年度股东会决议公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-27; title=张江高科:关于副总经理离任的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-19; title=张江高科:关于国有股份无偿划转及非公开协议转让的提示性公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-17; title=张江高科:关于2025年年度股东会增加临时提案的公告\n- Source: stock_individual_notice_report; as_of: 2026-07-19; date=2026-06-17; title=张江高科:关于非公开协议转让上海张江科学之门科技发展有限公司16.51%股权暨关联交易的公告",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      }
+    ],
+    "source_facts": [
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:36275e919b3c8fa6b75a3e627650213257d9c75677ecde62f8d0216eca0c1602",
+        "normalized_numeric_tokens": [
+          "30.27"
+        ],
+        "raw_text": "| Close | 30.27 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 609,
+        "source_span_start": 592,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:dcc0129ef742f69b05e78393aef588b6cb0de34114593d0bfa4360c7fe143309",
+        "normalized_numeric_tokens": [
+          "31.50"
+        ],
+        "raw_text": "| Open | 31.50 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 558,
+        "source_span_start": 542,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:f531596c7dcd73a742429c8b9c5fa08cd74b3444db40950f5006825b2b87cf40",
+        "normalized_numeric_tokens": [
+          "31.79"
+        ],
+        "raw_text": "| High | 31.79 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 575,
+        "source_span_start": 559,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:aa8893d36db8c7e9cb6baa6fab27074d7f655042fb7e51281cdc9459220cf925",
+        "normalized_numeric_tokens": [
+          "30.06"
+        ],
+        "raw_text": "| Low | 30.06 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 591,
+        "source_span_start": 576,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:661babaea7b00288a53cb85db711f3691668559c87bda683138d6f0675b155bb",
+        "normalized_numeric_tokens": [
+          "28674153"
+        ],
+        "raw_text": "| Volume | 28674153 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 631,
+        "source_span_start": 610,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef",
+        "normalized_numeric_tokens": [
+          "37.41"
+        ],
+        "raw_text": "| rsi | 37.41 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 805,
+        "source_span_start": 790,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "d59bef64454d649cfb51f717a6fb3f6cb7d933004cd4d592c140f4a2b1c263b4",
+        "calculation_ids": [],
+        "fact_id": "fact:7f8d815cc1dad8552bd43c3aa37eb32318624bbd85c8949eaaf6ae950818d0c3",
+        "normalized_numeric_tokens": [
+          "39.11"
+        ],
+        "raw_text": "| close_200_sma | 39.11 |",
+        "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "source_span_end": 789,
+        "source_span_start": 764,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:8823cd2f652bf98b5965c8ba98b28d8e63e8973a1cbd49ce8d31711439bd0876",
+        "normalized_numeric_tokens": [],
+        "raw_text": "主营业务: 受让地块内的土地转让、房产开发与销售、房产租赁、数据通信服务,创业投资。",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 171,
+        "source_span_start": 129,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:a2bca74c54ac0f71c8bfaed56b3b076a06a21264623c885ee727a06f6882fab5",
+        "normalized_numeric_tokens": [
+          "83513563.59"
+        ],
+        "raw_text": "归母净利润,83513563.59",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 843,
+        "source_span_start": 826,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:64800ae2b21ddc1e5d250464174583c59898728811b10ec4940f2c538ca1bc72",
+        "normalized_numeric_tokens": [
+          "986121183.65"
+        ],
+        "raw_text": "986121183.65",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 856,
+        "source_span_start": 844,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:eb4a61c5f10e44e8215c65e5e89756b1a9d377f2e87824c76daab087fa3f1d4d",
+        "normalized_numeric_tokens": [
+          "7.11"
+        ],
+        "raw_text": "7.11",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 1454,
+        "source_span_start": 1450,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:c30e38e2e722896e44bca58bca0e4169d826437df08ea38c8d52fd929bcbcdd7",
+        "normalized_numeric_tokens": [
+          "68.673563"
+        ],
+        "raw_text": "资产负债率,68.673563",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 1691,
+        "source_span_start": 1676,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982",
+        "normalized_numeric_tokens": [
+          "61.77551"
+        ],
+        "raw_text": "PE Ratio (TTM): 61.77551",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 2118,
+        "source_span_start": 2094,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:18d62514125fce9f51a84e0f4d42f0a6e7384ab3ee839926214dd4c7c5e80bc0",
+        "normalized_numeric_tokens": [
+          "3.4300284"
+        ],
+        "raw_text": "Price to Book: 3.4300284",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 2165,
+        "source_span_start": 2141,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      },
+      {
+        "artifact_sha256": "8d1f1139325fd33a1c898475935becc1e279366303472936e68037a3acee2781",
+        "calculation_ids": [],
+        "fact_id": "fact:ab67afa92407a4a6c2d7d095c76bc781c1362b79cda967538405c24c2425d017",
+        "normalized_numeric_tokens": [
+          "838011211.7"
+        ],
+        "raw_text": "营业总收入,838011211.7",
+        "source_ref": "get_fundamentals:600895.SS:2026-07-19",
+        "source_span_end": 906,
+        "source_span_start": 889,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "get_fundamentals"
+      }
+    ],
+    "sources": [
+      {
+        "detail": "finalized_structured",
+        "required": true,
+        "source_id": "analyst.market.submission",
+        "status": "available"
+      },
+      {
+        "detail": "",
+        "required": false,
+        "source_id": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e",
+        "status": "available"
+      },
+      {
+        "detail": "direct_structured",
+        "required": true,
+        "source_id": "analyst.sentiment.submission",
+        "status": "available"
+      },
+      {
+        "detail": "source returned unavailable",
+        "required": false,
+        "source_id": "sentiment.news",
+        "status": "unavailable"
+      },
+      {
+        "detail": "source returned unavailable",
+        "required": false,
+        "source_id": "sentiment.china_local",
+        "status": "unavailable"
+      },
+      {
+        "detail": "finalized_structured",
+        "required": true,
+        "source_id": "analyst.news.submission",
+        "status": "available"
+      },
+      {
+        "detail": "source ref is not in allowed catalog",
+        "required": false,
+        "source_id": "stock_individual_notice_report",
+        "status": "unavailable"
+      },
+      {
+        "detail": "finalized_structured",
+        "required": true,
+        "source_id": "analyst.fundamentals.submission",
+        "status": "available"
+      },
+      {
+        "detail": "",
+        "required": false,
+        "source_id": "get_fundamentals:600895.SS:2026-07-19",
+        "status": "available"
+      }
+    ]
+  },
+  "fixture_version": "1.0",
+  "legacy_selection": {
+    "decision_assertions": [
+      {
+        "claim_id": "fundamentals.007",
+        "fact_ids": [
+          "fact:7d87c9c77d32f50b9707fc7ab334954cb470c79fa08ac1bc9f8417ec0e33c982"
+        ]
+      },
+      {
+        "claim_id": "market.6",
+        "fact_ids": [
+          "fact:0dd5468143f66e00bd4e41d98baf4ca8211255eaaa4d7a2163e6424bd7573cef"
+        ]
+      }
+    ],
+    "material_claim_ids": [
+      "fundamentals.007",
+      "market.6"
+    ],
+    "rating": "Underweight"
+  },
+  "run": {
+    "asset_type": "stock",
+    "requested_date": "2026-07-19",
+    "ticker": "600895.SS"
+  },
+  "run_telemetry": {
+    "acquisition": {
+      "events": [
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "fundamentals",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_fundamentals:600895.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_002",
+          "tool_name": "get_fundamentals"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "sentiment.china_local",
+            "http_status": null,
+            "outcome": "unavailable",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": "no_data",
+            "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+            "retry_after_seconds": null,
+            "retryable": false,
+            "source_ref": "sentiment.china_local"
+          },
+          "tool_call_id": "recorded_outcome_002",
+          "tool_name": "recorded_acquisition"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "sentiment.news",
+            "http_status": null,
+            "outcome": "unavailable",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": "no_data",
+            "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+            "retry_after_seconds": null,
+            "retryable": false,
+            "source_ref": "sentiment.news"
+          },
+          "tool_call_id": "recorded_outcome_003",
+          "tool_name": "recorded_acquisition"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "stock_individual_notice_report",
+            "http_status": null,
+            "outcome": "unavailable",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": "no_data",
+            "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+            "retry_after_seconds": null,
+            "retryable": false,
+            "source_ref": "stock_individual_notice_report"
+          },
+          "tool_call_id": "recorded_outcome_004",
+          "tool_name": "recorded_acquisition"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "verified_market_snapshot",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "baostock",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T12:04:37.906984+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "snapshot:47133c0697d3e20c1b37c67ccce5be103b87b64f3d58a4f5177fd5cfbe891d7e"
+          },
+          "tool_call_id": "recorded_call_001",
+          "tool_name": "get_verified_market_snapshot"
+        }
+      ],
+      "summary": {
+        "attempts": 5,
+        "available": 2,
+        "circuit_breaker_events": 0,
+        "retry_events": 0,
+        "retryable_unavailable": 0,
+        "unavailable": 3,
+        "unavailable_reasons": {
+          "no_data": 3
+        }
+      }
+    },
+    "contract_version": "1.0",
+    "stages": {},
+    "terminal_route": "analysis_outcome"
+  },
+  "source_audit_sha256": "8cc76042f9e23bbc481778f28d2d837053f96fbe4d38b6c4553093a9114eb409",
+  "source_report": "reports/600895.SS_20260719_050442/decision-audit.json",
+  "source_report_sha256": "b6c13b0dce09047437258c74a10fc8d33ee2a6896f994973263be2059b099827"
+}

@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from cli import main as cli_main
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    SourceAcquisitionUnavailable,
+)
+from tradingagents.run_telemetry import RunTelemetryLedger
 
 
 def _selections():
@@ -350,12 +355,13 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     tmp_path, monkeypatch
 ):
     snapshot_scope_events = []
+    telemetry_ledger = RunTelemetryLedger()
 
     @contextmanager
     def snapshot_scope():
         snapshot_scope_events.append("entered")
         try:
-            yield
+            yield SimpleNamespace(telemetry_ledger=telemetry_ledger)
         finally:
             snapshot_scope_events.append("exited")
 
@@ -376,6 +382,21 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
 
     class FakeStream:
         def stream(self, *args, **kwargs):
+            telemetry_ledger.record_acquisition(
+                SimpleNamespace(
+                    tool_call_id="news-circuit",
+                    tool_name="get_news",
+                ),
+                SourceAcquisitionUnavailable(
+                    provider="news-primary",
+                    capability="instrument_news",
+                    source_ref="news:688519.SS",
+                    attempt=1,
+                    retrieved_at="2026-07-22T18:00:00Z",
+                    retryable=False,
+                    reason=AcquisitionUnavailableReason.CIRCUIT_OPEN,
+                ),
+            )
             raise KeyboardInterrupt("ctrl-c")
             yield {}
 
@@ -383,6 +404,9 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
         def __init__(self, *args, **kwargs):
             self.propagator = FakePropagator()
             self.graph = FakeStream()
+
+        def create_initial_state(self, *args, **kwargs):
+            return self.propagator.create_initial_state(*args, **kwargs)
 
         def resolve_instrument_context(self, *args, **kwargs):
             return "resolved identity"
@@ -407,6 +431,11 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     assert payload["error_summary"] == "KeyboardInterrupt: ctrl-c"
     assert display.closed is True
     assert snapshot_scope_events == ["entered", "exited"]
+    metrics = json.loads(
+        next(tmp_path.rglob("runtime_metrics.json")).read_text(encoding="utf-8")
+    )
+    assert metrics["terminal"]["acquisition"]["attempts"] == 1
+    assert metrics["terminal"]["acquisition"]["circuit_breaker_events"] == 1
 
 
 @pytest.mark.unit

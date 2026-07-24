@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import queue
 from datetime import date
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, TypedDict
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
+from langgraph.graph import END, START, StateGraph
 
 from tradingagents.agents.analysts import sentiment_analyst
 from tradingagents.agents.managers.direction_selector import (
@@ -29,6 +33,7 @@ from tradingagents.agents.schemas import (
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.acquisition import AcquisitionResult
 from tradingagents.decision_policy import (
+    AdmittedEvidenceBinding,
     CanonicalFactAdapterResult,
     DecisionAssertion,
     DecisionContextBlocked,
@@ -52,6 +57,7 @@ from tradingagents.decision_policy import (
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     AdmissionGateResult,
+    AnalysisDiagnosticCode,
     AnalysisOutcome,
     CalculationDefinition,
     CalculationLineage,
@@ -70,6 +76,7 @@ from tradingagents.evidence import (
     render_analysis_outcome,
     stable_source_fact_id,
 )
+from tradingagents.graph.checkpointer import get_checkpointer, thread_id
 from tradingagents.graph.conditional_logic import ConditionalLogic
 from tradingagents.graph.evidence_gate import (
     create_admission_gate_node,
@@ -80,9 +87,28 @@ from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.setup import GraphSetup
 from tradingagents.graph.signal_processing import SignalProcessor
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.terminal_contract import TerminalContract, TerminalOutcomeKind
+from tradingagents.terminal_contract import (
+    TerminalContract,
+    TerminalOutcomeKind,
+    build_terminal_contract,
+)
 
 HORIZON = DecisionHorizon(count=20, unit=HorizonUnit.TRADING_DAYS)
+
+
+class _AdmissionResumeState(TypedDict, total=False):
+    run_id: str
+    trade_date: str
+    evidence_state: dict[str, Any]
+    strategy_rule_applications: list[dict[str, Any]]
+    admission_gate: dict[str, Any]
+    admitted_evidence_binding: dict[str, Any]
+    validated_decision_context: dict[str, Any]
+    direction_selection: dict[str, Any]
+    decision_gate: dict[str, Any]
+    decision_gate_v2: dict[str, Any]
+    trading_decision: dict[str, Any]
+    final_trade_decision: str
 
 
 def _context() -> ValidatedDecisionContext:
@@ -100,14 +126,30 @@ def _context() -> ValidatedDecisionContext:
         evaluation_digest="evaluation:pe",
     )
     return ValidatedDecisionContext(
-        context_id="context:NVDA", evidence_contract_version="1.0",
-        registry_digest="registry:test", calculation_registry_digest="calculations:test",
+        context_id="context:" + "1" * 64, evidence_contract_version="1.0",
+        registry_digest="registry:" + "2" * 64,
+        calculation_registry_digest="calculations:" + "3" * 64,
         instrument=DecisionInstrument(
             symbol="NVDA", venue="XNAS", instrument_kind="equity", currency="USD"
         ),
         capability_profile_id="equity-v1", as_of_date=date(2026, 1, 10),
         horizon=HORIZON, facts=(fact,), assertions=(assertion,),
         integrity_status=EvidenceIntegrityStatus.DECISION_READY,
+    )
+
+
+def _checkpoint_binding(
+    context: ValidatedDecisionContext,
+    *,
+    run_id: str = "run:" + "1" * 64,
+) -> AdmittedEvidenceBinding:
+    return AdmittedEvidenceBinding.create(
+        run_id=run_id,
+        evidence_semantic_digest="evidence:" + "4" * 64,
+        context_id=context.context_id,
+        registry_digest=context.registry_digest,
+        calculation_registry_digest=context.calculation_registry_digest,
+        integrity_status=context.integrity_status,
     )
 
 
@@ -284,7 +326,6 @@ def _permitted_policy_case(
         source_artifacts=(artifact, identity_artifact),
         sources=sources,
     )
-    policy.register_trusted_evidence(evidence)
     built = policy.build_context(
         evidence,
         (
@@ -303,13 +344,174 @@ def _permitted_policy_case(
         rating=PortfolioRating.BUY,
         assertion_ids=(built.context.assertions[0].assertion_id,),
     )
-    policy.register_admitted_evidence(evidence, built.context)
+    binding = policy.admit_evidence(
+        evidence,
+        built.context,
+        run_id="run:" + "2" * 64,
+    )
     assert policy.gate(
         built.context,
         selection,
         evidence=evidence,
+        admitted_evidence_binding=binding,
+        run_id=binding.run_id,
+        expected_run_id=binding.run_id,
     ).permitted is True
     return policy, built.context, selection, evidence
+
+
+def _admission_resume_workflow(policy, selection, crash_control):
+    builder = StateGraph(_AdmissionResumeState)
+    builder.add_node(
+        "Evidence Admission",
+        create_admission_gate_node(policy, HORIZON),
+    )
+
+    def after_admission(_state):
+        if crash_control["enabled"]:
+            raise RuntimeError("simulated process exit after admission")
+        return {"direction_selection": selection.model_dump(mode="json")}
+
+    builder.add_node("After Admission", after_admission)
+    builder.add_node("Decision Gate", create_decision_gate_node(policy))
+    builder.add_edge(START, "Evidence Admission")
+    builder.add_edge("Evidence Admission", "After Admission")
+    builder.add_edge("After Admission", "Decision Gate")
+    builder.add_edge("Decision Gate", END)
+    return builder
+
+
+def _resume_admission_checkpoint_in_fresh_process(
+    checkpoint_dir,
+    config,
+    result_queue,
+):
+    """Spawn target proving resume does not inherit process-local policy state."""
+
+    try:
+        policy, context, selection, _ = _permitted_policy_case()
+        with get_checkpointer(checkpoint_dir, "NVDA") as saver:
+            resumed = _admission_resume_workflow(
+                policy,
+                selection,
+                {"enabled": False},
+            ).compile(checkpointer=saver).invoke(None, config=config)
+        result_queue.put(
+            {
+                "context_id": context.context_id,
+                "admitted_evidence_binding": resumed[
+                    "admitted_evidence_binding"
+                ],
+                "trading_decision": resumed["trading_decision"],
+                "terminal_contract": build_terminal_contract(resumed).model_dump(
+                    mode="json"
+                ),
+            }
+        )
+    except Exception as error:
+        result_queue.put({"error": f"{type(error).__name__}: {error}"})
+        raise
+
+
+def test_admission_gate_publishes_run_scoped_checkpoint_binding():
+    policy, context, _, evidence = _permitted_policy_case()
+    node = create_admission_gate_node(policy, HORIZON)
+
+    update = node(
+        {
+            "run_id": "run:" + "3" * 64,
+            "trade_date": "2026-01-10",
+            "evidence_state": evidence.model_dump(mode="json"),
+            "strategy_rule_applications": [],
+        }
+    )
+
+    binding = AdmittedEvidenceBinding.model_validate(
+        update["admitted_evidence_binding"]
+    )
+    assert update["admission_gate"]["admitted"] is True
+    assert binding.run_id == "run:" + "3" * 64
+    assert binding.context_id == context.context_id
+
+
+def test_sqlite_resume_after_admission_in_fresh_process_matches_uninterrupted(
+    tmp_path,
+):
+    policy, expected_context, selection, evidence = _permitted_policy_case()
+    initial_state = {
+        "run_id": "run:" + "4" * 64,
+        "trade_date": "2026-01-10",
+        "evidence_state": evidence.model_dump(mode="json"),
+        "strategy_rule_applications": [],
+    }
+    crash_control = {"enabled": True}
+    config = {
+        "configurable": {
+            "thread_id": thread_id("NVDA", "2026-01-10", "binding-v1"),
+            "run_id": initial_state["run_id"],
+        }
+    }
+    with get_checkpointer(tmp_path, "NVDA") as saver:
+        graph = _admission_resume_workflow(policy, selection, crash_control).compile(
+            checkpointer=saver
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="simulated process exit after admission",
+        ):
+            graph.invoke(initial_state, config=config)
+
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    process = process_context.Process(
+        target=_resume_admission_checkpoint_in_fresh_process,
+        args=(str(tmp_path), config, result_queue),
+    )
+    process.start()
+    process.join(timeout=60)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=10)
+        pytest.fail("fresh-process checkpoint resume timed out")
+    try:
+        resumed = result_queue.get(timeout=5)
+    except queue.Empty:
+        pytest.fail(
+            "fresh-process checkpoint resume returned no result; "
+            f"exit code {process.exitcode}"
+        )
+    assert "error" not in resumed, resumed.get("error")
+    assert process.exitcode == 0
+    assert resumed["context_id"] == expected_context.context_id
+
+    uninterrupted_config = {
+        "configurable": {
+            "thread_id": thread_id("NVDA", "2026-01-10", "binding-v1-clean"),
+            "run_id": initial_state["run_id"],
+        }
+    }
+    resumed_policy, _, resumed_selection, resumed_evidence = (
+        _permitted_policy_case()
+    )
+    assert resumed_evidence == evidence
+    crash_control["enabled"] = False
+    with get_checkpointer(tmp_path, "NVDA") as saver:
+        uninterrupted = _admission_resume_workflow(
+            resumed_policy,
+            resumed_selection,
+            crash_control,
+        ).compile(checkpointer=saver).invoke(
+            initial_state,
+            config=uninterrupted_config,
+        )
+
+    assert resumed["admitted_evidence_binding"] == uninterrupted[
+        "admitted_evidence_binding"
+    ]
+    assert resumed["trading_decision"] == uninterrupted["trading_decision"]
+    assert resumed["terminal_contract"] == build_terminal_contract(
+        uninterrupted
+    ).model_dump(mode="json")
 
 
 class _FixtureStructuredBinding:
@@ -514,6 +716,7 @@ def test_admission_empty_applications_short_circuits_policy(monkeypatch):
         integrity_status=EvidenceIntegrityStatus.INSUFFICIENT,
         blocker_codes=("no_applicable_registered_strategy_rule",),
         diagnostics=("no applicable rule",),
+        diagnostic_codes=(AnalysisDiagnosticCode.STRATEGY_RULE_INVALID,),
     )
     monkeypatch.setattr(
         "tradingagents.graph.evidence_gate.evaluate_admission_gate",
@@ -530,6 +733,13 @@ def test_admission_empty_applications_short_circuits_policy(monkeypatch):
     )
 
     assert update["admission_gate"]["admitted"] is False
+    assert update["admission_gate"]["diagnostic_codes"] == [
+        AnalysisDiagnosticCode.STRATEGY_RULE_INVALID.value
+    ]
+    outcome = AnalysisOutcome.model_validate(update["analysis_outcome_contract"])
+    assert outcome.diagnostic_codes == (
+        AnalysisDiagnosticCode.STRATEGY_RULE_INVALID,
+    )
     assert "analysis_outcome" in update
     policy.build_context.assert_called_once()
     restored = policy.build_context.call_args.args[0].source_facts[0].normalized_value
@@ -539,7 +749,7 @@ def test_admission_empty_applications_short_circuits_policy(monkeypatch):
     assert policy.build_context.call_args.kwargs[
         "tolerate_unsatisfied_applications"
     ] is True
-    policy.register_admitted_evidence.assert_not_called()
+    policy.admit_evidence.assert_not_called()
 
 
 @pytest.mark.unit
@@ -555,6 +765,8 @@ def test_admission_discovers_registered_candidates_when_state_selection_is_empty
     policy = MagicMock()
     policy.candidate_applications.return_value = (application,)
     policy.build_context.return_value = DecisionContextBuilt(context=context)
+    binding = _checkpoint_binding(context)
+    policy.admit_evidence.return_value = binding
     evidence = EvidenceState()
     monkeypatch.setattr(
         "tradingagents.graph.evidence_gate.evaluate_admission_gate",
@@ -567,6 +779,7 @@ def test_admission_discovers_registered_candidates_when_state_selection_is_empty
 
     update = create_admission_gate_node(policy, HORIZON)(
         {
+            "run_id": binding.run_id,
             "evidence_state": evidence.model_dump(mode="json"),
             "strategy_rule_applications": [],
             "trade_date": "2026-01-10",
@@ -580,7 +793,12 @@ def test_admission_discovers_registered_candidates_when_state_selection_is_empty
     assert policy.build_context.call_args.kwargs[
         "tolerate_unsatisfied_applications"
     ] is True
-    policy.register_admitted_evidence.assert_called_once_with(evidence, context)
+    policy.admit_evidence.assert_called_once_with(
+        evidence,
+        context,
+        run_id=binding.run_id,
+    )
+    assert update["admitted_evidence_binding"] == binding.model_dump(mode="json")
 
 
 @pytest.mark.unit
@@ -684,6 +902,10 @@ def test_public_propagate_publishes_audited_signal_and_memory(tmp_path):
         "audit_digest"
     ]
     assert final_state["decision_audit_path"]
+    assert (
+        final_state["admitted_evidence_binding"]["run_id"]
+        == final_state["run_id"]
+    )
     assert graph.curr_state is final_state
     [entry] = graph.memory_log.load_entries()
     assert entry["ticker"] == "NVDA"
@@ -723,7 +945,46 @@ def test_public_propagate_publishes_audited_signal_and_memory(tmp_path):
 
 
 @pytest.mark.unit
-def test_600895_optional_news_degrades_but_still_generates_valid_report(
+def test_cli_style_stream_and_programmatic_runner_share_terminal_contract(tmp_path):
+    policy, _, selection, evidence = _permitted_policy_case()
+    programmatic_graph = _PermittedPropagateHarness(
+        tmp_path / "programmatic",
+        policy,
+        selection,
+        evidence,
+    )
+    programmatic_state, _ = programmatic_graph.propagate(
+        "NVDA",
+        "2026-01-10",
+    )
+
+    cli_policy, _, cli_selection, cli_evidence = _permitted_policy_case()
+    cli_graph = _PermittedPropagateHarness(
+        tmp_path / "cli",
+        cli_policy,
+        cli_selection,
+        cli_evidence,
+    )
+    cli_initial_state = cli_graph.create_initial_state(
+        "NVDA",
+        "2026-01-10",
+        evidence_state=cli_evidence,
+    )
+    cli_state = cli_graph.graph.invoke(
+        cli_initial_state,
+        config={"configurable": {"run_id": cli_initial_state["run_id"]}},
+    )
+
+    assert build_terminal_contract(cli_state) == TerminalContract.model_validate(
+        programmatic_state["terminal_contract"]
+    )
+    assert cli_state["trading_decision"] == programmatic_state[
+        "trading_decision"
+    ]
+
+
+@pytest.mark.unit
+def test_synthetic_optional_news_degrades_but_still_generates_valid_report(
     tmp_path,
     monkeypatch,
 ):
@@ -831,7 +1092,9 @@ def test_600895_optional_news_degrades_but_still_generates_valid_report(
 
 
 @pytest.mark.unit
-def test_601658_deterministic_selection_generates_report_without_selector_llm(tmp_path):
+def test_synthetic_deterministic_selection_generates_report_without_selector_llm(
+    tmp_path,
+):
     policy, _context, selection, evidence = _permitted_policy_case(
         symbol="601658.SS",
         venue="XSHG",
@@ -928,6 +1191,7 @@ def test_selector_blocks_context_with_multiple_target_ratings():
 @pytest.mark.unit
 def test_semantic_gate_rejection_does_not_retry_selector_or_publish():
     context = _context()
+    binding = _checkpoint_binding(context)
     llm = _StructuredLLM(_selection(context))
     selection_update = create_direction_selector(llm)(
         {"validated_decision_context": context.model_dump(mode="json")}
@@ -941,10 +1205,13 @@ def test_semantic_gate_rejection_does_not_retry_selector_or_publish():
 
     update = create_decision_gate_node(policy)(
         {
+            "run_id": binding.run_id,
+            "admitted_evidence_binding": binding.model_dump(mode="json"),
             "validated_decision_context": context.model_dump(mode="json"),
             "direction_selection": swapped,
             "evidence_state": EvidenceState().model_dump(mode="json"),
-        }
+        },
+        config={"configurable": {"run_id": binding.run_id}},
     )
 
     assert len(llm.prompts) == 0
@@ -958,6 +1225,7 @@ def test_semantic_gate_rejection_does_not_retry_selector_or_publish():
 @pytest.mark.unit
 def test_permitted_gate_publishes_only_deterministic_contract_and_render():
     context = _context()
+    binding = _checkpoint_binding(context)
     decision = TradingDecisionContract(
         decision_id="decision:NVDA", context_id=context.context_id,
         registry_digest=context.registry_digest,
@@ -974,10 +1242,13 @@ def test_permitted_gate_publishes_only_deterministic_contract_and_render():
 
     update = create_decision_gate_node(policy)(
         {
+            "run_id": binding.run_id,
+            "admitted_evidence_binding": binding.model_dump(mode="json"),
             "validated_decision_context": context.model_dump(mode="json"),
             "direction_selection": _selection(context).model_dump(mode="json"),
             "evidence_state": EvidenceState().model_dump(mode="json"),
-        }
+        },
+        config={"configurable": {"run_id": binding.run_id}},
     )
 
     assert update["trading_decision"] == decision.model_dump(mode="json")
@@ -992,6 +1263,11 @@ def test_shadow_mode_cannot_bypass_decision_gate_or_publish():
     )
 
     assert update["decision_gate"]["permitted"] is False
+    assert update["decision_gate"]["diagnostic_codes"] == [
+        AnalysisDiagnosticCode.SHADOW_MODE.value
+    ]
+    outcome = AnalysisOutcome.model_validate(update["analysis_outcome_contract"])
+    assert outcome.diagnostic_codes == (AnalysisDiagnosticCode.SHADOW_MODE,)
     assert "trading_decision" not in update
     assert "final_trade_decision" not in update
 
@@ -1021,7 +1297,11 @@ def test_shadow_mode_blocks_a_policy_permitted_direction():
 
 @pytest.mark.unit
 def test_json_safe_nullable_initial_state_and_topology_signature_contract():
-    state = Propagator().create_initial_state("NVDA", "2026-01-10")
+    state = Propagator().create_initial_state(
+        "NVDA",
+        "2026-01-10",
+        run_id="run:" + "5" * 64,
+    )
     round_trip = json.loads(json.dumps(state))
     assert state["strategy_rule_applications"] == []
     assert state["decision_gate_v2"] == {}
@@ -1030,7 +1310,7 @@ def test_json_safe_nullable_initial_state_and_topology_signature_contract():
     for field in (
         "validated_decision_context", "direction_selection",
         "direction_selection_diagnostics", "direction_selector_diagnostics",
-        "trading_decision", "final_trade_decision",
+        "admitted_evidence_binding", "trading_decision", "final_trade_decision",
     ):
         assert state[field] is None
         assert round_trip[field] is None

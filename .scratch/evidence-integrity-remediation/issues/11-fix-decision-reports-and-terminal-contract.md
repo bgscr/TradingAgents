@@ -1,6 +1,6 @@
 # Fix decision reports, metrics, and terminal contracts
 
-Status: ready-for-agent
+Status: completed
 
 Blocked by: 10
 

@@ -21,6 +21,7 @@ from tradingagents.evidence import (
     stable_acquisition_source_ref,
     stable_market_snapshot_id,
 )
+from tradingagents.run_telemetry import RunTelemetryLedger
 
 from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
 from .config import get_config
@@ -129,9 +130,8 @@ class _AuthoritativeSnapshotRun:
     latest_snapshots: dict[tuple[str, str], AuthoritativeMarketSnapshot] = field(
         default_factory=dict
     )
-    acquisition_controller: AcquisitionController = field(
-        default_factory=lambda: AcquisitionController(providers=())
-    )
+    telemetry_ledger: RunTelemetryLedger = field(default_factory=RunTelemetryLedger)
+    acquisition_controller: AcquisitionController = field(init=False)
     acquisition_records: dict[
         tuple[str, str, str], MarketSnapshotAcquisitionRecord
     ] = field(default_factory=dict)
@@ -139,6 +139,12 @@ class _AuthoritativeSnapshotRun:
         tuple[str, str], MarketSnapshotAcquisitionRecord
     ] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        self.acquisition_controller = AcquisitionController(
+            providers=(),
+            outcome_observer=self.telemetry_ledger.record_acquisition,
+        )
 
 
 _ACTIVE_SNAPSHOT_RUN: ContextVar[_AuthoritativeSnapshotRun | None] = ContextVar(
@@ -152,12 +158,13 @@ def authoritative_snapshot_run():
     """Reuse accepted market frames for the duration of one analysis run."""
     active = _ACTIVE_SNAPSHOT_RUN.get()
     if active is not None:
-        yield
+        yield active
         return
 
-    token = _ACTIVE_SNAPSHOT_RUN.set(_AuthoritativeSnapshotRun())
+    run = _AuthoritativeSnapshotRun()
+    token = _ACTIVE_SNAPSHOT_RUN.set(run)
     try:
-        yield
+        yield run
     finally:
         _ACTIVE_SNAPSHOT_RUN.reset(token)
 
@@ -166,6 +173,12 @@ def get_active_acquisition_controller() -> AcquisitionController | None:
     """Return the controller owned by the active analysis run, when present."""
     active = _ACTIVE_SNAPSHOT_RUN.get()
     return None if active is None else active.acquisition_controller
+
+
+def get_active_run_telemetry() -> RunTelemetryLedger | None:
+    """Return the canonical telemetry ledger owned by the active run."""
+    active = _ACTIVE_SNAPSHOT_RUN.get()
+    return None if active is None else active.telemetry_ledger
 
 
 def _load_akshare(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:

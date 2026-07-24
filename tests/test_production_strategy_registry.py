@@ -30,7 +30,12 @@ from tradingagents.strategy_registry import (
 )
 
 
-def _market_evidence(last_close: str = "110") -> EvidenceState:
+def _market_evidence(
+    last_close: str = "110",
+    *,
+    instrument_kind: str = "equity",
+    symbol: str = "600895.SS",
+) -> EvidenceState:
     dates = tuple(f"2026-06-{day:02d}" for day in range(1, 22))
     closes = ("100",) * 20 + (last_close,)
     raw_text = "Date,Open,High,Low,Close,Volume\n" + "".join(
@@ -46,7 +51,7 @@ def _market_evidence(last_close: str = "110") -> EvidenceState:
         raw_text=raw_text,
     )
     snapshot_id = stable_market_snapshot_id(
-        symbol="510500.SS",
+        symbol=symbol,
         provider="synthetic",
         adjustment_basis="qfq",
         requested_date="2026-06-21",
@@ -56,16 +61,16 @@ def _market_evidence(last_close: str = "110") -> EvidenceState:
     )
     snapshot = SimpleNamespace(
         adjustment_basis="qfq",
-        symbol="510500.SS",
+        symbol=symbol,
         effective_trading_date="2026-06-21",
         snapshot_id=snapshot_id,
     )
     fact = build_market_return_fact(snapshot, artifact)
     return EvidenceState(
         instrument_identity=InstrumentIdentityEvidence(
-            symbol="510500.SS",
+            symbol=symbol,
             venue="XSHG",
-            instrument_kind="fund",
+            instrument_kind=instrument_kind,
             currency="CNY",
             provenance=IdentityProvenance(
                 provider="mainland-security-master",
@@ -75,7 +80,7 @@ def _market_evidence(last_close: str = "110") -> EvidenceState:
             ),
         ),
         market_snapshot=MarketSnapshotEvidence(
-            symbol="510500.SS",
+            symbol=symbol,
             provider="synthetic",
             retrieved_at="2026-06-21T12:00:00+00:00",
             adjustment_basis="qfq",
@@ -88,6 +93,26 @@ def _market_evidence(last_close: str = "110") -> EvidenceState:
         source_facts=(fact,),
         source_artifacts=(artifact,),
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("instrument_kind", ("fund", "index"))
+def test_generic_market_return_rules_do_not_apply_to_non_equity_instruments(
+    instrument_kind,
+):
+    symbol = "510500.SS" if instrument_kind == "fund" else "000001.SS"
+    evidence = _market_evidence(
+        instrument_kind=instrument_kind,
+        symbol=symbol,
+    )
+    policy = create_production_decision_policy()
+
+    applications = policy.candidate_applications(
+        evidence,
+        horizon=DEFAULT_DECISION_HORIZON,
+    )
+
+    assert applications == ()
 
 
 @pytest.mark.unit
@@ -106,7 +131,6 @@ def test_production_policy_authorizes_rule_supported_rating_from_snapshot(
 ):
     evidence = _market_evidence(last_close)
     policy = create_production_decision_policy()
-    policy.register_trusted_evidence(evidence)
     applications = policy.candidate_applications(
         evidence,
         horizon=DEFAULT_DECISION_HORIZON,
@@ -120,7 +144,11 @@ def test_production_policy_authorizes_rule_supported_rating_from_snapshot(
         tolerate_unsatisfied_applications=True,
     )
     context = built.context
-    policy.register_admitted_evidence(evidence, context)
+    binding = policy.admit_evidence(
+        evidence,
+        context,
+        run_id="run:" + "1" * 64,
+    )
     selection = DirectionSelection(
         context_id=context.context_id,
         rating=expected_rating,
@@ -131,6 +159,9 @@ def test_production_policy_authorizes_rule_supported_rating_from_snapshot(
         context,
         selection,
         evidence=evidence,
+        admitted_evidence_binding=binding,
+        run_id=binding.run_id,
+        expected_run_id=binding.run_id,
     )
 
     assert result.permitted is True
@@ -145,7 +176,6 @@ def test_production_policy_authorizes_rule_supported_rating_from_snapshot(
 def test_graph_decision_gate_authorizes_from_checkpoint_safe_artifact_ledger():
     evidence = _market_evidence()
     policy = create_production_decision_policy()
-    policy.register_trusted_evidence(evidence)
     built = policy.build_context(
         evidence,
         policy.candidate_applications(
@@ -157,7 +187,11 @@ def test_graph_decision_gate_authorizes_from_checkpoint_safe_artifact_ledger():
         tolerate_unsatisfied_applications=True,
     )
     context = built.context
-    policy.register_admitted_evidence(evidence, context)
+    binding = policy.admit_evidence(
+        evidence,
+        context,
+        run_id="run:" + "2" * 64,
+    )
     selection = DirectionSelection(
         context_id=context.context_id,
         rating=PortfolioRating.BUY,
@@ -165,15 +199,99 @@ def test_graph_decision_gate_authorizes_from_checkpoint_safe_artifact_ledger():
     )
     node = create_decision_gate_node(policy)
 
-    update = node({
-        "validated_decision_context": context.model_dump(mode="json"),
-        "direction_selection": selection.model_dump(mode="json"),
-        "evidence_state": evidence.model_dump(mode="json"),
-    })
+    update = node(
+        {
+            "run_id": binding.run_id,
+            "admitted_evidence_binding": binding.model_dump(mode="json"),
+            "validated_decision_context": context.model_dump(mode="json"),
+            "direction_selection": selection.model_dump(mode="json"),
+            "evidence_state": evidence.model_dump(mode="json"),
+        },
+        config={"configurable": {"run_id": binding.run_id}},
+    )
 
     assert update["decision_gate"]["permitted"] is True
     assert update["trading_decision"]["rating"] == PortfolioRating.BUY.value
     assert "Analysis Outcome" not in update.get("analysis_outcome", "")
+
+
+def test_fresh_policy_instance_authorizes_from_checkpointed_admission_binding():
+    evidence = _market_evidence()
+    admission_policy = create_production_decision_policy()
+    built = admission_policy.build_context(
+        evidence,
+        admission_policy.candidate_applications(
+            evidence,
+            horizon=DEFAULT_DECISION_HORIZON,
+        ),
+        horizon=DEFAULT_DECISION_HORIZON,
+        as_of_date=date(2026, 6, 21),
+        tolerate_unsatisfied_applications=True,
+    )
+    context = built.context
+    binding = admission_policy.admit_evidence(
+        evidence,
+        context,
+        run_id="run:" + "3" * 64,
+    )
+    selection = DirectionSelection(
+        context_id=context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=tuple(
+            assertion.assertion_id for assertion in context.assertions
+        ),
+    )
+
+    resumed_node = create_decision_gate_node(create_production_decision_policy())
+    update = resumed_node(
+        {
+            "run_id": binding.run_id,
+            "admitted_evidence_binding": binding.model_dump(mode="json"),
+            "validated_decision_context": context.model_dump(mode="json"),
+            "direction_selection": selection.model_dump(mode="json"),
+            "evidence_state": evidence.model_dump(mode="json"),
+        },
+        config={"configurable": {"run_id": binding.run_id}},
+    )
+
+    assert update["decision_gate"]["permitted"] is True
+    assert update["trading_decision"]["rating"] == PortfolioRating.BUY.value
+
+
+def test_decision_gate_rejects_legacy_state_without_admission_binding():
+    evidence = _market_evidence()
+    policy = create_production_decision_policy()
+    built = policy.build_context(
+        evidence,
+        policy.candidate_applications(
+            evidence,
+            horizon=DEFAULT_DECISION_HORIZON,
+        ),
+        horizon=DEFAULT_DECISION_HORIZON,
+        as_of_date=date(2026, 6, 21),
+        tolerate_unsatisfied_applications=True,
+    )
+    context = built.context
+    selection = DirectionSelection(
+        context_id=context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=tuple(
+            assertion.assertion_id for assertion in context.assertions
+        ),
+    )
+
+    update = create_decision_gate_node(policy)(
+        {
+            "validated_decision_context": context.model_dump(mode="json"),
+            "direction_selection": selection.model_dump(mode="json"),
+            "evidence_state": evidence.model_dump(mode="json"),
+        }
+    )
+
+    assert update["decision_gate"]["permitted"] is False
+    assert "admitted evidence binding is unavailable" in update["decision_gate"][
+        "diagnostics"
+    ]
 
 
 @pytest.mark.unit
@@ -205,7 +323,7 @@ def test_graph_decision_gate_blocks_without_registered_source_fact_ledger():
 
     assert update["decision_gate"]["permitted"] is False
     assert update["decision_gate"]["diagnostics"] == [
-        "decision admitted evidence unavailable"
+        "admitted evidence binding is unavailable"
     ]
     assert "trading_decision" not in update
 
@@ -214,7 +332,22 @@ def test_graph_decision_gate_blocks_without_registered_source_fact_ledger():
 def test_graph_decision_gate_blocks_changed_source_fact_identity():
     evidence = _market_evidence()
     policy = create_production_decision_policy()
-    policy.register_trusted_evidence(evidence)
+    built = policy.build_context(
+        evidence,
+        policy.candidate_applications(
+            evidence,
+            horizon=DEFAULT_DECISION_HORIZON,
+        ),
+        horizon=DEFAULT_DECISION_HORIZON,
+        as_of_date=date(2026, 6, 21),
+        tolerate_unsatisfied_applications=True,
+    )
+    context = built.context
+    binding = policy.admit_evidence(
+        evidence,
+        context,
+        run_id="run:" + "4" * 64,
+    )
     original_fact = evidence.source_facts[0]
     changed_fact = original_fact.model_copy(update={"effective_date": "2026-06-20"})
     changed_fact = changed_fact.model_copy(
@@ -231,17 +364,6 @@ def test_graph_decision_gate_blocks_changed_source_fact_identity():
         }
     )
     changed_evidence = evidence.model_copy(update={"source_facts": (changed_fact,)})
-    built = policy.build_context(
-        changed_evidence,
-        policy.candidate_applications(
-            changed_evidence,
-            horizon=DEFAULT_DECISION_HORIZON,
-        ),
-        horizon=DEFAULT_DECISION_HORIZON,
-        as_of_date=date(2026, 6, 21),
-        tolerate_unsatisfied_applications=True,
-    )
-    context = built.context
     selection = DirectionSelection(
         context_id=context.context_id,
         rating=PortfolioRating.BUY,
@@ -249,15 +371,20 @@ def test_graph_decision_gate_blocks_changed_source_fact_identity():
     )
     node = create_decision_gate_node(policy)
 
-    update = node({
-        "validated_decision_context": context.model_dump(mode="json"),
-        "direction_selection": selection.model_dump(mode="json"),
-        "evidence_state": changed_evidence.model_dump(mode="json"),
-    })
+    update = node(
+        {
+            "run_id": binding.run_id,
+            "admitted_evidence_binding": binding.model_dump(mode="json"),
+            "validated_decision_context": context.model_dump(mode="json"),
+            "direction_selection": selection.model_dump(mode="json"),
+            "evidence_state": changed_evidence.model_dump(mode="json"),
+        },
+        config={"configurable": {"run_id": binding.run_id}},
+    )
 
     assert update["decision_gate"]["permitted"] is False
     assert update["decision_gate"]["diagnostics"] == [
-        "decision admitted evidence unavailable"
+        "decision admitted evidence mismatch"
     ]
     assert "trading_decision" not in update
 

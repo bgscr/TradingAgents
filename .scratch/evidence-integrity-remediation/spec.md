@@ -1,6 +1,6 @@
 # Evidence integrity and runtime efficiency remediation
 
-Status: ready-for-agent
+Status: completed
 
 ## Source
 
@@ -153,6 +153,55 @@ Legacy acceptance scenarios for Chinese monetary normalization, invalid OHLC fal
 6. Land deterministic reports, split metrics, terminal-state contract, export identity, and cost/call telemetry.
 7. Run focused tests, full suite, Ruff, diff checks, replay fixtures, migration tests, and required specialist reviews.
 8. Only with explicit cost approval, run controlled live validation for an equity, a mainland fund, and an optional-source-degraded case.
+
+## Controlled live-validation finding
+
+Judith Sholler authorized the three-run DeepSeek validation on 2026-07-23 with
+a CNY 33 total spend limit, 20-minute per-run limit, sequential execution,
+`debate=1|risk=1`, zero SDK retries, disabled checkpointing, and the shared
+analysis date 2026-07-23.
+
+- The `600895.SS` Equity completed with a canonical rule-backed `Sell`,
+  degraded optional-news availability, complete Decision Assertion Coverage,
+  reconciled audit/runtime telemetry, and content-addressed artifacts whose
+  plaintext digests verified.
+- The `510500.SS` Fund resolved authoritatively to `fund` and `fund.v1`, excluded
+  company fundamentals, and completed with the required non-directional
+  Analysis Outcome because the production registry has no applicable Fund
+  Strategy Rule. It made zero model/tool calls and produced no directional
+  write.
+- The process-local degraded-news `600895.SS` run preserved required identity
+  and snapshot availability and recorded the intended typed `not_configured`
+  optional-news outcome. It then stopped on an external DeepSeek HTTP 503 in
+  the Bull Researcher stage. The run correctly used zero retries and finalized
+  as typed `graph_execution` operational failure, but it could not create a
+  canonical audit or satisfy the live acceptance gate.
+
+The first attempt's final observed DeepSeek balance delta was CNY 0.31, well
+inside the approved envelope. It left controlled live acceptance incomplete
+until the user authorized one degraded-news retry on 2026-07-24.
+
+That single retry completed canonically in 520 seconds. It preserved required
+Instrument Identity, used registered BaoStock fallback after a typed AkShare
+market-snapshot failure, recorded the intended
+`validation_unavailable / sentiment_news / not_configured` optional-news
+outcome, and excluded unavailable-source diagnostics from the Validated
+Decision Context. Its rule-backed `Sell` retained the baseline rating, Strategy
+Rule version, comparator, threshold, polarity, target, and horizon. Audit,
+runtime telemetry, deterministic reports, and content-addressed artifacts
+passed 27 of 27 focused reconciliation checks.
+
+The retry used an observed CNY 0.21, bringing total observed spend to CNY 0.52
+and leaving CNY 32.48 of the approved envelope. A post-terminal Windows GBK
+console render raised `UnicodeEncodeError` on `¥`, but canonical status, audit,
+report, and telemetry had already finalized as completed. That console defect
+was reproduced and resolved offline by normalizing CLI stdout/stderr to UTF-8;
+strict-GBK regression coverage now verifies Rich report output preserves `¥`.
+The correction does not touch the directional trust contract or canonical
+artifacts.
+
+Controlled live acceptance is complete. Exact run IDs, digests, telemetry,
+artifact paths, and balance checkpoints are recorded in ticket 13.
 
 ## Non-goals
 

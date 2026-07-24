@@ -200,6 +200,12 @@ class TestCheckpointSignature(unittest.TestCase):
         g.selected_analysts = ("market", "news")
         g.config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
         base = g._run_signature("stock")
+        self.assertIn("admission_binding=1", base)
+        legacy = base.replace("|admission_binding=1", "")
+        self.assertNotEqual(
+            thread_id(self.ticker, self.date, legacy),
+            thread_id(self.ticker, self.date, base),
+        )
 
         self.assertNotEqual(base, g._run_signature("crypto"))     # asset mode
         g.selected_analysts = ("market",)

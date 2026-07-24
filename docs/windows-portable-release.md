@@ -78,7 +78,7 @@ reports\ak_candidates.csv
 
 ## Runtime Output Locations
 
-All runtime output is written under the release folder:
+By default, all runtime output is written under the release folder:
 
 ```text
 data\cache
@@ -96,6 +96,16 @@ TRADINGAGENTS_CACHE_DIR
 TRADINGAGENTS_MEMORY_LOG_PATH
 AK_PICK_OUTPUT_PATH
 ```
+
+Values already exported by the caller are preserved, allowing an operator to
+place runtime state elsewhere explicitly.
+
+## Console Encoding
+
+The CLI normalizes stdout and stderr to UTF-8 before rendering progress and
+reports. This prevents model-generated Unicode text, including `¥`, from
+failing when Windows starts Python with a legacy console encoding such as GBK.
+Stored reports and runtime artifacts remain UTF-8 and are not rewritten.
 
 ## API Keys
 

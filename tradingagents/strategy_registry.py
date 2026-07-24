@@ -272,8 +272,6 @@ def production_strategy_rules() -> tuple[StrategyRuleDefinition, ...]:
         "version": "1.0",
         "applicable_instrument_kinds": (
             InstrumentKind.EQUITY,
-            InstrumentKind.FUND,
-            InstrumentKind.INDEX,
         ),
         "required_canonical_fields": (MARKET_RETURN_FIELD,),
         "polarity": RulePolarity.SUPPORTS,

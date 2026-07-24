@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,7 +14,12 @@ import tradingagents.evidence as evidence_module
 import tradingagents.graph.analyst_execution as analyst_execution
 from tradingagents.agents import create_msg_delete
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.dataflows.instrument_identity import (
+    IdentityRegistryAvailable,
+    resolve_authoritative_instrument_identity,
+)
 from tradingagents.evidence import (
+    AnalysisDiagnosticCode,
     AnalysisOutcome,
     CapabilityProfile,
     EvidenceCapability,
@@ -23,6 +30,7 @@ from tradingagents.evidence import (
     InstrumentIdentityEvidence,
     InstrumentKind,
     MarketSnapshotEvidence,
+    build_evidence_state,
     evaluate_admission_gate,
     render_analysis_outcome,
 )
@@ -113,6 +121,44 @@ def test_authoritative_fund_skips_company_fundamentals_without_constructing_anal
     )
     assert evidence.sources[-1].status is EvidenceStatus.NOT_APPLICABLE
     assert evidence.sources[-1].required is False
+
+
+@pytest.mark.unit
+def test_production_510500_identity_routes_away_from_company_fundamentals():
+    registry_path = (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "instrument_identity_registry.json"
+    )
+    digest = sha256(registry_path.read_bytes()).hexdigest()
+    resolved = resolve_authoritative_instrument_identity(
+        "510500.SS",
+        registry_path=registry_path,
+        expected_sha256=digest,
+    )
+    assert isinstance(resolved, IdentityRegistryAvailable)
+    evidence = build_evidence_state(
+        symbol="510500.SS",
+        identity=resolved.identity.as_mapping(),
+        snapshot=None,
+    )
+    factory = MagicMock()
+    node = analyst_execution.create_capability_guarded_analyst_node(
+        analyst_execution.ANALYST_NODE_SPECS["fundamentals"],
+        factory,
+    )
+
+    result = node({"evidence_state": evidence.model_dump(mode="json")})
+
+    factory.assert_not_called()
+    assert result["fundamentals_report"] == (
+        "NOT_APPLICABLE: Fundamentals Analyst is not applicable under "
+        "capability profile fund.v1."
+    )
+    routed = EvidenceState.model_validate(result["evidence_state"])
+    assert routed.instrument_identity is not None
+    assert routed.instrument_identity.instrument_kind is InstrumentKind.FUND
+    assert routed.sources[-1].status is EvidenceStatus.NOT_APPLICABLE
 
 
 @pytest.mark.unit
@@ -294,11 +340,18 @@ def test_preflight_blocks_authoritative_baseline_without_policy_configuration():
     assert route_after_preflight(result) == "blocked"
     assert "decision_horizon_not_configured" in result["evidence_preflight"]["blockers"]
     assert "no_applicable_registered_strategy_rule" in result["evidence_preflight"]["blockers"]
+    assert result["evidence_preflight"]["diagnostic_codes"] == [
+        AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID.value
+    ]
+    outcome = AnalysisOutcome.model_validate(result["analysis_outcome_contract"])
+    assert outcome.diagnostic_codes == (
+        AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,
+    )
     assert "analysis_outcome" in result
 
 
 @pytest.mark.unit
-def test_production_policy_allows_authoritative_baseline_to_reach_analysts():
+def test_production_policy_yields_analysis_outcome_without_fund_specific_rule():
     node = create_preflight_gate_node(
         create_production_decision_policy(),
         DEFAULT_DECISION_HORIZON,
@@ -308,22 +361,34 @@ def test_production_policy_allows_authoritative_baseline_to_reach_analysts():
         {"evidence_state": _authoritative_baseline().model_dump(mode="json")}
     )
 
-    assert result["evidence_preflight"] == {
-        "contract_version": "1.0",
-        "passed": True,
-        "readiness": "decision_ready",
-        "blockers": [],
-    }
-    assert route_after_preflight(result) == "admitted"
-    assert "analysis_outcome" not in result
+    assert result["evidence_preflight"]["passed"] is False
+    assert result["evidence_preflight"]["blockers"] == [
+        "no_applicable_registered_strategy_rule"
+    ]
+    assert route_after_preflight(result) == "blocked"
+    outcome = AnalysisOutcome.model_validate(result["analysis_outcome_contract"])
+    assert outcome.reason.value == "preflight_blocked"
+    assert "No Trading Decision was issued." in result["analysis_outcome"]
+    assert result.get("trading_decision") is None
+    assert result.get("final_trade_decision") is None
 
 
 @pytest.mark.unit
 def test_production_preflight_blocks_history_before_analyst_work():
-    short_history = _authoritative_baseline().model_copy(
+    baseline = _authoritative_baseline()
+    short_history = baseline.model_copy(
         update={
-            "market_snapshot": _authoritative_baseline().market_snapshot.model_copy(
-                update={"history_rows": 20}
+            "instrument_identity": baseline.instrument_identity.model_copy(
+                update={
+                    "symbol": "600895.SS",
+                    "instrument_kind": InstrumentKind.EQUITY,
+                }
+            ),
+            "market_snapshot": baseline.market_snapshot.model_copy(
+                update={
+                    "symbol": "600895.SS",
+                    "history_rows": 20,
+                }
             )
         }
     )

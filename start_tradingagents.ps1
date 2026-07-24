@@ -14,6 +14,7 @@ else {
 $AppDir = (Resolve-Path -LiteralPath $ScriptDir).Path
 $TradingAgentsExe = Join-Path $AppDir "tradingagents.exe"
 $VenvActivate = Join-Path $AppDir ".venv\Scripts\Activate.ps1"
+$VenvPython = Join-Path $AppDir ".venv\Scripts\python.exe"
 
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -22,27 +23,96 @@ function Ensure-Directory {
     }
 }
 
+function Get-ConfiguredRuntimePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$EnvironmentName,
+        [Parameter(Mandatory = $true)][string]$DefaultPath
+    )
+
+    $ConfiguredPath = [Environment]::GetEnvironmentVariable(
+        $EnvironmentName,
+        [EnvironmentVariableTarget]::Process
+    )
+    if ([string]::IsNullOrWhiteSpace($ConfiguredPath)) {
+        return $DefaultPath
+    }
+    return $ConfiguredPath
+}
+
 function Set-PortableTradingAgentsEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [switch]$CreateDirectories
     )
 
-    $ReportsDir = Join-Path $Root "reports\runs"
-    $CacheDir = Join-Path $Root "data\cache"
-    $MemoryDir = Join-Path $Root "data\memory"
+    $ReportsDir = Get-ConfiguredRuntimePath `
+        -EnvironmentName "TRADINGAGENTS_RESULTS_DIR" `
+        -DefaultPath (Join-Path $Root "reports\runs")
+    $CacheDir = Get-ConfiguredRuntimePath `
+        -EnvironmentName "TRADINGAGENTS_CACHE_DIR" `
+        -DefaultPath (Join-Path $Root "data\cache")
+    $MemoryLogPath = Get-ConfiguredRuntimePath `
+        -EnvironmentName "TRADINGAGENTS_MEMORY_LOG_PATH" `
+        -DefaultPath (Join-Path $Root "data\memory\trading_memory.md")
+    $MemoryDir = Split-Path -Parent $MemoryLogPath
     $LogsDir = Join-Path $Root "logs"
 
     if ($CreateDirectories) {
         Ensure-Directory $ReportsDir
         Ensure-Directory $CacheDir
-        Ensure-Directory $MemoryDir
+        if (-not [string]::IsNullOrWhiteSpace($MemoryDir)) {
+            Ensure-Directory $MemoryDir
+        }
         Ensure-Directory $LogsDir
     }
 
     $env:TRADINGAGENTS_RESULTS_DIR = $ReportsDir
     $env:TRADINGAGENTS_CACHE_DIR = $CacheDir
-    $env:TRADINGAGENTS_MEMORY_LOG_PATH = Join-Path $MemoryDir "trading_memory.md"
+    $env:TRADINGAGENTS_MEMORY_LOG_PATH = $MemoryLogPath
+}
+
+function Get-DevelopmentRuntimeConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    $PythonLauncher = if (Test-Path -LiteralPath $VenvPython -PathType Leaf) {
+        $VenvPython
+    }
+    else {
+        "python"
+    }
+    $ConfigCode = @'
+from tradingagents.default_config import DEFAULT_CONFIG
+print(DEFAULT_CONFIG["results_dir"])
+print(DEFAULT_CONFIG["data_cache_dir"])
+print(DEFAULT_CONFIG["memory_log_path"])
+'@
+    $EncodedConfigCode = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($ConfigCode)
+    )
+    $BootstrapCode = "import sys,base64;exec(base64.b64decode(sys.argv[1]))"
+
+    Push-Location -LiteralPath $Root
+    try {
+        $Configuration = @(
+            & $PythonLauncher -c $BootstrapCode $EncodedConfigCode
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to resolve development runtime configuration."
+        }
+        if ($Configuration.Count -ne 3) {
+            throw "Development runtime configuration returned an unexpected result."
+        }
+        return @(
+            "TRADINGAGENTS_RESULTS_DIR=$($Configuration[0])",
+            "TRADINGAGENTS_CACHE_DIR=$($Configuration[1])",
+            "TRADINGAGENTS_MEMORY_LOG_PATH=$($Configuration[2])"
+        )
+    }
+    finally {
+        Pop-Location
+    }
 }
 
 if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
@@ -67,12 +137,16 @@ if (Test-Path -LiteralPath $TradingAgentsExe -PathType Leaf) {
     exit $LASTEXITCODE
 }
 
+$env:TRADINGAGENTS_PROJECT_ROOT = $AppDir
+
 if ($DryRun) {
     Write-Host "Mode=development"
     Write-Host "ProjectDir=$AppDir"
     Write-Host "AppDir=$AppDir"
     Write-Host "VenvActivate=$VenvActivate"
     Write-Host "Launcher=tradingagents"
+    Get-DevelopmentRuntimeConfiguration -Root $AppDir |
+        ForEach-Object { Write-Host $_ }
     exit 0
 }
 

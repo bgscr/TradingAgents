@@ -24,6 +24,7 @@ class Propagator:
         past_context: str = "",
         instrument_context: str = "",
         evidence_state: EvidenceState | None = None,
+        run_id: str = "",
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph.
 
@@ -39,12 +40,14 @@ class Propagator:
             "asset_type": asset_type,
             "instrument_context": instrument_context,
             "trade_date": str(trade_date),
+            "run_id": run_id,
             "past_context": past_context,
             "evidence_state": (evidence_state or EvidenceState()).model_dump(mode="json"),
             # Gate and selector payloads stay JSON-compatible because LangGraph
             # checkpoints serialize state independently of the in-memory models.
             "evidence_preflight": {},
             "admission_gate": {},
+            "admitted_evidence_binding": None,
             "analysis_outcome": "",
             "analysis_outcome_contract": None,
             "strategy_rule_applications": [],
@@ -86,7 +89,12 @@ class Propagator:
             "news_report": "",
         }
 
-    def get_graph_args(self, callbacks: list | None = None) -> dict[str, Any]:
+    def get_graph_args(
+        self,
+        callbacks: list | None = None,
+        *,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
         """Get arguments for the graph invocation.
 
         Args:
@@ -96,6 +104,8 @@ class Propagator:
         config = {"recursion_limit": self.max_recur_limit}
         if callbacks:
             config["callbacks"] = callbacks
+        if run_id is not None:
+            config["configurable"] = {"run_id": run_id}
         return {
             "stream_mode": "values",
             "config": config,

@@ -38,6 +38,50 @@ def test_message_buffer_reports_whether_section_content_changed():
     assert buffer.update_report_section("market_report", "second") is True
 
 
+@pytest.mark.unit
+def test_message_buffer_labels_model_authored_plans_as_advisory_commentary():
+    buffer = cli_main.MessageBuffer()
+    buffer.init_for_analysis(["market"])
+
+    buffer.update_report_section("investment_plan", "Research prose")
+    buffer.update_report_section(
+        "trader_investment_plan",
+        "FINAL TRANSACTION PROPOSAL: **SELL**",
+    )
+
+    assert buffer.current_report == (
+        "### Trader Advisory Commentary\n"
+        "FINAL TRANSACTION PROPOSAL: **SELL**"
+    )
+    assert "## Research Advisory Commentary\n\nResearch prose" in buffer.final_report
+    assert (
+        "## Trader Advisory Commentary\n\n"
+        "FINAL TRANSACTION PROPOSAL: **SELL**"
+    ) in buffer.final_report
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "runtime_graph_phase",
+    [
+        "research_debate",
+        "trading",
+        "risk_debate",
+        "portfolio_synthesis",
+    ],
+)
+def test_operator_message_projection_labels_model_prose_as_advisory_commentary(
+    runtime_graph_phase,
+):
+    message_type, content = cli_main.classify_message_type(
+        AIMessage(content="Model-authored prose"),
+        runtime_graph_phase=runtime_graph_phase,
+    )
+
+    assert message_type == "Advisory Commentary"
+    assert content == "Model-authored prose"
+
+
 def _run_selections():
     return {
         "ticker": "601658.SS",
@@ -65,12 +109,16 @@ def _run_with_chunks(
     invoke_cli=False,
     evidence_gate_mode="enforce",
     initial_state=None,
+    callback_script=None,
 ):
     class FakeStream:
         def __init__(self):
             self.finished = False
+            self.callbacks = ()
 
         def stream(self, *args, **kwargs):
+            if callback_script is not None:
+                callback_script(self.callbacks)
             yield from chunks
             self.finished = True
 
@@ -95,6 +143,10 @@ def _run_with_chunks(
         def __init__(self, *args, **kwargs):
             self.propagator = FakePropagator()
             self.graph = fake_stream
+            fake_stream.callbacks = tuple(kwargs.get("callbacks", ()))
+
+        def create_initial_state(self, *args, **kwargs):
+            return self.propagator.create_initial_state(*args, **kwargs)
 
         def resolve_instrument_context(self, *args, **kwargs):
             return "resolved identity"
@@ -277,6 +329,9 @@ def test_run_analysis_attributes_tool_before_same_chunk_status_advance(
             self.propagator = FakePropagator()
             self.graph = FakeStream()
 
+        def create_initial_state(self, *args, **kwargs):
+            return self.propagator.create_initial_state(*args, **kwargs)
+
         def resolve_instrument_context(self, *args, **kwargs):
             return "resolved identity"
 
@@ -360,6 +415,56 @@ def test_debate_only_chunks_emit_progress_without_finalized_report_artifacts(
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     assert not (run_dir / "reports" / "investment_plan.md").exists()
     assert not (run_dir / "reports" / "final_trade_decision.md").exists()
+
+
+@pytest.mark.unit
+def test_trader_proposal_is_logged_as_advisory_commentary_without_rewriting_raw_text(
+    tmp_path,
+    monkeypatch,
+):
+    advisory = "FINAL TRANSACTION PROPOSAL: **SELL**"
+    display = _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "messages": [AIMessage(content=advisory, id="trader-advisory")],
+                "trader_investment_plan": advisory,
+            },
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            },
+        ],
+    )
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    log_text = (run_dir / "message_tool.log").read_text(encoding="utf-8")
+    raw_projections = [
+        content
+        for section_name, content, _path, _finished in display.report_calls
+        if section_name == "trader_investment_plan"
+    ]
+
+    assert f"[Advisory Commentary] {advisory}" in log_text
+    assert f"[Agent] {advisory}" not in log_text
+    assert raw_projections == [advisory]
+    artifact_match = re.search(
+        rf"\[Advisory Commentary\] {re.escape(advisory)} "
+        r"artifact=sha256:([0-9a-f]{64})",
+        log_text,
+    )
+    assert artifact_match is not None
+    digest = artifact_match.group(1)
+    artifact_path = (
+        tmp_path
+        / "runtime_artifacts"
+        / "sha256"
+        / digest[:2]
+        / f"{digest}.json.gz"
+    )
+    assert json.loads(gzip.decompress(artifact_path.read_bytes())) == advisory
 
 
 @pytest.mark.unit
@@ -582,6 +687,154 @@ def test_run_analysis_emits_bounded_logs_artifacts_and_runtime_metrics(
     )
     assert "graph_stream" in metrics["durations"]["graph_phase"]
     assert "market_report" in metrics["durations"]["report"]
+
+
+@pytest.mark.unit
+def test_run_analysis_reconciles_circuit_rejection_between_audit_and_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    from tradingagents.dataflows.acquisition import (
+        AcquisitionController,
+        AcquisitionFailure,
+        AcquisitionRequest,
+    )
+    from tradingagents.dataflows.market_snapshot import (
+        get_active_acquisition_controller,
+    )
+    from tradingagents.evidence import AcquisitionUnavailableReason
+
+    def unavailable_news(_request):
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+        )
+
+    def run_chunks():
+        controller = get_active_acquisition_controller()
+        assert isinstance(controller, AcquisitionController)
+        providers = (("news-primary", unavailable_news),)
+        for tool_call_id in ("news-call-1", "news-call-2"):
+            controller.acquire(
+                AcquisitionRequest(
+                    capability="instrument_news",
+                    source_ref="news:601658.SS",
+                    tool_call_id=tool_call_id,
+                    tool_name="get_news",
+                ),
+                validator=lambda value: value,
+                serializer=str,
+                providers=providers,
+            )
+        yield {
+            "messages": [],
+            "analysis_outcome": _INSUFFICIENT_OUTCOME,
+            "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+        }
+
+    _run_with_chunks(tmp_path, monkeypatch, run_chunks())
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    audit = json.loads(
+        (run_dir / "reports" / "decision-audit.json").read_text(encoding="utf-8")
+    )
+    metrics = json.loads(
+        (run_dir / "runtime_metrics.json").read_text(encoding="utf-8")
+    )
+    expected_summary = {
+        "attempts": 2,
+        "available": 0,
+        "unavailable": 2,
+        "retryable_unavailable": 1,
+        "retry_events": 0,
+        "circuit_breaker_events": 1,
+        "unavailable_reasons": {
+            "circuit_open": 1,
+            "provider_error": 1,
+        },
+    }
+
+    assert audit["schema_version"] == "4.0"
+    assert audit["telemetry"]["acquisition"]["summary"] == expected_summary
+    assert [
+        event["outcome"]["reason"]
+        for event in audit["telemetry"]["acquisition"]["events"]
+    ] == ["provider_error", "circuit_open"]
+    assert metrics["terminal"]["acquisition"] == expected_summary
+
+
+@pytest.mark.unit
+def test_run_analysis_reconciles_stage_usage_between_audit_and_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    from uuid import UUID
+
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    def emit_model_and_tool_usage(callbacks):
+        handler = callbacks[0]
+        model_run_id = UUID("00000000-0000-0000-0000-000000000001")
+        tool_run_id = UUID("00000000-0000-0000-0000-000000000002")
+        handler.on_chat_model_start(
+            {"name": "test-model"},
+            [[]],
+            run_id=model_run_id,
+            metadata={"langgraph_node": "market_analyst"},
+        )
+        handler.on_llm_end(
+            LLMResult(
+                generations=[[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="analysis",
+                            usage_metadata={
+                                "input_tokens": 100,
+                                "output_tokens": 20,
+                                "total_tokens": 120,
+                            },
+                        )
+                    )
+                ]]
+            ),
+            run_id=model_run_id,
+        )
+        handler.on_tool_start(
+            {"name": "get_news"},
+            "{}",
+            run_id=tool_run_id,
+            metadata={"langgraph_node": "tools_news"},
+        )
+        handler.on_tool_end("news", run_id=tool_run_id)
+
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [{
+            "messages": [],
+            "analysis_outcome": _INSUFFICIENT_OUTCOME,
+            "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+        }],
+        callback_script=emit_model_and_tool_usage,
+    )
+
+    run_dir = next(tmp_path.rglob("run_status.json")).parent
+    audit = json.loads(
+        (run_dir / "reports" / "decision-audit.json").read_text(encoding="utf-8")
+    )
+    metrics = json.loads(
+        (run_dir / "runtime_metrics.json").read_text(encoding="utf-8")
+    )
+    stage = audit["telemetry"]["stages"]["analysis"]
+
+    assert stage["model_calls"] == 1
+    assert stage["model_tokens_in"] == 100
+    assert stage["model_tokens_out"] == 20
+    assert stage["model_seconds"] >= 0
+    assert stage["tool_calls"] == 1
+    assert stage["tool_seconds"] >= 0
+    assert stage["cost"] == {"available": False, "amount_usd": None}
+    assert metrics["stage_activity"]["analysis"] == stage
+    assert metrics["terminal"]["terminal_route"] == audit["telemetry"]["terminal_route"]
 
 
 @pytest.mark.unit

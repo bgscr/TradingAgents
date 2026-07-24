@@ -1,0 +1,1113 @@
+{
+  "evidence_state": {
+    "acquisition_outcomes": [
+      {
+        "artifact": {
+          "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+          "raw_text": "## Verified market data snapshot for 510500.SS\n\n- Requested analysis date: 2026-07-19\n- Latest trading row used: 2026-07-17\n- Rows after the requested analysis date are excluded before verification.\n- Provider: baostock\n- Adjustment basis: qfq\n- Retrieved at: 2026-07-19T13:45:27.593568+00:00\n- History rows: 129\nFrame SHA-256: 34e1ba8a2f384fd9b155d80072b68bdd1a4fe4f863052d5362116a63d0c87db0\nSnapshot ID: snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0\n\n### Latest verified OHLCV row\n\n| Field | Value |\n|---|---:|\n| Open | 7.92 |\n| High | 7.93 |\n| Low | 7.49 |\n| Close | 7.50 |\n| Volume | 749802929 |\n\n### Verified technical indicators (latest row)\n\n| Indicator | Value |\n|---|---:|\n| close_10_ema | 8.27 |\n| close_50_sma | 8.62 |\n| close_200_sma | 8.39 |\n| rsi | 29.08 |\n| boll | 8.68 |\n| boll_ub | 9.55 |\n| boll_lb | 7.82 |\n| macd | -0.17 |\n| macds | -0.03 |\n| macdh | -0.14 |\n| atr | 0.27 |\n\n### Recent verified closes (last 30 rows)\n\n| Date | Close |\n|---|---:|\n| 2026-06-05 | 8.34 |\n| 2026-06-08 | 8.07 |\n| 2026-06-09 | 8.27 |\n| 2026-06-10 | 8.17 |\n| 2026-06-11 | 8.13 |\n| 2026-06-12 | 8.24 |\n| 2026-06-15 | 8.54 |\n| 2026-06-16 | 8.63 |\n| 2026-06-17 | 8.76 |\n| 2026-06-18 | 8.83 |\n| 2026-06-22 | 9.01 |\n| 2026-06-23 | 8.81 |\n| 2026-06-24 | 8.98 |\n| 2026-06-25 | 9.09 |\n| 2026-06-26 | 8.86 |\n| 2026-06-29 | 8.97 |\n| 2026-06-30 | 9.19 |\n| 2026-07-01 | 9.18 |\n| 2026-07-02 | 8.85 |\n| 2026-07-03 | 8.90 |\n| 2026-07-06 | 8.81 |\n| 2026-07-07 | 8.66 |\n| 2026-07-08 | 8.55 |\n| 2026-07-09 | 8.80 |\n| 2026-07-10 | 8.70 |\n| 2026-07-13 | 8.29 |\n| 2026-07-14 | 8.41 |\n| 2026-07-15 | 8.15 |\n| 2026-07-16 | 7.96 |\n| 2026-07-17 | 7.50 |\n\nUse this snapshot as the source of truth for exact OHLCV, price-level, and indicator-value claims. If another tool output conflicts with it, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless directly supported by tool output with concrete dates and prices.",
+          "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+          "tool_call_id": "recorded_call_001",
+          "tool_name": "get_verified_market_snapshot"
+        },
+        "attempt": 1,
+        "capability": "verified_market_snapshot",
+        "outcome": "available",
+        "provider": "baostock",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "f17867b442a57115bb8f8a5a868af97ea1c4708f7c5e363e06b6354b20dad837",
+          "raw_text": "Error fetching news for 510500.SS: Too Many Requests. Rate limited. Try after a while.",
+          "source_ref": "sentiment.news",
+          "tool_call_id": "recorded_call_002",
+          "tool_name": "inline_source"
+        },
+        "attempt": 1,
+        "capability": "inline_source",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "sentiment.news"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "a7dcf586496dcadc7f481d5a45f359efeb6ac3808ede0a5fc439ca31e944102d",
+          "raw_text": "## FRED: Consumer Price Index for All Urban Consumers: All Items in U.S. City Average (CPIAUCSL)\n- Units: Index 1982-1984=100\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 332.568 (2026-06-01) | **Change over window:** +10.40 (+3.23%) from 322.169 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 322.169 |\n| 2025-08-01 | 323.291 |\n| 2025-09-01 | 324.245 |\n| 2025-11-01 | 325.063 |\n| 2025-12-01 | 326.031 |\n| 2026-01-01 | 326.588 |\n| 2026-02-01 | 327.460 |\n| 2026-03-01 | 330.293 |\n| 2026-04-01 | 332.407 |\n| 2026-05-01 | 333.979 |\n| 2026-06-01 | 332.568 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_003",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 1,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "21155e3b8c2c20227dd546d0d8245141f353a2cf9fe422d4d4f3abfd40086586",
+          "raw_text": "## FRED: Federal Funds Effective Rate (FEDFUNDS)\n- Units: %\n- Frequency: Monthly (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 3.63 (2026-06-01) | **Change over window:** -0.70 (-16.17%) from 4.33 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 4.33 |\n| 2025-08-01 | 4.33 |\n| 2025-09-01 | 4.22 |\n| 2025-10-01 | 4.09 |\n| 2025-11-01 | 3.88 |\n| 2025-12-01 | 3.72 |\n| 2026-01-01 | 3.64 |\n| 2026-02-01 | 3.64 |\n| 2026-03-01 | 3.64 |\n| 2026-04-01 | 3.64 |\n| 2026-05-01 | 3.63 |\n| 2026-06-01 | 3.63 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_004",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 2,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "273e3ab02bbe15ff6a687b61a1cc71e7da3b5f7f44fe134f2ec12c99fc275bdf",
+          "raw_text": "## FRED: Unemployment Rate (UNRATE)\n- Units: %\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 4.2 (2026-06-01) | **Change over window:** -0.10 (-2.33%) from 4.3 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 4.3 |\n| 2025-08-01 | 4.3 |\n| 2025-09-01 | 4.4 |\n| 2025-11-01 | 4.5 |\n| 2025-12-01 | 4.4 |\n| 2026-01-01 | 4.3 |\n| 2026-02-01 | 4.4 |\n| 2026-03-01 | 4.3 |\n| 2026-04-01 | 4.3 |\n| 2026-05-01 | 4.3 |\n| 2026-06-01 | 4.2 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_005",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 3,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "4b12839d44e87ad931d09be35e538393326c7f97be42ce29bfddc6f5f5328d0c",
+          "raw_text": "## FRED: Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity, Quoted on an Investment Basis (DGS10)\n- Units: %\n- Frequency: Daily (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 4.57 (2026-07-16) | **Change over window:** +0.19 (+4.34%) from 4.38 (2025-07-21)\n\n_(showing the most recent 40 of 248 observations)_\n\n| Date | Value |\n| --- | --- |\n| 2026-05-19 | 4.67 |\n| 2026-05-20 | 4.57 |\n| 2026-05-21 | 4.57 |\n| 2026-05-22 | 4.56 |\n| 2026-05-26 | 4.5 |\n| 2026-05-27 | 4.48 |\n| 2026-05-28 | 4.45 |\n| 2026-05-29 | 4.45 |\n| 2026-06-01 | 4.47 |\n| 2026-06-02 | 4.46 |\n| 2026-06-03 | 4.49 |\n| 2026-06-04 | 4.47 |\n| 2026-06-05 | 4.55 |\n| 2026-06-08 | 4.56 |\n| 2026-06-09 | 4.53 |\n| 2026-06-10 | 4.55 |\n| 2026-06-11 | 4.45 |\n| 2026-06-12 | 4.48 |\n| 2026-06-15 | 4.47 |\n| 2026-06-16 | 4.43 |\n| 2026-06-17 | 4.49 |\n| 2026-06-18 | 4.46 |\n| 2026-06-22 | 4.51 |\n| 2026-06-23 | 4.5 |\n| 2026-06-24 | 4.41 |\n| 2026-06-25 | 4.4 |\n| 2026-06-26 | 4.38 |\n| 2026-06-29 | 4.38 |\n| 2026-06-30 | 4.44 |\n| 2026-07-01 | 4.48 |\n| 2026-07-02 | 4.49 |\n| 2026-07-06 | 4.48 |\n| 2026-07-07 | 4.55 |\n| 2026-07-08 | 4.56 |\n| 2026-07-09 | 4.54 |\n| 2026-07-10 | 4.56 |\n| 2026-07-13 | 4.62 |\n| 2026-07-14 | 4.58 |\n| 2026-07-15 | 4.55 |\n| 2026-07-16 | 4.57 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_006",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 4,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "91bc0bdfba152154c1ebff445e47eb34e25268206753bcdce2c83bedace76487",
+          "raw_text": "## FRED: 10-Year Treasury Constant Maturity Minus 2-Year Treasury Constant Maturity (T10Y2Y)\n- Units: %\n- Frequency: Daily (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 0.37 (2026-07-17) | **Change over window:** -0.16 (-30.19%) from 0.53 (2025-07-21)\n\n_(showing the most recent 40 of 249 observations)_\n\n| Date | Value |\n| --- | --- |\n| 2026-05-20 | 0.53 |\n| 2026-05-21 | 0.49 |\n| 2026-05-22 | 0.43 |\n| 2026-05-26 | 0.49 |\n| 2026-05-27 | 0.48 |\n| 2026-05-28 | 0.46 |\n| 2026-05-29 | 0.47 |\n| 2026-06-01 | 0.42 |\n| 2026-06-02 | 0.41 |\n| 2026-06-03 | 0.41 |\n| 2026-06-04 | 0.42 |\n| 2026-06-05 | 0.38 |\n| 2026-06-08 | 0.41 |\n| 2026-06-09 | 0.4 |\n| 2026-06-10 | 0.42 |\n| 2026-06-11 | 0.4 |\n| 2026-06-12 | 0.39 |\n| 2026-06-15 | 0.4 |\n| 2026-06-16 | 0.38 |\n| 2026-06-17 | 0.29 |\n| 2026-06-18 | 0.27 |\n| 2026-06-22 | 0.27 |\n| 2026-06-23 | 0.34 |\n| 2026-06-24 | 0.3 |\n| 2026-06-25 | 0.31 |\n| 2026-06-26 | 0.31 |\n| 2026-06-29 | 0.28 |\n| 2026-06-30 | 0.3 |\n| 2026-07-01 | 0.31 |\n| 2026-07-02 | 0.35 |\n| 2026-07-06 | 0.35 |\n| 2026-07-07 | 0.36 |\n| 2026-07-08 | 0.35 |\n| 2026-07-09 | 0.38 |\n| 2026-07-10 | 0.35 |\n| 2026-07-13 | 0.36 |\n| 2026-07-14 | 0.4 |\n| 2026-07-15 | 0.42 |\n| 2026-07-16 | 0.41 |\n| 2026-07-17 | 0.37 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_007",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 5,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "c0f3067952537fe865476438b9b860c701c7654fb0daeeffddbe476e9d176cb8",
+          "raw_text": "## FRED: Real Gross Domestic Product (GDPC1)\n- Units: Bil. of Chn. 2017 $\n- Frequency: Quarterly (SAAR)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 24180.419 (2026-01-01) | **Change over window:** +153.59 (+0.64%) from 24026.834 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 24026.834 |\n| 2025-10-01 | 24055.749 |\n| 2026-01-01 | 24180.419 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_008",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 6,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "artifact": {
+          "artifact_sha256": "42e65a06f17a820ef2e47ae389b1a2f37b42960ac6d8a3be9d0165fd3fd7e1b0",
+          "raw_text": "## FRED: Personal Consumption Expenditures Excluding Food and Energy (Chain-Type Price Index) (PCEPILFE)\n- Units: Index 2017=100\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 130.082 (2026-05-01) | **Change over window:** +3.65 (+2.89%) from 126.43 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 126.43 |\n| 2025-08-01 | 126.714 |\n| 2025-09-01 | 126.954 |\n| 2025-10-01 | 127.243 |\n| 2025-11-01 | 127.469 |\n| 2025-12-01 | 127.886 |\n| 2026-01-01 | 128.455 |\n| 2026-02-01 | 128.961 |\n| 2026-03-01 | 129.343 |\n| 2026-04-01 | 129.667 |\n| 2026-05-01 | 130.082 |\n",
+          "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+          "tool_call_id": "recorded_call_009",
+          "tool_name": "get_macro_indicators"
+        },
+        "attempt": 7,
+        "capability": "macro_indicators",
+        "outcome": "available",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+      },
+      {
+        "attempt": 1,
+        "capability": "sentiment.china_local",
+        "outcome": "unavailable",
+        "provider": "legacy_recorded",
+        "provider_order": 0,
+        "reason": "no_data",
+        "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+        "retryable": false,
+        "source_ref": "sentiment.china_local"
+      }
+    ],
+    "claim_validations": [
+      {
+        "claim_id": "market.1",
+        "detail": "source does not contain numeric claim(s): 510500, 2026, 07, 17",
+        "fact_ids": [
+          "fact:6a1eaa29e77a9e46e042c659fe58666d2db1df905343971e9820f6f618d70db6"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "market.2",
+        "detail": "source does not contain numeric claim(s): 50",
+        "fact_ids": [
+          "fact:ef63d1183e96d5b583fca037ce549db7fa056cf721f28b599f4b66307069c206"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "market.3",
+        "detail": "",
+        "fact_ids": [
+          "fact:bb3bb7fd156b2c7244e2fefb871b5c531eb882b61b7c66e52a34870b3b031c95"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.4",
+        "detail": "source quote is absent from the cited tool result",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "market.5",
+        "detail": "",
+        "fact_ids": [
+          "fact:f4483855a032b57c542ceec0f28b1e699173a729fc6e4828ff274bcb8bc84420"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "market.6",
+        "detail": "",
+        "fact_ids": [
+          "fact:c6862b3a87058170c0edc5e77e4ae0c58735892b0ce4e8ee62b279c66ac9b616"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "sentiment.news_rate_limit",
+        "detail": "",
+        "fact_ids": [
+          "fact:c65d1ad4d809061ea20b2276028216b7c12bd354035792ef5f5ccb1a231e174c"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "sentiment.china_local_hot_rank",
+        "detail": "cited source unavailable: sentiment.china_local",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "sentiment.china_local_comment",
+        "detail": "cited source unavailable: sentiment.china_local",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "sentiment.china_local_hsgt",
+        "detail": "cited source unavailable: sentiment.china_local",
+        "fact_ids": [],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.mc1",
+        "detail": "",
+        "fact_ids": [
+          "fact:dc69efac13036bd716227a4c3ada388738c09e897c63793a7002f7c30a6d2a8a"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "news.mc2",
+        "detail": "source does not contain numeric claim(s): 3.63%, 16.17%",
+        "fact_ids": [
+          "fact:82db5a67e37953030a6707fcf5c58542c5a08bfe9e017a8aae318973fbbd88b3"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.mc3",
+        "detail": "source does not contain numeric claim(s): 4.2%, 2.33%",
+        "fact_ids": [
+          "fact:5a2e8ed77eeb38af702a89db774ff2469d35437eb85170f27ed2bfe6f6c30ace"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.mc4",
+        "detail": "source does not contain numeric claim(s): 10, 4.57%",
+        "fact_ids": [
+          "fact:f8f497bd6f45e298e6da9a674b16cb133584bcce076ca440d8987209bec94da8"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.mc5",
+        "detail": "source does not contain numeric claim(s): 0.37%, 30.19%",
+        "fact_ids": [
+          "fact:bcf64fb1c6202e5534b5d0ebfdfae7232f17834a33b0cce7ac616b9048137e44"
+        ],
+        "status": "unsupported"
+      },
+      {
+        "claim_id": "news.mc6",
+        "detail": "",
+        "fact_ids": [
+          "fact:fa8d7dbf532d9bb856427a1a8eb03ad5f4e8e2b7b9a2280107b89f9eeb56035f"
+        ],
+        "status": "supported"
+      },
+      {
+        "claim_id": "news.mc7",
+        "detail": "",
+        "fact_ids": [
+          "fact:305faa6b650b14c1ba4c49d735b04ea985a8e92f42dd07ff82e8e45ed8c1cf21"
+        ],
+        "status": "supported"
+      }
+    ],
+    "instrument_identity": null,
+    "market_snapshot": {
+      "adjustment_basis": "qfq",
+      "effective_trading_date": "2026-07-17",
+      "frame_sha256": "34e1ba8a2f384fd9b155d80072b68bdd1a4fe4f863052d5362116a63d0c87db0",
+      "history_rows": 129,
+      "provider": "baostock",
+      "requested_date": "2026-07-19",
+      "retrieved_at": "2026-07-19T13:45:27.593568+00:00",
+      "snapshot_id": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+      "symbol": "510500.SS"
+    },
+    "material_claims": [
+      {
+        "analyst": "market",
+        "claim_id": "market.1",
+        "fact_ids": [
+          "fact:6a1eaa29e77a9e46e042c659fe58666d2db1df905343971e9820f6f618d70db6"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "Close | 7.50",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "The latest closing price for 510500.SS on the last trading day (2026-07-17) was 7.50."
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.2",
+        "fact_ids": [
+          "fact:ef63d1183e96d5b583fca037ce549db7fa056cf721f28b599f4b66307069c206"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "close_50_sma | 8.62",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "The 50-day simple moving average is 8.62."
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.3",
+        "fact_ids": [
+          "fact:bb3bb7fd156b2c7244e2fefb871b5c531eb882b61b7c66e52a34870b3b031c95"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "rsi | 29.08",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "The RSI value is 29.08, indicating oversold conditions."
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.4",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "macd | -0.17\nmacds | -0.03",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "MACD is -0.17 and the signal line is -0.03, showing bearish momentum."
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.5",
+        "fact_ids": [
+          "fact:f4483855a032b57c542ceec0f28b1e699173a729fc6e4828ff274bcb8bc84420"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "boll_lb | 7.82",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "Price has broken below the lower Bollinger Band of 7.82."
+      },
+      {
+        "analyst": "market",
+        "claim_id": "market.6",
+        "fact_ids": [
+          "fact:c6862b3a87058170c0edc5e77e4ae0c58735892b0ce4e8ee62b279c66ac9b616"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "atr | 0.27",
+        "source_refs": [
+          "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+        ],
+        "statement": "Average true range is 0.27, indicating moderate volatility."
+      },
+      {
+        "analyst": "sentiment",
+        "claim_id": "sentiment.news_rate_limit",
+        "fact_ids": [
+          "fact:c65d1ad4d809061ea20b2276028216b7c12bd354035792ef5f5ccb1a231e174c"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "Error fetching news for 510500.SS: Too Many Requests. Rate limited. Try after a while.",
+        "source_refs": [
+          "sentiment.news"
+        ],
+        "statement": "新闻数据因速率限制请求失败，未能获取任何新闻标题。"
+      },
+      {
+        "analyst": "sentiment",
+        "claim_id": "sentiment.china_local_hot_rank",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "DATA_DEGRADED: AKShare stock_hot_rank_detail_em unavailable (Length mismatch: Expected axis has 1 elements, new values have 3 elements).",
+        "source_refs": [
+          "sentiment.china_local"
+        ],
+        "statement": "中国A股热度排名数据不可用，因数据长度不匹配。"
+      },
+      {
+        "analyst": "sentiment",
+        "claim_id": "sentiment.china_local_comment",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "DATA_DEGRADED: AKShare stock_comment_em returned no row for this symbol in requested window.",
+        "source_refs": [
+          "sentiment.china_local"
+        ],
+        "statement": "中国A股个股评论数据不可用，在请求窗口内无返回行。"
+      },
+      {
+        "analyst": "sentiment",
+        "claim_id": "sentiment.china_local_hsgt",
+        "fact_ids": [],
+        "minimum_history_rows": 1,
+        "source_quote": "DATA_DEGRADED: AKShare stock_hsgt_individual_em unavailable ('NoneType' object is not subscriptable).",
+        "source_refs": [
+          "sentiment.china_local"
+        ],
+        "statement": "中国A股北向资金持仓数据不可用，因返回NoneType对象。"
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc1",
+        "fact_ids": [
+          "fact:dc69efac13036bd716227a4c3ada388738c09e897c63793a7002f7c30a6d2a8a"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "332.568 (2026-06-01) | **Change over window:** +10.40 (+3.23%) from 322.169 (2025-07-01)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "CPI increased 3.23% over the past year to 332.568."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc2",
+        "fact_ids": [
+          "fact:82db5a67e37953030a6707fcf5c58542c5a08bfe9e017a8aae318973fbbd88b3"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "3.63 (2026-06-01) | **Change over window:** -0.70 (-16.17%) from 4.33 (2025-07-01)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "Fed funds rate decreased to 3.63%, down 16.17% from a year ago."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc3",
+        "fact_ids": [
+          "fact:5a2e8ed77eeb38af702a89db774ff2469d35437eb85170f27ed2bfe6f6c30ace"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "4.2 (2026-06-01) | **Change over window:** -0.10 (-2.33%) from 4.3 (2025-07-01)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "Unemployment rate is 4.2%, down 2.33% from a year ago."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc4",
+        "fact_ids": [
+          "fact:f8f497bd6f45e298e6da9a674b16cb133584bcce076ca440d8987209bec94da8"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "4.57 (2026-07-16) | **Change over window:** +0.19 (+4.34%) from 4.38 (2025-07-21)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "10-year Treasury yield rose to 4.57%, up 4.34% from a year ago."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc5",
+        "fact_ids": [
+          "fact:bcf64fb1c6202e5534b5d0ebfdfae7232f17834a33b0cce7ac616b9048137e44"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "0.37 (2026-07-17) | **Change over window:** -0.16 (-30.19%) from 0.53 (2025-07-21)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "10Y-2Y yield spread narrowed to 0.37%, down 30.19% from a year ago."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc6",
+        "fact_ids": [
+          "fact:fa8d7dbf532d9bb856427a1a8eb03ad5f4e8e2b7b9a2280107b89f9eeb56035f"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "24180.419 (2026-01-01) | **Change over window:** +153.59 (+0.64%) from 24026.834 (2025-07-01)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "Real GDP grew 0.64% over the past year to 24180.419 billion."
+      },
+      {
+        "analyst": "news",
+        "claim_id": "news.mc7",
+        "fact_ids": [
+          "fact:305faa6b650b14c1ba4c49d735b04ea985a8e92f42dd07ff82e8e45ed8c1cf21"
+        ],
+        "minimum_history_rows": 1,
+        "source_quote": "130.082 (2026-05-01) | **Change over window:** +3.65 (+2.89%) from 126.43 (2025-07-01)",
+        "source_refs": [
+          "get_macro_indicators:510500.SS:2026-07-19"
+        ],
+        "statement": "Core PCE inflation rose 2.89% over the past year to 130.082."
+      }
+    ],
+    "source_artifacts": [
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "raw_text": "## Verified market data snapshot for 510500.SS\n\n- Requested analysis date: 2026-07-19\n- Latest trading row used: 2026-07-17\n- Rows after the requested analysis date are excluded before verification.\n- Provider: baostock\n- Adjustment basis: qfq\n- Retrieved at: 2026-07-19T13:45:27.593568+00:00\n- History rows: 129\nFrame SHA-256: 34e1ba8a2f384fd9b155d80072b68bdd1a4fe4f863052d5362116a63d0c87db0\nSnapshot ID: snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0\n\n### Latest verified OHLCV row\n\n| Field | Value |\n|---|---:|\n| Open | 7.92 |\n| High | 7.93 |\n| Low | 7.49 |\n| Close | 7.50 |\n| Volume | 749802929 |\n\n### Verified technical indicators (latest row)\n\n| Indicator | Value |\n|---|---:|\n| close_10_ema | 8.27 |\n| close_50_sma | 8.62 |\n| close_200_sma | 8.39 |\n| rsi | 29.08 |\n| boll | 8.68 |\n| boll_ub | 9.55 |\n| boll_lb | 7.82 |\n| macd | -0.17 |\n| macds | -0.03 |\n| macdh | -0.14 |\n| atr | 0.27 |\n\n### Recent verified closes (last 30 rows)\n\n| Date | Close |\n|---|---:|\n| 2026-06-05 | 8.34 |\n| 2026-06-08 | 8.07 |\n| 2026-06-09 | 8.27 |\n| 2026-06-10 | 8.17 |\n| 2026-06-11 | 8.13 |\n| 2026-06-12 | 8.24 |\n| 2026-06-15 | 8.54 |\n| 2026-06-16 | 8.63 |\n| 2026-06-17 | 8.76 |\n| 2026-06-18 | 8.83 |\n| 2026-06-22 | 9.01 |\n| 2026-06-23 | 8.81 |\n| 2026-06-24 | 8.98 |\n| 2026-06-25 | 9.09 |\n| 2026-06-26 | 8.86 |\n| 2026-06-29 | 8.97 |\n| 2026-06-30 | 9.19 |\n| 2026-07-01 | 9.18 |\n| 2026-07-02 | 8.85 |\n| 2026-07-03 | 8.90 |\n| 2026-07-06 | 8.81 |\n| 2026-07-07 | 8.66 |\n| 2026-07-08 | 8.55 |\n| 2026-07-09 | 8.80 |\n| 2026-07-10 | 8.70 |\n| 2026-07-13 | 8.29 |\n| 2026-07-14 | 8.41 |\n| 2026-07-15 | 8.15 |\n| 2026-07-16 | 7.96 |\n| 2026-07-17 | 7.50 |\n\nUse this snapshot as the source of truth for exact OHLCV, price-level, and indicator-value claims. If another tool output conflicts with it, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless directly supported by tool output with concrete dates and prices.",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "f17867b442a57115bb8f8a5a868af97ea1c4708f7c5e363e06b6354b20dad837",
+        "raw_text": "Error fetching news for 510500.SS: Too Many Requests. Rate limited. Try after a while.",
+        "source_ref": "sentiment.news",
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "inline_source"
+      },
+      {
+        "artifact_sha256": "a7dcf586496dcadc7f481d5a45f359efeb6ac3808ede0a5fc439ca31e944102d",
+        "raw_text": "## FRED: Consumer Price Index for All Urban Consumers: All Items in U.S. City Average (CPIAUCSL)\n- Units: Index 1982-1984=100\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 332.568 (2026-06-01) | **Change over window:** +10.40 (+3.23%) from 322.169 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 322.169 |\n| 2025-08-01 | 323.291 |\n| 2025-09-01 | 324.245 |\n| 2025-11-01 | 325.063 |\n| 2025-12-01 | 326.031 |\n| 2026-01-01 | 326.588 |\n| 2026-02-01 | 327.460 |\n| 2026-03-01 | 330.293 |\n| 2026-04-01 | 332.407 |\n| 2026-05-01 | 333.979 |\n| 2026-06-01 | 332.568 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_003",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "21155e3b8c2c20227dd546d0d8245141f353a2cf9fe422d4d4f3abfd40086586",
+        "raw_text": "## FRED: Federal Funds Effective Rate (FEDFUNDS)\n- Units: %\n- Frequency: Monthly (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 3.63 (2026-06-01) | **Change over window:** -0.70 (-16.17%) from 4.33 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 4.33 |\n| 2025-08-01 | 4.33 |\n| 2025-09-01 | 4.22 |\n| 2025-10-01 | 4.09 |\n| 2025-11-01 | 3.88 |\n| 2025-12-01 | 3.72 |\n| 2026-01-01 | 3.64 |\n| 2026-02-01 | 3.64 |\n| 2026-03-01 | 3.64 |\n| 2026-04-01 | 3.64 |\n| 2026-05-01 | 3.63 |\n| 2026-06-01 | 3.63 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_004",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "273e3ab02bbe15ff6a687b61a1cc71e7da3b5f7f44fe134f2ec12c99fc275bdf",
+        "raw_text": "## FRED: Unemployment Rate (UNRATE)\n- Units: %\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 4.2 (2026-06-01) | **Change over window:** -0.10 (-2.33%) from 4.3 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 4.3 |\n| 2025-08-01 | 4.3 |\n| 2025-09-01 | 4.4 |\n| 2025-11-01 | 4.5 |\n| 2025-12-01 | 4.4 |\n| 2026-01-01 | 4.3 |\n| 2026-02-01 | 4.4 |\n| 2026-03-01 | 4.3 |\n| 2026-04-01 | 4.3 |\n| 2026-05-01 | 4.3 |\n| 2026-06-01 | 4.2 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_005",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "4b12839d44e87ad931d09be35e538393326c7f97be42ce29bfddc6f5f5328d0c",
+        "raw_text": "## FRED: Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity, Quoted on an Investment Basis (DGS10)\n- Units: %\n- Frequency: Daily (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 4.57 (2026-07-16) | **Change over window:** +0.19 (+4.34%) from 4.38 (2025-07-21)\n\n_(showing the most recent 40 of 248 observations)_\n\n| Date | Value |\n| --- | --- |\n| 2026-05-19 | 4.67 |\n| 2026-05-20 | 4.57 |\n| 2026-05-21 | 4.57 |\n| 2026-05-22 | 4.56 |\n| 2026-05-26 | 4.5 |\n| 2026-05-27 | 4.48 |\n| 2026-05-28 | 4.45 |\n| 2026-05-29 | 4.45 |\n| 2026-06-01 | 4.47 |\n| 2026-06-02 | 4.46 |\n| 2026-06-03 | 4.49 |\n| 2026-06-04 | 4.47 |\n| 2026-06-05 | 4.55 |\n| 2026-06-08 | 4.56 |\n| 2026-06-09 | 4.53 |\n| 2026-06-10 | 4.55 |\n| 2026-06-11 | 4.45 |\n| 2026-06-12 | 4.48 |\n| 2026-06-15 | 4.47 |\n| 2026-06-16 | 4.43 |\n| 2026-06-17 | 4.49 |\n| 2026-06-18 | 4.46 |\n| 2026-06-22 | 4.51 |\n| 2026-06-23 | 4.5 |\n| 2026-06-24 | 4.41 |\n| 2026-06-25 | 4.4 |\n| 2026-06-26 | 4.38 |\n| 2026-06-29 | 4.38 |\n| 2026-06-30 | 4.44 |\n| 2026-07-01 | 4.48 |\n| 2026-07-02 | 4.49 |\n| 2026-07-06 | 4.48 |\n| 2026-07-07 | 4.55 |\n| 2026-07-08 | 4.56 |\n| 2026-07-09 | 4.54 |\n| 2026-07-10 | 4.56 |\n| 2026-07-13 | 4.62 |\n| 2026-07-14 | 4.58 |\n| 2026-07-15 | 4.55 |\n| 2026-07-16 | 4.57 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_006",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "91bc0bdfba152154c1ebff445e47eb34e25268206753bcdce2c83bedace76487",
+        "raw_text": "## FRED: 10-Year Treasury Constant Maturity Minus 2-Year Treasury Constant Maturity (T10Y2Y)\n- Units: %\n- Frequency: Daily (NSA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 0.37 (2026-07-17) | **Change over window:** -0.16 (-30.19%) from 0.53 (2025-07-21)\n\n_(showing the most recent 40 of 249 observations)_\n\n| Date | Value |\n| --- | --- |\n| 2026-05-20 | 0.53 |\n| 2026-05-21 | 0.49 |\n| 2026-05-22 | 0.43 |\n| 2026-05-26 | 0.49 |\n| 2026-05-27 | 0.48 |\n| 2026-05-28 | 0.46 |\n| 2026-05-29 | 0.47 |\n| 2026-06-01 | 0.42 |\n| 2026-06-02 | 0.41 |\n| 2026-06-03 | 0.41 |\n| 2026-06-04 | 0.42 |\n| 2026-06-05 | 0.38 |\n| 2026-06-08 | 0.41 |\n| 2026-06-09 | 0.4 |\n| 2026-06-10 | 0.42 |\n| 2026-06-11 | 0.4 |\n| 2026-06-12 | 0.39 |\n| 2026-06-15 | 0.4 |\n| 2026-06-16 | 0.38 |\n| 2026-06-17 | 0.29 |\n| 2026-06-18 | 0.27 |\n| 2026-06-22 | 0.27 |\n| 2026-06-23 | 0.34 |\n| 2026-06-24 | 0.3 |\n| 2026-06-25 | 0.31 |\n| 2026-06-26 | 0.31 |\n| 2026-06-29 | 0.28 |\n| 2026-06-30 | 0.3 |\n| 2026-07-01 | 0.31 |\n| 2026-07-02 | 0.35 |\n| 2026-07-06 | 0.35 |\n| 2026-07-07 | 0.36 |\n| 2026-07-08 | 0.35 |\n| 2026-07-09 | 0.38 |\n| 2026-07-10 | 0.35 |\n| 2026-07-13 | 0.36 |\n| 2026-07-14 | 0.4 |\n| 2026-07-15 | 0.42 |\n| 2026-07-16 | 0.41 |\n| 2026-07-17 | 0.37 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_007",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "c0f3067952537fe865476438b9b860c701c7654fb0daeeffddbe476e9d176cb8",
+        "raw_text": "## FRED: Real Gross Domestic Product (GDPC1)\n- Units: Bil. of Chn. 2017 $\n- Frequency: Quarterly (SAAR)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 24180.419 (2026-01-01) | **Change over window:** +153.59 (+0.64%) from 24026.834 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 24026.834 |\n| 2025-10-01 | 24055.749 |\n| 2026-01-01 | 24180.419 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_008",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "42e65a06f17a820ef2e47ae389b1a2f37b42960ac6d8a3be9d0165fd3fd7e1b0",
+        "raw_text": "## FRED: Personal Consumption Expenditures Excluding Food and Energy (Chain-Type Price Index) (PCEPILFE)\n- Units: Index 2017=100\n- Frequency: Monthly (SA)\n- Window: 2025-07-19 to 2026-07-19\n\n**Latest:** 130.082 (2026-05-01) | **Change over window:** +3.65 (+2.89%) from 126.43 (2025-07-01)\n\n| Date | Value |\n| --- | --- |\n| 2025-07-01 | 126.43 |\n| 2025-08-01 | 126.714 |\n| 2025-09-01 | 126.954 |\n| 2025-10-01 | 127.243 |\n| 2025-11-01 | 127.469 |\n| 2025-12-01 | 127.886 |\n| 2026-01-01 | 128.455 |\n| 2026-02-01 | 128.961 |\n| 2026-03-01 | 129.343 |\n| 2026-04-01 | 129.667 |\n| 2026-05-01 | 130.082 |\n",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "tool_call_id": "recorded_call_009",
+        "tool_name": "get_macro_indicators"
+      }
+    ],
+    "source_facts": [
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "calculation_ids": [],
+        "fact_id": "fact:6a1eaa29e77a9e46e042c659fe58666d2db1df905343971e9820f6f618d70db6",
+        "normalized_numeric_tokens": [
+          "7.50"
+        ],
+        "raw_text": "Close | 7.50",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "source_span_end": 602,
+        "source_span_start": 590,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "calculation_ids": [],
+        "fact_id": "fact:ef63d1183e96d5b583fca037ce549db7fa056cf721f28b599f4b66307069c206",
+        "normalized_numeric_tokens": [
+          "8.62"
+        ],
+        "raw_text": "close_50_sma | 8.62",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "source_span_end": 755,
+        "source_span_start": 736,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "calculation_ids": [],
+        "fact_id": "fact:bb3bb7fd156b2c7244e2fefb871b5c531eb882b61b7c66e52a34870b3b031c95",
+        "normalized_numeric_tokens": [
+          "29.08"
+        ],
+        "raw_text": "rsi | 29.08",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "source_span_end": 796,
+        "source_span_start": 785,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "calculation_ids": [],
+        "fact_id": "fact:f4483855a032b57c542ceec0f28b1e699173a729fc6e4828ff274bcb8bc84420",
+        "normalized_numeric_tokens": [
+          "7.82"
+        ],
+        "raw_text": "boll_lb | 7.82",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "source_span_end": 850,
+        "source_span_start": 836,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "fa931baca899d654872c2af543a1b3e1d8dfbd279ba03e1ea78f2e11f624b9d0",
+        "calculation_ids": [],
+        "fact_id": "fact:c6862b3a87058170c0edc5e77e4ae0c58735892b0ce4e8ee62b279c66ac9b616",
+        "normalized_numeric_tokens": [
+          "0.27"
+        ],
+        "raw_text": "atr | 0.27",
+        "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "source_span_end": 918,
+        "source_span_start": 908,
+        "tool_call_id": "recorded_call_001",
+        "tool_name": "get_verified_market_snapshot"
+      },
+      {
+        "artifact_sha256": "f17867b442a57115bb8f8a5a868af97ea1c4708f7c5e363e06b6354b20dad837",
+        "calculation_ids": [],
+        "fact_id": "fact:c65d1ad4d809061ea20b2276028216b7c12bd354035792ef5f5ccb1a231e174c",
+        "normalized_numeric_tokens": [
+          "510500"
+        ],
+        "raw_text": "Error fetching news for 510500.SS: Too Many Requests. Rate limited. Try after a while.",
+        "source_ref": "sentiment.news",
+        "source_span_end": 86,
+        "source_span_start": 0,
+        "tool_call_id": "recorded_call_002",
+        "tool_name": "inline_source"
+      },
+      {
+        "artifact_sha256": "a7dcf586496dcadc7f481d5a45f359efeb6ac3808ede0a5fc439ca31e944102d",
+        "calculation_ids": [],
+        "fact_id": "fact:dc69efac13036bd716227a4c3ada388738c09e897c63793a7002f7c30a6d2a8a",
+        "normalized_numeric_tokens": [
+          "332.568",
+          "2026",
+          "06",
+          "01",
+          "10.40",
+          "3.23%",
+          "322.169",
+          "2025",
+          "07",
+          "01"
+        ],
+        "raw_text": "332.568 (2026-06-01) | **Change over window:** +10.40 (+3.23%) from 322.169 (2025-07-01)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 288,
+        "source_span_start": 200,
+        "tool_call_id": "recorded_call_003",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "21155e3b8c2c20227dd546d0d8245141f353a2cf9fe422d4d4f3abfd40086586",
+        "calculation_ids": [],
+        "fact_id": "fact:82db5a67e37953030a6707fcf5c58542c5a08bfe9e017a8aae318973fbbd88b3",
+        "normalized_numeric_tokens": [
+          "3.63",
+          "2026",
+          "06",
+          "01",
+          "-0.70",
+          "-16.17%",
+          "4.33",
+          "2025",
+          "07",
+          "01"
+        ],
+        "raw_text": "3.63 (2026-06-01) | **Change over window:** -0.70 (-16.17%) from 4.33 (2025-07-01)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 217,
+        "source_span_start": 135,
+        "tool_call_id": "recorded_call_004",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "273e3ab02bbe15ff6a687b61a1cc71e7da3b5f7f44fe134f2ec12c99fc275bdf",
+        "calculation_ids": [],
+        "fact_id": "fact:5a2e8ed77eeb38af702a89db774ff2469d35437eb85170f27ed2bfe6f6c30ace",
+        "normalized_numeric_tokens": [
+          "4.2",
+          "2026",
+          "06",
+          "01",
+          "-0.10",
+          "-2.33%",
+          "4.3",
+          "2025",
+          "07",
+          "01"
+        ],
+        "raw_text": "4.2 (2026-06-01) | **Change over window:** -0.10 (-2.33%) from 4.3 (2025-07-01)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 200,
+        "source_span_start": 121,
+        "tool_call_id": "recorded_call_005",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "4b12839d44e87ad931d09be35e538393326c7f97be42ce29bfddc6f5f5328d0c",
+        "calculation_ids": [],
+        "fact_id": "fact:f8f497bd6f45e298e6da9a674b16cb133584bcce076ca440d8987209bec94da8",
+        "normalized_numeric_tokens": [
+          "4.57",
+          "2026",
+          "07",
+          "16",
+          "0.19",
+          "4.34%",
+          "4.38",
+          "2025",
+          "07",
+          "21"
+        ],
+        "raw_text": "4.57 (2026-07-16) | **Change over window:** +0.19 (+4.34%) from 4.38 (2025-07-21)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 283,
+        "source_span_start": 202,
+        "tool_call_id": "recorded_call_006",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "91bc0bdfba152154c1ebff445e47eb34e25268206753bcdce2c83bedace76487",
+        "calculation_ids": [],
+        "fact_id": "fact:bcf64fb1c6202e5534b5d0ebfdfae7232f17834a33b0cce7ac616b9048137e44",
+        "normalized_numeric_tokens": [
+          "0.37",
+          "2026",
+          "07",
+          "17",
+          "-0.16",
+          "-30.19%",
+          "0.53",
+          "2025",
+          "07",
+          "21"
+        ],
+        "raw_text": "0.37 (2026-07-17) | **Change over window:** -0.16 (-30.19%) from 0.53 (2025-07-21)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 259,
+        "source_span_start": 177,
+        "tool_call_id": "recorded_call_007",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "c0f3067952537fe865476438b9b860c701c7654fb0daeeffddbe476e9d176cb8",
+        "calculation_ids": [],
+        "fact_id": "fact:fa8d7dbf532d9bb856427a1a8eb03ad5f4e8e2b7b9a2280107b89f9eeb56035f",
+        "normalized_numeric_tokens": [
+          "24180.419",
+          "2026",
+          "01",
+          "01",
+          "153.59",
+          "0.64%",
+          "24026.834",
+          "2025",
+          "07",
+          "01"
+        ],
+        "raw_text": "24180.419 (2026-01-01) | **Change over window:** +153.59 (+0.64%) from 24026.834 (2025-07-01)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 245,
+        "source_span_start": 152,
+        "tool_call_id": "recorded_call_008",
+        "tool_name": "get_macro_indicators"
+      },
+      {
+        "artifact_sha256": "42e65a06f17a820ef2e47ae389b1a2f37b42960ac6d8a3be9d0165fd3fd7e1b0",
+        "calculation_ids": [],
+        "fact_id": "fact:305faa6b650b14c1ba4c49d735b04ea985a8e92f42dd07ff82e8e45ed8c1cf21",
+        "normalized_numeric_tokens": [
+          "130.082",
+          "2026",
+          "05",
+          "01",
+          "3.65",
+          "2.89%",
+          "126.43",
+          "2025",
+          "07",
+          "01"
+        ],
+        "raw_text": "130.082 (2026-05-01) | **Change over window:** +3.65 (+2.89%) from 126.43 (2025-07-01)",
+        "source_ref": "get_macro_indicators:510500.SS:2026-07-19",
+        "source_span_end": 289,
+        "source_span_start": 203,
+        "tool_call_id": "recorded_call_009",
+        "tool_name": "get_macro_indicators"
+      }
+    ],
+    "sources": [
+      {
+        "detail": "finalized_structured",
+        "required": true,
+        "source_id": "analyst.market.submission",
+        "status": "available"
+      },
+      {
+        "detail": "",
+        "required": false,
+        "source_id": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0",
+        "status": "available"
+      },
+      {
+        "detail": "direct_structured",
+        "required": true,
+        "source_id": "analyst.sentiment.submission",
+        "status": "available"
+      },
+      {
+        "detail": "",
+        "required": false,
+        "source_id": "sentiment.news",
+        "status": "available"
+      },
+      {
+        "detail": "source returned unavailable",
+        "required": false,
+        "source_id": "sentiment.china_local",
+        "status": "unavailable"
+      },
+      {
+        "detail": "finalized_structured",
+        "required": true,
+        "source_id": "analyst.news.submission",
+        "status": "available"
+      },
+      {
+        "detail": "",
+        "required": false,
+        "source_id": "get_macro_indicators:510500.SS:2026-07-19",
+        "status": "available"
+      }
+    ]
+  },
+  "fixture_version": "1.0",
+  "legacy_selection": null,
+  "run": {
+    "asset_type": "stock",
+    "requested_date": "2026-07-19",
+    "ticker": "510500.SS"
+  },
+  "run_telemetry": {
+    "acquisition": {
+      "events": [
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "close_200_sma",
+            "http_status": null,
+            "outcome": "unavailable",
+            "provider": "baostock",
+            "provider_order": 0,
+            "reason": "insufficient_history",
+            "retrieved_at": "2026-07-19T13:45:27.593568+00:00",
+            "retry_after_seconds": null,
+            "retryable": false,
+            "source_ref": "acq.v1:calculation:5f67850b66927cb108a0f527bce8325823065fd325cd18ffbf414804bf6d451c"
+          },
+          "tool_call_id": "acq.v1:calculation:5f67850b66927cb108a0f527bce8325823065fd325cd18ffbf414804bf6d451c",
+          "tool_name": "deterministic_calculation"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "inline_source",
+            "http_status": 429,
+            "outcome": "unavailable",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": "rate_limited",
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": true,
+            "source_ref": "sentiment.news"
+          },
+          "tool_call_id": "recorded_call_002",
+          "tool_name": "inline_source"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_003",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 2,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_004",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 3,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_005",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 4,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_006",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 5,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_007",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 6,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_008",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 7,
+            "capability": "macro_indicators",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "get_macro_indicators:510500.SS:2026-07-19"
+          },
+          "tool_call_id": "recorded_call_009",
+          "tool_name": "get_macro_indicators"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "sentiment.china_local",
+            "http_status": null,
+            "outcome": "unavailable",
+            "provider": "legacy_recorded",
+            "provider_order": 0,
+            "reason": "no_data",
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": false,
+            "source_ref": "sentiment.china_local"
+          },
+          "tool_call_id": "recorded_outcome_010",
+          "tool_name": "recorded_acquisition"
+        },
+        {
+          "contract_version": "1.0",
+          "outcome": {
+            "attempt": 1,
+            "capability": "verified_market_snapshot",
+            "http_status": null,
+            "outcome": "available",
+            "provider": "baostock",
+            "provider_order": 0,
+            "reason": null,
+            "retrieved_at": "2026-07-19T13:49:52.450263+00:00",
+            "retry_after_seconds": null,
+            "retryable": null,
+            "source_ref": "snapshot:523346c1176d507871c9e956906e077d91ccd987217b6d31cc6fd14852f1cee0"
+          },
+          "tool_call_id": "recorded_call_001",
+          "tool_name": "get_verified_market_snapshot"
+        }
+      ],
+      "summary": {
+        "attempts": 11,
+        "available": 8,
+        "circuit_breaker_events": 0,
+        "retry_events": 21,
+        "retryable_unavailable": 1,
+        "unavailable": 3,
+        "unavailable_reasons": {
+          "insufficient_history": 1,
+          "no_data": 1,
+          "rate_limited": 1
+        }
+      }
+    },
+    "contract_version": "1.0",
+    "stages": {},
+    "terminal_route": "analysis_outcome"
+  },
+  "source_audit_sha256": "fb2676259729f46c0ec50ee231d6515981dbde7ac3224726eb618d424c23e78f",
+  "source_report": "reports/510500.SS_20260719_065148/decision-audit.json",
+  "source_report_sha256": "19a5b4ce7bd0b97e09f754b735f07772c3b67d674507cfddba812001b3b5799d"
+}

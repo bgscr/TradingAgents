@@ -1,6 +1,6 @@
 # Normalize Chinese monetary source facts
 
-Status: ready-for-agent
+Status: completed
 
 Implement boundary extraction and normalization for `元`, `万元`, and `亿元`, preserving raw spans, ranges, currency, normalized values, source references, and deterministic rendered annotations. Cover the exact audit cases and ambiguous/invalid expressions without silently guessing.
 

@@ -1,0 +1,26 @@
+{
+  "fixtures": [
+    {
+      "expected_blocked_stage": "preflight",
+      "expected_terminal_kind": "analysis_outcome",
+      "fixture_sha256": "434ef647dee0ae65fe0d4dc2b0671934a24b431bd8adedf6a07b27d098e30163",
+      "requested_date": "2026-07-19",
+      "ticker": "600895.SS"
+    },
+    {
+      "expected_blocked_stage": "preflight",
+      "expected_terminal_kind": "analysis_outcome",
+      "fixture_sha256": "a4d339cd66eef3bf51d9e269e7357b4e7d8a11f1d930d3283c24945cda1b9b47",
+      "requested_date": "2026-07-19",
+      "ticker": "601658.SS"
+    },
+    {
+      "expected_blocked_stage": "preflight",
+      "expected_terminal_kind": "analysis_outcome",
+      "fixture_sha256": "4b23e0de383a687882bea4e6fc6f97052fcbf1cf2c863c3daa21cbd6d08d8d32",
+      "requested_date": "2026-07-19",
+      "ticker": "510500.SS"
+    }
+  ],
+  "manifest_version": "1.0"
+}

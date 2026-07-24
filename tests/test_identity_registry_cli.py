@@ -25,22 +25,33 @@ class _Response:
 
 
 @pytest.mark.unit
+def test_identity_registry_refresh_help_describes_mainland_instruments():
+    result = CliRunner().invoke(app, ["identity-registry-refresh", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Explicit Mainland Instrument symbols" in result.output
+    assert "mainland equity symbols" not in result.output
+
+
+@pytest.mark.unit
 def test_identity_registry_refresh_is_one_complete_command(tmp_path, monkeypatch):
     def exchange_get(_session, url, **kwargs):
-        assert url == "https://query.sse.com.cn/sseQuery/commonQuery.do"
-        assert kwargs["params"]["STOCK_CODE"] == "600000"
-        return _Response(
-            {
-                "result": [
-                    {
-                        "A_STOCK_CODE": "600000",
-                        "STOCK_TYPE": "1",
-                        "FULL_NAME": "上海浦东发展银行股份有限公司",
-                        "SEC_NAME_CN": "浦发银行",
-                    }
-                ]
-            }
-        )
+        if url == "https://query.sse.com.cn/sseQuery/commonQuery.do":
+            assert kwargs["params"]["STOCK_CODE"] == "600000"
+            return _Response(
+                {
+                    "result": [
+                        {
+                            "A_STOCK_CODE": "600000",
+                            "STOCK_TYPE": "1",
+                            "FULL_NAME": "上海浦东发展银行股份有限公司",
+                            "SEC_NAME_CN": "浦发银行",
+                        }
+                    ]
+                }
+            )
+        assert url == "https://query.sse.com.cn/commonSoaQuery.do"
+        return _Response({"result": []})
 
     test_runs: list[list[str]] = []
 
@@ -119,6 +130,228 @@ def test_identity_registry_refresh_is_one_complete_command(tmp_path, monkeypatch
     assert "TRADINGAGENTS_IDENTITY_REGISTRY_SHA256" in result.output
     assert os.environ["TRADINGAGENTS_IDENTITY_REGISTRY_PATH"] == "stale-path"
     assert os.environ["TRADINGAGENTS_IDENTITY_REGISTRY_SHA256"] == "stale-digest"
+
+
+@pytest.mark.unit
+def test_identity_registry_refresh_maps_sse_fund_response_to_fund(
+    tmp_path,
+    monkeypatch,
+):
+    def exchange_get(_session, url, **kwargs):
+        params = kwargs["params"]
+        if url == "https://query.sse.com.cn/sseQuery/commonQuery.do":
+            assert params["STOCK_CODE"] == "510500"
+            return _Response({"result": []})
+
+        assert url == "https://query.sse.com.cn/commonSoaQuery.do"
+        assert params["sqlId"] == "FUND_LIST"
+        return _Response(
+            {
+                "result": [
+                    {
+                        "fundCode": "510500",
+                        "secNameFull": "中证500ETF南方",
+                        "companyName": "南方基金管理股份有限公司",
+                        "subClass": "03",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(requests.Session, "get", exchange_get)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    registry_path = tmp_path / "instrument_identity_registry.json"
+    env_path = tmp_path / ".env.enterprise"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "identity-registry-refresh",
+            "510500.SS",
+            "--registry-path",
+            str(registry_path),
+            "--env-file",
+            str(env_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = json.loads(registry_path.read_text(encoding="utf-8"))["rows"]
+    assert rows == [
+        {
+            "canonical_symbol": "510500.SS",
+            "aliases": ["510500", "510500.SH"],
+            "venue": "XSHG",
+            "instrument_kind": "fund",
+            "currency": "CNY",
+            "display_name": "中证500ETF南方",
+            "provenance": {
+                "provider": "Shanghai Stock Exchange",
+                "source_ref": (
+                    "https://www.sse.com.cn/assortment/fund/list/etfinfo/"
+                    "basic/index.shtml?FUNDID=510500"
+                ),
+                "retrieved_at": rows[0]["provenance"]["retrieved_at"],
+            },
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_identity_registry_refresh_rejects_ambiguous_sse_categories(
+    tmp_path,
+    monkeypatch,
+):
+    def exchange_get(_session, url, **kwargs):
+        if url == "https://query.sse.com.cn/sseQuery/commonQuery.do":
+            return _Response(
+                {
+                    "result": [
+                        {
+                            "A_STOCK_CODE": "510500",
+                            "STOCK_TYPE": "1",
+                            "FULL_NAME": "冲突的公司记录",
+                            "SEC_NAME_CN": "冲突公司",
+                        }
+                    ]
+                }
+            )
+        if url == "https://query.sse.com.cn/commonSoaQuery.do":
+            return _Response(
+                {
+                    "result": [
+                        {
+                            "fundCode": "510500",
+                            "secNameFull": "中证500ETF南方",
+                            "companyName": "南方基金管理股份有限公司",
+                            "subClass": "03",
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected exchange URL: {url}")
+
+    monkeypatch.setattr(requests.Session, "get", exchange_get)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    registry_path = tmp_path / "instrument_identity_registry.json"
+    env_path = tmp_path / ".env.enterprise"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "identity-registry-refresh",
+            "510500.SS",
+            "--registry-path",
+            str(registry_path),
+            "--env-file",
+            str(env_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "ambiguous authoritative categories" in result.output
+    assert not registry_path.exists()
+    assert not registry_path.with_suffix(".sha256").exists()
+    assert not env_path.exists()
+
+
+@pytest.mark.unit
+def test_identity_registry_refresh_rejects_unknown_sse_fund_category(
+    tmp_path,
+    monkeypatch,
+):
+    def exchange_get(_session, url, **_kwargs):
+        if url == "https://query.sse.com.cn/sseQuery/commonQuery.do":
+            return _Response({"result": []})
+        if url == "https://query.sse.com.cn/commonSoaQuery.do":
+            return _Response(
+                {
+                    "result": [
+                        {
+                            "fundCode": "510500",
+                            "secNameFull": "未知类别基金",
+                            "subClass": "99",
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected exchange URL: {url}")
+
+    monkeypatch.setattr(requests.Session, "get", exchange_get)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    registry_path = tmp_path / "instrument_identity_registry.json"
+    env_path = tmp_path / ".env.enterprise"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "identity-registry-refresh",
+            "510500.SS",
+            "--registry-path",
+            str(registry_path),
+            "--env-file",
+            str(env_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unsupported SSE fund category '99'" in result.output
+    assert not registry_path.exists()
+    assert not registry_path.with_suffix(".sha256").exists()
+    assert not env_path.exists()
+
+
+@pytest.mark.unit
+def test_identity_registry_refresh_fails_closed_for_index_without_supported_source(
+    tmp_path,
+    monkeypatch,
+):
+    def exchange_get(_session, url, **_kwargs):
+        if url in {
+            "https://query.sse.com.cn/sseQuery/commonQuery.do",
+            "https://query.sse.com.cn/commonSoaQuery.do",
+        }:
+            return _Response({"result": []})
+        raise AssertionError(f"unexpected exchange URL: {url}")
+
+    monkeypatch.setattr(requests.Session, "get", exchange_get)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    registry_path = tmp_path / "instrument_identity_registry.json"
+    env_path = tmp_path / ".env.enterprise"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "identity-registry-refresh",
+            "000001.SS",
+            "--registry-path",
+            str(registry_path),
+            "--env-file",
+            str(env_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "no authoritative equity or fund row" in result.output
+    assert not registry_path.exists()
+    assert not registry_path.with_suffix(".sha256").exists()
+    assert not env_path.exists()
 
 
 @pytest.mark.unit

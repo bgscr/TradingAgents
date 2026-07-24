@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from dateutil.relativedelta import relativedelta
 from pydantic import (
@@ -20,6 +20,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+if TYPE_CHECKING:
+    from tradingagents.decision_policy import DecisionHorizon, DecisionPolicyEngine
 
 EVIDENCE_CONTRACT_VERSION = "1.0"
 ANALYSIS_OUTCOME_CONTRACT_VERSION = "2.0"
@@ -193,6 +196,25 @@ class EvidenceReadiness(str, Enum):
     DEGRADED = "degraded"
     INSUFFICIENT = "insufficient"
     CONFLICTED = "conflicted"
+
+
+class AnalysisDiagnosticCode(str, Enum):
+    IDENTITY_UNAVAILABLE = "identity_unavailable"
+    SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
+    SNAPSHOT_INVALID = "snapshot_invalid"
+    HISTORY_INSUFFICIENT = "history_insufficient"
+    REQUIRED_EVIDENCE_UNAVAILABLE = "required_evidence_unavailable"
+    REQUIRED_EVIDENCE_CONFLICTED = "required_evidence_conflicted"
+    DECISION_CONFIGURATION_INVALID = "decision_configuration_invalid"
+    STRATEGY_RULE_INVALID = "strategy_rule_invalid"
+    DIRECTION_CONTEXT_INVALID = "direction_context_invalid"
+    DIRECTION_ASSERTIONS_CONFLICTED = "direction_assertions_conflicted"
+    DIRECTION_SELECTION_INVALID = "direction_selection_invalid"
+    DECISION_ASSERTION_INVALID = "decision_assertion_invalid"
+    STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
+    SHADOW_MODE = "shadow_mode"
+    DETERMINISTIC_GATE_REJECTED = "deterministic_gate_rejected"
+    OPTIONAL_EVIDENCE_UNAVAILABLE = "optional_evidence_unavailable"
 
 
 class ClaimValidationStatus(str, Enum):
@@ -1033,14 +1055,13 @@ class EvidenceState(BaseModel):
             object.__setattr__(self, "source_facts", canonical_facts)
         return self
 
-    @model_validator(mode="after")
-    def _canonicalize_acquisition_outcomes(self) -> EvidenceState:
-        canonical = _canonicalize_source_acquisition_outcomes(
-            self.acquisition_outcomes
-        )
-        if canonical == self.acquisition_outcomes:
-            return self
-        return self.model_copy(update={"acquisition_outcomes": canonical})
+    @field_validator("acquisition_outcomes")
+    @classmethod
+    def _canonicalize_acquisition_outcomes(
+        cls,
+        value: tuple[SourceAcquisitionOutcome, ...],
+    ) -> tuple[SourceAcquisitionOutcome, ...]:
+        return _canonicalize_source_acquisition_outcomes(value)
 
 
 def merge_material_claims(
@@ -1873,6 +1894,24 @@ class AdmissionGateResult(BaseModel):
     admitted: bool
     readiness: EvidenceReadiness
     diagnostics: tuple[str, ...] = ()
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
+
+    @field_validator("diagnostic_codes")
+    @classmethod
+    def _canonicalize_diagnostic_codes(
+        cls,
+        value: tuple[AnalysisDiagnosticCode, ...],
+    ) -> tuple[AnalysisDiagnosticCode, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
+
+    @model_validator(mode="after")
+    def _admitted_gate_has_only_advisory_diagnostics(self) -> AdmissionGateResult:
+        if self.admitted and any(
+            code is not AnalysisDiagnosticCode.OPTIONAL_EVIDENCE_UNAVAILABLE
+            for code in self.diagnostic_codes
+        ):
+            raise ValueError("admitted gate cannot carry blocker diagnostic codes")
+        return self
 
 
 class EvidencePreflightResult(BaseModel):
@@ -1884,6 +1923,21 @@ class EvidencePreflightResult(BaseModel):
     passed: bool
     readiness: EvidenceReadiness
     blockers: tuple[str, ...] = ()
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
+
+    @field_validator("diagnostic_codes")
+    @classmethod
+    def _canonicalize_diagnostic_codes(
+        cls,
+        value: tuple[AnalysisDiagnosticCode, ...],
+    ) -> tuple[AnalysisDiagnosticCode, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
+
+    @model_validator(mode="after")
+    def _passed_gate_has_no_blockers(self) -> EvidencePreflightResult:
+        if self.passed and (self.blockers or self.diagnostic_codes):
+            raise ValueError("passed preflight cannot carry blocker diagnostics")
+        return self
 
 
 class DraftThesis(BaseModel):
@@ -2228,7 +2282,13 @@ def build_evidence_state(
     )
 
 
-def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
+def acquire_run_evidence(
+    symbol: str,
+    requested_date: str,
+    *,
+    decision_policy: DecisionPolicyEngine | None = None,
+    decision_horizon: DecisionHorizon | None = None,
+) -> EvidenceState:
     """Acquire run identity and the validated five-year market snapshot."""
     from tradingagents.dataflows.errors import NoMarketDataError
     from tradingagents.dataflows.instrument_identity import (
@@ -2238,16 +2298,23 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
     )
     from tradingagents.dataflows.market_snapshot import (
         get_active_market_snapshot_acquisition_record,
+        get_active_run_telemetry,
         get_authoritative_market_snapshot,
     )
     from tradingagents.strategy_registry import (
+        DEFAULT_DECISION_HORIZON,
         MARKET_RETURN_OBSERVATIONS,
         build_market_return_fact,
+        create_production_decision_policy,
         market_return_calculation_id,
     )
 
     requested = datetime.strptime(requested_date, "%Y-%m-%d")
     start_date = (requested - relativedelta(years=5)).strftime("%Y-%m-%d")
+    if decision_policy is None:
+        decision_policy = create_production_decision_policy()
+        if decision_horizon is None:
+            decision_horizon = DEFAULT_DECISION_HORIZON
     registry_result = resolve_authoritative_instrument_identity(symbol)
     identity: dict[str, Any] = {}
     acquired_at = datetime.now(timezone.utc).isoformat()
@@ -2257,12 +2324,25 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
         canonical_symbol = registry_result.identity.canonical_symbol
         identity = registry_result.identity.as_mapping()
         identity["exchange"] = registry_result.identity.venue
+        minimum_history_rows = (
+            decision_policy.preflight_minimum_history_rows(
+                InstrumentKind(registry_result.identity.instrument_kind),
+                decision_horizon,
+            )
+            if decision_horizon is not None
+            else None
+        )
+        history_requirement = (
+            {"minimum_history_rows": minimum_history_rows}
+            if minimum_history_rows is not None
+            else {}
+        )
         try:
             snapshot = get_authoritative_market_snapshot(
                 canonical_symbol,
                 start_date,
                 requested_date,
-                minimum_history_rows=1,
+                **history_requirement,
             )
         except NoMarketDataError:
             snapshot = None
@@ -2381,6 +2461,20 @@ def acquire_run_evidence(symbol: str, requested_date: str) -> EvidenceState:
                     ),
                 )
 
+    telemetry_ledger = get_active_run_telemetry()
+    if telemetry_ledger is not None:
+        telemetry_ledger.record_source_outcome(
+            tool_call_id="identity-registry",
+            tool_name="instrument_identity_registry",
+            outcome=identity_outcome,
+        )
+        for outcome in calculation_outcomes:
+            telemetry_ledger.record_source_outcome(
+                tool_call_id=outcome.source_ref,
+                tool_name="deterministic_calculation",
+                outcome=outcome,
+            )
+
     state = build_evidence_state(
         symbol=symbol,
         identity=identity,
@@ -2407,24 +2501,6 @@ class AnalysisOutcomeReason(str, Enum):
     SHADOW_MODE_BLOCKED = "shadow_mode_blocked"
 
 
-class AnalysisDiagnosticCode(str, Enum):
-    IDENTITY_UNAVAILABLE = "identity_unavailable"
-    SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
-    SNAPSHOT_INVALID = "snapshot_invalid"
-    HISTORY_INSUFFICIENT = "history_insufficient"
-    REQUIRED_EVIDENCE_UNAVAILABLE = "required_evidence_unavailable"
-    REQUIRED_EVIDENCE_CONFLICTED = "required_evidence_conflicted"
-    DECISION_CONFIGURATION_INVALID = "decision_configuration_invalid"
-    STRATEGY_RULE_INVALID = "strategy_rule_invalid"
-    DIRECTION_CONTEXT_INVALID = "direction_context_invalid"
-    DIRECTION_ASSERTIONS_CONFLICTED = "direction_assertions_conflicted"
-    DIRECTION_SELECTION_INVALID = "direction_selection_invalid"
-    DECISION_ASSERTION_INVALID = "decision_assertion_invalid"
-    STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
-    SHADOW_MODE = "shadow_mode"
-    DETERMINISTIC_GATE_REJECTED = "deterministic_gate_rejected"
-
-
 class AnalysisOutcome(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -2444,8 +2520,8 @@ class AnalysisOutcome(BaseModel):
 
 _ANALYSIS_OUTCOME_SUMMARIES = {
     AnalysisOutcomeReason.PREFLIGHT_BLOCKED: (
-        "Analysis stopped before model-mediated work because required baseline "
-        "evidence or deterministic decision configuration was not decision-ready."
+        "Analysis stopped before model-mediated work because one or more "
+        "deterministic preflight requirements were not decision-ready."
     ),
     AnalysisOutcomeReason.ADMISSION_BLOCKED: (
         "Analysis stopped before thesis synthesis because required evidence and "
@@ -2621,22 +2697,28 @@ def evaluate_preflight_gate(
         else EvidenceState.model_validate(evidence or {})
     )
     blockers: list[str] = []
+    diagnostic_codes: set[AnalysisDiagnosticCode] = set()
     identity = state.instrument_identity
     snapshot = state.market_snapshot
     profile = None
 
     if identity is None:
         blockers.append("authoritative instrument identity is missing")
+        diagnostic_codes.add(AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE)
     elif not identity.is_authoritative:
         blockers.append(
             "instrument identity requires canonical symbol, venue, kind, currency, "
             "and provenance"
         )
+        diagnostic_codes.add(AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE)
     else:
         try:
             profile = capability_profile_for(identity.instrument_kind)
         except ValueError as exc:
             blockers.append(str(exc))
+            diagnostic_codes.add(
+                AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+            )
 
     if profile is not None:
         unsupported_required = set(profile.required_capabilities) - {
@@ -2646,12 +2728,18 @@ def evaluate_preflight_gate(
             "unsupported required capability: " + capability.value
             for capability in sorted(unsupported_required, key=lambda item: item.value)
         )
+        if unsupported_required:
+            diagnostic_codes.add(
+                AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+            )
 
     if snapshot is None:
         blockers.append("authoritative market snapshot is missing")
+        diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE)
     else:
         if identity is not None and snapshot.symbol != identity.symbol:
             blockers.append("instrument identity and market snapshot symbols differ")
+            diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         unknown_adjustment = snapshot.adjustment_basis.strip().casefold() in {
             "",
             "unknown",
@@ -2660,25 +2748,31 @@ def evaluate_preflight_gate(
         }
         if unknown_adjustment:
             blockers.append("authoritative market snapshot adjustment basis is unknown")
+            diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         try:
             requested_date = datetime.fromisoformat(snapshot.requested_date)
             effective_date = datetime.fromisoformat(snapshot.effective_trading_date)
         except ValueError:
             blockers.append("authoritative market snapshot dates must be ISO-8601")
+            diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         else:
             if effective_date > requested_date:
                 blockers.append(
                     "effective trading date cannot be later than the requested date"
                 )
+                diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         if not re.fullmatch(r"[0-9a-f]{64}", snapshot.frame_sha256):
             blockers.append("authoritative market snapshot frame digest is invalid")
+            diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         if not snapshot.snapshot_id.strip():
             blockers.append("authoritative market snapshot ID is missing")
+            diagnostic_codes.add(AnalysisDiagnosticCode.SNAPSHOT_INVALID)
         if snapshot.history_rows < minimum_history_rows:
             blockers.append(
                 "authoritative market snapshot has "
                 f"{snapshot.history_rows} rows; at least {minimum_history_rows} are required"
             )
+            diagnostic_codes.add(AnalysisDiagnosticCode.HISTORY_INSUFFICIENT)
 
     return EvidencePreflightResult(
         passed=not blockers,
@@ -2688,6 +2782,7 @@ def evaluate_preflight_gate(
             else EvidenceReadiness.INSUFFICIENT
         ),
         blockers=tuple(blockers),
+        diagnostic_codes=tuple(diagnostic_codes),
     )
 
 
@@ -2700,6 +2795,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE,),
             diagnostics=(
                 "Required evidence missing: resolved instrument identity.",
             ),
@@ -2709,6 +2805,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE,),
             diagnostics=(
                 "Required evidence missing: Authoritative Market Snapshot.",
             ),
@@ -2718,6 +2815,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.SNAPSHOT_INVALID,),
             diagnostics=(
                 "Required evidence missing: known Adjustment Basis.",
             ),
@@ -2727,6 +2825,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.SNAPSHOT_INVALID,),
             diagnostics=(
                 "Required evidence missing: Effective Trading Date.",
             ),
@@ -2739,6 +2838,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.SNAPSHOT_INVALID,),
             diagnostics=(
                 "Required evidence missing: immutable Authoritative Market "
                 "Snapshot ID and frame digest.",
@@ -2764,6 +2864,7 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(AnalysisDiagnosticCode.HISTORY_INSUFFICIENT,),
             diagnostics=(
                 "Insufficient market history: "
                 f"{evidence.market_snapshot.history_rows} rows available; "
@@ -2780,6 +2881,9 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(
+                AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,
+            ),
             diagnostics=tuple(
                 "Required evidence configuration invalid: "
                 f"{source.source_id}"
@@ -2798,6 +2902,9 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.CONFLICTED,
+            diagnostic_codes=(
+                AnalysisDiagnosticCode.REQUIRED_EVIDENCE_CONFLICTED,
+            ),
             diagnostics=tuple(
                 "Required evidence conflicted: "
                 f"{source.source_id}{f' ({source.detail})' if source.detail else ''}."
@@ -2814,6 +2921,9 @@ def evaluate_admission_gate(
         return AdmissionGateResult(
             admitted=False,
             readiness=EvidenceReadiness.INSUFFICIENT,
+            diagnostic_codes=(
+                AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE,
+            ),
             diagnostics=tuple(
                 "Required evidence unavailable: "
                 f"{source.source_id}{f' ({source.detail})' if source.detail else ''}."
@@ -2840,4 +2950,9 @@ def evaluate_admission_gate(
             else EvidenceReadiness.DECISION_READY
         ),
         diagnostics=diagnostics,
+        diagnostic_codes=(
+            (AnalysisDiagnosticCode.OPTIONAL_EVIDENCE_UNAVAILABLE,)
+            if optional_unavailable
+            else ()
+        ),
     )

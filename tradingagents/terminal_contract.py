@@ -21,11 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tradingagents.agents.managers.direction_selector import render_trading_decision
 from tradingagents.decision_policy import (
+    CANONICAL_RUN_ID_PATTERN,
     DECISION_POLICY_CONTRACT_VERSION,
     DecisionGateResultV2,
     EvidenceIntegrityStatus,
     TradingDecisionContract,
     ValidatedDecisionContext,
+    is_canonical_run_id,
 )
 from tradingagents.evidence import (
     EVIDENCE_CONTRACT_VERSION,
@@ -148,7 +150,7 @@ class CanonicalRunIdentity(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = TERMINAL_CONTRACT_VERSION
-    run_id: str = Field(pattern=r"^run:[0-9a-f]{64}$")
+    run_id: str = Field(pattern=CANONICAL_RUN_ID_PATTERN)
     configuration_digest: str = Field(pattern=r"^config:[0-9a-f]{64}$")
     evidence_contract_version: str = Field(min_length=1)
     decision_contract_version: str = Field(min_length=1)
@@ -603,8 +605,14 @@ def build_run_identity(
         calculation_digest = calculation_digest or context_payload.get(
             "calculation_registry_digest"
         )
+    existing_run_id = final_state.get("run_id")
+    run_id = (
+        existing_run_id
+        if is_canonical_run_id(existing_run_id)
+        else f"run:{_digest(identity_payload)}"
+    )
     return CanonicalRunIdentity(
-        run_id=f"run:{_digest(identity_payload)}",
+        run_id=run_id,
         configuration_digest=configured_digest,
         evidence_contract_version=EVIDENCE_CONTRACT_VERSION,
         decision_contract_version=DECISION_POLICY_CONTRACT_VERSION,

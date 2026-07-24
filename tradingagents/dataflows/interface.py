@@ -508,7 +508,7 @@ def route_to_vendor_acquired(
 
     return controller.acquire(
         AcquisitionRequest(
-            capability="get_news" if method == "get_news" else capability,
+            capability=capability,
             source_ref=source_ref,
             tool_call_id=tool_call_id,
             tool_name=method,

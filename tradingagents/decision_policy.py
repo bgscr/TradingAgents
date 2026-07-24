@@ -9,6 +9,7 @@ the final decision gate.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -23,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from tradingagents.agents.schemas import PortfolioRating
 from tradingagents.evidence import (
+    AnalysisDiagnosticCode,
     CalculationDefinition,
     CalculationLineage,
     EvidenceState,
@@ -37,8 +39,11 @@ from tradingagents.evidence import (
 )
 
 DECISION_POLICY_CONTRACT_VERSION = "1.0"
+ADMITTED_EVIDENCE_BINDING_VERSION = "1.0"
+CANONICAL_RUN_ID_PATTERN = r"^run:[0-9a-f]{64}$"
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 _IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"
+_SHA256_DIGEST_PATTERN = r"^[a-z]+:[0-9a-f]{64}$"
 
 
 class HorizonUnit(str, Enum):
@@ -61,6 +66,54 @@ class EvidenceIntegrityStatus(str, Enum):
     DEGRADED = "degraded"
     INSUFFICIENT = "insufficient"
     CONFLICTED = "conflicted"
+
+
+class AdmittedEvidenceBinding(BaseModel):
+    """Checkpoint-safe binding between one run and its admitted evidence."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = ADMITTED_EVIDENCE_BINDING_VERSION
+    run_id: str = Field(pattern=CANONICAL_RUN_ID_PATTERN)
+    evidence_semantic_digest: str = Field(pattern=_SHA256_DIGEST_PATTERN)
+    context_id: str = Field(pattern=_SHA256_DIGEST_PATTERN)
+    registry_digest: str = Field(pattern=_SHA256_DIGEST_PATTERN)
+    calculation_registry_digest: str = Field(pattern=_SHA256_DIGEST_PATTERN)
+    integrity_status: EvidenceIntegrityStatus
+    binding_digest: str = Field(pattern=_SHA256_DIGEST_PATTERN)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        evidence_semantic_digest: str,
+        context_id: str,
+        registry_digest: str,
+        calculation_registry_digest: str,
+        integrity_status: EvidenceIntegrityStatus,
+    ) -> AdmittedEvidenceBinding:
+        """Create a self-attesting binding over every checkpointed field."""
+
+        payload = {
+            "contract_version": ADMITTED_EVIDENCE_BINDING_VERSION,
+            "run_id": run_id,
+            "evidence_semantic_digest": evidence_semantic_digest,
+            "context_id": context_id,
+            "registry_digest": registry_digest,
+            "calculation_registry_digest": calculation_registry_digest,
+            "integrity_status": integrity_status,
+        }
+        return cls(
+            **payload,
+            binding_digest=_digest("admission", payload),
+        )
+
+    @model_validator(mode="after")
+    def _binding_digest_matches_payload(self) -> AdmittedEvidenceBinding:
+        if self.binding_digest != stable_admitted_evidence_binding_digest(self):
+            raise ValueError("admitted evidence binding digest mismatch")
+        return self
 
 
 class DecisionHorizon(BaseModel):
@@ -235,6 +288,15 @@ class DecisionContextBlocked(BaseModel):
     integrity_status: EvidenceIntegrityStatus
     blocker_codes: tuple[str, ...] = Field(min_length=1)
     diagnostics: tuple[str, ...] = Field(min_length=1)
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
+
+    @field_validator("diagnostic_codes")
+    @classmethod
+    def _canonicalize_diagnostic_codes(
+        cls,
+        value: tuple[AnalysisDiagnosticCode, ...],
+    ) -> tuple[AnalysisDiagnosticCode, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
 
 
 DecisionContextBuildResult = Annotated[
@@ -296,12 +358,23 @@ class DecisionGateResultV2(BaseModel):
     permitted: bool
     integrity_status: EvidenceIntegrityStatus
     diagnostics: tuple[str, ...]
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
     decision: TradingDecisionContract | None = None
+
+    @field_validator("diagnostic_codes")
+    @classmethod
+    def _canonicalize_diagnostic_codes(
+        cls,
+        value: tuple[AnalysisDiagnosticCode, ...],
+    ) -> tuple[AnalysisDiagnosticCode, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
 
     @model_validator(mode="after")
     def _decision_matches_permission(self) -> DecisionGateResultV2:
         if self.permitted != (self.decision is not None):
             raise ValueError("a decision must exist if and only if the gate is permitted")
+        if self.permitted and (self.diagnostics or self.diagnostic_codes):
+            raise ValueError("permitted gate cannot carry blocker diagnostics")
         return self
 
 
@@ -336,8 +409,28 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def is_canonical_run_id(value: object) -> bool:
+    """Return whether ``value`` is the canonical persisted run-ID form."""
+
+    return isinstance(value, str) and re.fullmatch(
+        CANONICAL_RUN_ID_PATTERN,
+        value,
+    ) is not None
+
+
 def _digest(prefix: str, value: Any) -> str:
     return f"{prefix}:{sha256(_canonical_json(value).encode()).hexdigest()}"
+
+
+def stable_admitted_evidence_binding_digest(
+    binding: AdmittedEvidenceBinding,
+) -> str:
+    """Return the digest that closes an admitted-evidence binding payload."""
+
+    return _digest(
+        "admission",
+        binding.model_dump(mode="json", exclude={"binding_digest"}),
+    )
 
 
 def stable_decision_value_digest(
@@ -458,6 +551,114 @@ def _semantic_evidence_payload(evidence: EvidenceState) -> dict[str, Any]:
     return payload
 
 
+def stable_evidence_semantic_digest(evidence: EvidenceState) -> str:
+    """Return the checkpoint-stable digest of one canonical Evidence State."""
+
+    canonical = EvidenceState.model_validate_json(evidence.model_dump_json())
+    return _digest("evidence", _semantic_evidence_payload(canonical))
+
+
+def _context_diagnostic_codes(
+    blocker_codes: Iterable[str],
+) -> tuple[AnalysisDiagnosticCode, ...]:
+    diagnostic_codes: set[AnalysisDiagnosticCode] = set()
+    for blocker_code in blocker_codes:
+        if blocker_code == "authoritative_instrument_identity_required":
+            code = AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE
+        elif blocker_code == "instrument_capability_profile_unavailable":
+            code = AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+        elif blocker_code == "source_fact_insufficient_history":
+            code = AnalysisDiagnosticCode.HISTORY_INSUFFICIENT
+        elif blocker_code in {
+            "conflicting_duplicate_fact_id",
+            "conflicting_duplicate_source_artifact",
+            "required_evidence_conflicted",
+            "selected_source_facts_conflicted",
+        }:
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_CONFLICTED
+        elif blocker_code in {
+            "required_evidence_unavailable",
+            "selected_source_fact_missing",
+            "selected_source_fact_artifact_missing",
+            "selected_source_artifact_digest_mismatch",
+            "selected_source_fact_span_invalid",
+            "selected_source_fact_excerpt_mismatch",
+            "source_fact_instrument_mismatch",
+            "source_fact_effective_date_invalid",
+            "source_fact_effective_date_in_future",
+            "source_fact_stale",
+        }:
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE
+        elif blocker_code == "strategy_rule_evaluator_unavailable":
+            code = AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+        elif (
+            blocker_code == "no_applicable_registered_strategy_rule"
+            or blocker_code.startswith("strategy_rule_")
+        ):
+            code = AnalysisDiagnosticCode.STRATEGY_RULE_INVALID
+        else:
+            code = AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED
+        diagnostic_codes.add(code)
+    return tuple(sorted(diagnostic_codes, key=lambda item: item.value))
+
+
+def _decision_gate_diagnostic_codes(
+    diagnostics: Iterable[str],
+) -> tuple[AnalysisDiagnosticCode, ...]:
+    diagnostic_codes: set[AnalysisDiagnosticCode] = set()
+    for diagnostic in diagnostics:
+        if diagnostic == "decision market snapshot unavailable":
+            code = AnalysisDiagnosticCode.SNAPSHOT_UNAVAILABLE
+        elif diagnostic.startswith("decision market snapshot"):
+            code = AnalysisDiagnosticCode.SNAPSHOT_INVALID
+        elif diagnostic.startswith("decision instrument identity"):
+            code = AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE
+        elif diagnostic in {
+            "decision source fact ledger conflict",
+            "decision source artifact ledger conflict",
+            "decision assertion facts are conflicted",
+        }:
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_CONFLICTED
+        elif diagnostic == "decision assertion fact history is insufficient":
+            code = AnalysisDiagnosticCode.HISTORY_INSUFFICIENT
+        elif diagnostic.startswith("decision source"):
+            code = AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE
+        elif (
+            diagnostic.startswith("canonical calculation")
+            or diagnostic.startswith("canonical fact adapter")
+            or diagnostic
+            in {
+                "strategy rule registry digest mismatch",
+                "calculation registry digest mismatch",
+                "decision assertion evaluator is unavailable",
+            }
+        ):
+            code = AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID
+        elif diagnostic.startswith("validated decision context"):
+            code = AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID
+        elif diagnostic.startswith("direction proposal"):
+            code = AnalysisDiagnosticCode.DIRECTION_SELECTION_INVALID
+        elif diagnostic in {
+            "selected assertions target multiple ratings",
+            "validated context contains duplicate assertion ids",
+        }:
+            code = AnalysisDiagnosticCode.DIRECTION_ASSERTIONS_CONFLICTED
+        elif (
+            diagnostic.startswith("decision assertion")
+            or diagnostic
+            in {
+                "assertion does not support the proposed rating",
+                "opposing assertions cannot authorize a rating",
+                "validated context contains duplicate fact ids",
+            }
+        ):
+            code = AnalysisDiagnosticCode.DECISION_ASSERTION_INVALID
+        else:
+            code = AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED
+        diagnostic_codes.add(code)
+    return tuple(sorted(diagnostic_codes, key=lambda item: item.value))
+
+
 def _blocked(*codes: str) -> DecisionContextBlocked:
     unique = tuple(sorted(set(codes))) or ("decision_context_invalid",)
     diagnostics = tuple(code.replace("_", " ") for code in unique)
@@ -470,6 +671,7 @@ def _blocked(*codes: str) -> DecisionContextBlocked:
         integrity_status=integrity,
         blocker_codes=unique,
         diagnostics=diagnostics,
+        diagnostic_codes=_context_diagnostic_codes(unique),
     )
 
 
@@ -485,8 +687,6 @@ class DecisionPolicyEngine:
     _evaluators: Mapping[str, RuleEvaluator]
     _fact_adapters: Mapping[tuple[str, str], CanonicalFactAdapter]
     _artifact_resolver: ArtifactResolver | None
-    _trusted_run_evidence: EvidenceState | None
-    _trusted_admitted_evidence_by_context_id: Mapping[str, EvidenceState]
 
     def __init__(
         self,
@@ -559,12 +759,6 @@ class DecisionPolicyEngine:
             self, "_fact_adapters", MappingProxyType(fact_adapter_copy)
         )
         object.__setattr__(self, "_artifact_resolver", artifact_resolver)
-        object.__setattr__(self, "_trusted_run_evidence", None)
-        object.__setattr__(
-            self,
-            "_trusted_admitted_evidence_by_context_id",
-            MappingProxyType({}),
-        )
 
     @property
     def configuration_blockers(self) -> tuple[str, ...]:
@@ -598,46 +792,33 @@ class DecisionPolicyEngine:
             return None
         return min(rule.minimum_history_rows for rule in applicable)
 
-    def register_trusted_evidence(self, evidence: EvidenceState) -> None:
-        """Bind one pre-checkpoint run ledger and clear prior admission state."""
-
-        trusted = EvidenceState.model_validate_json(evidence.model_dump_json())
-        object.__setattr__(self, "_trusted_run_evidence", trusted)
-        object.__setattr__(
-            self,
-            "_trusted_admitted_evidence_by_context_id",
-            MappingProxyType({}),
-        )
-
-    def register_admitted_evidence(
+    def admit_evidence(
         self,
         evidence: EvidenceState,
         context: ValidatedDecisionContext,
-    ) -> None:
-        """Promote evidence only after it preserves the trusted run ledger."""
+        *,
+        run_id: str,
+    ) -> AdmittedEvidenceBinding:
+        """Create the closed run binding persisted with admitted graph state."""
 
         admitted = EvidenceState.model_validate_json(evidence.model_dump_json())
-        binding_failure = self._trusted_run_binding_failure(admitted)
-        if binding_failure is not None:
-            raise ValueError(binding_failure)
+        if not run_id.strip():
+            raise ValueError("admitted_evidence_run_id_unavailable")
+        if context.registry_digest != self.registry_digest:
+            raise ValueError("validated_decision_context_registry_mismatch")
+        if context.calculation_registry_digest != self.calculation_registry_digest:
+            raise ValueError("validated_decision_context_calculation_registry_mismatch")
         if context.context_id != _digest("context", _context_payload(context)):
             raise ValueError("validated_decision_context_digest_mismatch")
         if self._integrity_status(admitted) is not context.integrity_status:
             raise ValueError("validated_decision_context_integrity_mismatch")
-
-        admitted_by_context_id = dict(
-            self._trusted_admitted_evidence_by_context_id
-        )
-        existing = admitted_by_context_id.get(context.context_id)
-        if existing is not None and _semantic_evidence_payload(
-            existing
-        ) != _semantic_evidence_payload(admitted):
-            raise ValueError("trusted_admitted_evidence_redefined")
-        admitted_by_context_id[context.context_id] = admitted
-        object.__setattr__(
-            self,
-            "_trusted_admitted_evidence_by_context_id",
-            MappingProxyType(admitted_by_context_id),
+        return AdmittedEvidenceBinding.create(
+            run_id=run_id,
+            evidence_semantic_digest=stable_evidence_semantic_digest(admitted),
+            context_id=context.context_id,
+            registry_digest=self.registry_digest,
+            calculation_registry_digest=self.calculation_registry_digest,
+            integrity_status=context.integrity_status,
         )
 
     def candidate_applications(
@@ -911,6 +1092,9 @@ class DecisionPolicyEngine:
         proposal: DirectionSelection,
         *,
         evidence: EvidenceState,
+        admitted_evidence_binding: AdmittedEvidenceBinding | None = None,
+        run_id: str | None = None,
+        expected_run_id: str | None = None,
     ) -> DecisionGateResultV2:
         checkpoint_evidence = EvidenceState.model_validate_json(
             evidence.model_dump_json()
@@ -954,11 +1138,19 @@ class DecisionPolicyEngine:
         facts_by_id = {fact.fact_id: fact for fact in context.facts}
         if len(facts_by_id) != len(context.facts):
             diagnostics.append("validated context contains duplicate fact ids")
-        ledger_failure = self._gate_ledger_failure(context, checkpoint_evidence)
+        ledger_failure = self._gate_ledger_failure(
+            context,
+            checkpoint_evidence,
+            admitted_evidence_binding=admitted_evidence_binding,
+            run_id=run_id,
+            expected_run_id=expected_run_id,
+        )
         if ledger_failure is not None:
             diagnostics.append(ledger_failure.replace("_", " "))
         trusted_admitted_evidence = (
-            self._trusted_admitted_evidence_by_context_id.get(context.context_id)
+            checkpoint_evidence
+            if admitted_evidence_binding is not None
+            else None
         )
         target_ratings: set[PortfolioRating] = set()
         for assertion in selected:
@@ -1079,6 +1271,7 @@ class DecisionPolicyEngine:
         if len(target_ratings) > 1:
             diagnostics.append("selected assertions target multiple ratings")
         if diagnostics:
+            canonical_diagnostics = tuple(sorted(set(diagnostics)))
             return DecisionGateResultV2(
                 permitted=False,
                 integrity_status=(
@@ -1086,7 +1279,10 @@ class DecisionPolicyEngine:
                     if context.integrity_status is EvidenceIntegrityStatus.CONFLICTED
                     else EvidenceIntegrityStatus.INSUFFICIENT
                 ),
-                diagnostics=tuple(sorted(set(diagnostics))),
+                diagnostics=canonical_diagnostics,
+                diagnostic_codes=_decision_gate_diagnostic_codes(
+                    canonical_diagnostics
+                ),
             )
 
         selected_fact_ids = {
@@ -1239,67 +1435,6 @@ class DecisionPolicyEngine:
                 return failure.replace(" ", "_")
         return None
 
-    def _trusted_run_binding_failure(
-        self,
-        admitted_evidence: EvidenceState,
-    ) -> str | None:
-        trusted = self._trusted_run_evidence
-        if trusted is None:
-            return "trusted_run_evidence_unavailable"
-
-        trusted_payload = _semantic_evidence_payload(trusted)
-        admitted_payload = _semantic_evidence_payload(admitted_evidence)
-        for field in (
-            "contract_version",
-            "instrument_identity",
-            "market_snapshot",
-        ):
-            if admitted_payload[field] != trusted_payload[field]:
-                return f"trusted_run_{field}_mismatch"
-        for field in (
-            "material_claims",
-            "source_facts",
-            "source_artifacts",
-            "claim_validations",
-            "acquisition_outcomes",
-        ):
-            if not set(trusted_payload[field]).issubset(admitted_payload[field]):
-                return f"trusted_run_{field}_mismatch"
-
-        severity = {
-            EvidenceStatus.NOT_APPLICABLE: -1,
-            EvidenceStatus.AVAILABLE: 0,
-            EvidenceStatus.UNAVAILABLE: 1,
-            EvidenceStatus.CONFLICTED: 2,
-        }
-
-        def source_bindings(
-            evidence: EvidenceState,
-        ) -> dict[str, tuple[int, bool]]:
-            bindings: dict[str, tuple[int, bool]] = {}
-            for source in evidence.sources:
-                candidate = (severity[source.status], source.required)
-                prior = bindings.get(source.source_id)
-                if prior is None:
-                    bindings[source.source_id] = candidate
-                else:
-                    bindings[source.source_id] = (
-                        max(prior[0], candidate[0]),
-                        prior[1] or candidate[1],
-                    )
-            return bindings
-
-        admitted_sources = source_bindings(admitted_evidence)
-        for source_id, trusted_binding in source_bindings(trusted).items():
-            admitted_binding = admitted_sources.get(source_id)
-            if (
-                admitted_binding is None
-                or admitted_binding[0] < trusted_binding[0]
-                or (trusted_binding[1] and not admitted_binding[1])
-            ):
-                return "trusted_run_sources_mismatch"
-        return None
-
     def _gate_adapter_failure(
         self,
         facts: tuple[DecisionFact, ...],
@@ -1381,16 +1516,37 @@ class DecisionPolicyEngine:
         self,
         context: ValidatedDecisionContext,
         checkpoint_evidence: EvidenceState,
+        *,
+        admitted_evidence_binding: AdmittedEvidenceBinding | None = None,
+        run_id: str | None = None,
+        expected_run_id: str | None = None,
     ) -> str | None:
-        trusted = self._trusted_admitted_evidence_by_context_id.get(
-            context.context_id
-        )
-        if trusted is None:
+        if admitted_evidence_binding is None:
             return "decision_admitted_evidence_unavailable"
-        if _semantic_evidence_payload(
-            checkpoint_evidence
-        ) != _semantic_evidence_payload(trusted):
+        binding = admitted_evidence_binding
+        if not is_canonical_run_id(expected_run_id):
+            return "decision_expected_run_identity_unavailable"
+        if run_id != expected_run_id or binding.run_id != expected_run_id:
+            return "decision_admitted_evidence_run_mismatch"
+        if binding.context_id != context.context_id:
+            return "decision_admitted_evidence_context_mismatch"
+        if binding.registry_digest != self.registry_digest:
+            return "decision_admitted_evidence_registry_mismatch"
+        if binding.calculation_registry_digest != self.calculation_registry_digest:
+            return "decision_admitted_evidence_calculation_registry_mismatch"
+        if binding.integrity_status is not context.integrity_status:
+            return "decision_admitted_evidence_integrity_mismatch"
+        if (
+            binding.evidence_semantic_digest
+            != stable_evidence_semantic_digest(checkpoint_evidence)
+        ):
             return "decision_admitted_evidence_mismatch"
+        if (
+            binding.binding_digest
+            != stable_admitted_evidence_binding_digest(binding)
+        ):
+            return "decision_admitted_evidence_binding_mismatch"
+        trusted = checkpoint_evidence
         if self._integrity_status(trusted) is not context.integrity_status:
             return "decision_evidence_integrity_mismatch"
         if (

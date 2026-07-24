@@ -298,6 +298,7 @@ def _outcome_state() -> dict:
             "passed": False,
             "readiness": "insufficient",
             "blockers": ["authoritative instrument identity is missing"],
+            "diagnostic_codes": ["identity_unavailable"],
         },
         "analysis_outcome_contract": outcome.model_dump(mode="json"),
         "analysis_outcome": render_analysis_outcome(outcome),
@@ -630,7 +631,7 @@ def test_report_tree_writes_complete_immutable_audit(tmp_path, outcome):
     first_bytes = audit_path.read_bytes()
     audit = json.loads(first_bytes)
     expected = "analysis_outcome" if outcome else "trading_decision"
-    assert audit["schema_version"] == "3.1"
+    assert audit["schema_version"] == "4.0"
     assert audit["terminal"]["terminal_outcome_kind"] == expected
     assert audit["run"]["run_id"] == state["run_id"]
     assert audit["run"]["configuration_digest"] == state["configuration_digest"]
@@ -790,6 +791,32 @@ def test_memory_log_requires_the_audited_terminal_publication(tmp_path):
     [entry] = log.load_entries()
     assert entry["rating"] == "Buy"
     assert entry["decision"] == state["final_trade_decision"]
+
+
+@pytest.mark.unit
+def test_memory_reflection_is_labeled_advisory_commentary(tmp_path):
+    memory_path = tmp_path / "memory.md"
+    log = TradingMemoryLog({"memory_log_path": str(memory_path)})
+    state = _decision_state()
+    prepare_decision_audit(state, tmp_path / "audit")
+    log.store_trading_decision("AAPL", "2026-07-18", state)
+
+    log.update_with_outcome(
+        ticker="AAPL",
+        trade_date="2026-07-18",
+        raw_return=0.04,
+        alpha_return=0.01,
+        holding_days=20,
+        reflection="The model-authored lesson remains advisory.",
+    )
+
+    text = memory_path.read_text(encoding="utf-8")
+    assert (
+        "ADVISORY COMMENTARY (REFLECTION):\n"
+        "The model-authored lesson remains advisory."
+    ) in text
+    [entry] = log.load_entries()
+    assert entry["reflection"] == "The model-authored lesson remains advisory."
 
 
 @pytest.mark.unit

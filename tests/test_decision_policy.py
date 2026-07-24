@@ -12,10 +12,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from tradingagents.agents.schemas import PortfolioDecisionSelection, PortfolioRating
 from tradingagents.decision_policy import (
+    AdmittedEvidenceBinding,
     CanonicalFactAdapterResult,
     DecisionContextBlocked,
     DecisionContextBuildResult,
     DecisionContextBuilt,
+    DecisionGateResultV2,
     DecisionHorizon,
     DecisionPolicyEngine,
     DirectionSelection,
@@ -28,9 +30,11 @@ from tradingagents.decision_policy import (
     StrategyRuleDefinition,
     ValidatedDecisionContext,
     stable_decision_value_digest,
+    stable_evidence_semantic_digest,
 )
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
+    AnalysisDiagnosticCode,
     CalculationDefinition,
     CalculationLineage,
     ClaimValidation,
@@ -52,6 +56,7 @@ from tradingagents.evidence import (
 )
 
 HORIZON = DecisionHorizon(count=20, unit=HorizonUnit.TRADING_DAYS)
+TEST_RUN_ID = "run:" + "1" * 64
 ARTIFACT_TEXT = "P/E was 9.5; P/B was 1.2."
 ARTIFACT_SHA256 = sha256(ARTIFACT_TEXT.encode()).hexdigest()
 SOURCE_REF = "market:600895.SS:2026-07-18"
@@ -301,16 +306,239 @@ def _build(
 ):
     policy = engine or _engine()
     run_evidence = evidence or _evidence(_fact())
-    policy.register_trusted_evidence(run_evidence)
     result = policy.build_context(
         run_evidence,
         applications or (_application(),),
         horizon=horizon,
         as_of_date=date(2026, 7, 19),
     )
-    if isinstance(result, DecisionContextBuilt):
-        policy.register_admitted_evidence(run_evidence, result.context)
     return result
+
+
+def _gate(
+    engine: DecisionPolicyEngine,
+    context: ValidatedDecisionContext,
+    proposal: DirectionSelection,
+    evidence: EvidenceState,
+    *,
+    binding=None,
+    run_id: str = TEST_RUN_ID,
+    expected_run_id: str | None = None,
+):
+    admitted_binding = binding or engine.admit_evidence(
+        evidence,
+        context,
+        run_id=run_id,
+    )
+    return engine.gate(
+        context,
+        proposal,
+        evidence=evidence,
+        admitted_evidence_binding=admitted_binding,
+        run_id=run_id,
+        expected_run_id=expected_run_id or run_id,
+    )
+
+
+def test_admission_returns_a_checkpoint_binding_for_the_run_and_context():
+    engine = _engine()
+    evidence = _evidence(_fact())
+    built = engine.build_context(
+        evidence,
+        (_application(),),
+        horizon=HORIZON,
+        as_of_date=date(2026, 7, 19),
+    )
+    assert isinstance(built, DecisionContextBuilt)
+
+    binding = engine.admit_evidence(
+        evidence,
+        built.context,
+        run_id="run:" + "2" * 64,
+    )
+
+    assert binding.run_id == "run:" + "2" * 64
+    assert binding.evidence_semantic_digest == stable_evidence_semantic_digest(
+        evidence
+    )
+    assert binding.context_id == built.context.context_id
+    assert binding.registry_digest == engine.registry_digest
+    assert (
+        binding.calculation_registry_digest
+        == engine.calculation_registry_digest
+    )
+    assert binding.integrity_status is built.context.integrity_status
+
+
+def test_policy_gate_fails_closed_without_checkpoint_admission_binding():
+    engine = _engine()
+    evidence = _evidence(_fact())
+    built = _build(engine=engine, evidence=evidence)
+    assert isinstance(built, DecisionContextBuilt)
+    proposal = DirectionSelection(
+        context_id=built.context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=(built.context.assertions[0].assertion_id,),
+    )
+    result = engine.gate(built.context, proposal, evidence=evidence)
+
+    assert result.permitted is False
+    assert "decision admitted evidence unavailable" in result.diagnostics
+
+
+def test_distinct_run_bindings_are_isolated_on_one_policy_instance():
+    engine = _engine()
+    evidence = _evidence(_fact())
+    built = _build(engine=engine, evidence=evidence)
+    assert isinstance(built, DecisionContextBuilt)
+    proposal = DirectionSelection(
+        context_id=built.context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=(built.context.assertions[0].assertion_id,),
+    )
+    binding_a = engine.admit_evidence(
+        evidence,
+        built.context,
+        run_id="run:" + "a" * 64,
+    )
+    binding_b = engine.admit_evidence(
+        evidence,
+        built.context,
+        run_id="run:" + "b" * 64,
+    )
+
+    result_b = _gate(
+        engine,
+        built.context,
+        proposal,
+        evidence,
+        binding=binding_b,
+        run_id=binding_b.run_id,
+    )
+    result_a = _gate(
+        engine,
+        built.context,
+        proposal,
+        evidence,
+        binding=binding_a,
+        run_id=binding_a.run_id,
+    )
+    crossed = _gate(
+        engine,
+        built.context,
+        proposal,
+        evidence,
+        binding=binding_b,
+        run_id=binding_a.run_id,
+    )
+
+    assert result_a.permitted is True
+    assert result_b.permitted is True
+    assert crossed.permitted is False
+    assert "decision admitted evidence run mismatch" in crossed.diagnostics
+
+
+def test_run_identity_and_binding_cannot_be_mutated_together():
+    engine = _engine()
+    evidence = _evidence(_fact())
+    built = _build(engine=engine, evidence=evidence)
+    assert isinstance(built, DecisionContextBuilt)
+    proposal = DirectionSelection(
+        context_id=built.context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=(built.context.assertions[0].assertion_id,),
+    )
+    binding = engine.admit_evidence(
+        evidence,
+        built.context,
+        run_id=TEST_RUN_ID,
+    )
+    mutated_run_id = "run:" + "c" * 64
+    mutated_binding = AdmittedEvidenceBinding.create(
+        run_id=mutated_run_id,
+        evidence_semantic_digest=binding.evidence_semantic_digest,
+        context_id=binding.context_id,
+        registry_digest=binding.registry_digest,
+        calculation_registry_digest=binding.calculation_registry_digest,
+        integrity_status=binding.integrity_status,
+    )
+
+    result = _gate(
+        engine,
+        built.context,
+        proposal,
+        evidence,
+        binding=mutated_binding,
+        run_id=mutated_run_id,
+        expected_run_id=TEST_RUN_ID,
+    )
+
+    assert result.permitted is False
+    assert "decision admitted evidence run mismatch" in result.diagnostics
+
+
+def test_admission_binding_mutations_fail_closed():
+    engine = _engine()
+    evidence = _evidence(_fact())
+    built = _build(engine=engine, evidence=evidence)
+    assert isinstance(built, DecisionContextBuilt)
+    proposal = DirectionSelection(
+        context_id=built.context.context_id,
+        rating=PortfolioRating.BUY,
+        assertion_ids=(built.context.assertions[0].assertion_id,),
+    )
+    binding = engine.admit_evidence(
+        evidence,
+        built.context,
+        run_id=TEST_RUN_ID,
+    )
+    mutations = (
+        (
+            binding.model_copy(update={"run_id": "run:" + "d" * 64}),
+            "decision admitted evidence run mismatch",
+        ),
+        (
+            binding.model_copy(
+                update={"evidence_semantic_digest": "evidence:" + "0" * 64}
+            ),
+            "decision admitted evidence mismatch",
+        ),
+        (
+            binding.model_copy(update={"context_id": "context:" + "0" * 64}),
+            "decision admitted evidence context mismatch",
+        ),
+        (
+            binding.model_copy(
+                update={"registry_digest": "registry:" + "0" * 64}
+            ),
+            "decision admitted evidence registry mismatch",
+        ),
+        (
+            binding.model_copy(
+                update={
+                    "calculation_registry_digest": "calculations:" + "0" * 64
+                }
+            ),
+            "decision admitted evidence calculation registry mismatch",
+        ),
+        (
+            binding.model_copy(
+                update={"integrity_status": EvidenceIntegrityStatus.DEGRADED}
+            ),
+            "decision admitted evidence integrity mismatch",
+        ),
+    )
+
+    for mutated, diagnostic in mutations:
+        result = _gate(
+            engine,
+            built.context,
+            proposal,
+            evidence,
+            binding=mutated,
+        )
+        assert result.permitted is False
+        assert diagnostic in result.diagnostics
 
 
 def test_registry_digest_is_order_independent_and_duplicate_rules_are_rejected():
@@ -670,30 +898,45 @@ def test_gate_accepts_only_the_rule_supported_rating():
     assert isinstance(built, DecisionContextBuilt)
     assertion_id = built.context.assertions[0].assertion_id
 
-    accepted = engine.gate(
+    accepted = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
-    swapped = engine.gate(
+    swapped = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.SELL,
             assertion_ids=(assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
     assert accepted.permitted is True
     assert accepted.decision is not None
     assert accepted.decision.rating is PortfolioRating.BUY
+    assert accepted.diagnostic_codes == ()
     assert swapped.permitted is False
     assert swapped.decision is None
     assert "assertion does not support the proposed rating" in swapped.diagnostics
+    assert swapped.diagnostic_codes == (
+        AnalysisDiagnosticCode.DECISION_ASSERTION_INVALID,
+    )
+    with pytest.raises(ValidationError, match="permitted gate"):
+        DecisionGateResultV2.model_validate(
+            {
+                **accepted.model_dump(mode="json"),
+                "diagnostic_codes": [
+                    AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED.value
+                ],
+            }
+        )
 
 
 def test_gate_uses_configured_artifact_resolver_with_trusted_ledger():
@@ -702,14 +945,15 @@ def test_gate_uses_configured_artifact_resolver_with_trusted_ledger():
     assert isinstance(built, DecisionContextBuilt)
     assertion_id = built.context.assertions[0].assertion_id
 
-    result = engine.gate(
+    result = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
 
     assert result.permitted is True
@@ -733,7 +977,12 @@ def test_gate_rejects_checkpoint_rewrite_of_required_source_conflict():
     )
     assert isinstance(built, DecisionContextBuilt)
 
-    trusted_evidence = checkpoint_evidence.model_copy(
+    admitted_binding = engine.admit_evidence(
+        checkpoint_evidence,
+        built.context,
+        run_id=TEST_RUN_ID,
+    )
+    rewritten_evidence = checkpoint_evidence.model_copy(
         update={
             "sources": (
                 available_source.model_copy(
@@ -745,21 +994,21 @@ def test_gate_rejects_checkpoint_rewrite_of_required_source_conflict():
             )
         }
     )
-    engine.register_trusted_evidence(trusted_evidence)
-    with pytest.raises(ValueError, match="trusted_run_sources_mismatch"):
-        engine.register_admitted_evidence(checkpoint_evidence, built.context)
-    result = engine.gate(
+    result = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
-        evidence=checkpoint_evidence,
+        rewritten_evidence,
+        binding=admitted_binding,
     )
 
     assert result.permitted is False
     assert result.decision is None
+    assert "decision admitted evidence mismatch" in result.diagnostics
 
 
 def test_gate_rejects_post_admission_evidence_ledger_rewrites():
@@ -798,6 +1047,11 @@ def test_gate_rejects_post_admission_evidence_ledger_rewrites():
         rating=PortfolioRating.BUY,
         assertion_ids=(built.context.assertions[0].assertion_id,),
     )
+    admitted_binding = engine.admit_evidence(
+        admitted_evidence,
+        built.context,
+        run_id=TEST_RUN_ID,
+    )
 
     rewrites = (
         admitted_evidence.model_copy(
@@ -830,10 +1084,12 @@ def test_gate_rejects_post_admission_evidence_ledger_rewrites():
     )
 
     for rewritten_evidence in rewrites:
-        result = engine.gate(
+        result = _gate(
+            engine,
             built.context,
             proposal,
-            evidence=rewritten_evidence,
+            rewritten_evidence,
+            binding=admitted_binding,
         )
         assert result.permitted is False
         assert "decision admitted evidence mismatch" in result.diagnostics
@@ -859,7 +1115,6 @@ def test_gate_rejects_as_of_date_after_trusted_snapshot_request_date():
             )
         }
     )
-    engine.register_trusted_evidence(evidence)
     built = engine.build_context(
         evidence,
         (_application(),),
@@ -867,16 +1122,16 @@ def test_gate_rejects_as_of_date_after_trusted_snapshot_request_date():
         as_of_date=date(2026, 7, 20),
     )
     assert isinstance(built, DecisionContextBuilt)
-    engine.register_admitted_evidence(evidence, built.context)
 
-    result = engine.gate(
+    result = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
-        evidence=evidence,
+        evidence,
     )
 
     assert result.permitted is False
@@ -887,14 +1142,15 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
     opposing_engine = _engine(_rule(polarity=RulePolarity.OPPOSES))
     opposing = _build(engine=opposing_engine)
     assert isinstance(opposing, DecisionContextBuilt)
-    opposing_result = opposing_engine.gate(
+    opposing_result = _gate(
+        opposing_engine,
         opposing.context,
         DirectionSelection(
             context_id=opposing.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(opposing.context.assertions[0].assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
     assert opposing_result.permitted is False
     assert "opposing assertions cannot authorize a rating" in opposing_result.diagnostics
@@ -910,7 +1166,8 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
         ),
     )
     assert isinstance(multiple, DecisionContextBuilt)
-    multiple_result = multiple_engine.gate(
+    multiple_result = _gate(
+        multiple_engine,
         multiple.context,
         DirectionSelection(
             context_id=multiple.context.context_id,
@@ -919,19 +1176,20 @@ def test_opposing_and_multiple_rating_assertions_cannot_authorize_a_decision():
                 assertion.assertion_id for assertion in multiple.context.assertions
             ),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
     assert multiple_result.permitted is False
     assert "selected assertions target multiple ratings" in multiple_result.diagnostics
 
-    cherry_picked = multiple_engine.gate(
+    cherry_picked = _gate(
+        multiple_engine,
         multiple.context,
         DirectionSelection(
             context_id=multiple.context.context_id,
             rating=multiple.context.assertions[0].target_rating,
             assertion_ids=(multiple.context.assertions[0].assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
     assert cherry_picked.permitted is False
     assert (
@@ -961,14 +1219,15 @@ def test_gate_recomputes_and_rejects_changed_evaluation_digest():
     )
     built = _build(engine=engine)
     assert isinstance(built, DecisionContextBuilt)
-    result = engine.gate(
+    result = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
     assert result.permitted is False
     assert "decision assertion reevaluation mismatch" in result.diagnostics
@@ -986,14 +1245,21 @@ def test_gate_rejects_duplicate_context_members_and_preserves_conflicted_status(
             "integrity_status": EvidenceIntegrityStatus.CONFLICTED,
         }
     )
-    result = engine.gate(
+    binding = engine.admit_evidence(
+        _evidence(_fact()),
+        built.context,
+        run_id=TEST_RUN_ID,
+    )
+    result = _gate(
+        engine,
         tampered,
         DirectionSelection(
             context_id=tampered.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(assertion.assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
+        binding=binding,
     )
     assert result.permitted is False
     assert result.integrity_status.value == "conflicted"
@@ -1075,6 +1341,38 @@ def test_metamorphic_context_ignores_runtime_call_ids(runtime_call_id):
     assert isinstance(baseline, DecisionContextBuilt)
     assert isinstance(transformed, DecisionContextBuilt)
     assert transformed.context == baseline.context
+
+
+@settings(deadline=None)
+@given(
+    value=st.decimals(
+        min_value=Decimal("-1000000"),
+        max_value=Decimal("1000000"),
+        places=4,
+        allow_nan=False,
+        allow_infinity=False,
+    ),
+    trailing_zeros=st.integers(min_value=1, max_value=6),
+)
+def test_metamorphic_equivalent_decimal_encodings_share_decision_value_digest(
+    value,
+    trailing_zeros,
+):
+    equivalent_encoding = Decimal(f"{format(value, 'f')}{'0' * trailing_zeros}")
+
+    baseline = stable_decision_value_digest(
+        canonical_field="pe_ratio",
+        normalized_value=value,
+        unit="ratio",
+    )
+    transformed = stable_decision_value_digest(
+        canonical_field="pe_ratio",
+        normalized_value=equivalent_encoding,
+        unit="ratio",
+    )
+
+    assert equivalent_encoding == value
+    assert transformed == baseline
 
 
 @settings(deadline=None)
@@ -1166,27 +1464,27 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
     assert transformed.context.facts == baseline.context.facts
     assert transformed.context.assertions == baseline.context.assertions
 
-    engine.register_trusted_evidence(baseline_evidence)
-    engine.register_admitted_evidence(baseline_evidence, baseline.context)
-    baseline_gate = engine.gate(
+    baseline_gate = _gate(
+        engine,
         baseline.context,
         DirectionSelection(
             context_id=baseline.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(baseline.context.assertions[0].assertion_id,),
         ),
-        evidence=baseline_evidence,
+        baseline_evidence,
+        run_id="run:" + "e" * 64,
     )
-    engine.register_trusted_evidence(transformed_evidence)
-    engine.register_admitted_evidence(transformed_evidence, transformed.context)
-    transformed_gate = engine.gate(
+    transformed_gate = _gate(
+        engine,
         transformed.context,
         DirectionSelection(
             context_id=transformed.context.context_id,
             rating=PortfolioRating.BUY,
             assertion_ids=(transformed.context.assertions[0].assertion_id,),
         ),
-        evidence=transformed_evidence,
+        transformed_evidence,
+        run_id="run:" + "f" * 64,
     )
     assert baseline_gate.permitted is True
     assert transformed_gate.permitted is True
@@ -1396,14 +1694,15 @@ def test_metamorphic_gate_accepts_exactly_the_rule_supported_rating(proposed_rat
     engine = _engine()
     built = _build(engine=engine)
     assert isinstance(built, DecisionContextBuilt)
-    result = engine.gate(
+    result = _gate(
+        engine,
         built.context,
         DirectionSelection(
             context_id=built.context.context_id,
             rating=proposed_rating,
             assertion_ids=(built.context.assertions[0].assertion_id,),
         ),
-        evidence=_evidence(_fact()),
+        _evidence(_fact()),
     )
 
     assert result.permitted is (proposed_rating is PortfolioRating.BUY)

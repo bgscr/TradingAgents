@@ -1,6 +1,6 @@
 # Buffer and deduplicate runtime artifacts
 
-Status: ready-for-agent
+Status: completed
 
 Move complete tool payloads to compressed content-addressed artifacts, retain bounded log previews/references, add a bounded background writer, and instrument the entire post-analyst graph and logging path.
 

@@ -1,14 +1,14 @@
 """Closed-context direction selection and deterministic final decision gating."""
 
-from __future__ import annotations
-
 import json
 from collections.abc import Mapping
 from typing import Any, Literal
 
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tradingagents.decision_policy import (
+    AdmittedEvidenceBinding,
     DecisionGateResultV2,
     DecisionPolicyEngine,
     DirectionSelection,
@@ -23,7 +23,6 @@ from tradingagents.evidence import (
     AnalysisOutcomeReason,
     EvidenceReadiness,
     EvidenceState,
-    analysis_diagnostic_codes,
     analysis_outcome_publication,
 )
 
@@ -127,11 +126,15 @@ def _readiness(status: EvidenceIntegrityStatus) -> EvidenceReadiness:
     return EvidenceReadiness(status.value)
 
 
-def _blocked_gate_result(diagnostic: str) -> DecisionGateResultV2:
+def _blocked_gate_result(
+    diagnostic: str,
+    diagnostic_code: AnalysisDiagnosticCode,
+) -> DecisionGateResultV2:
     return DecisionGateResultV2(
         permitted=False,
         integrity_status=EvidenceIntegrityStatus.INSUFFICIENT,
         diagnostics=(diagnostic,),
+        diagnostic_codes=(diagnostic_code,),
     )
 
 
@@ -159,18 +162,39 @@ def _selection_failure_diagnostic(state: Mapping[str, Any]) -> str:
     return "direction selection is unavailable"
 
 
+def _selection_failure_code(state: Mapping[str, Any]) -> AnalysisDiagnosticCode:
+    for key in (
+        "direction_selection_diagnostics",
+        "direction_selector_diagnostics",
+    ):
+        value = state.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        reason = value.get("reason")
+        if reason in {
+            "direction_context_invalid",
+            "validated_decision_context_invalid",
+        }:
+            return AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID
+        if reason in {
+            "direction_assertion_ids_duplicate",
+            "direction_assertions_target_multiple_ratings",
+        }:
+            return AnalysisDiagnosticCode.DIRECTION_ASSERTIONS_CONFLICTED
+    return AnalysisDiagnosticCode.DIRECTION_SELECTION_INVALID
+
+
 def _blocked_outcome(gate: DecisionGateResultV2) -> dict[str, Any]:
-    diagnostic_codes = analysis_diagnostic_codes(gate.diagnostics)
     reason = (
         AnalysisOutcomeReason.SHADOW_MODE_BLOCKED
-        if AnalysisDiagnosticCode.SHADOW_MODE in diagnostic_codes
+        if AnalysisDiagnosticCode.SHADOW_MODE in gate.diagnostic_codes
         else AnalysisOutcomeReason.DECISION_GATE_BLOCKED
     )
     return analysis_outcome_publication(
         AnalysisOutcome(
             readiness=_readiness(gate.integrity_status),
             reason=reason,
-            diagnostic_codes=diagnostic_codes,
+            diagnostic_codes=gate.diagnostic_codes,
         )
     )
 
@@ -200,19 +224,26 @@ def create_decision_gate_node(
             f"got {evidence_gate_mode!r}"
         )
 
-    def decision_gate_node(state: Mapping[str, Any]) -> dict[str, Any]:
+    def decision_gate_node(
+        state: Mapping[str, Any],
+        config: RunnableConfig | None = None,
+    ) -> dict[str, Any]:
         if (
             evidence_gate_mode == "shadow"
             or state.get("evidence_gate_mode") == "shadow"
         ):
             gate = _blocked_gate_result(
-                "shadow evidence mode is diagnostic-only and cannot publish direction"
+                "shadow evidence mode is diagnostic-only and cannot publish direction",
+                AnalysisDiagnosticCode.SHADOW_MODE,
             )
         else:
             try:
                 context = _context_from_state(state.get("validated_decision_context"))
             except (ValidationError, TypeError, ValueError):
-                gate = _blocked_gate_result("validated decision context is unavailable")
+                gate = _blocked_gate_result(
+                    "validated decision context is unavailable",
+                    AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID,
+                )
             else:
                 try:
                     selection = DirectionSelection.model_validate(
@@ -220,7 +251,8 @@ def create_decision_gate_node(
                     )
                 except (ValidationError, TypeError, ValueError):
                     gate = _blocked_gate_result(
-                        _selection_failure_diagnostic(state)
+                        _selection_failure_diagnostic(state),
+                        _selection_failure_code(state),
                     )
                 else:
                     raw_evidence = state.get("evidence_state")
@@ -230,17 +262,42 @@ def create_decision_gate_node(
                         )
                     except (ValidationError, TypeError, ValueError):
                         gate = _blocked_gate_result(
-                            "evidence artifact ledger is unavailable"
+                            "evidence artifact ledger is unavailable",
+                            AnalysisDiagnosticCode.REQUIRED_EVIDENCE_UNAVAILABLE,
                         )
                     else:
+                        raw_binding = state.get("admitted_evidence_binding")
                         try:
-                            gate = decision_policy.gate(
-                                context,
-                                selection,
-                                evidence=evidence,
+                            binding = AdmittedEvidenceBinding.model_validate_json(
+                                json.dumps(raw_binding)
                             )
-                        except Exception:  # noqa: BLE001 - trust seam fails closed
-                            gate = _blocked_gate_result("decision policy gate failed")
+                            run_id = state.get("run_id")
+                            expected_run_id = (config or {}).get(
+                                "configurable",
+                                {},
+                            ).get("run_id")
+                            if not isinstance(run_id, str) or not run_id.strip():
+                                raise ValueError("run identity is unavailable")
+                        except (ValidationError, TypeError, ValueError):
+                            gate = _blocked_gate_result(
+                                "admitted evidence binding is unavailable",
+                                AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED,
+                            )
+                        else:
+                            try:
+                                gate = decision_policy.gate(
+                                    context,
+                                    selection,
+                                    evidence=evidence,
+                                    admitted_evidence_binding=binding,
+                                    run_id=run_id,
+                                    expected_run_id=expected_run_id,
+                                )
+                            except Exception:  # noqa: BLE001 - trust seam fails closed
+                                gate = _blocked_gate_result(
+                                    "decision policy gate failed",
+                                    AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED,
+                                )
 
         gate_payload = gate.model_dump(mode="json")
         update: dict[str, Any] = {

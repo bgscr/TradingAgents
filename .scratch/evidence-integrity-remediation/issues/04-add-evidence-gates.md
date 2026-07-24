@@ -1,6 +1,6 @@
 # Add structured evidence and two-stage decision gates
 
-Status: ready-for-agent
+Status: completed
 
 Add source-linked material claims, shared evidence state, admission and decision gates, one constrained draft revision, confidence/coverage, and first-class non-directional outcomes. Preserve Markdown rendering compatibility where a decision is permitted.
 

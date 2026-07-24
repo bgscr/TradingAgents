@@ -74,7 +74,7 @@ def test_primary_rate_limit_falls_back_without_creating_failed_artifact() -> Non
     assert not hasattr(first, "artifact")
 
 
-def test_open_circuit_cannot_be_bypassed_by_rephrasing_request() -> None:
+def test_open_circuit_is_shared_by_logical_capabilities_for_one_tool() -> None:
     calls: list[str] = []
 
     def provider(request: AcquisitionRequest) -> object:
@@ -106,6 +106,9 @@ def test_open_circuit_cannot_be_bypassed_by_rephrasing_request() -> None:
             "tool_call_id": "call-3",
         }
     )
+    other_tool = other_capability.model_copy(
+        update={"tool_call_id": "call-4", "tool_name": "get_sentiment"}
+    )
 
     first_result = controller.acquire(
         first, validator=lambda value: value, serializer=lambda _value: "{}"
@@ -113,8 +116,13 @@ def test_open_circuit_cannot_be_bypassed_by_rephrasing_request() -> None:
     skipped_result = controller.acquire(
         rephrased, validator=lambda value: value, serializer=lambda _value: "{}"
     )
-    other_result = controller.acquire(
+    other_capability_result = controller.acquire(
         other_capability,
+        validator=lambda value: value,
+        serializer=lambda _value: '{"sentiment":"neutral"}',
+    )
+    other_tool_result = controller.acquire(
+        other_tool,
         validator=lambda value: value,
         serializer=lambda _value: '{"sentiment":"neutral"}',
     )
@@ -128,7 +136,13 @@ def test_open_circuit_cannot_be_bypassed_by_rephrasing_request() -> None:
     assert skipped.reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
     assert skipped.retryable is False
     assert skipped.http_status is None
-    assert other_result.value == {"sentiment": "neutral"}
+    assert other_capability_result.artifact is None
+    assert (
+        other_capability_result.outcomes[0].reason
+        is AcquisitionUnavailableReason.CIRCUIT_OPEN
+    )
+    assert other_capability_result.outcomes[0].capability == "sentiment"
+    assert other_tool_result.value == {"sentiment": "neutral"}
 
 
 def test_retry_after_precedes_configured_backoff_and_attempts_are_bounded() -> None:

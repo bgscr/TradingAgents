@@ -78,6 +78,7 @@ def _artifact_backed_outcome_state(raw_text: str) -> tuple[dict, str]:
                 "passed": False,
                 "readiness": "insufficient",
                 "blockers": ["authoritative instrument identity is missing"],
+                "diagnostic_codes": ["identity_unavailable"],
             },
             "analysis_outcome_contract": outcome.model_dump(mode="json"),
             "analysis_outcome": render_analysis_outcome(outcome),
@@ -226,7 +227,7 @@ def test_prepare_decision_audit_persists_raw_artifacts_and_returns_safe_projecti
     payload = decision_audit.prepare_decision_audit(state, tmp_path)
 
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    assert payload["schema_version"] == "3.1"
+    assert payload["schema_version"] == "4.0"
     assert raw_text not in serialized
     assert "TOP_SECRET_AUDIT_TOKEN" not in serialized
     for unsafe_key in ("raw_text", "source_ref", "tool_call_id"):
@@ -361,7 +362,7 @@ def test_write_immutable_decision_audit_prepares_a_safe_payload_by_default(tmp_p
 
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert target == tmp_path / "decision-audit.json"
-    assert payload["schema_version"] == "3.1"
+    assert payload["schema_version"] == "4.0"
     assert payload["audit_sha256"] == state["decision_audit_sha256"]
     assert raw_text not in json.dumps(payload, ensure_ascii=False, sort_keys=True)
     assert (
@@ -398,6 +399,7 @@ def test_prepare_decision_audit_projects_gate_diagnostics_without_raw_text(tmp_p
         "passed": False,
         "readiness": "insufficient",
         "blockers": [secret],
+        "diagnostic_codes": ["deterministic_gate_rejected"],
     }
 
     payload = decision_audit.prepare_decision_audit(state, tmp_path)
@@ -422,6 +424,7 @@ def test_prepare_decision_audit_projects_admission_diagnostics_without_raw_text(
         "admitted": False,
         "readiness": "insufficient",
         "diagnostics": [f"Required evidence unavailable: {secret}."],
+        "diagnostic_codes": ["required_evidence_unavailable"],
     }
 
     payload = decision_audit.prepare_decision_audit(state, tmp_path)
@@ -436,6 +439,29 @@ def test_prepare_decision_audit_projects_admission_diagnostics_without_raw_text(
 
 
 @pytest.mark.unit
+def test_prepare_decision_audit_copies_typed_admitted_gate_diagnostics(tmp_path):
+    state, _digest, _source_ref = _artifact_backed_trading_decision_state()
+    secret = "Authorization: Bearer OPTIONAL_SOURCE_SECRET"
+    state["admission_gate"] = {
+        "contract_version": "1.0",
+        "admitted": True,
+        "readiness": "degraded",
+        "diagnostics": [f"Optional evidence unavailable: news ({secret})."],
+        "diagnostic_codes": ["optional_evidence_unavailable"],
+    }
+
+    payload = decision_audit.prepare_decision_audit(state, tmp_path)
+
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert secret not in serialized
+    assert payload["admission_gate"] == {
+        "admitted": True,
+        "readiness": "degraded",
+        "diagnostic_codes": ["optional_evidence_unavailable"],
+    }
+
+
+@pytest.mark.unit
 def test_prepare_decision_audit_projects_decision_gate_diagnostics_without_raw_text(
     tmp_path,
 ):
@@ -446,6 +472,7 @@ def test_prepare_decision_audit_projects_decision_gate_diagnostics_without_raw_t
         "permitted": False,
         "integrity_status": "insufficient",
         "diagnostics": [secret],
+        "diagnostic_codes": ["deterministic_gate_rejected"],
         "decision": None,
     }
 
@@ -458,6 +485,15 @@ def test_prepare_decision_audit_projects_decision_gate_diagnostics_without_raw_t
         "readiness": "insufficient",
         "diagnostic_codes": ["deterministic_gate_rejected"],
     }
+
+
+@pytest.mark.unit
+def test_prepare_decision_audit_rejects_untyped_gate_diagnostics(tmp_path):
+    state, _digest = _artifact_backed_outcome_state("safe provider artifact")
+    state["evidence_preflight"].pop("diagnostic_codes")
+
+    with pytest.raises(ValueError, match="typed diagnostic_codes"):
+        decision_audit.prepare_decision_audit(state, tmp_path)
 
 
 @pytest.mark.unit

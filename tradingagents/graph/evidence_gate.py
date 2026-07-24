@@ -17,11 +17,11 @@ from tradingagents.decision_policy import (
 )
 from tradingagents.evidence import (
     AdmissionGateResult,
+    AnalysisDiagnosticCode,
     AnalysisOutcome,
     AnalysisOutcomeReason,
     EvidenceReadiness,
     EvidenceState,
-    analysis_diagnostic_codes,
     analysis_outcome_publication,
     evaluate_admission_gate,
     evaluate_preflight_gate,
@@ -42,13 +42,13 @@ def _analysis_outcome(
     *,
     readiness: EvidenceReadiness,
     reason: AnalysisOutcomeReason,
-    diagnostics: tuple[str, ...],
+    diagnostic_codes: tuple[AnalysisDiagnosticCode, ...],
 ) -> dict[str, Any]:
     return analysis_outcome_publication(
         AnalysisOutcome(
             readiness=readiness,
             reason=reason,
-            diagnostic_codes=analysis_diagnostic_codes(diagnostics),
+            diagnostic_codes=diagnostic_codes,
         )
     )
 
@@ -110,6 +110,15 @@ def create_preflight_gate_node(
                     "passed": False,
                     "readiness": EvidenceReadiness.INSUFFICIENT,
                     "blockers": blockers,
+                    "diagnostic_codes": tuple(
+                        sorted(
+                            {
+                            *result.diagnostic_codes,
+                            AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,
+                            },
+                            key=lambda code: code.value,
+                        )
+                    ),
                 }
             )
         update = {"evidence_preflight": result.model_dump(mode="json")}
@@ -118,7 +127,7 @@ def create_preflight_gate_node(
                 _analysis_outcome(
                     readiness=result.readiness,
                     reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
-                    diagnostics=result.blockers,
+                    diagnostic_codes=result.diagnostic_codes,
                 )
             )
         return update
@@ -144,6 +153,7 @@ def create_admission_gate_node(
     def blocked_gate(
         gate: AdmissionGateResult,
         diagnostics: tuple[str, ...],
+        diagnostic_codes: tuple[AnalysisDiagnosticCode, ...],
         readiness: EvidenceReadiness = EvidenceReadiness.INSUFFICIENT,
     ) -> AdmissionGateResult:
         return gate.model_copy(
@@ -151,6 +161,12 @@ def create_admission_gate_node(
                 "admitted": False,
                 "readiness": readiness,
                 "diagnostics": tuple(sorted({*gate.diagnostics, *diagnostics})),
+                "diagnostic_codes": tuple(
+                    sorted(
+                        {*gate.diagnostic_codes, *diagnostic_codes},
+                        key=lambda code: code.value,
+                    )
+                ),
             }
         )
 
@@ -158,9 +174,14 @@ def create_admission_gate_node(
         evidence = _evidence_from_state(state.get("evidence_state", {}))
         gate = evaluate_admission_gate(evidence, minimum_history_rows)
         context = None
+        binding = None
         if gate.admitted:
             if decision_horizon is None:
-                gate = blocked_gate(gate, ("decision_horizon_not_configured",))
+                gate = blocked_gate(
+                    gate,
+                    ("decision_horizon_not_configured",),
+                    (AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,),
+                )
             else:
                 raw_applications: Any = state.get("strategy_rule_applications", ())
                 discovered_applications = not raw_applications
@@ -183,12 +204,17 @@ def create_admission_gate_node(
                             if discovered_applications
                             else "strategy_rule_application_invalid",
                         ),
+                        (AnalysisDiagnosticCode.STRATEGY_RULE_INVALID,),
                     )
                 else:
                     try:
                         as_of_date = date.fromisoformat(str(state.get("trade_date", "")))
                     except ValueError:
-                        gate = blocked_gate(gate, ("decision_as_of_date_invalid",))
+                        gate = blocked_gate(
+                            gate,
+                            ("decision_as_of_date_invalid",),
+                            (AnalysisDiagnosticCode.DECISION_CONFIGURATION_INVALID,),
+                        )
                     else:
                         built = policy.build_context(
                             evidence,
@@ -200,34 +226,51 @@ def create_admission_gate_node(
                             ),
                         )
                         if isinstance(built, DecisionContextBuilt):
-                            try:
-                                policy.register_admitted_evidence(
-                                    evidence,
-                                    built.context,
-                                )
-                            except (TypeError, ValueError):
+                            run_id = state.get("run_id")
+                            if not isinstance(run_id, str) or not run_id.strip():
                                 gate = blocked_gate(
                                     gate,
-                                    ("trusted_evidence_admission_failed",),
+                                    ("run_identity_unavailable",),
+                                    (
+                                        AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED,
+                                    ),
                                 )
                             else:
-                                context = built.context
+                                try:
+                                    binding = policy.admit_evidence(
+                                        evidence,
+                                        built.context,
+                                        run_id=run_id,
+                                    )
+                                except (TypeError, ValueError):
+                                    gate = blocked_gate(
+                                        gate,
+                                        ("trusted_evidence_admission_failed",),
+                                        (
+                                            AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED,
+                                        ),
+                                    )
+                                else:
+                                    context = built.context
                         else:
                             gate = blocked_gate(
                                 gate,
                                 built.blocker_codes,
+                                built.diagnostic_codes,
                                 _readiness(built.integrity_status),
                             )
 
         update = {"admission_gate": gate.model_dump(mode="json")}
         if context is not None:
             update["validated_decision_context"] = context.model_dump(mode="json")
+        if binding is not None:
+            update["admitted_evidence_binding"] = binding.model_dump(mode="json")
         if not gate.admitted:
             update.update(
                 _analysis_outcome(
                     readiness=gate.readiness,
                     reason=AnalysisOutcomeReason.ADMISSION_BLOCKED,
-                    diagnostics=gate.diagnostics,
+                    diagnostic_codes=gate.diagnostic_codes,
                 )
             )
         return update

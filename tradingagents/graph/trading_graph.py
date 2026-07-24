@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -30,18 +31,24 @@ from tradingagents.agents.utils.agent_utils import (
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
-from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
+from tradingagents.dataflows.market_snapshot import (
+    authoritative_snapshot_run,
+    get_active_run_telemetry,
+)
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import (
     DecisionHorizon,
     DecisionPolicyEngine,
+    is_canonical_run_id,
+    stable_evidence_semantic_digest,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState, acquire_run_evidence
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
+from tradingagents.run_telemetry import RunTelemetryCallbackHandler
 from tradingagents.strategy_registry import (
     DEFAULT_DECISION_HORIZON,
     create_production_decision_policy,
@@ -410,9 +417,59 @@ class TradingAgentsGraph:
 
     def resolve_evidence_state(self, ticker: str, trade_date: str) -> EvidenceState:
         """Acquire the typed identity and market evidence for one analysis run."""
-        evidence = acquire_run_evidence(ticker, trade_date)
-        self.decision_policy.register_trusted_evidence(evidence)
-        return evidence
+        return acquire_run_evidence(
+            ticker,
+            trade_date,
+            decision_policy=self.decision_policy,
+            decision_horizon=getattr(self, "decision_horizon", None),
+        )
+
+    def create_initial_state(
+        self,
+        company_name: str,
+        trade_date: str,
+        asset_type: str = "stock",
+        *,
+        evidence_state: EvidenceState,
+        past_context: str = "",
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the shared CLI/programmatic state for one resumable run."""
+
+        instrument_context = self.resolve_instrument_context(
+            company_name,
+            asset_type,
+            evidence_state=evidence_state,
+        )
+        if run_id is None:
+            if self.config.get("checkpoint_enabled"):
+                run_seed = "checkpoint:" + thread_id(
+                    company_name,
+                    str(trade_date),
+                    self._run_signature(asset_type),
+                )
+            else:
+                run_seed = "|".join(
+                    (
+                        "execution",
+                        company_name.upper(),
+                        str(trade_date),
+                        self._run_signature(asset_type),
+                        stable_evidence_semantic_digest(evidence_state),
+                    )
+                )
+            run_id = f"run:{sha256(run_seed.encode('utf-8')).hexdigest()}"
+        if not is_canonical_run_id(run_id):
+            raise ValueError("run_id must be a canonical run ID")
+        return self.propagator.create_initial_state(
+            company_name,
+            trade_date,
+            asset_type=asset_type,
+            past_context=past_context,
+            instrument_context=instrument_context,
+            evidence_state=evidence_state,
+            run_id=run_id,
+        )
 
     def _run_signature(self, asset_type: str) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
@@ -438,6 +495,7 @@ class TradingAgentsGraph:
             f"evidence_gate={config.get('evidence_gate_mode', 'enforce')}",
             "evidence_schema=4",
             "decision_schema=1",
+            "admission_binding=1",
             f"registry={registry_digest}",
             f"horizon={horizon_signature}",
         ])
@@ -508,21 +566,23 @@ class TradingAgentsGraph:
         # Preflight without first spending Yahoo/AKShare or reflection calls.
         past_context = self.memory_log.get_past_context(company_name)
         evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
-        self.decision_policy.register_trusted_evidence(evidence_state)
-        instrument_context = self.resolve_instrument_context(
-            company_name,
-            asset_type,
-            evidence_state=evidence_state,
-        )
-        init_agent_state = self.propagator.create_initial_state(
+        init_agent_state = self.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
-            past_context=past_context,
-            instrument_context=instrument_context,
             evidence_state=evidence_state,
+            past_context=past_context,
         )
-        args = self.propagator.get_graph_args()
+        telemetry_ledger = get_active_run_telemetry()
+        telemetry_callbacks = (
+            [RunTelemetryCallbackHandler(telemetry_ledger)]
+            if telemetry_ledger is not None
+            else None
+        )
+        args = self.propagator.get_graph_args(
+            callbacks=telemetry_callbacks,
+            run_id=init_agent_state["run_id"],
+        )
 
         # Inject thread_id so same ticker+date+graph-shape resumes; a different
         # date or graph shape starts fresh (#1089).
@@ -559,6 +619,15 @@ class TradingAgentsGraph:
             "evidence_gate_mode",
             "enforce",
         )
+        if telemetry_ledger is not None:
+            terminal_route = (
+                "trading_decision"
+                if final_state.get("trading_decision") is not None
+                else "analysis_outcome"
+            )
+            final_state["run_telemetry"] = telemetry_ledger.finalize(
+                terminal_route=terminal_route,
+            ).model_dump(mode="json")
         audit_directory = (
             Path(self.config["results_dir"])
             / safe_ticker_component(company_name)

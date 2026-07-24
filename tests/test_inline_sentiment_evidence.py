@@ -195,7 +195,7 @@ def test_sentiment_node_merges_controller_and_inline_acquisition_outcomes(monkey
         reddit_source_ref,
     }
     assert isinstance(outcomes[news_source_ref], SourceAcquisitionAvailable)
-    assert outcomes[news_source_ref].capability == "get_news"
+    assert outcomes[news_source_ref].capability == "sentiment_news"
     assert isinstance(outcomes[stocktwits_source_ref], SourceAcquisitionAvailable)
     assert outcomes[stocktwits_source_ref].capability == "sentiment_stocktwits"
     assert isinstance(outcomes[reddit_source_ref], SourceAcquisitionAvailable)
@@ -358,7 +358,7 @@ def test_china_local_prompt_context_cannot_mint_synthetic_evidence(monkeypatch):
         )
         outcome = SourceAcquisitionAvailable(
             provider="fixture_news",
-            capability="get_news",
+            capability=capability,
             source_ref=source_ref,
             attempt=1,
             retrieved_at="2026-07-20T12:00:00Z",
@@ -541,10 +541,10 @@ def test_sentiment_news_prefetch_uses_run_owned_acquisition_controller(monkeypat
     )
 
     assert isinstance(first_news, SourceAcquisitionUnavailable)
-    assert first_news.capability == "get_news"
+    assert first_news.capability == "sentiment_news"
     assert first_news.reason is AcquisitionUnavailableReason.RATE_LIMITED
     assert isinstance(second_news, SourceAcquisitionUnavailable)
-    assert second_news.capability == "get_news"
+    assert second_news.capability == "sentiment_news"
     assert second_news.reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
     assert provider_calls == 1
     for outcome in (first_news, second_news):

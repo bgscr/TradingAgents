@@ -88,6 +88,11 @@ class AgentState(MessagesState):
         dict[str, Any] | None, "Published structured trading decision when permitted"
     ]
     trade_date: Annotated[str, "What date we are trading at"]
+    run_id: Annotated[str, "Stable identity for this resumable analysis run"]
+    admitted_evidence_binding: Annotated[
+        dict[str, Any] | None,
+        "Checkpoint-safe binding for evidence accepted at Evidence Admission",
+    ]
 
     sender: Annotated[str, "Agent that sent this message"]
 

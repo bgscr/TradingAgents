@@ -977,7 +977,7 @@ class TestPortfolioManagerInjection:
         assert "NVDA" in past_ctx
         assert "Correct call." in past_ctx
         assert "DECISION:" in past_ctx
-        assert "REFLECTION:" in past_ctx
+        assert "ADVISORY COMMENTARY (REFLECTION):" in past_ctx
 
 
 # ---------------------------------------------------------------------------

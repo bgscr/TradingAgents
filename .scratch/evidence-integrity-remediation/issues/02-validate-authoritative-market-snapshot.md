@@ -1,6 +1,6 @@
 # Validate and reconcile the authoritative market snapshot
 
-Status: ready-for-agent
+Status: completed
 
 Add full OHLCV validation and provenance, route the snapshot through the configured market provider chain, quarantine invalid rows, and derive every exact indicator from the accepted frame. Do not blend providers.
 

@@ -1,6 +1,6 @@
 # Add the three-gate rule-backed decision graph
 
-Status: ready-for-agent
+Status: completed
 
 Blocked by: 09
 

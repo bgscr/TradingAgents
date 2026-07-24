@@ -1,6 +1,6 @@
 # Add canonical evidence and acquisition contracts
 
-Status: ready-for-agent
+Status: completed
 
 Introduce versioned, closed Pydantic contracts for artifacts, facts, acquisition outcomes, Instrument Identity and Capability Profiles, Calculation Definitions and Lineage, stable identifiers, and JSON/checkpoint compatibility adapters. Preserve raw artifacts separately and categorically exclude provider errors from evidence.
 

@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 from cli.announcements import display_announcements, fetch_announcements
+from cli.console_encoding import configure_utf8_stdio
 from cli.run_display import create_run_display
 from cli.run_progress import StateProgressTracker, message_key
 from cli.runtime_artifacts import (
@@ -56,9 +57,15 @@ from tradingagents.graph.analyst_execution import (
     get_initial_analyst_node,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.recorded_replay import (
+    DEFAULT_RECORDED_FIXTURE_MANIFEST,
+    load_recorded_run_fixtures,
+    replay_recorded_run,
+)
 from tradingagents.reporting import write_report_tree
 from tradingagents.terminal_contract import configuration_digest
 
+configure_utf8_stdio()
 console = Console()
 
 app = typer.Typer(
@@ -267,8 +274,8 @@ class MessageBuffer:
                 "sentiment_report": "Social Sentiment",
                 "news_report": "News Analysis",
                 "fundamentals_report": "Fundamentals Analysis",
-                "investment_plan": "Research Team Decision",
-                "trader_investment_plan": "Trading Team Plan",
+                "investment_plan": "Research Advisory Commentary",
+                "trader_investment_plan": "Trader Advisory Commentary",
                 "final_trade_decision": "Portfolio Management Decision",
                 "analysis_outcome": "Analysis Outcome",
             }
@@ -305,12 +312,12 @@ class MessageBuffer:
 
         # Research Team Reports
         if self.report_sections.get("investment_plan"):
-            report_parts.append("## Research Team Decision")
+            report_parts.append("## Research Advisory Commentary")
             report_parts.append(f"{self.report_sections['investment_plan']}")
 
         # Trading Team Reports
         if self.report_sections.get("trader_investment_plan"):
-            report_parts.append("## Trading Team Plan")
+            report_parts.append("## Trader Advisory Commentary")
             report_parts.append(f"{self.report_sections['trader_investment_plan']}")
 
         # Analysis outcome or Portfolio Management Decision
@@ -936,11 +943,26 @@ def extract_content_string(content):
     return str(content).strip() if not is_empty(content) else None
 
 
-def classify_message_type(message) -> tuple[str, str | None]:
+_ADVISORY_COMMENTARY_PHASES = frozenset(
+    {
+        "research_debate",
+        "trading",
+        "risk_debate",
+        "portfolio_synthesis",
+    }
+)
+
+
+def classify_message_type(
+    message,
+    *,
+    runtime_graph_phase: str | None = None,
+) -> tuple[str, str | None]:
     """Classify LangChain message into display type and extract content.
 
     Returns:
-        (type, content) - type is one of: User, Agent, Data, Control
+        (type, content) - type is one of: User, Agent, Advisory Commentary,
+                          Data, Control
                         - content is extracted string or None
     """
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -956,6 +978,8 @@ def classify_message_type(message) -> tuple[str, str | None]:
         return ("Data", content)
 
     if isinstance(message, AIMessage):
+        if runtime_graph_phase in _ADVISORY_COMMENTARY_PHASES:
+            return ("Advisory Commentary", content)
         return ("Agent", content)
 
     # Fallback for unknown types
@@ -1234,6 +1258,7 @@ def _update_run_status(artifacts: dict, **updates) -> None:
                 "terminal_acquisition_outcomes",
                 (),
             ),
+            run_telemetry=artifacts.get("terminal_run_telemetry"),
         )
         runtime_writer.finish_phases()
 
@@ -1249,6 +1274,12 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
     if artifacts is None:
         return
     summary = _exception_summary(exc)
+    with suppress(Exception):
+        telemetry_ledger = artifacts.get("run_telemetry_ledger")
+        if telemetry_ledger is not None:
+            artifacts["terminal_run_telemetry"] = telemetry_ledger.finalize(
+                terminal_route="operational_failure",
+            ).model_dump(mode="json")
     with suppress(Exception):
         _update_run_status(
             artifacts,
@@ -1286,6 +1317,20 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
 def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
     started_at = time.monotonic()
     final_state["configuration_digest"] = artifacts["configuration_digest"]
+    telemetry_ledger = artifacts.get("run_telemetry_ledger")
+    if telemetry_ledger is not None:
+        terminal_route = final_state.get("terminal_outcome_kind")
+        if terminal_route is None:
+            terminal_route = (
+                "trading_decision"
+                if final_state.get("trading_decision") is not None
+                else "analysis_outcome"
+            )
+        telemetry = telemetry_ledger.finalize(
+            terminal_route=str(terminal_route),
+        ).model_dump(mode="json")
+        final_state["run_telemetry"] = telemetry
+        artifacts["terminal_run_telemetry"] = telemetry
     report_file = save_report_to_disk(final_state, ticker, artifacts["report_dir"])
     runtime_writer = artifacts.get("runtime_writer")
     if runtime_writer is not None:
@@ -1293,12 +1338,6 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
             "report",
             "complete_report",
             time.monotonic() - started_at,
-        )
-    evidence_state = final_state.get("evidence_state")
-    if isinstance(evidence_state, dict):
-        artifacts["terminal_acquisition_outcomes"] = evidence_state.get(
-            "acquisition_outcomes",
-            (),
         )
     _update_run_status(
         artifacts,
@@ -1457,7 +1496,9 @@ def run_analysis(checkpoint: bool | None = None):
 
     spinner_text = f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
     snapshot_scope = ExitStack()
-    snapshot_scope.enter_context(authoritative_snapshot_run())
+    snapshot_run = snapshot_scope.enter_context(authoritative_snapshot_run())
+    artifacts["run_telemetry_ledger"] = snapshot_run.telemetry_ledger
+    stats_handler.set_telemetry_recorder(snapshot_run.telemetry_ledger)
     try:
         display.start()
         # Add initial messages
@@ -1485,27 +1526,25 @@ def run_analysis(checkpoint: bool | None = None):
         evidence_state = graph.resolve_evidence_state(
             selections["ticker"], selections["analysis_date"]
         )
-        instrument_context = graph.resolve_instrument_context(
-            selections["ticker"],
-            selections["asset_type"],
-            evidence_state=evidence_state,
-        )
-        init_agent_state = graph.propagator.create_initial_state(
+        init_agent_state = graph.create_initial_state(
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
-            instrument_context=instrument_context,
             evidence_state=evidence_state,
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
-        args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+        args = graph.propagator.get_graph_args(
+            callbacks=[stats_handler],
+            run_id=init_agent_state.get("run_id"),
+        )
 
         # Stream the analysis
         current_phase = "graph_stream"
         _update_run_status(artifacts, current_phase=current_phase)
         runtime_graph_phase = "analysis"
         runtime_writer.transition_phase(runtime_graph_phase)
+        snapshot_run.telemetry_ledger.transition_stage(runtime_graph_phase)
         tracker = StateProgressTracker()
         latest_state = dict(init_agent_state)
         for chunk in graph.graph.stream(init_agent_state, **args):
@@ -1515,13 +1554,17 @@ def run_analysis(checkpoint: bool | None = None):
             ):
                 runtime_graph_phase = observed_phase
                 runtime_writer.transition_phase(runtime_graph_phase)
+                snapshot_run.telemetry_ledger.transition_stage(runtime_graph_phase)
             for message in chunk.get("messages", []):
                 key = message_key(message)
                 if key in message_buffer._processed_message_ids:
                     continue
                 message_buffer._processed_message_ids.add(key)
 
-                msg_type, content = classify_message_type(message)
+                msg_type, content = classify_message_type(
+                    message,
+                    runtime_graph_phase=runtime_graph_phase,
+                )
                 if content and content.strip():
                     message_buffer.add_message(msg_type, content)
 
@@ -1759,7 +1802,10 @@ def identity_registry_refresh(
     symbols: Annotated[
         list[str],
         typer.Argument(
-            help="Explicit mainland equity symbols such as 600895.SS or 000001.SZ."
+            help=(
+                "Explicit Mainland Instrument symbols such as "
+                "600895.SS, 510500.SS, or 000001.SZ."
+            )
         ),
     ],
     registry_path: Annotated[
@@ -1858,6 +1904,56 @@ def analyze(
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command("replay-recorded")
+def replay_recorded(
+    fixture: Annotated[
+        str,
+        typer.Argument(help="Recorded fixture ticker or SHA-256 content address."),
+    ],
+    output_directory: Annotated[
+        Path,
+        typer.Option(
+            "--output-directory",
+            help="Directory for the deterministic audit and report.",
+        ),
+    ],
+    manifest: Annotated[
+        Path,
+        typer.Option(
+            "--manifest",
+            help="Typed recorded-fixture expectation manifest.",
+        ),
+    ] = DEFAULT_RECORDED_FIXTURE_MANIFEST,
+) -> None:
+    """Replay a recorded run offline without providers or models."""
+
+    fixture_key = fixture.strip()
+    matches = tuple(
+        candidate
+        for candidate in load_recorded_run_fixtures(manifest)
+        if candidate.content_sha256 == fixture_key
+        or candidate.recorded.run.ticker.casefold() == fixture_key.casefold()
+    )
+    if len(matches) != 1:
+        raise typer.BadParameter(
+            "fixture must identify exactly one recorded ticker or content address"
+        )
+    result = replay_recorded_run(matches[0], output_directory)
+    typer.echo(
+        json.dumps(
+            {
+                "terminal_contract": result.terminal.model_dump(mode="json"),
+                "blocked_stage": result.blocked_stage,
+                "counters": result.counters.model_dump(mode="json"),
+                "report_path": str(result.report_path),
+                "audit_path": str(result.audit_path),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
