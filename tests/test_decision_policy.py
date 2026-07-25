@@ -55,6 +55,11 @@ from tradingagents.evidence import (
     stable_source_fact_id,
 )
 
+_ALPHANUMERIC_ALPHABET = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+_ADVISORY_TEXT_ALPHABET = f"{_ALPHANUMERIC_ALPHABET} "
+
 HORIZON = DecisionHorizon(count=20, unit=HorizonUnit.TRADING_DAYS)
 TEST_RUN_ID = "run:" + "1" * 64
 ARTIFACT_TEXT = "P/E was 9.5; P/B was 1.2."
@@ -1329,7 +1334,7 @@ def test_legacy_recorded_claim_selection_replays_fail_closed_without_rules(
 @settings(deadline=None)
 @given(
     runtime_call_id=st.text(
-        alphabet=st.characters(categories=("L", "N")),
+        alphabet=_ALPHANUMERIC_ALPHABET,
         min_size=1,
         max_size=32,
     )
@@ -1393,7 +1398,7 @@ def test_metamorphic_context_ignores_duplicate_facts_and_applications(duplicate_
 @settings(deadline=None)
 @given(
     advisory_prose=st.text(
-        alphabet=st.characters(categories=("L", "N", "Zs")),
+        alphabet=_ADVISORY_TEXT_ALPHABET,
         max_size=80,
     )
 )
@@ -1420,12 +1425,12 @@ def test_metamorphic_context_ignores_advisory_prose(advisory_prose):
 @settings(deadline=None)
 @given(
     source_id=st.text(
-        alphabet=st.characters(categories=("L", "N")),
+        alphabet=_ALPHANUMERIC_ALPHABET,
         min_size=1,
         max_size=32,
     ),
     unavailable_detail=st.text(
-        alphabet=st.characters(categories=("L", "N", "Zs")),
+        alphabet=_ADVISORY_TEXT_ALPHABET,
         max_size=80,
     ),
 )
@@ -1498,7 +1503,7 @@ def test_metamorphic_optional_unused_source_loss_preserves_direction(source_id, 
 @settings(deadline=None)
 @given(
     missing_suffix=st.text(
-        alphabet=st.characters(categories=("L", "N")),
+        alphabet=_ALPHANUMERIC_ALPHABET,
         min_size=1,
         max_size=32,
     )

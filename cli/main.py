@@ -1102,7 +1102,7 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
 
 def _now_iso() -> str:
     return (
-        datetime.datetime.now(datetime.UTC)
+        datetime.datetime.now(datetime.timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
