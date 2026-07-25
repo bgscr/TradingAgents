@@ -114,24 +114,40 @@ def test_start_launcher_uses_development_mode_from_source_checkout() -> None:
 def test_start_launcher_uses_project_local_development_roots_from_outside_repo(
     tmp_path: Path,
 ) -> None:
-    if (REPO_ROOT / "tradingagents.exe").exists():
-        pytest.skip("source checkout contains a portable executable")
-
+    project_dir = tmp_path / "project"
     outside_dir = tmp_path / "outside"
+    project_dir.mkdir()
     outside_dir.mkdir()
+    launcher = project_dir / "start_tradingagents.ps1"
+    shutil.copy2(REPO_ROOT / "start_tradingagents.ps1", launcher)
+    env = os.environ.copy()
+    for name in (
+        "TRADINGAGENTS_RESULTS_DIR",
+        "TRADINGAGENTS_CACHE_DIR",
+        "TRADINGAGENTS_MEMORY_LOG_PATH",
+        "TRADINGAGENTS_PROJECT_ROOT",
+    ):
+        env.pop(name, None)
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))
+    )
 
     result = _run_script(
-        REPO_ROOT / "start_tradingagents.ps1",
+        launcher,
         "-DryRun",
         cwd=outside_dir,
+        env=env,
     )
 
     _assert_success(result)
-    assert f"TRADINGAGENTS_RESULTS_DIR={REPO_ROOT / 'logs'}" in result.stdout
-    assert f"TRADINGAGENTS_CACHE_DIR={REPO_ROOT / 'data' / 'cache'}" in result.stdout
+    assert f"TRADINGAGENTS_RESULTS_DIR={project_dir / 'logs'}" in result.stdout
+    assert (
+        f"TRADINGAGENTS_CACHE_DIR={project_dir / 'data' / 'cache'}"
+        in result.stdout
+    )
     assert (
         "TRADINGAGENTS_MEMORY_LOG_PATH="
-        f"{REPO_ROOT / 'data' / 'memory' / 'trading_memory.md'}"
+        f"{project_dir / 'data' / 'memory' / 'trading_memory.md'}"
     ) in result.stdout
 
 

@@ -22,6 +22,7 @@ def test_direct_use_without_project_launcher_keeps_user_home_defaults(
         "TRADINGAGENTS_MEMORY_LOG_PATH",
     ):
         env.pop(name, None)
+    env["HOME"] = str(user_home)
     env["USERPROFILE"] = str(user_home)
     code = (
         "import json;"

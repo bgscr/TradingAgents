@@ -18,9 +18,18 @@ PORTABLE_ENV_NAMES = (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_entrypoint_environment(monkeypatch):
+def _isolate_entrypoint_environment():
+    original = {name: os.environ.get(name) for name in PORTABLE_ENV_NAMES}
     for name in PORTABLE_ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _load_module(path: Path, module_name: str):

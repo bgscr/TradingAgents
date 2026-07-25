@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -395,7 +395,7 @@ def build_decision_audit(
     terminal, run_identity = apply_terminal_contract(final_state, config=config)
     created_at = final_state.get("decision_audit_created_at")
     if not created_at:
-        created_at = datetime.now(UTC).isoformat()
+        created_at = datetime.now(timezone.utc).isoformat()
         final_state["decision_audit_created_at"] = created_at
     EvidenceState.model_validate(final_state.get("evidence_state", {}))
     analysis_outcome_contract = final_state.get("analysis_outcome_contract")
