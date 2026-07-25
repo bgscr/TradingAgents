@@ -97,8 +97,9 @@ def _normalize_numeric_text(text: str) -> str:
 
 
 def _require_concrete_utc_timestamp(value: str) -> str:
+    parsed_value = f"{value[:-1]}+00:00" if value.endswith("Z") else value
     try:
-        instant = datetime.fromisoformat(value)
+        instant = datetime.fromisoformat(parsed_value)
     except ValueError as exc:
         raise ValueError(
             "retrieved_at must be a concrete ISO-8601 UTC timestamp"

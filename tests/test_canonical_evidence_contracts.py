@@ -184,6 +184,49 @@ def test_source_acquisition_outcomes_require_concrete_utc_timestamps(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "retrieved_at",
+    (
+        "2026-07-20T12:00:00Z",
+        "2026-07-20T12:00:00+00:00",
+    ),
+)
+@pytest.mark.parametrize(
+    "outcome_type",
+    (SourceAcquisitionAvailable, SourceAcquisitionUnavailable),
+)
+def test_source_acquisition_outcomes_accept_equivalent_utc_timestamps(
+    outcome_type,
+    retrieved_at,
+):
+    source_ref = "acq.v1:test:" + "c" * 64
+    common = {
+        "provider": "provider.v1",
+        "capability": "news.latest",
+        "source_ref": source_ref,
+        "attempt": 1,
+        "retrieved_at": retrieved_at,
+    }
+    if outcome_type is SourceAcquisitionAvailable:
+        artifact_text = "validated payload"
+        common["artifact"] = SourceArtifact(
+            artifact_sha256=sha256(artifact_text.encode()).hexdigest(),
+            source_ref=source_ref,
+            tool_call_id="call-timestamp",
+            tool_name="get_news",
+            raw_text=artifact_text,
+        )
+    else:
+        common.update(
+            retryable=False,
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
+
+    outcome = outcome_type(**common)
+    assert outcome.retrieved_at == retrieved_at
+
+
+@pytest.mark.unit
 def test_evidence_source_is_a_versioned_closed_boundary_contract():
     source = EvidenceSource(
         source_id="market_snapshot",
