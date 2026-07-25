@@ -5,6 +5,11 @@ checkpoint flag, must win over the interactive research-depth selection — the 
 must not clobber an env-configured value back to a prompt/flag default.
 """
 
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -67,3 +72,48 @@ def test_checkpoint_flag_overrides_env(flag):
     with mock.patch.object(m, "DEFAULT_CONFIG", patched):
         cfg = m._build_run_config(SELECTIONS, checkpoint=flag)
     assert cfg["checkpoint_enabled"] is flag
+
+
+@pytest.mark.parametrize(
+    ("environment_value", "cli_args", "expected_enabled"),
+    [
+        ("true", [], True),
+        ("true", ["--no-checkpoint"], False),
+        ("false", ["--checkpoint"], True),
+        (None, [], False),
+    ],
+    ids=[
+        "environment-enables-when-flag-omitted",
+        "no-checkpoint-flag-overrides-enabled-environment",
+        "checkpoint-flag-overrides-disabled-environment",
+        "disabled-when-neither-source-enables",
+    ],
+)
+def test_checkpoint_precedence_reaches_cli_graph_execution(
+    tmp_path,
+    environment_value,
+    cli_args,
+    expected_enabled,
+):
+    output_path = tmp_path / "checkpoint-probe.json"
+    environment = os.environ.copy()
+    environment["CHECKPOINT_PROBE_OUTPUT"] = str(output_path)
+    if environment_value is None:
+        environment.pop("TRADINGAGENTS_CHECKPOINT_ENABLED", None)
+    else:
+        environment["TRADINGAGENTS_CHECKPOINT_ENABLED"] = environment_value
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "tests.cli_checkpoint_probe", *cli_args],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(output_path.read_text(encoding="utf-8"))
+    assert observed["config_checkpoint_enabled"] is expected_enabled
+    assert observed["stream_thread_id_present"] is expected_enabled

@@ -307,7 +307,14 @@ Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
 
 ### Checkpoint resume
 
-Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves state after each node so a crashed or interrupted run resumes from the last successful step instead of starting over. On a resume run you will see `Resuming from step N for <TICKER> on <date>` in the logs; on a new run you will see `Starting fresh`. Checkpoints are cleared automatically on successful completion.
+Checkpoint resume is opt-in via `--checkpoint` or
+`TRADINGAGENTS_CHECKPOINT_ENABLED=true`. Explicit `--checkpoint` and
+`--no-checkpoint` flags override the environment for that run. When enabled,
+LangGraph saves state after each node so a crashed or interrupted run resumes
+from the last successful step instead of starting over. On a resume run you
+will see `Resuming from step N for <TICKER> on <date>` in the logs; on a new
+run you will see `Starting fresh`. Checkpoints are cleared automatically on
+successful completion.
 
 Per-ticker SQLite databases live under
 `<data_cache_dir>/checkpoints/<TICKER>.db`. Use
@@ -316,6 +323,7 @@ reset all of them before a run.
 
 ```bash
 tradingagents analyze --checkpoint           # enable for this run
+tradingagents analyze --no-checkpoint        # override an enabled environment
 tradingagents analyze --clear-checkpoints    # reset before running
 ```
 

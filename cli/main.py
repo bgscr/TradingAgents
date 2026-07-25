@@ -4,7 +4,7 @@ import os
 import re
 import time
 from collections import deque
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 from functools import wraps
 from pathlib import Path
 from typing import Annotated
@@ -56,7 +56,7 @@ from tradingagents.graph.analyst_execution import (
     build_analyst_execution_plan,
     get_initial_analyst_node,
 )
-from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.graph.trading_graph import CheckpointSession, TradingAgentsGraph
 from tradingagents.recorded_replay import (
     DEFAULT_RECORDED_FIXTURE_MANIFEST,
     load_recorded_run_fixtures,
@@ -94,6 +94,37 @@ CHINA_A_ENHANCEMENT_ALIASES = {
 }
 
 CHINA_A_B_SHARE_PREFIXES = ("900", "200")
+
+_ERROR_DIAGNOSTICS_CONTRACT_VERSION = "1.0"
+_MAX_ERROR_CHAIN_ENTRIES = 8
+_MAX_ERROR_MESSAGE_CHARS = 500
+_ERROR_URL_RE = re.compile(
+    r"\b[a-z][a-z0-9+.-]*://[^\s<>'\"]+",
+    re.IGNORECASE,
+)
+_ERROR_SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTHORIZATION|AUTH|"
+    r"COOKIE|CREDENTIALS?|PRIVATE_KEY)(?:$|_)",
+    re.IGNORECASE,
+)
+_ERROR_SECRET_HEADER_RE = re.compile(
+    r"\b(authorization|proxy-authorization|cookie|set-cookie)\s*([:=])\s*[^\r\n]+",
+    re.IGNORECASE,
+)
+_ERROR_BEARER_TOKEN_RE = re.compile(
+    r"\b(bearer|basic)\s+[a-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+_ERROR_SECRET_FIELD_RE = re.compile(
+    r"(?<![\w-])"
+    r"(?P<prefix>(?P<key_quote>[\"']?)(?:"
+    r"(?i:(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"token|password|passwd|client[_-]?secret|secret|credentials?|authorization|"
+    r"cookie|set-cookie|key))|"
+    r"[A-Za-z0-9]*(?:ApiKey|APIKey|AccessToken|RefreshToken|Token|Password|Passwd|"
+    r"ClientSecret|Secret|Credentials?|Authorization|Cookie|Key)"
+    r")(?P=key_quote)\s*[:=]\s*)",
+)
 
 
 def is_mainland_ticker(ticker: str) -> bool:
@@ -1205,6 +1236,7 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
             "operational_error_category": None,
             "audit_digest": None,
             "error_summary": None,
+            "error_diagnostics": None,
             "reports_written": [],
         },
     )
@@ -1263,17 +1295,203 @@ def _update_run_status(artifacts: dict, **updates) -> None:
         runtime_writer.finish_phases()
 
 
+def _redact_error_url(match: re.Match) -> str:
+    value = match.group(0)
+    trailing = ""
+    while value and value[-1] in ".,;)]}":
+        trailing = value[-1] + trailing
+        value = value[:-1]
+    try:
+        hostname = urlsplit(value).hostname
+    except ValueError:
+        hostname = None
+    return f"{hostname or '<url>'}{trailing}"
+
+
+def _known_secret_environment_values() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                value
+                for name, value in os.environ.items()
+                if value and _ERROR_SECRET_ENV_RE.search(name)
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _secret_value_end(message: str, start: int) -> int:
+    if start >= len(message):
+        return start
+
+    opener = message[start]
+    if opener in {'"', "'"}:
+        escaped = False
+        for index in range(start + 1, len(message)):
+            character = message[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == opener:
+                return index + 1
+        return len(message)
+
+    if opener in "[{(":
+        stack = [opener]
+        pairs = {"]": "[", "}": "{", ")": "("}
+        quote = None
+        escaped = False
+        for index in range(start + 1, len(message)):
+            character = message[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character in "[{(":
+                stack.append(character)
+            elif character in "]})":
+                if pairs[character] != stack[-1]:
+                    return len(message)
+                stack.pop()
+                if not stack:
+                    return index + 1
+        return len(message)
+
+    index = start
+    while index < len(message) and message[index] not in ",;})]":
+        index += 1
+    return index
+
+
+def _redact_structured_secret_values(message: str) -> str:
+    parts: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _ERROR_SECRET_FIELD_RE.search(message, search_from):
+        parts.append(message[cursor : match.end()])
+        value_start = match.end()
+        value_end = _secret_value_end(message, value_start)
+        value = message[value_start:value_end]
+        if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
+            parts.append(f"{value[0]}<redacted>{value[0]}")
+        else:
+            parts.append("<redacted>")
+        cursor = value_end
+        search_from = value_end
+    parts.append(message[cursor:])
+    return "".join(parts)
+
+
+def _sanitize_exception_message(message: str) -> tuple[str, bool]:
+    sanitized = _ERROR_URL_RE.sub(_redact_error_url, message)
+    sanitized = _ERROR_BEARER_TOKEN_RE.sub(
+        lambda match: f"{match.group(1)} <redacted>",
+        sanitized,
+    )
+    sanitized = _ERROR_SECRET_HEADER_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)} <redacted>",
+        sanitized,
+    )
+    sanitized = _redact_structured_secret_values(sanitized)
+    for secret in _known_secret_environment_values():
+        sanitized = sanitized.replace(secret, "<redacted>")
+
+    home_variants = {
+        str(Path.home()),
+        str(Path.home()).replace("\\", "/"),
+    }
+    for home in sorted(home_variants, key=len, reverse=True):
+        if home:
+            sanitized = re.sub(re.escape(home), "<home>", sanitized, flags=re.IGNORECASE)
+
+    sanitized = " ".join(sanitized.split())
+    truncated = len(sanitized) > _MAX_ERROR_MESSAGE_CHARS
+    if truncated:
+        sanitized = sanitized[: _MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+    return sanitized, truncated
+
+
+def _exception_chain_diagnostics(exc: BaseException) -> dict:
+    entries: list[dict] = []
+    seen: set[int] = set()
+    relationship = "outermost"
+    current: BaseException | None = exc
+    cycle_detected = False
+
+    while current is not None:
+        identity = id(current)
+        if identity in seen:
+            cycle_detected = True
+            break
+        seen.add(identity)
+        message, message_truncated = _sanitize_exception_message(str(current))
+        entries.append(
+            {
+                "exception_type": type(current).__name__,
+                "message": message,
+                "message_truncated": message_truncated,
+                "relationship": relationship,
+            }
+        )
+
+        if current.__cause__ is not None:
+            current = current.__cause__
+            relationship = "cause"
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+            relationship = "context"
+        else:
+            current = None
+
+    chain_truncated = len(entries) > _MAX_ERROR_CHAIN_ENTRIES
+    if chain_truncated:
+        entries = [
+            *entries[: _MAX_ERROR_CHAIN_ENTRIES - 1],
+            entries[-1],
+        ]
+    root_cause = dict(entries[-1])
+    return {
+        "contract_version": _ERROR_DIAGNOSTICS_CONTRACT_VERSION,
+        "chain": entries,
+        "root_cause": root_cause,
+        "chain_truncated": chain_truncated,
+        "cycle_detected": cycle_detected,
+    }
+
+
 def _exception_summary(exc: BaseException) -> str:
-    message = str(exc)
+    message, _ = _sanitize_exception_message(str(exc))
     if message:
         return f"{type(exc).__name__}: {message}"
     return type(exc).__name__
+
+
+def _exception_log_summary(summary: str, diagnostics: dict) -> str:
+    chain = diagnostics["chain"]
+    if len(chain) <= 1:
+        return summary
+    root_cause = diagnostics["root_cause"]
+    root_summary = root_cause["exception_type"]
+    if root_cause["message"]:
+        root_summary = f"{root_summary}: {root_cause['message']}"
+    return f"{summary}; root cause: {root_summary}"
 
 
 def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: str) -> None:
     if artifacts is None:
         return
     summary = _exception_summary(exc)
+    diagnostics = _exception_chain_diagnostics(exc)
+    log_summary = _exception_log_summary(summary, diagnostics)
     with suppress(Exception):
         telemetry_ledger = artifacts.get("run_telemetry_ledger")
         if telemetry_ledger is not None:
@@ -1289,7 +1507,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             terminal_outcome_kind="operational_failure",
             operational_error_category=(
                 "report_publication"
-                if current_phase == "report_writing"
+                if current_phase in {"report_writing", "checkpoint_cleanup"}
                 else (
                     "configuration"
                     if current_phase in {"setup", "graph_initializing"}
@@ -1297,6 +1515,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
                 )
             ),
             error_summary=summary,
+            error_diagnostics=diagnostics,
         )
     with suppress(Exception):
         runtime_writer = artifacts.get("runtime_writer")
@@ -1304,13 +1523,13 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             runtime_writer.record_critical(
                 datetime.datetime.now().strftime("%H:%M:%S"),
                 "System",
-                f"Run failed during {current_phase}: {summary}",
+                f"Run failed during {current_phase}: {log_summary}",
             )
         else:
             _append_line_to_run_logs(
                 [artifacts["log_file"], artifacts["latest_log_file"]],
                 f"{datetime.datetime.now().strftime('%H:%M:%S')} "
-                f"[System] Run failed during {current_phase}: {summary}\n",
+                f"[System] Run failed during {current_phase}: {log_summary}\n",
             )
 
 
@@ -1339,6 +1558,11 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
             "complete_report",
             time.monotonic() - started_at,
         )
+    _update_run_status(artifacts, reports_written=[str(report_file)])
+    return report_file
+
+
+def _mark_run_completed(final_state: dict, artifacts: dict) -> None:
     _update_run_status(
         artifacts,
         status="completed",
@@ -1349,9 +1573,7 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
         canonical_run_id=final_state["run_id"],
         configuration_digest=final_state["configuration_digest"],
         audit_digest=final_state["decision_audit_sha256"],
-        reports_written=[str(report_file)],
     )
-    return report_file
 
 
 def _append_line_to_run_logs(paths: list[Path], line: str) -> None:
@@ -1496,10 +1718,26 @@ def run_analysis(checkpoint: bool | None = None):
 
     spinner_text = f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
     snapshot_scope = ExitStack()
-    snapshot_run = snapshot_scope.enter_context(authoritative_snapshot_run())
-    artifacts["run_telemetry_ledger"] = snapshot_run.telemetry_ledger
-    stats_handler.set_telemetry_recorder(snapshot_run.telemetry_ledger)
     try:
+        snapshot_run = snapshot_scope.enter_context(authoritative_snapshot_run())
+        artifacts["run_telemetry_ledger"] = snapshot_run.telemetry_ledger
+        stats_handler.set_telemetry_recorder(snapshot_run.telemetry_ledger)
+        checkpoint_scope_factory = getattr(graph, "checkpoint_scope", None)
+        if callable(checkpoint_scope_factory):
+            checkpoint_context = checkpoint_scope_factory(
+                selections["ticker"],
+                selections["analysis_date"],
+                selections["asset_type"],
+            )
+        elif config.get("checkpoint_enabled"):
+            raise RuntimeError(
+                "checkpointing is enabled but the graph has no checkpoint scope"
+            )
+        else:
+            checkpoint_context = nullcontext(CheckpointSession({}, False))
+        checkpoint_session = snapshot_scope.enter_context(checkpoint_context)
+        checkpoint_graph_config = checkpoint_session.graph_config
+
         display.start()
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
@@ -1538,6 +1776,10 @@ def run_analysis(checkpoint: bool | None = None):
             callbacks=[stats_handler],
             run_id=init_agent_state.get("run_id"),
         )
+        if checkpoint_graph_config:
+            args.setdefault("config", {}).setdefault("configurable", {}).update(
+                checkpoint_graph_config.get("configurable", {})
+            )
 
         # Stream the analysis
         current_phase = "graph_stream"
@@ -1547,7 +1789,10 @@ def run_analysis(checkpoint: bool | None = None):
         snapshot_run.telemetry_ledger.transition_stage(runtime_graph_phase)
         tracker = StateProgressTracker()
         latest_state = dict(init_agent_state)
-        for chunk in graph.graph.stream(init_agent_state, **args):
+        graph_input = (
+            None if checkpoint_session.resume_from_checkpoint else init_agent_state
+        )
+        for chunk in graph.graph.stream(graph_input, **args):
             observed_phase = _runtime_graph_phase_for_chunk(chunk)
             if _RUNTIME_GRAPH_PHASES.index(observed_phase) > _RUNTIME_GRAPH_PHASES.index(
                 runtime_graph_phase
@@ -1702,6 +1947,21 @@ def run_analysis(checkpoint: bool | None = None):
         current_phase = "report_writing"
         _update_run_status(artifacts, current_phase=current_phase)
         _write_run_reports(final_state, selections["ticker"], artifacts)
+        checkpoint_clearer = getattr(graph, "clear_run_checkpoint", None)
+        if config.get("checkpoint_enabled"):
+            current_phase = "checkpoint_cleanup"
+            _update_run_status(artifacts, current_phase=current_phase)
+        if callable(checkpoint_clearer):
+            checkpoint_clearer(
+                selections["ticker"],
+                selections["analysis_date"],
+                selections["asset_type"],
+            )
+        elif config.get("checkpoint_enabled"):
+            raise RuntimeError(
+                "checkpointing is enabled but the graph cannot clear completed runs"
+            )
+        _mark_run_completed(final_state, artifacts)
 
     except BaseException as exc:
         _mark_run_failed(artifacts, exc, current_phase=current_phase)

@@ -35,6 +35,22 @@
       }
     },
     {
+      "canonical_symbol": "601328.SS",
+      "aliases": [
+        "601328",
+        "601328.SH"
+      ],
+      "venue": "XSHG",
+      "instrument_kind": "equity",
+      "currency": "CNY",
+      "display_name": "交通银行股份有限公司",
+      "provenance": {
+        "provider": "Shanghai Stock Exchange",
+        "source_ref": "https://www.sse.com.cn/assortment/stock/list/info/company/index.shtml?COMPANY_CODE=601328",
+        "retrieved_at": "2026-07-24T14:51:50.385262Z"
+      }
+    },
+    {
       "canonical_symbol": "601658.SS",
       "aliases": [
         "601658",

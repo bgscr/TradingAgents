@@ -1,5 +1,6 @@
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -84,6 +85,7 @@ def test_prepare_run_artifacts_writes_running_status(tmp_path):
     assert payload["terminal_outcome_kind"] is None
     assert payload["completed_at"] is None
     assert payload["error_summary"] is None
+    assert payload["error_diagnostics"] is None
     assert payload["reports_written"] == []
 
 
@@ -251,7 +253,7 @@ def test_update_run_status_marks_completed(tmp_path):
 
 
 @pytest.mark.unit
-def test_write_run_reports_publishes_canonical_terminal_identity(
+def test_mark_run_completed_publishes_canonical_identity_after_reports(
     tmp_path,
     monkeypatch,
 ):
@@ -277,7 +279,15 @@ def test_write_run_reports_publishes_canonical_terminal_identity(
         return report_file
 
     monkeypatch.setattr(cli_main, "save_report_to_disk", fake_save)
-    cli_main._write_run_reports({}, "688519.SS", artifacts)
+    final_state = {}
+    cli_main._write_run_reports(final_state, "688519.SS", artifacts)
+
+    interim = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    assert interim["status"] == "running"
+    assert interim["completed_at"] is None
+    assert interim["reports_written"] == [str(report_file)]
+
+    cli_main._mark_run_completed(final_state, artifacts)
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
     assert payload["status"] == "completed"
@@ -319,6 +329,362 @@ def test_mark_run_failed_records_error_summary(tmp_path):
     assert artifacts["latest_log_file"].read_text(encoding="utf-8") == artifacts[
         "log_file"
     ].read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_mark_run_failed_records_sanitized_chained_error_diagnostics(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TEST_PROVIDER_TOKEN", "known-environment-secret")
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    root_error = ConnectionError(
+        "POST https://user:password@api.example.test/v1/orders?token=query-secret "
+        f"failed in {Path.home() / 'private'}\n"
+        "token=known-environment-secret"
+    )
+    failure = RuntimeError(
+        "analysis wrapper failed; Authorization: Bearer header-secret"
+    )
+    failure.__cause__ = root_error
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    diagnostics = payload["error_diagnostics"]
+    assert diagnostics["contract_version"] == "1.0"
+    assert diagnostics["chain"] == [
+        {
+            "exception_type": "RuntimeError",
+            "message": "analysis wrapper failed; Authorization: <redacted>",
+            "message_truncated": False,
+            "relationship": "outermost",
+        },
+        {
+            "exception_type": "ConnectionError",
+            "message": (
+                f"POST api.example.test failed in {Path('<home>') / 'private'} "
+                "token=<redacted>"
+            ),
+            "message_truncated": False,
+            "relationship": "cause",
+        },
+    ]
+    assert diagnostics["root_cause"] == diagnostics["chain"][-1]
+    assert diagnostics["chain_truncated"] is False
+    assert diagnostics["cycle_detected"] is False
+    serialized = json.dumps(payload)
+    for secret in (
+        "password",
+        "query-secret",
+        "known-environment-secret",
+        "header-secret",
+        str(Path.home()),
+        "/v1/orders",
+    ):
+        assert secret not in serialized
+
+
+@pytest.mark.unit
+def test_mark_run_failed_redacts_common_structured_secret_renderings(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failure = RuntimeError(
+        'provider rejected Bearer standalone-secret; '
+        '{"api_key": "json-key-secret", "password": "json-password-secret", '
+        '"cookie": "session=json-cookie-secret"}'
+    )
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    message = payload["error_diagnostics"]["root_cause"]["message"]
+    assert message == (
+        'provider rejected Bearer <redacted>; '
+        '{"api_key": "<redacted>", "password": "<redacted>", '
+        '"cookie": "<redacted>"}'
+    )
+    for secret in (
+        "standalone-secret",
+        "json-key-secret",
+        "json-password-secret",
+        "json-cookie-secret",
+    ):
+        assert secret not in json.dumps(payload)
+
+
+@pytest.mark.unit
+def test_mark_run_failed_redacts_prefixed_secret_fields(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failure = RuntimeError(
+        '{"OPENAI_API_KEY": "openai-secret", '
+        '"x-api-key": "header-key-secret", '
+        '"github_token": "github-secret", '
+        '"db_password": "database-secret", '
+        '"private_key": "pem-secret", '
+        '"AWS_SECRET_ACCESS_KEY": "aws-secret", '
+        '"secret_key": "secret-key-value", '
+        '"service_credentials": "credential-secret", '
+        '"openaiApiKey": "camel-key-secret", '
+        '"dbPassword": "camel-password-secret"}'
+    )
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    message = payload["error_diagnostics"]["root_cause"]["message"]
+    assert message == (
+        '{"OPENAI_API_KEY": "<redacted>", '
+        '"x-api-key": "<redacted>", '
+        '"github_token": "<redacted>", '
+        '"db_password": "<redacted>", '
+        '"private_key": "<redacted>", '
+        '"AWS_SECRET_ACCESS_KEY": "<redacted>", '
+        '"secret_key": "<redacted>", '
+        '"service_credentials": "<redacted>", '
+        '"openaiApiKey": "<redacted>", '
+        '"dbPassword": "<redacted>"}'
+    )
+    for secret in (
+        "openai-secret",
+        "header-key-secret",
+        "github-secret",
+        "database-secret",
+        "pem-secret",
+        "aws-secret",
+        "secret-key-value",
+        "credential-secret",
+        "camel-key-secret",
+        "camel-password-secret",
+    ):
+        assert secret not in json.dumps(payload)
+
+
+@pytest.mark.unit
+def test_mark_run_failed_redacts_unquoted_secret_values_with_whitespace(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failure = RuntimeError(
+        "password=my secret phrase; "
+        "private_key=-----BEGIN PRIVATE KEY-----\n"
+        "pem-body-secret\n"
+        "-----END PRIVATE KEY-----; provider failed"
+    )
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    message = payload["error_diagnostics"]["root_cause"]["message"]
+    assert message == "password=<redacted>; private_key=<redacted>; provider failed"
+    serialized = json.dumps(payload)
+    assert "my secret phrase" not in serialized
+    assert "pem-body-secret" not in serialized
+
+
+@pytest.mark.unit
+def test_mark_run_failed_redacts_escaped_quotes_inside_secret_values(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failure = RuntimeError(
+        '{"api_key": "prefix\\\"double-tail-secret", '
+        "'password': 'prefix\\'single-tail-secret', "
+        '"message": "failed"}'
+    )
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    message = payload["error_diagnostics"]["root_cause"]["message"]
+    assert message == (
+        '{"api_key": "<redacted>", '
+        "'password': '<redacted>', "
+        '"message": "failed"}'
+    )
+    serialized = json.dumps(payload)
+    assert "double-tail-secret" not in serialized
+    assert "single-tail-secret" not in serialized
+
+
+@pytest.mark.unit
+def test_mark_run_failed_redacts_container_secret_values(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failure = RuntimeError(
+        '{"credentials": ["prefix", "array-tail-secret"], '
+        '"private_key": {"primary": ["prefix", "object-tail-secret"]}, '
+        '"service_token": ("prefix", "tuple-tail-secret"), '
+        '"message": "failed"}'
+    )
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    message = payload["error_diagnostics"]["root_cause"]["message"]
+    assert message == (
+        '{"credentials": <redacted>, '
+        '"private_key": <redacted>, '
+        '"service_token": <redacted>, '
+        '"message": "failed"}'
+    )
+    serialized = json.dumps(payload)
+    assert "array-tail-secret" not in serialized
+    assert "object-tail-secret" not in serialized
+    assert "tuple-tail-secret" not in serialized
+
+
+@pytest.mark.unit
+def test_mark_run_failed_logs_sanitized_outer_and_root_cause(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    root_error = TimeoutError(
+        "request to https://user:password@feed.example.test/private timed out"
+    )
+    failure = RuntimeError("analysis stream stopped")
+    failure.__cause__ = root_error
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    log_text = artifacts["log_file"].read_text(encoding="utf-8")
+    assert (
+        "Run failed during graph_stream: RuntimeError: analysis stream stopped; "
+        "root cause: TimeoutError: request to feed.example.test timed out"
+    ) in log_text
+    assert "/private" not in log_text
+    assert "password" not in log_text
+    assert artifacts["latest_log_file"].read_text(encoding="utf-8") == log_text
+
+
+@pytest.mark.unit
+def test_error_diagnostics_bound_implicit_context_chain_and_message_length(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    failures = [RuntimeError(f"level-{index}") for index in range(9)]
+    failures.append(RuntimeError("x" * 600))
+    for outer, context in zip(failures[:-1], failures[1:], strict=True):
+        outer.__context__ = context
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failures[0],
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    diagnostics = payload["error_diagnostics"]
+    assert len(diagnostics["chain"]) == 8
+    assert [entry["message"] for entry in diagnostics["chain"][:-1]] == [
+        f"level-{index}" for index in range(7)
+    ]
+    assert diagnostics["chain"][-1]["relationship"] == "context"
+    assert diagnostics["chain"][-1]["message_truncated"] is True
+    assert len(diagnostics["chain"][-1]["message"]) == 500
+    assert diagnostics["chain"][-1]["message"].endswith("…")
+    assert diagnostics["root_cause"] == diagnostics["chain"][-1]
+    assert diagnostics["chain_truncated"] is True
+    assert diagnostics["cycle_detected"] is False
+
+
+@pytest.mark.unit
+def test_error_diagnostics_detect_exception_chain_cycles(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    outer = RuntimeError("outer")
+    inner = ValueError("inner")
+    outer.__cause__ = inner
+    inner.__cause__ = outer
+
+    cli_main._mark_run_failed(
+        artifacts,
+        outer,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    diagnostics = payload["error_diagnostics"]
+    assert [entry["exception_type"] for entry in diagnostics["chain"]] == [
+        "RuntimeError",
+        "ValueError",
+    ]
+    assert diagnostics["root_cause"] == diagnostics["chain"][-1]
+    assert diagnostics["chain_truncated"] is False
+    assert diagnostics["cycle_detected"] is True
+
+
+@pytest.mark.unit
+def test_error_diagnostics_do_not_follow_suppressed_context(tmp_path):
+    artifacts = cli_main._prepare_run_artifacts(
+        {"results_dir": str(tmp_path)},
+        _selections(),
+    )
+    hidden_context = ValueError("suppressed provider payload")
+    failure = RuntimeError("public failure")
+    failure.__context__ = hidden_context
+    failure.__suppress_context__ = True
+
+    cli_main._mark_run_failed(
+        artifacts,
+        failure,
+        current_phase="graph_stream",
+    )
+
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    assert payload["error_diagnostics"]["chain"] == [
+        {
+            "exception_type": "RuntimeError",
+            "message": "public failure",
+            "message_truncated": False,
+            "relationship": "outermost",
+        }
+    ]
+    assert "suppressed provider payload" not in json.dumps(payload)
 
 
 @pytest.mark.unit

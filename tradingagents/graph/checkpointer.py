@@ -13,13 +13,18 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from tradingagents.dataflows.symbol_utils import normalize_symbol
 from tradingagents.dataflows.utils import safe_ticker_component
+
+
+def _canonical_ticker(ticker: str) -> str:
+    return safe_ticker_component(normalize_symbol(ticker)).upper()
 
 
 def _db_path(data_dir: str | Path, ticker: str) -> Path:
     """Return the SQLite checkpoint DB path for a ticker."""
     # Reject ticker values that would escape the checkpoints directory.
-    safe = safe_ticker_component(ticker).upper()
+    safe = _canonical_ticker(ticker)
     p = Path(data_dir) / "checkpoints"
     p.mkdir(parents=True, exist_ok=True)
     return p / f"{safe}.db"
@@ -32,7 +37,7 @@ def thread_id(ticker: str, date: str, signature: str = "") -> str:
     different graph can't reuse this checkpoint (#1089); omitting it keeps the
     legacy ID.
     """
-    base = f"{ticker.upper()}:{date}"
+    base = f"{_canonical_ticker(ticker)}:{date}"
     if signature:
         base = f"{base}:{signature}"
     return hashlib.sha256(base.encode()).hexdigest()[:16]
@@ -92,7 +97,5 @@ def clear_checkpoint(data_dir: str | Path, ticker: str, date: str, signature: st
         for table in ("writes", "checkpoints"):
             conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (tid,))
         conn.commit()
-    except sqlite3.OperationalError:
-        pass
     finally:
         conn.close()

@@ -1,6 +1,8 @@
 import gzip
 import json
 import re
+import sqlite3
+from contextlib import contextmanager
 from io import StringIO
 from types import SimpleNamespace
 
@@ -110,6 +112,11 @@ def _run_with_chunks(
     evidence_gate_mode="enforce",
     initial_state=None,
     callback_script=None,
+    checkpoint=None,
+    checkpoint_marker=None,
+    checkpoint_clear_error=None,
+    resume_from_checkpoint=False,
+    observed_graph_inputs=None,
 ):
     class FakeStream:
         def __init__(self):
@@ -117,6 +124,8 @@ def _run_with_chunks(
             self.callbacks = ()
 
         def stream(self, *args, **kwargs):
+            if observed_graph_inputs is not None:
+                observed_graph_inputs.append(args[0])
             if callback_script is not None:
                 callback_script(self.callbacks)
             yield from chunks
@@ -141,9 +150,30 @@ def _run_with_chunks(
 
     class FakeTradingAgentsGraph:
         def __init__(self, *args, **kwargs):
+            self.config = kwargs["config"]
             self.propagator = FakePropagator()
             self.graph = fake_stream
             fake_stream.callbacks = tuple(kwargs.get("callbacks", ()))
+
+        @contextmanager
+        def checkpoint_scope(self, ticker, trade_date, asset_type="stock"):
+            if self.config["checkpoint_enabled"]:
+                yield cli_main.CheckpointSession(
+                    {
+                        "configurable": {
+                            "thread_id": f"{ticker}:{trade_date}:{asset_type}",
+                        }
+                    },
+                    resume_from_checkpoint,
+                )
+            else:
+                yield cli_main.CheckpointSession({}, False)
+
+        def clear_run_checkpoint(self, *args, **kwargs):
+            if checkpoint_clear_error is not None:
+                raise checkpoint_clear_error
+            if self.config["checkpoint_enabled"] and checkpoint_marker is not None:
+                checkpoint_marker.unlink()
 
         def create_initial_state(self, *args, **kwargs):
             return self.propagator.create_initial_state(*args, **kwargs)
@@ -195,7 +225,7 @@ def _run_with_chunks(
         result = CliRunner().invoke(cli_main.app, [])
         assert result.exit_code == 0, result.output
     else:
-        cli_main.run_analysis()
+        cli_main.run_analysis(checkpoint=checkpoint)
     return display
 
 
@@ -279,6 +309,66 @@ def test_cli_audit_preserves_configured_evidence_gate_mode(
     audit_path = next(tmp_path.rglob("decision-audit.json"))
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     assert audit["run"]["evidence_gate_mode"] == evidence_gate_mode
+
+
+@pytest.mark.unit
+def test_cli_clears_checkpoint_after_completed_analysis_outcome(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_marker = tmp_path / "incomplete.checkpoint"
+    checkpoint_marker.write_text("saved", encoding="utf-8")
+    graph_inputs = []
+
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
+        checkpoint=True,
+        checkpoint_marker=checkpoint_marker,
+        resume_from_checkpoint=True,
+        observed_graph_inputs=graph_inputs,
+    )
+
+    assert graph_inputs == [None]
+    assert not checkpoint_marker.exists()
+
+
+@pytest.mark.unit
+def test_cli_checkpoint_cleanup_failure_never_marks_run_completed(
+    tmp_path,
+    monkeypatch,
+):
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        _run_with_chunks(
+            tmp_path,
+            monkeypatch,
+            [
+                {
+                    "messages": [],
+                    "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                    "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+                }
+            ],
+            checkpoint=True,
+            checkpoint_clear_error=sqlite3.OperationalError("database is locked"),
+        )
+
+    status_file = next(tmp_path.rglob("run_status.json"))
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert status["lifecycle_status"] == "failed"
+    assert status["failed_phase"] == "checkpoint_cleanup"
+    assert status["operational_error_category"] == "report_publication"
+    assert status["completed_at"] is None
+    assert status["failed_at"] is not None
+    assert len(status["reports_written"]) == 1
 
 
 @pytest.mark.unit

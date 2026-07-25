@@ -1,7 +1,9 @@
 """Test checkpoint resume: crash mid-analysis, re-run resumes from last node."""
 
+import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -104,6 +106,18 @@ class TestCheckpointResume(unittest.TestCase):
 
         self.assertEqual(result["count"], 11)
 
+    def test_clear_checkpoint_surfaces_storage_failure(self):
+        """A failed cleanup must not masquerade as a cleared checkpoint."""
+        checkpoint_dir = Path(self.tmpdir) / "checkpoints"
+        checkpoint_dir.mkdir()
+        db_path = checkpoint_dir / f"{self.ticker}.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE writes (unexpected_column TEXT)")
+            conn.execute("CREATE TABLE checkpoints (thread_id TEXT)")
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "thread_id"):
+            clear_checkpoint(self.tmpdir, self.ticker, self.date)
+
 
     def test_different_date_starts_fresh(self):
         """A different date must NOT resume from an existing checkpoint."""
@@ -139,6 +153,72 @@ class TestCheckpointResume(unittest.TestCase):
         # Original date checkpoint still exists (untouched)
         self.assertTrue(has_checkpoint(self.tmpdir, self.ticker, self.date))
 
+    def test_trading_graph_checkpoint_scope_resumes_and_clears_completed_run(self):
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        events = []
+        should_crash = True
+
+        def analyst(state):
+            events.append("analyst")
+            return {"count": state["count"] + 1}
+
+        def trader(state):
+            events.append("trader")
+            if should_crash:
+                raise RuntimeError("simulated mid-analysis crash")
+            return {"count": state["count"] + 10}
+
+        workflow = StateGraph(_SimpleState)
+        workflow.add_node("analyst", analyst)
+        workflow.add_node("trader", trader)
+        workflow.set_entry_point("analyst")
+        workflow.add_edge("analyst", "trader")
+        workflow.add_edge("trader", END)
+
+        graph = object.__new__(TradingAgentsGraph)
+        graph.config = {
+            "checkpoint_enabled": True,
+            "data_cache_dir": self.tmpdir,
+            "max_debate_rounds": 1,
+            "max_risk_discuss_rounds": 1,
+        }
+        graph.selected_analysts = ("market",)
+        graph.decision_policy = None
+        graph.decision_horizon = None
+        graph.workflow = workflow
+        graph.graph = graph.workflow.compile()
+        signature = graph._run_signature("stock")
+
+        with graph.checkpoint_scope(self.ticker, self.date, "stock") as session:
+            config = session.graph_config
+            self.assertFalse(session.resume_from_checkpoint)
+            self.assertEqual(
+                config["configurable"]["thread_id"],
+                thread_id(self.ticker, self.date, signature),
+            )
+            with self.assertRaises(RuntimeError):
+                graph.graph.invoke({"count": 0}, config=config)
+
+        self.assertTrue(
+            has_checkpoint(self.tmpdir, self.ticker, self.date, signature)
+        )
+        self.assertEqual(events, ["analyst", "trader"])
+
+        should_crash = False
+        with graph.checkpoint_scope(self.ticker, self.date, "stock") as session:
+            config = session.graph_config
+            self.assertTrue(session.resume_from_checkpoint)
+            graph_input = None if session.resume_from_checkpoint else {"count": 0}
+            result = graph.graph.invoke(graph_input, config=config)
+            graph.clear_run_checkpoint(self.ticker, self.date, "stock")
+
+        self.assertEqual(result["count"], 11)
+        self.assertEqual(events, ["analyst", "trader", "trader"])
+        self.assertFalse(
+            has_checkpoint(self.tmpdir, self.ticker, self.date, signature)
+        )
+
 
 class TestCheckpointSignature(unittest.TestCase):
     """A different graph shape (analyst selection / depth / asset mode) must not
@@ -163,6 +243,32 @@ class TestCheckpointSignature(unittest.TestCase):
         self.assertNotEqual(legacy, sig_a)         # signature-keyed differs from legacy
         self.assertEqual(                          # same inputs are stable
             sig_a, thread_id(self.ticker, self.date, "analysts=market,news|asset=stock")
+        )
+
+    def test_symbol_aliases_share_canonical_checkpoint_identity(self):
+        alias = "BTCUSD"
+        canonical = "BTC-USD"
+        signature = "analysts=market|asset=crypto"
+        builder = _build_graph()
+        config = {
+            "configurable": {
+                "thread_id": thread_id(alias, self.date, signature),
+            }
+        }
+
+        global _should_crash
+        _should_crash = True
+        with get_checkpointer(self.tmpdir, alias) as saver:
+            graph = builder.compile(checkpointer=saver)
+            with self.assertRaises(RuntimeError):
+                graph.invoke({"count": 0}, config=config)
+
+        self.assertEqual(
+            thread_id(alias, self.date, signature),
+            thread_id(canonical, self.date, signature),
+        )
+        self.assertTrue(
+            has_checkpoint(self.tmpdir, canonical, self.date, signature)
         )
 
     def test_different_signature_starts_fresh(self):
