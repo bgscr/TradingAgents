@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from functools import lru_cache
+from typing import cast
 
 import akshare as ak
 import pandas as pd
+import requests
 from dateutil.relativedelta import relativedelta
 from stockstats import wrap
 
@@ -103,25 +107,159 @@ def _history_endpoint_name(instrument) -> str:
     return "fund_lof_hist_em" if is_lof else "fund_etf_hist_em"
 
 
+_EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+
+def _retry_after_seconds(response: object) -> float | None:
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return None
+    raw = headers.get("Retry-After")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _fetch_eastmoney_current_frame(
+    instrument,
+    *,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    from tradingagents.market_history import (
+        PhysicalAttemptFailure,
+        PhysicalAttemptOutcome,
+    )
+
+    market_code = 1 if instrument.exchange == "shanghai" else 0
+    response = requests.get(
+        _EASTMONEY_KLINE_URL,
+        params={
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "klt": "101",
+            "fqt": "1",
+            "secid": f"{market_code}.{instrument.akshare_code}",
+            "beg": start_date,
+            "end": end_date,
+        },
+        timeout=15,
+    )
+    status_code = getattr(response, "status_code", 200)
+    if isinstance(status_code, bool) or not isinstance(status_code, int):
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+            retryable=False,
+            error_code="EASTMONEY_INVALID_HTTP_STATUS",
+        )
+    if status_code in {429, 503}:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.RATE_LIMITED,
+            retryable=True,
+            status_code=status_code,
+            error_code=f"EASTMONEY_HTTP_{status_code}",
+            retry_after_seconds=_retry_after_seconds(response),
+        )
+    if status_code in {401, 403}:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.AUTHENTICATION,
+            retryable=False,
+            status_code=status_code,
+            error_code=f"EASTMONEY_HTTP_{status_code}",
+        )
+    if status_code >= 400:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+            retryable=status_code >= 500,
+            status_code=status_code,
+            error_code=f"EASTMONEY_HTTP_{status_code}",
+        )
+    payload = response.json()
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise ValueError("Eastmoney response is missing data")
+    data = payload["data"]
+    if data is None:
+        raise NoMarketDataError(
+            instrument.yahoo_symbol,
+            instrument.yahoo_symbol,
+            "Eastmoney returned no data",
+        )
+    if not isinstance(data, dict) or "klines" not in data:
+        raise ValueError("Eastmoney response is missing klines")
+    klines = data["klines"]
+    if not isinstance(klines, list):
+        raise ValueError("Eastmoney klines must be a list")
+    if not klines:
+        raise NoMarketDataError(
+            instrument.yahoo_symbol,
+            instrument.yahoo_symbol,
+            "Eastmoney returned no rows",
+        )
+    rows: list[list[str]] = []
+    for item in klines:
+        if not isinstance(item, str):
+            raise ValueError("Eastmoney kline row must be text")
+        fields = item.split(",")
+        if len(fields) < 11:
+            raise ValueError("Eastmoney kline row has too few fields")
+        rows.append(fields[:11])
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "日期",
+            "开盘",
+            "收盘",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "振幅",
+            "涨跌幅",
+            "涨跌额",
+            "换手率",
+        ],
+    )
+
+
 def _fetch_hist(
     symbol: str,
     start_date: str,
     end_date: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
 ) -> tuple[str, pd.DataFrame, str]:
     instrument = _require_china_a(symbol)
     endpoint_name = _history_endpoint_name(instrument)
-    endpoint = getattr(ak, endpoint_name)
-    raw = endpoint(
-        symbol=instrument.akshare_code,
-        period="daily",
-        start_date=_date_for_akshare(start_date),
-        end_date=_date_for_akshare(end_date),
-        adjust="qfq",
-    )
-    frame = _normalize_hist_frame(raw, symbol, instrument.yahoo_symbol)
-    frame = validate_ohlcv_frame(frame, end_date)
-    _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
-    return instrument.yahoo_symbol, frame, endpoint_name
+    formatted_start_date = _date_for_akshare(start_date)
+    formatted_end_date = _date_for_akshare(end_date)
+
+    def request() -> tuple[str, pd.DataFrame, str]:
+        if physical_request is None:
+            endpoint = getattr(ak, endpoint_name)
+            raw = endpoint(
+                symbol=instrument.akshare_code,
+                period="daily",
+                start_date=formatted_start_date,
+                end_date=formatted_end_date,
+                adjust="qfq",
+            )
+        else:
+            raw = _fetch_eastmoney_current_frame(
+                instrument,
+                start_date=formatted_start_date,
+                end_date=formatted_end_date,
+            )
+        frame = _normalize_hist_frame(raw, symbol, instrument.yahoo_symbol)
+        frame = validate_ohlcv_frame(frame, end_date)
+        _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
+        return instrument.yahoo_symbol, frame, endpoint_name
+
+    if physical_request is None:
+        return request()
+    return cast(tuple[str, pd.DataFrame, str], physical_request(endpoint_name, request))
 
 
 def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
@@ -136,8 +274,19 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     return header + out.to_csv(index=False)
 
 
-def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    return _fetch_hist(symbol, start_date, end_date)[1].copy()
+def load_ohlcv_range(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> pd.DataFrame:
+    return _fetch_hist(
+        symbol,
+        start_date,
+        end_date,
+        physical_request=physical_request,
+    )[1].copy()
 
 
 @lru_cache(maxsize=64)

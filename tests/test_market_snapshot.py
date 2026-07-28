@@ -693,16 +693,22 @@ def test_production_akshare_snapshot_records_full_provenance(monkeypatch):
             "cn_a": {"core_stock_apis": "akshare"}
         }
     })
-    valid = pd.DataFrame({
-        "日期": ["2026-07-15"],
-        "开盘": [12.55],
-        "最高": [13.10],
-        "最低": [12.40],
-        "收盘": [12.58],
-        "成交量": [1_000_000],
-        "成交额": [12_580_000],
-    })
-    monkeypatch.setattr(akshare_data.ak, "stock_zh_a_hist", lambda **kwargs: valid)
+    class Response:
+        status_code = 200
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {
+                "data": {
+                    "klines": [
+                        "2026-07-15,12.55,12.58,13.10,12.40,"
+                        "1000000,12580000,0,0,0,0"
+                    ]
+                }
+            }
+
+    monkeypatch.setattr(akshare_data.requests, "get", lambda *args, **kwargs: Response())
 
     snapshot = get_authoritative_market_snapshot(
         "000021.SZ", "2026-07-01", "2026-07-15"
@@ -882,18 +888,25 @@ def test_china_indicator_tool_derives_from_accepted_core_snapshot(monkeypatch):
             }
         }
     })
+    class Response:
+        status_code = 200
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {
+                "data": {
+                    "klines": [
+                        "2026-07-15,12.55,999,12.60,13.01,"
+                        "1000000,999000000,0,0,0,0"
+                    ]
+                }
+            }
+
     monkeypatch.setattr(
-        akshare_data.ak,
-        "stock_zh_a_hist",
-        lambda **kwargs: pd.DataFrame({
-            "日期": ["2026-07-15"],
-            "开盘": [12.55],
-            "最高": [12.60],
-            "最低": [13.01],
-            "收盘": [999.0],
-            "成交量": [1_000_000],
-            "成交额": [999_000_000],
-        }),
+        akshare_data.requests,
+        "get",
+        lambda *args, **kwargs: Response(),
     )
     monkeypatch.setattr(baostock_data.bs, "login", lambda: Login())
     monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
@@ -1059,18 +1072,25 @@ def test_china_stock_data_tool_renders_same_authoritative_provider(monkeypatch):
             "cn_a": {"core_stock_apis": "akshare,baostock"}
         }
     })
+    class Response:
+        status_code = 200
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {
+                "data": {
+                    "klines": [
+                        "2026-07-15,12.55,999,12.60,13.01,"
+                        "1000000,999000000,0,0,0,0"
+                    ]
+                }
+            }
+
     monkeypatch.setattr(
-        akshare_data.ak,
-        "stock_zh_a_hist",
-        lambda **kwargs: pd.DataFrame({
-            "日期": ["2026-07-15"],
-            "开盘": [12.55],
-            "最高": [12.60],
-            "最低": [13.01],
-            "收盘": [999.0],
-            "成交量": [1_000_000],
-            "成交额": [999_000_000],
-        }),
+        akshare_data.requests,
+        "get",
+        lambda *args, **kwargs: Response(),
     )
     monkeypatch.setattr(baostock_data.bs, "login", lambda: Login())
     monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
@@ -1202,15 +1222,23 @@ def test_production_akshare_cannot_silently_drop_invalid_date_row(monkeypatch):
             "cn_a": {"core_stock_apis": "akshare,baostock"}
         }
     })
-    akshare_rows = pd.DataFrame({
-        "日期": ["not-a-date", "2026-07-15"],
-        "开盘": [12.50, 12.55],
-        "最高": [13.00, 13.10],
-        "最低": [12.40, 12.40],
-        "收盘": [12.60, 12.58],
-        "成交量": [900_000, 1_000_000],
-        "成交额": [11_000_000, 12_580_000],
-    })
+    class Response:
+        status_code = 200
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {
+                "data": {
+                    "klines": [
+                        "not-a-date,12.50,12.60,13.00,12.40,"
+                        "900000,11000000,0,0,0,0",
+                        "2026-07-15,12.55,12.58,13.10,12.40,"
+                        "1000000,12580000,0,0,0,0",
+                    ]
+                }
+            }
+
     accepted = pd.DataFrame({
         "Date": ["2026-07-15"],
         "Open": [12.55],
@@ -1219,7 +1247,7 @@ def test_production_akshare_cannot_silently_drop_invalid_date_row(monkeypatch):
         "Close": [12.58],
         "Volume": [1_000_000],
     })
-    monkeypatch.setattr(akshare_data.ak, "stock_zh_a_hist", lambda **kwargs: akshare_rows)
+    monkeypatch.setattr(akshare_data.requests, "get", lambda *args, **kwargs: Response())
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
@@ -1234,7 +1262,8 @@ def test_production_akshare_cannot_silently_drop_invalid_date_row(monkeypatch):
     )
 
     assert snapshot.provider == "baostock"
-    assert "invalid Date at row(s) 0" in snapshot.quarantined[0].reason
+    assert snapshot.quarantined[0].reason == "malformed_response"
+    assert snapshot.physical_attempt_events[0].outcome.value == "malformed_response"
 
 
 @pytest.mark.unit

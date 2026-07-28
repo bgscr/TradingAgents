@@ -17,6 +17,10 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
+from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
+    Timeout as RequestsTimeout,
+)
 from stockstats import wrap
 
 from tradingagents.evidence import (
@@ -29,7 +33,11 @@ from tradingagents.evidence import (
     stable_acquisition_source_ref,
     stable_market_snapshot_id,
 )
-from tradingagents.market_history.coordinator import ProviderPhysicalAttemptEvent
+from tradingagents.market_history.coordinator import (
+    PhysicalAttemptFailure,
+    PhysicalAttemptOutcome,
+    ProviderPhysicalAttemptEvent,
+)
 from tradingagents.market_history.models import TradingStatus, TradingStatusProvenance
 from tradingagents.market_history.snapshot_identity import (
     LEGACY_SNAPSHOT_ID_PATTERN,
@@ -63,6 +71,7 @@ class SnapshotProvider:
     history_load: Callable[..., object] | None = None
     reports_physical_requests: bool = False
     crypto_dataset: CryptoProviderDatasetDescriptor | None = None
+    uses_typed_physical_requests: bool = False
 
 
 @dataclass(frozen=True)
@@ -552,10 +561,21 @@ def get_active_run_telemetry() -> RunTelemetryLedger | None:
     return None if active is None else active.telemetry_ledger
 
 
-def _load_akshare(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _load_akshare(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> pd.DataFrame:
     from .akshare_data import load_ohlcv_range
 
-    return load_ohlcv_range(symbol, start_date, end_date)
+    return load_ohlcv_range(
+        symbol,
+        start_date,
+        end_date,
+        physical_request=physical_request,
+    )
 
 
 def _load_baostock(
@@ -599,7 +619,11 @@ def _load_yfinance(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
 
 
 SNAPSHOT_PROVIDERS: dict[str, SnapshotProvider] = {
-    "akshare": SnapshotProvider(_load_akshare, "qfq"),
+    "akshare": SnapshotProvider(
+        _load_akshare,
+        "qfq",
+        uses_typed_physical_requests=True,
+    ),
     "baostock": SnapshotProvider(
         _load_baostock,
         "qfq",
@@ -643,6 +667,74 @@ def _coordinator_sleep(seconds: float) -> None:
     from time import sleep
 
     sleep(seconds)
+
+
+def _typed_mainland_physical_request(
+    physical_request: Callable[[], object],
+) -> object:
+    try:
+        return physical_request()
+    except PhysicalAttemptFailure:
+        raise
+    except VendorRateLimitError as exc:
+        error_code = (
+            exc.error_code
+            if isinstance(exc.error_code, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", exc.error_code)
+            else None
+        )
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.RATE_LIMITED,
+            retryable=True,
+            status_code=exc.status_code,
+            error_code=error_code,
+            retry_after_seconds=exc.retry_after_seconds,
+        ) from exc
+    except (RequestsTimeout, TimeoutError) as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.TIMEOUT,
+            retryable=True,
+        ) from exc
+    except NoMarketDataError as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.EMPTY_FRAME,
+            retryable=False,
+        ) from exc
+    except PermissionError as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.AUTHENTICATION,
+            retryable=False,
+        ) from exc
+    except (RequestsConnectionError, ConnectionError) as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.DISCONNECT,
+            retryable=True,
+        ) from exc
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+            retryable=False,
+        ) from exc
+    except Exception as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+            retryable=True,
+        ) from exc
+
+
+_ACQUISITION_REASON_BY_PHYSICAL_OUTCOME = {
+    PhysicalAttemptOutcome.RATE_LIMITED: AcquisitionUnavailableReason.RATE_LIMITED,
+    PhysicalAttemptOutcome.TIMEOUT: AcquisitionUnavailableReason.TIMEOUT,
+    PhysicalAttemptOutcome.DISCONNECT: AcquisitionUnavailableReason.DISCONNECT,
+    PhysicalAttemptOutcome.EMPTY_FRAME: AcquisitionUnavailableReason.EMPTY_FRAME,
+    PhysicalAttemptOutcome.AUTHENTICATION: AcquisitionUnavailableReason.AUTHENTICATION,
+    PhysicalAttemptOutcome.MALFORMED_RESPONSE: (
+        AcquisitionUnavailableReason.MALFORMED_RESPONSE
+    ),
+    PhysicalAttemptOutcome.PROVIDER_ERROR: AcquisitionUnavailableReason.PROVIDER_ERROR,
+    PhysicalAttemptOutcome.UPSTREAM_BUSY: AcquisitionUnavailableReason.UPSTREAM_BUSY,
+    PhysicalAttemptOutcome.ABANDONED: AcquisitionUnavailableReason.PROVIDER_ERROR,
+}
 
 
 def _load_through_provider_coordinator(
@@ -757,6 +849,67 @@ def _load_through_provider_coordinator(
             provider.adjustment_basis,
         )
         owner_id = f"snapshot:{threading.get_ident()}:{uuid4().hex}"
+        if provider.uses_typed_physical_requests:
+            from tradingagents.market_history.coordinator import (
+                PhysicalAttemptBudgetExhausted,
+            )
+
+            physical_request_index = 0
+
+            def execute_physical_request(
+                operation: str,
+                physical_request: Callable[[], object],
+            ) -> object:
+                nonlocal physical_request_index
+                physical_request_index += 1
+                subrequest_key = stable_acquisition_source_ref(
+                    "provider-physical-request",
+                    request_key,
+                    str(physical_request_index),
+                    operation,
+                )
+                try:
+                    result = coordinator.execute_direct_physical_request(
+                        request_key=subrequest_key,
+                        upstream_service_id=upstream_service_id,
+                        owner_id=f"{owner_id}:{physical_request_index}",
+                        priority=RequestPriority.INTERACTIVE_MAINLAND,
+                        now=_coordinator_now,
+                        sleep=_coordinator_sleep,
+                        lease_duration=lease_duration,
+                        operation=operation,
+                        physical_request=lambda: _typed_mainland_physical_request(
+                            physical_request
+                        ),
+                        cooldown_scope="market-snapshot",
+                    )
+                except PhysicalAttemptBudgetExhausted as exc:
+                    if attempt_observer is not None:
+                        attempt_observer(exc.attempt_events)
+                    raise exc.failure from exc
+                if attempt_observer is not None:
+                    attempt_observer(result.attempt_events)
+                return result.value
+
+            try:
+                value = provider.load(
+                    symbol,
+                    start_date,
+                    end_date,
+                    physical_request=execute_physical_request,
+                )
+            except PhysicalAttemptFailure as failure:
+                raise AcquisitionFailure(
+                    reason=_ACQUISITION_REASON_BY_PHYSICAL_OUTCOME[failure.outcome],
+                    status_code=failure.status_code,
+                    error_code=failure.error_code,
+                    retry_after_seconds=failure.retry_after_seconds,
+                ) from failure
+            if physical_request_index == 0:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.PROVIDER_ERROR
+                )
+            return value
         if provider_name == "yfinance":
             from tradingagents.dataflows.stockstats_utils import (
                 _execute_guarded_yahoo_attempt,
