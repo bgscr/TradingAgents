@@ -29,13 +29,19 @@ from tradingagents.market_history.revisions import RevisionKind, revision_identi
 from tradingagents.market_history.snapshot_identity import (
     LEGACY_SNAPSHOT_ID_PATTERN,
     SNAPSHOT_V2_ID_PATTERN,
+    CryptoProviderDatasetDescriptor,
+    CryptoSnapshotIdentityMismatch,
+    _historical_snapshot_v2_identity,
     snapshot_v2_identity,
+    validate_crypto_provider_dataset_descriptor,
 )
 
 SNAPSHOT_DERIVATION_VERSION = "mainland-qfq-v1"
+CRYPTO_SNAPSHOT_DERIVATION_VERSION = "crypto-auto-adjusted-v1"
 SNAPSHOT_NORMALIZATION_VERSION = "normalized-frame-csv-v1"
 
 if TYPE_CHECKING:
+    from tradingagents.asset_configuration import RunAssetConfiguration
     from tradingagents.market_history.store import MarketHistoryStore
 
 
@@ -48,6 +54,8 @@ class _BundleRow(NamedTuple):
     provenance_class: str
     observed_at: str
     upstream_service_id: str
+    dataset_name: str
+    adjustment_methodology: str
     identity_revision: str
     reference_market: str
     instrument_kind: str
@@ -251,6 +259,82 @@ def _derive_qfq_materialization(
         latest_status=latest_status,
         latest_traded_close=latest_traded_close,
     )
+
+
+def _derive_crypto_materialization(
+    observations: tuple[_SnapshotObservationInput, ...],
+    factors: tuple[_SnapshotFactorInput, ...],
+    *,
+    error: Callable[[str], Exception],
+) -> _DerivedSnapshotMaterialization:
+    if any(factor.factor_value != Decimal("1") for factor in factors):
+        raise error("crypto durable history contains a non-identity adjustment factor")
+    if any(
+        observation.trading_status is not TradingStatus.TRADED
+        for observation in observations
+    ):
+        raise error("crypto durable history contains incompatible trading status")
+    return _derive_qfq_materialization(observations, factors, error=error)
+
+
+def _validate_crypto_bundle_binding(
+    bundle: _BundleRow,
+    *,
+    asset_configuration: RunAssetConfiguration | None,
+    crypto_provider_dataset: CryptoProviderDatasetDescriptor | None,
+) -> None:
+    if bundle.instrument_kind != "crypto":
+        return
+    if asset_configuration is None:
+        raise CryptoSnapshotIdentityMismatch(
+            "authoritative RunAssetConfiguration is required"
+        )
+    dataset = validate_crypto_provider_dataset_descriptor(
+        crypto_provider_dataset,
+        provider_name=bundle.provider_name,
+        upstream_service_id=bundle.upstream_service_id,
+    )
+    if (
+        bundle.provider_dataset_id != dataset.provider_dataset_id
+        or bundle.dataset_name != dataset.dataset_name
+        or bundle.adjustment_methodology != asset_configuration.adjustment_basis
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "durable crypto provider dataset contradicts the run asset"
+        )
+
+
+def _validate_crypto_calendar_membership(
+    connection,
+    *,
+    calendar_revision_id: str,
+    observation_dates: tuple[str, ...],
+) -> None:
+    calendar = connection.execute(
+        "SELECT reference_market, timezone_name FROM market_session_calendars "
+        "WHERE calendar_revision_id = ?",
+        (calendar_revision_id,),
+    ).fetchone()
+    if (
+        calendar is None
+        or str(calendar[0]) != "CCC"
+        or not str(calendar[1]).strip()
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "crypto durable calendar contradicts consecutive-daily CCC semantics"
+        )
+    sessions = {
+        str(row[0]): str(row[1])
+        for row in connection.execute(
+            "SELECT session_date, session_status FROM market_sessions "
+            "WHERE calendar_revision_id = ?",
+            (calendar_revision_id,),
+        )
+    }
+    if any(sessions.get(session_date) != "open" for session_date in observation_dates):
+        raise CryptoSnapshotIdentityMismatch(
+            "crypto durable calendar does not cover exact daily membership"
+        )
 
 
 def _build_reconstructed_snapshot(
@@ -1023,12 +1107,15 @@ def reconstruct_snapshot(
     purpose: SnapshotPurpose,
     replay_as_of: datetime | None,
     pin: bool,
+    asset_configuration: RunAssetConfiguration | None = None,
+    crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None,
 ) -> ReconstructedMarketSnapshot:
     connection = store._connection
     bundle_record = connection.execute(
         "SELECT b.provider_dataset_id, d.provider_name, b.instrument_id, "
         "i.canonical_symbol, b.retrieval_cutoff, b.provenance_class, b.observed_at, "
-        "d.upstream_service_id, i.identity_revision, i.reference_market, "
+        "d.upstream_service_id, d.dataset_name, d.adjustment_methodology, "
+        "i.identity_revision, i.reference_market, "
         "i.instrument_kind, i.currency "
         "FROM history_bundle_revisions AS b "
         "JOIN provider_datasets AS d ON d.provider_dataset_id = b.provider_dataset_id "
@@ -1039,6 +1126,11 @@ def reconstruct_snapshot(
     if bundle_record is None:
         raise KeyError(f"unknown history bundle {bundle_revision_id}")
     bundle = _BundleRow(*(str(value) for value in bundle_record))
+    _validate_crypto_bundle_binding(
+        bundle,
+        asset_configuration=asset_configuration,
+        crypto_provider_dataset=crypto_provider_dataset,
+    )
     provenance = ProvenanceClass(bundle.provenance_class)
     if purpose is SnapshotPurpose.STRICT_REPLAY:
         if replay_as_of is None or replay_as_of.tzinfo is None:
@@ -1115,6 +1207,12 @@ def reconstruct_snapshot(
             "snapshot reconstruction requires an applicable Market Session Calendar"
         )
     calendar_revision_id = str(calendar[0])
+    if bundle.instrument_kind == "crypto":
+        _validate_crypto_calendar_membership(
+            connection,
+            calendar_revision_id=calendar_revision_id,
+            observation_dates=tuple(row.session_date for row in observation_rows),
+        )
     observation_inputs: list[_SnapshotObservationInput] = []
     for observation in observation_rows:
         status_row = statuses.get(observation.session_date)
@@ -1145,17 +1243,33 @@ def reconstruct_snapshot(
                 ),
             )
         )
-    materialization = _derive_qfq_materialization(
-        tuple(observation_inputs),
-        tuple(
-            _SnapshotFactorInput(
-                revision_id=item.revision_id,
-                effective_date=item.effective_date,
-                factor_value=Decimal(item.factor_value),
-            )
-            for item in factors
-        ),
-        error=StrictReplayUnavailable,
+    factor_inputs = tuple(
+        _SnapshotFactorInput(
+            revision_id=item.revision_id,
+            effective_date=item.effective_date,
+            factor_value=Decimal(item.factor_value),
+        )
+        for item in factors
+    )
+    is_crypto = bundle.instrument_kind == "crypto"
+    materialization = (
+        _derive_crypto_materialization(
+            tuple(observation_inputs),
+            factor_inputs,
+            error=CryptoSnapshotIdentityMismatch,
+        )
+        if is_crypto
+        else _derive_qfq_materialization(
+            tuple(observation_inputs),
+            factor_inputs,
+            error=StrictReplayUnavailable,
+        )
+    )
+    adjustment_basis = "auto_adjusted" if is_crypto else "qfq"
+    derivation_version = (
+        CRYPTO_SNAPSHOT_DERIVATION_VERSION
+        if is_crypto
+        else SNAPSHOT_DERIVATION_VERSION
     )
     identity = snapshot_v2_identity(
         instrument_id=bundle.instrument_id,
@@ -1169,10 +1283,10 @@ def reconstruct_snapshot(
         upstream_service_id=bundle.upstream_service_id,
         requested_date=requested_date.isoformat(),
         effective_trading_date=materialization.effective_trading_date,
-        adjustment_basis="qfq",
+        adjustment_basis=adjustment_basis,
         frame_digest=materialization.frame_digest,
         history_rows=len(materialization.frame),
-        derivation_version=SNAPSHOT_DERIVATION_VERSION,
+        derivation_version=derivation_version,
         normalization_version=SNAPSHOT_NORMALIZATION_VERSION,
         observation_membership=tuple(
             (
@@ -1189,6 +1303,8 @@ def reconstruct_snapshot(
         bundle_revision_id=bundle_revision_id,
         retrieval_cutoff=bundle.retrieval_cutoff,
         bundle_observed_at=bundle.observed_at,
+        asset_configuration=asset_configuration,
+        crypto_provider_dataset=crypto_provider_dataset,
     )
     result = _build_reconstructed_snapshot(
         bundle=bundle,
@@ -1201,6 +1317,7 @@ def reconstruct_snapshot(
         snapshot_id_version="v2",
         pin_membership_digest=identity.membership_digest,
         manifest_json=identity.manifest_json,
+        adjustment_basis=adjustment_basis,
     )
     if pin:
         _pin_snapshot(
@@ -1217,6 +1334,9 @@ def reconstruct_snapshot(
 def read_pinned_snapshot(
     store: MarketHistoryStore,
     snapshot_id: str,
+    *,
+    asset_configuration: RunAssetConfiguration | None = None,
+    crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None,
 ) -> ReconstructedMarketSnapshot:
     if (
         SNAPSHOT_V2_ID_PATTERN.fullmatch(snapshot_id) is None
@@ -1238,7 +1358,8 @@ def read_pinned_snapshot(
     bundle_record = connection.execute(
         "SELECT b.provider_dataset_id, d.provider_name, b.instrument_id, "
         "i.canonical_symbol, b.retrieval_cutoff, b.provenance_class, b.observed_at, "
-        "d.upstream_service_id, i.identity_revision, i.reference_market, "
+        "d.upstream_service_id, d.dataset_name, d.adjustment_methodology, "
+        "i.identity_revision, i.reference_market, "
         "i.instrument_kind, i.currency FROM history_bundle_revisions AS b "
         "JOIN provider_datasets AS d ON d.provider_dataset_id = b.provider_dataset_id "
         "JOIN instruments AS i ON i.instrument_id = b.instrument_id "
@@ -1248,6 +1369,11 @@ def read_pinned_snapshot(
     if bundle_record is None:
         raise SnapshotPinCorruptionError("pinned snapshot parent bundle is unavailable")
     bundle = _BundleRow(*(str(value) for value in bundle_record))
+    _validate_crypto_bundle_binding(
+        bundle,
+        asset_configuration=asset_configuration,
+        crypto_provider_dataset=crypto_provider_dataset,
+    )
     if (
         bundle.provider_dataset_id != parent.provider_dataset_id
         or bundle.instrument_id != parent.instrument_id
@@ -1529,10 +1655,19 @@ def read_pinned_snapshot(
         )
         for row in pinned_rows
     )
-    materialization = _derive_qfq_materialization(
-        observation_inputs,
-        factor_inputs,
-        error=SnapshotPinCorruptionError,
+    is_crypto = bundle.instrument_kind == "crypto"
+    materialization = (
+        _derive_crypto_materialization(
+            observation_inputs,
+            factor_inputs,
+            error=CryptoSnapshotIdentityMismatch,
+        )
+        if is_crypto
+        else _derive_qfq_materialization(
+            observation_inputs,
+            factor_inputs,
+            error=SnapshotPinCorruptionError,
+        )
     )
     if frozenset(materialization.factor_revision_ids) != frozenset(
         row.revision_id for row in factor_inputs
@@ -1558,15 +1693,30 @@ def read_pinned_snapshot(
     pin_membership_digest: str | None = None
     manifest_json: str | None = None
     if is_v2:
+        expected_derivation_version = (
+            CRYPTO_SNAPSHOT_DERIVATION_VERSION
+            if is_crypto
+            else SNAPSHOT_DERIVATION_VERSION
+        )
         if (
             parent.identity_version != "v2"
-            or parent.derivation_version != SNAPSHOT_DERIVATION_VERSION
+            or parent.derivation_version != expected_derivation_version
             or parent.normalization_version != SNAPSHOT_NORMALIZATION_VERSION
         ):
             raise SnapshotPinCorruptionError(
                 "pinned snapshot v2 version metadata is unsupported or incomplete"
             )
-        identity = snapshot_v2_identity(
+        historical_crypto_material = (
+            bundle.instrument_kind != "crypto"
+            and '"crypto_identity_binding_version":'
+            not in str(parent.manifest_json)
+        )
+        identity_builder = (
+            _historical_snapshot_v2_identity
+            if historical_crypto_material
+            else snapshot_v2_identity
+        )
+        identity = identity_builder(
             instrument_id=parent.instrument_id,
             canonical_symbol=bundle.canonical_symbol,
             identity_revision=bundle.identity_revision,
@@ -1598,6 +1748,8 @@ def read_pinned_snapshot(
             bundle_revision_id=parent.bundle_revision_id,
             retrieval_cutoff=parent.retrieval_cutoff,
             bundle_observed_at=bundle.observed_at,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_dataset,
         )
         if (
             identity.snapshot_id != snapshot_id
@@ -1882,7 +2034,11 @@ def _pin_snapshot(
         snapshot.requested_date,
         retrieval_cutoff,
         snapshot.adjustment_basis,
-        SNAPSHOT_DERIVATION_VERSION,
+        (
+            CRYPTO_SNAPSHOT_DERIVATION_VERSION
+            if snapshot.adjustment_basis == "auto_adjusted"
+            else SNAPSHOT_DERIVATION_VERSION
+        ),
         snapshot.frame_sha256,
         snapshot.provenance_class.value,
         0,

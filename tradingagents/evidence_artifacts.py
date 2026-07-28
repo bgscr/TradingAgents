@@ -102,6 +102,7 @@ class AuditMarketSnapshot(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    snapshot_manifest_json: str | None = None
     current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
     current_status_provenance: AuditTradingStatusProvenance | None = None
     latest_traded_close: Decimal | None = None
@@ -450,6 +451,7 @@ def project_evidence_for_audit(
             snapshot_id=snapshot.snapshot_id,
             snapshot_id_version=snapshot.snapshot_id_version,
             pin_membership_digest=snapshot.pin_membership_digest,
+            snapshot_manifest_json=snapshot.snapshot_manifest_json,
             current_tradeability=snapshot.current_tradeability,
             current_status_provenance=(
                 AuditTradingStatusProvenance.model_validate(

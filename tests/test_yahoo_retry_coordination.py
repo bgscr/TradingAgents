@@ -168,7 +168,7 @@ def test_yahoo_budget_exhausts_before_sequential_fallback_starts(
     )
 
     snapshot = market_snapshot.get_authoritative_market_snapshot(
-        "BTC-USD",
+        "AAPL",
         "2026-07-01",
         "2026-07-24",
     )
@@ -266,7 +266,7 @@ def test_one_yahoo_coordinator_permit_cannot_trigger_a_hidden_adapter_retry(
     )
 
     snapshot = market_snapshot.get_authoritative_market_snapshot(
-        "BTC-USD",
+        "AAPL",
         "2026-07-01",
         "2026-07-24",
     )

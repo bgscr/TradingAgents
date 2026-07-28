@@ -851,7 +851,7 @@ class TradingAgentsGraph:
                 str(trade_date),
                 effective_asset_type,
             ) as checkpoint_session,
-            authoritative_snapshot_run(),
+            authoritative_snapshot_run(asset_configuration=asset_configuration),
         ):
             return self._run_graph(
                 company_name,

@@ -1790,7 +1790,13 @@ def run_analysis(checkpoint: bool | None = None):
     spinner_text = f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
     snapshot_scope = ExitStack()
     try:
-        snapshot_run = snapshot_scope.enter_context(authoritative_snapshot_run())
+        run_asset = getattr(graph, "asset_configuration", None)
+        snapshot_context = (
+            authoritative_snapshot_run()
+            if run_asset is None
+            else authoritative_snapshot_run(asset_configuration=run_asset)
+        )
+        snapshot_run = snapshot_scope.enter_context(snapshot_context)
         artifacts["run_telemetry_ledger"] = snapshot_run.telemetry_ledger
         stats_handler.set_telemetry_recorder(snapshot_run.telemetry_ledger)
         checkpoint_scope_factory = getattr(graph, "checkpoint_scope", None)

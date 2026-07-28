@@ -464,6 +464,7 @@ def build_analyst_update(
                     snapshot_id=active_snapshot.snapshot_id,
                     snapshot_id_version=active_snapshot.snapshot_id_version,
                     pin_membership_digest=active_snapshot.pin_membership_digest,
+                    snapshot_manifest_json=active_snapshot.snapshot_manifest_json,
                     current_tradeability=active_snapshot.current_tradeability,
                     current_status_provenance=(
                         {

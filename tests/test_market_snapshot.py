@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -89,6 +90,21 @@ def test_live_status_and_explicit_unknown_have_distinct_snapshot_v2_identities()
     assert unknown.snapshot_id != traded.snapshot_id
     assert unknown.snapshot_id_version == traded.snapshot_id_version == "v2"
     assert unknown.pin_membership_digest != traded.pin_membership_digest
+    unknown_manifest = json.loads(unknown.snapshot_manifest_json)
+    assert unknown_manifest["adjustment_basis"] == "qfq"
+    assert unknown_manifest["instrument"] == {
+        "canonical_symbol": "600519.SS",
+        "currency": "CNY",
+        "identity_revision": "mainland-routing-v1",
+        "instrument_id": unknown_manifest["instrument"]["instrument_id"],
+        "instrument_kind": "equity",
+        "reference_market": "shanghai",
+    }
+    assert "asset_configuration" not in unknown_manifest
+    assert unknown_manifest["provider"]["provider_dataset_id"].startswith(
+        "provider-dataset=sha256:"
+    )
+    assert "dataset" not in unknown_manifest["provider"]
 
 
 @pytest.mark.unit

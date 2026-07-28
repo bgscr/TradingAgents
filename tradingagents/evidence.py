@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
@@ -496,6 +497,7 @@ class MarketSnapshotEvidence(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    snapshot_manifest_json: str | None = None
     current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
     current_status_provenance: TradingStatusProvenanceEvidence | None = None
     latest_traded_close: Decimal | None = None
@@ -560,6 +562,34 @@ class MarketSnapshotEvidence(BaseModel):
             self.physical_attempt_events,
             self.physical_attempt_count,
         )
+        return self
+
+    @model_validator(mode="after")
+    def validate_snapshot_manifest_binding(self) -> MarketSnapshotEvidence:
+        manifest_json = self.snapshot_manifest_json
+        if manifest_json is None:
+            return self
+        if self.snapshot_id_version != "v2":
+            raise ValueError("only snapshot v2 may carry a canonical manifest")
+        try:
+            manifest = json.loads(manifest_json)
+            canonical = json.dumps(
+                manifest,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("snapshot manifest is not canonical JSON") from exc
+        if canonical != manifest_json:
+            raise ValueError("snapshot manifest JSON is not canonical")
+        digest = sha256(manifest_json.encode("utf-8")).hexdigest()
+        if (
+            self.snapshot_id != f"snapshot:v2:{digest}"
+            or self.pin_membership_digest != digest
+        ):
+            raise ValueError("snapshot manifest contradicts its v2 identity")
         return self
 
 
@@ -2498,6 +2528,11 @@ def build_evidence_state(
                 "pin_membership_digest",
                 None,
             ),
+            snapshot_manifest_json=getattr(
+                snapshot,
+                "snapshot_manifest_json",
+                None,
+            ),
             current_tradeability=getattr(snapshot, "current_tradeability", "unknown"),
             current_status_provenance=canonical_status_provenance,
             latest_traded_close=getattr(snapshot, "latest_traded_close", None),
@@ -2562,6 +2597,25 @@ def acquire_run_evidence(
     asset_configuration: RunAssetConfiguration | None = None,
 ) -> EvidenceState:
     """Acquire run identity and the validated five-year market snapshot."""
+    if asset_configuration is None:
+        from tradingagents.dataflows.crypto_universe import is_crypto_pair_syntax
+
+        if is_crypto_pair_syntax(symbol):
+            from tradingagents.asset_configuration import (
+                RunAssetConfigurationError,
+                resolve_run_asset_configuration,
+            )
+            from tradingagents.dataflows.config import get_config
+
+            try:
+                asset_configuration = resolve_run_asset_configuration(
+                    symbol,
+                    config=get_config(),
+                )
+            except RunAssetConfigurationError:
+                # Preserve the existing typed registry-unavailable EvidenceState
+                # projection below for unsupported or invalid registry inputs.
+                asset_configuration = None
     from tradingagents.dataflows.errors import NoMarketDataError
     from tradingagents.dataflows.instrument_identity import (
         IdentityRegistryAvailable,
@@ -2668,6 +2722,7 @@ def acquire_run_evidence(
                 canonical_symbol,
                 start_date,
                 requested_date,
+                asset_configuration=asset_configuration,
                 **history_requirement,
             )
         except NoMarketDataError:

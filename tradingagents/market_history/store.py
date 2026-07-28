@@ -14,6 +14,7 @@ from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from types import TracebackType
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pandas as pd
@@ -53,6 +54,12 @@ from tradingagents.market_history.schema import (
     MIGRATION_V7,
     SCHEMA_VERSION,
 )
+
+if TYPE_CHECKING:
+    from tradingagents.asset_configuration import RunAssetConfiguration
+    from tradingagents.market_history.snapshot_identity import (
+        CryptoProviderDatasetDescriptor,
+    )
 
 _PAYLOAD_ROOT_OWNER_FILENAME = ".market-history-database-owner"
 _PAYLOAD_MUTATION_TIMEOUT_SECONDS = 30.0
@@ -1266,6 +1273,8 @@ class MarketHistoryStore:
         requested_date,
         purpose: SnapshotPurpose,
         replay_as_of: datetime | None = None,
+        asset_configuration: RunAssetConfiguration | None = None,
+        crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None,
     ) -> ReconstructedMarketSnapshot:
         self._require_open()
         from tradingagents.market_history.bundle import (
@@ -1281,19 +1290,37 @@ class MarketHistoryStore:
                 purpose=purpose,
                 replay_as_of=replay_as_of,
                 pin=True,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=crypto_provider_dataset,
             )
             self._phase_hook(
                 "publisher_references_committed",
                 bundle_revision_id,
             )
-            read_pinned_snapshot(self, reconstructed.snapshot_id)
+            read_pinned_snapshot(
+                self,
+                reconstructed.snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=crypto_provider_dataset,
+            )
             return reconstructed
 
-    def read_pinned_snapshot(self, snapshot_id: str) -> ReconstructedMarketSnapshot:
+    def read_pinned_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        asset_configuration: RunAssetConfiguration | None = None,
+        crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None,
+    ) -> ReconstructedMarketSnapshot:
         self._require_open()
         from tradingagents.market_history.bundle import read_pinned_snapshot
 
-        return read_pinned_snapshot(self, snapshot_id)
+        return read_pinned_snapshot(
+            self,
+            snapshot_id,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_dataset,
+        )
 
     @classmethod
     def restore_backup(cls, backup_path: Path, config: MarketHistoryConfig) -> None:

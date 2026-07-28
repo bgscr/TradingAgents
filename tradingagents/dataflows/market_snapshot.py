@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import numpy as np
@@ -33,7 +34,13 @@ from tradingagents.market_history.models import TradingStatus, TradingStatusProv
 from tradingagents.market_history.snapshot_identity import (
     LEGACY_SNAPSHOT_ID_PATTERN,
     SNAPSHOT_V2_ID_PATTERN,
+    CryptoProviderDatasetDescriptor,
+    CryptoSnapshotIdentityMismatch,
+    build_crypto_provider_dataset_descriptor,
+    crypto_snapshot_identity_revision,
+    crypto_snapshot_instrument_id,
     live_snapshot_v2_identity,
+    validate_crypto_provider_dataset_descriptor,
 )
 from tradingagents.run_telemetry import RunTelemetryLedger
 
@@ -42,6 +49,9 @@ from .config import get_config
 from .errors import NoMarketDataError, VendorRateLimitError
 from .stockstats_utils import MAX_OHLCV_STALE_DAYS
 from .symbol_utils import resolve_china_a_symbol
+
+if TYPE_CHECKING:
+    from tradingagents.asset_configuration import RunAssetConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,7 @@ class SnapshotProvider:
     adjustment_basis: str
     history_load: Callable[..., object] | None = None
     reports_physical_requests: bool = False
+    crypto_dataset: CryptoProviderDatasetDescriptor | None = None
 
 
 @dataclass(frozen=True)
@@ -97,9 +108,28 @@ class AuthoritativeMarketSnapshot:
     carried_suspension_close: Decimal | None = None
     history_gap_dates: tuple[str, ...] = ()
     physical_attempt_events: tuple[ProviderPhysicalAttemptEvent, ...] = ()
+    asset_configuration: RunAssetConfiguration | None = None
+    crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None
 
     def __post_init__(self) -> None:
-        frame_digest = self.frame_sha256 or _frame_sha256(self.frame)
+        configured_crypto = (
+            self.asset_configuration is not None
+            and self.asset_configuration.instrument_kind.value == "crypto"
+        )
+        computed_frame_digest = (
+            _frame_sha256(self.frame)
+            if configured_crypto or not self.frame_sha256
+            else self.frame_sha256
+        )
+        if (
+            configured_crypto
+            and bool(self.frame_sha256)
+            and self.frame_sha256 != computed_frame_digest
+        ):
+            raise CryptoSnapshotIdentityMismatch(
+                "crypto snapshot frame digest contradicts the selected frame"
+            )
+        frame_digest = self.frame_sha256 or computed_frame_digest
         identity = self.snapshot_id
         identity_version = self.snapshot_id_version
         membership_digest = self.pin_membership_digest
@@ -241,41 +271,90 @@ def _live_snapshot_identity(
         upstream_service_identity_for_provider,
     )
 
-    instrument = resolve_china_a_symbol(snapshot.symbol)
-    if instrument is None:
+    asset_configuration = snapshot.asset_configuration
+    configured_crypto = (
+        asset_configuration is not None
+        and asset_configuration.instrument_kind.value == "crypto"
+    )
+    if configured_crypto:
+        if not asset_configuration.matches_symbol(snapshot.symbol):
+            raise CryptoSnapshotIdentityMismatch(
+                "crypto snapshot symbol contradicts the run asset"
+            )
+        identity = asset_configuration.instrument_identity
+        canonical_symbol = identity.symbol
+        reference_market = identity.venue
+        instrument_kind = identity.instrument_kind.value
+        currency = identity.currency
+        identity_revision = crypto_snapshot_identity_revision(asset_configuration)
+        instrument_id = crypto_snapshot_instrument_id(asset_configuration)
+    else:
+        instrument = resolve_china_a_symbol(snapshot.symbol)
+    if not configured_crypto and instrument is None:
+        from tradingagents.dataflows.crypto_universe import is_crypto_pair_syntax
+
+        if is_crypto_pair_syntax(snapshot.symbol):
+            raise CryptoSnapshotIdentityMismatch(
+                "authoritative RunAssetConfiguration is required"
+            )
         canonical_symbol = snapshot.symbol.strip().upper()
         reference_market = "unresolved"
         instrument_kind = "unknown"
         currency = "unknown"
         identity_revision = "current-live-symbol-v1"
-    else:
+        instrument_id = _stable_live_identity(
+            "instrument",
+            canonical_symbol,
+            reference_market,
+            instrument_kind,
+            currency,
+        )
+    elif not configured_crypto:
         canonical_symbol = instrument.yahoo_symbol
         reference_market = instrument.exchange
         instrument_kind = getattr(instrument, "instrument_kind", "equity")
         currency = "CNY"
         identity_revision = "mainland-routing-v1"
-    instrument_id = _stable_live_identity(
-        "instrument",
-        canonical_symbol,
-        reference_market,
-        instrument_kind,
-        currency,
-    )
+        instrument_id = _stable_live_identity(
+            "instrument",
+            canonical_symbol,
+            reference_market,
+            instrument_kind,
+            currency,
+        )
     upstream_service_id, _ = upstream_service_identity_for_provider(snapshot.provider)
     provenance = snapshot.current_status_provenance
-    provider_dataset_id = (
-        provenance.provider_dataset_id
-        if provenance is not None
-        else _stable_live_identity(
-            "provider-dataset",
-            snapshot.provider,
-            upstream_service_id,
-            "mainland-current-adjusted-v1",
+    if configured_crypto:
+        crypto_dataset = validate_crypto_provider_dataset_descriptor(
+            snapshot.crypto_provider_dataset,
+            provider_name=snapshot.provider,
+            upstream_service_id=upstream_service_id,
         )
-    )
+        provider_dataset_id = crypto_dataset.provider_dataset_id
+    else:
+        crypto_dataset = None
+        provider_dataset_id = (
+            provenance.provider_dataset_id
+            if provenance is not None
+            else _stable_live_identity(
+                "provider-dataset",
+                snapshot.provider,
+                upstream_service_id,
+                "mainland-current-adjusted-v1",
+            )
+        )
     if provenance is None:
-        status_identity = "unknown"
-        status_value = "unknown"
+        if configured_crypto:
+            status_identity = _stable_live_identity(
+                "crypto-continuous-market-status",
+                provider_dataset_id,
+                snapshot.effective_trading_date,
+                frame_digest,
+            )
+            status_value = "not_applicable"
+        else:
+            status_identity = "unknown"
+            status_value = "unknown"
     else:
         status_value = provenance.status.value
         status_identity = provenance.revision_id or _stable_live_identity(
@@ -312,6 +391,8 @@ def _live_snapshot_identity(
         authoritative_status_identity=status_identity,
         authoritative_status_value=status_value,
         provenance_class=snapshot.history_store_status,
+        asset_configuration=asset_configuration,
+        crypto_provider_dataset=crypto_dataset,
     )
 
 
@@ -326,6 +407,7 @@ def _stable_live_identity(namespace: str, *components: object) -> str:
 
 @dataclass
 class _AuthoritativeSnapshotRun:
+    asset_configuration: RunAssetConfiguration | None = None
     snapshots: dict[tuple[str, str, str], AuthoritativeMarketSnapshot] = field(
         default_factory=dict
     )
@@ -359,14 +441,27 @@ _ACTIVE_SNAPSHOT_RUN: ContextVar[_AuthoritativeSnapshotRun | None] = ContextVar(
 
 
 @contextmanager
-def authoritative_snapshot_run():
+def authoritative_snapshot_run(
+    *,
+    asset_configuration: RunAssetConfiguration | None = None,
+):
     """Reuse accepted market frames for the duration of one analysis run."""
     active = _ACTIVE_SNAPSHOT_RUN.get()
     if active is not None:
+        if asset_configuration is not None:
+            if active.asset_configuration is None:
+                active.asset_configuration = asset_configuration
+            elif (
+                asset_configuration.asset_configuration_signature
+                != active.asset_configuration.asset_configuration_signature
+            ):
+                raise CryptoSnapshotIdentityMismatch(
+                    "nested snapshot run contradicts the authoritative run asset"
+                )
         yield active
         return
 
-    run = _AuthoritativeSnapshotRun()
+    run = _AuthoritativeSnapshotRun(asset_configuration=asset_configuration)
     token = _ACTIVE_SNAPSHOT_RUN.set(run)
     try:
         yield run
@@ -512,6 +607,31 @@ SNAPSHOT_PROVIDERS: dict[str, SnapshotProvider] = {
     ),
     "yfinance": SnapshotProvider(_load_yfinance, "auto_adjusted"),
 }
+
+
+def _crypto_dataset_for_provider(
+    provider_name: str,
+    provider: SnapshotProvider,
+) -> CryptoProviderDatasetDescriptor | None:
+    if provider.crypto_dataset is not None:
+        return provider.crypto_dataset
+    if provider_name != "yfinance":
+        return None
+    from tradingagents.market_history.coordinator import (
+        upstream_service_identity_for_provider,
+    )
+
+    upstream_service_id, _ = upstream_service_identity_for_provider(provider_name)
+    return build_crypto_provider_dataset_descriptor(
+        provider_name=provider_name,
+        upstream_service_id=upstream_service_id,
+        dataset_family="crypto",
+        dataset_name="yahoo-ccc-daily-ohlcv",
+        dataset_version="1.0",
+        dataset_revision="yfinance-download-auto-adjusted-v1",
+        reference_market="CCC",
+        tags=("crypto", "ccc", "ohlcv", "daily"),
+    )
 
 
 def _coordinator_now() -> datetime:
@@ -1179,16 +1299,88 @@ def _validated_candidate_status(
     )
 
 
+def _resolve_snapshot_asset_configuration(
+    symbol: str,
+    *,
+    explicit: RunAssetConfiguration | None,
+    active: RunAssetConfiguration | None,
+) -> RunAssetConfiguration | None:
+    from tradingagents.dataflows.crypto_universe import is_crypto_pair_syntax
+
+    if (
+        explicit is not None
+        and active is not None
+        and explicit.asset_configuration_signature
+        != active.asset_configuration_signature
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "snapshot publication received contradictory run assets"
+        )
+    configuration = explicit or active
+    if not is_crypto_pair_syntax(symbol) and (
+        configuration is None
+        or configuration.instrument_kind.value != "crypto"
+    ):
+        return configuration
+    if configuration is None:
+        from tradingagents.asset_configuration import (
+            RunAssetConfigurationError,
+            resolve_run_asset_configuration,
+        )
+        from tradingagents.dataflows.config import get_config
+
+        try:
+            configuration = resolve_run_asset_configuration(
+                symbol,
+                config=get_config(),
+            )
+        except RunAssetConfigurationError as exc:
+            raise CryptoSnapshotIdentityMismatch(
+                "authoritative RunAssetConfiguration is required"
+            ) from exc
+    identity = configuration.instrument_identity
+    provenance = identity.provenance
+    if (
+        configuration.asset_configuration_version != "1.0"
+        or configuration.instrument_kind.value != "crypto"
+        or not configuration.matches_symbol(symbol)
+        or not identity.is_authoritative
+        or provenance is None
+        or provenance.artifact_sha256 != configuration.registry_digest
+        or not configuration.registry_id.strip()
+        or re.fullmatch(r"[0-9a-f]{64}", configuration.registry_digest) is None
+        or identity.venue != "CCC"
+        or identity.instrument_kind.value != "crypto"
+        or identity.currency != "USD"
+        or configuration.reference_market != "CCC"
+        or configuration.capability_profile.profile_id != "crypto.v1"
+        or configuration.capability_profile.contract_version != "1.0"
+        or configuration.capability_profile.instrument_kind.value != "crypto"
+        or configuration.observation_calendar_kind.value != "consecutive_daily"
+        or configuration.adjustment_basis != "auto_adjusted"
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "crypto snapshot RunAssetConfiguration is contradictory"
+        )
+    return configuration
+
+
 def _acquire_authoritative_market_snapshot(
     symbol: str,
     start_date: str,
     end_date: str,
     *,
     minimum_history_rows: int = 1,
+    asset_configuration: RunAssetConfiguration | None = None,
 ) -> AuthoritativeMarketSnapshot:
     if minimum_history_rows < 1:
         raise ValueError("minimum_history_rows must be positive")
     active = _ACTIVE_SNAPSHOT_RUN.get()
+    asset_configuration = _resolve_snapshot_asset_configuration(
+        symbol,
+        explicit=asset_configuration,
+        active=(active.asset_configuration if active is not None else None),
+    )
     from tradingagents.market_history.current import (
         try_read_authoritative_mainland_frame,
     )
@@ -1247,6 +1439,7 @@ def _acquire_authoritative_market_snapshot(
             latest_traded_close=stored.latest_traded_close,
             latest_traded_close_diagnostic=stored.latest_traded_close_diagnostic,
             carried_suspension_close=stored.carried_suspension_close,
+            asset_configuration=asset_configuration,
         )
         if active is not None:
             record = MarketSnapshotAcquisitionRecord(
@@ -1269,6 +1462,7 @@ def _acquire_authoritative_market_snapshot(
     validation_quarantine: dict[str, QuarantinedSnapshot] = {}
     validated_frames: dict[str, pd.DataFrame] = {}
     history_candidates: dict[str, object] = {}
+    crypto_provider_datasets: dict[str, CryptoProviderDatasetDescriptor] = {}
     physical_attempt_events: list[ProviderPhysicalAttemptEvent] = []
 
     def observe_physical_attempts(
@@ -1354,6 +1548,28 @@ def _acquire_authoritative_market_snapshot(
 
             provider_callables.append((provider_name, not_configured))
         else:
+            if (
+                asset_configuration is not None
+                and asset_configuration.instrument_kind.value == "crypto"
+            ):
+                if provider.adjustment_basis != asset_configuration.adjustment_basis:
+                    raise CryptoSnapshotIdentityMismatch(
+                        "crypto provider Adjustment Basis contradicts the run asset"
+                    )
+                from tradingagents.market_history.coordinator import (
+                    upstream_service_identity_for_provider,
+                )
+
+                upstream_service_id, _ = upstream_service_identity_for_provider(
+                    provider_name
+                )
+                crypto_provider_datasets[provider_name] = (
+                    validate_crypto_provider_dataset_descriptor(
+                        _crypto_dataset_for_provider(provider_name, provider),
+                        provider_name=provider_name,
+                        upstream_service_id=upstream_service_id,
+                    )
+                )
             provider_callables.append(
                 (
                     provider_name,
@@ -1441,6 +1657,8 @@ def _acquire_authoritative_market_snapshot(
             latest_traded_close_diagnostic=status_values[3],
             carried_suspension_close=status_values[4],
             history_gap_dates=(),
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_datasets.get(provider_name),
         )
         from tradingagents.market_history.shadow import (
             persist_mainland_history_candidate,
@@ -1540,6 +1758,8 @@ def _acquire_authoritative_market_snapshot(
             quarantined=tuple(
                 item for item in quarantined if item is not selected_rejection
             ),
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_datasets.get(provider_name),
         )
     detail = "; ".join(f"{item.provider}: {item.reason}" for item in quarantined)
     raise NoMarketDataError(symbol, symbol, detail or "no configured snapshot provider")
@@ -1551,25 +1771,59 @@ def get_authoritative_market_snapshot(
     end_date: str,
     *,
     minimum_history_rows: int = 1,
+    asset_configuration: RunAssetConfiguration | None = None,
 ) -> AuthoritativeMarketSnapshot:
     active = _ACTIVE_SNAPSHOT_RUN.get()
+    asset_configuration = _resolve_snapshot_asset_configuration(
+        symbol,
+        explicit=asset_configuration,
+        active=(active.asset_configuration if active is not None else None),
+    )
     if active is None:
         return _acquire_authoritative_market_snapshot(
             symbol,
             start_date,
             end_date,
             minimum_history_rows=minimum_history_rows,
+            asset_configuration=asset_configuration,
         )
 
     key = (symbol, start_date, end_date)
     with active.lock:
+        if (
+            asset_configuration is not None
+            and asset_configuration.instrument_kind.value == "crypto"
+        ):
+            if active.asset_configuration is None:
+                active.asset_configuration = asset_configuration
+            elif (
+                active.asset_configuration.asset_configuration_signature
+                != asset_configuration.asset_configuration_signature
+            ):
+                raise CryptoSnapshotIdentityMismatch(
+                    "snapshot run contradicts the authoritative crypto asset"
+                )
         snapshot = active.snapshots.get(key)
+        if (
+            snapshot is not None
+            and asset_configuration is not None
+            and asset_configuration.instrument_kind.value == "crypto"
+            and (
+                snapshot.asset_configuration is None
+                or snapshot.asset_configuration.asset_configuration_signature
+                != asset_configuration.asset_configuration_signature
+            )
+        ):
+            raise CryptoSnapshotIdentityMismatch(
+                "cached crypto snapshot contradicts the authoritative run asset"
+            )
         if snapshot is None or len(snapshot.frame) < minimum_history_rows:
             snapshot = _acquire_authoritative_market_snapshot(
                 symbol,
                 start_date,
                 end_date,
                 minimum_history_rows=minimum_history_rows,
+                asset_configuration=asset_configuration,
             )
             active.snapshots[key] = snapshot
         latest_key = (symbol.strip().upper(), str(end_date))

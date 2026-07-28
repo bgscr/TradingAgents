@@ -211,6 +211,35 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
     return lines
 
 
+def _render_market_snapshot_binding(evidence: EvidenceState) -> list[str]:
+    snapshot = evidence.market_snapshot
+    if snapshot is None:
+        return []
+    lines = [
+        "## Authoritative Market Snapshot",
+        "",
+        f"- **Snapshot ID:** `{snapshot.snapshot_id}`",
+        f"- **Snapshot identity version:** {snapshot.snapshot_id_version}",
+    ]
+    if snapshot.pin_membership_digest is not None:
+        lines.append(
+            "- **Canonical manifest digest:** "
+            f"`{snapshot.pin_membership_digest}`"
+        )
+    if snapshot.snapshot_manifest_json is not None:
+        lines.extend(
+            [
+                "- **Canonical manifest:**",
+                "",
+                "```json",
+                snapshot.snapshot_manifest_json,
+                "```",
+            ]
+        )
+    lines.append("")
+    return lines
+
+
 def render_decision_report(
     decision: TradingDecisionContract,
     terminal: TerminalContract,
@@ -248,6 +277,7 @@ def render_decision_report(
         "",
     ]
     if evidence is not None:
+        lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend(["## Canonical Source Facts", ""])
     for index, fact in enumerate(sorted(decision.facts, key=lambda item: item.fact_id), 1):
@@ -291,6 +321,7 @@ def render_analysis_outcome_report(
         "",
     ]
     if evidence is not None:
+        lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend([render_analysis_outcome(outcome), ""])
     return "\n".join(lines)
