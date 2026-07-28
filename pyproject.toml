@@ -65,6 +65,10 @@ include = ["tradingagents*", "cli*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
+tradingagents = [
+    "config/crypto_identity_registry.json",
+    "config/crypto_identity_registry.sha256",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

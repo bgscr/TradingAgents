@@ -4,6 +4,8 @@ import tradingagents.default_config as default_config
 
 # Use default config but allow it to be overridden
 _config: dict | None = None
+_CRYPTO_REGISTRY_PATH_KEY = "crypto_identity_registry_path"
+_CRYPTO_REGISTRY_DIGEST_KEY = "crypto_identity_registry_sha256"
 
 
 def initialize_config():
@@ -23,6 +25,15 @@ def set_config(config: dict):
     global _config
     initialize_config()
     incoming = deepcopy(config)
+    path_overridden = _CRYPTO_REGISTRY_PATH_KEY in incoming
+    digest_overridden = _CRYPTO_REGISTRY_DIGEST_KEY in incoming
+    if path_overridden != digest_overridden:
+        missing_key = (
+            _CRYPTO_REGISTRY_DIGEST_KEY
+            if path_overridden
+            else _CRYPTO_REGISTRY_PATH_KEY
+        )
+        incoming[missing_key] = None
     for key, value in incoming.items():
         if isinstance(value, dict) and isinstance(_config.get(key), dict):
             _config[key].update(value)

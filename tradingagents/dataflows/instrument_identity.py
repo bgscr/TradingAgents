@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -17,6 +18,14 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from tradingagents.dataflows.crypto_universe import (
+    CRYPTO_REGISTRY_ID,
+    CryptoUniversePolicyError,
+    canonical_supported_crypto_symbol,
+    is_crypto_pair_syntax,
+    validate_crypto_registry_rows,
+)
 
 _CLOSED = ConfigDict(frozen=True, extra="forbid")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -101,6 +110,12 @@ class _RegistryArtifact(BaseModel):
 
 
 @dataclass(frozen=True)
+class _RegistryArtifactValidationFailure:
+    reason: RegistryFailureReason
+    diagnostic_code: str
+
+
+@dataclass(frozen=True)
 class AuthoritativeInstrumentIdentity:
     canonical_symbol: str
     venue: str
@@ -136,6 +151,7 @@ class IdentityRegistryAvailable:
     registry_sha256: str
     registry_source_ref: str
     raw_artifact: str
+    registry_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,8 +204,19 @@ def resolve_authoritative_instrument_identity(
     *,
     registry_path: str | Path | None = None,
     expected_sha256: str | None = None,
+    _artifact_validator: Callable[
+        [_RegistryArtifact], _RegistryArtifactValidationFailure | None
+    ]
+    | None = None,
 ) -> IdentityRegistryResult:
     """Resolve ``symbol`` only from a configured, digest-pinned JSON artifact."""
+    if _artifact_validator is None and is_crypto_pair_syntax(symbol):
+        return resolve_authoritative_crypto_identity(
+            symbol,
+            registry_path=registry_path,
+            expected_sha256=expected_sha256,
+        )
+
     if registry_path is None or expected_sha256 is None:
         from tradingagents.dataflows.config import get_config
 
@@ -242,6 +269,14 @@ def resolve_authoritative_instrument_identity(
             source_ref,
             "registry_schema_invalid",
         )
+    if _artifact_validator is not None:
+        validation_failure = _artifact_validator(artifact)
+        if validation_failure is not None:
+            return _unavailable(
+                validation_failure.reason,
+                source_ref,
+                validation_failure.diagnostic_code,
+            )
 
     requested_keys = _routing_lookup_keys(symbol)
     matches: list[_RegistryRow] = []
@@ -281,4 +316,95 @@ def resolve_authoritative_instrument_identity(
         registry_sha256=actual_digest,
         registry_source_ref=source_ref,
         raw_artifact=raw_artifact,
+        registry_id=artifact.registry_id,
     )
+
+
+def resolve_authoritative_crypto_identity(
+    symbol: str,
+    *,
+    registry_path: str | Path | None = None,
+    expected_sha256: str | None = None,
+    expected_registry_id: str | None = None,
+) -> IdentityRegistryResult:
+    """Resolve a crypto symbol only from the separately pinned CCC registry."""
+    if canonical_supported_crypto_symbol(symbol) is None:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            "crypto-identity-registry:unconfigured",
+            "crypto_symbol_not_supported",
+        )
+    path_was_supplied = registry_path is not None
+    digest_was_supplied = expected_sha256 is not None
+    if path_was_supplied != digest_was_supplied:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            str(registry_path or "crypto-identity-registry:unconfigured"),
+            "crypto_registry_pin_partial_override",
+        )
+
+    if not path_was_supplied:
+        from tradingagents.dataflows.config import get_config
+
+        config = get_config()
+        registry_path = config.get("crypto_identity_registry_path")
+        expected_sha256 = config.get("crypto_identity_registry_sha256")
+        expected_registry_id = config.get("crypto_identity_registry_id")
+    elif expected_registry_id is None:
+        expected_registry_id = CRYPTO_REGISTRY_ID
+
+    if not registry_path and not expected_sha256:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            "crypto-identity-registry:unconfigured",
+            "registry_path_or_digest_missing",
+        )
+    if not registry_path:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            "crypto-identity-registry:unconfigured",
+            "crypto_registry_path_missing",
+        )
+    if not expected_sha256:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            str(registry_path),
+            "crypto_registry_expected_digest_missing",
+        )
+    if not expected_registry_id:
+        return _unavailable(
+            RegistryFailureReason.NOT_CONFIGURED,
+            str(registry_path),
+            "crypto_registry_expected_id_missing",
+        )
+
+    result = resolve_authoritative_instrument_identity(
+        symbol,
+        registry_path=registry_path,
+        expected_sha256=expected_sha256,
+        _artifact_validator=lambda artifact: _crypto_registry_diagnostic(
+            artifact,
+            expected_registry_id=expected_registry_id,
+        ),
+    )
+    return result
+
+
+def _crypto_registry_diagnostic(
+    artifact: _RegistryArtifact,
+    *,
+    expected_registry_id: str = CRYPTO_REGISTRY_ID,
+) -> _RegistryArtifactValidationFailure | None:
+    if artifact.registry_id != expected_registry_id:
+        return _RegistryArtifactValidationFailure(
+            reason=RegistryFailureReason.INTEGRITY_FAILURE,
+            diagnostic_code="crypto_registry_id_mismatch",
+        )
+    try:
+        validate_crypto_registry_rows(artifact.rows)
+    except CryptoUniversePolicyError as exc:
+        return _RegistryArtifactValidationFailure(
+            reason=RegistryFailureReason.MALFORMED,
+            diagnostic_code=f"crypto_registry_{exc.diagnostic_code}",
+        )
+    return None

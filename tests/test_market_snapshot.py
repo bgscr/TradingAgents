@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from hashlib import sha256
 
 import pandas as pd
 import pytest
@@ -28,8 +31,9 @@ from tradingagents.dataflows.market_snapshot import (
     build_authoritative_indicator_window,
     get_authoritative_market_snapshot,
 )
-from tradingagents.evidence import AcquisitionUnavailableReason
+from tradingagents.evidence import AcquisitionUnavailableReason, SourceArtifact
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.market_history import TradingStatus, TradingStatusProvenance
 
 
 def _valid_history(rows: int) -> pd.DataFrame:
@@ -42,6 +46,49 @@ def _valid_history(rows: int) -> pd.DataFrame:
         "Close": [10.0] * rows,
         "Volume": [1_000_000] * rows,
     })
+
+
+@pytest.mark.unit
+def test_live_status_and_explicit_unknown_have_distinct_snapshot_v2_identities() -> None:
+    frame = _valid_history(1)
+    raw_text = frame.to_csv(index=False)
+    artifact = SourceArtifact(
+        artifact_sha256=sha256(raw_text.encode("utf-8")).hexdigest(),
+        source_ref="acq.v1:market:test-live-status",
+        tool_call_id="live-status",
+        tool_name="fixture_market_snapshot",
+        raw_text=raw_text,
+    )
+    common = {
+        "symbol": "600519.SS",
+        "frame": frame,
+        "provider": "baostock",
+        "retrieved_at": "2026-07-24T10:00:00+00:00",
+        "adjustment_basis": "qfq",
+        "requested_date": "2026-07-24",
+        "effective_trading_date": frame.iloc[-1]["Date"].strftime("%Y-%m-%d"),
+        "source_artifact": artifact,
+    }
+    unknown = AuthoritativeMarketSnapshot(**common)
+    traded = AuthoritativeMarketSnapshot(
+        **common,
+        current_tradeability="tradeable",
+        current_status_provenance=TradingStatusProvenance(
+            provider="baostock",
+            provider_dataset_id="provider-dataset:baostock-cn-a-v1",
+            session_date=date.fromisoformat(common["effective_trading_date"]),
+            status=TradingStatus.TRADED,
+            observed_at=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+            revision_id="trading-status=sha256:" + "1" * 64,
+        ),
+        latest_traded_close=Decimal("10"),
+    )
+
+    assert unknown.snapshot_id.startswith("snapshot:v2:")
+    assert traded.snapshot_id.startswith("snapshot:v2:")
+    assert unknown.snapshot_id != traded.snapshot_id
+    assert unknown.snapshot_id_version == traded.snapshot_id_version == "v2"
+    assert unknown.pin_membership_digest != traded.pin_membership_digest
 
 
 @pytest.mark.unit

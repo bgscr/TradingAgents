@@ -1684,17 +1684,25 @@ class DecisionPolicyEngine:
                 return "decision_market_snapshot_unavailable"
             if checkpoint_evidence.market_snapshot != snapshot:
                 return "decision_market_snapshot_mismatch"
-            expected_snapshot_id = stable_market_snapshot_id(
-                symbol=snapshot.symbol,
-                provider=snapshot.provider,
-                adjustment_basis=snapshot.adjustment_basis,
-                requested_date=snapshot.requested_date,
-                effective_trading_date=snapshot.effective_trading_date,
-                frame_sha256=snapshot.frame_sha256,
-                history_rows=snapshot.history_rows,
-            )
-            if snapshot.snapshot_id != expected_snapshot_id:
-                return "decision_market_snapshot_id_mismatch"
+            if snapshot.snapshot_id_version == "v2":
+                if (
+                    snapshot.pin_membership_digest is None
+                    or snapshot.snapshot_id
+                    != f"snapshot:v2:{snapshot.pin_membership_digest}"
+                ):
+                    return "decision_market_snapshot_id_mismatch"
+            else:
+                expected_snapshot_id = stable_market_snapshot_id(
+                    symbol=snapshot.symbol,
+                    provider=snapshot.provider,
+                    adjustment_basis=snapshot.adjustment_basis,
+                    requested_date=snapshot.requested_date,
+                    effective_trading_date=snapshot.effective_trading_date,
+                    frame_sha256=snapshot.frame_sha256,
+                    history_rows=snapshot.history_rows,
+                )
+                if snapshot.snapshot_id != expected_snapshot_id:
+                    return "decision_market_snapshot_id_mismatch"
             if (
                 snapshot.symbol != identity.symbol
                 or snapshot.frame_sha256 != lineage.input_artifact_sha256

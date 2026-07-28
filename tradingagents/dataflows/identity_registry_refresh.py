@@ -17,19 +17,36 @@ from typing import Any
 
 import requests
 
+from tradingagents.dataflows.crypto_universe import (
+    CRYPTO_REGISTRY_ID,
+    CryptoUniversePolicyError,
+    validate_crypto_registry_rows,
+)
 from tradingagents.dataflows.instrument_identity import (
     IdentityRegistryAvailable,
+    resolve_authoritative_crypto_identity,
     resolve_authoritative_instrument_identity,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 DEFAULT_REGISTRY_PATH = PROJECT_ROOT / "config" / "instrument_identity_registry.json"
 DEFAULT_CHECKSUM_PATH = DEFAULT_REGISTRY_PATH.with_suffix(".sha256")
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env.enterprise"
+DEFAULT_CRYPTO_REGISTRY_PATH = PACKAGE_CONFIG_ROOT / "crypto_identity_registry.json"
+DEFAULT_CRYPTO_CHECKSUM_PATH = DEFAULT_CRYPTO_REGISTRY_PATH.with_suffix(".sha256")
 
 REGISTRY_ID = "mainland-exchange-identity-registry-v1"
 REGISTRY_PATH_ENV = "TRADINGAGENTS_IDENTITY_REGISTRY_PATH"
 REGISTRY_SHA256_ENV = "TRADINGAGENTS_IDENTITY_REGISTRY_SHA256"
+CRYPTO_REGISTRY_PATH_ENV = "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_PATH"
+CRYPTO_REGISTRY_SHA256_ENV = "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_SHA256"
+CRYPTO_FOCUSED_TEST_PATHS = (
+    "tests/test_crypto_identity_registry.py",
+    "tests/test_crypto_identity_registry_refresh.py",
+    "tests/test_cli_symbol_handling.py",
+    "tests/test_env_overrides.py",
+)
 FOCUSED_TEST_PATHS = (
     "tests/test_production_instrument_identity_registry.py",
     "tests/test_authoritative_instrument_identity.py",
@@ -74,6 +91,139 @@ class RegistryRefreshResult:
 class _FileBackup:
     content: bytes | None
     mode: int | None
+
+
+def refresh_crypto_identity_registry(
+    *,
+    candidate_path: Path,
+    registry_path: Path = DEFAULT_CRYPTO_REGISTRY_PATH,
+    checksum_path: Path = DEFAULT_CRYPTO_CHECKSUM_PATH,
+    env_path: Path = DEFAULT_ENV_PATH,
+    full_tests: bool = False,
+) -> RegistryRefreshResult:
+    """Validate an offline crypto candidate, publish it, verify, and roll back."""
+    _require_source_checkout()
+    candidate_path = candidate_path.resolve()
+    registry_path = registry_path.resolve()
+    checksum_path = checksum_path.resolve()
+    env_path = env_path.resolve()
+    try:
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegistryRefreshError(f"cannot read crypto candidate {candidate_path}: {exc}") from exc
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("schema_version") != "1.0"
+        or candidate.get("registry_id") != CRYPTO_REGISTRY_ID
+        or not isinstance(candidate.get("rows"), list)
+        or not candidate["rows"]
+    ):
+        raise RegistryRefreshError("crypto candidate has an invalid registry envelope")
+    try:
+        rows = sorted(
+            candidate["rows"],
+            key=lambda row: str(row["canonical_symbol"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise RegistryRefreshError("crypto candidate rows are malformed") from exc
+    artifact = {
+        "schema_version": "1.0",
+        "registry_id": CRYPTO_REGISTRY_ID,
+        "rows": rows,
+    }
+    registry_bytes = (
+        json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    digest = sha256(registry_bytes).hexdigest()
+
+    try:
+        registry_reference = Path(
+            os.path.relpath(registry_path, start=checksum_path.parent)
+        ).as_posix()
+    except ValueError:
+        registry_reference = registry_path.as_posix()
+    checksum_bytes = f"{digest}  {registry_reference}\n".encode()
+    env_bytes = _updated_crypto_env_bytes(
+        env_path.read_bytes() if env_path.exists() else b"",
+        registry_path=registry_path,
+        digest=digest,
+    )
+    targets = (registry_path, checksum_path, env_path)
+    backups = {path: _backup(path) for path in targets}
+    try:
+        _validate_crypto_candidate(
+            registry_bytes,
+            digest,
+            rows,
+        )
+        _atomic_write(registry_path, registry_bytes, backups[registry_path].mode)
+        _atomic_write(checksum_path, checksum_bytes, backups[checksum_path].mode)
+        _atomic_write(env_path, env_bytes, backups[env_path].mode)
+        _run_crypto_registry_tests(
+            registry_path=registry_path,
+            digest=digest,
+            full_tests=full_tests,
+        )
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for path in reversed(targets):
+            if _matches_backup(path, backups[path]):
+                continue
+            try:
+                _restore(path, backups[path])
+            except OSError as rollback_exc:
+                rollback_errors.append(f"{path}: {rollback_exc}")
+        if rollback_errors:
+            raise RegistryRefreshError(
+                f"{exc}\nRollback incomplete: {'; '.join(rollback_errors)}"
+            ) from exc
+        if isinstance(exc, Exception):
+            raise RegistryRefreshError(f"{exc}\nChanges rolled back.") from exc
+        raise
+
+    symbols = tuple(str(row["canonical_symbol"]) for row in rows)
+    return RegistryRefreshResult(
+        registry_path=registry_path,
+        checksum_path=checksum_path,
+        env_path=env_path,
+        digest=digest,
+        added=symbols,
+        updated=(),
+        unchanged=(),
+    )
+
+
+def _validate_crypto_candidate(
+    registry_bytes: bytes,
+    digest: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    try:
+        validate_crypto_registry_rows(rows)
+    except CryptoUniversePolicyError as exc:
+        raise RegistryRefreshError(
+            f"{exc.diagnostic_code}: {exc}"
+        ) from exc
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as handle:
+            handle.write(registry_bytes)
+            temporary_path = Path(handle.name)
+        for row in rows:
+            symbol = str(row.get("canonical_symbol", ""))
+            result = resolve_authoritative_crypto_identity(
+                symbol,
+                registry_path=temporary_path,
+                expected_sha256=digest,
+            )
+            if not isinstance(result, IdentityRegistryAvailable):
+                raise RegistryRefreshError(
+                    f"generated crypto registry does not resolve {symbol}: "
+                    f"{result.diagnostic_code}"
+                )
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def refresh_identity_registry(
@@ -529,10 +679,56 @@ def _updated_env_bytes(
     return (newline.join(rendered) + newline).encode("utf-8")
 
 
+def _updated_crypto_env_bytes(
+    existing: bytes,
+    *,
+    registry_path: Path,
+    digest: str,
+) -> bytes:
+    try:
+        text = existing.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RegistryRefreshError("environment file must be UTF-8") from exc
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    values = {
+        CRYPTO_REGISTRY_PATH_ENV: str(registry_path),
+        CRYPTO_REGISTRY_SHA256_ENV: digest,
+    }
+    found: set[str] = set()
+    rendered: list[str] = []
+    for line in lines:
+        replacement = None
+        for key, value in values.items():
+            if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+                replacement = f"{key}={value}"
+                found.add(key)
+                break
+        rendered.append(replacement if replacement is not None else line)
+    missing = [key for key in values if key not in found]
+    if missing:
+        if rendered and rendered[-1].strip():
+            rendered.append("")
+        rendered.append("# Digest-pinned authoritative crypto identity registry.")
+        rendered.extend(f"{key}={values[key]}" for key in missing)
+    return (newline.join(rendered) + newline).encode("utf-8")
+
+
 def _backup(path: Path) -> _FileBackup:
     if not path.exists():
         return _FileBackup(content=None, mode=None)
     return _FileBackup(content=path.read_bytes(), mode=path.stat().st_mode)
+
+
+def _matches_backup(path: Path, backup: _FileBackup) -> bool:
+    if backup.content is None:
+        return not path.exists()
+    try:
+        return path.read_bytes() == backup.content and (
+            backup.mode is None or path.stat().st_mode == backup.mode
+        )
+    except OSError:
+        return False
 
 
 def _atomic_write(path: Path, content: bytes, mode: int | None) -> None:
@@ -592,4 +788,38 @@ def _run_registry_tests(
             details = details[-4000:]
         raise RegistryRefreshError(
             "registry tests failed" + (f":\n{details}" if details else "")
+        )
+
+
+def _run_crypto_registry_tests(
+    *,
+    registry_path: Path,
+    digest: str,
+    full_tests: bool,
+) -> None:
+    command = [sys.executable, "-m", "pytest", "-q"]
+    if not full_tests:
+        command.extend(CRYPTO_FOCUSED_TEST_PATHS)
+    environment = os.environ.copy()
+    environment[CRYPTO_REGISTRY_PATH_ENV] = str(registry_path)
+    environment[CRYPTO_REGISTRY_SHA256_ENV] = digest
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RegistryRefreshError(f"could not start crypto registry tests: {exc}") from exc
+    if completed.returncode != 0:
+        details = "\n".join(
+            part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+        )
+        if len(details) > 4000:
+            details = details[-4000:]
+        raise RegistryRefreshError(
+            "crypto registry tests failed" + (f":\n{details}" if details else "")
         )

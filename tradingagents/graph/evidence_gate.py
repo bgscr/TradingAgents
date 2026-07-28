@@ -20,6 +20,7 @@ from tradingagents.evidence import (
     AnalysisDiagnosticCode,
     AnalysisOutcome,
     AnalysisOutcomeReason,
+    CurrentSuspensionOutcome,
     EvidenceReadiness,
     EvidenceState,
     analysis_outcome_publication,
@@ -43,12 +44,14 @@ def _analysis_outcome(
     readiness: EvidenceReadiness,
     reason: AnalysisOutcomeReason,
     diagnostic_codes: tuple[AnalysisDiagnosticCode, ...],
+    current_suspension: CurrentSuspensionOutcome | None = None,
 ) -> dict[str, Any]:
     return analysis_outcome_publication(
         AnalysisOutcome(
             readiness=readiness,
             reason=reason,
             diagnostic_codes=diagnostic_codes,
+            current_suspension=current_suspension,
         )
     )
 
@@ -123,11 +126,33 @@ def create_preflight_gate_node(
             )
         update = {"evidence_preflight": result.model_dump(mode="json")}
         if not result.passed:
+            reason = (
+                AnalysisOutcomeReason.INSTRUMENT_CURRENTLY_SUSPENDED
+                if AnalysisDiagnosticCode.INSTRUMENT_CURRENTLY_SUSPENDED
+                in result.diagnostic_codes
+                else AnalysisOutcomeReason.PREFLIGHT_BLOCKED
+            )
+            current_suspension = None
+            if reason is AnalysisOutcomeReason.INSTRUMENT_CURRENTLY_SUSPENDED:
+                snapshot = evidence.market_snapshot
+                if snapshot is None:  # Defensive: the diagnostic requires a snapshot.
+                    raise ValueError(
+                        "suspended preflight outcome requires a market snapshot"
+                    )
+                current_suspension = CurrentSuspensionOutcome(
+                    latest_traded_close_status=(
+                        "available"
+                        if snapshot.latest_traded_close is not None
+                        else "unavailable"
+                    ),
+                    latest_traded_close=snapshot.latest_traded_close,
+                )
             update.update(
                 _analysis_outcome(
                     readiness=result.readiness,
-                    reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+                    reason=reason,
                     diagnostic_codes=result.diagnostic_codes,
+                    current_suspension=current_suspension,
                 )
             )
         return update

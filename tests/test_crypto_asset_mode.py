@@ -6,7 +6,9 @@ from cli.utils import (
     filter_analysts_for_asset_type,
     filter_analysts_for_instrument,
 )
+from tradingagents.evidence import InstrumentKind, capability_profile_for
 from tradingagents.graph.propagation import Propagator
+from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 
 class CryptoAssetModeTests(unittest.TestCase):
@@ -75,6 +77,19 @@ class CryptoAssetModeTests(unittest.TestCase):
         )
 
         self.assertEqual(state["asset_type"], AssetType.CRYPTO.value)
+
+    def test_graph_uses_domain_kind_and_capability_profile_internally(self):
+        kind = TradingAgentsGraph._instrument_kind_for_asset_type("crypto")
+        analysts = TradingAgentsGraph._analysts_for_instrument_kind(
+            ("market", "social", "news", "fundamentals"),
+            kind,
+        )
+
+        self.assertIs(kind, InstrumentKind.CRYPTO)
+        self.assertEqual(
+            analysts,
+            tuple(capability_profile_for(kind).applicable_analysts),
+        )
 
 
 if __name__ == "__main__":

@@ -462,6 +462,69 @@ def build_analyst_update(
                     history_rows=len(active_snapshot.frame),
                     frame_sha256=active_snapshot.frame_sha256,
                     snapshot_id=active_snapshot.snapshot_id,
+                    snapshot_id_version=active_snapshot.snapshot_id_version,
+                    pin_membership_digest=active_snapshot.pin_membership_digest,
+                    current_tradeability=active_snapshot.current_tradeability,
+                    current_status_provenance=(
+                        {
+                            "provider": active_snapshot.current_status_provenance.provider,
+                            "provider_dataset_id": (
+                                active_snapshot.current_status_provenance.provider_dataset_id
+                            ),
+                            "session_date": (
+                                active_snapshot.current_status_provenance.session_date.isoformat()
+                            ),
+                            "status": active_snapshot.current_status_provenance.status.value,
+                            "observed_at": (
+                                active_snapshot.current_status_provenance.observed_at.isoformat()
+                            ),
+                            "revision_id": (
+                                active_snapshot.current_status_provenance.revision_id
+                            ),
+                        }
+                        if active_snapshot.current_status_provenance is not None
+                        else None
+                    ),
+                    latest_traded_close=active_snapshot.latest_traded_close,
+                    latest_traded_close_diagnostic=(
+                        active_snapshot.latest_traded_close_diagnostic
+                    ),
+                    carried_suspension_close=(
+                        active_snapshot.carried_suspension_close
+                    ),
+                    history_gap_dates=active_snapshot.history_gap_dates,
+                    history_store_status=active_snapshot.history_store_status,
+                    history_store_diagnostic=active_snapshot.history_store_diagnostic,
+                    physical_attempt_events=tuple(
+                        {
+                            "sequence_id": event.sequence_id,
+                            "request_key": event.request_key,
+                            "upstream_service_id": event.upstream_service_id,
+                            "upstream_service_name": event.upstream_service_name,
+                            "attempt_index": event.attempt_index,
+                            "attempted_at": event.attempted_at.isoformat(),
+                            "pacing_event": event.pacing_event,
+                            "pacing_wait_seconds": event.pacing_wait_seconds,
+                            "outcome": event.outcome.value,
+                            "retryable": event.retryable,
+                            "status_code": event.status_code,
+                            "error_code": event.error_code,
+                            "retry_after_seconds": event.retry_after_seconds,
+                            "cooldown_changed": event.cooldown_changed,
+                            "cooldown_until": (
+                                event.cooldown_until.isoformat()
+                                if event.cooldown_until is not None
+                                else None
+                            ),
+                            "final_physical_attempt_count": (
+                                event.final_physical_attempt_count
+                            ),
+                        }
+                        for event in active_snapshot.physical_attempt_events
+                    ),
+                    physical_attempt_count=len(
+                        active_snapshot.physical_attempt_events
+                    ),
                 )
             }
         )

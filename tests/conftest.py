@@ -38,7 +38,7 @@ def _dummy_api_keys(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_config():
+def _isolate_config(tmp_path):
     """Reset the global dataflows config before and after each test.
 
     ``set_config`` merges (it never clears keys absent from the override), so a
@@ -51,9 +51,25 @@ def _isolate_config():
     import tradingagents.dataflows.config as config_module
     import tradingagents.default_config as default_config
 
-    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
-    yield
-    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    original_default = default_config.DEFAULT_CONFIG
+    isolated_default = copy.deepcopy(original_default)
+    history_root = tmp_path / "market_history"
+    isolated_default.update(
+        {
+            "market_history_database_path": str(
+                history_root / "market_history.sqlite3"
+            ),
+            "market_history_payload_root": str(history_root / "payloads"),
+            "market_history_backup_root": str(history_root / "backups"),
+        }
+    )
+    default_config.DEFAULT_CONFIG = isolated_default
+    config_module._config = copy.deepcopy(isolated_default)
+    try:
+        yield
+    finally:
+        default_config.DEFAULT_CONFIG = original_default
+        config_module._config = copy.deepcopy(original_default)
 
 
 @pytest.fixture()

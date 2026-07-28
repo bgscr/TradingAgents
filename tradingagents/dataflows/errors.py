@@ -51,9 +51,11 @@ class VendorRateLimitError(VendorError):
         message: str = "vendor rate limited",
         *,
         status_code: int | None = None,
+        error_code: str | None = None,
         retry_after_seconds: float | None = None,
     ) -> None:
         self.status_code = status_code
+        self.error_code = error_code
         self.retry_after_seconds = retry_after_seconds
         super().__init__(message)
 

@@ -8,12 +8,11 @@ from typing import Any
 
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
-from yfinance.exceptions import YFRateLimitError
 
 from tradingagents.evidence import InstrumentIdentityEvidence
 
 from .config import get_config
-from .errors import NoMarketDataError, VendorRateLimitError
+from .errors import NoMarketDataError
 from .stockstats_utils import yf_retry
 from .symbol_utils import normalize_symbol, resolve_china_a_symbol
 
@@ -183,13 +182,13 @@ def get_news_yfinance(
     resolved = "" if canonical == ticker else f" (resolved to {canonical})"
     try:
         stock = yf.Ticker(canonical)
-        if _acquired:
-            try:
-                news = stock.get_news(count=article_limit)
-            except YFRateLimitError:
-                raise VendorRateLimitError(status_code=429) from None
-        else:
-            news = yf_retry(lambda: stock.get_news(count=article_limit))
+        news = yf_retry(
+            lambda: stock.get_news(count=article_limit),
+            request_key=(
+                f"symbol-news:{canonical}:{start_date}:{end_date}:{article_limit}"
+            ),
+            operation="news",
+        )
 
         if not news:
             if _acquired:
@@ -274,14 +273,18 @@ def get_global_news_yfinance(
 
     try:
         for query in search_queries:
-            search = yf_retry(lambda q=query: yf.Search(
-                query=q,
-                news_count=limit,
-                enable_fuzzy_query=True,
-            ))
+            search_news = yf_retry(
+                lambda q=query: yf.Search(
+                    query=q,
+                    news_count=limit,
+                    enable_fuzzy_query=True,
+                ).news,
+                request_key=f"global-news:{query}:{look_back_days}:{limit}",
+                operation="news",
+            )
 
-            if search.news:
-                for article in search.news:
+            if search_news:
+                for article in search_news:
                     # Handle both flat and nested structures
                     if "content" in article:
                         data = _extract_article_data(article)

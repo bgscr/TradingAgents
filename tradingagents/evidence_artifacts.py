@@ -11,7 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
@@ -20,6 +20,7 @@ from tradingagents.evidence import (
     EvidenceState,
     EvidenceStatus,
     InstrumentKind,
+    ProviderPhysicalAttemptEvidence,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
     SourceArtifact,
@@ -71,6 +72,18 @@ class AuditInstrumentIdentity(BaseModel):
     provenance: AuditIdentityProvenance | None = None
 
 
+class AuditTradingStatusProvenance(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = SOURCE_ARTIFACT_MANIFEST_VERSION
+    provider: str
+    provider_dataset_id: str
+    session_date: str
+    status: Literal["traded", "suspended"]
+    observed_at: str
+    revision_id: str | None = None
+
+
 class AuditMarketSnapshot(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -84,6 +97,68 @@ class AuditMarketSnapshot(BaseModel):
     history_rows: int = Field(ge=0)
     frame_sha256: str
     snapshot_id: str
+    snapshot_id_version: Literal["v1", "v2"] = "v1"
+    pin_membership_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
+    current_status_provenance: AuditTradingStatusProvenance | None = None
+    latest_traded_close: Decimal | None = None
+    latest_traded_close_diagnostic: str | None = None
+    carried_suspension_close: Decimal | None = None
+    history_gap_dates: tuple[str, ...] = ()
+    history_store_status: Literal["live", "stored", "degraded"] = "live"
+    history_store_diagnostic: str | None = None
+    physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
+    physical_attempt_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_authoritative_status(self) -> AuditMarketSnapshot:
+        provenance = self.current_status_provenance
+        if self.current_tradeability == "unknown":
+            if (
+                provenance is not None
+                or self.latest_traded_close is not None
+                or self.carried_suspension_close is not None
+            ):
+                raise ValueError(
+                    "unknown tradeability cannot carry authoritative status values"
+                )
+            return self
+        if provenance is None:
+            raise ValueError(
+                "authoritative current tradeability requires status provenance"
+            )
+        expected_status = (
+            "suspended" if self.current_tradeability == "suspended" else "traded"
+        )
+        if (
+            provenance.provider != self.provider
+            or provenance.session_date != self.effective_trading_date
+            or provenance.status != expected_status
+        ):
+            raise ValueError(
+                "authoritative status provenance contradicts the audit snapshot"
+            )
+        if self.latest_traded_close is None:
+            if not self.latest_traded_close_diagnostic:
+                raise ValueError("unavailable latest traded close requires a diagnostic")
+        elif self.latest_traded_close_diagnostic is not None:
+            raise ValueError(
+                "available latest traded close cannot carry an unavailable diagnostic"
+            )
+        if self.current_tradeability == "suspended":
+            if self.carried_suspension_close is None:
+                raise ValueError("suspended tradeability requires a carried close")
+        else:
+            if self.carried_suspension_close is not None:
+                raise ValueError("tradeable status cannot carry a suspension close")
+            if self.latest_traded_close is None:
+                raise ValueError(
+                    "tradeable status requires the latest genuinely traded close"
+                )
+        return self
 
 
 class AuditMaterialClaim(BaseModel):
@@ -197,6 +272,8 @@ class AuditEvidenceProjection(BaseModel):
     claim_validations: tuple[AuditClaimValidation, ...] = ()
     sources: tuple[AuditEvidenceSource, ...] = ()
     acquisition_outcomes: tuple[AuditSourceAcquisitionOutcome, ...] = ()
+    physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
+    physical_attempt_count: int = Field(default=0, ge=0)
 
 
 def _candidate_artifacts(evidence: EvidenceState) -> tuple[SourceArtifact, ...]:
@@ -371,6 +448,24 @@ def project_evidence_for_audit(
             history_rows=snapshot.history_rows,
             frame_sha256=snapshot.frame_sha256,
             snapshot_id=snapshot.snapshot_id,
+            snapshot_id_version=snapshot.snapshot_id_version,
+            pin_membership_digest=snapshot.pin_membership_digest,
+            current_tradeability=snapshot.current_tradeability,
+            current_status_provenance=(
+                AuditTradingStatusProvenance.model_validate(
+                    snapshot.current_status_provenance.model_dump(mode="python")
+                )
+                if snapshot.current_status_provenance is not None
+                else None
+            ),
+            latest_traded_close=snapshot.latest_traded_close,
+            latest_traded_close_diagnostic=snapshot.latest_traded_close_diagnostic,
+            carried_suspension_close=snapshot.carried_suspension_close,
+            history_gap_dates=snapshot.history_gap_dates,
+            history_store_status=snapshot.history_store_status,
+            history_store_diagnostic=snapshot.history_store_diagnostic,
+            physical_attempt_events=snapshot.physical_attempt_events,
+            physical_attempt_count=snapshot.physical_attempt_count,
         )
         if snapshot is not None
         else None
@@ -501,4 +596,6 @@ def project_evidence_for_audit(
         claim_validations=projected_validations,
         sources=projected_sources,
         acquisition_outcomes=tuple(projected_outcomes),
+        physical_attempt_events=evidence.physical_attempt_events,
+        physical_attempt_count=evidence.physical_attempt_count,
     )

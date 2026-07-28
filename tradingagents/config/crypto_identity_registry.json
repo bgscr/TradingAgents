@@ -1,0 +1,149 @@
+{
+  "schema_version": "1.0",
+  "registry_id": "crypto-ccc-identity-registry-v1",
+  "rows": [
+    {
+      "canonical_symbol": "BTC-USD",
+      "aliases": ["BTCUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Bitcoin USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/BTC-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "ETH-USD",
+      "aliases": ["ETHUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Ethereum USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/ETH-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "SOL-USD",
+      "aliases": ["SOLUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Solana USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/SOL-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "XRP-USD",
+      "aliases": ["XRPUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "XRP USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/XRP-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "ADA-USD",
+      "aliases": ["ADAUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Cardano USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/ADA-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "DOGE-USD",
+      "aliases": ["DOGEUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Dogecoin USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/DOGE-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "LTC-USD",
+      "aliases": ["LTCUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Litecoin USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/LTC-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "BCH-USD",
+      "aliases": ["BCHUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Bitcoin Cash USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/BCH-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "DOT-USD",
+      "aliases": ["DOTUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Polkadot USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/DOT-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "AVAX-USD",
+      "aliases": ["AVAXUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Avalanche USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/AVAX-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    },
+    {
+      "canonical_symbol": "LINK-USD",
+      "aliases": ["LINKUSD"],
+      "venue": "CCC",
+      "instrument_kind": "crypto",
+      "currency": "USD",
+      "display_name": "Chainlink USD",
+      "provenance": {
+        "provider": "Yahoo Finance",
+        "source_ref": "https://finance.yahoo.com/quote/LINK-USD/",
+        "retrieved_at": "2026-07-25T00:00:00+00:00"
+      }
+    }
+  ]
+}

@@ -7,8 +7,11 @@ import unittest
 from unittest import mock
 
 import pytest
+from yfinance.exceptions import YFRateLimitError
 
 import tradingagents.dataflows.config as config_module
+import tradingagents.dataflows.stockstats_utils as stockstats_utils
+import tradingagents.dataflows.y_finance as y_finance
 import tradingagents.default_config as default_config
 from tradingagents.dataflows import interface
 from tradingagents.dataflows.alpha_vantage_common import (
@@ -23,6 +26,22 @@ from tradingagents.dataflows.errors import (
     VendorRateLimitError,
 )
 from tradingagents.dataflows.fred import FredNotConfiguredError
+
+
+@pytest.mark.unit
+def test_yahoo_history_rate_limit_is_exposed_as_vendor_capacity(monkeypatch):
+    class RateLimitedTicker:
+        def history(self, *, start, end):
+            raise YFRateLimitError()
+
+    monkeypatch.setattr(y_finance.yf, "Ticker", lambda _symbol: RateLimitedTicker())
+    monkeypatch.setattr(stockstats_utils.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(VendorRateLimitError) as exc_info:
+        y_finance.load_ohlcv_range("AAPL", "2026-07-01", "2026-07-24")
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.error_code == "YAHOO_HTTP_429"
 
 
 @pytest.mark.unit

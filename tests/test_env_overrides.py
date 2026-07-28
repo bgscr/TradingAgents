@@ -44,6 +44,56 @@ def test_string_overrides(monkeypatch):
     assert dc.DEFAULT_CONFIG["output_language"] == "Chinese"
 
 
+def test_crypto_identity_registry_overrides_are_separate(monkeypatch):
+    dc = _reload_with_env(
+        monkeypatch,
+        TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_PATH="crypto-registry.json",
+        TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_SHA256="a" * 64,
+    )
+
+    assert dc.DEFAULT_CONFIG["crypto_identity_registry_path"] == (
+        "crypto-registry.json"
+    )
+    assert dc.DEFAULT_CONFIG["crypto_identity_registry_sha256"] == "a" * 64
+    assert dc.DEFAULT_CONFIG["instrument_identity_registry_path"] is None
+    assert dc.DEFAULT_CONFIG["instrument_identity_registry_sha256"] is None
+    assert dc.DEFAULT_CONFIG["market_data_vendors"]["cn_a"][
+        "core_stock_apis"
+    ] == "akshare,baostock,yfinance"
+
+
+@pytest.mark.parametrize(
+    ("override", "configured_key", "missing_key"),
+    (
+        (
+            {"TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_PATH": "custom.json"},
+            "crypto_identity_registry_path",
+            "crypto_identity_registry_sha256",
+        ),
+        (
+            {"TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_SHA256": "b" * 64},
+            "crypto_identity_registry_sha256",
+            "crypto_identity_registry_path",
+        ),
+    ),
+)
+def test_partial_crypto_registry_environment_override_does_not_mix_pins(
+    monkeypatch,
+    override,
+    configured_key,
+    missing_key,
+):
+    try:
+        dc = _reload_with_env(monkeypatch, **override)
+
+        assert dc.DEFAULT_CONFIG[configured_key] == next(iter(override.values()))
+        assert dc.DEFAULT_CONFIG[missing_key] is None
+    finally:
+        for key in override:
+            monkeypatch.delenv(key, raising=False)
+        importlib.reload(default_config_module)
+
+
 def test_int_coercion(monkeypatch):
     dc = _reload_with_env(
         monkeypatch,

@@ -147,33 +147,67 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
         ),
     )
     if not outcomes:
-        return [*lines, "No acquisition outcomes were recorded.", ""]
-    for index, outcome in enumerate(outcomes, 1):
-        if isinstance(outcome, SourceAcquisitionUnavailable):
-            reason = outcome.reason.value
-            retry_after = (
-                f"{outcome.retry_after_seconds:g} seconds"
-                if outcome.retry_after_seconds is not None
-                else "not provided"
+        lines.extend(["No acquisition outcomes were recorded.", ""])
+    else:
+        for index, outcome in enumerate(outcomes, 1):
+            if isinstance(outcome, SourceAcquisitionUnavailable):
+                reason = outcome.reason.value
+                retry_after = (
+                    f"{outcome.retry_after_seconds:g} seconds"
+                    if outcome.retry_after_seconds is not None
+                    else "not provided"
+                )
+            else:
+                reason = "not applicable"
+                retry_after = "not provided"
+            lines.extend(
+                [
+                    f"### Acquisition {index}",
+                    "",
+                    f"- **Provider:** `{outcome.provider}`",
+                    f"- **Capability:** `{outcome.capability}`",
+                    f"- **Attempt:** {outcome.attempt}",
+                    f"- **Retrieved at:** {outcome.retrieved_at}",
+                    f"- **Outcome:** {outcome.outcome}",
+                    f"- **Unavailable reason:** {reason}",
+                    f"- **Retryable:** {_format_scalar(outcome.retryable)}",
+                    f"- **Retry-After:** {retry_after}",
+                    "",
+                ]
             )
-        else:
-            reason = "not applicable"
-            retry_after = "not provided"
+    attempts = evidence.physical_attempt_events
+    if attempts:
         lines.extend(
             [
-                f"### Acquisition {index}",
+                "## Physical Provider Attempts",
                 "",
-                f"- **Provider:** `{outcome.provider}`",
-                f"- **Capability:** `{outcome.capability}`",
-                f"- **Attempt:** {outcome.attempt}",
-                f"- **Retrieved at:** {outcome.retrieved_at}",
-                f"- **Outcome:** {outcome.outcome}",
-                f"- **Unavailable reason:** {reason}",
-                f"- **Retryable:** {_format_scalar(outcome.retryable)}",
-                f"- **Retry-After:** {retry_after}",
+                f"- **Total physical-attempt count:** {evidence.physical_attempt_count}",
                 "",
             ]
         )
+        for event in attempts:
+            cooldown = event.cooldown_until or "unchanged"
+            lines.extend(
+                [
+                    f"### Physical attempt {event.attempt_index}",
+                    "",
+                    (
+                        "- **Upstream Service Identity:** "
+                        f"`{event.upstream_service_id}` ({event.upstream_service_name})"
+                    ),
+                    f"- **Attempted at:** {event.attempted_at}",
+                    f"- **Pacing/permit event:** {event.pacing_event}",
+                    f"- **Pacing wait:** {event.pacing_wait_seconds:g} seconds",
+                    f"- **Typed outcome:** {event.outcome}",
+                    f"- **Cooldown changed:** {_format_scalar(event.cooldown_changed)}",
+                    f"- **Cooldown until:** {cooldown}",
+                    (
+                        "- **Final physical-attempt count:** "
+                        f"{event.final_physical_attempt_count}"
+                    ),
+                    "",
+                ]
+            )
     return lines
 
 

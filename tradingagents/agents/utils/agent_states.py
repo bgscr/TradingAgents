@@ -47,6 +47,10 @@ class RiskDebateState(TypedDict):
 class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
+    asset_configuration: Annotated[
+        dict[str, Any] | None,
+        "Immutable authoritative asset semantics for this run",
+    ]
     instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
     evidence_state: Annotated[dict[str, Any], "Validated shared evidence for gates"]
     evidence_preflight: Annotated[

@@ -22,6 +22,33 @@ _DEFAULT_MEMORY_LOG_PATH = (
     if _PROJECT_RUNTIME_ROOT
     else os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")
 )
+_DEFAULT_MARKET_HISTORY_ROOT = (
+    os.path.join(_PROJECT_RUNTIME_ROOT, "data", "market_history")
+    if _PROJECT_RUNTIME_ROOT
+    else os.path.join(_TRADINGAGENTS_HOME, "market_history")
+)
+_PACKAGE_CONFIG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "config"))
+_DEFAULT_CRYPTO_REGISTRY_PATH = os.path.join(
+    _PACKAGE_CONFIG_DIR,
+    "crypto_identity_registry.json",
+)
+_DEFAULT_CRYPTO_CHECKSUM_PATH = os.path.join(
+    _PACKAGE_CONFIG_DIR,
+    "crypto_identity_registry.sha256",
+)
+_DEFAULT_CRYPTO_REGISTRY_ID = "crypto-ccc-identity-registry-v1"
+
+
+def _read_default_crypto_registry_sha256() -> str | None:
+    try:
+        with open(_DEFAULT_CRYPTO_CHECKSUM_PATH, encoding="utf-8") as checksum:
+            fields = checksum.read().split()
+    except OSError:
+        return None
+    return fields[0] if fields else None
+
+
+_DEFAULT_CRYPTO_REGISTRY_SHA256 = _read_default_crypto_registry_sha256()
 
 # Single source of truth for env-var → config-key overrides. To expose
 # a new config key for environment-based override, add a row here — no
@@ -40,9 +67,17 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_EVIDENCE_GATE_MODE":   "evidence_gate_mode",
     "TRADINGAGENTS_IDENTITY_REGISTRY_PATH": "instrument_identity_registry_path",
     "TRADINGAGENTS_IDENTITY_REGISTRY_SHA256": "instrument_identity_registry_sha256",
+    "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_PATH": "crypto_identity_registry_path",
+    "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_SHA256": "crypto_identity_registry_sha256",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
+    "TRADINGAGENTS_MARKET_HISTORY_MODE":  "market_history_mode",
+    "TRADINGAGENTS_MARKET_HISTORY_DATABASE_PATH": "market_history_database_path",
+    "TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT": "market_history_payload_root",
+    "TRADINGAGENTS_MARKET_HISTORY_BACKUP_ROOT": "market_history_backup_root",
+    "TRADINGAGENTS_DATA_USAGE_MODE":      "data_usage_mode",
+    "TRADINGAGENTS_YAHOO_MAX_PHYSICAL_ATTEMPTS": "yahoo_max_physical_attempts",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -54,6 +89,8 @@ _ENV_OVERRIDES = {
 
 _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
+_CRYPTO_REGISTRY_PATH_ENV = "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_PATH"
+_CRYPTO_REGISTRY_DIGEST_ENV = "TRADINGAGENTS_CRYPTO_IDENTITY_REGISTRY_SHA256"
 
 
 def _coerce(value: str, reference):
@@ -81,14 +118,25 @@ def _coerce(value: str, reference):
 
 def _apply_env_overrides(config: dict) -> dict:
     """Apply TRADINGAGENTS_* env vars to the config dict in-place."""
+    applied: set[str] = set()
     for env_var, key in _ENV_OVERRIDES.items():
         raw = os.environ.get(env_var)
         if raw is None or raw == "":
             continue
         try:
             config[key] = _coerce(raw, config.get(key))
+            applied.add(env_var)
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
+    path_overridden = _CRYPTO_REGISTRY_PATH_ENV in applied
+    digest_overridden = _CRYPTO_REGISTRY_DIGEST_ENV in applied
+    if path_overridden != digest_overridden:
+        missing_key = (
+            "crypto_identity_registry_sha256"
+            if path_overridden
+            else "crypto_identity_registry_path"
+        )
+        config[missing_key] = None
     return config
 
 
@@ -100,6 +148,25 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "TRADINGAGENTS_MEMORY_LOG_PATH",
         _DEFAULT_MEMORY_LOG_PATH,
     ),
+    # The durable market-history store starts in shadow mode. Current analysis
+    # continues to read the existing live provider chain until the mainland
+    # compatibility gate passes. Switching back to "shadow" is the rollback.
+    "market_history_mode": "shadow",
+    "market_history_database_path": os.path.join(
+        _DEFAULT_MARKET_HISTORY_ROOT,
+        "market_history.sqlite3",
+    ),
+    "market_history_payload_root": os.path.join(
+        _DEFAULT_MARKET_HISTORY_ROOT,
+        "payloads",
+    ),
+    "market_history_backup_root": os.path.join(
+        _DEFAULT_MARKET_HISTORY_ROOT,
+        "backups",
+    ),
+    "data_usage_mode": "personal_research",
+    # Total Yahoo physical calls per coordinated sequence, including the first.
+    "yahoo_max_physical_attempts": 4,
     # Optional cap on the number of resolved memory log entries. When set,
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.
@@ -138,6 +205,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # establish identity when this network-free trust anchor is absent.
     "instrument_identity_registry_path": None,
     "instrument_identity_registry_sha256": None,
+    "crypto_identity_registry_path": _DEFAULT_CRYPTO_REGISTRY_PATH,
+    "crypto_identity_registry_checksum_path": _DEFAULT_CRYPTO_CHECKSUM_PATH,
+    "crypto_identity_registry_id": _DEFAULT_CRYPTO_REGISTRY_ID,
+    "crypto_identity_registry_sha256": _DEFAULT_CRYPTO_REGISTRY_SHA256,
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",

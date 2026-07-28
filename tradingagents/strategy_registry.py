@@ -12,6 +12,7 @@ import io
 import json
 from datetime import date
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from functools import partial
 from hashlib import sha256
 
 from tradingagents.agents.schemas import PortfolioRating
@@ -41,35 +42,71 @@ DEFAULT_DECISION_HORIZON = DecisionHorizon(
     count=20,
     unit=HorizonUnit.TRADING_DAYS,
 )
+CRYPTO_DECISION_HORIZON = DecisionHorizon(
+    count=20,
+    unit=HorizonUnit.CALENDAR_DAYS,
+)
 MARKET_RETURN_FIELD = "market.close_return_20d"
 MARKET_RETURN_UNIT = "ratio"
 MARKET_RETURN_OBSERVATIONS = 21
 MARKET_RETURN_PRECISION = Decimal("0.00000001")
 MARKET_RETURN_IMPLEMENTATION_VERSION = "decimal-close-return-1"
 _SUPPORTED_ADJUSTMENT_BASES = ("auto_adjusted", "qfq")
+_MARKET_SESSION_INSTRUMENT_KINDS = (
+    InstrumentKind.EQUITY,
+    InstrumentKind.FUND,
+    InstrumentKind.INDEX,
+    InstrumentKind.BOND,
+)
 
 
-def market_return_calculation_id(adjustment_basis: str) -> str:
+class InsufficientStrategyHistoryError(ValueError):
+    """Raised when a registered observation window cannot be assembled."""
+
+
+def market_return_calculation_id(
+    adjustment_basis: str,
+    instrument_kind: InstrumentKind = InstrumentKind.EQUITY,
+) -> str:
+    if instrument_kind is InstrumentKind.CRYPTO:
+        return f"market.close_return_20d.crypto.{adjustment_basis}"
     return f"market.close_return_20d.{adjustment_basis}"
 
 
 def market_return_calculation_definitions() -> tuple[CalculationDefinition, ...]:
     return tuple(
         CalculationDefinition(
-            calculation_id=market_return_calculation_id(adjustment_basis),
+            calculation_id=market_return_calculation_id(
+                adjustment_basis,
+                instrument_kind,
+            ),
             version="1.0",
             input_fields=("Close",),
-            input_frequency="trading_day",
+            input_frequency=(
+                "calendar_day"
+                if instrument_kind is InstrumentKind.CRYPTO
+                else "trading_day"
+            ),
+            applicable_instrument_kinds=(
+                (InstrumentKind.CRYPTO,)
+                if instrument_kind is InstrumentKind.CRYPTO
+                else _MARKET_SESSION_INSTRUMENT_KINDS
+            ),
             minimum_history_rows=MARKET_RETURN_OBSERVATIONS,
             warmup_rows=MARKET_RETURN_OBSERVATIONS - 1,
             adjustment_basis=adjustment_basis,
             missing_value_policy=MissingValuePolicy.FAIL,
             formula="(close[t] / close[t-20]) - 1",
-            implementation_version=MARKET_RETURN_IMPLEMENTATION_VERSION,
+            implementation_version=(
+                "decimal-calendar-close-return-1"
+                if instrument_kind is InstrumentKind.CRYPTO
+                else MARKET_RETURN_IMPLEMENTATION_VERSION
+            ),
             output_field=MARKET_RETURN_FIELD,
             output_unit=MARKET_RETURN_UNIT,
             precision=8,
         )
+        for instrument_kind in (InstrumentKind.EQUITY, InstrumentKind.CRYPTO)
         for adjustment_basis in _SUPPORTED_ADJUSTMENT_BASES
     )
 
@@ -77,49 +114,108 @@ def market_return_calculation_definitions() -> tuple[CalculationDefinition, ...]
 def _tail_observation_span(raw_text: str) -> tuple[int, int]:
     lines = raw_text.splitlines(keepends=True)
     if len(lines) < MARKET_RETURN_OBSERVATIONS + 1:
-        raise ValueError("market snapshot has insufficient history")
+        raise InsufficientStrategyHistoryError(
+            "market snapshot has insufficient history"
+        )
     start = sum(len(line) for line in lines[:-MARKET_RETURN_OBSERVATIONS])
     return start, len(raw_text)
 
 
-def calculate_market_return(raw_text: str) -> Decimal:
+def calculate_market_return(
+    raw_text: str,
+    *,
+    instrument_kind: InstrumentKind = InstrumentKind.EQUITY,
+) -> Decimal:
     rows = tuple(csv.DictReader(io.StringIO(raw_text)))
     if len(rows) < MARKET_RETURN_OBSERVATIONS:
-        raise ValueError("market snapshot has insufficient history")
+        raise InsufficientStrategyHistoryError(
+            "market snapshot has insufficient history"
+        )
     selected = rows[-MARKET_RETURN_OBSERVATIONS:]
+    if instrument_kind is InstrumentKind.CRYPTO:
+        try:
+            observation_dates = tuple(
+                date.fromisoformat(row["Date"]) for row in selected
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("crypto market snapshot dates are invalid") from exc
+        if any(
+            (current - previous).days != 1
+            for previous, current in zip(
+                observation_dates[:-1],
+                observation_dates[1:],
+                strict=True,
+            )
+        ):
+            raise InsufficientStrategyHistoryError(
+                "crypto market snapshot dates are not consecutive calendar days"
+            )
     try:
-        first_close = Decimal(selected[0]["Close"])
-        last_close = Decimal(selected[-1]["Close"])
+        closes = tuple(Decimal(row["Close"]) for row in selected)
     except (InvalidOperation, KeyError, TypeError) as exc:
+        if instrument_kind is InstrumentKind.CRYPTO:
+            raise InsufficientStrategyHistoryError(
+                "crypto market snapshot requires 21 valid daily closes"
+            ) from exc
         raise ValueError("market snapshot close values are invalid") from exc
-    if not first_close.is_finite() or not last_close.is_finite() or first_close <= 0:
+    if any(not close.is_finite() or close <= 0 for close in closes):
+        if instrument_kind is InstrumentKind.CRYPTO:
+            raise InsufficientStrategyHistoryError(
+                "crypto market snapshot requires 21 valid daily closes"
+            )
         raise ValueError("market snapshot close values are invalid")
+    first_close = closes[0]
+    last_close = closes[-1]
     return ((last_close / first_close) - Decimal(1)).quantize(
         MARKET_RETURN_PRECISION,
         rounding=ROUND_HALF_EVEN,
     )
 
 
-def build_market_return_fact(snapshot, artifact: SourceArtifact) -> SourceFact:
+def build_market_return_fact(
+    snapshot,
+    artifact: SourceArtifact,
+    *,
+    instrument_kind: InstrumentKind = InstrumentKind.EQUITY,
+) -> SourceFact:
     definitions = {
-        definition.adjustment_basis: definition
+        (applicable_kind, definition.adjustment_basis): definition
         for definition in market_return_calculation_definitions()
+        if definition.applicable_instrument_kinds is not None
+        for applicable_kind in definition.applicable_instrument_kinds
     }
     try:
-        definition = definitions[snapshot.adjustment_basis]
+        definition = definitions[(instrument_kind, snapshot.adjustment_basis)]
     except KeyError as exc:
-        raise ValueError("market snapshot adjustment basis is not registered") from exc
+        raise ValueError(
+            "market snapshot instrument kind and adjustment basis are not registered"
+        ) from exc
 
     rows = tuple(csv.DictReader(io.StringIO(artifact.raw_text)))
     if len(rows) < MARKET_RETURN_OBSERVATIONS:
-        raise ValueError("market snapshot has insufficient history")
+        raise InsufficientStrategyHistoryError(
+            "market snapshot has insufficient history"
+        )
     selected = rows[-MARKET_RETURN_OBSERVATIONS:]
     try:
         effective_range_start = selected[0]["Date"]
         effective_range_end = selected[-1]["Date"]
     except (KeyError, TypeError) as exc:
         raise ValueError("market snapshot dates are invalid") from exc
-    value = calculate_market_return(artifact.raw_text)
+    blocking_gaps = tuple(
+        str(gap_date)
+        for gap_date in getattr(snapshot, "history_gap_dates", ())
+        if effective_range_start <= str(gap_date) <= effective_range_end
+    )
+    if blocking_gaps:
+        raise ValueError(
+            "History Gap intersects the registered market-return input window: "
+            + ", ".join(blocking_gaps)
+        )
+    value = calculate_market_return(
+        artifact.raw_text,
+        instrument_kind=instrument_kind,
+    )
     span_start, span_end = _tail_observation_span(artifact.raw_text)
     fact_id = stable_source_fact_id(
         source_ref=artifact.source_ref,
@@ -170,6 +266,8 @@ def _market_return_adapter(
     artifact: SourceArtifact,
     source_span_start: int,
     source_span_end: int,
+    *,
+    instrument_kind: InstrumentKind = InstrumentKind.EQUITY,
 ) -> CanonicalFactAdapterResult:
     if (source_span_start, source_span_end) != _tail_observation_span(
         artifact.raw_text
@@ -179,7 +277,10 @@ def _market_return_adapter(
     selected = rows[-MARKET_RETURN_OBSERVATIONS:]
     return CanonicalFactAdapterResult(
         canonical_field=MARKET_RETURN_FIELD,
-        normalized_value=calculate_market_return(artifact.raw_text),
+        normalized_value=calculate_market_return(
+            artifact.raw_text,
+            instrument_kind=instrument_kind,
+        ),
         unit=MARKET_RETURN_UNIT,
         effective_range_start=selected[0]["Date"],
         effective_range_end=selected[-1]["Date"],
@@ -267,44 +368,63 @@ def _market_return_rule_evaluator(
     )
 
 
-def production_strategy_rules() -> tuple[StrategyRuleDefinition, ...]:
+def _market_return_rules(
+    *,
+    instrument_kind: InstrumentKind,
+    horizon: DecisionHorizon,
+    rule_prefix: str,
+) -> tuple[StrategyRuleDefinition, ...]:
     common = {
         "version": "1.0",
-        "applicable_instrument_kinds": (
-            InstrumentKind.EQUITY,
-        ),
+        "applicable_instrument_kinds": (instrument_kind,),
         "required_canonical_fields": (MARKET_RETURN_FIELD,),
         "polarity": RulePolarity.SUPPORTS,
-        "horizon": DEFAULT_DECISION_HORIZON,
+        "horizon": horizon,
         "predicate_id": "market_return_threshold",
         "max_fact_age_days": 10,
         "minimum_history_rows": MARKET_RETURN_OBSERVATIONS,
         "missing_fact_behavior": MissingFactBehavior.BLOCK,
         "block_on_conflict": True,
-        "implementation_version": "market-return-threshold-1",
+        "implementation_version": (
+            "calendar-market-return-threshold-1"
+            if instrument_kind is InstrumentKind.CRYPTO
+            else "market-return-threshold-1"
+        ),
     }
     return (
         StrategyRuleDefinition(
-            rule_id="market.return_20d.buy",
+            rule_id=f"{rule_prefix}.buy",
             target_rating=PortfolioRating.BUY,
             comparator="greater_than_or_equal",
             threshold=Decimal("0.05"),
             **common,
         ),
         StrategyRuleDefinition(
-            rule_id="market.return_20d.hold",
+            rule_id=f"{rule_prefix}.hold",
             target_rating=PortfolioRating.HOLD,
             comparator="absolute_value_less_than",
             threshold=Decimal("0.05"),
             **common,
         ),
         StrategyRuleDefinition(
-            rule_id="market.return_20d.sell",
+            rule_id=f"{rule_prefix}.sell",
             target_rating=PortfolioRating.SELL,
             comparator="less_than_or_equal",
             threshold=Decimal("-0.05"),
             **common,
         ),
+    )
+
+
+def production_strategy_rules() -> tuple[StrategyRuleDefinition, ...]:
+    return _market_return_rules(
+        instrument_kind=InstrumentKind.EQUITY,
+        horizon=DEFAULT_DECISION_HORIZON,
+        rule_prefix="market.return_20d",
+    ) + _market_return_rules(
+        instrument_kind=InstrumentKind.CRYPTO,
+        horizon=CRYPTO_DECISION_HORIZON,
+        rule_prefix="market.return_20d.crypto",
     )
 
 
@@ -315,14 +435,25 @@ def create_production_decision_policy() -> DecisionPolicyEngine:
         evaluators={"market_return_threshold": _market_return_rule_evaluator},
         calculation_definitions=definitions,
         fact_adapters={
-            (definition.calculation_id, definition.version): _market_return_adapter
+            (definition.calculation_id, definition.version): partial(
+                _market_return_adapter,
+                instrument_kind=(
+                    InstrumentKind.CRYPTO
+                    if definition.applicable_instrument_kinds
+                    == (InstrumentKind.CRYPTO,)
+                    else InstrumentKind.EQUITY
+                ),
+            )
             for definition in definitions
+            if definition.applicable_instrument_kinds is not None
         },
     )
 
 
 __all__ = [
+    "CRYPTO_DECISION_HORIZON",
     "DEFAULT_DECISION_HORIZON",
+    "InsufficientStrategyHistoryError",
     "MARKET_RETURN_FIELD",
     "MARKET_RETURN_IMPLEMENTATION_VERSION",
     "MARKET_RETURN_OBSERVATIONS",

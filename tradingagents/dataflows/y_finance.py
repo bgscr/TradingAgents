@@ -4,11 +4,20 @@ from typing import Annotated
 import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
+from yfinance.exceptions import YFRateLimitError
 
-from .market_snapshot import validate_ohlcv_frame
+from tradingagents.market_history.coordinator import (
+    PhysicalAttemptFailure,
+    PhysicalAttemptOutcome,
+)
+
+from .errors import VendorRateLimitError
+from .market_snapshot import OHLCVValidationError, validate_ohlcv_frame
 from .stockstats_utils import (
     StockstatsUtils,
     _assert_ohlcv_not_stale,
+    _physical_attempt_failure_from_yahoo_exception,
+    _yahoo_session_guard,
     filter_financials_by_date,
     load_ohlcv,
     yf_retry,
@@ -33,27 +42,34 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_inclusive))
+    def load_and_validate_history() -> pd.DataFrame:
+        raw = ticker.history(start=start_date, end=end_inclusive)
+        _validated_yahoo_history_frame(raw, end_date, start_date)
+        return raw
 
-    # Empty result means the symbol is unknown/delisted. Raise a typed error
-    # instead of returning prose: the routing layer turns it into a single
-    # unambiguous "no data" signal so the agent never fabricates a price.
-    if data.empty:
-        raise NoMarketDataError(
-            symbol, canonical, f"no rows between {start_date} and {end_date}"
+    try:
+        data = yf_retry(
+            load_and_validate_history,
+            request_key=f"history-csv:{canonical}:{start_date}:{end_date}",
+            operation="market-snapshot",
+            injected_transport=not type(ticker).__module__.startswith("yfinance"),
         )
+    except PhysicalAttemptFailure as exc:
+        if exc.outcome in {
+            PhysicalAttemptOutcome.EMPTY_FRAME,
+            PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+        }:
+            detail = (
+                "OHLC invariant failed"
+                if exc.error_code == "YAHOO_OHLC_INVARIANT_FAILED"
+                else exc.outcome.value
+            )
+            raise NoMarketDataError(symbol, canonical, detail) from exc
+        raise
 
     # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
+    if isinstance(data.index, pd.DatetimeIndex) and data.index.tz is not None:
         data.index = data.index.tz_localize(None)
-
-    validation_frame = data.reset_index()
-    if "Date" not in validation_frame.columns and "index" in validation_frame.columns:
-        validation_frame = validation_frame.rename(columns={"index": "Date"})
-    try:
-        validate_ohlcv_frame(validation_frame, end_date)
-    except ValueError as exc:
-        raise NoMarketDataError(symbol, canonical, str(exc)) from exc
 
     # Reject a stale frame (e.g. a year-old partial response) before it is
     # formatted into the report. Raises NoMarketDataError, which the router
@@ -84,15 +100,58 @@ def load_ohlcv_range(symbol: str, start_date: str, end_date: str) -> pd.DataFram
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
     canonical = normalize_symbol(symbol)
     ticker = yf.Ticker(canonical)
+    guard = _yahoo_session_guard()
+    if guard.permit_active and not type(ticker).__module__.startswith("yfinance"):
+        guard.mark_injected_transport_attempt()
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_inclusive))
-    if data.empty:
-        raise NoMarketDataError(
-            symbol, canonical, f"no rows between {start_date} and {end_date}"
+    try:
+        # Exactly one high-level Yahoo transport invocation. Retry ownership lives
+        # at the Provider Request Coordinator boundary that calls this adapter.
+        data = ticker.history(start=start_date, end=end_inclusive)
+    except PhysicalAttemptFailure:
+        raise
+    except YFRateLimitError:
+        raise VendorRateLimitError(
+            status_code=429,
+            error_code="YAHOO_HTTP_429",
+        ) from None
+    except Exception as exc:
+        raise _physical_attempt_failure_from_yahoo_exception(exc) from exc
+    return _validated_yahoo_history_frame(data, end_date, start_date)
+
+
+def _validated_yahoo_history_frame(
+    data: object,
+    end_date: str,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    if not isinstance(data, pd.DataFrame):
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+            retryable=False,
         )
-    if data.index.tz is not None:
+    if data.empty:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.EMPTY_FRAME,
+            retryable=True,
+        )
+    if isinstance(data.index, pd.DatetimeIndex) and data.index.tz is not None:
         data.index = data.index.tz_localize(None)
-    return data.reset_index()
+    candidate = data.reset_index()
+    if "Date" not in candidate.columns and "index" in candidate.columns:
+        candidate = candidate.rename(columns={"index": "Date"})
+    try:
+        return validate_ohlcv_frame(candidate, end_date, start_date)
+    except ValueError as exc:
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+            retryable=False,
+            error_code=(
+                "YAHOO_OHLC_INVARIANT_FAILED"
+                if isinstance(exc, OHLCVValidationError)
+                else None
+            ),
+        ) from exc
 
 def get_stock_stats_indicators_window(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -304,7 +363,11 @@ def get_fundamentals(
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
-        info = yf_retry(lambda: ticker_obj.info)
+        info = yf_retry(
+            lambda: ticker_obj.info,
+            request_key=f"fundamentals:{canonical}:{curr_date}",
+            operation="fundamentals",
+        )
 
         if not info:
             raise NoMarketDataError(ticker, canonical, "no fundamentals returned")
@@ -374,9 +437,17 @@ def get_balance_sheet(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
+            data = yf_retry(
+                lambda: ticker_obj.quarterly_balance_sheet,
+                request_key=f"balance-sheet:{canonical}:quarterly:{curr_date}",
+                operation="fundamentals",
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.balance_sheet)
+            data = yf_retry(
+                lambda: ticker_obj.balance_sheet,
+                request_key=f"balance-sheet:{canonical}:annual:{curr_date}",
+                operation="fundamentals",
+            )
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -409,9 +480,17 @@ def get_cashflow(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
+            data = yf_retry(
+                lambda: ticker_obj.quarterly_cashflow,
+                request_key=f"cashflow:{canonical}:quarterly:{curr_date}",
+                operation="fundamentals",
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.cashflow)
+            data = yf_retry(
+                lambda: ticker_obj.cashflow,
+                request_key=f"cashflow:{canonical}:annual:{curr_date}",
+                operation="fundamentals",
+            )
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -444,9 +523,17 @@ def get_income_statement(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
+            data = yf_retry(
+                lambda: ticker_obj.quarterly_income_stmt,
+                request_key=f"income-statement:{canonical}:quarterly:{curr_date}",
+                operation="fundamentals",
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.income_stmt)
+            data = yf_retry(
+                lambda: ticker_obj.income_stmt,
+                request_key=f"income-statement:{canonical}:annual:{curr_date}",
+                operation="fundamentals",
+            )
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -475,7 +562,11 @@ def get_insider_transactions(
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
-        data = yf_retry(lambda: ticker_obj.insider_transactions)
+        data = yf_retry(
+            lambda: ticker_obj.insider_transactions,
+            request_key=f"insider-transactions:{canonical}",
+            operation="fundamentals",
+        )
 
         # Empty is normal here (many valid symbols have no insider filings),
         # so report it plainly rather than treating the symbol as invalid.

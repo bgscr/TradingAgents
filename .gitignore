@@ -223,6 +223,7 @@ __marimo__/
 /logs/
 /data/cache/
 /data/memory/
+/data/market_history/
 reports/
 
 .codegraph/

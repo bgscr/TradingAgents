@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from tradingagents.asset_configuration import RunAssetConfigurationProjection
 from tradingagents.decision_policy import (
     DirectionSelection,
     TradingDecisionContract,
@@ -36,6 +37,14 @@ from tradingagents.terminal_contract import (
     apply_terminal_contract,
     canonical_json_bytes,
 )
+
+
+class _AssetConfigurationFailureProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    contract_version: str
+    reason: str
+    diagnostic_code: str
 
 
 class _AuditValidatedDecisionFact(BaseModel):
@@ -368,6 +377,12 @@ def prepare_decision_audit(
     """Persist source artifacts before authorizing a safe decision audit."""
 
     evidence = EvidenceState.model_validate(final_state.get("evidence_state", {}))
+    from tradingagents.dataflows.market_snapshot import (
+        refresh_active_evidence_physical_attempts,
+    )
+
+    evidence = refresh_active_evidence_physical_attempts(evidence)
+    final_state["evidence_state"] = evidence.model_dump(mode="python")
     manifest = persist_source_artifacts(evidence, Path(directory))
     projection = project_evidence_for_audit(evidence, manifest)
     payload = build_decision_audit(
@@ -402,7 +417,7 @@ def build_decision_audit(
     if analysis_outcome_contract is not None:
         analysis_outcome_contract = AnalysisOutcome.model_validate(
             analysis_outcome_contract
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude_none=True)
     terminal_output: Any
     if terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
         terminal_output = final_state["trading_decision"]
@@ -413,6 +428,30 @@ def build_decision_audit(
     graph_signature = final_state.get("graph_signature")
     if not isinstance(graph_signature, str):
         graph_signature = None
+    raw_asset_configuration = final_state.get("asset_configuration")
+    asset_configuration = (
+        None
+        if raw_asset_configuration is None
+        else RunAssetConfigurationProjection.model_validate(
+            raw_asset_configuration
+        )
+    )
+    if (
+        asset_configuration is not None
+        and graph_signature is not None
+        and asset_configuration.asset_configuration_signature not in graph_signature
+    ):
+        raise ValueError(
+            "graph signature does not commit to the run asset configuration"
+        )
+    raw_asset_failure = final_state.get("asset_configuration_failure")
+    asset_configuration_failure = (
+        None
+        if raw_asset_failure is None
+        else _AssetConfigurationFailureProjection.model_validate(raw_asset_failure)
+    )
+    if asset_configuration is not None and asset_configuration_failure is not None:
+        raise ValueError("run cannot contain both asset configuration and failure")
     raw_telemetry = final_state.get("run_telemetry")
     telemetry = (
         RunTelemetryProjection.empty(
@@ -439,6 +478,16 @@ def build_decision_audit(
             "output_sha256": sha256(_canonical_json(terminal_output)).hexdigest(),
         },
         "telemetry": telemetry.model_dump(mode="json"),
+        "asset_configuration": (
+            asset_configuration.model_dump(mode="json")
+            if asset_configuration is not None
+            else None
+        ),
+        "asset_configuration_failure": (
+            asset_configuration_failure.model_dump(mode="json")
+            if asset_configuration_failure is not None
+            else None
+        ),
         "evidence_state": _evidence_projection.model_dump(mode="json"),
         "evidence_preflight": _project_gate_diagnostics(
             final_state.get("evidence_preflight"),

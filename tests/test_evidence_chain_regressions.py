@@ -2,6 +2,7 @@
 
 import copy
 import re
+from dataclasses import replace
 from hashlib import sha256
 
 import pytest
@@ -403,6 +404,16 @@ def test_reacquired_snapshot_becomes_shared_authority_for_analyst_claims(monkeyp
             "2026-01-15",
             minimum_history_rows=20,
         )
+        degraded = replace(
+            reacquired,
+            history_store_status="degraded",
+            history_store_diagnostic="shadow_write_failed:disk_full",
+        )
+        monkeypatch.setattr(
+            submission,
+            "get_active_authoritative_market_snapshot",
+            lambda *_args: degraded,
+        )
         shorter = get_authoritative_market_snapshot(
             "NVDA", "2026-01-01", "2026-01-15"
         )
@@ -465,6 +476,11 @@ def test_reacquired_snapshot_becomes_shared_authority_for_analyst_claims(monkeyp
     evidence = EvidenceState.model_validate(update["evidence_state"])
     assert evidence.market_snapshot is not None
     assert evidence.market_snapshot.snapshot_id == reacquired.snapshot_id
+    assert evidence.market_snapshot.history_store_status == "degraded"
+    assert (
+        evidence.market_snapshot.history_store_diagnostic
+        == "shadow_write_failed:disk_full"
+    )
     market_outcomes = [
         outcome
         for outcome in evidence.acquisition_outcomes

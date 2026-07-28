@@ -28,6 +28,7 @@ from tradingagents.dataflows.instrument_identity import (
     IdentityRegistryAvailable,
     resolve_authoritative_instrument_identity,
 )
+from tradingagents.dataflows.stockstats_utils import yf_retry
 
 # Public surface: the data tools are imported here so agents and the graph
 # import them from one place, plus the instrument/language helpers defined below.
@@ -113,7 +114,12 @@ def resolve_instrument_identity(ticker: str) -> dict:
     provider_identity: dict[str, str] = {}
     yahoo_failed = False
     try:
-        info = yf.Ticker(normalize_symbol(ticker)).info or {}
+        canonical = normalize_symbol(ticker)
+        info = yf_retry(
+            lambda: yf.Ticker(canonical).info,
+            request_key=f"instrument-identity:{canonical}",
+            operation="instrument-identity",
+        ) or {}
     except Exception as exc:  # noqa: BLE001 — fail open, never block the run
         logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)
         info = {}

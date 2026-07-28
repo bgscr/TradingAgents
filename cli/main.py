@@ -48,14 +48,21 @@ from cli.utils import (
     select_research_depth,
     select_shallow_thinking_agent,
 )
+from tradingagents.asset_configuration import (
+    RunAssetConfigurationError,
+    resolve_run_asset_configuration,
+)
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.evidence import asset_configuration_failure_evidence
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
     get_initial_analyst_node,
 )
+from tradingagents.graph.evidence_gate import create_preflight_gate_node
+from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import CheckpointSession, TradingAgentsGraph
 from tradingagents.recorded_replay import (
     DEFAULT_RECORDED_FIXTURE_MANIFEST,
@@ -63,6 +70,7 @@ from tradingagents.recorded_replay import (
     replay_recorded_run,
 )
 from tradingagents.reporting import write_report_tree
+from tradingagents.strategy_registry import create_production_decision_policy
 from tradingagents.terminal_contract import configuration_digest
 
 configure_utf8_stdio()
@@ -1582,11 +1590,61 @@ def _append_line_to_run_logs(paths: list[Path], line: str) -> None:
             f.write(line)
 
 
+def _complete_asset_configuration_failure(
+    *,
+    selections: dict,
+    config: dict,
+    artifacts: dict,
+    error: RunAssetConfigurationError,
+) -> dict:
+    """Publish a typed non-directional result without constructing a graph."""
+
+    evidence = asset_configuration_failure_evidence(error)
+    final_state = Propagator().create_initial_state(
+        selections["ticker"],
+        selections["analysis_date"],
+        asset_type=selections["asset_type"],
+        evidence_state=evidence,
+    )
+    final_state.update(
+        create_preflight_gate_node(
+            create_production_decision_policy(),
+            None,
+        )(final_state)
+    )
+    final_state["graph_signature"] = "asset_configuration=unavailable:v1"
+    final_state["evidence_gate_mode"] = config.get("evidence_gate_mode", "enforce")
+    final_state["asset_configuration_failure"] = {
+        "contract_version": "1.0",
+        "reason": error.reason.value,
+        "diagnostic_code": error.diagnostic_code,
+    }
+    _write_run_reports(final_state, selections["ticker"], artifacts)
+    _mark_run_completed(final_state, artifacts)
+    return final_state
+
+
 def run_analysis(checkpoint: bool | None = None):
     # First get all user selections
     selections = get_user_selections()
 
     config = _build_run_config(selections, checkpoint)
+    asset_configuration = None
+    asset_configuration_error = None
+    should_resolve_asset = selections["asset_type"] == "crypto"
+    if should_resolve_asset:
+        try:
+            asset_configuration = resolve_run_asset_configuration(
+                selections["ticker"],
+                config=config,
+            )
+        except RunAssetConfigurationError as exc:
+            asset_configuration_error = exc
+        else:
+            config = dict(config)
+            config["asset_configuration_signature"] = (
+                asset_configuration.asset_configuration_signature
+            )
 
     artifacts = None
     current_phase = "setup"
@@ -1606,6 +1664,17 @@ def run_analysis(checkpoint: bool | None = None):
     artifacts["runtime_writer"] = runtime_writer
     stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
     artifacts["stats_handler"] = stats_handler
+    if asset_configuration_error is not None:
+        try:
+            return _complete_asset_configuration_failure(
+                selections=selections,
+                config=config,
+                artifacts=artifacts,
+                error=asset_configuration_error,
+            )
+        finally:
+            with suppress(Exception):
+                runtime_writer.close()
     current_phase = "graph_initializing"
     _update_run_status(artifacts, current_phase="graph_initializing")
     report_dir = artifacts["report_dir"]
@@ -1617,6 +1686,8 @@ def run_analysis(checkpoint: bool | None = None):
             config=config,
             debug=True,
             callbacks=[stats_handler],
+            asset_type=selections["asset_type"],
+            asset_configuration=asset_configuration,
         )
 
         # Initialize message buffer with selected analysts
@@ -2055,6 +2126,60 @@ def runtime_artifacts_gc(
     )
     for candidate in report.candidates:
         typer.echo(str(candidate))
+
+
+@app.command("crypto-identity-registry-refresh")
+def crypto_identity_registry_refresh(
+    candidate: Annotated[
+        Path,
+        typer.Argument(
+            help="Offline crypto registry candidate JSON to validate and publish."
+        ),
+    ],
+    registry_path: Annotated[
+        Path | None,
+        typer.Option(help="Registry JSON path; defaults to the production registry."),
+    ] = None,
+    checksum_path: Annotated[
+        Path | None,
+        typer.Option(help="SHA-256 manifest path; defaults beside the registry."),
+    ] = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option(help="Environment file updated with the crypto registry pin."),
+    ] = None,
+    full_tests: Annotated[
+        bool,
+        typer.Option("--full-tests", help="Run the complete test suite after refresh."),
+    ] = False,
+) -> None:
+    """Validate an offline crypto candidate, publish all pins, and verify."""
+    from tradingagents.dataflows.identity_registry_refresh import (
+        DEFAULT_CRYPTO_REGISTRY_PATH,
+        DEFAULT_ENV_PATH,
+        RegistryRefreshError,
+        refresh_crypto_identity_registry,
+    )
+
+    resolved_registry_path = registry_path or DEFAULT_CRYPTO_REGISTRY_PATH
+    try:
+        result = refresh_crypto_identity_registry(
+            candidate_path=candidate,
+            registry_path=resolved_registry_path,
+            checksum_path=checksum_path
+            or resolved_registry_path.with_suffix(".sha256"),
+            env_path=env_file or DEFAULT_ENV_PATH,
+            full_tests=full_tests,
+        )
+    except RegistryRefreshError as exc:
+        typer.echo(f"Crypto registry refresh failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Crypto registry refreshed rows={len(result.added)}")
+    typer.echo(f"Registry: {result.registry_path}")
+    typer.echo(f"SHA-256: {result.digest}")
+    typer.echo(f"Environment: {result.env_path}")
+    typer.echo("Tests passed")
 
 
 @app.command("identity-registry-refresh")

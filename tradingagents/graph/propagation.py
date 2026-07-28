@@ -6,6 +6,7 @@ from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.evidence import EvidenceState
 
 
@@ -24,6 +25,7 @@ class Propagator:
         past_context: str = "",
         instrument_context: str = "",
         evidence_state: EvidenceState | None = None,
+        asset_configuration: RunAssetConfiguration | None = None,
         run_id: str = "",
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph.
@@ -38,6 +40,11 @@ class Propagator:
             "messages": [("human", company_name)],
             "company_of_interest": company_name,
             "asset_type": asset_type,
+            "asset_configuration": (
+                asset_configuration.model_dump(mode="json")
+                if asset_configuration is not None
+                else None
+            ),
             "instrument_context": instrument_context,
             "trade_date": str(trade_date),
             "run_id": run_id,

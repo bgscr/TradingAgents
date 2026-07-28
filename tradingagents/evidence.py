@@ -18,10 +18,12 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 if TYPE_CHECKING:
+    from tradingagents.asset_configuration import RunAssetConfiguration
     from tradingagents.decision_policy import DecisionHorizon, DecisionPolicyEngine
 
 EVIDENCE_CONTRACT_VERSION = "1.0"
@@ -216,6 +218,7 @@ class AnalysisDiagnosticCode(str, Enum):
     SHADOW_MODE = "shadow_mode"
     DETERMINISTIC_GATE_REJECTED = "deterministic_gate_rejected"
     OPTIONAL_EVIDENCE_UNAVAILABLE = "optional_evidence_unavailable"
+    INSTRUMENT_CURRENTLY_SUSPENDED = "instrument_currently_suspended"
 
 
 class ClaimValidationStatus(str, Enum):
@@ -260,6 +263,18 @@ class IdentityProvenance(BaseModel):
     source_ref: str = Field(min_length=1)
     retrieved_at: str = Field(min_length=1)
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TradingStatusProvenanceEvidence(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    provider: str = Field(min_length=1)
+    provider_dataset_id: str = Field(min_length=1)
+    session_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    status: Literal["traded", "suspended"]
+    observed_at: str = Field(min_length=1)
+    revision_id: str | None = None
 
 
 class CapabilityProfile(BaseModel):
@@ -325,6 +340,16 @@ _CAPABILITY_PROFILES = {
         ),
         applicable_analysts=("market", "social", "news"),
     ),
+    InstrumentKind.CRYPTO: CapabilityProfile(
+        profile_id="crypto.v1",
+        instrument_kind=InstrumentKind.CRYPTO,
+        required_capabilities=(EvidenceCapability.MARKET_SNAPSHOT,),
+        optional_capabilities=(
+            EvidenceCapability.INSTRUMENT_NEWS,
+            EvidenceCapability.SOCIAL_SENTIMENT,
+        ),
+        applicable_analysts=("market", "social", "news"),
+    ),
 }
 
 
@@ -384,6 +409,75 @@ class InstrumentIdentityEvidence(BaseModel):
         )
 
 
+class ProviderPhysicalAttemptEvidence(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    sequence_id: str = Field(min_length=1)
+    request_key: str = Field(min_length=1)
+    upstream_service_id: str = Field(min_length=1)
+    upstream_service_name: str = Field(min_length=1)
+    attempt_index: int = Field(ge=1)
+    attempted_at: str = Field(min_length=1)
+    pacing_event: Literal[
+        "permit_acquired", "paced_then_permit_acquired"
+    ]
+    pacing_wait_seconds: float = Field(ge=0, allow_inf_nan=False)
+    outcome: Literal[
+        "available",
+        "rate_limited",
+        "timeout",
+        "disconnect",
+        "empty_frame",
+        "authentication",
+        "malformed_response",
+        "provider_error",
+        "upstream_busy",
+    ]
+    retryable: bool
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    error_code: str | None = None
+    retry_after_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    cooldown_changed: bool
+    cooldown_until: str | None = None
+    final_physical_attempt_count: int = Field(ge=1)
+
+    @field_validator("attempted_at")
+    @classmethod
+    def _validate_attempted_at(cls, value: str) -> str:
+        return _require_concrete_utc_timestamp(value)
+
+    @field_validator("cooldown_until")
+    @classmethod
+    def _validate_cooldown_until(cls, value: str | None) -> str | None:
+        return _require_concrete_utc_timestamp(value) if value is not None else None
+
+
+def _validate_physical_attempt_accounting(
+    events: tuple[ProviderPhysicalAttemptEvidence, ...],
+    count: int,
+) -> None:
+    if count != len(events):
+        raise ValueError("physical-attempt count must match the event sequence")
+    by_sequence: dict[str, list[ProviderPhysicalAttemptEvidence]] = {}
+    for event in events:
+        by_sequence.setdefault(event.sequence_id, []).append(event)
+    for sequence_events in by_sequence.values():
+        expected_count = len(sequence_events)
+        if [event.attempt_index for event in sequence_events] != list(
+            range(1, expected_count + 1)
+        ):
+            raise ValueError("physical-attempt indices must be contiguous")
+        if any(
+            event.final_physical_attempt_count != expected_count
+            for event in sequence_events
+        ):
+            raise ValueError("physical-attempt final count is inconsistent")
+
+
 class MarketSnapshotEvidence(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -397,6 +491,76 @@ class MarketSnapshotEvidence(BaseModel):
     history_rows: int = Field(ge=0)
     frame_sha256: str = ""
     snapshot_id: str = ""
+    snapshot_id_version: Literal["v1", "v2"] = "v1"
+    pin_membership_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
+    current_status_provenance: TradingStatusProvenanceEvidence | None = None
+    latest_traded_close: Decimal | None = None
+    latest_traded_close_diagnostic: str | None = None
+    carried_suspension_close: Decimal | None = None
+    history_gap_dates: tuple[str, ...] = ()
+    history_store_status: Literal["live", "stored", "degraded"] = "live"
+    history_store_diagnostic: str | None = None
+    physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
+    physical_attempt_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_authoritative_status(self) -> MarketSnapshotEvidence:
+        provenance = self.current_status_provenance
+        if self.current_tradeability == "unknown":
+            if (
+                provenance is not None
+                or self.latest_traded_close is not None
+                or self.carried_suspension_close is not None
+            ):
+                raise ValueError(
+                    "unknown tradeability cannot carry authoritative status values"
+                )
+            return self
+        if provenance is None:
+            raise ValueError(
+                "authoritative current tradeability requires status provenance"
+            )
+        expected_status = (
+            "suspended" if self.current_tradeability == "suspended" else "traded"
+        )
+        if (
+            provenance.provider != self.provider
+            or provenance.session_date != self.effective_trading_date
+            or provenance.status != expected_status
+        ):
+            raise ValueError(
+                "authoritative status provenance contradicts the market snapshot"
+            )
+        if self.latest_traded_close is None:
+            if not self.latest_traded_close_diagnostic:
+                raise ValueError("unavailable latest traded close requires a diagnostic")
+        elif self.latest_traded_close_diagnostic is not None:
+            raise ValueError(
+                "available latest traded close cannot carry an unavailable diagnostic"
+            )
+        if self.current_tradeability == "suspended":
+            if self.carried_suspension_close is None:
+                raise ValueError("suspended tradeability requires a carried close")
+        else:
+            if self.carried_suspension_close is not None:
+                raise ValueError("tradeable status cannot carry a suspension close")
+            if self.latest_traded_close is None:
+                raise ValueError(
+                    "tradeable status requires the latest genuinely traded close"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_physical_attempt_accounting(self) -> MarketSnapshotEvidence:
+        _validate_physical_attempt_accounting(
+            self.physical_attempt_events,
+            self.physical_attempt_count,
+        )
+        return self
 
 
 class MaterialClaim(BaseModel):
@@ -497,6 +661,7 @@ class CalculationDefinition(BaseModel):
     version: str = Field(min_length=1)
     input_fields: tuple[str, ...] = Field(min_length=1)
     input_frequency: str = Field(min_length=1)
+    applicable_instrument_kinds: tuple[InstrumentKind, ...] | None = None
     minimum_history_rows: int = Field(ge=1)
     warmup_rows: int = Field(ge=0)
     adjustment_basis: str = Field(min_length=1)
@@ -665,12 +830,16 @@ class SourceArtifact(BaseModel):
 class AcquisitionUnavailableReason(str, Enum):
     RATE_LIMITED = "rate_limited"
     TIMEOUT = "timeout"
+    DISCONNECT = "disconnect"
+    EMPTY_FRAME = "empty_frame"
     NOT_CONFIGURED = "not_configured"
     NO_DATA = "no_data"
     AUTHENTICATION = "authentication"
     MALFORMED_RESPONSE = "malformed_response"
     INSUFFICIENT_HISTORY = "insufficient_history"
     PROVIDER_ERROR = "provider_error"
+    UPSTREAM_BUSY = "upstream_busy"
+    USAGE_NOT_ENTITLED = "usage_not_entitled"
     REGISTRY_NOT_CONFIGURED = "registry_not_configured"
     REGISTRY_UNAVAILABLE = "registry_unavailable"
     IDENTITY_NOT_FOUND = "identity_not_found"
@@ -1048,6 +1217,8 @@ class EvidenceState(BaseModel):
     claim_validations: tuple[ClaimValidation, ...] = ()
     sources: tuple[EvidenceSource, ...] = ()
     acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
+    physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
+    physical_attempt_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _canonicalize_source_fact_collection(self) -> EvidenceState:
@@ -1063,6 +1234,38 @@ class EvidenceState(BaseModel):
         value: tuple[SourceAcquisitionOutcome, ...],
     ) -> tuple[SourceAcquisitionOutcome, ...]:
         return _canonicalize_source_acquisition_outcomes(value)
+
+    @model_validator(mode="after")
+    def validate_physical_attempt_accounting(self) -> EvidenceState:
+        events = self.physical_attempt_events
+        count = self.physical_attempt_count
+        snapshot = self.market_snapshot
+        run_attempt_fields_omitted = {
+            "physical_attempt_events",
+            "physical_attempt_count",
+        }.isdisjoint(self.model_fields_set)
+        if run_attempt_fields_omitted and snapshot is not None:
+            events = snapshot.physical_attempt_events
+            count = snapshot.physical_attempt_count
+            object.__setattr__(self, "physical_attempt_events", events)
+            object.__setattr__(self, "physical_attempt_count", count)
+        _validate_physical_attempt_accounting(
+            events,
+            count,
+        )
+        if snapshot is not None and (
+            snapshot.physical_attempt_events != events
+            or snapshot.physical_attempt_count != count
+        ):
+            snapshot_payload = snapshot.model_dump(mode="python")
+            snapshot_payload["physical_attempt_events"] = events
+            snapshot_payload["physical_attempt_count"] = count
+            object.__setattr__(
+                self,
+                "market_snapshot",
+                MarketSnapshotEvidence.model_validate(snapshot_payload),
+            )
+        return self
 
 
 def merge_material_claims(
@@ -2266,6 +2469,19 @@ def build_evidence_state(
         )
     market_snapshot = None
     if snapshot is not None:
+        status_provenance = getattr(snapshot, "current_status_provenance", None)
+        canonical_status_provenance = (
+            TradingStatusProvenanceEvidence(
+                provider=status_provenance.provider,
+                provider_dataset_id=status_provenance.provider_dataset_id,
+                session_date=status_provenance.session_date.isoformat(),
+                status=status_provenance.status.value,
+                observed_at=status_provenance.observed_at.isoformat(),
+                revision_id=status_provenance.revision_id,
+            )
+            if status_provenance is not None
+            else None
+        )
         market_snapshot = MarketSnapshotEvidence(
             symbol=snapshot.symbol,
             provider=snapshot.provider,
@@ -2276,6 +2492,60 @@ def build_evidence_state(
             history_rows=len(snapshot.frame),
             frame_sha256=snapshot.frame_sha256,
             snapshot_id=snapshot.snapshot_id,
+            snapshot_id_version=getattr(snapshot, "snapshot_id_version", "v1"),
+            pin_membership_digest=getattr(
+                snapshot,
+                "pin_membership_digest",
+                None,
+            ),
+            current_tradeability=getattr(snapshot, "current_tradeability", "unknown"),
+            current_status_provenance=canonical_status_provenance,
+            latest_traded_close=getattr(snapshot, "latest_traded_close", None),
+            latest_traded_close_diagnostic=getattr(
+                snapshot,
+                "latest_traded_close_diagnostic",
+                None,
+            ),
+            carried_suspension_close=getattr(
+                snapshot,
+                "carried_suspension_close",
+                None,
+            ),
+            history_gap_dates=getattr(snapshot, "history_gap_dates", ()),
+            history_store_status=getattr(snapshot, "history_store_status", "live"),
+            history_store_diagnostic=getattr(
+                snapshot,
+                "history_store_diagnostic",
+                None,
+            ),
+            physical_attempt_events=tuple(
+                ProviderPhysicalAttemptEvidence(
+                    sequence_id=event.sequence_id,
+                    request_key=event.request_key,
+                    upstream_service_id=event.upstream_service_id,
+                    upstream_service_name=event.upstream_service_name,
+                    attempt_index=event.attempt_index,
+                    attempted_at=event.attempted_at.isoformat(),
+                    pacing_event=event.pacing_event,
+                    pacing_wait_seconds=event.pacing_wait_seconds,
+                    outcome=event.outcome.value,
+                    retryable=event.retryable,
+                    status_code=event.status_code,
+                    error_code=event.error_code,
+                    retry_after_seconds=event.retry_after_seconds,
+                    cooldown_changed=event.cooldown_changed,
+                    cooldown_until=(
+                        event.cooldown_until.isoformat()
+                        if event.cooldown_until is not None
+                        else None
+                    ),
+                    final_physical_attempt_count=event.final_physical_attempt_count,
+                )
+                for event in getattr(snapshot, "physical_attempt_events", ())
+            ),
+            physical_attempt_count=len(
+                getattr(snapshot, "physical_attempt_events", ())
+            ),
         )
     return EvidenceState(
         instrument_identity=instrument_identity,
@@ -2289,11 +2559,13 @@ def acquire_run_evidence(
     *,
     decision_policy: DecisionPolicyEngine | None = None,
     decision_horizon: DecisionHorizon | None = None,
+    asset_configuration: RunAssetConfiguration | None = None,
 ) -> EvidenceState:
     """Acquire run identity and the validated five-year market snapshot."""
     from tradingagents.dataflows.errors import NoMarketDataError
     from tradingagents.dataflows.instrument_identity import (
         IdentityRegistryAvailable,
+        IdentityRegistryUnavailable,
         RegistryFailureReason,
         resolve_authoritative_instrument_identity,
     )
@@ -2303,8 +2575,10 @@ def acquire_run_evidence(
         get_authoritative_market_snapshot,
     )
     from tradingagents.strategy_registry import (
+        CRYPTO_DECISION_HORIZON,
         DEFAULT_DECISION_HORIZON,
         MARKET_RETURN_OBSERVATIONS,
+        InsufficientStrategyHistoryError,
         build_market_return_fact,
         create_production_decision_policy,
         market_return_calculation_id,
@@ -2312,22 +2586,73 @@ def acquire_run_evidence(
 
     requested = datetime.strptime(requested_date, "%Y-%m-%d")
     start_date = (requested - relativedelta(years=5)).strftime("%Y-%m-%d")
-    if decision_policy is None:
+    using_default_policy = decision_policy is None
+    if using_default_policy:
         decision_policy = create_production_decision_policy()
-        if decision_horizon is None:
-            decision_horizon = DEFAULT_DECISION_HORIZON
-    registry_result = resolve_authoritative_instrument_identity(symbol)
     identity: dict[str, Any] = {}
+    resolved_instrument_kind = InstrumentKind.UNKNOWN
     acquired_at = datetime.now(timezone.utc).isoformat()
     market_artifact: SourceArtifact | None = None
 
-    if isinstance(registry_result, IdentityRegistryAvailable):
-        canonical_symbol = registry_result.identity.canonical_symbol
-        identity = registry_result.identity.as_mapping()
-        identity["exchange"] = registry_result.identity.venue
+    if asset_configuration is not None:
+        configured_identity = asset_configuration.instrument_identity
+        if asset_configuration.instrument_kind is InstrumentKind.CRYPTO:
+            from tradingagents.dataflows.crypto_universe import (
+                canonical_supported_crypto_symbol,
+            )
+
+            requested_identity = canonical_supported_crypto_symbol(symbol)
+        else:
+            requested_identity = symbol.strip().upper()
+        if requested_identity != configured_identity.symbol:
+            raise ValueError("run asset identity does not match requested instrument")
+        if (
+            decision_horizon is not None
+            and decision_horizon != asset_configuration.horizon
+        ):
+            raise ValueError("run asset horizon does not match evidence configuration")
+        decision_horizon = asset_configuration.horizon
+        resolved_instrument_kind = asset_configuration.instrument_kind
+        identity = {
+            "canonical_symbol": configured_identity.symbol,
+            "venue": configured_identity.venue,
+            "exchange": configured_identity.venue,
+            "instrument_kind": configured_identity.instrument_kind.value,
+            "currency": configured_identity.currency,
+            "provenance": configured_identity.provenance,
+            "company_name": configured_identity.display_name,
+        }
+        registry_available = True
+        registry_sha256 = asset_configuration.registry_digest
+        registry_source_ref = asset_configuration.registry_source_ref
+        registry_raw_artifact = asset_configuration.registry_artifact
+    else:
+        registry_result = resolve_authoritative_instrument_identity(symbol)
+        registry_available = isinstance(registry_result, IdentityRegistryAvailable)
+        if registry_available:
+            registry_sha256 = registry_result.registry_sha256
+            registry_source_ref = registry_result.registry_source_ref
+            registry_raw_artifact = registry_result.raw_artifact
+
+    if registry_available:
+        if asset_configuration is None:
+            canonical_symbol = registry_result.identity.canonical_symbol
+            resolved_instrument_kind = InstrumentKind(
+                registry_result.identity.instrument_kind
+            )
+            identity = registry_result.identity.as_mapping()
+            identity["exchange"] = registry_result.identity.venue
+        else:
+            canonical_symbol = asset_configuration.instrument_identity.symbol
+        if using_default_policy and decision_horizon is None:
+            decision_horizon = (
+                CRYPTO_DECISION_HORIZON
+                if resolved_instrument_kind is InstrumentKind.CRYPTO
+                else DEFAULT_DECISION_HORIZON
+            )
         minimum_history_rows = (
             decision_policy.preflight_minimum_history_rows(
-                InstrumentKind(registry_result.identity.instrument_kind),
+                resolved_instrument_kind,
                 decision_horizon,
             )
             if decision_horizon is not None
@@ -2352,15 +2677,15 @@ def acquire_run_evidence(
         )
         identity_source_ref = stable_acquisition_source_ref(
             "identity-registry",
-            registry_result.registry_source_ref,
-            registry_result.registry_sha256,
+            registry_source_ref,
+            registry_sha256,
         )
         artifact = SourceArtifact(
-            artifact_sha256=registry_result.registry_sha256,
+            artifact_sha256=registry_sha256,
             source_ref=identity_source_ref,
             tool_call_id="identity-registry",
             tool_name="instrument_identity_registry",
-            raw_text=registry_result.raw_artifact,
+            raw_text=registry_raw_artifact,
         )
         identity_outcome: SourceAcquisitionOutcome = SourceAcquisitionAvailable(
             provider="instrument-identity-registry",
@@ -2386,6 +2711,7 @@ def acquire_run_evidence(
     else:
         # Identity failure is deterministic for this registry configuration.
         # Do not spend market-data calls on a run that preflight must reject.
+        assert isinstance(registry_result, IdentityRegistryUnavailable)
         snapshot = None
         reason_map = {
             RegistryFailureReason.NOT_CONFIGURED: (
@@ -2438,7 +2764,8 @@ def acquire_run_evidence(
                     reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
                     calculation_readiness=CalculationReadinessDiagnostic(
                         calculation_id=market_return_calculation_id(
-                            snapshot.adjustment_basis
+                            snapshot.adjustment_basis,
+                            resolved_instrument_kind,
                         ),
                         required_observations=MARKET_RETURN_OBSERVATIONS,
                         available_observations=len(snapshot.frame),
@@ -2448,7 +2775,34 @@ def acquire_run_evidence(
             )
         else:
             try:
-                source_facts = (build_market_return_fact(snapshot, market_artifact),)
+                source_facts = (
+                    build_market_return_fact(
+                        snapshot,
+                        market_artifact,
+                        instrument_kind=resolved_instrument_kind,
+                    ),
+                )
+            except InsufficientStrategyHistoryError:
+                calculation_outcomes = (
+                    SourceAcquisitionUnavailable(
+                        provider="deterministic-calculation",
+                        capability="market_return_20d",
+                        source_ref=calculation_source_ref,
+                        attempt=1,
+                        retrieved_at=acquired_at,
+                        retryable=False,
+                        reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
+                        calculation_readiness=CalculationReadinessDiagnostic(
+                            calculation_id=market_return_calculation_id(
+                                snapshot.adjustment_basis,
+                                resolved_instrument_kind,
+                            ),
+                            required_observations=MARKET_RETURN_OBSERVATIONS,
+                            available_observations=len(snapshot.frame),
+                            input_artifact_sha256=market_artifact.artifact_sha256,
+                        ),
+                    ),
+                )
             except ValueError:
                 calculation_outcomes = (
                     SourceAcquisitionUnavailable(
@@ -2494,12 +2848,77 @@ def acquire_run_evidence(
     )
 
 
+def asset_configuration_failure_evidence(
+    error: Any,
+    *,
+    observed_at: str | None = None,
+) -> EvidenceState:
+    """Project a typed pre-graph asset failure into non-directional evidence."""
+
+    from tradingagents.dataflows.instrument_identity import RegistryFailureReason
+
+    reason_map = {
+        RegistryFailureReason.NOT_CONFIGURED: (
+            AcquisitionUnavailableReason.REGISTRY_NOT_CONFIGURED
+        ),
+        RegistryFailureReason.NOT_FOUND: AcquisitionUnavailableReason.IDENTITY_NOT_FOUND,
+        RegistryFailureReason.MALFORMED: AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+        RegistryFailureReason.INTEGRITY_FAILURE: (
+            AcquisitionUnavailableReason.INTEGRITY_FAILURE
+        ),
+        RegistryFailureReason.UNAVAILABLE: (
+            AcquisitionUnavailableReason.REGISTRY_UNAVAILABLE
+        ),
+    }
+    reason = reason_map[RegistryFailureReason(error.reason)]
+    source_ref = stable_acquisition_source_ref(
+        "asset-configuration",
+        error.source_ref,
+        error.diagnostic_code,
+        reason.value,
+    )
+    outcome = SourceAcquisitionUnavailable(
+        provider="instrument-identity-registry",
+        capability="instrument_identity",
+        source_ref=source_ref,
+        attempt=1,
+        retrieved_at=observed_at or datetime.now(timezone.utc).isoformat(),
+        retryable=False,
+        reason=reason,
+    )
+    return EvidenceState(acquisition_outcomes=(outcome,))
+
+
 class AnalysisOutcomeReason(str, Enum):
     PREFLIGHT_BLOCKED = "preflight_blocked"
     ADMISSION_BLOCKED = "admission_blocked"
     DECISION_GATE_BLOCKED = "decision_gate_blocked"
     PORTFOLIO_GATE_BLOCKED = "portfolio_gate_blocked"
     SHADOW_MODE_BLOCKED = "shadow_mode_blocked"
+    INSTRUMENT_CURRENTLY_SUSPENDED = "instrument_currently_suspended"
+
+
+class CurrentSuspensionOutcome(BaseModel):
+    """Typed, non-directional rendering inputs for ADR-0023 outcomes."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    current_tradeability: Literal["suspended"] = "suspended"
+    latest_traded_close_status: Literal["available", "unavailable"]
+    latest_traded_close: Decimal | None = None
+
+    @model_validator(mode="after")
+    def _validate_latest_traded_close(self) -> CurrentSuspensionOutcome:
+        if self.latest_traded_close_status == "available":
+            if self.latest_traded_close is None:
+                raise ValueError(
+                    "available latest traded close status requires a value"
+                )
+        elif self.latest_traded_close is not None:
+            raise ValueError(
+                "unavailable latest traded close status cannot carry a value"
+            )
+        return self
 
 
 class AnalysisOutcome(BaseModel):
@@ -2509,6 +2928,7 @@ class AnalysisOutcome(BaseModel):
     readiness: EvidenceReadiness
     reason: AnalysisOutcomeReason
     diagnostic_codes: tuple[AnalysisDiagnosticCode, ...] = ()
+    current_suspension: CurrentSuspensionOutcome | None = None
 
     @field_validator("diagnostic_codes")
     @classmethod
@@ -2517,6 +2937,28 @@ class AnalysisOutcome(BaseModel):
         value: tuple[AnalysisDiagnosticCode, ...],
     ) -> tuple[AnalysisDiagnosticCode, ...]:
         return tuple(sorted(set(value), key=lambda item: item.value))
+
+    @model_validator(mode="after")
+    def _validate_current_suspension(self) -> AnalysisOutcome:
+        is_suspension = (
+            self.reason is AnalysisOutcomeReason.INSTRUMENT_CURRENTLY_SUSPENDED
+        )
+        if is_suspension and self.current_suspension is None:
+            raise ValueError(
+                "instrument_currently_suspended requires current suspension details"
+            )
+        if not is_suspension and self.current_suspension is not None:
+            raise ValueError(
+                "current suspension details require instrument_currently_suspended"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_contract(self, handler) -> dict[str, Any]:
+        payload = handler(self)
+        if self.current_suspension is None:
+            payload.pop("current_suspension", None)
+        return payload
 
 
 _ANALYSIS_OUTCOME_SUMMARIES = {
@@ -2539,6 +2981,10 @@ _ANALYSIS_OUTCOME_SUMMARIES = {
     AnalysisOutcomeReason.SHADOW_MODE_BLOCKED: (
         "Analysis completed without a Trading Decision because shadow evidence mode "
         "is diagnostic-only."
+    ),
+    AnalysisOutcomeReason.INSTRUMENT_CURRENTLY_SUSPENDED: (
+        "Analysis completed without a Trading Decision because the Mainland Instrument "
+        "is currently suspended and cannot be traded."
     ),
 }
 
@@ -2588,6 +3034,9 @@ _ANALYSIS_DIAGNOSTIC_LABELS = {
     AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED: (
         "A deterministic trust-boundary check rejected publication."
     ),
+    AnalysisDiagnosticCode.INSTRUMENT_CURRENTLY_SUSPENDED: (
+        "The latest applicable mainland session authoritatively confirms suspension."
+    ),
 }
 
 
@@ -2599,7 +3048,9 @@ def analysis_diagnostic_codes(
     codes: set[AnalysisDiagnosticCode] = set()
     for diagnostic in diagnostics:
         normalized = " ".join(str(diagnostic).replace("_", " ").casefold().split())
-        if "shadow" in normalized:
+        if "currently suspended" in normalized:
+            code = AnalysisDiagnosticCode.INSTRUMENT_CURRENTLY_SUSPENDED
+        elif "shadow" in normalized:
             code = AnalysisDiagnosticCode.SHADOW_MODE
         elif "direction context" in normalized or "validated decision context" in normalized:
             code = AnalysisDiagnosticCode.DIRECTION_CONTEXT_INVALID
@@ -2663,9 +3114,22 @@ def render_analysis_outcome(outcome: AnalysisOutcome) -> str:
         f"**Reason Code:** `{outcome.reason.value}`",
         "",
         _ANALYSIS_OUTCOME_SUMMARIES[outcome.reason],
-        "",
-        "No Trading Decision was issued.",
     ]
+    if outcome.current_suspension is not None:
+        latest_close = (
+            str(outcome.current_suspension.latest_traded_close)
+            if outcome.current_suspension.latest_traded_close_status == "available"
+            else "unavailable"
+        )
+        lines.extend(
+            [
+                "",
+                "**Current Tradeability:** `suspended`",
+                "",
+                f"**Latest Genuinely Traded Close:** `{latest_close}`",
+            ]
+        )
+    lines.extend(["", "No Trading Decision was issued."])
     if outcome.diagnostic_codes:
         lines.extend(["", "### Deterministic Blockers", ""])
         lines.extend(
@@ -2679,7 +3143,10 @@ def analysis_outcome_publication(outcome: AnalysisOutcome) -> dict[str, Any]:
     """Publish the typed outcome and its sole deterministic prose rendering."""
 
     return {
-        "analysis_outcome_contract": outcome.model_dump(mode="json"),
+        "analysis_outcome_contract": outcome.model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
         "analysis_outcome": render_analysis_outcome(outcome),
     }
 
@@ -2774,6 +3241,19 @@ def evaluate_preflight_gate(
                 f"{snapshot.history_rows} rows; at least {minimum_history_rows} are required"
             )
             diagnostic_codes.add(AnalysisDiagnosticCode.HISTORY_INSUFFICIENT)
+        if snapshot.current_tradeability == "suspended":
+            latest_close = (
+                str(snapshot.latest_traded_close)
+                if snapshot.latest_traded_close is not None
+                else "unavailable"
+            )
+            blockers.append(
+                "instrument currently suspended; latest genuinely traded close: "
+                f"{latest_close}"
+            )
+            diagnostic_codes.add(
+                AnalysisDiagnosticCode.INSTRUMENT_CURRENTLY_SUSPENDED
+            )
 
     return EvidencePreflightResult(
         passed=not blockers,

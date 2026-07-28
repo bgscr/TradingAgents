@@ -49,6 +49,7 @@ from tradingagents.evidence import (
     InstrumentKind,
     MarketSnapshotEvidence,
     MaterialClaim,
+    ProviderPhysicalAttemptEvidence,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
     SourceArtifact,
@@ -476,6 +477,79 @@ def test_analysis_outcome_report_renders_sanitized_deterministic_acquisitions(
     ):
         assert secret not in outcome_report
         assert secret not in complete
+
+
+@pytest.mark.unit
+def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
+    state = _outcome_state()
+    event = ProviderPhysicalAttemptEvidence(
+        sequence_id="yahoo-sequence-1",
+        request_key="SOL-USD:history",
+        upstream_service_id="yahoo-finance",
+        upstream_service_name="Yahoo Finance",
+        attempt_index=1,
+        attempted_at="2026-07-18T00:01:00+00:00",
+        pacing_event="permit_acquired",
+        pacing_wait_seconds=0,
+        outcome="disconnect",
+        retryable=True,
+        error_code="connection_reset",
+        cooldown_changed=False,
+        final_physical_attempt_count=1,
+    )
+    state["evidence_state"] = EvidenceState(
+        physical_attempt_events=(event,),
+        physical_attempt_count=1,
+    ).model_dump(mode="json")
+
+    write_report_tree(state, "SOL-USD", tmp_path)
+    report = (tmp_path / "5_portfolio" / "analysis_outcome.md").read_text()
+
+    assert "## Physical Provider Attempts" in report
+    assert "**Total physical-attempt count:** 1" in report
+    assert "`yahoo-finance` (Yahoo Finance)" in report
+    assert "**Attempted at:** 2026-07-18T00:01:00+00:00" in report
+    assert "**Pacing/permit event:** permit_acquired" in report
+    assert "**Typed outcome:** disconnect" in report
+    assert "**Cooldown changed:** false" in report
+    assert "**Final physical-attempt count:** 1" in report
+
+
+@pytest.mark.unit
+def test_explicit_empty_run_attempts_override_stale_snapshot_compatibility_data():
+    event = ProviderPhysicalAttemptEvidence(
+        sequence_id="stale-yahoo-sequence",
+        request_key="SOL-USD:history",
+        upstream_service_id="yahoo-finance",
+        upstream_service_name="Yahoo Finance",
+        attempt_index=1,
+        attempted_at="2026-07-18T00:01:00+00:00",
+        pacing_event="permit_acquired",
+        pacing_wait_seconds=0,
+        outcome="disconnect",
+        retryable=True,
+        cooldown_changed=False,
+        final_physical_attempt_count=1,
+    )
+    snapshot = _evidence().market_snapshot
+    assert snapshot is not None
+    snapshot_payload = snapshot.model_dump(mode="python")
+    snapshot_payload["physical_attempt_events"] = (event,)
+    snapshot_payload["physical_attempt_count"] = 1
+
+    evidence = EvidenceState.model_validate(
+        {
+            "market_snapshot": snapshot_payload,
+            "physical_attempt_events": (),
+            "physical_attempt_count": 0,
+        }
+    )
+
+    assert evidence.physical_attempt_events == ()
+    assert evidence.physical_attempt_count == 0
+    assert evidence.market_snapshot is not None
+    assert evidence.market_snapshot.physical_attempt_events == ()
+    assert evidence.market_snapshot.physical_attempt_count == 0
 
 
 @pytest.mark.unit

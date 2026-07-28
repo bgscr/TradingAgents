@@ -31,12 +31,19 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.asset_configuration import (
+    RunAssetConfiguration,
+    RunAssetConfigurationError,
+    resolve_run_asset_configuration,
+)
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
+from tradingagents.dataflows.instrument_identity import RegistryFailureReason
 from tradingagents.dataflows.market_snapshot import (
     authoritative_snapshot_run,
     get_active_run_telemetry,
 )
+from tradingagents.dataflows.stockstats_utils import yf_retry
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import (
@@ -46,12 +53,18 @@ from tradingagents.decision_policy import (
     stable_evidence_semantic_digest,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.evidence import EvidenceState, acquire_run_evidence
+from tradingagents.evidence import (
+    EvidenceState,
+    InstrumentKind,
+    acquire_run_evidence,
+    capability_profile_for,
+)
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.reporting import write_report_tree
 from tradingagents.run_telemetry import RunTelemetryCallbackHandler
 from tradingagents.strategy_registry import (
+    CRYPTO_DECISION_HORIZON,
     DEFAULT_DECISION_HORIZON,
     create_production_decision_policy,
 )
@@ -117,6 +130,9 @@ class TradingAgentsGraph:
         callbacks: list | None = None,
         decision_policy: DecisionPolicyEngine | None = None,
         decision_horizon: DecisionHorizon | None = None,
+        asset_type: str | None = None,
+        asset_configuration: RunAssetConfiguration | None = None,
+        instrument_symbol: str | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -127,20 +143,105 @@ class TradingAgentsGraph:
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
             decision_policy: Optional deterministic registry for final decisions.
             decision_horizon: Required horizon for rule-backed decisions.
+            asset_type: Legacy graph mode when no run asset configuration exists.
+            asset_configuration: Authoritative immutable run asset resolved before
+                graph construction.
+            instrument_symbol: Programmatic resolution boundary used to resolve the
+                run asset before clients, workflow, or checkpoint state are built.
         """
+        resolved_config = config or DEFAULT_CONFIG
+        if asset_configuration is None and instrument_symbol is not None:
+            asset_configuration = resolve_run_asset_configuration(
+                instrument_symbol,
+                config=resolved_config,
+            )
+        if asset_configuration is not None:
+            if (
+                instrument_symbol is not None
+                and not asset_configuration.matches_symbol(instrument_symbol)
+            ):
+                raise RunAssetConfigurationError(
+                    reason=RegistryFailureReason.MALFORMED,
+                    diagnostic_code="asset_identity_configuration_mismatch",
+                    source_ref=asset_configuration.registry_source_ref,
+                )
+            instrument_kind = asset_configuration.instrument_kind
+            configured_asset_type = asset_configuration.asset_type
+            if (
+                asset_type is not None
+                and self._normalize_asset_type(asset_type) != configured_asset_type
+            ):
+                raise RunAssetConfigurationError(
+                    reason=RegistryFailureReason.MALFORMED,
+                    diagnostic_code="asset_type_configuration_mismatch",
+                    source_ref=asset_configuration.registry_source_ref,
+                )
+        else:
+            configured_asset_type = asset_type or "stock"
+            instrument_kind = self._instrument_kind_for_asset_type(
+                configured_asset_type
+            )
+            if instrument_kind is InstrumentKind.CRYPTO:
+                raise RunAssetConfigurationError(
+                    reason=RegistryFailureReason.NOT_CONFIGURED,
+                    diagnostic_code="crypto_asset_configuration_required",
+                    source_ref="crypto-identity-registry:unresolved",
+                )
+        normalized_asset_type = self._asset_type_for_instrument_kind(instrument_kind)
+        requested_analysts = tuple(selected_analysts)
+        effective_analysts = self._analysts_for_instrument_kind(
+            requested_analysts,
+            instrument_kind,
+        )
         self.debug = debug
-        self.config = config or DEFAULT_CONFIG
+        self.config = dict(resolved_config)
+        if asset_configuration is not None:
+            configured_signature = self.config.get("asset_configuration_signature")
+            if (
+                configured_signature is not None
+                and configured_signature
+                != asset_configuration.asset_configuration_signature
+            ):
+                raise RunAssetConfigurationError(
+                    reason=RegistryFailureReason.INTEGRITY_FAILURE,
+                    diagnostic_code="asset_configuration_signature_mismatch",
+                    source_ref=asset_configuration.registry_source_ref,
+                )
+            self.config["asset_configuration_signature"] = (
+                asset_configuration.asset_configuration_signature
+            )
         self.callbacks = callbacks or []
+        self.asset_configuration = asset_configuration
         self.decision_policy = (
             decision_policy
             if decision_policy is not None
             else create_production_decision_policy()
         )
+        self._decision_horizon_is_explicit = (
+            decision_horizon is not None or decision_policy is not None
+        )
         self.decision_horizon = (
             decision_horizon
-            if decision_horizon is not None or decision_policy is not None
-            else DEFAULT_DECISION_HORIZON
+            if self._decision_horizon_is_explicit
+            else (
+                asset_configuration.horizon
+                if asset_configuration is not None
+                else (
+                    CRYPTO_DECISION_HORIZON
+                    if instrument_kind is InstrumentKind.CRYPTO
+                    else DEFAULT_DECISION_HORIZON
+                )
+            )
         )
+        if (
+            asset_configuration is not None
+            and self.decision_horizon != asset_configuration.horizon
+        ):
+            raise RunAssetConfigurationError(
+                reason=RegistryFailureReason.MALFORMED,
+                diagnostic_code="asset_horizon_configuration_mismatch",
+                source_ref=asset_configuration.registry_source_ref,
+            )
 
         # Update the interface's config
         set_config(self.config)
@@ -204,12 +305,119 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Graph-shape-affecting run choices, kept for the checkpoint signature.
-        self.selected_analysts = tuple(selected_analysts)
+        self.instrument_kind = instrument_kind
+        self.capability_profile = capability_profile_for(instrument_kind)
+        self.asset_type = normalized_asset_type
+        self._requested_analysts = requested_analysts
+        self.selected_analysts = effective_analysts
 
         # Set up the graph: keep the workflow for recompilation with a checkpointer.
-        self.workflow = self.graph_setup.setup_graph(selected_analysts)
+        self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+
+    @staticmethod
+    def _instrument_kind_for_asset_type(
+        asset_type: str | InstrumentKind,
+    ) -> InstrumentKind:
+        if isinstance(asset_type, InstrumentKind):
+            if asset_type in {InstrumentKind.EQUITY, InstrumentKind.CRYPTO}:
+                return asset_type
+            raise ValueError("instrument kind must be equity or crypto")
+        normalized = str(asset_type).strip().casefold()
+        if normalized not in {"stock", "crypto"}:
+            raise ValueError("asset_type must be one of: stock, crypto")
+        return (
+            InstrumentKind.CRYPTO
+            if normalized == "crypto"
+            else InstrumentKind.EQUITY
+        )
+
+    @staticmethod
+    def _asset_type_for_instrument_kind(instrument_kind: InstrumentKind) -> str:
+        return "crypto" if instrument_kind is InstrumentKind.CRYPTO else "stock"
+
+    @classmethod
+    def _normalize_asset_type(cls, asset_type: str | InstrumentKind) -> str:
+        """Backward-compatible wire representation for saved state and callers."""
+        return cls._asset_type_for_instrument_kind(
+            cls._instrument_kind_for_asset_type(asset_type)
+        )
+
+    @staticmethod
+    def _analysts_for_instrument_kind(
+        selected_analysts: tuple[str, ...],
+        instrument_kind: InstrumentKind,
+    ) -> tuple[str, ...]:
+        applicable = frozenset(
+            capability_profile_for(instrument_kind).applicable_analysts
+        )
+        return tuple(
+            analyst for analyst in selected_analysts if analyst in applicable
+        )
+
+    @staticmethod
+    def _analysts_for_asset_type(
+        selected_analysts: tuple[str, ...],
+        asset_type: str,
+    ) -> tuple[str, ...]:
+        kind = TradingAgentsGraph._instrument_kind_for_asset_type(asset_type)
+        return TradingAgentsGraph._analysts_for_instrument_kind(
+            selected_analysts,
+            kind,
+        )
+
+    def _configure_asset_type(self, asset_type: str) -> None:
+        instrument_kind = self._instrument_kind_for_asset_type(asset_type)
+        normalized = self._asset_type_for_instrument_kind(instrument_kind)
+        asset_configuration = getattr(self, "asset_configuration", None)
+        if asset_configuration is not None:
+            if normalized != asset_configuration.asset_type:
+                raise RunAssetConfigurationError(
+                    reason=RegistryFailureReason.MALFORMED,
+                    diagnostic_code="asset_type_configuration_mismatch",
+                    source_ref=asset_configuration.registry_source_ref,
+                )
+            return
+        if instrument_kind is InstrumentKind.CRYPTO:
+            raise RunAssetConfigurationError(
+                reason=RegistryFailureReason.NOT_CONFIGURED,
+                diagnostic_code="crypto_asset_configuration_required",
+                source_ref="crypto-identity-registry:unresolved",
+            )
+        if not hasattr(self, "_requested_analysts") or not hasattr(
+            self,
+            "graph_setup",
+        ):
+            self.instrument_kind = instrument_kind
+            self.capability_profile = capability_profile_for(instrument_kind)
+            self.asset_type = normalized
+            return
+        selected_analysts = self._analysts_for_instrument_kind(
+            self._requested_analysts,
+            instrument_kind,
+        )
+        decision_horizon = self.decision_horizon
+        if not self._decision_horizon_is_explicit:
+            decision_horizon = (
+                CRYPTO_DECISION_HORIZON
+                if instrument_kind is InstrumentKind.CRYPTO
+                else DEFAULT_DECISION_HORIZON
+            )
+        if (
+            normalized == self.asset_type
+            and selected_analysts == self.selected_analysts
+            and decision_horizon == self.decision_horizon
+        ):
+            return
+        self.asset_type = normalized
+        self.instrument_kind = instrument_kind
+        self.capability_profile = capability_profile_for(instrument_kind)
+        self.selected_analysts = selected_analysts
+        self.decision_horizon = decision_horizon
+        self.graph_setup.decision_horizon = decision_horizon
+        self.workflow = self.graph_setup.setup_graph(selected_analysts)
+        self.graph = self.workflow.compile()
 
     def _get_provider_kwargs(self) -> dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -331,8 +539,23 @@ class TradingAgentsGraph:
             # Normalize so the realized-return lookup hits the same instrument
             # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
             # already a canonical Yahoo symbol from ``_resolve_benchmark``.
-            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            canonical = normalize_symbol(ticker)
+            stock = yf_retry(
+                lambda: yf.Ticker(canonical).history(
+                    start=trade_date,
+                    end=end_str,
+                ),
+                request_key=f"realized-return:{canonical}:{trade_date}:{end_str}",
+                operation="realized-return",
+            )
+            bench = yf_retry(
+                lambda: yf.Ticker(benchmark).history(
+                    start=trade_date,
+                    end=end_str,
+                ),
+                request_key=f"benchmark-return:{benchmark}:{trade_date}:{end_str}",
+                operation="realized-return",
+            )
 
             if len(stock) < 2 or len(bench) < 2:
                 return None, None, None
@@ -432,6 +655,7 @@ class TradingAgentsGraph:
             trade_date,
             decision_policy=self.decision_policy,
             decision_horizon=getattr(self, "decision_horizon", None),
+            asset_configuration=getattr(self, "asset_configuration", None),
         )
 
     def create_initial_state(
@@ -478,6 +702,7 @@ class TradingAgentsGraph:
             past_context=past_context,
             instrument_context=instrument_context,
             evidence_state=evidence_state,
+            asset_configuration=getattr(self, "asset_configuration", None),
             run_id=run_id,
         )
 
@@ -497,7 +722,7 @@ class TradingAgentsGraph:
         else:
             unit = getattr(horizon.unit, "value", horizon.unit)
             horizon_signature = f"{horizon.count}:{unit}"
-        return "|".join([
+        signature_fields = [
             "analysts=" + ",".join(getattr(self, "selected_analysts", ())),
             f"debate={config.get('max_debate_rounds', 0)}",
             f"risk={config.get('max_risk_discuss_rounds', 0)}",
@@ -508,7 +733,18 @@ class TradingAgentsGraph:
             "admission_binding=1",
             f"registry={registry_digest}",
             f"horizon={horizon_signature}",
-        ])
+        ]
+        asset_configuration = getattr(self, "asset_configuration", None)
+        if asset_configuration is not None:
+            signature_fields.extend(
+                (
+                    "asset_configuration_version="
+                    + asset_configuration.asset_configuration_version,
+                    "asset_configuration="
+                    + asset_configuration.asset_configuration_signature,
+                )
+            )
+        return "|".join(signature_fields)
 
     @contextmanager
     def checkpoint_scope(
@@ -577,30 +813,50 @@ class TradingAgentsGraph:
             self._run_signature(asset_type),
         )
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str | None = None,
+    ):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
-        crypto pipeline (``"crypto"``) shipped in #567 — the CLI auto-detects
-        from the ticker; programmatic callers pass it explicitly. When
+        crypto pipeline (``"crypto"``) shipped in #567. The CLI resolves crypto
+        from the ticker; programmatic callers provide ``instrument_symbol`` to
+        the constructor or pass a pre-resolved run asset configuration. When
         ``checkpoint_enabled`` is set in config, the graph is recompiled with
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node on a subsequent invocation with the same ticker+date.
         """
+        effective_asset_type = self._normalize_asset_type(
+            getattr(self, "asset_type", "stock") if asset_type is None else asset_type
+        )
+        self._configure_asset_type(effective_asset_type)
+        asset_configuration = getattr(self, "asset_configuration", None)
+        if (
+            asset_configuration is not None
+            and not asset_configuration.matches_symbol(company_name)
+        ):
+            raise RunAssetConfigurationError(
+                reason=RegistryFailureReason.MALFORMED,
+                diagnostic_code="asset_identity_configuration_mismatch",
+                source_ref=asset_configuration.registry_source_ref,
+            )
         self.ticker = company_name
         with (
             TradingAgentsGraph.checkpoint_scope(
                 self,
                 company_name,
                 str(trade_date),
-                asset_type,
+                effective_asset_type,
             ) as checkpoint_session,
             authoritative_snapshot_run(),
         ):
             return self._run_graph(
                 company_name,
                 trade_date,
-                asset_type=asset_type,
+                asset_type=effective_asset_type,
                 resume_from_checkpoint=checkpoint_session.resume_from_checkpoint,
             )
 

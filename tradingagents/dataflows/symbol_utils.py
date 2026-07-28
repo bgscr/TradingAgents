@@ -24,6 +24,11 @@ import logging
 import re
 from dataclasses import dataclass
 
+from tradingagents.dataflows.crypto_universe import (
+    CRYPTO_PAIR_QUOTES,
+    SUPPORTED_CRYPTO_BASES,
+)
+
 # NoMarketDataError lives in the vendor-error taxonomy (errors.py); re-exported
 # here for the many call sites that import it alongside normalize_symbol.
 from .errors import NoMarketDataError as NoMarketDataError
@@ -65,11 +70,6 @@ _FOREX_CURRENCIES = frozenset(
     }
 )
 
-# Crypto bases that brokers quote against USD without a separator.
-_CRYPTO_BASES = frozenset(
-    {"BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "BCH", "DOT", "AVAX", "LINK"}
-)
-
 # Explicit aliases for instruments whose broker symbol does not map to a
 # Yahoo symbol by rule. Metals/energy resolve to their front-month future;
 # index CFD names resolve to the underlying Yahoo index symbol. Extend by
@@ -97,11 +97,9 @@ _ALIASES = {
 _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 
 
-# Crypto quote currencies that all map to Yahoo's USD pair. Yahoo lists only
-# ``<BASE>-USD`` (not the USDT/USDC stablecoin pairs), so a broker symbol quoted
-# in any of these resolves to ``-USD`` (#982). Longest first so ``USDT``/``USDC``
-# match before the ``USD`` substring.
-_CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+# Crypto quote currencies recognized for syntactic classification. Quote
+# currency is identity-defining, so only USD pairs may normalize to Yahoo's
+# ``<BASE>-USD`` symbol; stablecoin-quoted pairs remain unchanged.
 
 
 def _infer_china_a_exchange(code: str, suffix: str | None) -> str | None:
@@ -206,17 +204,20 @@ def crypto_base(raw: str) -> str | None:
     if not isinstance(raw, str):
         return None
     compact = raw.strip().upper().rstrip("+").replace("-", "")
-    for quote in _CRYPTO_QUOTES:
+    for quote in CRYPTO_PAIR_QUOTES:
         if compact.endswith(quote):
             base = compact[: -len(quote)]
-            return base if base in _CRYPTO_BASES else None
+            return base if base in SUPPORTED_CRYPTO_BASES else None
     return None
 
 
 def _normalize_crypto(s: str) -> str | None:
-    """Return ``<BASE>-USD`` for a known USD/USDT/USDC-quoted crypto, else None."""
-    base = crypto_base(s)
-    return f"{base}-USD" if base else None
+    """Return ``<BASE>-USD`` only for a known USD-quoted crypto pair."""
+    compact = s.rstrip("+").replace("-", "")
+    if not compact.endswith("USD"):
+        return None
+    base = compact.removesuffix("USD")
+    return f"{base}-USD" if base in SUPPORTED_CRYPTO_BASES else None
 
 
 def normalize_symbol(raw: str) -> str:
@@ -225,8 +226,8 @@ def normalize_symbol(raw: str) -> str:
     Resolution order (first match wins):
       1. China A-share rule: six-digit mainland tickers -> Yahoo ``.SS``/``.SZ``.
       2. Explicit alias table (metals, energy, index CFDs).
-      3. Crypto rule: a known crypto base quoted in USD/USDT/USDC (dashed or
-         not) -> ``BASE-USD``.
+      3. Crypto rule: a known crypto base quoted in USD (dashed or not) ->
+         ``BASE-USD``. USDT/USDC pairs remain distinct and unchanged.
       4. Forex rule: six letters that are two ISO currency codes -> ``PAIR=X``.
       5. Otherwise the upper-cased symbol is returned unchanged (plain
          equities, ETFs, Yahoo-native symbols like ``GC=F`` or ``^GSPC``).
