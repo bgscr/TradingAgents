@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,7 @@ from tradingagents.market_history import (
     MarketHistoryStore,
     PhysicalAttemptBudgetExhausted,
     PhysicalAttemptFailure,
+    PhysicalAttemptNotMade,
     PhysicalAttemptOutcome,
     ProviderRequestAuthorityUnavailableError,
     ProviderRequestCoordinator,
@@ -33,6 +36,20 @@ def _config(tmp_path) -> MarketHistoryConfig:
         backup_root=root / "backups",
         data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
     )
+
+
+def _downgrade_attempt_event_identity_schema(database_path) -> None:
+    """Convert a test database from schema v8 to the exact v7 attempt shape."""
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX provider_request_attempts_by_event_id")
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN terminal_outcome"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN attempt_event_id"
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 8")
 
 
 def _multiprocess_retry_caller(
@@ -96,6 +113,37 @@ def _multiprocess_retry_caller(
         )
     except BaseException as exc:
         results.put((role, "error", type(exc).__name__, str(exc), 0))
+
+
+def _interrupt_direct_physical_request_caller(
+    config: MarketHistoryConfig,
+    request_started,
+    transport_calls,
+) -> None:
+    """Spawn-safe worker that is terminated after its typed attempt starts."""
+
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+
+    def physical_request() -> str:
+        with transport_calls.get_lock():
+            transport_calls.value += 1
+        request_started.set()
+        os._exit(0)
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:direct-interrupted",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="crashed-process",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=5),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
 
 
 @pytest.mark.unit
@@ -500,6 +548,438 @@ def test_identical_request_single_flight_precedes_operator_capacity_checks(
 
 
 @pytest.mark.unit
+def test_direct_physical_request_success_persists_one_terminal_attempt(tmp_path) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "available-frame"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+
+        result = coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:direct-success",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-a",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+        persisted = coordinator.physical_attempt_events(result.sequence_id)
+        diagnostic_detail = store._connection.execute(
+            "SELECT detail FROM history_store_diagnostics "
+            "WHERE operation = 'provider_request' AND code = 'physical_attempt'"
+        ).fetchone()
+
+    assert transport_calls == 1
+    assert result.value == "available-frame"
+    assert result.physical_attempt_count == 1
+    assert result.attempt_events == persisted
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event.attempt_event_id.startswith("provider-physical-attempt=sha256:")
+    assert event.attempt_index == 1
+    assert event.outcome is PhysicalAttemptOutcome.AVAILABLE
+    assert event.final_physical_attempt_count == 1
+    assert diagnostic_detail is not None
+    assert json.loads(str(diagnostic_detail[0]))["attempt_event_id"] == (
+        event.attempt_event_id
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("outcome", "retryable"),
+    (
+        (PhysicalAttemptOutcome.RATE_LIMITED, True),
+        (PhysicalAttemptOutcome.TIMEOUT, True),
+        (PhysicalAttemptOutcome.PROVIDER_ERROR, False),
+        (PhysicalAttemptOutcome.EMPTY_FRAME, False),
+        (PhysicalAttemptOutcome.MALFORMED_RESPONSE, False),
+        (PhysicalAttemptOutcome.AUTHENTICATION, False),
+        (PhysicalAttemptOutcome.DISCONNECT, True),
+    ),
+)
+def test_direct_physical_request_persists_each_terminal_failure_type(
+    tmp_path,
+    outcome: PhysicalAttemptOutcome,
+    retryable: bool,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> None:
+        nonlocal transport_calls
+        transport_calls += 1
+        raise PhysicalAttemptFailure(
+            outcome=outcome,
+            retryable=retryable,
+            status_code=429 if outcome is PhysicalAttemptOutcome.RATE_LIMITED else None,
+            error_code=f"EASTMONEY_{outcome.value.upper()}",
+            retry_after_seconds=(
+                75 if outcome is PhysicalAttemptOutcome.RATE_LIMITED else None
+            ),
+        )
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        with pytest.raises(PhysicalAttemptBudgetExhausted) as captured:
+            coordinator.execute_direct_physical_request(
+                request_key=f"history:600519.SS:direct-{outcome.value}",
+                upstream_service_id="upstream:eastmoney",
+                owner_id="process-a",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="current-market-frame",
+                physical_request=physical_request,
+                cooldown_scope="market-snapshot",
+            )
+
+    failure = captured.value.failure
+    events = captured.value.attempt_events
+    assert transport_calls == 1
+    assert captured.value.physical_attempt_count == 1
+    assert failure.outcome is outcome
+    assert len(events) == 1
+    assert events[0].outcome is outcome
+    assert events[0].retryable is retryable
+    assert events[0].status_code == failure.status_code
+    assert events[0].error_code == failure.error_code
+    assert events[0].retry_after_seconds == failure.retry_after_seconds
+    assert events[0].final_physical_attempt_count == 1
+    if outcome is PhysicalAttemptOutcome.RATE_LIMITED:
+        assert events[0].cooldown_changed is True
+        assert events[0].cooldown_until == now + timedelta(seconds=75)
+    else:
+        assert events[0].cooldown_changed is False
+        assert events[0].cooldown_until is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "invalid_metadata",
+    (
+        {"status_code": 99},
+        {"error_code": "raw provider secret with spaces"},
+        {"retry_after_seconds": float("inf")},
+    ),
+)
+def test_direct_physical_attempt_bounds_failure_metadata(
+    tmp_path,
+    invalid_metadata: dict[str, object],
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> None:
+        nonlocal transport_calls
+        transport_calls += 1
+        raise PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+            retryable=False,
+            **invalid_metadata,
+        )
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        with pytest.raises(PhysicalAttemptBudgetExhausted) as captured:
+            coordinator.execute_direct_physical_request(
+                request_key="history:600519.SS:invalid-failure-metadata",
+                upstream_service_id="upstream:eastmoney",
+                owner_id="process-a",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="current-market-frame",
+                physical_request=physical_request,
+            )
+
+    event = captured.value.attempt_events[0]
+    assert transport_calls == 1
+    assert event.outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+    assert event.status_code is None
+    assert event.error_code == "unhandled_transport_exception"
+    assert event.retry_after_seconds is None
+
+
+@pytest.mark.unit
+def test_n_direct_physical_requests_persist_exactly_n_attempt_events(tmp_path) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls: list[int] = []
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        results = []
+        for request_index in range(1, 4):
+            results.append(
+                coordinator.execute_direct_physical_request(
+                    request_key=f"history:600519.SS:direct-{request_index}",
+                    upstream_service_id="upstream:eastmoney",
+                    owner_id=f"process-{request_index}",
+                    priority=RequestPriority.INTERACTIVE_MAINLAND,
+                    now=lambda: now,
+                    sleep=lambda _seconds: None,
+                    lease_duration=timedelta(seconds=30),
+                    operation="current-market-frame",
+                    physical_request=lambda index=request_index: (
+                        transport_calls.append(index) or f"frame-{index}"
+                    ),
+                )
+            )
+        persisted_count = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+    assert transport_calls == [1, 2, 3]
+    assert persisted_count == (3,)
+    assert sum(result.physical_attempt_count for result in results) == 3
+    assert len({result.attempt_events[0].attempt_event_id for result in results}) == 3
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("disposition", ("cache_hit", "circuit_open"))
+def test_direct_physical_attempt_no_io_result_persists_zero_events(
+    tmp_path,
+    disposition: str,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def no_io_result() -> PhysicalAttemptNotMade[str]:
+        return PhysicalAttemptNotMade(disposition)
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        result = coordinator.execute_direct_physical_request(
+            request_key=f"history:600519.SS:{disposition}",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-a",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=no_io_result,
+        )
+        persisted_count = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+    assert transport_calls == 0
+    assert result.value == disposition
+    assert result.physical_attempt_count == 0
+    assert result.attempt_events == ()
+    assert persisted_count == (0,)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "blocked_by",
+    ("cooldown", "operator_policy"),
+)
+def test_direct_physical_attempt_pre_io_skip_persists_zero_events(
+    tmp_path,
+    blocked_by: str,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "must-not-run"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        priority = RequestPriority.INTERACTIVE_MAINLAND
+        if blocked_by == "cooldown":
+            coordinator.record_rate_limit(
+                upstream_service_id="upstream:eastmoney",
+                cooldown_scope="market-snapshot",
+                observed_at=now,
+                retry_after=timedelta(seconds=60),
+                provider_code="EASTMONEY_HTTP_429",
+            )
+        else:
+            priority = RequestPriority.CONFIGURED_PREWARMING
+        with pytest.raises(PhysicalAttemptBudgetExhausted) as captured:
+            coordinator.execute_direct_physical_request(
+                request_key=f"history:600519.SS:{blocked_by}",
+                upstream_service_id="upstream:eastmoney",
+                owner_id="process-a",
+                priority=priority,
+                now=lambda: now + timedelta(seconds=1),
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="current-market-frame",
+                physical_request=physical_request,
+                cooldown_scope="market-snapshot",
+            )
+        persisted_count = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+    assert transport_calls == 0
+    assert captured.value.physical_attempt_count == 0
+    assert captured.value.attempt_events == ()
+    assert persisted_count == (0,)
+
+
+@pytest.mark.unit
+def test_direct_physical_attempt_single_flight_follower_adds_no_event(tmp_path) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    request_started = Event()
+    release_request = Event()
+    follower_observed_duplicate = Event()
+    transport_calls = 0
+
+    class CrossProcessLikeCoordinator(ProviderRequestCoordinator):
+        _single_flight_lock = Lock()
+        _single_flights = {}
+
+        def acquire(self, **kwargs):
+            decision = super().acquire(**kwargs)
+            if decision.disposition is LeaseDisposition.DUPLICATE_IN_FLIGHT:
+                follower_observed_duplicate.set()
+            return decision
+
+    with MarketHistoryStore.open(config) as store:
+        ProviderRequestCoordinator(store).register_upstream_service(
+            "upstream:eastmoney",
+            "Eastmoney push2his",
+        )
+
+    def invoke(owner_id: str):
+        nonlocal transport_calls
+
+        def physical_request() -> str:
+            nonlocal transport_calls
+            transport_calls += 1
+            request_started.set()
+            assert release_request.wait(timeout=5)
+            return "available-frame"
+
+        with MarketHistoryStore.open(config) as store:
+            coordinator_type = (
+                ProviderRequestCoordinator
+                if owner_id == "process-a"
+                else CrossProcessLikeCoordinator
+            )
+            return coordinator_type(store).execute_direct_physical_request(
+                request_key="history:600519.SS:direct-single-flight",
+                upstream_service_id="upstream:eastmoney",
+                owner_id=owner_id,
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="current-market-frame",
+                physical_request=physical_request,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(invoke, "process-a")
+        assert request_started.wait(timeout=5)
+        follower = executor.submit(invoke, "process-b")
+        assert follower_observed_duplicate.wait(timeout=5)
+        release_request.set()
+        results = (leader.result(timeout=5), follower.result(timeout=5))
+
+    with MarketHistoryStore.open(config) as store:
+        persisted_count = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+    assert transport_calls == 1
+    assert persisted_count == (1,)
+    assert results[0].sequence_id == results[1].sequence_id
+    assert results[0].attempt_events == results[1].attempt_events
+
+
+@pytest.mark.unit
+def test_direct_physical_attempt_persists_initial_pacing_wait(tmp_path) -> None:
+    config = _config(tmp_path)
+    started_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    elapsed_seconds = 0.0
+    sleeps: list[float] = []
+    transport_calls = 0
+
+    def clock() -> datetime:
+        return started_at + timedelta(seconds=elapsed_seconds)
+
+    def sleep(seconds: float) -> None:
+        nonlocal elapsed_seconds
+        sleeps.append(seconds)
+        elapsed_seconds += seconds
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "available-frame"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        coordinator.configure_operator_ceiling(
+            upstream_service_id="upstream:eastmoney",
+            minimum_interval=timedelta(seconds=10),
+            allow_prewarming=False,
+            configured_at=started_at,
+        )
+        coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:first-direct",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-a",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=clock,
+            sleep=sleep,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+        elapsed_seconds = 1
+        paced = coordinator.execute_direct_physical_request(
+            request_key="history:000001.SZ:paced-direct",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-b",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=clock,
+            sleep=sleep,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+
+    assert transport_calls == 2
+    assert sleeps == [9]
+    assert paced.physical_attempt_count == 1
+    assert paced.attempt_events[0].pacing_event == "paced_then_permit_acquired"
+    assert paced.attempt_events[0].pacing_wait_seconds == 9
+
+
+@pytest.mark.unit
 def test_yahoo_retry_sequence_persists_one_typed_event_per_physical_attempt(
     tmp_path,
 ) -> None:
@@ -805,10 +1285,241 @@ def test_attempt_audit_migration_preserves_existing_coordinator_state(tmp_path) 
             cooldown_scope="market-snapshot",
         )
 
-    assert migrated_version == (7,)
+    assert migrated_version == (8,)
     assert preserved_ceiling == original_ceiling
     assert blocked.disposition is LeaseDisposition.COOLDOWN
     assert blocked.cooldown_until == now + timedelta(seconds=60)
+
+
+@pytest.mark.unit
+def test_direct_attempt_migration_preserves_typed_rows_and_diagnostic_history(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "available-frame"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        original = coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:pre-v8-typed",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-a",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+        diagnostic_lease = coordinator.acquire(
+            request_key="history:000001.SZ:diagnostic-only",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="legacy-process",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+        ).lease
+        coordinator.record_physical_attempt(
+            diagnostic_lease,
+            occurred_at=now + timedelta(seconds=1),
+            attempt_key="legacy-diagnostic-only",
+        )
+        coordinator.release(diagnostic_lease)
+        original_attempt = store._connection.execute(
+            "SELECT sequence_id, attempt_index, request_key, upstream_service_id, "
+            "upstream_service_name, owner_id, priority, operation, attempted_at, "
+            "pacing_event, pacing_wait_seconds, outcome, retryable, status_code, "
+            "error_code, retry_after_seconds, cooldown_changed, cooldown_until, "
+            "final_physical_attempt_count FROM provider_request_attempts"
+        ).fetchone()
+        original_diagnostics = tuple(
+            store._connection.execute(
+                "SELECT diagnostic_id, occurred_at, code, detail "
+                "FROM history_store_diagnostics "
+                "WHERE operation = 'provider_request' ORDER BY diagnostic_id"
+            )
+        )
+
+    _downgrade_attempt_event_identity_schema(config.database_path)
+
+    with MarketHistoryStore.open(config) as upgraded:
+        migrated_version = upgraded._connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        migrated_attempt = upgraded._connection.execute(
+            "SELECT sequence_id, attempt_index, request_key, upstream_service_id, "
+            "upstream_service_name, owner_id, priority, operation, attempted_at, "
+            "pacing_event, pacing_wait_seconds, outcome, retryable, status_code, "
+            "error_code, retry_after_seconds, cooldown_changed, cooldown_until, "
+            "final_physical_attempt_count FROM provider_request_attempts"
+        ).fetchone()
+        stored_event_identity = upgraded._connection.execute(
+            "SELECT attempt_event_id FROM provider_request_attempts"
+        ).fetchone()
+        migrated_diagnostics = tuple(
+            upgraded._connection.execute(
+                "SELECT diagnostic_id, occurred_at, code, detail "
+                "FROM history_store_diagnostics "
+                "WHERE operation = 'provider_request' ORDER BY diagnostic_id"
+            )
+        )
+        typed_count = upgraded._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+        projected = ProviderRequestCoordinator(upgraded).physical_attempt_events(
+            original.sequence_id
+        )
+
+    assert transport_calls == 1
+    assert migrated_version == (8,)
+    assert migrated_attempt == original_attempt
+    assert stored_event_identity == (None,)
+    assert migrated_diagnostics == original_diagnostics
+    assert typed_count == (1,)
+    assert len(projected) == 1
+    assert projected[0].attempt_event_id == original.attempt_events[0].attempt_event_id
+
+
+@pytest.mark.unit
+def test_direct_attempt_identity_migration_is_failure_atomic(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import tradingagents.market_history.store as store_module
+
+    config = _config(tmp_path)
+    with MarketHistoryStore.open(config):
+        pass
+    _downgrade_attempt_event_identity_schema(config.database_path)
+    valid_alter = store_module.MIGRATION_V8[0]
+    monkeypatch.setattr(
+        store_module,
+        "MIGRATION_V8",
+        (valid_alter, "INVALID MIGRATION STATEMENT"),
+    )
+
+    with pytest.raises(sqlite3.DatabaseError):
+        MarketHistoryStore.open(config)
+
+    with sqlite3.connect(config.database_path) as connection:
+        migrated_version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        attempt_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(provider_request_attempts)")
+        }
+
+    assert migrated_version == (7,)
+    assert "attempt_event_id" not in attempt_columns
+    assert "terminal_outcome" not in attempt_columns
+
+
+@pytest.mark.unit
+def test_direct_attempt_open_repairs_an_additive_v8_shape_without_provider_io(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    with MarketHistoryStore.open(config):
+        pass
+    with sqlite3.connect(config.database_path) as connection:
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN terminal_outcome"
+        )
+        version_before = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+
+    with MarketHistoryStore.open(config) as repaired:
+        columns_after = {
+            str(row[1])
+            for row in repaired._connection.execute(
+                "PRAGMA table_info(provider_request_attempts)"
+            )
+        }
+        version_after = repaired._connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+
+    assert version_before == version_after == (8,)
+    assert "attempt_event_id" in columns_after
+    assert "terminal_outcome" in columns_after
+
+
+@pytest.mark.unit
+def test_dedicated_authority_imports_v7_typed_attempt_without_promoting_diagnostic(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    transport_calls = 0
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "available-frame"
+
+    with MarketHistoryStore.open(config) as primary:
+        coordinator = ProviderRequestCoordinator(primary)
+        coordinator.register_upstream_service("upstream:eastmoney", "Eastmoney push2his")
+        original = coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:legacy-primary",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="legacy-process",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+        lease = coordinator.acquire(
+            request_key="history:000001.SZ:legacy-diagnostic",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="diagnostic-process",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+        ).lease
+        coordinator.record_physical_attempt(
+            lease,
+            occurred_at=now + timedelta(seconds=1),
+            attempt_key="diagnostic-only",
+        )
+        coordinator.release(lease)
+
+    _downgrade_attempt_event_identity_schema(config.database_path)
+
+    with MarketHistoryStore.open_provider_request_authority(config) as authority:
+        typed_rows = authority._connection.execute(
+            "SELECT COUNT(*), attempt_event_id FROM provider_request_attempts"
+        ).fetchone()
+        diagnostic_rows = authority._connection.execute(
+            "SELECT COUNT(*) FROM history_store_diagnostics "
+            "WHERE operation = 'provider_request' AND code = 'physical_attempt'"
+        ).fetchone()
+        projected = ProviderRequestCoordinator(authority).physical_attempt_events(
+            original.sequence_id
+        )
+
+    with sqlite3.connect(config.database_path) as legacy:
+        legacy_version = legacy.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+
+    assert transport_calls == 1
+    assert typed_rows == (1, None)
+    assert diagnostic_rows == (2,)
+    assert len(projected) == 1
+    assert projected[0].attempt_event_id == original.attempt_events[0].attempt_event_id
+    assert legacy_version == (7,)
 
 
 @pytest.mark.unit
@@ -1089,6 +1800,75 @@ def test_identical_yahoo_requests_single_flight_across_spawned_processes(
 
 
 @pytest.mark.unit
+def test_interrupted_direct_physical_attempt_recovery_closes_original_event_once(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
+    context = get_context("spawn")
+    request_started = context.Event()
+    transport_calls = context.Value("i", 0)
+    with MarketHistoryStore.open(config) as store:
+        ProviderRequestCoordinator(store).register_upstream_service(
+            "upstream:eastmoney",
+            "Eastmoney push2his",
+        )
+    worker = context.Process(
+        target=_interrupt_direct_physical_request_caller,
+        args=(config, request_started, transport_calls),
+    )
+
+    worker.start()
+    try:
+        assert request_started.wait(timeout=60)
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+        assert worker.exitcode == 0
+        with MarketHistoryStore.open(config) as store:
+            started_row = store._connection.execute(
+                "SELECT sequence_id, attempt_event_id, outcome, terminal_outcome "
+                "FROM provider_request_attempts"
+            ).fetchone()
+        assert started_row is not None
+        assert started_row[2] == "started"
+
+        with MarketHistoryStore.open(config) as store:
+            coordinator = ProviderRequestCoordinator(store)
+            recovered = coordinator.acquire(
+                request_key="history:000001.SZ:replacement",
+                upstream_service_id="upstream:eastmoney",
+                owner_id="replacement-process",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=now + timedelta(seconds=5),
+                lease_duration=timedelta(seconds=5),
+            )
+            events = coordinator.physical_attempt_events(str(started_row[0]))
+            terminal_row = store._connection.execute(
+                "SELECT outcome, terminal_outcome FROM provider_request_attempts "
+                "WHERE sequence_id = ?",
+                (str(started_row[0]),),
+            ).fetchone()
+            row_count = store._connection.execute(
+                "SELECT COUNT(*) FROM provider_request_attempts"
+            ).fetchone()
+            coordinator.release(recovered.lease)
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join(timeout=60)
+
+    assert transport_calls.value == 1
+    assert recovered.disposition is LeaseDisposition.ACQUIRED
+    assert row_count == (1,)
+    assert len(events) == 1
+    assert events[0].attempt_event_id == started_row[1]
+    assert terminal_row == ("provider_error", "abandoned")
+    assert events[0].outcome is PhysicalAttemptOutcome.ABANDONED
+    assert events[0].error_code == "coordinator_lease_expired"
+    assert events[0].final_physical_attempt_count == 1
+
+
+@pytest.mark.unit
 def test_expired_retry_owner_recovers_started_attempt_into_closed_audit_event(
     tmp_path,
 ) -> None:
@@ -1130,7 +1910,7 @@ def test_expired_retry_owner_recovers_started_attempt_into_closed_audit_event(
 
     assert recovered.disposition is LeaseDisposition.ACQUIRED
     assert len(events) == 1
-    assert events[0].outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+    assert events[0].outcome is PhysicalAttemptOutcome.ABANDONED
     assert events[0].error_code == "coordinator_lease_expired"
     assert events[0].final_physical_attempt_count == 1
 
@@ -1214,5 +1994,5 @@ def test_unsupported_handoff_result_closes_attempt_sequence_and_lease(tmp_path) 
 
     assert sequence == ("failed", 1, "coordinator_sequence_abandoned")
     assert lease_count == (0,)
-    assert events[0].outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+    assert events[0].outcome is PhysicalAttemptOutcome.ABANDONED
     assert events[0].final_physical_attempt_count == 1

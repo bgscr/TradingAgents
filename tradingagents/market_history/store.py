@@ -52,6 +52,7 @@ from tradingagents.market_history.schema import (
     MIGRATION_V5,
     MIGRATION_V6,
     MIGRATION_V7,
+    MIGRATION_V8,
     SCHEMA_VERSION,
 )
 
@@ -398,7 +399,6 @@ class MarketHistoryStore:
                 "request_leases",
                 "request_queue",
                 "provider_request_sequences",
-                "provider_request_attempts",
             ):
                 if table in source_tables:
                     self._connection.execute(
@@ -406,6 +406,49 @@ class MarketHistoryStore:
                         f"SELECT * FROM legacy_provider_requests.{table}"
                     )
                     require_preserved_rows(table)
+            if "provider_request_attempts" in source_tables:
+                attempt_columns = (
+                    "sequence_id",
+                    "attempt_index",
+                    "request_key",
+                    "upstream_service_id",
+                    "upstream_service_name",
+                    "owner_id",
+                    "priority",
+                    "operation",
+                    "attempted_at",
+                    "pacing_event",
+                    "pacing_wait_seconds",
+                    "outcome",
+                    "retryable",
+                    "status_code",
+                    "error_code",
+                    "retry_after_seconds",
+                    "cooldown_changed",
+                    "cooldown_until",
+                    "final_physical_attempt_count",
+                )
+                source_attempt_columns = {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA legacy_provider_requests."
+                        "table_info(provider_request_attempts)"
+                    )
+                }
+                if "attempt_event_id" in source_attempt_columns:
+                    attempt_columns = (*attempt_columns, "attempt_event_id")
+                if "terminal_outcome" in source_attempt_columns:
+                    attempt_columns = (*attempt_columns, "terminal_outcome")
+                column_list = ", ".join(attempt_columns)
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO provider_request_attempts "
+                    f"({column_list}) SELECT {column_list} "
+                    "FROM legacy_provider_requests.provider_request_attempts"
+                )
+                require_preserved_rows(
+                    "provider_request_attempts",
+                    columns=column_list,
+                )
             if "history_store_diagnostics" in source_tables:
                 self._connection.execute(
                     "INSERT OR IGNORE INTO history_store_diagnostics "
@@ -1574,6 +1617,33 @@ class MarketHistoryStore:
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+                current_version = 7
+            attempt_columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(provider_request_attempts)"
+                )
+            }
+            if current_version < 8 or not {
+                "attempt_event_id",
+                "terminal_outcome",
+            }.issubset(attempt_columns):
+                for statement_index, statement in enumerate(MIGRATION_V8):
+                    if statement_index == 0 and "attempt_event_id" in attempt_columns:
+                        continue
+                    if statement_index == 1 and "terminal_outcome" in attempt_columns:
+                        continue
+                    self._connection.execute(statement)
+                if current_version < 8:
+                    self._connection.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            8,
+                            "provider_physical_attempt_typed_lifecycle",
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
             foreign_key_failures = tuple(
                 self._connection.execute("PRAGMA foreign_key_check")
             )

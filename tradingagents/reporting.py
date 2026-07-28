@@ -187,10 +187,28 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
         )
         for event in attempts:
             cooldown = event.cooldown_until or "unchanged"
+            retry_after = (
+                f"{event.retry_after_seconds:g} seconds"
+                if event.retry_after_seconds is not None
+                else "not provided"
+            )
+            status_code = (
+                str(event.status_code)
+                if event.status_code is not None
+                else "not provided"
+            )
+            error_code = event.error_code or "not provided"
             lines.extend(
                 [
                     f"### Physical attempt {event.attempt_index}",
                     "",
+                    *(
+                        [f"- **Attempt event ID:** `{event.attempt_event_id}`"]
+                        if event.attempt_event_id is not None
+                        else []
+                    ),
+                    f"- **Request identity:** `{event.request_key}`",
+                    f"- **Sequence identity:** `{event.sequence_id}`",
                     (
                         "- **Upstream Service Identity:** "
                         f"`{event.upstream_service_id}` ({event.upstream_service_name})"
@@ -199,6 +217,10 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
                     f"- **Pacing/permit event:** {event.pacing_event}",
                     f"- **Pacing wait:** {event.pacing_wait_seconds:g} seconds",
                     f"- **Typed outcome:** {event.outcome}",
+                    f"- **Retryable:** {_format_scalar(event.retryable)}",
+                    f"- **Status code:** {status_code}",
+                    f"- **Error code:** `{error_code}`",
+                    f"- **Retry-After:** {retry_after}",
                     f"- **Cooldown changed:** {_format_scalar(event.cooldown_changed)}",
                     f"- **Cooldown until:** {cooldown}",
                     (

@@ -505,6 +505,7 @@ def refresh_active_evidence_physical_attempts(
         events = tuple(active.physical_attempt_events)
     projected = tuple(
         ProviderPhysicalAttemptEvidence(
+            attempt_event_id=event.attempt_event_id,
             sequence_id=event.sequence_id,
             request_key=event.request_key,
             upstream_service_id=event.upstream_service_id,

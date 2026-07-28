@@ -1,6 +1,6 @@
 """Explicit transactional migrations for the Market History Database."""
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 CREATE_MIGRATION_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -577,5 +577,37 @@ MIGRATION_V7 = (
         source_database_path TEXT PRIMARY KEY,
         imported_at TEXT NOT NULL
     )
+    """,
+)
+
+
+MIGRATION_V8 = (
+    """
+    ALTER TABLE provider_request_attempts
+    ADD COLUMN attempt_event_id TEXT CHECK (
+        attempt_event_id IS NULL
+        OR (
+            length(attempt_event_id) = 97
+            AND substr(attempt_event_id, 1, 33) =
+                'provider-physical-attempt=sha256:'
+            AND substr(attempt_event_id, 34) NOT GLOB '*[^0-9a-f]*'
+        )
+    )
+    """,
+    """
+    ALTER TABLE provider_request_attempts
+    ADD COLUMN terminal_outcome TEXT CHECK (
+        terminal_outcome IS NULL
+        OR terminal_outcome IN (
+            'available', 'rate_limited', 'timeout', 'disconnect',
+            'empty_frame', 'authentication', 'malformed_response',
+            'provider_error', 'upstream_busy', 'abandoned'
+        )
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS provider_request_attempts_by_event_id
+    ON provider_request_attempts (attempt_event_id)
+    WHERE attempt_event_id IS NOT NULL
     """,
 )

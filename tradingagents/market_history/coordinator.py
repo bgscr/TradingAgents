@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
+
+_PHYSICAL_ATTEMPT_ERROR_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 
 
 _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER: ContextVar[Callable[[], None] | None] = (
@@ -48,6 +52,15 @@ def _as_utc(value: datetime, *, label: str) -> datetime:
     if value.tzinfo is None:
         raise ValueError(f"{label} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def _physical_attempt_event_id(sequence_id: str, attempt_index: int) -> str:
+    digest = sha256()
+    for component in ("provider-physical-attempt", sequence_id, str(attempt_index)):
+        encoded = component.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return f"provider-physical-attempt=sha256:{digest.hexdigest()}"
 
 
 def upstream_service_identity_for_provider(provider: str) -> tuple[str, str]:
@@ -81,6 +94,7 @@ class PhysicalAttemptOutcome(str, Enum):
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_ERROR = "provider_error"
     UPSTREAM_BUSY = "upstream_busy"
+    ABANDONED = "abandoned"
 
 
 class PhysicalAttemptFailure(Exception):
@@ -95,10 +109,32 @@ class PhysicalAttemptFailure(Exception):
         error_code: str | None = None,
         retry_after_seconds: float | None = None,
     ) -> None:
+        if not isinstance(outcome, PhysicalAttemptOutcome):
+            raise TypeError("physical-attempt outcome must be typed")
         if outcome in {PhysicalAttemptOutcome.STARTED, PhysicalAttemptOutcome.AVAILABLE}:
             raise ValueError("a physical-attempt failure requires a failure outcome")
-        if retry_after_seconds is not None and retry_after_seconds < 0:
-            raise ValueError("Retry-After must be nonnegative")
+        if not isinstance(retryable, bool):
+            raise TypeError("physical-attempt retryability must be a boolean")
+        if status_code is not None and (
+            isinstance(status_code, bool)
+            or not isinstance(status_code, int)
+            or not 100 <= status_code <= 599
+        ):
+            raise ValueError("physical-attempt status code must be an HTTP status")
+        if error_code is not None and (
+            not isinstance(error_code, str)
+            or _PHYSICAL_ATTEMPT_ERROR_CODE.fullmatch(error_code) is None
+        ):
+            raise ValueError("physical-attempt error code must be a bounded code token")
+        if retry_after_seconds is not None:
+            if (
+                isinstance(retry_after_seconds, bool)
+                or not isinstance(retry_after_seconds, (int, float))
+                or not math.isfinite(float(retry_after_seconds))
+                or retry_after_seconds < 0
+            ):
+                raise ValueError("Retry-After must be finite and nonnegative")
+            retry_after_seconds = float(retry_after_seconds)
         self.outcome = outcome
         self.retryable = retryable
         self.status_code = status_code
@@ -109,6 +145,7 @@ class PhysicalAttemptFailure(Exception):
 
 @dataclass(frozen=True)
 class ProviderPhysicalAttemptEvent:
+    attempt_event_id: str
     sequence_id: str
     request_key: str
     upstream_service_id: str
@@ -332,6 +369,13 @@ class ProviderRequestCoordinator:
         upstream_service_id: str,
     ) -> datetime | None:
         attempts: list[datetime] = []
+        typed_latest = self._store._connection.execute(
+            "SELECT MAX(attempted_at) FROM provider_request_attempts "
+            "WHERE upstream_service_id = ?",
+            (upstream_service_id,),
+        ).fetchone()
+        if typed_latest is not None and typed_latest[0] is not None:
+            attempts.append(datetime.fromisoformat(str(typed_latest[0])))
         for occurred_at, raw_detail in self._store._connection.execute(
             "SELECT occurred_at, detail FROM history_store_diagnostics "
             "WHERE operation = 'provider_request' AND code = 'physical_attempt'"
@@ -342,7 +386,10 @@ class ProviderRequestCoordinator:
                 continue
             if not isinstance(detail, dict):
                 continue
-            if detail.get("upstream_service_id") == upstream_service_id:
+            if (
+                "attempt_event_id" not in detail
+                and detail.get("upstream_service_id") == upstream_service_id
+            ):
                 try:
                     attempt_at = datetime.fromisoformat(str(occurred_at))
                 except ValueError:
@@ -643,11 +690,17 @@ class ProviderRequestCoordinator:
         *,
         occurred_at: datetime,
         attempt_key: str = "",
+        attempt_event_id: str | None = None,
     ) -> str:
         if lease is None:
             raise ValueError("an acquired request lease is required")
         if not isinstance(attempt_key, str):
             raise TypeError("physical-attempt key must be a string")
+        if attempt_event_id is not None and (
+            not isinstance(attempt_event_id, str)
+            or not attempt_event_id.startswith("provider-physical-attempt=sha256:")
+        ):
+            raise ValueError("physical-attempt event identity is malformed")
         occurred_at = _as_utc(
             occurred_at,
             label="physical-attempt time",
@@ -662,6 +715,7 @@ class ProviderRequestCoordinator:
                 lease.owner_id,
                 occurred_at.isoformat(),
                 attempt_key,
+                attempt_event_id or "",
             ),
             detail={
                 "request_key": lease.request_key,
@@ -669,6 +723,11 @@ class ProviderRequestCoordinator:
                 "owner_id": lease.owner_id,
                 "priority": int(lease.priority),
                 "attempt_key": attempt_key,
+                **(
+                    {"attempt_event_id": attempt_event_id}
+                    if attempt_event_id is not None
+                    else {}
+                ),
             },
         )
 
@@ -687,6 +746,7 @@ class ProviderRequestCoordinator:
         physical_attempt: Callable[[int], T],
         cooldown_scope: str = "all",
         record_at_physical_io: bool = False,
+        _wait_for_initial_pacing: bool = False,
     ) -> CoordinatedRequestResult[T]:
         """Run one single-flighted sequence whose permits map 1:1 to I/O calls."""
         if max_physical_attempts < 1:
@@ -723,6 +783,7 @@ class ProviderRequestCoordinator:
                 physical_attempt=physical_attempt,
                 cooldown_scope=cooldown_scope,
                 record_at_physical_io=record_at_physical_io,
+                wait_for_initial_pacing=_wait_for_initial_pacing,
             )
         except BaseException as exc:
             shared.set_exception(exc)
@@ -734,6 +795,37 @@ class ProviderRequestCoordinator:
             with self._single_flight_lock:
                 if self._single_flights.get(flight_key) is shared:
                     del self._single_flights[flight_key]
+
+    def execute_direct_physical_request(
+        self,
+        *,
+        request_key: str,
+        upstream_service_id: str,
+        owner_id: str,
+        priority: RequestPriority,
+        now: Callable[[], datetime],
+        sleep: Callable[[float], None],
+        lease_duration: timedelta,
+        operation: str,
+        physical_request: Callable[[], T],
+        cooldown_scope: str = "all",
+    ) -> CoordinatedRequestResult[T]:
+        """Execute at most one direct provider request under one typed attempt."""
+
+        return self.execute_retry_sequence(
+            request_key=request_key,
+            upstream_service_id=upstream_service_id,
+            owner_id=owner_id,
+            priority=priority,
+            now=now,
+            sleep=sleep,
+            lease_duration=lease_duration,
+            max_physical_attempts=1,
+            operation=operation,
+            physical_attempt=lambda _attempt_index: physical_request(),
+            cooldown_scope=cooldown_scope,
+            _wait_for_initial_pacing=True,
+        )
 
     def _execute_retry_sequence_as_leader(
         self,
@@ -750,17 +842,37 @@ class ProviderRequestCoordinator:
         physical_attempt: Callable[[int], T],
         cooldown_scope: str,
         record_at_physical_io: bool,
+        wait_for_initial_pacing: bool,
     ) -> CoordinatedRequestResult[T]:
         started_at = _as_utc(now(), label="coordinator time")
-        decision = self.acquire(
-            request_key=request_key,
-            upstream_service_id=upstream_service_id,
-            owner_id=owner_id,
-            priority=priority,
-            now=started_at,
-            lease_duration=lease_duration,
-            cooldown_scope=cooldown_scope,
-        )
+        initial_pacing_wait_seconds = 0.0
+        while True:
+            decision = self.acquire(
+                request_key=request_key,
+                upstream_service_id=upstream_service_id,
+                owner_id=owner_id,
+                priority=priority,
+                now=started_at,
+                lease_duration=lease_duration,
+                cooldown_scope=cooldown_scope,
+            )
+            if (
+                wait_for_initial_pacing
+                and decision.disposition is LeaseDisposition.PACING
+                and decision.cooldown_until is not None
+            ):
+                wait_seconds = max(
+                    0.0,
+                    (decision.cooldown_until - started_at).total_seconds(),
+                )
+                sleep(wait_seconds)
+                initial_pacing_wait_seconds += wait_seconds
+                started_at = max(
+                    _as_utc(now(), label="coordinator time"),
+                    decision.cooldown_until,
+                )
+                continue
+            break
         if decision.disposition is LeaseDisposition.DUPLICATE_IN_FLIGHT:
             assert decision.active_owner_id is not None
             return self._wait_for_persisted_sequence(
@@ -801,9 +913,12 @@ class ProviderRequestCoordinator:
                     lease,
                     requested_at=requested_at,
                 )
-                pacing_wait_seconds = max(
+                permit_pacing_wait_seconds = max(
                     0.0,
                     (earliest_at - requested_at).total_seconds(),
+                )
+                pacing_wait_seconds = permit_pacing_wait_seconds + (
+                    initial_pacing_wait_seconds if attempt_index == 1 else 0.0
                 )
                 attempted_at = requested_at
                 while attempted_at < earliest_at:
@@ -879,7 +994,7 @@ class ProviderRequestCoordinator:
                     io_at = _as_utc(now(), label="physical-attempt time")
                     _connection.execute("BEGIN IMMEDIATE")
                     try:
-                        self._start_attempt_event(
+                        attempt_event_id = self._start_attempt_event(
                             sequence_id=sequence_id,
                             lease=_lease,
                             service_name=self._service_name(upstream_service_id),
@@ -895,6 +1010,7 @@ class ProviderRequestCoordinator:
                             attempt_key=(
                                 f"{sequence_id}:{_attempt_index}:{operation}"
                             ),
+                            attempt_event_id=attempt_event_id,
                         )
                         _connection.commit()
                     except BaseException:
@@ -1186,6 +1302,11 @@ class ProviderRequestCoordinator:
         final_count: int,
         failure: PhysicalAttemptFailure,
     ) -> None:
+        persisted_outcome = (
+            PhysicalAttemptOutcome.PROVIDER_ERROR
+            if failure.outcome is PhysicalAttemptOutcome.ABANDONED
+            else failure.outcome
+        )
         cursor = self._store._connection.execute(
             "UPDATE provider_request_sequences SET status = 'failed', "
             "completed_at = ?, final_physical_attempt_count = ?, "
@@ -1195,7 +1316,7 @@ class ProviderRequestCoordinator:
             (
                 completed_at.isoformat(),
                 final_count,
-                failure.outcome.value,
+                persisted_outcome.value,
                 int(failure.retryable),
                 failure.status_code,
                 failure.error_code,
@@ -1291,8 +1412,16 @@ class ProviderRequestCoordinator:
                 physical_attempt_count=final_count,
                 attempt_events=attempt_events,
             )
+        persisted_outcome = PhysicalAttemptOutcome(str(row[5]))
+        failure_outcome = (
+            PhysicalAttemptOutcome.ABANDONED
+            if persisted_outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+            and attempt_events
+            and attempt_events[-1].outcome is PhysicalAttemptOutcome.ABANDONED
+            else persisted_outcome
+        )
         failure = PhysicalAttemptFailure(
-            outcome=PhysicalAttemptOutcome(str(row[5])),
+            outcome=failure_outcome,
             retryable=bool(row[6]),
             status_code=int(row[7]) if row[7] is not None else None,
             error_code=str(row[8]) if row[8] is not None else None,
@@ -1319,6 +1448,7 @@ class ProviderRequestCoordinator:
         final_count = int(count_row[0]) if count_row is not None else 0
         self._store._connection.execute(
             "UPDATE provider_request_attempts SET outcome = 'provider_error', "
+            "terminal_outcome = 'abandoned', "
             "retryable = 0, error_code = ? "
             "WHERE sequence_id = ? AND outcome = 'started'",
             (error_code, sequence_id),
@@ -1360,14 +1490,16 @@ class ProviderRequestCoordinator:
         attempted_at: datetime,
         pacing_event: str,
         pacing_wait_seconds: float,
-    ) -> None:
+    ) -> str:
+        attempt_event_id = _physical_attempt_event_id(sequence_id, attempt_index)
         self._store._connection.execute(
             "INSERT INTO provider_request_attempts "
-            "(sequence_id, attempt_index, request_key, upstream_service_id, "
+            "(attempt_event_id, sequence_id, attempt_index, request_key, upstream_service_id, "
             "upstream_service_name, owner_id, priority, operation, attempted_at, "
             "pacing_event, pacing_wait_seconds, outcome) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started')",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started')",
             (
+                attempt_event_id,
                 sequence_id,
                 attempt_index,
                 lease.request_key,
@@ -1381,6 +1513,7 @@ class ProviderRequestCoordinator:
                 pacing_wait_seconds,
             ),
         )
+        return attempt_event_id
 
     def _finish_attempt_event(
         self,
@@ -1394,12 +1527,19 @@ class ProviderRequestCoordinator:
         outcome = (
             PhysicalAttemptOutcome.AVAILABLE if failure is None else failure.outcome
         )
+        legacy_outcome = (
+            PhysicalAttemptOutcome.PROVIDER_ERROR
+            if outcome is PhysicalAttemptOutcome.ABANDONED
+            else outcome
+        )
         cursor = self._store._connection.execute(
-            "UPDATE provider_request_attempts SET outcome = ?, retryable = ?, "
+            "UPDATE provider_request_attempts SET outcome = ?, terminal_outcome = ?, "
+            "retryable = ?, "
             "status_code = ?, error_code = ?, retry_after_seconds = ?, "
             "cooldown_changed = ?, cooldown_until = ? "
             "WHERE sequence_id = ? AND attempt_index = ? AND outcome = 'started'",
             (
+                legacy_outcome.value,
                 outcome.value,
                 int(failure.retryable) if failure is not None else 0,
                 failure.status_code if failure is not None else None,
@@ -1428,9 +1568,11 @@ class ProviderRequestCoordinator:
         sequence_id: str,
     ) -> tuple[ProviderPhysicalAttemptEvent, ...]:
         rows = self._store._connection.execute(
-            "SELECT request_key, upstream_service_id, upstream_service_name, "
+            "SELECT attempt_event_id, request_key, upstream_service_id, "
+            "upstream_service_name, "
             "attempt_index, attempted_at, pacing_event, pacing_wait_seconds, "
-            "outcome, retryable, status_code, error_code, retry_after_seconds, "
+            "COALESCE(terminal_outcome, outcome), retryable, status_code, error_code, "
+            "retry_after_seconds, "
             "cooldown_changed, cooldown_until, final_physical_attempt_count "
             "FROM provider_request_attempts WHERE sequence_id = ? "
             "ORDER BY attempt_index",
@@ -1438,29 +1580,34 @@ class ProviderRequestCoordinator:
         )
         return tuple(
             ProviderPhysicalAttemptEvent(
-                sequence_id=sequence_id,
-                request_key=str(row[0]),
-                upstream_service_id=str(row[1]),
-                upstream_service_name=str(row[2]),
-                attempt_index=int(row[3]),
-                attempted_at=datetime.fromisoformat(str(row[4])),
-                pacing_event=str(row[5]),
-                pacing_wait_seconds=float(row[6]),
-                outcome=PhysicalAttemptOutcome(str(row[7])),
-                retryable=bool(row[8]),
-                status_code=int(row[9]) if row[9] is not None else None,
-                error_code=str(row[10]) if row[10] is not None else None,
-                retry_after_seconds=(
-                    float(row[11]) if row[11] is not None else None
+                attempt_event_id=(
+                    str(row[0])
+                    if row[0] is not None
+                    else _physical_attempt_event_id(sequence_id, int(row[4]))
                 ),
-                cooldown_changed=bool(row[12]),
+                sequence_id=sequence_id,
+                request_key=str(row[1]),
+                upstream_service_id=str(row[2]),
+                upstream_service_name=str(row[3]),
+                attempt_index=int(row[4]),
+                attempted_at=datetime.fromisoformat(str(row[5])),
+                pacing_event=str(row[6]),
+                pacing_wait_seconds=float(row[7]),
+                outcome=PhysicalAttemptOutcome(str(row[8])),
+                retryable=bool(row[9]),
+                status_code=int(row[10]) if row[10] is not None else None,
+                error_code=str(row[11]) if row[11] is not None else None,
+                retry_after_seconds=(
+                    float(row[12]) if row[12] is not None else None
+                ),
+                cooldown_changed=bool(row[13]),
                 cooldown_until=(
-                    datetime.fromisoformat(str(row[13]))
-                    if row[13] is not None
+                    datetime.fromisoformat(str(row[14]))
+                    if row[14] is not None
                     else None
                 ),
                 final_physical_attempt_count=(
-                    int(row[14]) if row[14] is not None else None
+                    int(row[15]) if row[15] is not None else None
                 ),
             )
             for row in rows

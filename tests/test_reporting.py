@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from types import SimpleNamespace
@@ -15,6 +15,7 @@ from langchain_core.messages import ToolMessage
 from tradingagents.agents.managers.direction_selector import render_trading_decision
 from tradingagents.agents.schemas import PortfolioRating
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.dataflows import market_snapshot
 from tradingagents.dataflows.acquisition import (
     AcquisitionController,
     AcquisitionFailure,
@@ -62,6 +63,14 @@ from tradingagents.evidence import (
 )
 from tradingagents.graph.signal_processing import SignalProcessor
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.market_history import (
+    DataUsageMode,
+    MarketHistoryConfig,
+    MarketHistoryMode,
+    MarketHistoryStore,
+    ProviderRequestCoordinator,
+    RequestPriority,
+)
 from tradingagents.reporting import render_analysis_outcome_report, write_report_tree
 from tradingagents.terminal_contract import (
     TerminalOutcomeKind,
@@ -483,6 +492,10 @@ def test_analysis_outcome_report_renders_sanitized_deterministic_acquisitions(
 def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
     state = _outcome_state()
     event = ProviderPhysicalAttemptEvidence(
+        attempt_event_id=(
+            "provider-physical-attempt=sha256:"
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ),
         sequence_id="yahoo-sequence-1",
         request_key="SOL-USD:history",
         upstream_service_id="yahoo-finance",
@@ -493,7 +506,9 @@ def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
         pacing_wait_seconds=0,
         outcome="disconnect",
         retryable=True,
+        status_code=503,
         error_code="connection_reset",
+        retry_after_seconds=15,
         cooldown_changed=False,
         final_physical_attempt_count=1,
     )
@@ -507,12 +522,89 @@ def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
 
     assert "## Physical Provider Attempts" in report
     assert "**Total physical-attempt count:** 1" in report
+    assert "**Attempt event ID:** `provider-physical-attempt=sha256:" in report
+    assert "**Request identity:** `SOL-USD:history`" in report
+    assert "**Sequence identity:** `yahoo-sequence-1`" in report
     assert "`yahoo-finance` (Yahoo Finance)" in report
     assert "**Attempted at:** 2026-07-18T00:01:00+00:00" in report
     assert "**Pacing/permit event:** permit_acquired" in report
     assert "**Typed outcome:** disconnect" in report
+    assert "**Retryable:** true" in report
+    assert "**Status code:** 503" in report
+    assert "**Error code:** `connection_reset`" in report
+    assert "**Retry-After:** 15 seconds" in report
     assert "**Cooldown changed:** false" in report
     assert "**Final physical-attempt count:** 1" in report
+
+
+@pytest.mark.unit
+def test_report_and_audit_counts_derive_only_from_typed_attempt_events(tmp_path):
+    history_root = tmp_path / "history"
+    config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    now = datetime(2026, 7, 18, 0, 1, tzinfo=timezone.utc)
+    transport_calls: list[int] = []
+    direct_event_ids: list[str] = []
+
+    with market_snapshot.authoritative_snapshot_run():
+        with MarketHistoryStore.open(config) as store:
+            coordinator = ProviderRequestCoordinator(store)
+            coordinator.register_upstream_service(
+                "upstream:eastmoney",
+                "Eastmoney push2his",
+            )
+            for index in range(1, 4):
+                result = coordinator.execute_direct_physical_request(
+                    request_key=f"600519.SS:direct-{index}",
+                    upstream_service_id="upstream:eastmoney",
+                    owner_id=f"process-{index}",
+                    priority=RequestPriority.INTERACTIVE_MAINLAND,
+                    now=lambda: now,
+                    sleep=lambda _seconds: None,
+                    lease_duration=timedelta(seconds=30),
+                    operation="current-market-frame",
+                    physical_request=lambda index=index: (
+                        transport_calls.append(index) or f"frame-{index}"
+                    ),
+                )
+                market_snapshot.record_active_physical_attempt_events(
+                    result.attempt_events
+                )
+                direct_event_ids.append(result.attempt_events[0].attempt_event_id)
+            persisted_count = store._connection.execute(
+                "SELECT COUNT(*) FROM provider_request_attempts"
+            ).fetchone()
+
+        evidence = market_snapshot.refresh_active_evidence_physical_attempts(
+            EvidenceState()
+        )
+        state = _outcome_state()
+        state["evidence_state"] = evidence.model_dump(mode="json")
+
+        audit = prepare_decision_audit(state, tmp_path / "audit")
+        write_report_tree(state, "600519.SS", tmp_path / "reports")
+    report = (
+        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+    ).read_text()
+
+    audit_evidence = audit["evidence_state"]
+    audit_event_ids = [
+        event["attempt_event_id"]
+        for event in audit_evidence["physical_attempt_events"]
+    ]
+    assert transport_calls == [1, 2, 3]
+    assert persisted_count == (3,)
+    assert audit_evidence["physical_attempt_count"] == 3
+    assert len(audit_evidence["physical_attempt_events"]) == 3
+    assert audit_event_ids == direct_event_ids
+    assert report.count("### Physical attempt") == 3
+    assert "**Total physical-attempt count:** 3" in report
+    assert all(event_id in report for event_id in direct_event_ids)
 
 
 @pytest.mark.unit

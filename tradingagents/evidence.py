@@ -413,6 +413,10 @@ class InstrumentIdentityEvidence(BaseModel):
 class ProviderPhysicalAttemptEvidence(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
+    attempt_event_id: str | None = Field(
+        default=None,
+        pattern=r"^provider-physical-attempt=sha256:[0-9a-f]{64}$",
+    )
     sequence_id: str = Field(min_length=1)
     request_key: str = Field(min_length=1)
     upstream_service_id: str = Field(min_length=1)
@@ -433,6 +437,7 @@ class ProviderPhysicalAttemptEvidence(BaseModel):
         "malformed_response",
         "provider_error",
         "upstream_busy",
+        "abandoned",
     ]
     retryable: bool
     status_code: int | None = Field(default=None, ge=100, le=599)
@@ -463,6 +468,13 @@ def _validate_physical_attempt_accounting(
 ) -> None:
     if count != len(events):
         raise ValueError("physical-attempt count must match the event sequence")
+    event_ids = tuple(
+        event.attempt_event_id
+        for event in events
+        if event.attempt_event_id is not None
+    )
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("physical-attempt event identities must be unique")
     by_sequence: dict[str, list[ProviderPhysicalAttemptEvidence]] = {}
     for event in events:
         by_sequence.setdefault(event.sequence_id, []).append(event)
@@ -2555,6 +2567,7 @@ def build_evidence_state(
             ),
             physical_attempt_events=tuple(
                 ProviderPhysicalAttemptEvidence(
+                    attempt_event_id=event.attempt_event_id,
                     sequence_id=event.sequence_id,
                     request_key=event.request_key,
                     upstream_service_id=event.upstream_service_id,

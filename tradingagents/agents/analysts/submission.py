@@ -498,6 +498,7 @@ def build_analyst_update(
                     history_store_diagnostic=active_snapshot.history_store_diagnostic,
                     physical_attempt_events=tuple(
                         {
+                            "attempt_event_id": event.attempt_event_id,
                             "sequence_id": event.sequence_id,
                             "request_key": event.request_key,
                             "upstream_service_id": event.upstream_service_id,
