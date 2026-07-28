@@ -43,6 +43,16 @@ class CryptoSnapshotIdentityMismatch(ValueError):
         super().__init__(self.diagnostic_code)
 
 
+class LegacyCryptoSnapshotIdentityIncomplete(ValueError):
+    """Historical crypto material cannot prove the corrected replay binding."""
+
+    diagnostic_code = "legacy_crypto_snapshot_identity_incomplete"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(self.diagnostic_code)
+
+
 @dataclass(frozen=True)
 class CryptoProviderDatasetDescriptor:
     """Closed material descriptor for one accepted crypto provider dataset."""
@@ -57,6 +67,208 @@ class CryptoProviderDatasetDescriptor:
     reference_market: str
     tags: tuple[str, ...] = ()
     contract_version: str = "1.0"
+
+
+def _lacks_recorded_shape(actual: object, expected: object) -> bool:
+    if isinstance(expected, dict):
+        return not isinstance(actual, dict) or any(
+            key not in actual or _lacks_recorded_shape(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return not isinstance(actual, list) or any(
+            _lacks_recorded_shape(item, expected_item)
+            for item, expected_item in zip(actual, expected, strict=False)
+        )
+    return False
+
+
+def validate_crypto_replay_manifest_completeness(
+    manifest_json: str | None,
+    *,
+    snapshot_id: str,
+    manifest_digest: str | None,
+    asset_configuration: RunAssetConfiguration,
+    crypto_provider_dataset: CryptoProviderDatasetDescriptor | None,
+    stored_material: dict[str, object],
+    observation_membership: tuple[tuple[int, str, str, str, str | None], ...],
+    factor_revision_ids: tuple[str, ...],
+) -> None:
+    """Reject recorded crypto v2 material that lacks its corrected binding."""
+
+    try:
+        manifest = json.loads(manifest_json) if manifest_json is not None else None
+        recorded_asset = manifest["asset_configuration"]
+        recorded_instrument = manifest["instrument"]
+        recorded_provider = manifest["provider"]
+        registry = recorded_asset["registry"]
+        registry_digest = registry["digest"]
+        registry_id = registry["registry_id"]
+        capability_profile = recorded_asset["capability_profile"]
+        identity_provenance = recorded_instrument["identity_provenance"]
+        recorded_dataset = recorded_provider["dataset"]
+        recorded_material = {
+            "adjustment_basis": manifest["adjustment_basis"],
+            "authoritative_status": manifest["authoritative_status"],
+            "bundle_observed_at": manifest["bundle_observed_at"],
+            "bundle_revision_id": manifest["bundle_revision_id"],
+            "calendar_revision_id": manifest["calendar_revision_id"],
+            "crypto_identity_binding_version": manifest[
+                "crypto_identity_binding_version"
+            ],
+            "derivation_version": manifest["derivation_version"],
+            "effective_trading_date": manifest["effective_trading_date"],
+            "factors": manifest["factors"],
+            "frame": manifest["frame"],
+            "manifest_version": manifest["manifest_version"],
+            "normalization_version": manifest["normalization_version"],
+            "observations": manifest["observations"],
+            "provenance_class": manifest["provenance_class"],
+            "requested_date": manifest["requested_date"],
+            "retrieval_cutoff": manifest["retrieval_cutoff"],
+            "snapshot_kind": manifest["snapshot_kind"],
+        }
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise LegacyCryptoSnapshotIdentityIncomplete(
+            "historical crypto snapshot lacks corrected identity material"
+        ) from exc
+    if (
+        not isinstance(registry_digest, str)
+        or not registry_digest.strip()
+        or not isinstance(registry_id, str)
+        or not registry_id.strip()
+        or not isinstance(capability_profile, dict)
+        or not isinstance(identity_provenance, dict)
+        or not isinstance(recorded_provider, dict)
+        or not isinstance(recorded_dataset, dict)
+    ):
+        raise LegacyCryptoSnapshotIdentityIncomplete(
+            "historical crypto snapshot lacks corrected identity material"
+        )
+    identity = asset_configuration.instrument_identity
+    provenance = identity.provenance
+    if provenance is None:
+        raise CryptoSnapshotIdentityMismatch(
+            "requested crypto Instrument Identity is unresolved"
+        )
+    if (
+        asset_configuration.instrument_kind != identity.instrument_kind
+        or asset_configuration.reference_market != identity.venue
+        or asset_configuration.capability_profile.instrument_kind
+        != asset_configuration.instrument_kind
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "requested RunAssetConfiguration has contradictory crypto semantics"
+        )
+    expected_asset = {
+        "capability_profile": {
+            "contract_version": asset_configuration.capability_profile.contract_version,
+            "profile_id": asset_configuration.capability_profile.profile_id,
+            "profile_version": asset_configuration.capability_profile.contract_version,
+        },
+        "contract_version": asset_configuration.asset_configuration_version,
+        "observation_calendar_kind": (
+            asset_configuration.observation_calendar_kind.value
+        ),
+        "registry": {
+            "digest": asset_configuration.registry_digest,
+            "registry_id": asset_configuration.registry_id,
+        },
+    }
+    expected_instrument = {
+        "canonical_symbol": identity.symbol,
+        "currency": identity.currency,
+        "identity_provenance": provenance.model_dump(mode="json"),
+        "identity_revision": crypto_snapshot_identity_revision(asset_configuration),
+        "instrument_id": crypto_snapshot_instrument_id(asset_configuration),
+        "instrument_kind": identity.instrument_kind.value,
+        "reference_market": identity.venue,
+    }
+    if _lacks_recorded_shape(
+        recorded_asset, expected_asset
+    ) or _lacks_recorded_shape(recorded_instrument, expected_instrument):
+        raise LegacyCryptoSnapshotIdentityIncomplete(
+            "historical crypto snapshot lacks corrected identity material"
+        )
+    if recorded_asset != expected_asset or recorded_instrument != expected_instrument:
+        raise CryptoSnapshotIdentityMismatch(
+            "recorded crypto identity contradicts the requested run asset"
+        )
+    if not isinstance(crypto_provider_dataset, CryptoProviderDatasetDescriptor):
+        raise CryptoSnapshotIdentityMismatch(
+            "requested crypto provider dataset is missing"
+        )
+    dataset = validate_crypto_provider_dataset_descriptor(
+        crypto_provider_dataset,
+        provider_name=crypto_provider_dataset.provider_name,
+        upstream_service_id=crypto_provider_dataset.upstream_service_id,
+    )
+    expected_provider = {
+        "dataset": _crypto_provider_dataset_payload(dataset),
+        "provider_dataset_id": dataset.provider_dataset_id,
+        "provider_name": dataset.provider_name,
+        "upstream_service_id": dataset.upstream_service_id,
+    }
+    if _lacks_recorded_shape(recorded_provider, expected_provider):
+        raise LegacyCryptoSnapshotIdentityIncomplete(
+            "historical crypto snapshot lacks corrected identity material"
+        )
+    if recorded_provider != expected_provider:
+        raise CryptoSnapshotIdentityMismatch(
+            "recorded crypto provider dataset contradicts the requested dataset"
+        )
+    canonical_manifest = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    canonical_digest = sha256(canonical_manifest.encode("utf-8")).hexdigest()
+    if (
+        canonical_manifest != manifest_json
+        or canonical_digest != manifest_digest
+        or snapshot_id != f"snapshot:v2:{canonical_digest}"
+    ):
+        raise CryptoSnapshotIdentityMismatch(
+            "recorded crypto manifest identity is inconsistent"
+        )
+    expected_observations = [
+        {
+            "observation_revision_id": observation_revision_id,
+            "ordinal": ordinal,
+            "session_date": session_date,
+            "trading_status_revision_id": status_revision_id,
+            "trading_status_value": status_value,
+        }
+        for ordinal, session_date, observation_revision_id, status_revision_id, status_value
+        in observation_membership
+    ]
+    expected_status = (
+        {
+            "identity": observation_membership[-1][3],
+            "value": observation_membership[-1][4],
+        }
+        if observation_membership
+        else None
+    )
+    expected_material = {
+        **stored_material,
+        "authoritative_status": expected_status,
+        "crypto_identity_binding_version": CRYPTO_SNAPSHOT_IDENTITY_BINDING_VERSION,
+        "factors": sorted(factor_revision_ids),
+        "manifest_version": SNAPSHOT_V2_MANIFEST_VERSION,
+        "observations": expected_observations,
+        "snapshot_kind": "durable_exact_pin",
+    }
+    if _lacks_recorded_shape(recorded_material, expected_material):
+        raise LegacyCryptoSnapshotIdentityIncomplete(
+            "historical crypto snapshot lacks corrected identity material"
+        )
+    if recorded_material != expected_material:
+        raise CryptoSnapshotIdentityMismatch(
+            "recorded crypto manifest contradicts stored exact pin material"
+        )
 
 
 def build_crypto_provider_dataset_descriptor(

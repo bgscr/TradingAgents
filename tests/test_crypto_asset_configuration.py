@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from cli import main as cli_main
+from tradingagents import asset_configuration as asset_configuration_module
 from tradingagents.asset_configuration import (
     ObservationCalendarKind,
     RunAssetConfiguration,
@@ -42,6 +43,7 @@ from tradingagents.evidence import (
     acquire_run_evidence,
     capability_profile_for,
     stable_acquisition_source_ref,
+    stable_market_snapshot_id,
 )
 from tradingagents.graph import trading_graph as trading_graph_module
 from tradingagents.graph.checkpointer import get_checkpointer, has_checkpoint, thread_id
@@ -61,6 +63,7 @@ from tradingagents.market_history import (
     ProviderDatasetSpec,
     ProviderHistoryBundlePublication,
     RawMarketObservation,
+    SnapshotPinCorruptionError,
     SnapshotPurpose,
     TradingStatus,
     TradingStatusObservation,
@@ -69,7 +72,9 @@ from tradingagents.market_history.coordinator import (
     upstream_service_identity_for_provider,
 )
 from tradingagents.market_history.snapshot_identity import (
+    CryptoProviderDatasetDescriptor,
     CryptoSnapshotIdentityMismatch,
+    LegacyCryptoSnapshotIdentityIncomplete,
     build_crypto_provider_dataset_descriptor,
     crypto_snapshot_identity_revision,
     crypto_snapshot_instrument_id,
@@ -101,6 +106,28 @@ def _crypto_dataset_descriptor(
         tags=tags,
         reference_market=reference_market,
     )
+
+
+def _mismatched_replay_dataset(
+    dataset: CryptoProviderDatasetDescriptor,
+    field: str,
+) -> CryptoProviderDatasetDescriptor:
+    if field == "provider_dataset_id":
+        return replace(dataset, provider_dataset_id="provider-dataset:crypto:v1:wrong")
+    replacements = {
+        "provider_name": "newer-provider",
+        "upstream_service_id": "upstream:newer-service",
+        "contract_version": "2.0",
+        "dataset_family": "mainland-equity",
+        "dataset_name": "newer-ccc-bars",
+        "dataset_version": "2.0",
+        "dataset_revision": "revision-2",
+        "reference_market": "XSHG",
+        "tags": ("crypto", "ccc", "mainland"),
+    }
+    values = {**dataset.__dict__, field: replacements[field]}
+    values.pop("provider_dataset_id")
+    return build_crypto_provider_dataset_descriptor(**values)
 
 
 def _live_crypto_identity(
@@ -137,6 +164,298 @@ def _live_crypto_identity(
     }
     values.update(updates)
     return live_snapshot_v2_identity(**values)
+
+
+def _publish_corrected_crypto_replay_fixture(tmp_path: Path):
+    asset_configuration = resolve_run_asset_configuration(
+        "SOL-USD",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    dataset = _crypto_dataset_descriptor()
+    observed_at = datetime(2026, 7, 25, 23, 0, tzinfo=timezone.utc)
+    session_dates = (date(2026, 7, 24), date(2026, 7, 25))
+    provider = ProviderDatasetSpec(
+        upstream_service_id=dataset.upstream_service_id,
+        upstream_service_name="Yahoo Finance service",
+        provider_dataset_id=dataset.provider_dataset_id,
+        provider_name=dataset.provider_name,
+        dataset_name=dataset.dataset_name,
+        adjustment_methodology="auto_adjusted",
+        strict_history_qualified=True,
+    )
+    publication = ProviderHistoryBundlePublication(
+        provider=provider,
+        instrument=InstrumentSpec(
+            instrument_id=crypto_snapshot_instrument_id(asset_configuration),
+            canonical_symbol="SOL-USD",
+            reference_market="CCC",
+            instrument_kind="crypto",
+            currency="USD",
+            identity_revision=crypto_snapshot_identity_revision(asset_configuration),
+        ),
+        requested_as_of=session_dates[-1],
+        retrieval_cutoff=observed_at,
+        observed_at=observed_at,
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        raw_payload=b'{"provider":"yfinance","symbol":"SOL-USD"}',
+        observations=tuple(
+            RawMarketObservation(
+                session_date=session_date,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("10"),
+            )
+            for session_date in session_dates
+        ),
+        trading_statuses=tuple(
+            TradingStatusObservation(session_date, TradingStatus.TRADED)
+            for session_date in session_dates
+        ),
+        adjustment_factors=(
+            AdjustmentFactorObservation(session_dates[0], Decimal("1")),
+        ),
+    )
+    history_root = tmp_path / "corrected-crypto-replay"
+    history_config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    with MarketHistoryStore.open(history_config) as store:
+        store.publish_session_calendar(
+            MarketSessionCalendarPublication(
+                provider=replace(
+                    provider,
+                    provider_dataset_id="provider-dataset:crypto-calendar:v1",
+                    dataset_name="crypto-consecutive-daily-calendar-v1",
+                    adjustment_methodology="not-applicable",
+                    strict_history_qualified=False,
+                ),
+                reference_market="CCC",
+                timezone_name="UTC",
+                observed_at=observed_at,
+                provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+                raw_payload=b'{"calendar":"crypto-consecutive-daily"}',
+                sessions=tuple(
+                    MarketSession(session_date, MarketSessionStatus.OPEN)
+                    for session_date in session_dates
+                ),
+            )
+        )
+        published = store.publish_history_bundle(publication)
+        snapshot = store.reconstruct_snapshot(
+            published.bundle_revision_id,
+            requested_date=session_dates[-1],
+            purpose=SnapshotPurpose.STRICT_REPLAY,
+            replay_as_of=observed_at,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=dataset,
+        )
+    return history_config, asset_configuration, dataset, snapshot
+
+
+def _clone_crypto_pin_with_manifest(
+    store: MarketHistoryStore,
+    source_snapshot_id: str,
+    manifest: dict[str, object],
+) -> str:
+    manifest_json = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    manifest_digest = sha256(manifest_json.encode("utf-8")).hexdigest()
+    snapshot_id = f"snapshot:v2:{manifest_digest}"
+    store._connection.execute(
+        "INSERT INTO snapshot_pins "
+        "(snapshot_id, bundle_revision_id, instrument_id, provider_dataset_id, "
+        "calendar_revision_id, requested_as_of, retrieval_cutoff, adjustment_basis, "
+        "derivation_version, frame_digest, provenance_class, history_store_degraded, "
+        "created_at, identity_version, manifest_digest, manifest_json, "
+        "normalization_version, effective_trading_date, history_rows) "
+        "SELECT ?, bundle_revision_id, instrument_id, provider_dataset_id, "
+        "calendar_revision_id, requested_as_of, retrieval_cutoff, adjustment_basis, "
+        "derivation_version, frame_digest, provenance_class, history_store_degraded, "
+        "created_at, identity_version, ?, ?, normalization_version, "
+        "effective_trading_date, history_rows FROM snapshot_pins WHERE snapshot_id = ?",
+        (snapshot_id, manifest_digest, manifest_json, source_snapshot_id),
+    )
+    store._connection.execute(
+        "INSERT INTO snapshot_observation_pins "
+        "(snapshot_id, ordinal, session_date, observation_revision_id, "
+        "trading_status_revision_id) SELECT ?, ordinal, session_date, "
+        "observation_revision_id, trading_status_revision_id "
+        "FROM snapshot_observation_pins WHERE snapshot_id = ?",
+        (snapshot_id, source_snapshot_id),
+    )
+    store._connection.execute(
+        "INSERT INTO snapshot_factor_pins (snapshot_id, factor_revision_id) "
+        "SELECT ?, factor_revision_id FROM snapshot_factor_pins WHERE snapshot_id = ?",
+        (snapshot_id, source_snapshot_id),
+    )
+    return snapshot_id
+
+
+def _clone_crypto_v1_pin(store: MarketHistoryStore, snapshot) -> str:
+    snapshot_id = stable_market_snapshot_id(
+        symbol=snapshot.symbol,
+        provider=snapshot.provider,
+        adjustment_basis=snapshot.adjustment_basis,
+        requested_date=snapshot.requested_date,
+        effective_trading_date=snapshot.effective_trading_date,
+        frame_sha256=snapshot.frame_sha256,
+        history_rows=len(snapshot.frame),
+    )
+    store._connection.execute(
+        "INSERT INTO snapshot_pins "
+        "(snapshot_id, bundle_revision_id, instrument_id, provider_dataset_id, "
+        "calendar_revision_id, requested_as_of, retrieval_cutoff, adjustment_basis, "
+        "derivation_version, frame_digest, provenance_class, history_store_degraded, "
+        "created_at, identity_version, manifest_digest, manifest_json, "
+        "normalization_version, effective_trading_date, history_rows) "
+        "SELECT ?, bundle_revision_id, instrument_id, provider_dataset_id, NULL, "
+        "requested_as_of, retrieval_cutoff, adjustment_basis, derivation_version, "
+        "frame_digest, provenance_class, history_store_degraded, created_at, 'v1', "
+        "NULL, NULL, NULL, NULL, NULL FROM snapshot_pins WHERE snapshot_id = ?",
+        (snapshot_id, snapshot.snapshot_id),
+    )
+    store._connection.execute(
+        "INSERT INTO snapshot_observation_pins "
+        "(snapshot_id, ordinal, session_date, observation_revision_id, "
+        "trading_status_revision_id) SELECT ?, ordinal, session_date, "
+        "observation_revision_id, trading_status_revision_id "
+        "FROM snapshot_observation_pins WHERE snapshot_id = ?",
+        (snapshot_id, snapshot.snapshot_id),
+    )
+    store._connection.execute(
+        "INSERT INTO snapshot_factor_pins (snapshot_id, factor_revision_id) "
+        "SELECT ?, factor_revision_id FROM snapshot_factor_pins WHERE snapshot_id = ?",
+        (snapshot_id, snapshot.snapshot_id),
+    )
+    return snapshot_id
+
+
+def _mismatched_replay_configuration(
+    asset_configuration: RunAssetConfiguration,
+    field: str,
+) -> RunAssetConfiguration:
+    identity = asset_configuration.instrument_identity
+    provenance = identity.provenance
+    assert provenance is not None
+    if field == "asset_configuration_version":
+        return asset_configuration.model_copy(
+            update={"asset_configuration_version": "2.0"}
+        )
+    if field == "canonical_symbol":
+        return asset_configuration.model_copy(
+            update={"instrument_identity": identity.model_copy(update={"symbol": "ETH-USD"})}
+        )
+    if field == "reference_market":
+        return asset_configuration.model_copy(
+            update={
+                "reference_market": "XSHG",
+                "instrument_identity": identity.model_copy(update={"venue": "XSHG"}),
+            }
+        )
+    if field == "incoherent_reference_market":
+        return asset_configuration.model_copy(update={"reference_market": "XSHG"})
+    if field == "instrument_kind":
+        return asset_configuration.model_copy(
+            update={
+                "instrument_identity": identity.model_copy(
+                    update={"instrument_kind": InstrumentKind.EQUITY}
+                )
+            }
+        )
+    if field == "incoherent_instrument_kind":
+        return asset_configuration.model_copy(
+            update={"instrument_kind": InstrumentKind.EQUITY}
+        )
+    if field == "currency":
+        return asset_configuration.model_copy(
+            update={"instrument_identity": identity.model_copy(update={"currency": "EUR"})}
+        )
+    if field == "identity_provenance":
+        return asset_configuration.model_copy(
+            update={
+                "instrument_identity": identity.model_copy(
+                    update={
+                        "provenance": provenance.model_copy(
+                            update={"retrieved_at": "2026-07-26T00:00:00+00:00"}
+                        )
+                    }
+                )
+            }
+        )
+    if field == "registry_id":
+        return asset_configuration.model_copy(update={"registry_id": "crypto-registry-v2"})
+    if field == "registry_digest":
+        digest = "a" * 64
+        return asset_configuration.model_copy(
+            update={
+                "registry_digest": digest,
+                "instrument_identity": identity.model_copy(
+                    update={
+                        "provenance": provenance.model_copy(
+                            update={"artifact_sha256": digest}
+                        )
+                    }
+                ),
+            }
+        )
+    if field == "capability_profile":
+        return asset_configuration.model_copy(
+            update={
+                "capability_profile": asset_configuration.capability_profile.model_copy(
+                    update={"profile_id": "crypto.v2"}
+                )
+            }
+        )
+    if field == "incoherent_capability_profile_kind":
+        return asset_configuration.model_copy(
+            update={
+                "capability_profile": asset_configuration.capability_profile.model_copy(
+                    update={"instrument_kind": InstrumentKind.EQUITY}
+                )
+            }
+        )
+    if field == "observation_calendar":
+        return asset_configuration.model_copy(
+            update={"observation_calendar_kind": ObservationCalendarKind.MARKET_SESSIONS}
+        )
+    if field == "adjustment_basis":
+        return asset_configuration.model_copy(update={"adjustment_basis": "qfq"})
+    raise AssertionError(field)
+
+
+def _replace_manifest_value(
+    manifest: dict[str, object],
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    current = manifest
+    for key in path[:-1]:
+        child = current[key]
+        assert isinstance(child, dict)
+        current = child
+    current[path[-1]] = value
+
+
+def _delete_manifest_value(
+    manifest: dict[str, object],
+    path: tuple[str, ...],
+) -> None:
+    current = manifest
+    for key in path[:-1]:
+        child = current[key]
+        assert isinstance(child, dict)
+        current = child
+    del current[path[-1]]
 
 
 def test_sol_asset_configuration_is_authoritative_immutable_and_crypto_specific():
@@ -571,6 +890,639 @@ def test_historical_crypto_snapshot_ids_and_manifests_are_not_rehashed_or_repair
     assert historical_v2.snapshot_manifest_json == historical_manifest
     assert historical_v1.snapshot_id == historical_v1_id
     assert historical_v1.snapshot_manifest_json is None
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    (
+        ("crypto_identity_binding_version",),
+        ("asset_configuration", "contract_version"),
+        ("asset_configuration", "registry", "digest"),
+        ("asset_configuration", "capability_profile"),
+        ("instrument", "identity_provenance"),
+        ("provider", "dataset"),
+        ("observations",),
+        ("retrieval_cutoff",),
+    ),
+)
+def test_corrected_crypto_strict_replay_rejects_incomplete_legacy_manifest(
+    tmp_path: Path,
+    missing_path: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    incomplete_manifest = json.loads(snapshot.manifest_json)
+    _delete_manifest_value(incomplete_manifest, missing_path)
+
+    def forbidden_current_resolution(*_args, **_kwargs):
+        raise AssertionError("strict replay must not resolve current identity material")
+
+    monkeypatch.setattr(
+        asset_configuration_module,
+        "resolve_run_asset_configuration",
+        forbidden_current_resolution,
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "resolve_authoritative_instrument_identity",
+        forbidden_current_resolution,
+    )
+
+    with MarketHistoryStore.open(history_config) as store:
+        historical_snapshot_id = _clone_crypto_pin_with_manifest(
+            store,
+            snapshot.snapshot_id,
+            incomplete_manifest,
+        )
+        historical_rows_before = (
+            store._connection.execute(
+                "SELECT * FROM snapshot_pins WHERE snapshot_id = ?",
+                (historical_snapshot_id,),
+            ).fetchone(),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_observation_pins WHERE snapshot_id = ? "
+                    "ORDER BY ordinal",
+                    (historical_snapshot_id,),
+                )
+            ),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_factor_pins WHERE snapshot_id = ? "
+                    "ORDER BY factor_revision_id",
+                    (historical_snapshot_id,),
+                )
+            ),
+        )
+
+        with pytest.raises(LegacyCryptoSnapshotIdentityIncomplete) as raised:
+            store.read_pinned_snapshot(
+                historical_snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
+        historical_rows_after = (
+            store._connection.execute(
+                "SELECT * FROM snapshot_pins WHERE snapshot_id = ?",
+                (historical_snapshot_id,),
+            ).fetchone(),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_observation_pins WHERE snapshot_id = ? "
+                    "ORDER BY ordinal",
+                    (historical_snapshot_id,),
+                )
+            ),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_factor_pins WHERE snapshot_id = ? "
+                    "ORDER BY factor_revision_id",
+                    (historical_snapshot_id,),
+                )
+            ),
+        )
+
+    assert raised.value.diagnostic_code == (
+        "legacy_crypto_snapshot_identity_incomplete"
+    )
+    assert historical_rows_after == historical_rows_before
+
+
+@pytest.mark.parametrize(
+    "material_field",
+    (
+        "asset_configuration_version",
+        "canonical_symbol",
+        "reference_market",
+        "incoherent_reference_market",
+        "instrument_kind",
+        "incoherent_instrument_kind",
+        "currency",
+        "identity_provenance",
+        "registry_id",
+        "registry_digest",
+        "capability_profile",
+        "incoherent_capability_profile_kind",
+        "observation_calendar",
+        "adjustment_basis",
+    ),
+)
+def test_corrected_crypto_strict_replay_validates_configuration_before_membership(
+    tmp_path: Path,
+    material_field: str,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    mismatched_configuration = _mismatched_replay_configuration(
+        asset_configuration,
+        material_field,
+    )
+    manifest = json.loads(snapshot.manifest_json)
+
+    with MarketHistoryStore.open(history_config) as store:
+        observation_revision_id = manifest["observations"][0][
+            "observation_revision_id"
+        ]
+        store._connection.execute(
+            "UPDATE raw_market_observation_revisions SET close_value = '999' "
+            "WHERE revision_id = ?",
+            (observation_revision_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                snapshot.snapshot_id,
+                asset_configuration=mismatched_configuration,
+                crypto_provider_dataset=dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("manifest_path", "replacement"),
+    (
+        (("provider", "provider_name"), "newer-provider"),
+        (("provider", "upstream_service_id"), "upstream:newer-service"),
+        (("provider", "provider_dataset_id"), "provider-dataset:newer"),
+        (("provider", "dataset", "contract_version"), "2.0"),
+        (("provider", "dataset", "dataset_family"), "mainland-equity"),
+        (("provider", "dataset", "dataset_name"), "newer-ccc-bars"),
+        (("provider", "dataset", "dataset_version"), "2.0"),
+        (("provider", "dataset", "dataset_revision"), "revision-2"),
+        (("provider", "dataset", "reference_market"), "XSHG"),
+        (("provider", "dataset", "tags"), ["crypto", "ccc", "mainland"]),
+    ),
+)
+def test_corrected_crypto_strict_replay_validates_recorded_dataset_before_membership(
+    tmp_path: Path,
+    manifest_path: tuple[str, ...],
+    replacement: object,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    mismatched_manifest = json.loads(snapshot.manifest_json)
+    _replace_manifest_value(mismatched_manifest, manifest_path, replacement)
+
+    with MarketHistoryStore.open(history_config) as store:
+        historical_snapshot_id = _clone_crypto_pin_with_manifest(
+            store,
+            snapshot.snapshot_id,
+            mismatched_manifest,
+        )
+        store._connection.execute(
+            "DELETE FROM snapshot_observation_pins WHERE snapshot_id = ?",
+            (historical_snapshot_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                historical_snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    "dataset_field",
+    (
+        "provider_dataset_id",
+        "provider_name",
+        "upstream_service_id",
+        "contract_version",
+        "dataset_family",
+        "dataset_name",
+        "dataset_version",
+        "dataset_revision",
+        "reference_market",
+        "tags",
+    ),
+)
+def test_corrected_crypto_strict_replay_validates_requested_dataset_before_membership(
+    tmp_path: Path,
+    dataset_field: str,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    mismatched_dataset = _mismatched_replay_dataset(dataset, dataset_field)
+    manifest = json.loads(snapshot.manifest_json)
+
+    with MarketHistoryStore.open(history_config) as store:
+        observation_revision_id = manifest["observations"][0][
+            "observation_revision_id"
+        ]
+        store._connection.execute(
+            "UPDATE raw_market_observation_revisions SET close_value = '999' "
+            "WHERE revision_id = ?",
+            (observation_revision_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                snapshot.snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=mismatched_dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("manifest_path", "replacement"),
+    (
+        (("crypto_identity_binding_version",), "2.0"),
+        (("manifest_version",), "3.0"),
+        (("snapshot_kind",), "current_only_live_artifact"),
+        (("adjustment_basis",), "qfq"),
+        (("authoritative_status", "identity"), "unknown"),
+        (("authoritative_status", "value"), "suspended"),
+        (("bundle_revision_id",), "history-bundle:newer"),
+        (("bundle_observed_at",), "2026-07-26T00:00:00+00:00"),
+        (("calendar_revision_id",), "mainland-session-calendar:v1"),
+        (("derivation_version",), "crypto-auto-adjusted-v2"),
+        (("effective_trading_date",), "2026-07-24"),
+        (("factors",), ["adjustment-factor:newer"]),
+        (("frame", "rows"), 3),
+        (("frame", "sha256"), "b" * 64),
+        (("normalization_version",), "normalized-frame-csv-v2"),
+        (("observations",), []),
+        (("provenance_class",), "retrospective_backfill"),
+        (("requested_date",), "2026-07-26"),
+        (("retrieval_cutoff",), "2026-07-26T00:00:00+00:00"),
+    ),
+)
+def test_corrected_crypto_strict_replay_validates_recorded_material_before_reconstruction(
+    tmp_path: Path,
+    manifest_path: tuple[str, ...],
+    replacement: object,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    mismatched_manifest = json.loads(snapshot.manifest_json)
+    _replace_manifest_value(mismatched_manifest, manifest_path, replacement)
+
+    with MarketHistoryStore.open(history_config) as store:
+        historical_snapshot_id = _clone_crypto_pin_with_manifest(
+            store,
+            snapshot.snapshot_id,
+            mismatched_manifest,
+        )
+        store._connection.execute(
+            "DELETE FROM snapshot_observation_pins WHERE snapshot_id = ?",
+            (historical_snapshot_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                historical_snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("parent_field", "manifest_path", "replacement"),
+    (
+        ("adjustment_basis", ("adjustment_basis",), "qfq"),
+        ("derivation_version", ("derivation_version",), "crypto-v2"),
+        (
+            "normalization_version",
+            ("normalization_version",),
+            "normalized-frame-csv-v2",
+        ),
+        ("identity_version", None, "v1"),
+    ),
+)
+def test_corrected_crypto_strict_replay_rejects_joint_parent_manifest_mismatch(
+    tmp_path: Path,
+    parent_field: str,
+    manifest_path: tuple[str, ...] | None,
+    replacement: str,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    manifest = json.loads(snapshot.manifest_json)
+    if manifest_path is not None:
+        _replace_manifest_value(manifest, manifest_path, replacement)
+
+    with MarketHistoryStore.open(history_config) as store:
+        historical_snapshot_id = (
+            _clone_crypto_pin_with_manifest(
+                store,
+                snapshot.snapshot_id,
+                manifest,
+            )
+            if manifest_path is not None
+            else snapshot.snapshot_id
+        )
+        store._connection.execute(
+            f"UPDATE snapshot_pins SET {parent_field} = ? WHERE snapshot_id = ?",
+            (replacement, historical_snapshot_id),
+        )
+        observation_revision_id = manifest["observations"][0][
+            "observation_revision_id"
+        ]
+        store._connection.execute(
+            "UPDATE raw_market_observation_revisions SET close_value = '999' "
+            "WHERE revision_id = ?",
+            (observation_revision_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                historical_snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    "stored_field",
+    (
+        "canonical_symbol",
+        "reference_market",
+        "instrument_kind",
+        "currency",
+        "identity_revision",
+        "provider_name",
+        "upstream_service_id",
+        "dataset_name",
+        "adjustment_methodology",
+    ),
+)
+def test_corrected_crypto_strict_replay_validates_stored_provider_metadata(
+    tmp_path: Path,
+    stored_field: str,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    manifest = json.loads(snapshot.manifest_json)
+    instrument_id = manifest["instrument"]["instrument_id"]
+    provider_dataset_id = manifest["provider"]["provider_dataset_id"]
+    replacements = {
+        "canonical_symbol": "ETH-USD",
+        "reference_market": "XSHG",
+        "instrument_kind": "unknown",
+        "currency": "EUR",
+        "identity_revision": "crypto-registry:newer",
+        "provider_name": "newer-provider",
+        "dataset_name": "newer-ccc-bars",
+        "adjustment_methodology": "qfq",
+    }
+
+    with MarketHistoryStore.open(history_config) as store:
+        if stored_field == "upstream_service_id":
+            store._connection.execute(
+                "INSERT INTO upstream_services "
+                "(upstream_service_id, service_name, account_scope, created_at) "
+                "VALUES ('upstream:newer', 'Newer service', '', ?)",
+                ("2026-07-26T00:00:00+00:00",),
+            )
+            store._connection.execute(
+                "UPDATE provider_datasets SET upstream_service_id = 'upstream:newer' "
+                "WHERE provider_dataset_id = ?",
+                (provider_dataset_id,),
+            )
+        elif stored_field in {
+            "provider_name",
+            "dataset_name",
+            "adjustment_methodology",
+        }:
+            store._connection.execute(
+                f"UPDATE provider_datasets SET {stored_field} = ? "
+                "WHERE provider_dataset_id = ?",
+                (replacements[stored_field], provider_dataset_id),
+            )
+        else:
+            store._connection.execute(
+                f"UPDATE instruments SET {stored_field} = ? WHERE instrument_id = ?",
+                (replacements[stored_field], instrument_id),
+            )
+        observation_revision_id = manifest["observations"][0][
+            "observation_revision_id"
+        ]
+        store._connection.execute(
+            "UPDATE raw_market_observation_revisions SET close_value = '999' "
+            "WHERE revision_id = ?",
+            (observation_revision_id,),
+        )
+
+        with pytest.raises(CryptoSnapshotIdentityMismatch) as raised:
+            store.read_pinned_snapshot(
+                snapshot.snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
+
+    assert raised.value.diagnostic_code == "crypto_snapshot_identity_mismatch"
+
+
+def test_corrected_crypto_strict_replay_is_exact_immutable_and_provider_free(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    provider_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def unexpected_provider_call(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        raise AssertionError("strict replay must not call a provider")
+
+    for provider_name, provider in tuple(market_snapshot.SNAPSHOT_PROVIDERS.items()):
+        monkeypatch.setitem(
+            market_snapshot.SNAPSHOT_PROVIDERS,
+            provider_name,
+            replace(
+                provider,
+                load=unexpected_provider_call,
+                history_load=unexpected_provider_call,
+            ),
+        )
+
+    payload_bytes_before = {
+        path.relative_to(history_config.payload_root): path.read_bytes()
+        for path in history_config.payload_root.rglob("*")
+        if path.is_file()
+    }
+    historical_files = {
+        tmp_path / "historical-report.md": b"unchanged historical report\n",
+        tmp_path / "historical-checkpoint.bin": b"unchanged checkpoint\x00",
+        tmp_path / "historical-artifact.bin": b"unchanged artifact\x00",
+    }
+    for path, content in historical_files.items():
+        path.write_bytes(content)
+    with MarketHistoryStore.open(history_config) as store:
+        pin_rows_before = (
+            store._connection.execute(
+                "SELECT * FROM snapshot_pins WHERE snapshot_id = ?",
+                (snapshot.snapshot_id,),
+            ).fetchone(),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_observation_pins WHERE snapshot_id = ? "
+                    "ORDER BY ordinal",
+                    (snapshot.snapshot_id,),
+                )
+            ),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_factor_pins WHERE snapshot_id = ? "
+                    "ORDER BY factor_revision_id",
+                    (snapshot.snapshot_id,),
+                )
+            ),
+        )
+        replayed = store.read_pinned_snapshot(
+            snapshot.snapshot_id,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=dataset,
+        )
+        pin_rows_after = (
+            store._connection.execute(
+                "SELECT * FROM snapshot_pins WHERE snapshot_id = ?",
+                (snapshot.snapshot_id,),
+            ).fetchone(),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_observation_pins WHERE snapshot_id = ? "
+                    "ORDER BY ordinal",
+                    (snapshot.snapshot_id,),
+                )
+            ),
+            tuple(
+                store._connection.execute(
+                    "SELECT * FROM snapshot_factor_pins WHERE snapshot_id = ? "
+                    "ORDER BY factor_revision_id",
+                    (snapshot.snapshot_id,),
+                )
+            ),
+        )
+    payload_bytes_after = {
+        path.relative_to(history_config.payload_root): path.read_bytes()
+        for path in history_config.payload_root.rglob("*")
+        if path.is_file()
+    }
+
+    assert provider_calls == []
+    assert replayed.snapshot_id == snapshot.snapshot_id
+    assert replayed.manifest_json == snapshot.manifest_json
+    assert replayed.pin_membership_digest == snapshot.pin_membership_digest
+    assert replayed.observation_revision_ids == snapshot.observation_revision_ids
+    assert replayed.trading_status_revision_ids == snapshot.trading_status_revision_ids
+    assert replayed.factor_revision_ids == snapshot.factor_revision_ids
+    assert replayed.calendar_revision_id == snapshot.calendar_revision_id
+    assert pin_rows_after == pin_rows_before
+    assert payload_bytes_after == payload_bytes_before
+    assert {path: path.read_bytes() for path in historical_files} == historical_files
+
+
+def test_valid_legacy_crypto_v1_pin_remains_readable(tmp_path: Path) -> None:
+    history_config, _asset_configuration, _dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+
+    with MarketHistoryStore.open(history_config) as store:
+        legacy_snapshot_id = _clone_crypto_v1_pin(store, snapshot)
+        replayed = store.read_pinned_snapshot(legacy_snapshot_id)
+
+    assert replayed.snapshot_id == legacy_snapshot_id
+    assert replayed.snapshot_id_version == "v1"
+    assert replayed.manifest_json is None
+    assert replayed.frame.equals(snapshot.frame)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "observation",
+        "status",
+        "factor",
+        "calendar",
+        "payload_missing",
+        "payload_corrupt",
+        "parent",
+    ),
+)
+def test_corrected_crypto_strict_replay_fails_closed_for_missing_exact_material(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    history_config, asset_configuration, dataset, snapshot = (
+        _publish_corrected_crypto_replay_fixture(tmp_path)
+    )
+    manifest = json.loads(snapshot.manifest_json)
+    observation_id = manifest["observations"][0]["observation_revision_id"]
+    status_id = manifest["observations"][0]["trading_status_revision_id"]
+    factor_id = manifest["factors"][0]
+    calendar_id = manifest["calendar_revision_id"]
+    bundle_id = manifest["bundle_revision_id"]
+
+    with MarketHistoryStore.open(history_config) as store:
+        if corruption in {"payload_missing", "payload_corrupt"}:
+            relative_path = store._connection.execute(
+                "SELECT p.relative_path FROM payload_artifacts AS p "
+                "JOIN raw_market_observation_revisions AS o "
+                "ON o.payload_digest = p.digest WHERE o.revision_id = ?",
+                (observation_id,),
+            ).fetchone()[0]
+            payload_path = history_config.payload_root / relative_path
+            if corruption == "payload_missing":
+                payload_path.unlink()
+            else:
+                payload_path.write_bytes(b"corrupt historical payload")
+        else:
+            store._connection.execute("PRAGMA foreign_keys = OFF")
+            if corruption == "observation":
+                store._connection.execute(
+                    "DELETE FROM raw_market_observation_revisions WHERE revision_id = ?",
+                    (observation_id,),
+                )
+            elif corruption == "status":
+                store._connection.execute(
+                    "DELETE FROM trading_status_revisions WHERE revision_id = ?",
+                    (status_id,),
+                )
+            elif corruption == "factor":
+                store._connection.execute(
+                    "DELETE FROM adjustment_factor_revisions WHERE revision_id = ?",
+                    (factor_id,),
+                )
+            elif corruption == "calendar":
+                store._connection.execute(
+                    "DELETE FROM market_session_calendars "
+                    "WHERE calendar_revision_id = ?",
+                    (calendar_id,),
+                )
+            elif corruption == "parent":
+                store._connection.execute(
+                    "DELETE FROM history_bundle_revisions WHERE bundle_revision_id = ?",
+                    (bundle_id,),
+                )
+
+        with pytest.raises(
+            (CryptoSnapshotIdentityMismatch, SnapshotPinCorruptionError)
+        ):
+            store.read_pinned_snapshot(
+                snapshot.snapshot_id,
+                asset_configuration=asset_configuration,
+                crypto_provider_dataset=dataset,
+            )
 
 
 def test_crypto_snapshot_v2_id_changes_for_each_material_identity_or_dataset_field():

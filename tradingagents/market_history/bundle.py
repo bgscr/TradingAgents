@@ -32,8 +32,11 @@ from tradingagents.market_history.snapshot_identity import (
     CryptoProviderDatasetDescriptor,
     CryptoSnapshotIdentityMismatch,
     _historical_snapshot_v2_identity,
+    crypto_snapshot_identity_revision,
+    crypto_snapshot_instrument_id,
     snapshot_v2_identity,
     validate_crypto_provider_dataset_descriptor,
+    validate_crypto_replay_manifest_completeness,
 )
 
 SNAPSHOT_DERIVATION_VERSION = "mainland-qfq-v1"
@@ -283,19 +286,31 @@ def _validate_crypto_bundle_binding(
     asset_configuration: RunAssetConfiguration | None,
     crypto_provider_dataset: CryptoProviderDatasetDescriptor | None,
 ) -> None:
-    if bundle.instrument_kind != "crypto":
+    configured_crypto = (
+        asset_configuration is not None
+        and asset_configuration.instrument_kind.value == "crypto"
+    )
+    if bundle.instrument_kind != "crypto" and not configured_crypto:
         return
     if asset_configuration is None:
         raise CryptoSnapshotIdentityMismatch(
             "authoritative RunAssetConfiguration is required"
         )
+    identity = asset_configuration.instrument_identity
     dataset = validate_crypto_provider_dataset_descriptor(
         crypto_provider_dataset,
         provider_name=bundle.provider_name,
         upstream_service_id=bundle.upstream_service_id,
     )
     if (
-        bundle.provider_dataset_id != dataset.provider_dataset_id
+        bundle.instrument_id != crypto_snapshot_instrument_id(asset_configuration)
+        or bundle.canonical_symbol != identity.symbol
+        or bundle.identity_revision
+        != crypto_snapshot_identity_revision(asset_configuration)
+        or bundle.reference_market != identity.venue
+        or bundle.instrument_kind != identity.instrument_kind.value
+        or bundle.currency != identity.currency
+        or bundle.provider_dataset_id != dataset.provider_dataset_id
         or bundle.dataset_name != dataset.dataset_name
         or bundle.adjustment_methodology != asset_configuration.adjustment_basis
     ):
@@ -1338,8 +1353,9 @@ def read_pinned_snapshot(
     asset_configuration: RunAssetConfiguration | None = None,
     crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None,
 ) -> ReconstructedMarketSnapshot:
+    is_v2 = SNAPSHOT_V2_ID_PATTERN.fullmatch(snapshot_id) is not None
     if (
-        SNAPSHOT_V2_ID_PATTERN.fullmatch(snapshot_id) is None
+        not is_v2
         and LEGACY_SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id) is None
     ):
         raise StrictReplayUnavailable(f"unsupported pinned snapshot identity {snapshot_id}")
@@ -1369,11 +1385,92 @@ def read_pinned_snapshot(
     if bundle_record is None:
         raise SnapshotPinCorruptionError("pinned snapshot parent bundle is unavailable")
     bundle = _BundleRow(*(str(value) for value in bundle_record))
-    _validate_crypto_bundle_binding(
-        bundle,
-        asset_configuration=asset_configuration,
-        crypto_provider_dataset=crypto_provider_dataset,
+    recorded_crypto_binding = (
+        '"crypto_identity_binding_version":' in str(parent.manifest_json)
     )
+    requested_crypto_replay = (
+        asset_configuration is not None
+        and asset_configuration.instrument_kind.value == "crypto"
+    )
+    corrected_crypto_replay = (
+        SNAPSHOT_V2_ID_PATTERN.fullmatch(snapshot_id) is not None
+        and (
+            recorded_crypto_binding
+            or requested_crypto_replay
+            or bundle.instrument_kind == "crypto"
+        )
+    )
+    if corrected_crypto_replay:
+        if asset_configuration is None:
+            raise CryptoSnapshotIdentityMismatch(
+                "authoritative RunAssetConfiguration is required for crypto replay"
+            )
+        if (
+            parent.identity_version != "v2"
+            or parent.adjustment_basis != asset_configuration.adjustment_basis
+            or parent.derivation_version != CRYPTO_SNAPSHOT_DERIVATION_VERSION
+            or parent.normalization_version != SNAPSHOT_NORMALIZATION_VERSION
+        ):
+            raise CryptoSnapshotIdentityMismatch(
+                "recorded crypto parent uses contradictory replay semantics"
+            )
+        manifest_observations = tuple(
+            (
+                int(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                str(row[4]) if row[4] is not None else None,
+            )
+            for row in connection.execute(
+                "SELECT p.ordinal, p.session_date, p.observation_revision_id, "
+                "p.trading_status_revision_id, s.trading_status "
+                "FROM snapshot_observation_pins AS p "
+                "LEFT JOIN trading_status_revisions AS s "
+                "ON s.revision_id = p.trading_status_revision_id "
+                "WHERE p.snapshot_id = ? ORDER BY p.ordinal",
+                (snapshot_id,),
+            )
+        )
+        manifest_factors = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT factor_revision_id FROM snapshot_factor_pins "
+                "WHERE snapshot_id = ? ORDER BY factor_revision_id",
+                (snapshot_id,),
+            )
+        )
+        validate_crypto_replay_manifest_completeness(
+            parent.manifest_json,
+            snapshot_id=snapshot_id,
+            manifest_digest=parent.manifest_digest,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_dataset,
+            stored_material={
+                "adjustment_basis": parent.adjustment_basis,
+                "bundle_observed_at": bundle.observed_at,
+                "bundle_revision_id": parent.bundle_revision_id,
+                "calendar_revision_id": parent.calendar_revision_id,
+                "derivation_version": parent.derivation_version,
+                "effective_trading_date": parent.effective_trading_date,
+                "frame": {
+                    "rows": parent.history_rows,
+                    "sha256": parent.frame_digest,
+                },
+                "normalization_version": parent.normalization_version,
+                "provenance_class": parent.provenance_class,
+                "requested_date": parent.requested_as_of,
+                "retrieval_cutoff": parent.retrieval_cutoff,
+            },
+            observation_membership=manifest_observations,
+            factor_revision_ids=manifest_factors,
+        )
+    if is_v2:
+        _validate_crypto_bundle_binding(
+            bundle,
+            asset_configuration=asset_configuration,
+            crypto_provider_dataset=crypto_provider_dataset,
+        )
     if (
         bundle.provider_dataset_id != parent.provider_dataset_id
         or bundle.instrument_id != parent.instrument_id
@@ -1550,7 +1647,6 @@ def read_pinned_snapshot(
             "pinned snapshot child membership contradicts its parent bundle"
         )
 
-    is_v2 = SNAPSHOT_V2_ID_PATTERN.fullmatch(snapshot_id) is not None
     calendar_revision_id = parent.calendar_revision_id
     calendar_payload_digest: str | None = None
     if is_v2 and calendar_revision_id is None:
