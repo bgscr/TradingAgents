@@ -23,6 +23,7 @@ from requests.exceptions import (
     Timeout as RequestsTimeout,
 )
 
+from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.dataflows.acquisition import (
     AcquisitionController,
     AcquisitionFailure,
@@ -50,6 +51,7 @@ from tradingagents.market_history import PhysicalAttemptFailure, PhysicalAttempt
 FINANCIAL_REQUEST_KEY_VERSION = "1.0"
 FINANCIAL_PROVIDER_CHAIN_VERSION = "1.0"
 FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
+FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
@@ -392,6 +394,135 @@ class FinancialDispatchResult(BaseModel):
         )
 
 
+class FinancialDispatchCheckpointFailureReason(str, Enum):
+    MALFORMED = "financial_dispatch_checkpoint_malformed"
+    UNSAFE_BOUNDARY = "financial_dispatch_checkpoint_unsafe_boundary"
+    POLICY_MISMATCH = "financial_dispatch_checkpoint_policy_mismatch"
+    PROVIDER_CHAIN_MISMATCH = "financial_dispatch_checkpoint_provider_chain_mismatch"
+    ASSET_CONFIGURATION_MISMATCH = (
+        "financial_dispatch_checkpoint_asset_configuration_mismatch"
+    )
+    CANONICAL_REQUEST_MISMATCH = (
+        "financial_dispatch_checkpoint_canonical_request_mismatch"
+    )
+    ARTIFACT_REFERENCE_INVALID = (
+        "financial_dispatch_checkpoint_artifact_reference_invalid"
+    )
+    BUDGET_PROGRESS_INVALID = (
+        "financial_dispatch_checkpoint_budget_progress_invalid"
+    )
+    TERMINAL_OUTCOME_INVALID = (
+        "financial_dispatch_checkpoint_terminal_outcome_invalid"
+    )
+
+
+class FinancialDispatchCheckpointError(ValueError):
+    """Typed fail-closed validation error for restored dispatcher state."""
+
+    def __init__(self, reason: FinancialDispatchCheckpointFailureReason) -> None:
+        self.reason = reason
+        self.diagnostic_code = reason.value
+        super().__init__(reason.value)
+
+
+class FinancialProviderChainCheckpointBinding(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    provider_chain_identity: str = Field(
+        pattern=r"^financial-provider-chain:v1:[0-9a-f]{64}$"
+    )
+
+
+class FinancialProviderVariantProgress(BaseModel):
+    """Completed outcomes and budget consumed at one provider/variant step."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    provider_order: int = Field(ge=0)
+    variant_id: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    variant_order: int = Field(ge=0)
+    outcome_count: int = Field(ge=1)
+    attempts_consumed: int = Field(ge=0)
+
+
+class FinancialCircuitCheckpointState(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    is_open: Literal[True] = True
+
+
+class FinancialDispatchTerminalCheckpointState(BaseModel):
+    """Canonical terminal content stored independently of ToolMessage correlation."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    value: str | None
+    artifact: SourceArtifact | None
+    plan_outcomes: tuple[FinancialPlanOutcome, ...] = Field(min_length=1)
+    terminal_outcome: SourceAcquisitionAvailable | SourceAcquisitionUnavailable = Field(
+        discriminator="outcome"
+    )
+    provider: str | None = None
+    variant_id: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_terminal_state(self) -> FinancialDispatchTerminalCheckpointState:
+        if self.terminal_outcome != self.plan_outcomes[-1].outcome:
+            raise ValueError("financial terminal outcome contradicts plan progress")
+        available = tuple(
+            item.outcome
+            for item in self.plan_outcomes
+            if isinstance(item.outcome, SourceAcquisitionAvailable)
+        )
+        if self.artifact is None:
+            if self.value is not None or self.provider is not None or self.variant_id is not None:
+                raise ValueError("unavailable financial terminal state carries available data")
+            if available:
+                raise ValueError("unavailable financial terminal state has an artifact outcome")
+        else:
+            if self.value is None or self.provider is None or self.variant_id is None:
+                raise ValueError("available financial terminal state is incomplete")
+            if len(available) != 1 or available[0].artifact != self.artifact:
+                raise ValueError("available financial terminal state has a mismatched artifact")
+        return self
+
+
+class FinancialDispatchCheckpointEntry(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    canonical_request_key: CanonicalFinancialRequestKey
+    provider_variant_progress: tuple[FinancialProviderVariantProgress, ...] = Field(
+        min_length=1
+    )
+    consumed_attempt_budget: int = Field(ge=0)
+    terminal: FinancialDispatchTerminalCheckpointState
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reuse_count: int = Field(default=0, ge=0)
+
+
+class FinancialDispatchCheckpointLedger(BaseModel):
+    """Optional versioned state stored in the AgentState checkpoint channel."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = FINANCIAL_DISPATCH_LEDGER_VERSION
+    acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    retry_policy: RetryPolicy
+    provider_chain_identities: tuple[
+        FinancialProviderChainCheckpointBinding, ...
+    ] = ()
+    run_asset_configuration_version: str = Field(min_length=1)
+    run_asset_configuration_signature: str = Field(
+        pattern=r"^asset-config:v1:[0-9a-f]{64}$"
+    )
+    circuit_state: tuple[FinancialCircuitCheckpointState, ...] = ()
+    entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
+
+
 class FinancialToolDispatcher:
     """Run-scoped owner of financial request identity and acquisition policy."""
 
@@ -399,14 +530,25 @@ class FinancialToolDispatcher:
         self,
         *,
         instrument_identity: InstrumentIdentityEvidence,
+        run_asset_configuration: RunAssetConfiguration | None = None,
         provider_chains: Mapping[str, tuple[FinancialProvider, ...]],
         acquisition_policy_version: str = DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION,
         retry_policy: RetryPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        checkpoint_ledger: (
+            Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
+        ) = None,
     ) -> None:
         if not instrument_identity.is_authoritative:
             raise ValueError("financial dispatcher requires authoritative Instrument Identity")
+        if (
+            run_asset_configuration is not None
+            and run_asset_configuration.instrument_identity != instrument_identity
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+            )
         if _ACQUISITION_TOKEN.fullmatch(acquisition_policy_version) is None:
             raise ValueError("financial acquisition-policy version is malformed")
         copied_chains = {
@@ -422,6 +564,7 @@ class FinancialToolDispatcher:
             if len(provider_names) != len(set(provider_names)):
                 raise ValueError("configured financial provider names must be unique")
         self._instrument_identity = instrument_identity
+        self._run_asset_configuration = run_asset_configuration
         self._provider_chains = copied_chains
         self._acquisition_policy_version = acquisition_policy_version
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -430,18 +573,25 @@ class FinancialToolDispatcher:
         self._open_circuits: set[tuple[str, str]] = set()
         self._dispatch_lock = threading.Lock()
         self._dispatch_results: dict[str, Future[FinancialDispatchResult]] = {}
+        self._reuse_counts: dict[str, int] = {}
+        if checkpoint_ledger is not None:
+            self._restore_checkpoint_ledger(checkpoint_ledger)
 
     @classmethod
     def from_configured_vendors(
         cls,
         *,
         instrument_identity: InstrumentIdentityEvidence,
+        run_asset_configuration: RunAssetConfiguration | None = None,
         config: Mapping[str, Any] | None = None,
         vendor_methods: Mapping[str, Mapping[str, object]] | None = None,
         acquisition_policy_version: str = DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION,
         retry_policy: RetryPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        checkpoint_ledger: (
+            Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
+        ) = None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -488,11 +638,13 @@ class FinancialToolDispatcher:
             )
         return cls(
             instrument_identity=instrument_identity,
+            run_asset_configuration=run_asset_configuration,
             provider_chains=provider_chains,
             acquisition_policy_version=acquisition_policy_version,
             retry_policy=retry_policy,
             clock=clock,
             sleeper=sleeper,
+            checkpoint_ledger=checkpoint_ledger,
         )
 
     def canonical_request_key(
@@ -504,18 +656,8 @@ class FinancialToolDispatcher:
             raise ValueError(
                 f"financial tool {request.tool_name!r} has no configured provider chain"
             )
-        provenance = self._instrument_identity.provenance
-        if provenance is None:  # Defensive: is_authoritative already requires it.
-            raise ValueError("financial dispatcher identity revision is unavailable")
-        identity = CanonicalFinancialInstrumentIdentity(
-            canonical_symbol=self._instrument_identity.symbol.strip().upper(),
-            venue=self._instrument_identity.venue.strip(),
-            instrument_kind=self._instrument_identity.instrument_kind,
-            currency=self._instrument_identity.currency.strip().upper(),
-            provenance_provider=provenance.provider,
-            provenance_source_ref=provenance.source_ref,
-            provenance_retrieved_at=provenance.retrieved_at,
-            identity_revision=provenance.artifact_sha256,
+        identity = _canonical_financial_instrument_identity(
+            self._instrument_identity
         )
         material_arguments_json = _canonical_json(
             request.material_arguments,
@@ -556,6 +698,10 @@ class FinancialToolDispatcher:
 
         if not is_leader:
             original = shared.result()
+            with self._dispatch_lock:
+                self._reuse_counts[canonical_key.request_key] = (
+                    self._reuse_counts.get(canonical_key.request_key, 0) + 1
+                )
             return original.model_copy(
                 update={
                     "tool_call_id": request.tool_call_id,
@@ -569,12 +715,416 @@ class FinancialToolDispatcher:
             shared.set_exception(exc)
             raise
         shared.set_result(result)
+        with self._dispatch_lock:
+            self._reuse_counts.setdefault(canonical_key.request_key, 0)
         return result
 
     def dispatch_tool_message(self, request: FinancialToolRequest) -> ToolMessage:
         """Dispatch and render the independently correlated terminal ToolMessage."""
 
         return self.dispatch(request).to_tool_message()
+
+    def checkpoint_ledger(self) -> dict[str, Any]:
+        """Return JSON-compatible terminal state at a normal checkpoint boundary."""
+
+        asset_configuration = self._run_asset_configuration
+        if asset_configuration is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+            )
+        entries: list[FinancialDispatchCheckpointEntry] = []
+        with self._dispatch_lock:
+            for request_key, shared in sorted(self._dispatch_results.items()):
+                if not shared.done():
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                    )
+                try:
+                    result = shared.result()
+                except BaseException as exc:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.TERMINAL_OUTCOME_INVALID
+                    ) from exc
+                progress = _financial_provider_variant_progress(result.plan_outcomes)
+                entries.append(
+                    FinancialDispatchCheckpointEntry(
+                        canonical_request_key=result.request_key,
+                        provider_variant_progress=progress,
+                        consumed_attempt_budget=sum(
+                            item.attempts_consumed for item in progress
+                        ),
+                        terminal=FinancialDispatchTerminalCheckpointState(
+                            value=result.value,
+                            artifact=result.artifact,
+                            plan_outcomes=result.plan_outcomes,
+                            terminal_outcome=result.plan_outcomes[-1].outcome,
+                            provider=result.provider,
+                            variant_id=result.variant_id,
+                        ),
+                        artifact_sha256=(
+                            result.artifact.artifact_sha256
+                            if result.artifact is not None
+                            else None
+                        ),
+                        reuse_count=self._reuse_counts.get(request_key, 0),
+                    )
+                )
+        ledger = FinancialDispatchCheckpointLedger(
+            acquisition_policy_version=self._acquisition_policy_version,
+            retry_policy=self._retry_policy,
+            provider_chain_identities=self._checkpoint_provider_chain_bindings(),
+            run_asset_configuration_version=(
+                asset_configuration.asset_configuration_version
+            ),
+            run_asset_configuration_signature=(
+                asset_configuration.asset_configuration_signature
+            ),
+            circuit_state=tuple(
+                FinancialCircuitCheckpointState(provider=provider, tool_name=tool_name)
+                for provider, tool_name in sorted(self._open_circuits)
+            ),
+            entries=tuple(entries),
+        )
+        return ledger.model_dump(mode="json")
+
+    def _checkpoint_provider_chain_bindings(
+        self,
+    ) -> tuple[FinancialProviderChainCheckpointBinding, ...]:
+        return tuple(
+            FinancialProviderChainCheckpointBinding(
+                tool_name=tool_name,
+                provider_chain_identity=_provider_chain_identity(tool_name, providers),
+            )
+            for tool_name, providers in sorted(self._provider_chains.items())
+        )
+
+    def _restore_checkpoint_ledger(
+        self,
+        checkpoint_ledger: Mapping[str, Any] | FinancialDispatchCheckpointLedger,
+    ) -> None:
+        try:
+            ledger = FinancialDispatchCheckpointLedger.model_validate(checkpoint_ledger)
+        except (TypeError, ValueError) as exc:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.MALFORMED
+            ) from exc
+        asset_configuration = self._run_asset_configuration
+        if (
+            asset_configuration is None
+            or ledger.run_asset_configuration_version
+            != asset_configuration.asset_configuration_version
+            or ledger.run_asset_configuration_signature
+            != asset_configuration.asset_configuration_signature
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+            )
+        if (
+            ledger.acquisition_policy_version != self._acquisition_policy_version
+            or ledger.retry_policy != self._retry_policy
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.POLICY_MISMATCH
+            )
+        restored_chains = {
+            item.tool_name: item.provider_chain_identity
+            for item in ledger.provider_chain_identities
+        }
+        configured_chains = {
+            item.tool_name: item.provider_chain_identity
+            for item in self._checkpoint_provider_chain_bindings()
+        }
+        if (
+            len(restored_chains) != len(ledger.provider_chain_identities)
+            or restored_chains != configured_chains
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
+            )
+        request_keys: set[str] = set()
+        for entry in ledger.entries:
+            request_key = entry.canonical_request_key.request_key
+            if request_key in request_keys:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.CANONICAL_REQUEST_MISMATCH
+                )
+            request_keys.add(request_key)
+            self._validate_checkpoint_entry(entry, ledger=ledger)
+        self._validate_checkpoint_circuit_state(ledger)
+        self._open_circuits = {
+            (item.provider, item.tool_name) for item in ledger.circuit_state
+        }
+        for entry in ledger.entries:
+            terminal = entry.terminal
+            result = FinancialDispatchResult(
+                tool_call_id="checkpoint-restored",
+                disposition="executed",
+                request_key=entry.canonical_request_key,
+                value=terminal.value,
+                artifact=terminal.artifact,
+                plan_outcomes=terminal.plan_outcomes,
+                provider=terminal.provider,
+                variant_id=terminal.variant_id,
+            )
+            shared: Future[FinancialDispatchResult] = Future()
+            shared.set_result(result)
+            self._dispatch_results[entry.canonical_request_key.request_key] = shared
+            self._reuse_counts[entry.canonical_request_key.request_key] = entry.reuse_count
+
+    def _validate_checkpoint_entry(
+        self,
+        entry: FinancialDispatchCheckpointEntry,
+        *,
+        ledger: FinancialDispatchCheckpointLedger,
+    ) -> None:
+        key = entry.canonical_request_key
+        if (
+            key.acquisition_policy_version != ledger.acquisition_policy_version
+            or key.instrument_identity
+            != _canonical_financial_instrument_identity(self._instrument_identity)
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.CANONICAL_REQUEST_MISMATCH
+            )
+        providers = self._provider_chains.get(key.tool_name)
+        if (
+            providers is None
+            or key.provider_chain_identity
+            != _provider_chain_identity(key.tool_name, providers)
+            or not _canonical_financial_request_key_is_valid(key)
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.CANONICAL_REQUEST_MISMATCH
+            )
+        progress = _financial_provider_variant_progress(entry.terminal.plan_outcomes)
+        consumed_budget = sum(item.attempts_consumed for item in progress)
+        if (
+            entry.provider_variant_progress != progress
+            or entry.consumed_attempt_budget != consumed_budget
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+            )
+        self._validate_checkpoint_plan_progress(
+            entry.terminal.plan_outcomes,
+            providers=providers,
+            request_key=key.request_key,
+            tool_name=key.tool_name,
+            open_circuits=frozenset(
+                (item.provider, item.tool_name) for item in ledger.circuit_state
+            ),
+        )
+        terminal = entry.terminal
+        terminal_outcome = terminal.plan_outcomes[-1]
+        if terminal.artifact is None:
+            if entry.artifact_sha256 is not None or not isinstance(
+                terminal_outcome.outcome,
+                SourceAcquisitionUnavailable,
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ARTIFACT_REFERENCE_INVALID
+                )
+        else:
+            if (
+                entry.artifact_sha256 != terminal.artifact.artifact_sha256
+                or terminal.artifact.source_ref != key.request_key
+                or terminal.artifact.tool_name != key.tool_name
+                or terminal.value != terminal.artifact.raw_text
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ARTIFACT_REFERENCE_INVALID
+                )
+            if (
+                not isinstance(terminal_outcome.outcome, SourceAcquisitionAvailable)
+                or terminal.provider != terminal_outcome.provider
+                or terminal.variant_id != terminal_outcome.variant_id
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.TERMINAL_OUTCOME_INVALID
+                )
+
+    def _validate_checkpoint_plan_progress(
+        self,
+        plan_outcomes: tuple[FinancialPlanOutcome, ...],
+        *,
+        providers: tuple[FinancialProvider, ...],
+        request_key: str,
+        tool_name: str,
+        open_circuits: frozenset[tuple[str, str]],
+    ) -> None:
+        last_provider_order = -1
+        last_variant_order = -1
+        consumed_by_provider: dict[int, list[int]] = {}
+        grouped: dict[int, dict[int, list[FinancialPlanOutcome]]] = {}
+        for item in plan_outcomes:
+            if item.provider_order >= len(providers):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+            provider = providers[item.provider_order]
+            if (
+                item.provider != provider.name
+                or item.variant_order >= len(provider.variants)
+                or item.variant_id != provider.variants[item.variant_order].variant_id
+                or item.outcome.source_ref != request_key
+                or item.outcome.capability != "company_financials"
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+            if item.provider_order < last_provider_order or (
+                item.provider_order == last_provider_order
+                and (
+                    item.variant_order < last_variant_order
+                    or item.variant_order > last_variant_order + 1
+                )
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+            if item.provider_order != last_provider_order:
+                if item.provider_order != last_provider_order + 1:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                    )
+                last_provider_order = item.provider_order
+                last_variant_order = -1
+            if item.variant_order > last_variant_order + 1:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+            last_variant_order = item.variant_order
+            grouped.setdefault(item.provider_order, {}).setdefault(
+                item.variant_order, []
+            ).append(item)
+            if not (
+                isinstance(item.outcome, SourceAcquisitionUnavailable)
+                and item.outcome.reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
+            ):
+                consumed_by_provider.setdefault(item.provider_order, []).append(
+                    item.outcome.attempt
+                )
+        for attempts in consumed_by_provider.values():
+            if attempts != list(range(1, len(attempts) + 1)) or len(attempts) > (
+                self._retry_policy.max_attempts_per_provider
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+        for provider_order, provider in enumerate(providers):
+            variant_groups = grouped.get(provider_order)
+            if variant_groups is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+            provider_items = tuple(
+                item for items in variant_groups.values() for item in items
+            )
+            circuit_outcomes = tuple(
+                item
+                for item in provider_items
+                if isinstance(item.outcome, SourceAcquisitionUnavailable)
+                and item.outcome.reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
+            )
+            if circuit_outcomes:
+                if (
+                    len(provider_items) != 1
+                    or provider_items[0].variant_order != 0
+                ):
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                    )
+                if (provider.name, tool_name) not in open_circuits:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                    )
+                continue
+
+            consumed = 0
+            variant_orders = tuple(variant_groups)
+            for group_index, variant_order in enumerate(variant_orders):
+                outcomes = variant_groups[variant_order]
+                is_last_configured_variant = variant_order + 1 == len(provider.variants)
+                if not is_last_configured_variant and len(outcomes) != 1:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                    )
+                for prior in outcomes[:-1]:
+                    if not isinstance(
+                        prior.outcome, SourceAcquisitionUnavailable
+                    ) or not prior.outcome.retryable:
+                        raise FinancialDispatchCheckpointError(
+                            FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                        )
+                consumed += len(outcomes)
+                terminal = outcomes[-1]
+                if isinstance(terminal.outcome, SourceAcquisitionAvailable):
+                    if terminal is not plan_outcomes[-1]:
+                        raise FinancialDispatchCheckpointError(
+                            FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                        )
+                    return
+                remaining = self._retry_policy.max_attempts_per_provider - consumed
+                stops_provider = (
+                    not terminal.outcome.retryable
+                    and terminal.outcome.reason
+                    not in {
+                        AcquisitionUnavailableReason.NO_DATA,
+                        AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+                    }
+                )
+                expects_next_variant = (
+                    not stops_provider
+                    and remaining > 0
+                    and not is_last_configured_variant
+                )
+                has_next_variant = group_index + 1 < len(variant_orders)
+                if expects_next_variant:
+                    if (
+                        not has_next_variant
+                        or variant_orders[group_index + 1] != variant_order + 1
+                    ):
+                        raise FinancialDispatchCheckpointError(
+                            FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                        )
+                elif has_next_variant or (
+                    terminal.outcome.retryable and remaining > 0
+                ):
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                    )
+            if provider_order + 1 < len(providers) and provider_order + 1 not in grouped:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+                )
+
+    def _validate_checkpoint_circuit_state(
+        self,
+        ledger: FinancialDispatchCheckpointLedger,
+    ) -> None:
+        circuit_keys = tuple(
+            (item.provider, item.tool_name) for item in ledger.circuit_state
+        )
+        if len(circuit_keys) != len(set(circuit_keys)):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+            )
+        justified: set[tuple[str, str]] = set()
+        for entry in ledger.entries:
+            terminal_by_provider: dict[int, FinancialPlanOutcome] = {}
+            for item in entry.terminal.plan_outcomes:
+                terminal_by_provider[item.provider_order] = item
+            for item in terminal_by_provider.values():
+                if isinstance(
+                    item.outcome, SourceAcquisitionUnavailable
+                ) and item.outcome.reason in _SYSTEMIC_CIRCUIT_FAILURES:
+                    justified.add(
+                        (item.provider, entry.canonical_request_key.tool_name)
+                    )
+        if set(circuit_keys) != justified:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.BUDGET_PROGRESS_INVALID
+            )
 
     def _execute_dispatch(
         self,
@@ -760,6 +1310,78 @@ def _provider_chain_identity(
     }
     encoded = _canonical_json(payload, label="financial provider chain").encode("utf-8")
     return f"financial-provider-chain:v1:{sha256(encoded).hexdigest()}"
+
+
+def _canonical_financial_instrument_identity(
+    instrument_identity: InstrumentIdentityEvidence,
+) -> CanonicalFinancialInstrumentIdentity:
+    provenance = instrument_identity.provenance
+    if provenance is None:
+        raise ValueError("financial dispatcher identity revision is unavailable")
+    return CanonicalFinancialInstrumentIdentity(
+        canonical_symbol=instrument_identity.symbol.strip().upper(),
+        venue=instrument_identity.venue.strip(),
+        instrument_kind=instrument_identity.instrument_kind,
+        currency=instrument_identity.currency.strip().upper(),
+        provenance_provider=provenance.provider,
+        provenance_source_ref=provenance.source_ref,
+        provenance_retrieved_at=provenance.retrieved_at,
+        identity_revision=provenance.artifact_sha256,
+    )
+
+
+def _canonical_financial_request_key_is_valid(
+    key: CanonicalFinancialRequestKey,
+) -> bool:
+    spec = _FINANCIAL_TOOL_SPECS.get(key.tool_name)
+    if spec is None or key.statement_type is not spec[0] or key.frequency not in spec[1]:
+        return False
+    try:
+        material_arguments = json.loads(key.material_arguments_json)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(material_arguments, dict) or _canonical_json(
+        material_arguments,
+        label="material arguments",
+    ) != key.material_arguments_json:
+        return False
+    payload = key.model_dump(mode="json", exclude={"request_key"})
+    encoded = _canonical_json(payload, label="financial request key").encode("utf-8")
+    return key.request_key == f"financial-request:v1:{sha256(encoded).hexdigest()}"
+
+
+def _financial_provider_variant_progress(
+    plan_outcomes: tuple[FinancialPlanOutcome, ...],
+) -> tuple[FinancialProviderVariantProgress, ...]:
+    progress: dict[tuple[int, int], FinancialProviderVariantProgress] = {}
+    for item in plan_outcomes:
+        key = (item.provider_order, item.variant_order)
+        current = progress.get(key)
+        attempts_consumed = int(
+            not (
+                isinstance(item.outcome, SourceAcquisitionUnavailable)
+                and item.outcome.reason is AcquisitionUnavailableReason.CIRCUIT_OPEN
+            )
+        )
+        if current is None:
+            progress[key] = FinancialProviderVariantProgress(
+                provider=item.provider,
+                provider_order=item.provider_order,
+                variant_id=item.variant_id,
+                variant_order=item.variant_order,
+                outcome_count=1,
+                attempts_consumed=attempts_consumed,
+            )
+        else:
+            progress[key] = current.model_copy(
+                update={
+                    "outcome_count": current.outcome_count + 1,
+                    "attempts_consumed": (
+                        current.attempts_consumed + attempts_consumed
+                    ),
+                }
+            )
+    return tuple(progress.values())
 
 
 def _market_from_authoritative_identity(
@@ -1288,13 +1910,21 @@ def _valid_retry_after(value: object) -> float | None:
 __all__ = [
     "CanonicalFinancialRequestKey",
     "DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION",
+    "FINANCIAL_DISPATCH_LEDGER_VERSION",
+    "FinancialCircuitCheckpointState",
+    "FinancialDispatchCheckpointEntry",
+    "FinancialDispatchCheckpointError",
+    "FinancialDispatchCheckpointFailureReason",
+    "FinancialDispatchCheckpointLedger",
     "FinancialDispatchResult",
-    "FinancialTerminalUnavailableEnvelope",
     "FinancialPlanOutcome",
     "FinancialProvider",
+    "FinancialProviderChainCheckpointBinding",
     "FinancialProviderVariant",
+    "FinancialProviderVariantProgress",
     "FinancialReportingFrequency",
     "FinancialStatementType",
+    "FinancialTerminalUnavailableEnvelope",
     "FinancialToolDispatcher",
     "FinancialToolMessageAuditEnvelope",
     "FinancialToolRequest",

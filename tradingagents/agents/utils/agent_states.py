@@ -1,7 +1,7 @@
 from typing import Annotated, Any
 
 from langgraph.graph import MessagesState
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 # Researcher team state
@@ -96,6 +96,12 @@ class AgentState(MessagesState):
     admitted_evidence_binding: Annotated[
         dict[str, Any] | None,
         "Checkpoint-safe binding for evidence accepted at Evidence Admission",
+    ]
+    financial_dispatch_ledger: NotRequired[
+        Annotated[
+            dict[str, Any],
+            "Versioned checkpoint ledger for deterministic financial dispatch",
+        ]
     ]
 
     sender: Annotated[str, "Agent that sent this message"]
