@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -15,6 +16,7 @@ from hashlib import sha256
 from typing import Any, Literal
 from uuid import uuid4
 
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
@@ -47,6 +49,7 @@ from tradingagents.market_history import PhysicalAttemptFailure, PhysicalAttempt
 
 FINANCIAL_REQUEST_KEY_VERSION = "1.0"
 FINANCIAL_PROVIDER_CHAIN_VERSION = "1.0"
+FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
@@ -268,11 +271,60 @@ class FinancialPlanOutcome(BaseModel):
         return self
 
 
+class FinancialTerminalUnavailableEnvelope(BaseModel):
+    """Complete bounded content permitted at the model-visible failure boundary."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION
+    request_ref: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+    capability: Literal["company_financials"] = "company_financials"
+    reason: AcquisitionUnavailableReason
+
+
+class FinancialToolMessageAuditEnvelope(BaseModel):
+    """Operational provenance hidden from model-visible ToolMessage content."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    request_ref: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+    capability: Literal["company_financials"] = "company_financials"
+    disposition: Literal["executed", "duplicate_suppressed"]
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_result_references(self) -> FinancialToolMessageAuditEnvelope:
+        available = tuple(
+            outcome
+            for outcome in self.acquisition_outcomes
+            if isinstance(outcome, SourceAcquisitionAvailable)
+        )
+        for outcome in self.acquisition_outcomes:
+            if outcome.source_ref != self.request_ref:
+                raise ValueError("financial outcome source_ref does not match envelope")
+            if outcome.capability != self.capability:
+                raise ValueError("financial outcome capability does not match envelope")
+        if self.artifact_sha256 is None:
+            if available:
+                raise ValueError("unavailable financial envelope cannot reference an artifact")
+        elif len(available) != 1 or (
+            available[0].artifact.artifact_sha256 != self.artifact_sha256
+        ):
+            raise ValueError("financial artifact digest does not match available outcome")
+        return self
+
+
 class FinancialDispatchResult(BaseModel):
     """Terminal internal result; unavailable results cannot carry an artifact."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    disposition: Literal["executed", "duplicate_suppressed"]
     request_key: CanonicalFinancialRequestKey
     value: str | None
     artifact: SourceArtifact | None
@@ -302,6 +354,42 @@ class FinancialDispatchResult(BaseModel):
     @property
     def outcomes(self) -> tuple[SourceAcquisitionOutcome, ...]:
         return tuple(item.outcome for item in self.plan_outcomes)
+
+    def to_tool_message(self) -> ToolMessage:
+        """Render one correlation wrapper after deterministic policy terminates."""
+
+        audit = FinancialToolMessageAuditEnvelope(
+            tool_call_id=self.tool_call_id,
+            tool_name=self.request_key.tool_name,
+            request_ref=self.request_key.request_key,
+            disposition=self.disposition,
+            artifact_sha256=(
+                self.artifact.artifact_sha256 if self.artifact is not None else None
+            ),
+            acquisition_outcomes=self.outcomes,
+        )
+        if self.artifact is not None:
+            content = self.value
+            status = "success"
+        else:
+            terminal = self.plan_outcomes[-1].outcome
+            if not isinstance(terminal, SourceAcquisitionUnavailable):
+                raise ValueError("unavailable financial result lacks a terminal reason")
+            content = _canonical_json(
+                FinancialTerminalUnavailableEnvelope(
+                    request_ref=self.request_key.request_key,
+                    reason=terminal.reason,
+                ).model_dump(mode="json", exclude={"contract_version"}),
+                label="financial terminal unavailable envelope",
+            )
+            status = "error"
+        return ToolMessage(
+            content=content,
+            tool_call_id=self.tool_call_id,
+            name=self.request_key.tool_name,
+            artifact=audit.model_dump(mode="json"),
+            status=status,
+        )
 
 
 class FinancialToolDispatcher:
@@ -340,6 +428,8 @@ class FinancialToolDispatcher:
         self._sleeper = sleeper or time.sleep
         self._retry_policy = retry_policy or RetryPolicy()
         self._open_circuits: set[tuple[str, str]] = set()
+        self._dispatch_lock = threading.Lock()
+        self._dispatch_results: dict[str, Future[FinancialDispatchResult]] = {}
 
     @classmethod
     def from_configured_vendors(
@@ -454,9 +544,46 @@ class FinancialToolDispatcher:
         )
 
     def dispatch(self, request: FinancialToolRequest) -> FinancialDispatchResult:
-        """Execute the complete ordered plan before returning one terminal result."""
+        """Share one in-flight or terminal result for each exact request key."""
 
         canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            shared = self._dispatch_results.get(canonical_key.request_key)
+            is_leader = shared is None
+            if shared is None:
+                shared = Future()
+                self._dispatch_results[canonical_key.request_key] = shared
+
+        if not is_leader:
+            original = shared.result()
+            return original.model_copy(
+                update={
+                    "tool_call_id": request.tool_call_id,
+                    "disposition": "duplicate_suppressed",
+                }
+            )
+
+        try:
+            result = self._execute_dispatch(request, canonical_key=canonical_key)
+        except BaseException as exc:
+            shared.set_exception(exc)
+            raise
+        shared.set_result(result)
+        return result
+
+    def dispatch_tool_message(self, request: FinancialToolRequest) -> ToolMessage:
+        """Dispatch and render the independently correlated terminal ToolMessage."""
+
+        return self.dispatch(request).to_tool_message()
+
+    def _execute_dispatch(
+        self,
+        request: FinancialToolRequest,
+        *,
+        canonical_key: CanonicalFinancialRequestKey,
+    ) -> FinancialDispatchResult:
+        """Execute the complete ordered plan before publishing a shared result."""
+
         providers = self._provider_chains[request.tool_name]
         plan_outcomes: list[FinancialPlanOutcome] = []
         acquisition_request = AcquisitionRequest(
@@ -560,6 +687,8 @@ class FinancialToolDispatcher:
                 remaining_attempts -= consumed_attempts
                 if acquired.artifact is not None:
                     return FinancialDispatchResult(
+                        tool_call_id=request.tool_call_id,
+                        disposition="executed",
                         request_key=canonical_key,
                         value=acquired.value,
                         artifact=acquired.artifact,
@@ -597,6 +726,8 @@ class FinancialToolDispatcher:
             ):
                 self._open_circuits.add(circuit_key)
         return FinancialDispatchResult(
+            tool_call_id=request.tool_call_id,
+            disposition="executed",
             request_key=canonical_key,
             value=None,
             artifact=None,
@@ -1158,11 +1289,13 @@ __all__ = [
     "CanonicalFinancialRequestKey",
     "DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION",
     "FinancialDispatchResult",
+    "FinancialTerminalUnavailableEnvelope",
     "FinancialPlanOutcome",
     "FinancialProvider",
     "FinancialProviderVariant",
     "FinancialReportingFrequency",
     "FinancialStatementType",
     "FinancialToolDispatcher",
+    "FinancialToolMessageAuditEnvelope",
     "FinancialToolRequest",
 ]

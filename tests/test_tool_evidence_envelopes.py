@@ -56,6 +56,31 @@ def _available_envelope(
 
 
 @pytest.mark.unit
+def test_financial_duplicate_suppression_leaves_non_financial_tool_messages_unchanged():
+    content = "Non-financial news evidence remains correlation-bound."
+    message = ToolMessage(
+        content=content,
+        tool_call_id="news-call-1",
+        name="get_company_news",
+        artifact=_available_envelope(
+            tool_call_id="news-call-1",
+            content=content,
+            tool_name="get_company_news",
+        ),
+    )
+
+    checkpoint_message = ToolMessage.model_validate_json(message.model_dump_json())
+    envelope = ToolExecutionEvidenceEnvelope.model_validate(
+        checkpoint_message.artifact
+    )
+
+    assert checkpoint_message == message
+    assert envelope.tool_call_id == message.tool_call_id
+    assert envelope.selected_artifact is not None
+    assert envelope.selected_artifact.tool_call_id == message.tool_call_id
+
+
+@pytest.mark.unit
 def test_real_tool_node_preserves_json_envelope_and_correlates_reversed_calls_by_id():
     content_by_id = {"call-a": "Alpha fact: 10", "call-b": "Beta fact: 20"}
 
