@@ -753,36 +753,57 @@ class TradingAgentsGraph:
         signature = self._run_signature(asset_type)
         with get_checkpointer(self.config["data_cache_dir"], company_name) as saver:
             self.graph = self.workflow.compile(checkpointer=saver)
-            step = checkpoint_step(
-                self.config["data_cache_dir"],
-                company_name,
-                str(trade_date),
-                signature,
-            )
-            if step is not None:
-                logger.info(
-                    "Resuming from step %d for %s on %s",
-                    step,
-                    company_name,
-                    trade_date,
-                )
-            else:
-                logger.info(
-                    "Starting fresh for %s on %s",
-                    company_name,
-                    trade_date,
-                )
             try:
+                graph_config = {
+                    "configurable": {
+                        "thread_id": thread_id(
+                            company_name,
+                            str(trade_date),
+                            signature,
+                        )
+                    }
+                }
+                step = checkpoint_step(
+                    self.config["data_cache_dir"],
+                    company_name,
+                    str(trade_date),
+                    signature,
+                )
+                if step is not None:
+                    logger.info(
+                        "Resuming from step %d for %s on %s",
+                        step,
+                        company_name,
+                        trade_date,
+                    )
+                    checkpoint = saver.get_tuple(graph_config)
+                    if checkpoint is None:
+                        raise RuntimeError(
+                            "checkpoint disappeared during resume validation"
+                        )
+                    channel_values = checkpoint.checkpoint.get("channel_values")
+                    if not isinstance(channel_values, dict):
+                        raise ValueError("checkpoint channel values must be a mapping")
+                    financial_tool_node = getattr(self, "tool_nodes", {}).get(
+                        "fundamentals"
+                    )
+                    if isinstance(financial_tool_node, FinancialDispatchToolNode):
+                        financial_tool_node.validate_checkpoint_state(
+                            channel_values,
+                            expected_asset_configuration=getattr(
+                                self,
+                                "asset_configuration",
+                                None,
+                            ),
+                        )
+                else:
+                    logger.info(
+                        "Starting fresh for %s on %s",
+                        company_name,
+                        trade_date,
+                    )
                 yield CheckpointSession(
-                    graph_config={
-                        "configurable": {
-                            "thread_id": thread_id(
-                                company_name,
-                                str(trade_date),
-                                signature,
-                            )
-                        }
-                    },
+                    graph_config=graph_config,
                     resume_from_checkpoint=step is not None,
                 )
             finally:

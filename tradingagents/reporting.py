@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from tradingagents.dataflows.financial_dispatch import FinancialDispatchAuditProjection
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import TradingDecisionContract
 from tradingagents.evidence import (
@@ -262,10 +263,71 @@ def _render_market_snapshot_binding(evidence: EvidenceState) -> list[str]:
     return lines
 
 
+def _render_financial_dispatch_operations(
+    financial_dispatch: FinancialDispatchAuditProjection | None,
+) -> list[str]:
+    if financial_dispatch is None:
+        return []
+    lines = [
+        "## Financial dispatch operations",
+        "",
+        f"- **Canonical request count:** {financial_dispatch.request_count}",
+        (
+            "- **Acquisition attempt count:** "
+            f"{financial_dispatch.acquisition_attempt_count}"
+        ),
+        (
+            "- **Duplicate-suppressed call count:** "
+            f"{financial_dispatch.duplicate_suppressed_count}"
+        ),
+        "",
+    ]
+    for request in financial_dispatch.requests:
+        artifact = (
+            f"`artifact=sha256:{request.artifact_sha256}`"
+            if request.artifact_sha256 is not None
+            else "none"
+        )
+        lines.extend(
+            [
+                f"### `{request.tool_name}` request",
+                "",
+                f"- **Request reference:** `{request.request_ref}`",
+                f"- **Statement type:** {request.statement_type.value}",
+                f"- **Frequency:** {request.frequency.value}",
+                f"- **As of:** {request.as_of_date.isoformat()}",
+                (
+                    "- **Acquisition attempts:** "
+                    f"{request.acquisition_attempt_count}"
+                ),
+                (
+                    "- **Duplicate-suppressed calls:** "
+                    f"{request.duplicate_suppressed_count}"
+                ),
+                f"- **Artifact:** {artifact}",
+            ]
+        )
+        for index, outcome in enumerate(request.outcomes, 1):
+            reason = outcome.reason.value if outcome.reason is not None else "available"
+            error_code = outcome.error_code or "none"
+            lines.extend(
+                [
+                    f"- **Outcome {index}:** {outcome.outcome}",
+                    f"  - Provider: `{outcome.provider}`",
+                    f"  - Attempt: {outcome.attempt}",
+                    f"  - Reason: `{reason}`",
+                    f"  - Error code: `{error_code}`",
+                ]
+            )
+        lines.append("")
+    return lines
+
+
 def render_decision_report(
     decision: TradingDecisionContract,
     terminal: TerminalContract,
     evidence: EvidenceState | None = None,
+    financial_dispatch: FinancialDispatchAuditProjection | None = None,
 ) -> str:
     """Render only canonical facts and rule semantics from the gated decision."""
 
@@ -301,6 +363,7 @@ def render_decision_report(
     if evidence is not None:
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
+    lines.extend(_render_financial_dispatch_operations(financial_dispatch))
     lines.extend(["## Canonical Source Facts", ""])
     for index, fact in enumerate(sorted(decision.facts, key=lambda item: item.fact_id), 1):
         lines.extend(_render_fact(index, fact))
@@ -329,6 +392,7 @@ def render_analysis_outcome_report(
     outcome: AnalysisOutcome,
     terminal: TerminalContract,
     evidence: EvidenceState | None = None,
+    financial_dispatch: FinancialDispatchAuditProjection | None = None,
 ) -> str:
     outcome = AnalysisOutcome.model_validate(outcome)
     lines = [
@@ -345,6 +409,7 @@ def render_analysis_outcome_report(
     if evidence is not None:
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
+    lines.extend(_render_financial_dispatch_operations(financial_dispatch))
     lines.extend([render_analysis_outcome(outcome), ""])
     return "\n".join(lines)
 
@@ -383,6 +448,12 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     terminal = TerminalContract.model_validate(final_state["terminal_contract"])
     identity = CanonicalRunIdentity.model_validate(final_state["run_identity"])
     evidence = EvidenceState.model_validate(final_state["evidence_state"])
+    raw_financial_dispatch = final_state.get("financial_dispatch_audit_projection")
+    financial_dispatch = (
+        None
+        if raw_financial_dispatch is None
+        else FinancialDispatchAuditProjection.model_validate(raw_financial_dispatch)
+    )
     if identity.audit_digest is None:
         raise ValueError("canonical export identity is missing its audit digest")
 
@@ -391,11 +462,21 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
         outcome = AnalysisOutcome.model_validate(
             final_state["analysis_outcome_contract"]
         )
-        body = render_analysis_outcome_report(outcome, terminal, evidence)
+        body = render_analysis_outcome_report(
+            outcome,
+            terminal,
+            evidence,
+            financial_dispatch,
+        )
         _write_markdown(save_path / "5_portfolio" / "analysis_outcome.md", body)
     elif terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
         decision = TradingDecisionContract.model_validate(final_state["trading_decision"])
-        body = render_decision_report(decision, terminal, evidence)
+        body = render_decision_report(
+            decision,
+            terminal,
+            evidence,
+            financial_dispatch,
+        )
         _write_markdown(save_path / "5_portfolio" / "decision.md", body)
     else:
         raise ValueError("operational failures cannot be published as decision reports")

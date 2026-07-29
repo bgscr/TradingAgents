@@ -6,9 +6,14 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from typing import Any
 
-from tradingagents.asset_configuration import RunAssetConfigurationProjection
+from tradingagents.asset_configuration import (
+    RunAssetConfiguration,
+    RunAssetConfigurationProjection,
+)
 from tradingagents.dataflows.acquisition import RetryPolicy
 from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchCheckpointError,
+    FinancialDispatchCheckpointFailureReason,
     FinancialReportingFrequency,
     FinancialStatementType,
     FinancialToolDispatcher,
@@ -63,6 +68,71 @@ class FinancialDispatchToolNode:
         if not tool_calls:
             raise ValueError("financial tool node requires at least one tool call")
 
+        dispatcher, evidence = self._dispatcher_from_state(state)
+        graph_message_id = getattr(model_message, "id", None)
+        tool_messages = [
+            dispatcher.dispatch_tool_message(
+                _financial_request_from_tool_call(
+                    tool_call,
+                    canonical_symbol=evidence.instrument_identity.symbol,
+                    trade_date=str(state.get("trade_date") or ""),
+                    graph_message_id=(
+                        str(graph_message_id) if graph_message_id is not None else None
+                    ),
+                )
+            )
+            for tool_call in tool_calls
+        ]
+        from tradingagents.dataflows.market_snapshot import (
+            refresh_active_evidence_physical_attempts,
+        )
+
+        evidence = refresh_active_evidence_physical_attempts(evidence)
+        return {
+            "messages": tool_messages,
+            "evidence_state": evidence.model_dump(mode="json"),
+            "financial_dispatch_ledger": dispatcher.checkpoint_ledger(),
+        }
+
+    def validate_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        expected_asset_configuration: (
+            RunAssetConfiguration | RunAssetConfigurationProjection | None
+        ),
+    ) -> None:
+        """Fail closed on contradictory restored state before graph work begins."""
+
+        if state.get("financial_dispatch_ledger") is None:
+            return
+        try:
+            if expected_asset_configuration is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+                )
+            expected = RunAssetConfigurationProjection.model_validate(
+                expected_asset_configuration.model_dump(mode="json")
+            )
+            restored = RunAssetConfigurationProjection.model_validate(
+                state.get("asset_configuration")
+            )
+            if restored != expected:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+                )
+            self._dispatcher_from_state(state)
+        except FinancialDispatchCheckpointError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.MALFORMED
+            ) from exc
+
+    def _dispatcher_from_state(
+        self,
+        state: Mapping[str, Any],
+    ) -> tuple[FinancialToolDispatcher, EvidenceState]:
         evidence = EvidenceState.model_validate(state.get("evidence_state") or {})
         identity = evidence.instrument_identity
         if identity is None or not identity.is_authoritative:
@@ -91,30 +161,7 @@ class FinancialDispatchToolNode:
             sleeper=self._sleeper,
             checkpoint_ledger=state.get("financial_dispatch_ledger"),
         )
-        graph_message_id = getattr(model_message, "id", None)
-        tool_messages = [
-            dispatcher.dispatch_tool_message(
-                _financial_request_from_tool_call(
-                    tool_call,
-                    canonical_symbol=identity.symbol,
-                    trade_date=str(state.get("trade_date") or ""),
-                    graph_message_id=(
-                        str(graph_message_id) if graph_message_id is not None else None
-                    ),
-                )
-            )
-            for tool_call in tool_calls
-        ]
-        from tradingagents.dataflows.market_snapshot import (
-            refresh_active_evidence_physical_attempts,
-        )
-
-        evidence = refresh_active_evidence_physical_attempts(evidence)
-        return {
-            "messages": tool_messages,
-            "evidence_state": evidence.model_dump(mode="json"),
-            "financial_dispatch_ledger": dispatcher.checkpoint_ledger(),
-        }
+        return dispatcher, evidence
 
 
 def _financial_request_from_tool_call(

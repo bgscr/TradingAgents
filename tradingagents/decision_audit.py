@@ -15,6 +15,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from tradingagents.asset_configuration import RunAssetConfigurationProjection
+from tradingagents.dataflows.financial_dispatch import (
+    project_financial_dispatch_ledger,
+)
 from tradingagents.decision_policy import (
     DirectionSelection,
     TradingDecisionContract,
@@ -462,6 +465,16 @@ def build_decision_audit(
     )
     if telemetry.terminal_route != terminal.terminal_outcome_kind.value:
         raise ValueError("run telemetry terminal route does not match terminal contract")
+    financial_dispatch = project_financial_dispatch_ledger(
+        final_state.get("financial_dispatch_ledger"),
+        run_asset_configuration=asset_configuration,
+        config=config,
+    )
+    final_state["financial_dispatch_audit_projection"] = (
+        financial_dispatch.model_dump(mode="json")
+        if financial_dispatch is not None
+        else None
+    )
     payload: dict[str, Any] = {
         "schema_version": "4.0",
         "created_at": created_at,
@@ -478,6 +491,11 @@ def build_decision_audit(
             "output_sha256": sha256(_canonical_json(terminal_output)).hexdigest(),
         },
         "telemetry": telemetry.model_dump(mode="json"),
+        "financial_dispatch": (
+            financial_dispatch.model_dump(mode="json")
+            if financial_dispatch is not None
+            else None
+        ),
         "asset_configuration": (
             asset_configuration.model_dump(mode="json")
             if asset_configuration is not None

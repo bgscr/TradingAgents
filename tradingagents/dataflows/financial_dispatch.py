@@ -55,6 +55,7 @@ FINANCIAL_REQUEST_KEY_VERSION = "1.0"
 FINANCIAL_PROVIDER_CHAIN_VERSION = "1.0"
 FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
 FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
+FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
@@ -524,6 +525,65 @@ class FinancialDispatchCheckpointLedger(BaseModel):
     )
     circuit_state: tuple[FinancialCircuitCheckpointState, ...] = ()
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
+
+
+class FinancialDispatchAuditOutcome(BaseModel):
+    """Bounded operational projection of one deterministic plan outcome."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    provider_order: int = Field(ge=0)
+    outcome: Literal["available", "unavailable"]
+    attempt: int = Field(ge=1)
+    retryable: bool
+    reason: AcquisitionUnavailableReason | None = None
+    error_code: str | None = Field(default=None, pattern=ACQUISITION_TOKEN_PATTERN)
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    retry_after_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class FinancialDispatchAuditRequest(BaseModel):
+    """One canonical request without model correlation or provider payload text."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    request_ref: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    statement_type: FinancialStatementType
+    frequency: FinancialReportingFrequency
+    as_of_date: date
+    acquisition_attempt_count: int = Field(ge=0)
+    duplicate_suppressed_count: int = Field(ge=0)
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    outcomes: tuple[FinancialDispatchAuditOutcome, ...] = Field(min_length=1)
+
+
+class FinancialDispatchAuditProjection(BaseModel):
+    """Safe immutable-audit projection of the run-scoped dispatch ledger."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = FINANCIAL_DISPATCH_AUDIT_VERSION
+    request_count: int = Field(ge=0)
+    acquisition_attempt_count: int = Field(ge=0)
+    duplicate_suppressed_count: int = Field(ge=0)
+    requests: tuple[FinancialDispatchAuditRequest, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_totals(self) -> FinancialDispatchAuditProjection:
+        if self.request_count != len(self.requests):
+            raise ValueError("financial dispatch audit request count is inconsistent")
+        if self.acquisition_attempt_count != sum(
+            item.acquisition_attempt_count for item in self.requests
+        ):
+            raise ValueError("financial dispatch audit attempt count is inconsistent")
+        if self.duplicate_suppressed_count != sum(
+            item.duplicate_suppressed_count for item in self.requests
+        ):
+            raise ValueError("financial dispatch audit duplicate count is inconsistent")
+        return self
 
 
 class FinancialToolDispatcher:
@@ -1391,6 +1451,126 @@ def _financial_provider_variant_progress(
     return tuple(progress.values())
 
 
+def _validate_financial_dispatch_audit_integrity(
+    ledger: FinancialDispatchCheckpointLedger,
+    *,
+    run_asset_configuration: (
+        RunAssetConfiguration | RunAssetConfigurationProjection | None
+    ),
+    config: Mapping[str, Any] | None,
+) -> None:
+    """Fail closed before checkpoint state is authenticated in immutable audit."""
+
+    if run_asset_configuration is None:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+        )
+    effective_config = config
+    if effective_config is None:
+        from tradingagents.dataflows.config import get_config
+
+        effective_config = get_config()
+    retry_policy = None
+    configured_retry_policy = effective_config.get(
+        "financial_dispatch_retry_policy"
+    )
+    if configured_retry_policy is not None:
+        retry_policy = RetryPolicy.model_validate(configured_retry_policy)
+    FinancialToolDispatcher.from_configured_vendors(
+        instrument_identity=run_asset_configuration.instrument_identity,
+        run_asset_configuration=run_asset_configuration,
+        config=effective_config,
+        retry_policy=retry_policy,
+        checkpoint_ledger=ledger,
+    )
+
+
+def project_financial_dispatch_ledger(
+    checkpoint_ledger: Mapping[str, Any] | FinancialDispatchCheckpointLedger | None,
+    *,
+    run_asset_configuration: (
+        RunAssetConfiguration | RunAssetConfigurationProjection | None
+    ) = None,
+    config: Mapping[str, Any] | None = None,
+) -> FinancialDispatchAuditProjection | None:
+    """Project terminal dispatch state without provider payload or correlation text."""
+
+    if checkpoint_ledger is None:
+        return None
+    try:
+        ledger = FinancialDispatchCheckpointLedger.model_validate(checkpoint_ledger)
+    except (TypeError, ValueError) as exc:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.MALFORMED
+        ) from exc
+    _validate_financial_dispatch_audit_integrity(
+        ledger,
+        run_asset_configuration=run_asset_configuration,
+        config=config,
+    )
+    requests: list[FinancialDispatchAuditRequest] = []
+    for entry in sorted(
+        ledger.entries,
+        key=lambda item: item.canonical_request_key.request_key,
+    ):
+        outcomes: list[FinancialDispatchAuditOutcome] = []
+        for plan_outcome in entry.terminal.plan_outcomes:
+            outcome = plan_outcome.outcome
+            unavailable = (
+                outcome if isinstance(outcome, SourceAcquisitionUnavailable) else None
+            )
+            outcomes.append(
+                FinancialDispatchAuditOutcome(
+                    provider=outcome.provider,
+                    provider_order=outcome.provider_order,
+                    outcome=outcome.outcome,
+                    attempt=outcome.attempt,
+                    retryable=outcome.retryable,
+                    reason=(unavailable.reason if unavailable is not None else None),
+                    error_code=(
+                        unavailable.error_code if unavailable is not None else None
+                    ),
+                    http_status=(
+                        unavailable.http_status if unavailable is not None else None
+                    ),
+                    retry_after_seconds=(
+                        unavailable.retry_after_seconds
+                        if unavailable is not None
+                        else None
+                    ),
+                    artifact_sha256=(
+                        outcome.artifact.artifact_sha256
+                        if isinstance(outcome, SourceAcquisitionAvailable)
+                        else None
+                    ),
+                )
+            )
+        key = entry.canonical_request_key
+        requests.append(
+            FinancialDispatchAuditRequest(
+                request_ref=key.request_key,
+                tool_name=key.tool_name,
+                statement_type=key.statement_type,
+                frequency=key.frequency,
+                as_of_date=key.as_of_date,
+                acquisition_attempt_count=entry.consumed_attempt_budget,
+                duplicate_suppressed_count=entry.reuse_count,
+                artifact_sha256=entry.artifact_sha256,
+                outcomes=tuple(outcomes),
+            )
+        )
+    return FinancialDispatchAuditProjection(
+        request_count=len(requests),
+        acquisition_attempt_count=sum(
+            item.acquisition_attempt_count for item in requests
+        ),
+        duplicate_suppressed_count=sum(
+            item.duplicate_suppressed_count for item in requests
+        ),
+        requests=tuple(requests),
+    )
+
+
 def _market_from_authoritative_identity(
     instrument_identity: InstrumentIdentityEvidence,
 ) -> str | None:
@@ -1917,8 +2097,12 @@ def _valid_retry_after(value: object) -> float | None:
 __all__ = [
     "CanonicalFinancialRequestKey",
     "DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION",
+    "FINANCIAL_DISPATCH_AUDIT_VERSION",
     "FINANCIAL_DISPATCH_LEDGER_VERSION",
     "FinancialCircuitCheckpointState",
+    "FinancialDispatchAuditOutcome",
+    "FinancialDispatchAuditProjection",
+    "FinancialDispatchAuditRequest",
     "FinancialDispatchCheckpointEntry",
     "FinancialDispatchCheckpointError",
     "FinancialDispatchCheckpointFailureReason",
@@ -1935,4 +2119,5 @@ __all__ = [
     "FinancialToolDispatcher",
     "FinancialToolMessageAuditEnvelope",
     "FinancialToolRequest",
+    "project_financial_dispatch_ledger",
 ]
