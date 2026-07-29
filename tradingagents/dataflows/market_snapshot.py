@@ -512,7 +512,7 @@ def refresh_active_evidence_physical_attempts(
         return evidence
     with active.lock:
         events = tuple(active.physical_attempt_events)
-    projected = tuple(
+    active_projection = tuple(
         ProviderPhysicalAttemptEvidence(
             attempt_event_id=event.attempt_event_id,
             sequence_id=event.sequence_id,
@@ -538,13 +538,30 @@ def refresh_active_evidence_physical_attempts(
         )
         for event in events
     )
+    projected_by_key = {
+        (event.sequence_id, event.attempt_index): event
+        for event in evidence.physical_attempt_events
+    }
+    projected = list(evidence.physical_attempt_events)
+    for event in active_projection:
+        key = (event.sequence_id, event.attempt_index)
+        prior = projected_by_key.get(key)
+        if prior is not None:
+            if prior != event:
+                raise RuntimeError(
+                    "checkpointed physical-attempt identity has conflicting audit data"
+                )
+            continue
+        projected.append(event)
+        projected_by_key[key] = event
+    merged_projection = tuple(projected)
     payload = evidence.model_dump(mode="python")
-    payload["physical_attempt_events"] = projected
-    payload["physical_attempt_count"] = len(projected)
+    payload["physical_attempt_events"] = merged_projection
+    payload["physical_attempt_count"] = len(merged_projection)
     if evidence.market_snapshot is not None:
         snapshot_payload = evidence.market_snapshot.model_dump(mode="python")
-        snapshot_payload["physical_attempt_events"] = projected
-        snapshot_payload["physical_attempt_count"] = len(projected)
+        snapshot_payload["physical_attempt_events"] = merged_projection
+        snapshot_payload["physical_attempt_count"] = len(merged_projection)
         payload["market_snapshot"] = snapshot_payload
     return EvidenceState.model_validate(payload)
 

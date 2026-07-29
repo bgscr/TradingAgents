@@ -23,7 +23,10 @@ from requests.exceptions import (
     Timeout as RequestsTimeout,
 )
 
-from tradingagents.asset_configuration import RunAssetConfiguration
+from tradingagents.asset_configuration import (
+    RunAssetConfiguration,
+    RunAssetConfigurationProjection,
+)
 from tradingagents.dataflows.acquisition import (
     AcquisitionController,
     AcquisitionFailure,
@@ -530,7 +533,9 @@ class FinancialToolDispatcher:
         self,
         *,
         instrument_identity: InstrumentIdentityEvidence,
-        run_asset_configuration: RunAssetConfiguration | None = None,
+        run_asset_configuration: (
+            RunAssetConfiguration | RunAssetConfigurationProjection | None
+        ) = None,
         provider_chains: Mapping[str, tuple[FinancialProvider, ...]],
         acquisition_policy_version: str = DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION,
         retry_policy: RetryPolicy | None = None,
@@ -582,7 +587,9 @@ class FinancialToolDispatcher:
         cls,
         *,
         instrument_identity: InstrumentIdentityEvidence,
-        run_asset_configuration: RunAssetConfiguration | None = None,
+        run_asset_configuration: (
+            RunAssetConfiguration | RunAssetConfigurationProjection | None
+        ) = None,
         config: Mapping[str, Any] | None = None,
         vendor_methods: Mapping[str, Mapping[str, object]] | None = None,
         acquisition_policy_version: str = DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION,

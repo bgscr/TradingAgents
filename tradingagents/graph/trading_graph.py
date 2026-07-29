@@ -16,11 +16,7 @@ from langgraph.prebuilt import ToolNode
 # Import the abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
-    get_balance_sheet,
-    get_cashflow,
-    get_fundamentals,
     get_global_news,
-    get_income_statement,
     get_indicators,
     get_insider_transactions,
     get_macro_indicators,
@@ -77,6 +73,7 @@ from tradingagents.terminal_contract import (
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
+from .financial_tools import FinancialDispatchToolNode
 from .propagation import Propagator
 from .reflection import Reflector
 from .setup import GraphSetup
@@ -454,7 +451,7 @@ class TradingAgentsGraph:
 
         return kwargs
 
-    def _create_tool_nodes(self) -> dict[str, ToolNode]:
+    def _create_tool_nodes(self) -> dict[str, Any]:
         """Create tool nodes for different data sources using abstract methods."""
         return {
             "market": ToolNode(
@@ -486,14 +483,8 @@ class TradingAgentsGraph:
                     get_prediction_markets,
                 ]
             ),
-            "fundamentals": ToolNode(
-                [
-                    # Fundamental analysis tools
-                    get_fundamentals,
-                    get_balance_sheet,
-                    get_cashflow,
-                    get_income_statement,
-                ]
+            "fundamentals": FinancialDispatchToolNode(
+                config=getattr(self, "config", None),
             ),
         }
 

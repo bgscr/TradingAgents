@@ -117,7 +117,23 @@ def _source_ref(
         try:
             envelope = ToolExecutionEvidenceEnvelope.model_validate(raw_envelope)
         except (TypeError, ValidationError, ValueError):
-            return None
+            from tradingagents.dataflows.financial_dispatch import (
+                FinancialToolMessageAuditEnvelope,
+            )
+
+            try:
+                financial = FinancialToolMessageAuditEnvelope.model_validate(
+                    raw_envelope
+                )
+            except (TypeError, ValidationError, ValueError):
+                return None
+            if (
+                financial.tool_call_id != str(tool_call_id)
+                or financial.tool_name != tool_name
+                or financial.artifact_sha256 is None
+            ):
+                return None
+            return financial.request_ref
         if envelope.tool_call_id != str(tool_call_id) or envelope.tool_name != tool_name:
             return None
         return envelope.source_ref

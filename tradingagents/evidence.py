@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 
 from dateutil.relativedelta import relativedelta
 from pydantic import (
@@ -1314,6 +1314,54 @@ class EvidenceState(BaseModel):
         return self
 
 
+class _ToolExecutionEvidenceView(NamedTuple):
+    tool_call_id: str
+    tool_name: str
+    source_ref: str
+    capability: str
+    acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...]
+    selected_artifact: SourceArtifact | None
+
+
+def _validated_tool_execution_evidence(
+    raw_envelope: object,
+) -> ToolExecutionEvidenceEnvelope | _ToolExecutionEvidenceView:
+    """Validate either the ordinary or duplicate-aware financial envelope."""
+
+    try:
+        return ToolExecutionEvidenceEnvelope.model_validate(raw_envelope)
+    except ValidationError as ordinary_error:
+        from tradingagents.dataflows.financial_dispatch import (
+            FinancialToolMessageAuditEnvelope,
+        )
+
+        try:
+            financial = FinancialToolMessageAuditEnvelope.model_validate(raw_envelope)
+        except ValidationError:
+            raise ordinary_error from None
+        available = tuple(
+            outcome
+            for outcome in financial.acquisition_outcomes
+            if isinstance(outcome, SourceAcquisitionAvailable)
+        )
+        selected_artifact = available[0].artifact if available else None
+        if selected_artifact is not None and (
+            selected_artifact.tool_name != financial.tool_name
+            or selected_artifact.source_ref != financial.request_ref
+        ):
+            raise ValueError(
+                "financial tool artifact contradicts its audit envelope"
+            ) from None
+        return _ToolExecutionEvidenceView(
+            tool_call_id=financial.tool_call_id,
+            tool_name=financial.tool_name,
+            source_ref=financial.request_ref,
+            capability=financial.capability,
+            acquisition_outcomes=financial.acquisition_outcomes,
+            selected_artifact=selected_artifact,
+        )
+
+
 def merge_material_claims(
     evidence: EvidenceState | Mapping[str, Any] | None,
     claims: Iterable[MaterialClaim],
@@ -1553,10 +1601,10 @@ def build_tool_evidence_state(
             if message_tool_name in bound_tool_names:
                 return True
             try:
-                envelope = ToolExecutionEvidenceEnvelope.model_validate(
+                envelope = _validated_tool_execution_evidence(
                     getattr(message, "artifact", None)
                 )
-            except ValidationError:
+            except (TypeError, ValidationError, ValueError):
                 return False
             return (
                 envelope.source_ref == bound_source_ref
@@ -1589,17 +1637,17 @@ def build_tool_evidence_state(
             key=lambda item: str(getattr(item, "tool_call_id", "")),
         ):
             try:
-                envelope = ToolExecutionEvidenceEnvelope.model_validate(
+                envelope = _validated_tool_execution_evidence(
                     getattr(message, "artifact", None)
                 )
-            except ValidationError:
+            except (TypeError, ValidationError, ValueError):
                 envelope_error = True
                 break
             message_tool_call_id = str(getattr(message, "tool_call_id", ""))
             message_tool_name = str(getattr(message, "name", ""))
             expected_capability = (
                 envelope.capability
-                if source_ref.startswith("acq.v1:")
+                if source_ref.startswith(("acq.v1:", "financial-request:v1:"))
                 else (
                     EvidenceCapability.MARKET_SNAPSHOT.value
                     if source_kind == "snapshot"
@@ -1696,10 +1744,13 @@ def build_tool_evidence_state(
                 span_start = content.find(quote) if quote else -1
                 if span_start < 0:
                     continue
-                tool_call_id = str(getattr(message, "tool_call_id", ""))
-                artifact = selected_artifacts_by_source_call[(source_ref, tool_call_id)]
+                wrapper_tool_call_id = str(getattr(message, "tool_call_id", ""))
+                artifact = selected_artifacts_by_source_call[
+                    (source_ref, wrapper_tool_call_id)
+                ]
+                artifact_tool_call_id = artifact.tool_call_id
                 artifact_digest = artifact.artifact_sha256
-                artifact_key = (artifact_digest, tool_call_id, source_ref)
+                artifact_key = (artifact_digest, artifact_tool_call_id, source_ref)
                 artifacts[artifact_key] = artifact
                 fact_id = stable_source_fact_id(
                     source_ref=source_ref,
@@ -1711,8 +1762,8 @@ def build_tool_evidence_state(
                     SourceFact(
                         fact_id=fact_id,
                         source_ref=source_ref,
-                        tool_call_id=tool_call_id,
-                        tool_name=str(getattr(message, "name", "")),
+                        tool_call_id=artifact_tool_call_id,
+                        tool_name=artifact.tool_name,
                         artifact_sha256=artifact_digest,
                         raw_text=quote,
                         source_span_start=span_start,
