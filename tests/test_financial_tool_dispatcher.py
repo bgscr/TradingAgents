@@ -19,6 +19,23 @@ import tradingagents.dataflows.market_snapshot as market_snapshot
 import tradingagents.dataflows.y_finance as y_finance
 from tradingagents.dataflows.acquisition import AcquisitionFailure, RetryPolicy
 from tradingagents.dataflows.errors import VendorRateLimitError
+from tradingagents.dataflows.financial_contracts import (
+    FinancialCapability,
+    FinancialCompanyType,
+    FinancialConsolidationScope,
+    FinancialFieldValue,
+    FinancialFilingMetadata,
+    FinancialPeriodCandidate,
+    FinancialPeriodDisposition,
+    FinancialPeriodIdentity,
+    FinancialPeriodRejectionReason,
+    FinancialProviderArtifactIdentity,
+    FinancialProviderDatasetIdentity,
+    FinancialRatioFamily,
+    financial_ratio_field_declaration,
+    financial_statement_field_declaration,
+    resolve_financial_company_type,
+)
 from tradingagents.dataflows.financial_dispatch import (
     FinancialProvider,
     FinancialProviderVariant,
@@ -191,6 +208,213 @@ def test_qualified_routing_plan_identity_participates_in_financial_request_key()
 
     assert key.capability_routing_plan_signature == plan_signature
     assert key.request_key.startswith("financial-request:v1:")
+
+
+def test_statement_dispatch_assessment_rejects_ratio_family_candidate() -> None:
+    observed_at = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    identity = _identity()
+    dataset = FinancialProviderDatasetIdentity.create(
+        provider_id="fixture_provider",
+        endpoint_id="profit_ratio",
+        dataset_id="single_stock_ratio_history",
+        schema_identity="fixture-ratio-schema-v1",
+    )
+    artifact = FinancialProviderArtifactIdentity.create(
+        dataset=dataset,
+        canonical_request={"symbol": "AAPL"},
+        provider_metadata={"report_type": "1"},
+        retrieved_at=observed_at,
+        observed_at=observed_at,
+        payload={"fixture": "ratio-family"},
+    )
+    declaration = financial_ratio_field_declaration(
+        FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        FinancialRatioFamily.PROFIT,
+    )
+    fields = tuple(
+        FinancialFieldValue(
+            provider_field=field_name,
+            original_value="1",
+            original_unit="RATIO",
+            normalized_field=field_name,
+            normalized_value="1",
+            normalized_unit="RATIO",
+        )
+        for field_name in declaration.normalized_fields
+    )
+    candidate = FinancialPeriodCandidate.create(
+        artifact=artifact,
+        period_identity=FinancialPeriodIdentity.create(
+            instrument_identity=identity,
+            capability=FinancialCapability.RATIO_FAMILY,
+            statement_type=None,
+            ratio_family=FinancialRatioFamily.PROFIT,
+            period_end=date(2026, 6, 30),
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+            currency="USD",
+            provider_revision_binding=artifact.artifact_identity,
+        ),
+        filing_metadata=FinancialFilingMetadata(
+            ann_date=date(2026, 7, 20),
+            f_ann_date=date(2026, 7, 22),
+            report_type="1",
+            comp_type="1",
+            update_flag="0",
+            retrieved_at=observed_at,
+            observed_at=observed_at,
+            local_provider_revision_identity=artifact.artifact_identity,
+        ),
+        company_type_resolution=resolve_financial_company_type(
+            provider_declared_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            provider_declaration_qualified=True,
+            classifier_metadata={},
+            present_fields=tuple(field.normalized_field for field in fields),
+        ),
+        fields=fields,
+    )
+
+    assessment = _dispatcher(identity=identity).assess_period_candidate(
+        _request(),
+        candidate,
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+
+    assert assessment.disposition is FinancialPeriodDisposition.REJECTED
+    assert assessment.rejection_reasons == (
+        FinancialPeriodRejectionReason.CAPABILITY_MISMATCH,
+    )
+
+
+def test_statement_dispatch_assessment_binds_instrument_frequency_and_as_of() -> None:
+    request = _request()
+    dispatcher = _dispatcher(identity=_identity())
+    declaration = financial_statement_field_declaration(
+        FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        FinancialStatementType.BALANCE_SHEET,
+    )
+    fields = tuple(
+        FinancialFieldValue(
+            provider_field=field_name,
+            original_value="1",
+            original_unit=declaration.normalized_unit,
+            normalized_field=field_name,
+            normalized_value="1",
+            normalized_unit=declaration.normalized_unit,
+        )
+        for field_name in declaration.core_fields
+    )
+
+    def candidate(
+        *,
+        instrument: InstrumentIdentityEvidence,
+        frequency: FinancialReportingFrequency,
+        observed_at: datetime,
+        f_ann_date: date,
+    ) -> FinancialPeriodCandidate:
+        dataset = FinancialProviderDatasetIdentity.create(
+            provider_id="fixture_provider",
+            endpoint_id="balancesheet",
+            dataset_id="single_stock_statement_history",
+            schema_identity="fixture-statement-schema-v1",
+        )
+        artifact = FinancialProviderArtifactIdentity.create(
+            dataset=dataset,
+            canonical_request={"symbol": instrument.symbol},
+            provider_metadata={"report_type": "1"},
+            retrieved_at=observed_at,
+            observed_at=observed_at,
+            payload={"fixture": "statement"},
+        )
+        return FinancialPeriodCandidate.create(
+            artifact=artifact,
+            period_identity=FinancialPeriodIdentity.create(
+                instrument_identity=instrument,
+                capability=FinancialCapability.STATEMENT,
+                statement_type=FinancialStatementType.BALANCE_SHEET,
+                ratio_family=None,
+                period_end=date(2026, 6, 30),
+                frequency=frequency,
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                currency="USD",
+                provider_revision_binding=artifact.artifact_identity,
+            ),
+            filing_metadata=FinancialFilingMetadata(
+                ann_date=date(2026, 7, 20),
+                f_ann_date=f_ann_date,
+                report_type="1",
+                comp_type="1",
+                update_flag="0",
+                retrieved_at=observed_at,
+                observed_at=observed_at,
+                local_provider_revision_identity=artifact.artifact_identity,
+            ),
+            company_type_resolution=resolve_financial_company_type(
+                provider_declared_type=(
+                    FinancialCompanyType.INDUSTRIAL_NON_BANK
+                ),
+                provider_declaration_qualified=True,
+                classifier_metadata={},
+                present_fields=tuple(field.normalized_field for field in fields),
+            ),
+            fields=fields,
+        )
+
+    observed_before_cutoff = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+    other_instrument = dispatcher.assess_period_candidate(
+        request,
+        candidate(
+            instrument=_identity(symbol="MSFT"),
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            observed_at=observed_before_cutoff,
+            f_ann_date=date(2026, 7, 22),
+        ),
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    wrong_frequency = dispatcher.assess_period_candidate(
+        request,
+        candidate(
+            instrument=_identity(),
+            frequency=FinancialReportingFrequency.ANNUAL,
+            observed_at=observed_before_cutoff,
+            f_ann_date=date(2026, 7, 22),
+        ),
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    future_publication = dispatcher.assess_period_candidate(
+        request,
+        candidate(
+            instrument=_identity(),
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            observed_at=observed_before_cutoff,
+            f_ann_date=date(2026, 7, 29),
+        ),
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    future_observation = dispatcher.assess_period_candidate(
+        request,
+        candidate(
+            instrument=_identity(),
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            observed_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+            f_ann_date=date(2026, 7, 22),
+        ),
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+
+    assert other_instrument.rejection_reasons == (
+        FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA,
+    )
+    assert wrong_frequency.rejection_reasons == (
+        FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA,
+    )
+    assert future_publication.disposition is FinancialPeriodDisposition.CURRENT_ONLY
+    assert future_observation.disposition is FinancialPeriodDisposition.CURRENT_ONLY
+    assert future_publication.rejection_reasons == (
+        FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED,
+    )
 
 
 def test_financial_dispatch_single_flights_concurrent_duplicates_and_reuses_terminal() -> None:

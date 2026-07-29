@@ -38,6 +38,15 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
+from tradingagents.dataflows.financial_contracts import (
+    FinancialCapability,
+    FinancialConsolidationScope,
+    FinancialPeriodCandidate,
+    FinancialPeriodCompletenessAssessment,
+    FinancialReportingFrequency,
+    FinancialStatementType,
+    assess_financial_period_candidate,
+)
 from tradingagents.evidence import (
     ACQUISITION_TOKEN_PATTERN,
     AcquisitionUnavailableReason,
@@ -97,19 +106,6 @@ _SYSTEMIC_CIRCUIT_FAILURES = frozenset(
         AcquisitionUnavailableReason.INTEGRITY_FAILURE,
     }
 )
-
-
-class FinancialStatementType(str, Enum):
-    COMPREHENSIVE_FUNDAMENTALS = "comprehensive_fundamentals"
-    BALANCE_SHEET = "balance_sheet"
-    CASH_FLOW = "cash_flow"
-    INCOME_STATEMENT = "income_statement"
-
-
-class FinancialReportingFrequency(str, Enum):
-    NOT_APPLICABLE = "not_applicable"
-    ANNUAL = "annual"
-    QUARTERLY = "quarterly"
 
 
 _FINANCIAL_TOOL_SPECS = {
@@ -783,6 +779,31 @@ class FinancialToolDispatcher:
         return CanonicalFinancialRequestKey(
             **payload,
             request_key=f"financial-request:v1:{sha256(encoded).hexdigest()}",
+        )
+
+    def assess_period_candidate(
+        self,
+        request: FinancialToolRequest,
+        candidate: FinancialPeriodCandidate,
+        *,
+        expected_consolidation_scope: FinancialConsolidationScope,
+    ) -> FinancialPeriodCompletenessAssessment:
+        """Assess a normalized period at the public dispatcher seam."""
+
+        if request.statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS:
+            raise ValueError(
+                "comprehensive fundamentals has no full-statement period contract"
+            )
+        return assess_financial_period_candidate(
+            candidate,
+            requested_capability=FinancialCapability.STATEMENT,
+            requested_statement_type=request.statement_type,
+            requested_ratio_family=None,
+            expected_instrument_identity=self._instrument_identity,
+            expected_frequency=request.frequency,
+            expected_currency=self._instrument_identity.currency,
+            expected_consolidation_scope=expected_consolidation_scope,
+            pit_as_of_date=request.as_of_date,
         )
 
     def dispatch(self, request: FinancialToolRequest) -> FinancialDispatchResult:
