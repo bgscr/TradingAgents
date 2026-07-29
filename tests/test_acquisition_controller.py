@@ -64,6 +64,7 @@ def test_primary_rate_limit_falls_back_without_creating_failed_artifact() -> Non
         "retrieved_at": "2026-07-20T12:00:00Z",
         "retryable": True,
         "reason": "rate_limited",
+        "error_code": None,
         "retry_after_seconds": 30.0,
         "http_status": 429,
         "calculation_readiness": None,

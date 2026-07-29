@@ -549,10 +549,21 @@ def get_stock_stats_indicators_window(
     )
 
 
-def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
+def get_fundamentals(
+    ticker: str,
+    curr_date: str | None = None,
+    *,
+    _acquired: bool = False,
+) -> str:
     instrument = resolve_china_a_symbol(ticker)
     if instrument is None:
         raise NoMarketDataError(ticker, ticker, "Baostock supports China A-share symbols only")
+    if _acquired:
+        raise NoMarketDataError(
+            ticker,
+            instrument.yahoo_symbol,
+            "Baostock has no dispatcher-valid financial observations",
+        )
     return (
         f"# Company Fundamentals for {instrument.yahoo_symbol}\n"
         "# Primary source: Baostock\n"

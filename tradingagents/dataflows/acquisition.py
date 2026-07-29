@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,11 +54,21 @@ class AcquisitionFailure(Exception):
         status_code: int | None = None,
         error_code: str | None = None,
         retry_after_seconds: float | None = None,
+        retryable: bool | None = None,
     ) -> None:
+        if retryable is not None and not isinstance(retryable, bool):
+            raise TypeError("acquisition failure retryability must be a boolean")
+        if error_code is not None and (
+            not isinstance(error_code, str)
+            or re.fullmatch(ACQUISITION_TOKEN_PATTERN, error_code) is None
+        ):
+            raise ValueError("acquisition failure error code must be a bounded token")
         super().__init__(reason.value)
         self.reason = reason
         self.status_code = status_code
+        self.error_code = error_code
         self.retry_after_seconds = retry_after_seconds
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -145,11 +156,16 @@ class AcquisitionController:
                     value = validator(raw_value)
                     raw_text = serializer(value)
                 except AcquisitionFailure as failure:
-                    retryable = failure.reason in {
-                        AcquisitionUnavailableReason.RATE_LIMITED,
-                        AcquisitionUnavailableReason.TIMEOUT,
-                        AcquisitionUnavailableReason.PROVIDER_ERROR,
-                    }
+                    retryable = (
+                        failure.retryable
+                        if failure.retryable is not None
+                        else failure.reason
+                        in {
+                            AcquisitionUnavailableReason.RATE_LIMITED,
+                            AcquisitionUnavailableReason.TIMEOUT,
+                            AcquisitionUnavailableReason.PROVIDER_ERROR,
+                        }
+                    )
                     self._record_outcome(
                         outcomes,
                         request,
@@ -162,6 +178,7 @@ class AcquisitionController:
                             retrieved_at=self._timestamp(),
                             retryable=retryable,
                             reason=failure.reason,
+                            error_code=failure.error_code,
                             retry_after_seconds=failure.retry_after_seconds,
                             http_status=failure.status_code,
                         ),

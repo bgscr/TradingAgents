@@ -20,6 +20,7 @@ from .stockstats_utils import (
     _yahoo_session_guard,
     filter_financials_by_date,
     load_ohlcv,
+    yf_acquire_once,
     yf_retry,
 )
 from .symbol_utils import NoMarketDataError, normalize_symbol
@@ -357,16 +358,28 @@ def get_stockstats_indicator(
 
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
-    curr_date: Annotated[str, "current date (not used for yfinance)"] = None
+    curr_date: Annotated[str, "current date (not used for yfinance)"] = None,
+    *,
+    _acquired: bool = False,
+    _request_key: str | None = None,
 ):
     """Get company fundamentals overview from yfinance."""
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
-        info = yf_retry(
+        if _acquired and not _request_key:
+            raise ValueError("dispatcher-owned Yahoo acquisition requires a request key")
+        acquire = yf_acquire_once if _acquired else yf_retry
+        acquisition_kwargs = (
+            {"injected_transport": not type(ticker_obj).__module__.startswith("yfinance")}
+            if _acquired
+            else {}
+        )
+        info = acquire(
             lambda: ticker_obj.info,
-            request_key=f"fundamentals:{canonical}:{curr_date}",
+            request_key=_request_key or f"fundamentals:{canonical}:{curr_date}",
             operation="fundamentals",
+            **acquisition_kwargs,
         )
 
         if not info:
@@ -423,30 +436,50 @@ def get_fundamentals(
     except NoMarketDataError:
         raise
     except Exception as e:
+        if _acquired:
+            raise
         return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
 
 def get_balance_sheet(
     ticker: Annotated[str, "ticker symbol of the company"],
     freq: Annotated[str, "frequency of data: 'annual' or 'quarterly'"] = "quarterly",
-    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None
+    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
+    *,
+    _acquired: bool = False,
+    _request_key: str | None = None,
 ):
     """Get balance sheet data from yfinance."""
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
+        if _acquired and not _request_key:
+            raise ValueError("dispatcher-owned Yahoo acquisition requires a request key")
+        acquire = yf_acquire_once if _acquired else yf_retry
+        acquisition_kwargs = (
+            {"injected_transport": not type(ticker_obj).__module__.startswith("yfinance")}
+            if _acquired
+            else {}
+        )
 
         if freq.lower() == "quarterly":
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.quarterly_balance_sheet,
-                request_key=f"balance-sheet:{canonical}:quarterly:{curr_date}",
+                request_key=(
+                    _request_key
+                    or f"balance-sheet:{canonical}:quarterly:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
         else:
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.balance_sheet,
-                request_key=f"balance-sheet:{canonical}:annual:{curr_date}",
+                request_key=(
+                    _request_key or f"balance-sheet:{canonical}:annual:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
 
         data = filter_financials_by_date(data, curr_date)
@@ -466,30 +499,49 @@ def get_balance_sheet(
     except NoMarketDataError:
         raise
     except Exception as e:
+        if _acquired:
+            raise
         return f"Error retrieving balance sheet for {ticker}: {str(e)}"
 
 
 def get_cashflow(
     ticker: Annotated[str, "ticker symbol of the company"],
     freq: Annotated[str, "frequency of data: 'annual' or 'quarterly'"] = "quarterly",
-    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None
+    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
+    *,
+    _acquired: bool = False,
+    _request_key: str | None = None,
 ):
     """Get cash flow data from yfinance."""
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
+        if _acquired and not _request_key:
+            raise ValueError("dispatcher-owned Yahoo acquisition requires a request key")
+        acquire = yf_acquire_once if _acquired else yf_retry
+        acquisition_kwargs = (
+            {"injected_transport": not type(ticker_obj).__module__.startswith("yfinance")}
+            if _acquired
+            else {}
+        )
 
         if freq.lower() == "quarterly":
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.quarterly_cashflow,
-                request_key=f"cashflow:{canonical}:quarterly:{curr_date}",
+                request_key=(
+                    _request_key or f"cashflow:{canonical}:quarterly:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
         else:
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.cashflow,
-                request_key=f"cashflow:{canonical}:annual:{curr_date}",
+                request_key=(
+                    _request_key or f"cashflow:{canonical}:annual:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
 
         data = filter_financials_by_date(data, curr_date)
@@ -509,30 +561,51 @@ def get_cashflow(
     except NoMarketDataError:
         raise
     except Exception as e:
+        if _acquired:
+            raise
         return f"Error retrieving cash flow for {ticker}: {str(e)}"
 
 
 def get_income_statement(
     ticker: Annotated[str, "ticker symbol of the company"],
     freq: Annotated[str, "frequency of data: 'annual' or 'quarterly'"] = "quarterly",
-    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None
+    curr_date: Annotated[str, "current date in YYYY-MM-DD format"] = None,
+    *,
+    _acquired: bool = False,
+    _request_key: str | None = None,
 ):
     """Get income statement data from yfinance."""
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
+        if _acquired and not _request_key:
+            raise ValueError("dispatcher-owned Yahoo acquisition requires a request key")
+        acquire = yf_acquire_once if _acquired else yf_retry
+        acquisition_kwargs = (
+            {"injected_transport": not type(ticker_obj).__module__.startswith("yfinance")}
+            if _acquired
+            else {}
+        )
 
         if freq.lower() == "quarterly":
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.quarterly_income_stmt,
-                request_key=f"income-statement:{canonical}:quarterly:{curr_date}",
+                request_key=(
+                    _request_key
+                    or f"income-statement:{canonical}:quarterly:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
         else:
-            data = yf_retry(
+            data = acquire(
                 lambda: ticker_obj.income_stmt,
-                request_key=f"income-statement:{canonical}:annual:{curr_date}",
+                request_key=(
+                    _request_key
+                    or f"income-statement:{canonical}:annual:{curr_date}"
+                ),
                 operation="fundamentals",
+                **acquisition_kwargs,
             )
 
         data = filter_financials_by_date(data, curr_date)
@@ -552,6 +625,8 @@ def get_income_statement(
     except NoMarketDataError:
         raise
     except Exception as e:
+        if _acquired:
+            raise
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
 

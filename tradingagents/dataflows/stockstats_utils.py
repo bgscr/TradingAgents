@@ -290,6 +290,64 @@ def yf_retry(
         return result.value
 
 
+def yf_acquire_once(
+    func,
+    *,
+    request_key: str,
+    operation: str,
+    injected_transport: bool = False,
+    result_validator=None,
+):
+    """Execute one Yahoo attempt; the caller owns any retry sequence."""
+
+    from tradingagents.market_history import (
+        MarketHistoryConfig,
+        MarketHistoryStore,
+        PhysicalAttemptBudgetExhausted,
+        ProviderRequestCoordinator,
+        RequestPriority,
+        upstream_service_identity_for_provider,
+    )
+
+    history_config = MarketHistoryConfig.from_mapping(get_config())
+    session_guard = _yahoo_session_guard()
+    with MarketHistoryStore.open_provider_request_authority(history_config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        upstream_service_id, service_name = upstream_service_identity_for_provider(
+            "yfinance"
+        )
+        coordinator.register_upstream_service(upstream_service_id, service_name)
+
+        def physical_attempt(_attempt_index: int):
+            return _execute_guarded_yahoo_attempt(
+                func,
+                session_guard=session_guard,
+                injected_transport=injected_transport,
+                result_validator=result_validator,
+            )
+
+        try:
+            result = coordinator.execute_retry_sequence(
+                request_key=f"yahoo:{operation}:{request_key}",
+                upstream_service_id=upstream_service_id,
+                owner_id=f"yahoo:{threading.get_ident()}:{uuid4().hex}",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: datetime.now(timezone.utc),
+                sleep=time.sleep,
+                lease_duration=timedelta(minutes=2),
+                max_physical_attempts=1,
+                operation=operation,
+                physical_attempt=physical_attempt,
+                cooldown_scope="all",
+                record_at_physical_io=True,
+            )
+        except PhysicalAttemptBudgetExhausted as exc:
+            _record_active_yahoo_attempts(exc.attempt_events)
+            raise exc.failure from exc
+        _record_active_yahoo_attempts(result.attempt_events)
+        return result.value
+
+
 def _record_active_yahoo_attempts(events) -> None:
     """Attach completed attempts to the current run without a module cycle."""
     try:

@@ -939,6 +939,10 @@ class SourceAcquisitionUnavailable(BaseModel):
     retrieved_at: str = Field(min_length=1)
     retryable: bool
     reason: AcquisitionUnavailableReason
+    error_code: str | None = Field(
+        default=None,
+        pattern=ACQUISITION_TOKEN_PATTERN,
+    )
     retry_after_seconds: float | None = Field(
         default=None,
         ge=0,

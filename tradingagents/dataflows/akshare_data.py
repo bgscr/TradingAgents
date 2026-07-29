@@ -380,10 +380,17 @@ def _yahoo_supplemental_section(
     return ["## Yahoo Supplemental Profile", stripped], []
 
 
-def _safe_frame(endpoint: str, fn):
+def _safe_frame(
+    endpoint: str,
+    fn: Callable[[], object],
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+):
     try:
-        data = fn()
+        data = physical_request(endpoint, fn) if physical_request is not None else fn()
     except Exception as exc:  # noqa: BLE001 - degrade optional endpoints into report text
+        if physical_request is not None:
+            raise
         return None, _format_optional_error(endpoint, exc)
     if data is None or data.empty:
         return None, f"DATA_DEGRADED: AKShare {endpoint} returned no rows."
@@ -451,8 +458,16 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     return "\n".join(lines)
 
 
-def _business_section(code: str) -> tuple[list[str], list[str]]:
-    data, error = _safe_frame("stock_zyjs_ths", lambda: ak.stock_zyjs_ths(symbol=code))
+def _business_section(
+    code: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> tuple[list[str], list[str]]:
+    data, error = _safe_frame(
+        "stock_zyjs_ths",
+        lambda: ak.stock_zyjs_ths(symbol=code),
+        physical_request=physical_request,
+    )
     if error:
         return [], [error]
     row = data.iloc[0]
@@ -481,20 +496,32 @@ def _financial_abstract_section_from_frame(data: pd.DataFrame) -> tuple[list[str
     return lines, []
 
 
-def _financial_abstract_section(code: str) -> tuple[list[str], list[str]]:
+def _financial_abstract_section(
+    code: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> tuple[list[str], list[str]]:
     data, error = _safe_frame(
-        "stock_financial_abstract", lambda: ak.stock_financial_abstract(symbol=code)
+        "stock_financial_abstract",
+        lambda: ak.stock_financial_abstract(symbol=code),
+        physical_request=physical_request,
     )
     if error:
         return [], [error]
     return _financial_abstract_section_from_frame(data)
 
 
-def _fund_flow_section(code: str, exchange: str) -> tuple[list[str], list[str]]:
+def _fund_flow_section(
+    code: str,
+    exchange: str,
+    *,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> tuple[list[str], list[str]]:
     market = "sh" if exchange == "shanghai" else "sz"
     data, error = _safe_frame(
         "stock_individual_fund_flow",
         lambda: ak.stock_individual_fund_flow(stock=code, market=market),
+        physical_request=physical_request,
     )
     if error:
         return [], [error]
@@ -509,7 +536,13 @@ def _fund_flow_section(code: str, exchange: str) -> tuple[list[str], list[str]]:
     return lines, []
 
 
-def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
+def get_fundamentals(
+    ticker: str,
+    curr_date: str | None = None,
+    *,
+    _acquired: bool = False,
+    _physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+) -> str:
     instrument = _require_china_a(ticker)
     sections = [
         f"# Company Fundamentals for {instrument.yahoo_symbol}",
@@ -519,33 +552,60 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
     ]
     degraded: list[str] = []
     monetary_facts = []
+    primary_sections = 0
 
-    for source_ref, builder in (
+    builders = [
         (
             f"AKShare stock_zyjs_ths:{instrument.akshare_code}:{curr_date or 'unknown'}",
-            lambda: _business_section(instrument.akshare_code),
+            lambda: _business_section(
+                instrument.akshare_code,
+                physical_request=_physical_request,
+            ),
         ),
         (
             f"AKShare stock_financial_abstract:{instrument.akshare_code}:{curr_date or 'unknown'}",
-            lambda: _financial_abstract_section(instrument.akshare_code),
+            lambda: _financial_abstract_section(
+                instrument.akshare_code,
+                physical_request=_physical_request,
+            ),
         ),
         (
             f"AKShare stock_individual_fund_flow:{instrument.akshare_code}:{curr_date or 'unknown'}",
-            lambda: _fund_flow_section(instrument.akshare_code, instrument.exchange),
+            lambda: _fund_flow_section(
+                instrument.akshare_code,
+                instrument.exchange,
+                physical_request=_physical_request,
+            ),
         ),
-        (
-            f"Yahoo fundamentals:{instrument.yahoo_symbol}:{curr_date or 'unknown'}",
-            lambda: _yahoo_supplemental_section(instrument.yahoo_symbol, curr_date),
-        ),
-    ):
+    ]
+    if not _acquired:
+        builders.append(
+            (
+                f"Yahoo fundamentals:{instrument.yahoo_symbol}:{curr_date or 'unknown'}",
+                lambda: _yahoo_supplemental_section(
+                    instrument.yahoo_symbol,
+                    curr_date,
+                ),
+            )
+        )
+    for source_ref, builder in builders:
         lines, errors = builder()
         if lines:
+            if source_ref.startswith("AKShare "):
+                primary_sections += 1
             sections.extend(lines)
             sections.append("")
             monetary_facts.extend(
                 extract_chinese_monetary_facts("\n".join(lines), source_ref=source_ref)
             )
         degraded.extend(errors)
+
+    if _acquired and primary_sections == 0:
+        raise NoMarketDataError(
+            ticker,
+            instrument.yahoo_symbol,
+            "no dispatcher-owned AKShare fundamental sections returned",
+        )
 
     if degraded:
         sections.append("## Degraded Fields")
