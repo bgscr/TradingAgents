@@ -1631,7 +1631,9 @@ def run_analysis(checkpoint: bool | None = None):
     config = _build_run_config(selections, checkpoint)
     asset_configuration = None
     asset_configuration_error = None
-    should_resolve_asset = selections["asset_type"] == "crypto"
+    should_resolve_asset = selections["asset_type"] == "crypto" or any(
+        analyst.value == "fundamentals" for analyst in selections["analysts"]
+    )
     if should_resolve_asset:
         try:
             asset_configuration = resolve_run_asset_configuration(

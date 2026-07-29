@@ -1143,7 +1143,8 @@ def test_public_cli_financial_dispatch_acceptance_is_deterministic_and_audited(
 
     class CliFinancialGraph:
         def __init__(self, *_args, **_kwargs):
-            self.asset_configuration = asset_configuration
+            assert _kwargs["asset_configuration"] is not None
+            self.asset_configuration = _kwargs["asset_configuration"]
             self.graph = CliFinancialStream()
             self.propagator = CliPropagator()
 
