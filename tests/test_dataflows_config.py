@@ -62,6 +62,8 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
 
     def test_market_data_vendors_default_contains_china_a_chain(self):
         fresh = get_config()
+        self.assertEqual(fresh["mainland_capability_routing_mode"], "legacy")
+        self.assertEqual(fresh["tushare_enabled_capabilities"], ())
         self.assertEqual(
             fresh["market_data_vendors"]["cn_a"]["core_stock_apis"],
             "akshare,baostock,yfinance",

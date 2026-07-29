@@ -17,7 +17,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from langchain_core.messages import ToolMessage
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 from requests.exceptions import (
     ConnectionError as RequestsConnectionError,
     Timeout as RequestsTimeout,
@@ -252,7 +252,18 @@ class CanonicalFinancialRequestKey(BaseModel):
         pattern=r"^financial-provider-chain:v1:[0-9a-f]{64}$"
     )
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    capability_routing_plan_signature: str | None = Field(
+        default=None,
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$",
+    )
     request_key: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_routing_identity(self, handler) -> dict[str, Any]:
+        payload = handler(self)
+        if self.capability_routing_plan_signature is None:
+            payload.pop("capability_routing_plan_signature", None)
+        return payload
 
 
 class FinancialPlanOutcome(BaseModel):
@@ -597,6 +608,7 @@ class FinancialToolDispatcher:
             RunAssetConfiguration | RunAssetConfigurationProjection | None
         ) = None,
         provider_chains: Mapping[str, tuple[FinancialProvider, ...]],
+        capability_routing_plan_signature: str | None = None,
         acquisition_policy_version: str = DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION,
         retry_policy: RetryPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -616,6 +628,15 @@ class FinancialToolDispatcher:
             )
         if _ACQUISITION_TOKEN.fullmatch(acquisition_policy_version) is None:
             raise ValueError("financial acquisition-policy version is malformed")
+        if (
+            capability_routing_plan_signature is not None
+            and re.fullmatch(
+                r"mainland-routing-plan:v1:[0-9a-f]{64}",
+                capability_routing_plan_signature,
+            )
+            is None
+        ):
+            raise ValueError("Capability Routing Plan signature is malformed")
         copied_chains = {
             str(tool_name): tuple(providers)
             for tool_name, providers in provider_chains.items()
@@ -632,6 +653,9 @@ class FinancialToolDispatcher:
         self._run_asset_configuration = run_asset_configuration
         self._provider_chains = copied_chains
         self._acquisition_policy_version = acquisition_policy_version
+        self._capability_routing_plan_signature = (
+            capability_routing_plan_signature
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleeper = sleeper or time.sleep
         self._retry_policy = retry_policy or RetryPolicy()
@@ -707,6 +731,11 @@ class FinancialToolDispatcher:
             instrument_identity=instrument_identity,
             run_asset_configuration=run_asset_configuration,
             provider_chains=provider_chains,
+            capability_routing_plan_signature=(
+                str(config["mainland_capability_routing_plan_signature"])
+                if config.get("mainland_capability_routing_plan_signature") is not None
+                else None
+            ),
             acquisition_policy_version=acquisition_policy_version,
             retry_policy=retry_policy,
             clock=clock,
@@ -746,6 +775,10 @@ class FinancialToolDispatcher:
             "provider_chain_identity": provider_chain_identity,
             "acquisition_policy_version": self._acquisition_policy_version,
         }
+        if self._capability_routing_plan_signature is not None:
+            payload["capability_routing_plan_signature"] = (
+                self._capability_routing_plan_signature
+            )
         encoded = _canonical_json(payload, label="financial request key").encode("utf-8")
         return CanonicalFinancialRequestKey(
             **payload,
@@ -1412,7 +1445,11 @@ def _canonical_financial_request_key_is_valid(
         label="material arguments",
     ) != key.material_arguments_json:
         return False
-    payload = key.model_dump(mode="json", exclude={"request_key"})
+    payload = key.model_dump(
+        mode="json",
+        exclude={"request_key"},
+        exclude_none=True,
+    )
     encoded = _canonical_json(payload, label="financial request key").encode("utf-8")
     return key.request_key == f"financial-request:v1:{sha256(encoded).hexdigest()}"
 

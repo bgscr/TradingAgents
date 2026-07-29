@@ -77,6 +77,14 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT": "market_history_payload_root",
     "TRADINGAGENTS_MARKET_HISTORY_BACKUP_ROOT": "market_history_backup_root",
     "TRADINGAGENTS_DATA_USAGE_MODE":      "data_usage_mode",
+    "TRADINGAGENTS_MAINLAND_CAPABILITY_ROUTING_MODE": "mainland_capability_routing_mode",
+    "TRADINGAGENTS_TUSHARE_ENABLED_CAPABILITIES": "tushare_enabled_capabilities",
+    "TRADINGAGENTS_TUSHARE_QUALIFICATION_PROFILE": "tushare_qualification_profile",
+    "TRADINGAGENTS_TUSHARE_ACCOUNT_SCOPE_LABEL": "tushare_account_scope_label",
+    "TRADINGAGENTS_TUSHARE_CALLS_PER_MINUTE": "tushare_calls_per_minute",
+    "TRADINGAGENTS_TUSHARE_OPERATOR_SAFETY_CEILING_CALLS_PER_MINUTE": (
+        "tushare_operator_safety_ceiling_calls_per_minute"
+    ),
     "TRADINGAGENTS_YAHOO_MAX_PHYSICAL_ATTEMPTS": "yahoo_max_physical_attempts",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
@@ -165,6 +173,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "backups",
     ),
     "data_usage_mode": "personal_research",
+    # Capability-specific mainland provider routing is additive and opt-in.
+    # The Tushare token remains exclusively in the existing TUSHARE_TOKEN
+    # environment boundary and is never copied into runtime configuration.
+    "mainland_capability_routing_mode": "legacy",
+    "tushare_enabled_capabilities": (),
+    "tushare_qualification_profile": "cn-a-2000-20260729-v1",
+    "tushare_account_scope_label": "personal-research-default",
+    "tushare_calls_per_minute": 40,
+    "tushare_operator_safety_ceiling_calls_per_minute": 40,
     # Total Yahoo physical calls per coordinated sequence, including the first.
     "yahoo_max_physical_attempts": 4,
     # Optional cap on the number of resolved memory log entries. When set,

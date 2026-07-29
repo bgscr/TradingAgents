@@ -10,11 +10,15 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from tradingagents.asset_configuration import RunAssetConfigurationProjection
+from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingFailureReason,
+    MainlandCapabilityRoutingPlan,
+)
 from tradingagents.dataflows.financial_dispatch import (
     project_financial_dispatch_ledger,
 )
@@ -48,6 +52,20 @@ class _AssetConfigurationFailureProjection(BaseModel):
     contract_version: str
     reason: str
     diagnostic_code: str
+
+
+class _CapabilityRoutingFailureProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    contract_version: Literal["1.0"]
+    reason: MainlandCapabilityRoutingFailureReason
+    diagnostic_code: MainlandCapabilityRoutingFailureReason
+
+    @model_validator(mode="after")
+    def _validate_diagnostic(self) -> _CapabilityRoutingFailureProjection:
+        if self.reason is not self.diagnostic_code:
+            raise ValueError("routing failure diagnostic must match its reason")
+        return self
 
 
 class _AuditValidatedDecisionFact(BaseModel):
@@ -455,6 +473,37 @@ def build_decision_audit(
     )
     if asset_configuration is not None and asset_configuration_failure is not None:
         raise ValueError("run cannot contain both asset configuration and failure")
+    raw_routing_plan = final_state.get("capability_routing_plan")
+    capability_routing_plan = (
+        None
+        if raw_routing_plan is None
+        else MainlandCapabilityRoutingPlan.model_validate(raw_routing_plan)
+    )
+    if capability_routing_plan is not None:
+        if asset_configuration is None:
+            raise ValueError(
+                "Capability Routing Plan requires an authoritative asset configuration"
+            )
+        if (
+            capability_routing_plan.mode.value == "qualified_v1"
+            and (
+                graph_signature is None
+                or capability_routing_plan.plan_signature not in graph_signature
+            )
+        ):
+            raise ValueError(
+                "graph signature does not commit to the qualified Capability Routing Plan"
+            )
+    raw_routing_failure = final_state.get("capability_routing_failure")
+    capability_routing_failure = (
+        None
+        if raw_routing_failure is None
+        else _CapabilityRoutingFailureProjection.model_validate(
+            raw_routing_failure
+        )
+    )
+    if capability_routing_plan is not None and capability_routing_failure is not None:
+        raise ValueError("run cannot contain both a routing plan and routing failure")
     raw_telemetry = final_state.get("run_telemetry")
     telemetry = (
         RunTelemetryProjection.empty(
@@ -504,6 +553,16 @@ def build_decision_audit(
         "asset_configuration_failure": (
             asset_configuration_failure.model_dump(mode="json")
             if asset_configuration_failure is not None
+            else None
+        ),
+        "capability_routing_plan": (
+            capability_routing_plan.model_dump(mode="json")
+            if capability_routing_plan is not None
+            else None
+        ),
+        "capability_routing_failure": (
+            capability_routing_failure.model_dump(mode="json")
+            if capability_routing_failure is not None
             else None
         ),
         "evidence_state": _evidence_projection.model_dump(mode="json"),

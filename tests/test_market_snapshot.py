@@ -155,6 +155,61 @@ def test_snapshot_preserves_rate_limit_before_ordered_secondary_success(monkeypa
 
 
 @pytest.mark.unit
+def test_qualified_financial_routing_does_not_change_daily_mainland_order(
+    monkeypatch,
+):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config(
+        {
+            "mainland_capability_routing_mode": "qualified_v1",
+            "tushare_enabled_capabilities": ("statements",),
+            "market_data_vendors": {
+                "cn_a": {
+                    "core_stock_apis": "akshare,baostock,yfinance",
+                },
+            },
+        }
+    )
+    calls = []
+
+    def unavailable(provider):
+        def fetch(*_args):
+            calls.append(provider)
+            raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NO_DATA)
+
+        return fetch
+
+    def yahoo(*_args):
+        calls.append("yfinance")
+        return _valid_history(10)
+
+    def forbidden_tushare(*_args):
+        calls.append("tushare")
+        raise AssertionError("Tushare must not enter the daily snapshot chain")
+
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "akshare": SnapshotProvider(unavailable("akshare"), "qfq"),
+            "baostock": SnapshotProvider(unavailable("baostock"), "qfq"),
+            "yfinance": SnapshotProvider(yahoo, "auto_adjusted"),
+            "tushare": SnapshotProvider(forbidden_tushare, "qfq"),
+        },
+    )
+
+    with authoritative_snapshot_run():
+        snapshot = get_authoritative_market_snapshot(
+            "601328.SS",
+            "2026-06-01",
+            "2026-07-18",
+        )
+
+    assert calls == ["akshare", "baostock", "yfinance"]
+    assert snapshot.provider == "yfinance"
+
+
+@pytest.mark.unit
 def test_snapshot_selects_largest_valid_short_candidate_without_malforming_it(monkeypatch):
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     set_config({

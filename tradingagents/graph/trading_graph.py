@@ -32,6 +32,13 @@ from tradingagents.asset_configuration import (
     RunAssetConfigurationError,
     resolve_run_asset_configuration,
 )
+from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingPlan,
+    MainlandCapabilityRoutingPreflightError,
+    capability_routing_configuration_is_explicit,
+    is_mainland_equity_configuration,
+    preflight_mainland_capability_routing,
+)
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.instrument_identity import RegistryFailureReason
@@ -129,6 +136,7 @@ class TradingAgentsGraph:
         decision_horizon: DecisionHorizon | None = None,
         asset_type: str | None = None,
         asset_configuration: RunAssetConfiguration | None = None,
+        capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
         instrument_symbol: str | None = None,
     ):
         """Initialize the trading agents graph and components.
@@ -185,6 +193,36 @@ class TradingAgentsGraph:
                     source_ref="crypto-identity-registry:unresolved",
                 )
         normalized_asset_type = self._asset_type_for_instrument_kind(instrument_kind)
+        if (
+            asset_configuration is not None
+            and is_mainland_equity_configuration(asset_configuration)
+        ):
+            if capability_routing_plan is None:
+                routing_preflight = preflight_mainland_capability_routing(
+                    asset_configuration,
+                    config=resolved_config,
+                )
+                if not routing_preflight.passed:
+                    if routing_preflight.failure is None:  # pragma: no cover
+                        raise RuntimeError("routing preflight failure is unavailable")
+                    raise MainlandCapabilityRoutingPreflightError(
+                        routing_preflight.failure
+                    )
+                capability_routing_plan = routing_preflight.plan
+        elif capability_routing_plan is not None:
+            raise ValueError(
+                "mainland Capability Routing Plan requires a mainland Equity identity"
+            )
+        elif capability_routing_configuration_is_explicit(resolved_config):
+            routing_preflight = preflight_mainland_capability_routing(
+                None,
+                config=resolved_config,
+            )
+            if routing_preflight.failure is None:  # pragma: no cover - model invariant
+                raise RuntimeError("routing preflight failure is unavailable")
+            raise MainlandCapabilityRoutingPreflightError(
+                routing_preflight.failure
+            )
         requested_analysts = tuple(selected_analysts)
         effective_analysts = self._analysts_for_instrument_kind(
             requested_analysts,
@@ -207,8 +245,27 @@ class TradingAgentsGraph:
             self.config["asset_configuration_signature"] = (
                 asset_configuration.asset_configuration_signature
             )
+        if (
+            capability_routing_plan is not None
+            and capability_routing_plan.mode.value == "qualified_v1"
+        ):
+            configured_routing_signature = self.config.get(
+                "mainland_capability_routing_plan_signature"
+            )
+            if (
+                configured_routing_signature is not None
+                and configured_routing_signature
+                != capability_routing_plan.plan_signature
+            ):
+                raise ValueError("Capability Routing Plan signature mismatch")
+            self.config["mainland_capability_routing_plan_signature"] = (
+                capability_routing_plan.plan_signature
+            )
+        else:
+            self.config.pop("mainland_capability_routing_plan_signature", None)
         self.callbacks = callbacks or []
         self.asset_configuration = asset_configuration
+        self.capability_routing_plan = capability_routing_plan
         self.decision_policy = (
             decision_policy
             if decision_policy is not None
@@ -694,6 +751,7 @@ class TradingAgentsGraph:
             instrument_context=instrument_context,
             evidence_state=evidence_state,
             asset_configuration=getattr(self, "asset_configuration", None),
+            capability_routing_plan=getattr(self, "capability_routing_plan", None),
             run_id=run_id,
         )
 
@@ -733,6 +791,19 @@ class TradingAgentsGraph:
                     + asset_configuration.asset_configuration_version,
                     "asset_configuration="
                     + asset_configuration.asset_configuration_signature,
+                )
+            )
+        capability_routing_plan = getattr(self, "capability_routing_plan", None)
+        if (
+            capability_routing_plan is not None
+            and capability_routing_plan.mode.value == "qualified_v1"
+        ):
+            signature_fields.extend(
+                (
+                    "capability_routing_version="
+                    + capability_routing_plan.plan_version,
+                    "capability_routing="
+                    + capability_routing_plan.plan_signature,
                 )
             )
         return "|".join(signature_fields)

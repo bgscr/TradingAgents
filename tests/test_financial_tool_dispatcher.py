@@ -175,6 +175,24 @@ def _request(**updates: object) -> FinancialToolRequest:
     return FinancialToolRequest.model_validate(values)
 
 
+def test_qualified_routing_plan_identity_participates_in_financial_request_key() -> None:
+    plan_signature = "mainland-routing-plan:v1:" + "b" * 64
+    dispatcher = FinancialToolDispatcher(
+        instrument_identity=_identity(
+            symbol="601328.SS",
+            venue="XSHG",
+            currency="CNY",
+        ),
+        provider_chains={"get_balance_sheet": (_provider(),)},
+        capability_routing_plan_signature=plan_signature,
+    )
+
+    key = dispatcher.canonical_request_key(_request())
+
+    assert key.capability_routing_plan_signature == plan_signature
+    assert key.request_key.startswith("financial-request:v1:")
+
+
 def test_financial_dispatch_single_flights_concurrent_duplicates_and_reuses_terminal() -> None:
     provider_started = Event()
     release_provider = Event()

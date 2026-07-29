@@ -52,10 +52,24 @@ from tradingagents.asset_configuration import (
     RunAssetConfigurationError,
     resolve_run_asset_configuration,
 )
+from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingFailure,
+    MainlandCapabilityRoutingPlan,
+    is_mainland_equity_configuration,
+    preflight_mainland_capability_routing,
+)
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.evidence import asset_configuration_failure_evidence
+from tradingagents.evidence import (
+    EvidencePreflightResult,
+    EvidenceState,
+    SourceAcquisitionAvailable,
+    SourceArtifact,
+    analysis_outcome_publication,
+    asset_configuration_failure_evidence,
+    stable_acquisition_source_ref,
+)
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
@@ -1624,6 +1638,75 @@ def _complete_asset_configuration_failure(
     return final_state
 
 
+def _complete_capability_routing_failure(
+    *,
+    selections: dict,
+    config: dict,
+    artifacts: dict,
+    asset_configuration,
+    failure: MainlandCapabilityRoutingFailure,
+) -> dict:
+    """Publish a safe preflight Analysis Outcome without constructing a graph."""
+
+    identity_source_ref = stable_acquisition_source_ref(
+        "identity-registry",
+        asset_configuration.registry_source_ref,
+        asset_configuration.registry_digest,
+    )
+    identity_artifact = SourceArtifact(
+        artifact_sha256=asset_configuration.registry_digest,
+        source_ref=identity_source_ref,
+        tool_call_id="identity-registry",
+        tool_name="instrument_identity_registry",
+        raw_text=asset_configuration.registry_artifact,
+    )
+    evidence = EvidenceState(
+        instrument_identity=asset_configuration.instrument_identity,
+        source_artifacts=(identity_artifact,),
+        acquisition_outcomes=(
+            SourceAcquisitionAvailable(
+                provider="instrument-identity-registry",
+                capability="instrument_identity",
+                source_ref=identity_source_ref,
+                attempt=1,
+                retrieved_at=(
+                    asset_configuration.instrument_identity.provenance.retrieved_at
+                ),
+                artifact=identity_artifact,
+            ),
+        ),
+    )
+    final_state = Propagator().create_initial_state(
+        selections["ticker"],
+        selections["analysis_date"],
+        asset_type=selections["asset_type"],
+        evidence_state=evidence,
+        asset_configuration=asset_configuration,
+    )
+    final_state["evidence_preflight"] = EvidencePreflightResult(
+        passed=False,
+        readiness=failure.analysis_outcome.readiness,
+        blockers=(failure.reason.value,),
+        diagnostic_codes=failure.analysis_outcome.diagnostic_codes,
+    ).model_dump(mode="json")
+    final_state.update(analysis_outcome_publication(failure.analysis_outcome))
+    final_state["graph_signature"] = "|".join(
+        (
+            "asset_configuration="
+            + asset_configuration.asset_configuration_signature,
+            "capability_routing=unavailable:v1",
+        )
+    )
+    final_state["evidence_gate_mode"] = config.get("evidence_gate_mode", "enforce")
+    final_state["capability_routing_failure"] = failure.model_dump(
+        mode="json",
+        exclude={"analysis_outcome"},
+    )
+    _write_run_reports(final_state, selections["ticker"], artifacts)
+    _mark_run_completed(final_state, artifacts)
+    return final_state
+
+
 def run_analysis(checkpoint: bool | None = None):
     # First get all user selections
     selections = get_user_selections()
@@ -1631,9 +1714,24 @@ def run_analysis(checkpoint: bool | None = None):
     config = _build_run_config(selections, checkpoint)
     asset_configuration = None
     asset_configuration_error = None
-    should_resolve_asset = selections["asset_type"] == "crypto" or any(
+    capability_routing_plan: MainlandCapabilityRoutingPlan | None = None
+    capability_routing_failure: MainlandCapabilityRoutingFailure | None = None
+    routing_configuration_requires_identity = (
+        str(config.get("mainland_capability_routing_mode", "legacy")) != "legacy"
+        or bool(config.get("tushare_enabled_capabilities", ()))
+    )
+    mainland_symbol_requested = (
+        resolve_mainland_instrument(selections["ticker"]) is not None
+    )
+    fundamentals_requested = any(
         analyst.value == "fundamentals" for analyst in selections["analysts"]
     )
+    asset_configuration_required = (
+        selections["asset_type"] == "crypto"
+        or routing_configuration_requires_identity
+        or fundamentals_requested
+    )
+    should_resolve_asset = asset_configuration_required or mainland_symbol_requested
     if should_resolve_asset:
         try:
             asset_configuration = resolve_run_asset_configuration(
@@ -1641,12 +1739,40 @@ def run_analysis(checkpoint: bool | None = None):
                 config=config,
             )
         except RunAssetConfigurationError as exc:
-            asset_configuration_error = exc
+            # Default market-only mainland routing is additive: bind a legacy plan
+            # when an authoritative registry identity exists, but preserve the
+            # historical market path when that optional identity is unavailable.
+            if asset_configuration_required:
+                asset_configuration_error = exc
         else:
             config = dict(config)
             config["asset_configuration_signature"] = (
                 asset_configuration.asset_configuration_signature
             )
+            if (
+                is_mainland_equity_configuration(asset_configuration)
+                or routing_configuration_requires_identity
+            ):
+                routing_preflight = preflight_mainland_capability_routing(
+                    asset_configuration,
+                    config=config,
+                )
+                if routing_preflight.passed:
+                    capability_routing_plan = routing_preflight.plan
+                    if (
+                        capability_routing_plan is not None
+                        and capability_routing_plan.mode.value == "qualified_v1"
+                    ):
+                        config["mainland_capability_routing_plan_signature"] = (
+                            capability_routing_plan.plan_signature
+                        )
+                    else:
+                        config.pop(
+                            "mainland_capability_routing_plan_signature",
+                            None,
+                        )
+                else:
+                    capability_routing_failure = routing_preflight.failure
 
     artifacts = None
     current_phase = "setup"
@@ -1677,6 +1803,18 @@ def run_analysis(checkpoint: bool | None = None):
         finally:
             with suppress(Exception):
                 runtime_writer.close()
+    if capability_routing_failure is not None:
+        try:
+            return _complete_capability_routing_failure(
+                selections=selections,
+                config=config,
+                artifacts=artifacts,
+                asset_configuration=asset_configuration,
+                failure=capability_routing_failure,
+            )
+        finally:
+            with suppress(Exception):
+                runtime_writer.close()
     current_phase = "graph_initializing"
     _update_run_status(artifacts, current_phase="graph_initializing")
     report_dir = artifacts["report_dir"]
@@ -1690,6 +1828,7 @@ def run_analysis(checkpoint: bool | None = None):
             callbacks=[stats_handler],
             asset_type=selections["asset_type"],
             asset_configuration=asset_configuration,
+            capability_routing_plan=capability_routing_plan,
         )
 
         # Initialize message buffer with selected analysts

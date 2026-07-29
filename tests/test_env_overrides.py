@@ -44,6 +44,28 @@ def test_string_overrides(monkeypatch):
     assert dc.DEFAULT_CONFIG["output_language"] == "Chinese"
 
 
+def test_capability_routing_overrides_keep_tushare_token_out_of_config(monkeypatch):
+    dc = _reload_with_env(
+        monkeypatch,
+        TRADINGAGENTS_MAINLAND_CAPABILITY_ROUTING_MODE="qualified_v1",
+        TRADINGAGENTS_TUSHARE_ENABLED_CAPABILITIES="statements,name_events",
+        TRADINGAGENTS_TUSHARE_QUALIFICATION_PROFILE="cn-a-2000-20260729-v1",
+        TRADINGAGENTS_TUSHARE_ACCOUNT_SCOPE_LABEL="personal-research-primary",
+        TRADINGAGENTS_TUSHARE_CALLS_PER_MINUTE="40",
+        TRADINGAGENTS_TUSHARE_OPERATOR_SAFETY_CEILING_CALLS_PER_MINUTE="30",
+    )
+
+    assert dc.DEFAULT_CONFIG["mainland_capability_routing_mode"] == "qualified_v1"
+    assert dc.DEFAULT_CONFIG["tushare_enabled_capabilities"] == (
+        "statements,name_events"
+    )
+    assert dc.DEFAULT_CONFIG["tushare_calls_per_minute"] == 40
+    assert dc.DEFAULT_CONFIG[
+        "tushare_operator_safety_ceiling_calls_per_minute"
+    ] == 30
+    assert "tushare_token" not in dc.DEFAULT_CONFIG
+
+
 def test_crypto_identity_registry_overrides_are_separate(monkeypatch):
     dc = _reload_with_env(
         monkeypatch,

@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.asset_configuration import RunAssetConfiguration
+from tradingagents.capability_routing import MainlandCapabilityRoutingPlan
 from tradingagents.evidence import EvidenceState
 
 
@@ -26,6 +27,7 @@ class Propagator:
         instrument_context: str = "",
         evidence_state: EvidenceState | None = None,
         asset_configuration: RunAssetConfiguration | None = None,
+        capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
         run_id: str = "",
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph.
@@ -43,6 +45,11 @@ class Propagator:
             "asset_configuration": (
                 asset_configuration.model_dump(mode="json")
                 if asset_configuration is not None
+                else None
+            ),
+            "capability_routing_plan": (
+                capability_routing_plan.model_dump(mode="json")
+                if capability_routing_plan is not None
                 else None
             ),
             "instrument_context": instrument_context,
