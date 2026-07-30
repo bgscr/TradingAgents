@@ -5,3 +5,4 @@ config/crypto_identity_registry.json text eol=lf
 config/crypto_identity_registry.sha256 text eol=lf
 tradingagents/config/crypto_identity_registry.json text eol=lf
 tradingagents/config/crypto_identity_registry.sha256 text eol=lf
+tests/fixtures/recorded_runs/[0-9a-f]*.json text eol=lf
