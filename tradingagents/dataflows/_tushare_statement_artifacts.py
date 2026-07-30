@@ -56,6 +56,8 @@ def encode_provider_artifact(
     frame: pd.DataFrame,
     retrieved_at: datetime,
     observed_at: datetime,
+    artifact_contract_version: str = TUSHARE_STATEMENT_ADAPTER_VERSION,
+    adapter_metadata: Mapping[str, object] | None = None,
 ) -> bytes:
     """Encode every provider column and value before normalization."""
 
@@ -70,7 +72,7 @@ def encode_provider_artifact(
         for values in frame.itertuples(index=False, name=None)
     ]
     payload = {
-        "artifact_contract_version": TUSHARE_STATEMENT_ADAPTER_VERSION,
+        "artifact_contract_version": artifact_contract_version,
         "provider_id": "tushare",
         "endpoint_id": endpoint_id,
         "dataset_id": "single_stock_history",
@@ -80,6 +82,8 @@ def encode_provider_artifact(
         "columns": columns,
         "rows": rows,
     }
+    if adapter_metadata is not None:
+        payload["adapter_metadata"] = dict(adapter_metadata)
     return json.dumps(
         payload,
         allow_nan=False,
@@ -89,7 +93,13 @@ def encode_provider_artifact(
     ).encode("utf-8")
 
 
-def decode_provider_artifact(value: bytes, *, endpoint_id: str) -> dict[str, object]:
+def decode_provider_artifact(
+    value: bytes,
+    *,
+    endpoint_id: str,
+    artifact_contract_version: str = TUSHARE_STATEMENT_ADAPTER_VERSION,
+    adapter_metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Validate a cached artifact before deriving provider-neutral candidates."""
 
     try:
@@ -107,12 +117,18 @@ def decode_provider_artifact(value: bytes, *, endpoint_id: str) -> dict[str, obj
         "columns",
         "rows",
     }
+    if adapter_metadata is not None:
+        expected_keys.add("adapter_metadata")
     if (
         not isinstance(payload, dict)
         or set(payload) != expected_keys
-        or payload["artifact_contract_version"] != TUSHARE_STATEMENT_ADAPTER_VERSION
+        or payload["artifact_contract_version"] != artifact_contract_version
         or payload["provider_id"] != "tushare"
         or payload["endpoint_id"] != endpoint_id
+        or (
+            adapter_metadata is not None
+            and payload.get("adapter_metadata") != dict(adapter_metadata)
+        )
         or not isinstance(payload["columns"], list)
         or not isinstance(payload["rows"], list)
     ):
@@ -134,14 +150,17 @@ def financial_artifact_identity(
     """Bind the bulk response to its canonical request and canonical row payload."""
 
     dataset = _dataset_identity(payload)
+    provider_metadata = {
+        "provider_id": "tushare",
+        "endpoint_id": str(payload["endpoint_id"]),
+        "schema_identity": str(payload["schema_identity"]),
+    }
+    if "adapter_metadata" in payload:
+        provider_metadata["adapter_metadata"] = payload["adapter_metadata"]
     return FinancialProviderArtifactIdentity.create(
         dataset=dataset,
         canonical_request=key.model_dump(mode="json"),
-        provider_metadata={
-            "provider_id": "tushare",
-            "endpoint_id": str(payload["endpoint_id"]),
-            "schema_identity": str(payload["schema_identity"]),
-        },
+        provider_metadata=provider_metadata,
         retrieved_at=_payload_time(payload, "retrieved_at"),
         observed_at=_payload_time(payload, "observed_at"),
         payload=payload["rows"],

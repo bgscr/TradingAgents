@@ -21,6 +21,10 @@ FINANCIAL_CONTRACT_VERSION = "1.0"
 FINANCIAL_PROVIDER_DATASET_IDENTITY_VERSION = "financial-provider-dataset:v1"
 FINANCIAL_PROVIDER_ARTIFACT_IDENTITY_VERSION = "financial-provider-artifact:v1"
 FINANCIAL_PERIOD_IDENTITY_VERSION = "financial-period:v1"
+FINANCIAL_RATIO_DECLARATION_V1 = "financial-ratio-declarations-v1"
+FINANCIAL_RATIO_DECLARATION_V2 = "financial-ratio-declarations-v2"
+FINANCIAL_PERIOD_SELECTION_V1 = "financial-period-selection-v1"
+FINANCIAL_PERIOD_SELECTION_V2 = "financial-period-selection-v2"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
@@ -639,9 +643,10 @@ class FinancialRatioFieldSetDeclaration(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = FINANCIAL_CONTRACT_VERSION
-    declaration_version: Literal["financial-ratio-declarations-v1"] = (
-        "financial-ratio-declarations-v1"
-    )
+    declaration_version: Literal[
+        "financial-ratio-declarations-v1",
+        "financial-ratio-declarations-v2",
+    ] = FINANCIAL_RATIO_DECLARATION_V1
     company_type: FinancialCompanyType
     ratio_family: FinancialRatioFamily
     normalized_fields: tuple[str, ...]
@@ -734,15 +739,65 @@ _RATIO_FAMILY_FIELDS = {
     ),
 }
 
+_QUALIFIED_RATIO_FAMILY_FIELDS = {
+    **_RATIO_FAMILY_FIELDS,
+    FinancialRatioFamily.PROFIT: tuple(
+        field
+        for field in _RATIO_FAMILY_FIELDS[FinancialRatioFamily.PROFIT]
+        if field != "earnings_per_share"
+    ),
+    FinancialRatioFamily.OPERATION: (
+        "accounts_payable_turnover",
+        "asset_turnover",
+        "current_asset_turnover",
+        "fixed_asset_turnover",
+        "inventory_turnover",
+        "receivables_turnover",
+    ),
+}
+
+_QUALIFIED_BANK_RATIO_FAMILY_FIELDS = {
+    **_QUALIFIED_RATIO_FAMILY_FIELDS,
+    FinancialRatioFamily.PROFIT: (
+        "cost_income_ratio",
+        "net_interest_margin",
+        "net_interest_spread",
+        "net_margin",
+        "non_performing_loan_ratio",
+        "pre_tax_margin",
+        "provision_coverage_ratio",
+        "return_on_assets",
+        "return_on_equity",
+        "return_on_invested_capital",
+    ),
+}
+
 
 def financial_ratio_field_declaration(
     company_type: FinancialCompanyType,
     ratio_family: FinancialRatioFamily,
+    *,
+    declaration_version: Literal[
+        "financial-ratio-declarations-v1",
+        "financial-ratio-declarations-v2",
+    ] = FINANCIAL_RATIO_DECLARATION_V1,
 ) -> FinancialRatioFieldSetDeclaration:
+    if declaration_version == FINANCIAL_RATIO_DECLARATION_V1:
+        normalized_fields = _RATIO_FAMILY_FIELDS[ratio_family]
+    elif declaration_version == FINANCIAL_RATIO_DECLARATION_V2:
+        declarations = (
+            _QUALIFIED_BANK_RATIO_FAMILY_FIELDS
+            if company_type is FinancialCompanyType.BANK
+            else _QUALIFIED_RATIO_FAMILY_FIELDS
+        )
+        normalized_fields = declarations[ratio_family]
+    else:
+        raise ValueError("unsupported financial ratio declaration version")
     return FinancialRatioFieldSetDeclaration(
+        declaration_version=declaration_version,
         company_type=company_type,
         ratio_family=ratio_family,
-        normalized_fields=tuple(sorted(_RATIO_FAMILY_FIELDS[ratio_family])),
+        normalized_fields=tuple(sorted(normalized_fields)),
     )
 
 
@@ -1189,9 +1244,10 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-period-selection-v1"] = (
-        "financial-period-selection-v1"
-    )
+    contract_version: Literal[
+        "financial-period-selection-v1",
+        "financial-period-selection-v2",
+    ] = FINANCIAL_PERIOD_SELECTION_V1
     candidate_identity: str = Field(
         pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
     )
@@ -1255,6 +1311,11 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
         expected_critical: tuple[str, ...] = ()
         expected_core: tuple[str, ...] = ()
         ratio_assessment = False
+        ratio_contract = (
+            self.capability is FinancialCapability.RATIO_FAMILY
+            and self.statement_type is None
+            and self.ratio_family is not None
+        )
         if (
             self.capability is FinancialCapability.STATEMENT
             and self.company_type is not FinancialCompanyType.UNKNOWN
@@ -1279,12 +1340,24 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             and self.ratio_family is not None
         ):
             ratio_assessment = True
+            declaration_version = (
+                FINANCIAL_RATIO_DECLARATION_V2
+                if self.contract_version == FINANCIAL_PERIOD_SELECTION_V2
+                else FINANCIAL_RATIO_DECLARATION_V1
+            )
             expected_core = financial_ratio_field_declaration(
                 self.company_type,
                 self.ratio_family,
+                declaration_version=declaration_version,
             ).normalized_fields
         elif self.declared_critical_fields or self.declared_core_fields:
             raise ValueError("unsupported assessment cannot declare normalized fields")
+
+        if (
+            self.contract_version == FINANCIAL_PERIOD_SELECTION_V2
+            and not ratio_contract
+        ):
+            raise ValueError("financial period selection v2 requires a ratio assessment")
 
         if (
             self.declared_critical_fields != expected_critical
@@ -1411,6 +1484,10 @@ def assess_financial_period_candidate(
     expected_currency: str,
     expected_consolidation_scope: FinancialConsolidationScope,
     pit_as_of_date: date,
+    ratio_declaration_version: Literal[
+        "financial-ratio-declarations-v1",
+        "financial-ratio-declarations-v2",
+    ] = FINANCIAL_RATIO_DECLARATION_V1,
 ) -> FinancialPeriodCompletenessAssessment:
     """Apply capability, identity, metadata, and declared completeness gates."""
 
@@ -1501,6 +1578,7 @@ def assess_financial_period_candidate(
         ratio_declaration = financial_ratio_field_declaration(
             identity.company_type,
             identity.ratio_family,
+            declaration_version=ratio_declaration_version,
         )
         declared_core = ratio_declaration.normalized_fields
         normalized_fields = {
@@ -1548,7 +1626,16 @@ def assess_financial_period_candidate(
         disposition = FinancialPeriodDisposition.CURRENT_ONLY
     else:
         disposition = FinancialPeriodDisposition.REJECTED
+    assessment_contract_version = (
+        FINANCIAL_PERIOD_SELECTION_V2
+        if (
+            identity.capability is FinancialCapability.RATIO_FAMILY
+            and ratio_declaration_version == FINANCIAL_RATIO_DECLARATION_V2
+        )
+        else FINANCIAL_PERIOD_SELECTION_V1
+    )
     return FinancialPeriodCompletenessAssessment(
+        contract_version=assessment_contract_version,
         candidate_identity=candidate.candidate_identity,
         artifact_identity=candidate.artifact.artifact_identity,
         period_identity=identity.period_identity,
@@ -2878,6 +2965,10 @@ class FinancialAcquisitionManifest(BaseModel):
 
 
 __all__ = [
+    "FINANCIAL_PERIOD_SELECTION_V1",
+    "FINANCIAL_PERIOD_SELECTION_V2",
+    "FINANCIAL_RATIO_DECLARATION_V1",
+    "FINANCIAL_RATIO_DECLARATION_V2",
     "FinancialAcquisitionManifest",
     "FinancialAcquisitionOutcome",
     "FinancialCapability",
