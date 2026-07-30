@@ -53,6 +53,7 @@ def record_active_physical_attempt_io() -> None:
 
 _UPSTREAM_SERVICES = {
     "akshare": ("eastmoney-push2his", "Eastmoney push2his"),
+    "akshare_sina": ("sina-company-finance", "Sina Company Finance"),
     "baostock": ("baostock-tcp", "BaoStock TCP service"),
     "tushare": ("tushare-pro", "Tushare Pro account"),
     "yfinance": ("yahoo-finance", "Yahoo Finance"),
