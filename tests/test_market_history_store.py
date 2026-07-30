@@ -300,7 +300,7 @@ def test_opening_a_new_store_publishes_the_durable_schema_atomically(tmp_path: P
         status = store.status()
 
     assert config.database_path.is_file()
-    assert status.schema_version == 8
+    assert status.schema_version == 9
     assert status.foreign_keys_enabled is True
     assert status.journal_mode == "wal"
     assert status.synchronous == "full"
@@ -618,7 +618,7 @@ def test_backup_restores_database_and_referenced_payloads_together(tmp_path: Pat
     assert "payload-mutation" not in backup.manifest_path.read_text(
         encoding="utf-8"
     )
-    assert status.schema_version == 8
+    assert status.schema_version == 9
     assert restored_payload == payload
     assert restored_frame == stored
 
@@ -924,7 +924,7 @@ def test_v1_equivalence_rows_migrate_without_losing_their_frame_identity(
         status = migrated.status()
         results = migrated.latest_mainland_equivalence_results()
 
-    assert status.schema_version == 8
+    assert status.schema_version == 9
     assert "request_queue" in status.tables
     assert results == {"legacy_unclassified": True}
 
@@ -1001,7 +1001,7 @@ def test_failed_snapshot_v2_migration_leaves_v2_database_usable_and_unchanged(
 
     monkeypatch.setattr(store_module, "MIGRATION_V3", original_migration)
     with MarketHistoryStore.open(config) as upgraded:
-        assert upgraded.status().schema_version == 8
+        assert upgraded.status().schema_version == 9
         assert upgraded._connection.execute(
             "SELECT detail FROM history_store_diagnostics "
             "WHERE diagnostic_id = 'migration-control'"

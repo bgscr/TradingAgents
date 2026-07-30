@@ -47,6 +47,11 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialStatementType,
     assess_financial_period_candidate,
 )
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestCache,
+    ProviderSubrequestCacheCheckpoint,
+    ProviderSubrequestCacheError,
+)
 from tradingagents.evidence import (
     ACQUISITION_TOKEN_PATTERN,
     AcquisitionUnavailableReason,
@@ -93,6 +98,7 @@ _RESERVED_MATERIAL_ARGUMENTS = frozenset(
 )
 _SYSTEMIC_CIRCUIT_FAILURES = frozenset(
     {
+        AcquisitionUnavailableReason.PERMISSION_DENIED,
         AcquisitionUnavailableReason.RATE_LIMITED,
         AcquisitionUnavailableReason.TIMEOUT,
         AcquisitionUnavailableReason.DISCONNECT,
@@ -425,6 +431,9 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
     TERMINAL_OUTCOME_INVALID = (
         "financial_dispatch_checkpoint_terminal_outcome_invalid"
     )
+    PROVIDER_SUBREQUEST_CACHE_INVALID = (
+        "financial_dispatch_checkpoint_provider_subrequest_cache_invalid"
+    )
 
 
 class FinancialDispatchCheckpointError(ValueError):
@@ -531,6 +540,7 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         pattern=r"^asset-config:v1:[0-9a-f]{64}$"
     )
     circuit_state: tuple[FinancialCircuitCheckpointState, ...] = ()
+    provider_subrequest_cache: ProviderSubrequestCacheCheckpoint | None = None
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
 
 
@@ -612,6 +622,7 @@ class FinancialToolDispatcher:
         checkpoint_ledger: (
             Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
         ) = None,
+        provider_subrequest_cache: ProviderSubrequestCache | None = None,
     ) -> None:
         if not instrument_identity.is_authoritative:
             raise ValueError("financial dispatcher requires authoritative Instrument Identity")
@@ -659,6 +670,7 @@ class FinancialToolDispatcher:
         self._dispatch_lock = threading.Lock()
         self._dispatch_results: dict[str, Future[FinancialDispatchResult]] = {}
         self._reuse_counts: dict[str, int] = {}
+        self._provider_subrequest_cache = provider_subrequest_cache
         if checkpoint_ledger is not None:
             self._restore_checkpoint_ledger(checkpoint_ledger)
 
@@ -679,6 +691,7 @@ class FinancialToolDispatcher:
         checkpoint_ledger: (
             Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
         ) = None,
+        provider_subrequest_cache: ProviderSubrequestCache | None = None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -737,6 +750,7 @@ class FinancialToolDispatcher:
             clock=clock,
             sleeper=sleeper,
             checkpoint_ledger=checkpoint_ledger,
+            provider_subrequest_cache=provider_subrequest_cache,
         )
 
     def canonical_request_key(
@@ -904,9 +918,19 @@ class FinancialToolDispatcher:
                 FinancialCircuitCheckpointState(provider=provider, tool_name=tool_name)
                 for provider, tool_name in sorted(self._open_circuits)
             ),
+            provider_subrequest_cache=(
+                ProviderSubrequestCacheCheckpoint.model_validate(
+                    self._provider_subrequest_cache.checkpoint()
+                )
+                if self._provider_subrequest_cache is not None
+                else None
+            ),
             entries=tuple(entries),
         )
-        return ledger.model_dump(mode="json")
+        payload = ledger.model_dump(mode="json")
+        if ledger.provider_subrequest_cache is None:
+            payload.pop("provider_subrequest_cache", None)
+        return payload
 
     def _checkpoint_provider_chain_bindings(
         self,
@@ -962,6 +986,23 @@ class FinancialToolDispatcher:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
             )
+        if ledger.provider_subrequest_cache is not None:
+            if self._provider_subrequest_cache is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                )
+            try:
+                active_cache = ProviderSubrequestCacheCheckpoint.model_validate(
+                    self._provider_subrequest_cache.checkpoint()
+                )
+            except (ProviderSubrequestCacheError, TypeError, ValueError) as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                ) from exc
+            if active_cache != ledger.provider_subrequest_cache:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                )
         request_keys: set[str] = set()
         for entry in ledger.entries:
             request_key = entry.canonical_request_key.request_key
@@ -1313,6 +1354,7 @@ class FinancialToolDispatcher:
                         selected_variant,
                         canonical_request,
                         canonical_request_key=canonical_key.request_key,
+                        provider_subrequest_cache=self._provider_subrequest_cache,
                     )
 
                 controller = AcquisitionController(
@@ -1534,12 +1576,15 @@ def _validate_financial_dispatch_audit_integrity(
     )
     if configured_retry_policy is not None:
         retry_policy = RetryPolicy.model_validate(configured_retry_policy)
+    dispatch_ledger = ledger.model_copy(
+        update={"provider_subrequest_cache": None}
+    )
     FinancialToolDispatcher.from_configured_vendors(
         instrument_identity=run_asset_configuration.instrument_identity,
         run_asset_configuration=run_asset_configuration,
         config=effective_config,
         retry_policy=retry_policy,
-        checkpoint_ledger=ledger,
+        checkpoint_ledger=dispatch_ledger,
     )
 
 
@@ -2067,10 +2112,22 @@ def _invoke_financial_variant(
     request: FinancialToolRequest,
     *,
     canonical_request_key: str,
+    provider_subrequest_cache: ProviderSubrequestCache | None,
 ) -> object:
     """Translate raw adapter failures before deterministic policy observes them."""
 
     try:
+        cached_invoke = getattr(
+            variant.invoke,
+            "invoke_with_provider_subrequest_cache",
+            None,
+        )
+        if callable(cached_invoke) and provider_subrequest_cache is not None:
+            return cached_invoke(
+                request,
+                canonical_request_key,
+                provider_subrequest_cache,
+            )
         keyed_invoke = getattr(variant.invoke, "invoke_with_request_key", None)
         if callable(keyed_invoke):
             return keyed_invoke(request, canonical_request_key)
@@ -2079,6 +2136,9 @@ def _invoke_financial_variant(
         raise
     except PhysicalAttemptFailure as exc:
         reason = {
+            PhysicalAttemptOutcome.PERMISSION_DENIED: (
+                AcquisitionUnavailableReason.PERMISSION_DENIED
+            ),
             PhysicalAttemptOutcome.RATE_LIMITED: (
                 AcquisitionUnavailableReason.RATE_LIMITED
             ),

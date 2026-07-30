@@ -519,6 +519,7 @@ def refresh_active_evidence_physical_attempts(
             request_key=event.request_key,
             upstream_service_id=event.upstream_service_id,
             upstream_service_name=event.upstream_service_name,
+            capacity_scope=event.capacity_scope,
             attempt_index=event.attempt_index,
             attempted_at=event.attempted_at.isoformat(),
             pacing_event=event.pacing_event,

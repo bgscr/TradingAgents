@@ -1,6 +1,6 @@
 """Explicit transactional migrations for the Market History Database."""
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 CREATE_MIGRATION_TABLE = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -609,5 +609,43 @@ MIGRATION_V8 = (
     CREATE UNIQUE INDEX IF NOT EXISTS provider_request_attempts_by_event_id
     ON provider_request_attempts (attempt_event_id)
     WHERE attempt_event_id IS NOT NULL
+    """,
+)
+
+
+MIGRATION_V9 = (
+    """
+    ALTER TABLE request_leases
+    ADD COLUMN capacity_scope TEXT
+    """,
+    """
+    ALTER TABLE provider_request_sequences
+    ADD COLUMN capacity_scope TEXT
+    """,
+    """
+    ALTER TABLE provider_request_attempts
+    ADD COLUMN capacity_scope TEXT
+    """,
+    """
+    ALTER TABLE provider_request_sequences
+    ADD COLUMN failure_outcome_kind TEXT CHECK (
+        failure_outcome_kind IS NULL
+        OR failure_outcome_kind IN (
+            'permission_denied', 'rate_limited', 'timeout', 'disconnect',
+            'empty_frame', 'authentication', 'malformed_response',
+            'provider_error', 'upstream_busy', 'abandoned'
+        )
+    )
+    """,
+    """
+    ALTER TABLE provider_request_attempts
+    ADD COLUMN terminal_outcome_kind TEXT CHECK (
+        terminal_outcome_kind IS NULL
+        OR terminal_outcome_kind IN (
+            'available', 'permission_denied', 'rate_limited', 'timeout',
+            'disconnect', 'empty_frame', 'authentication',
+            'malformed_response', 'provider_error', 'upstream_busy', 'abandoned'
+        )
+    )
     """,
 )

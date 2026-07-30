@@ -214,6 +214,7 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
                         "- **Upstream Service Identity:** "
                         f"`{event.upstream_service_id}` ({event.upstream_service_name})"
                     ),
+                    f"- **Capacity scope:** `{event.capacity_scope}`",
                     f"- **Attempted at:** {event.attempted_at}",
                     f"- **Pacing/permit event:** {event.pacing_event}",
                     f"- **Pacing wait:** {event.pacing_wait_seconds:g} seconds",

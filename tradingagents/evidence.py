@@ -421,6 +421,7 @@ class ProviderPhysicalAttemptEvidence(BaseModel):
     request_key: str = Field(min_length=1)
     upstream_service_id: str = Field(min_length=1)
     upstream_service_name: str = Field(min_length=1)
+    capacity_scope: str = Field(default="all", pattern=ACQUISITION_TOKEN_PATTERN)
     attempt_index: int = Field(ge=1)
     attempted_at: str = Field(min_length=1)
     pacing_event: Literal[
@@ -433,6 +434,7 @@ class ProviderPhysicalAttemptEvidence(BaseModel):
         "timeout",
         "disconnect",
         "empty_frame",
+        "permission_denied",
         "authentication",
         "malformed_response",
         "provider_error",
@@ -870,6 +872,7 @@ class SourceArtifact(BaseModel):
 
 
 class AcquisitionUnavailableReason(str, Enum):
+    PERMISSION_DENIED = "permission_denied"
     RATE_LIMITED = "rate_limited"
     TIMEOUT = "timeout"
     DISCONNECT = "disconnect"
@@ -2627,6 +2630,7 @@ def build_evidence_state(
                     request_key=event.request_key,
                     upstream_service_id=event.upstream_service_id,
                     upstream_service_name=event.upstream_service_name,
+                    capacity_scope=getattr(event, "capacity_scope", "all"),
                     attempt_index=event.attempt_index,
                     attempted_at=event.attempted_at.isoformat(),
                     pacing_event=event.pacing_event,

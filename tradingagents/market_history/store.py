@@ -53,6 +53,7 @@ from tradingagents.market_history.schema import (
     MIGRATION_V6,
     MIGRATION_V7,
     MIGRATION_V8,
+    MIGRATION_V9,
     SCHEMA_VERSION,
 )
 
@@ -395,17 +396,68 @@ class MarketHistoryStore:
                         "updated_at = MAX(request_cooldowns.updated_at, excluded.updated_at)",
                         row,
                     )
-            for table in (
-                "request_leases",
-                "request_queue",
-                "provider_request_sequences",
-            ):
+            coordinator_columns = {
+                "request_leases": (
+                    "request_key",
+                    "upstream_service_id",
+                    "owner_id",
+                    "priority",
+                    "acquired_at",
+                    "expires_at",
+                ),
+                "request_queue": (
+                    "request_key",
+                    "upstream_service_id",
+                    "priority",
+                    "first_enqueued_at",
+                    "updated_at",
+                    "expires_at",
+                ),
+                "provider_request_sequences": (
+                    "sequence_id",
+                    "request_key",
+                    "upstream_service_id",
+                    "owner_id",
+                    "started_at",
+                    "completed_at",
+                    "status",
+                    "final_physical_attempt_count",
+                    "result_payload",
+                    "result_sha256",
+                    "failure_outcome",
+                    "failure_retryable",
+                    "failure_status_code",
+                    "failure_error_code",
+                    "failure_retry_after_seconds",
+                ),
+            }
+            optional_coordinator_columns = {
+                "request_leases": ("capacity_scope",),
+                "request_queue": (),
+                "provider_request_sequences": (
+                    "capacity_scope",
+                    "failure_outcome_kind",
+                ),
+            }
+            for table, base_columns in coordinator_columns.items():
                 if table in source_tables:
+                    source_column_names = {
+                        str(row[1])
+                        for row in self._connection.execute(
+                            f"PRAGMA legacy_provider_requests.table_info({table})"
+                        )
+                    }
+                    columns = (*base_columns, *(
+                        column
+                        for column in optional_coordinator_columns[table]
+                        if column in source_column_names
+                    ))
+                    column_list = ", ".join(columns)
                     self._connection.execute(
-                        f"INSERT OR IGNORE INTO {table} "
-                        f"SELECT * FROM legacy_provider_requests.{table}"
+                        f"INSERT OR IGNORE INTO {table} ({column_list}) "
+                        f"SELECT {column_list} FROM legacy_provider_requests.{table}"
                     )
-                    require_preserved_rows(table)
+                    require_preserved_rows(table, columns=column_list)
             if "provider_request_attempts" in source_tables:
                 attempt_columns = (
                     "sequence_id",
@@ -439,6 +491,10 @@ class MarketHistoryStore:
                     attempt_columns = (*attempt_columns, "attempt_event_id")
                 if "terminal_outcome" in source_attempt_columns:
                     attempt_columns = (*attempt_columns, "terminal_outcome")
+                if "capacity_scope" in source_attempt_columns:
+                    attempt_columns = (*attempt_columns, "capacity_scope")
+                if "terminal_outcome_kind" in source_attempt_columns:
+                    attempt_columns = (*attempt_columns, "terminal_outcome_kind")
                 column_list = ", ".join(attempt_columns)
                 self._connection.execute(
                     "INSERT OR IGNORE INTO provider_request_attempts "
@@ -1641,6 +1697,56 @@ class MarketHistoryStore:
                         (
                             8,
                             "provider_physical_attempt_typed_lifecycle",
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                    current_version = 8
+            scoped_tables = {
+                "request_leases": {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(request_leases)"
+                    )
+                },
+                "provider_request_sequences": {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(provider_request_sequences)"
+                    )
+                },
+                "provider_request_attempts": {
+                    str(row[1])
+                    for row in self._connection.execute(
+                        "PRAGMA table_info(provider_request_attempts)"
+                    )
+                },
+            }
+            scoped_columns = (
+                ("request_leases", "capacity_scope"),
+                ("provider_request_sequences", "capacity_scope"),
+                ("provider_request_attempts", "capacity_scope"),
+                ("provider_request_sequences", "failure_outcome_kind"),
+                ("provider_request_attempts", "terminal_outcome_kind"),
+            )
+            if current_version < 9 or any(
+                column not in scoped_tables[table]
+                for table, column in scoped_columns
+            ):
+                for statement, (table, column) in zip(
+                    MIGRATION_V9,
+                    scoped_columns,
+                    strict=True,
+                ):
+                    if column in scoped_tables[table]:
+                        continue
+                    self._connection.execute(statement)
+                if current_version < 9:
+                    self._connection.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            9,
+                            "provider_request_endpoint_capacity_scope",
                             datetime.now(timezone.utc).isoformat(),
                         ),
                     )

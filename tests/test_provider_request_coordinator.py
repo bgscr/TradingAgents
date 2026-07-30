@@ -23,7 +23,9 @@ from tradingagents.market_history import (
     PhysicalAttemptOutcome,
     ProviderRequestAuthorityUnavailableError,
     ProviderRequestCoordinator,
+    RateLimitScope,
     RequestPriority,
+    upstream_service_identity_for_provider,
 )
 
 
@@ -38,10 +40,413 @@ def _config(tmp_path) -> MarketHistoryConfig:
     )
 
 
+@pytest.mark.unit
+def test_tushare_attempt_persists_account_identity_and_endpoint_capacity_scope(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path)
+    upstream_service_id, service_name = upstream_service_identity_for_provider(
+        "tushare",
+        account_scope="personal-research-primary",
+    )
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            upstream_service_id,
+            service_name,
+            account_scope="personal-research-primary",
+        )
+        result = coordinator.execute_direct_physical_request(
+            request_key="provider-subrequest:v1:tushare-income",
+            upstream_service_id=upstream_service_id,
+            owner_id="ticket-03-test",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            physical_request=lambda: "immutable-income-artifact",
+            cooldown_scope="income",
+        )
+        persisted = store._connection.execute(
+            "SELECT capacity_scope FROM provider_request_attempts "
+            "WHERE sequence_id = ?",
+            (result.sequence_id,),
+        ).fetchone()
+
+    assert result.physical_attempt_count == 1
+    assert result.attempt_events[0].upstream_service_id == upstream_service_id
+    assert result.attempt_events[0].capacity_scope == "income"
+    assert persisted == ("income",)
+
+
+@pytest.mark.unit
+def test_tushare_global_and_endpoint_cooldowns_have_distinct_scope(tmp_path) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path)
+    upstream_service_id, service_name = upstream_service_identity_for_provider(
+        "tushare",
+        account_scope="personal-research-primary",
+    )
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            upstream_service_id,
+            service_name,
+            account_scope="personal-research-primary",
+        )
+        coordinator.record_rate_limit(
+            upstream_service_id=upstream_service_id,
+            cooldown_scope="all",
+            observed_at=now,
+            retry_after=timedelta(seconds=60),
+            provider_code="TUSHARE_GLOBAL_THROTTLE",
+        )
+        global_income = coordinator.acquire(
+            request_key="income-during-global",
+            upstream_service_id=upstream_service_id,
+            owner_id="income-global",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+            cooldown_scope="income",
+        )
+        global_balance = coordinator.acquire(
+            request_key="balance-during-global",
+            upstream_service_id=upstream_service_id,
+            owner_id="balance-global",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+            cooldown_scope="balancesheet",
+        )
+
+        endpoint_observed_at = now + timedelta(seconds=61)
+        coordinator.record_rate_limit(
+            upstream_service_id=upstream_service_id,
+            cooldown_scope="income",
+            observed_at=endpoint_observed_at,
+            retry_after=timedelta(seconds=30),
+            provider_code="TUSHARE_ENDPOINT_THROTTLE",
+        )
+        endpoint_income = coordinator.acquire(
+            request_key="income-during-endpoint",
+            upstream_service_id=upstream_service_id,
+            owner_id="income-endpoint",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=endpoint_observed_at + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+            cooldown_scope="income",
+        )
+        endpoint_balance = coordinator.acquire(
+            request_key="balance-during-endpoint",
+            upstream_service_id=upstream_service_id,
+            owner_id="balance-endpoint",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=endpoint_observed_at + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+            cooldown_scope="balancesheet",
+        )
+        coordinator.release(endpoint_balance.lease)
+
+    assert global_income.disposition is LeaseDisposition.COOLDOWN
+    assert global_balance.disposition is LeaseDisposition.COOLDOWN
+    assert endpoint_income.disposition is LeaseDisposition.COOLDOWN
+    assert endpoint_balance.disposition is LeaseDisposition.ACQUIRED
+
+
+@pytest.mark.unit
+def test_physical_account_rate_limit_blocks_every_tushare_endpoint(tmp_path) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    upstream_service_id, service_name = upstream_service_identity_for_provider(
+        "tushare",
+        account_scope="personal-research-primary",
+    )
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            upstream_service_id,
+            service_name,
+            account_scope="personal-research-primary",
+        )
+
+        def account_throttled() -> None:
+            raise PhysicalAttemptFailure(
+                outcome=PhysicalAttemptOutcome.RATE_LIMITED,
+                retryable=True,
+                retry_after_seconds=60,
+                rate_limit_scope=RateLimitScope.UPSTREAM,
+            )
+
+        with pytest.raises(PhysicalAttemptBudgetExhausted) as exc_info:
+            coordinator.execute_direct_physical_request(
+                request_key="provider-subrequest:v1:tushare-income-global-limit",
+                upstream_service_id=upstream_service_id,
+                owner_id="ticket-03-global-limit",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="financial-statement:income",
+                physical_request=account_throttled,
+                cooldown_scope="income",
+            )
+        blocked = coordinator.acquire(
+            request_key="balancesheet-after-global-limit",
+            upstream_service_id=upstream_service_id,
+            owner_id="ticket-03-global-limit-follower",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=30),
+            cooldown_scope="balancesheet",
+        )
+        cooldown_scopes = tuple(
+            row[0]
+            for row in store._connection.execute(
+                "SELECT cooldown_scope FROM request_cooldowns"
+            )
+        )
+
+    assert blocked.disposition is LeaseDisposition.COOLDOWN
+    assert cooldown_scopes == ("all",)
+    assert exc_info.value.attempt_events[0].capacity_scope == "income"
+    assert exc_info.value.attempt_events[0].cooldown_changed is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unsafe_scope", ["income endpoint", "x" * 129])
+def test_coordinator_rejects_unsafe_capacity_scope_before_persistence(
+    tmp_path,
+    unsafe_scope: str,
+) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    config = _config(tmp_path)
+    upstream_service_id, service_name = upstream_service_identity_for_provider(
+        "tushare",
+        account_scope="personal-research-primary",
+    )
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            upstream_service_id,
+            service_name,
+            account_scope="personal-research-primary",
+        )
+
+        with pytest.raises(ValueError, match="bounded capacity-scope token"):
+            coordinator.acquire(
+                request_key="unsafe-capacity-scope",
+                upstream_service_id=upstream_service_id,
+                owner_id="ticket-03-test",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=now,
+                lease_duration=timedelta(seconds=30),
+                cooldown_scope=unsafe_scope,
+            )
+        with pytest.raises(ValueError, match="bounded capacity-scope token"):
+            coordinator.record_rate_limit(
+                upstream_service_id=upstream_service_id,
+                cooldown_scope=unsafe_scope,
+                observed_at=now,
+                retry_after=timedelta(seconds=30),
+                provider_code="TUSHARE_ENDPOINT_THROTTLE",
+            )
+        with pytest.raises(ValueError, match="bounded provider-code token"):
+            coordinator.record_rate_limit(
+                upstream_service_id=upstream_service_id,
+                cooldown_scope="income",
+                observed_at=now,
+                retry_after=timedelta(seconds=30),
+                provider_code="RAW token=must-not-persist",
+            )
+
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM request_leases"
+        ).fetchone() == (0,)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM request_cooldowns"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.unit
+def test_tushare_account_scope_rejects_credential_like_text_before_persistence(
+    tmp_path,
+) -> None:
+    unsafe_scope = "token-must-not-persist-or-echo"
+
+    with pytest.raises(ValueError) as identity_error:
+        upstream_service_identity_for_provider(
+            "tushare",
+            account_scope=unsafe_scope,
+        )
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        with pytest.raises(ValueError) as registration_error:
+            ProviderRequestCoordinator(store).register_upstream_service(
+                "upstream:tushare-test",
+                "Tushare Pro account",
+                account_scope=unsafe_scope,
+            )
+        persisted = store._connection.execute(
+            "SELECT COUNT(*) FROM upstream_services"
+        ).fetchone()
+
+    assert unsafe_scope not in str(identity_error.value)
+    assert unsafe_scope not in str(registration_error.value)
+    assert persisted == (0,)
+
+
+@pytest.mark.unit
+def test_service_registration_rejects_account_scope_identity_mismatch(tmp_path) -> None:
+    upstream_service_id, service_name = upstream_service_identity_for_provider(
+        "tushare",
+        account_scope="personal-research-primary",
+    )
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            upstream_service_id,
+            service_name,
+            account_scope="personal-research-primary",
+        )
+        with pytest.raises(ValueError, match="account scope mismatch"):
+            coordinator.register_upstream_service(
+                upstream_service_id,
+                service_name,
+                account_scope="different-research-account",
+            )
+        persisted = store._connection.execute(
+            "SELECT account_scope FROM upstream_services "
+            "WHERE upstream_service_id = ?",
+            (upstream_service_id,),
+        ).fetchone()
+
+    assert persisted == ("personal-research-primary",)
+
+
+@pytest.mark.unit
+def test_physical_failure_rejects_secret_like_error_code_without_echo() -> None:
+    unsafe_code = "token:must-not-persist"
+
+    with pytest.raises(ValueError) as exc_info:
+        PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+            retryable=False,
+            error_code=unsafe_code,
+        )
+
+    assert unsafe_code not in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_endpoint_scope_migration_preserves_legacy_rows_as_all_without_io(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    physical_calls = 0
+
+    def physical_request() -> str:
+        nonlocal physical_calls
+        physical_calls += 1
+        return "legacy-artifact"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:legacy", "Legacy service")
+        original = coordinator.execute_direct_physical_request(
+            request_key="legacy-request",
+            upstream_service_id="upstream:legacy",
+            owner_id="legacy-owner",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="legacy-operation",
+            physical_request=physical_request,
+        )
+        legacy_attempt = store._connection.execute(
+            "SELECT sequence_id, attempt_index, request_key, upstream_service_id, "
+            "outcome, final_physical_attempt_count FROM provider_request_attempts"
+        ).fetchone()
+        retained_lease = coordinator.acquire(
+            request_key="legacy-active-lease",
+            upstream_service_id="upstream:legacy",
+            owner_id="legacy-active-owner",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=now + timedelta(seconds=1),
+            lease_duration=timedelta(minutes=5),
+            cooldown_scope="legacy-endpoint",
+        )
+        coordinator.record_rate_limit(
+            upstream_service_id="upstream:legacy",
+            cooldown_scope="legacy-endpoint",
+            observed_at=now + timedelta(seconds=1),
+            retry_after=timedelta(minutes=1),
+            provider_code="LEGACY_THROTTLE",
+        )
+        legacy_lease = store._connection.execute(
+            "SELECT request_key, upstream_service_id, owner_id, priority, "
+            "acquired_at, expires_at FROM request_leases"
+        ).fetchone()
+        legacy_cooldown = store._connection.execute(
+            "SELECT upstream_service_id, cooldown_scope, cooldown_until, reason, "
+            "retry_after_seconds, updated_at FROM request_cooldowns"
+        ).fetchone()
+
+    _downgrade_endpoint_scope_schema(config.database_path)
+
+    with MarketHistoryStore.open(config) as migrated:
+        migrated_attempt = migrated._connection.execute(
+            "SELECT sequence_id, attempt_index, request_key, upstream_service_id, "
+            "outcome, final_physical_attempt_count, capacity_scope "
+            "FROM provider_request_attempts"
+        ).fetchone()
+        projected = ProviderRequestCoordinator(migrated).physical_attempt_events(
+            original.sequence_id
+        )
+        migrated_lease = migrated._connection.execute(
+            "SELECT request_key, upstream_service_id, owner_id, priority, "
+            "acquired_at, expires_at, capacity_scope FROM request_leases"
+        ).fetchone()
+        migrated_cooldown = migrated._connection.execute(
+            "SELECT upstream_service_id, cooldown_scope, cooldown_until, reason, "
+            "retry_after_seconds, updated_at FROM request_cooldowns"
+        ).fetchone()
+
+    assert physical_calls == 1
+    assert retained_lease.disposition is LeaseDisposition.ACQUIRED
+    assert migrated_attempt[:-1] == legacy_attempt
+    assert migrated_attempt[-1] is None
+    assert migrated_lease[:-1] == legacy_lease
+    assert migrated_lease[-1] is None
+    assert migrated_cooldown == legacy_cooldown
+    assert projected[0].capacity_scope == "all"
+
+
 def _downgrade_attempt_event_identity_schema(database_path) -> None:
     """Convert a test database from schema v8 to the exact v7 attempt shape."""
 
     with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN terminal_outcome_kind"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN capacity_scope"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_sequences DROP COLUMN failure_outcome_kind"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_sequences DROP COLUMN capacity_scope"
+        )
+        connection.execute("ALTER TABLE request_leases DROP COLUMN capacity_scope")
         connection.execute("DROP INDEX provider_request_attempts_by_event_id")
         connection.execute(
             "ALTER TABLE provider_request_attempts DROP COLUMN terminal_outcome"
@@ -49,7 +454,27 @@ def _downgrade_attempt_event_identity_schema(database_path) -> None:
         connection.execute(
             "ALTER TABLE provider_request_attempts DROP COLUMN attempt_event_id"
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 8")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 8")
+
+
+def _downgrade_endpoint_scope_schema(database_path) -> None:
+    """Convert a test database from schema v9 to the exact v8 coordinator shape."""
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN terminal_outcome_kind"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_attempts DROP COLUMN capacity_scope"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_sequences DROP COLUMN failure_outcome_kind"
+        )
+        connection.execute(
+            "ALTER TABLE provider_request_sequences DROP COLUMN capacity_scope"
+        )
+        connection.execute("ALTER TABLE request_leases DROP COLUMN capacity_scope")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
 
 
 def _multiprocess_retry_caller(
@@ -1285,7 +1710,7 @@ def test_attempt_audit_migration_preserves_existing_coordinator_state(tmp_path) 
             cooldown_scope="market-snapshot",
         )
 
-    assert migrated_version == (8,)
+    assert migrated_version == (9,)
     assert preserved_ceiling == original_ceiling
     assert blocked.disposition is LeaseDisposition.COOLDOWN
     assert blocked.cooldown_until == now + timedelta(seconds=60)
@@ -1378,7 +1803,7 @@ def test_direct_attempt_migration_preserves_typed_rows_and_diagnostic_history(
         )
 
     assert transport_calls == 1
-    assert migrated_version == (8,)
+    assert migrated_version == (9,)
     assert migrated_attempt == original_attempt
     assert stored_event_identity == (None,)
     assert migrated_diagnostics == original_diagnostics
@@ -1423,6 +1848,57 @@ def test_direct_attempt_identity_migration_is_failure_atomic(
 
 
 @pytest.mark.unit
+def test_endpoint_scope_migration_is_failure_atomic(tmp_path, monkeypatch) -> None:
+    import tradingagents.market_history.store as store_module
+
+    config = _config(tmp_path)
+    with MarketHistoryStore.open(config):
+        pass
+    _downgrade_endpoint_scope_schema(config.database_path)
+    original_migration = store_module.MIGRATION_V9
+    monkeypatch.setattr(
+        store_module,
+        "MIGRATION_V9",
+        (
+            original_migration[0],
+            "INVALID ENDPOINT SCOPE MIGRATION",
+            *original_migration[2:],
+        ),
+    )
+
+    with pytest.raises(sqlite3.DatabaseError):
+        MarketHistoryStore.open(config)
+
+    with sqlite3.connect(config.database_path) as connection:
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        lease_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(request_leases)")
+        }
+        sequence_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(provider_request_sequences)"
+            )
+        }
+        attempt_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(provider_request_attempts)"
+            )
+        }
+
+    assert version == (8,)
+    assert "capacity_scope" not in lease_columns
+    assert "capacity_scope" not in sequence_columns
+    assert "failure_outcome_kind" not in sequence_columns
+    assert "capacity_scope" not in attempt_columns
+    assert "terminal_outcome_kind" not in attempt_columns
+
+
+@pytest.mark.unit
 def test_direct_attempt_open_repairs_an_additive_v8_shape_without_provider_io(
     tmp_path,
 ) -> None:
@@ -1448,7 +1924,7 @@ def test_direct_attempt_open_repairs_an_additive_v8_shape_without_provider_io(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone()
 
-    assert version_before == version_after == (8,)
+    assert version_before == version_after == (9,)
     assert "attempt_event_id" in columns_after
     assert "terminal_outcome" in columns_after
 

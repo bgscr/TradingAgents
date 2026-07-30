@@ -629,6 +629,7 @@ def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
     assert "**Request identity:** `SOL-USD:history`" in report
     assert "**Sequence identity:** `yahoo-sequence-1`" in report
     assert "`yahoo-finance` (Yahoo Finance)" in report
+    assert "**Capacity scope:** `all`" in report
     assert "**Attempted at:** 2026-07-18T00:01:00+00:00" in report
     assert "**Pacing/permit event:** permit_acquired" in report
     assert "**Typed outcome:** disconnect" in report
@@ -674,6 +675,7 @@ def test_report_and_audit_counts_derive_only_from_typed_attempt_events(tmp_path)
                     physical_request=lambda index=index: (
                         transport_calls.append(index) or f"frame-{index}"
                     ),
+                    cooldown_scope=f"endpoint-{index}",
                 )
                 market_snapshot.record_active_physical_attempt_events(
                     result.attempt_events
@@ -708,6 +710,10 @@ def test_report_and_audit_counts_derive_only_from_typed_attempt_events(tmp_path)
     assert report.count("### Physical attempt") == 3
     assert "**Total physical-attempt count:** 3" in report
     assert all(event_id in report for event_id in direct_event_ids)
+    assert all(
+        f"**Capacity scope:** `endpoint-{index}`" in report
+        for index in range(1, 4)
+    )
 
 
 @pytest.mark.unit

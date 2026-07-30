@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 _PHYSICAL_ATTEMPT_ERROR_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_CAPACITY_SCOPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_SECRET_IDENTITY_MARKERS = (
+    "api-key",
+    "api_key",
+    "apikey",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER: ContextVar[Callable[[], None] | None] = (
@@ -44,6 +54,7 @@ def record_active_physical_attempt_io() -> None:
 _UPSTREAM_SERVICES = {
     "akshare": ("eastmoney-push2his", "Eastmoney push2his"),
     "baostock": ("baostock-tcp", "BaoStock TCP service"),
+    "tushare": ("tushare-pro", "Tushare Pro account"),
     "yfinance": ("yahoo-finance", "Yahoo Finance"),
 }
 
@@ -52,6 +63,27 @@ def _as_utc(value: datetime, *, label: str) -> datetime:
     if value.tzinfo is None:
         raise ValueError(f"{label} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def _validate_capacity_scope(value: str) -> str:
+    if not isinstance(value, str) or _CAPACITY_SCOPE.fullmatch(value) is None:
+        raise ValueError("capacity scope must be a bounded capacity-scope token")
+    return value
+
+
+def _validate_account_scope(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("upstream account scope must be text")
+    if value and (
+        _PHYSICAL_ATTEMPT_ERROR_CODE.fullmatch(value) is None
+        or any(marker in value.casefold() for marker in _SECRET_IDENTITY_MARKERS)
+    ):
+        raise ValueError("upstream account scope must be an abstract identity token")
+    return value
+
+
+def _contains_secret_marker(value: str) -> bool:
+    return any(marker in value.casefold() for marker in _SECRET_IDENTITY_MARKERS)
 
 
 def _physical_attempt_event_id(sequence_id: str, attempt_index: int) -> str:
@@ -63,13 +95,21 @@ def _physical_attempt_event_id(sequence_id: str, attempt_index: int) -> str:
     return f"provider-physical-attempt=sha256:{digest.hexdigest()}"
 
 
-def upstream_service_identity_for_provider(provider: str) -> tuple[str, str]:
+def upstream_service_identity_for_provider(
+    provider: str,
+    *,
+    account_scope: str = "",
+) -> tuple[str, str]:
     service_key, service_name = _UPSTREAM_SERVICES.get(
         provider,
         (f"provider-{provider}", provider),
     )
     digest = sha256()
-    for component in (service_key,):
+    account_scope = _validate_account_scope(account_scope)
+    identity_components = (
+        (service_key, account_scope) if account_scope else (service_key,)
+    )
+    for component in identity_components:
         encoded = component.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -90,11 +130,17 @@ class PhysicalAttemptOutcome(str, Enum):
     TIMEOUT = "timeout"
     DISCONNECT = "disconnect"
     EMPTY_FRAME = "empty_frame"
+    PERMISSION_DENIED = "permission_denied"
     AUTHENTICATION = "authentication"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_ERROR = "provider_error"
     UPSTREAM_BUSY = "upstream_busy"
     ABANDONED = "abandoned"
+
+
+class RateLimitScope(str, Enum):
+    CAPACITY = "capacity"
+    UPSTREAM = "upstream"
 
 
 class PhysicalAttemptFailure(Exception):
@@ -108,6 +154,7 @@ class PhysicalAttemptFailure(Exception):
         status_code: int | None = None,
         error_code: str | None = None,
         retry_after_seconds: float | None = None,
+        rate_limit_scope: RateLimitScope = RateLimitScope.CAPACITY,
     ) -> None:
         if not isinstance(outcome, PhysicalAttemptOutcome):
             raise TypeError("physical-attempt outcome must be typed")
@@ -124,8 +171,16 @@ class PhysicalAttemptFailure(Exception):
         if error_code is not None and (
             not isinstance(error_code, str)
             or _PHYSICAL_ATTEMPT_ERROR_CODE.fullmatch(error_code) is None
+            or _contains_secret_marker(error_code)
         ):
             raise ValueError("physical-attempt error code must be a bounded code token")
+        if not isinstance(rate_limit_scope, RateLimitScope):
+            raise TypeError("rate-limit scope must be typed")
+        if (
+            outcome is not PhysicalAttemptOutcome.RATE_LIMITED
+            and rate_limit_scope is not RateLimitScope.CAPACITY
+        ):
+            raise ValueError("upstream rate-limit scope requires a rate-limit outcome")
         if retry_after_seconds is not None:
             if (
                 isinstance(retry_after_seconds, bool)
@@ -140,6 +195,7 @@ class PhysicalAttemptFailure(Exception):
         self.status_code = status_code
         self.error_code = error_code
         self.retry_after_seconds = retry_after_seconds
+        self.rate_limit_scope = rate_limit_scope
         super().__init__(outcome.value)
 
 
@@ -150,6 +206,7 @@ class ProviderPhysicalAttemptEvent:
     request_key: str
     upstream_service_id: str
     upstream_service_name: str
+    capacity_scope: str
     attempt_index: int
     attempted_at: datetime
     pacing_event: str
@@ -213,6 +270,7 @@ class RequestLease:
     upstream_service_id: str
     owner_id: str
     priority: RequestPriority
+    capacity_scope: str
     acquired_at: datetime
     expires_at: datetime
 
@@ -270,6 +328,7 @@ class ProviderRequestCoordinator:
     ) -> None:
         if not upstream_service_id.strip() or not service_name.strip():
             raise ValueError("upstream service identity and name must not be blank")
+        account_scope = _validate_account_scope(account_scope)
         self._store._connection.execute(
             "INSERT OR IGNORE INTO upstream_services "
             "(upstream_service_id, service_name, account_scope, created_at) "
@@ -281,6 +340,13 @@ class ProviderRequestCoordinator:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        persisted = self._store._connection.execute(
+            "SELECT account_scope FROM upstream_services "
+            "WHERE upstream_service_id = ?",
+            (upstream_service_id,),
+        ).fetchone()
+        if persisted is None or str(persisted[0]) != account_scope:
+            raise ValueError("upstream service account scope mismatch")
 
     def configure_operator_ceiling(
         self,
@@ -452,6 +518,7 @@ class ProviderRequestCoordinator:
         now = _as_utc(now, label="coordinator time")
         if lease_duration <= timedelta(0):
             raise ValueError("lease duration must be positive")
+        cooldown_scope = _validate_capacity_scope(cooldown_scope)
         expires_at = now + lease_duration
         connection = self._store._connection
         connection.execute("BEGIN IMMEDIATE")
@@ -561,6 +628,7 @@ class ProviderRequestCoordinator:
                 upstream_service_id=upstream_service_id,
                 owner_id=owner_id,
                 priority=priority,
+                capacity_scope=cooldown_scope,
                 acquired_at=now,
                 expires_at=expires_at,
             )
@@ -570,8 +638,8 @@ class ProviderRequestCoordinator:
             )
             connection.execute(
                 "INSERT INTO request_leases "
-                "(request_key, upstream_service_id, owner_id, priority, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(request_key, upstream_service_id, owner_id, priority, acquired_at, "
+                "expires_at, capacity_scope) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     lease.request_key,
                     lease.upstream_service_id,
@@ -579,6 +647,7 @@ class ProviderRequestCoordinator:
                     int(lease.priority),
                     lease.acquired_at.isoformat(),
                     lease.expires_at.isoformat(),
+                    lease.capacity_scope,
                 ),
             )
             connection.commit()
@@ -628,8 +697,13 @@ class ProviderRequestCoordinator:
         )
         if retry_after <= timedelta(0):
             raise ValueError("rate-limit cooldown must be positive")
-        if not cooldown_scope.strip() or not provider_code.strip():
-            raise ValueError("cooldown scope and provider code must not be blank")
+        cooldown_scope = _validate_capacity_scope(cooldown_scope)
+        if (
+            not isinstance(provider_code, str)
+            or _PHYSICAL_ATTEMPT_ERROR_CODE.fullmatch(provider_code) is None
+            or _contains_secret_marker(provider_code)
+        ):
+            raise ValueError("provider code must be a bounded provider-code token")
         candidate_until = observed_at + retry_after
         retry_after_seconds = retry_after.total_seconds()
         self._store._connection.execute(
@@ -1052,7 +1126,12 @@ class ProviderRequestCoordinator:
                         ):
                             cooldown = self.record_rate_limit(
                                 upstream_service_id=upstream_service_id,
-                                cooldown_scope=cooldown_scope,
+                                cooldown_scope=(
+                                    "all"
+                                    if failure.rate_limit_scope
+                                    is RateLimitScope.UPSTREAM
+                                    else cooldown_scope
+                                ),
                                 observed_at=attempted_at,
                                 retry_after=timedelta(
                                     seconds=failure.retry_after_seconds
@@ -1261,13 +1340,14 @@ class ProviderRequestCoordinator:
         self._store._connection.execute(
             "INSERT INTO provider_request_sequences "
             "(sequence_id, request_key, upstream_service_id, owner_id, started_at, "
-            "status) VALUES (?, ?, ?, ?, ?, 'running')",
+            "status, capacity_scope) VALUES (?, ?, ?, ?, ?, 'running', ?)",
             (
                 sequence_id,
                 lease.request_key,
                 lease.upstream_service_id,
                 lease.owner_id,
                 lease.acquired_at.isoformat(),
+                lease.capacity_scope,
             ),
         )
 
@@ -1304,19 +1384,25 @@ class ProviderRequestCoordinator:
     ) -> None:
         persisted_outcome = (
             PhysicalAttemptOutcome.PROVIDER_ERROR
-            if failure.outcome is PhysicalAttemptOutcome.ABANDONED
+            if failure.outcome
+            in {
+                PhysicalAttemptOutcome.ABANDONED,
+                PhysicalAttemptOutcome.PERMISSION_DENIED,
+            }
             else failure.outcome
         )
         cursor = self._store._connection.execute(
             "UPDATE provider_request_sequences SET status = 'failed', "
             "completed_at = ?, final_physical_attempt_count = ?, "
-            "failure_outcome = ?, failure_retryable = ?, failure_status_code = ?, "
+            "failure_outcome = ?, failure_outcome_kind = ?, failure_retryable = ?, "
+            "failure_status_code = ?, "
             "failure_error_code = ?, failure_retry_after_seconds = ? "
             "WHERE sequence_id = ? AND status = 'running'",
             (
                 completed_at.isoformat(),
                 final_count,
                 persisted_outcome.value,
+                failure.outcome.value,
                 int(failure.retryable),
                 failure.status_code,
                 failure.error_code,
@@ -1339,7 +1425,8 @@ class ProviderRequestCoordinator:
         while True:
             row = self._store._connection.execute(
                 "SELECT sequence_id, status, final_physical_attempt_count, "
-                "result_payload, result_sha256, failure_outcome, "
+                "result_payload, result_sha256, "
+                "COALESCE(failure_outcome_kind, failure_outcome), "
                 "failure_retryable, failure_status_code, failure_error_code, "
                 "failure_retry_after_seconds FROM provider_request_sequences "
                 "WHERE request_key = ? AND upstream_service_id = ? AND owner_id = ? "
@@ -1448,7 +1535,7 @@ class ProviderRequestCoordinator:
         final_count = int(count_row[0]) if count_row is not None else 0
         self._store._connection.execute(
             "UPDATE provider_request_attempts SET outcome = 'provider_error', "
-            "terminal_outcome = 'abandoned', "
+            "terminal_outcome = 'abandoned', terminal_outcome_kind = 'abandoned', "
             "retryable = 0, error_code = ? "
             "WHERE sequence_id = ? AND outcome = 'started'",
             (error_code, sequence_id),
@@ -1457,7 +1544,8 @@ class ProviderRequestCoordinator:
         self._store._connection.execute(
             "UPDATE provider_request_sequences SET status = 'failed', "
             "completed_at = ?, final_physical_attempt_count = ?, "
-            "failure_outcome = 'provider_error', failure_retryable = 0, "
+            "failure_outcome = 'provider_error', failure_outcome_kind = 'abandoned', "
+            "failure_retryable = 0, "
             "failure_error_code = ? WHERE sequence_id = ? AND status = 'running'",
             (completed_at.isoformat(), final_count, error_code, sequence_id),
         )
@@ -1496,8 +1584,8 @@ class ProviderRequestCoordinator:
             "INSERT INTO provider_request_attempts "
             "(attempt_event_id, sequence_id, attempt_index, request_key, upstream_service_id, "
             "upstream_service_name, owner_id, priority, operation, attempted_at, "
-            "pacing_event, pacing_wait_seconds, outcome) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started')",
+            "pacing_event, pacing_wait_seconds, outcome, capacity_scope) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)",
             (
                 attempt_event_id,
                 sequence_id,
@@ -1511,6 +1599,7 @@ class ProviderRequestCoordinator:
                 attempted_at.isoformat(),
                 pacing_event,
                 pacing_wait_seconds,
+                lease.capacity_scope,
             ),
         )
         return attempt_event_id
@@ -1529,16 +1618,22 @@ class ProviderRequestCoordinator:
         )
         legacy_outcome = (
             PhysicalAttemptOutcome.PROVIDER_ERROR
-            if outcome is PhysicalAttemptOutcome.ABANDONED
+            if outcome
+            in {
+                PhysicalAttemptOutcome.ABANDONED,
+                PhysicalAttemptOutcome.PERMISSION_DENIED,
+            }
             else outcome
         )
         cursor = self._store._connection.execute(
             "UPDATE provider_request_attempts SET outcome = ?, terminal_outcome = ?, "
+            "terminal_outcome_kind = ?, "
             "retryable = ?, "
             "status_code = ?, error_code = ?, retry_after_seconds = ?, "
             "cooldown_changed = ?, cooldown_until = ? "
             "WHERE sequence_id = ? AND attempt_index = ? AND outcome = 'started'",
             (
+                legacy_outcome.value,
                 legacy_outcome.value,
                 outcome.value,
                 int(failure.retryable) if failure is not None else 0,
@@ -1569,9 +1664,10 @@ class ProviderRequestCoordinator:
     ) -> tuple[ProviderPhysicalAttemptEvent, ...]:
         rows = self._store._connection.execute(
             "SELECT attempt_event_id, request_key, upstream_service_id, "
-            "upstream_service_name, "
+            "upstream_service_name, COALESCE(capacity_scope, 'all'), "
             "attempt_index, attempted_at, pacing_event, pacing_wait_seconds, "
-            "COALESCE(terminal_outcome, outcome), retryable, status_code, error_code, "
+            "COALESCE(terminal_outcome_kind, terminal_outcome, outcome), "
+            "retryable, status_code, error_code, "
             "retry_after_seconds, "
             "cooldown_changed, cooldown_until, final_physical_attempt_count "
             "FROM provider_request_attempts WHERE sequence_id = ? "
@@ -1583,31 +1679,32 @@ class ProviderRequestCoordinator:
                 attempt_event_id=(
                     str(row[0])
                     if row[0] is not None
-                    else _physical_attempt_event_id(sequence_id, int(row[4]))
+                    else _physical_attempt_event_id(sequence_id, int(row[5]))
                 ),
                 sequence_id=sequence_id,
                 request_key=str(row[1]),
                 upstream_service_id=str(row[2]),
                 upstream_service_name=str(row[3]),
-                attempt_index=int(row[4]),
-                attempted_at=datetime.fromisoformat(str(row[5])),
-                pacing_event=str(row[6]),
-                pacing_wait_seconds=float(row[7]),
-                outcome=PhysicalAttemptOutcome(str(row[8])),
-                retryable=bool(row[9]),
-                status_code=int(row[10]) if row[10] is not None else None,
-                error_code=str(row[11]) if row[11] is not None else None,
+                capacity_scope=str(row[4]),
+                attempt_index=int(row[5]),
+                attempted_at=datetime.fromisoformat(str(row[6])),
+                pacing_event=str(row[7]),
+                pacing_wait_seconds=float(row[8]),
+                outcome=PhysicalAttemptOutcome(str(row[9])),
+                retryable=bool(row[10]),
+                status_code=int(row[11]) if row[11] is not None else None,
+                error_code=str(row[12]) if row[12] is not None else None,
                 retry_after_seconds=(
-                    float(row[12]) if row[12] is not None else None
+                    float(row[13]) if row[13] is not None else None
                 ),
-                cooldown_changed=bool(row[13]),
+                cooldown_changed=bool(row[14]),
                 cooldown_until=(
-                    datetime.fromisoformat(str(row[14]))
-                    if row[14] is not None
+                    datetime.fromisoformat(str(row[15]))
+                    if row[15] is not None
                     else None
                 ),
                 final_physical_attempt_count=(
-                    int(row[15]) if row[15] is not None else None
+                    int(row[16]) if row[16] is not None else None
                 ),
             )
             for row in rows
@@ -1673,6 +1770,7 @@ class ProviderRequestCoordinator:
             upstream_service_id=lease.upstream_service_id,
             owner_id=lease.owner_id,
             priority=lease.priority,
+            capacity_scope=lease.capacity_scope,
             acquired_at=lease.acquired_at,
             expires_at=expires_at,
         )
