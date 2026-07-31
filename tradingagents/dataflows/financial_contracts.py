@@ -23,8 +23,14 @@ FINANCIAL_PROVIDER_ARTIFACT_IDENTITY_VERSION = "financial-provider-artifact:v1"
 FINANCIAL_PERIOD_IDENTITY_VERSION = "financial-period:v1"
 FINANCIAL_RATIO_DECLARATION_V1 = "financial-ratio-declarations-v1"
 FINANCIAL_RATIO_DECLARATION_V2 = "financial-ratio-declarations-v2"
+FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1 = (
+    "financial-ratio-declarations-baostock-v1"
+)
 FINANCIAL_PERIOD_SELECTION_V1 = "financial-period-selection-v1"
 FINANCIAL_PERIOD_SELECTION_V2 = "financial-period-selection-v2"
+FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1 = (
+    "financial-period-selection-baostock-v1"
+)
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
@@ -646,6 +652,7 @@ class FinancialRatioFieldSetDeclaration(BaseModel):
     declaration_version: Literal[
         "financial-ratio-declarations-v1",
         "financial-ratio-declarations-v2",
+        "financial-ratio-declarations-baostock-v1",
     ] = FINANCIAL_RATIO_DECLARATION_V1
     company_type: FinancialCompanyType
     ratio_family: FinancialRatioFamily
@@ -772,6 +779,58 @@ _QUALIFIED_BANK_RATIO_FAMILY_FIELDS = {
     ),
 }
 
+_BAOSTOCK_RATIO_FAMILY_FIELDS = {
+    FinancialRatioFamily.PROFIT: (
+        "gross_margin",
+        "net_margin",
+        "return_on_equity",
+    ),
+    FinancialRatioFamily.OPERATION: (
+        "asset_turnover",
+        "current_asset_turnover",
+        "inventory_turnover",
+        "receivables_turnover",
+    ),
+    FinancialRatioFamily.GROWTH: (
+        "asset_growth",
+        "basic_earnings_per_share_growth",
+        "equity_growth",
+        "net_income_growth",
+        "parent_net_income_growth",
+    ),
+    FinancialRatioFamily.BALANCE: (
+        "cash_ratio",
+        "current_ratio",
+        "debt_to_assets",
+        "equity_multiplier",
+        "liability_growth",
+        "quick_ratio",
+    ),
+    FinancialRatioFamily.CASH_FLOW: (
+        "cash_flow_to_gross_revenue",
+        "cash_flow_to_revenue",
+        "current_assets_to_assets",
+        "interest_coverage",
+        "non_current_assets_to_assets",
+        "quality_of_income",
+        "tangible_asset_ratio",
+    ),
+    FinancialRatioFamily.DUPONT: (
+        "asset_turnover_component",
+        "ebit_margin_component",
+        "equity_multiplier_component",
+        "interest_burden",
+        "net_profit_margin_component",
+        "parent_net_income_share",
+        "return_on_equity_component",
+        "tax_burden",
+    ),
+}
+
+_BAOSTOCK_BANK_RATIO_FAMILY_FIELDS = {
+    **_BAOSTOCK_RATIO_FAMILY_FIELDS,
+}
+
 
 def financial_ratio_field_declaration(
     company_type: FinancialCompanyType,
@@ -780,6 +839,7 @@ def financial_ratio_field_declaration(
     declaration_version: Literal[
         "financial-ratio-declarations-v1",
         "financial-ratio-declarations-v2",
+        "financial-ratio-declarations-baostock-v1",
     ] = FINANCIAL_RATIO_DECLARATION_V1,
 ) -> FinancialRatioFieldSetDeclaration:
     if declaration_version == FINANCIAL_RATIO_DECLARATION_V1:
@@ -789,6 +849,13 @@ def financial_ratio_field_declaration(
             _QUALIFIED_BANK_RATIO_FAMILY_FIELDS
             if company_type is FinancialCompanyType.BANK
             else _QUALIFIED_RATIO_FAMILY_FIELDS
+        )
+        normalized_fields = declarations[ratio_family]
+    elif declaration_version == FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1:
+        declarations = (
+            _BAOSTOCK_BANK_RATIO_FAMILY_FIELDS
+            if company_type is FinancialCompanyType.BANK
+            else _BAOSTOCK_RATIO_FAMILY_FIELDS
         )
         normalized_fields = declarations[ratio_family]
     else:
@@ -1247,6 +1314,7 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
     contract_version: Literal[
         "financial-period-selection-v1",
         "financial-period-selection-v2",
+        "financial-period-selection-baostock-v1",
     ] = FINANCIAL_PERIOD_SELECTION_V1
     candidate_identity: str = Field(
         pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
@@ -1340,11 +1408,13 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             and self.ratio_family is not None
         ):
             ratio_assessment = True
-            declaration_version = (
-                FINANCIAL_RATIO_DECLARATION_V2
-                if self.contract_version == FINANCIAL_PERIOD_SELECTION_V2
-                else FINANCIAL_RATIO_DECLARATION_V1
-            )
+            declaration_version = {
+                FINANCIAL_PERIOD_SELECTION_V1: FINANCIAL_RATIO_DECLARATION_V1,
+                FINANCIAL_PERIOD_SELECTION_V2: FINANCIAL_RATIO_DECLARATION_V2,
+                FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1: (
+                    FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1
+                ),
+            }[self.contract_version]
             expected_core = financial_ratio_field_declaration(
                 self.company_type,
                 self.ratio_family,
@@ -1354,7 +1424,11 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             raise ValueError("unsupported assessment cannot declare normalized fields")
 
         if (
-            self.contract_version == FINANCIAL_PERIOD_SELECTION_V2
+            self.contract_version
+            in {
+                FINANCIAL_PERIOD_SELECTION_V2,
+                FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1,
+            }
             and not ratio_contract
         ):
             raise ValueError("financial period selection v2 requires a ratio assessment")
@@ -1487,6 +1561,7 @@ def assess_financial_period_candidate(
     ratio_declaration_version: Literal[
         "financial-ratio-declarations-v1",
         "financial-ratio-declarations-v2",
+        "financial-ratio-declarations-baostock-v1",
     ] = FINANCIAL_RATIO_DECLARATION_V1,
 ) -> FinancialPeriodCompletenessAssessment:
     """Apply capability, identity, metadata, and declared completeness gates."""
@@ -1626,14 +1701,13 @@ def assess_financial_period_candidate(
         disposition = FinancialPeriodDisposition.CURRENT_ONLY
     else:
         disposition = FinancialPeriodDisposition.REJECTED
-    assessment_contract_version = (
-        FINANCIAL_PERIOD_SELECTION_V2
-        if (
-            identity.capability is FinancialCapability.RATIO_FAMILY
-            and ratio_declaration_version == FINANCIAL_RATIO_DECLARATION_V2
-        )
-        else FINANCIAL_PERIOD_SELECTION_V1
-    )
+    assessment_contract_version = {
+        FINANCIAL_RATIO_DECLARATION_V1: FINANCIAL_PERIOD_SELECTION_V1,
+        FINANCIAL_RATIO_DECLARATION_V2: FINANCIAL_PERIOD_SELECTION_V2,
+        FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1: (
+            FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1
+        ),
+    }[ratio_declaration_version]
     return FinancialPeriodCompletenessAssessment(
         contract_version=assessment_contract_version,
         candidate_identity=candidate.candidate_identity,
@@ -2967,8 +3041,10 @@ class FinancialAcquisitionManifest(BaseModel):
 __all__ = [
     "FINANCIAL_PERIOD_SELECTION_V1",
     "FINANCIAL_PERIOD_SELECTION_V2",
+    "FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1",
     "FINANCIAL_RATIO_DECLARATION_V1",
     "FINANCIAL_RATIO_DECLARATION_V2",
+    "FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1",
     "FinancialAcquisitionManifest",
     "FinancialAcquisitionOutcome",
     "FinancialCapability",
