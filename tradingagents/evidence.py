@@ -1336,12 +1336,26 @@ def _validated_tool_execution_evidence(
     except ValidationError as ordinary_error:
         from tradingagents.dataflows.financial_dispatch import (
             FinancialToolMessageAuditEnvelope,
+            FinancialToolMessageManifestEnvelope,
         )
 
         try:
             financial = FinancialToolMessageAuditEnvelope.model_validate(raw_envelope)
         except ValidationError:
-            raise ordinary_error from None
+            try:
+                manifest = FinancialToolMessageManifestEnvelope.model_validate(
+                    raw_envelope
+                )
+            except ValidationError:
+                raise ordinary_error from None
+            return _ToolExecutionEvidenceView(
+                tool_call_id=manifest.tool_call_id,
+                tool_name=manifest.tool_name,
+                source_ref=manifest.request_ref,
+                capability=manifest.capability,
+                acquisition_outcomes=(),
+                selected_artifact=manifest.selected_artifact,
+            )
         available = tuple(
             outcome
             for outcome in financial.acquisition_outcomes

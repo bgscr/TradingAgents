@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from typing import Any, Literal
@@ -26,6 +27,10 @@ from requests.exceptions import (
 from tradingagents.asset_configuration import (
     RunAssetConfiguration,
     RunAssetConfigurationProjection,
+)
+from tradingagents.capability_routing import (
+    MainlandCapability,
+    MainlandCapabilityRoutingPlan,
 )
 from tradingagents.dataflows.acquisition import (
     AcquisitionController,
@@ -44,19 +49,43 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialStatementRoutingRequest,
     FinancialStatementRoutingResult,
     MainlandFinancialCapabilityRouter,
+    finalize_indicator_routing_result,
+    finalize_statement_routing_result,
+    financial_indicator_evidence_disposition,
+    financial_statement_evidence_disposition,
     render_indicator_routing_result,
     render_statement_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FinancialAcquisitionManifest,
+    FinancialAcquisitionOutcome,
+    FinancialAggregateCompleteness,
     FinancialCapability,
+    FinancialCompanyType,
+    FinancialCompanyTypeResolutionMethod,
     FinancialConsolidationScope,
+    FinancialCriticalValueConflict,
+    FinancialEvidenceDisposition,
+    FinancialHistoryCompletenessAssessment,
     FinancialPeriodCandidate,
     FinancialPeriodCompletenessAssessment,
+    FinancialPeriodOverlapFinding,
+    FinancialPeriodRejectionReason,
+    FinancialPeriodSelection,
+    FinancialRatioFamily,
+    FinancialRatioHistoryCompletenessAssessment,
+    FinancialRejectedPeriod,
     FinancialReportingFrequency,
+    FinancialSinceListingException,
     FinancialStatementType,
+    assert_safe_financial_contract_payload,
+    assert_safe_financial_projection,
+    assess_financial_history_coverage,
     assess_financial_period_candidate,
+    assess_financial_ratio_history_coverage,
 )
 from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestAttemptEvent,
     ProviderSubrequestCache,
     ProviderSubrequestCacheCheckpoint,
     ProviderSubrequestCacheError,
@@ -64,13 +93,17 @@ from tradingagents.dataflows.provider_subrequests import (
 from tradingagents.evidence import (
     ACQUISITION_TOKEN_PATTERN,
     AcquisitionUnavailableReason,
+    EvidenceState,
     InstrumentIdentityEvidence,
     InstrumentKind,
+    ProviderPhysicalAttemptEvidence,
     SourceAcquisitionAvailable,
     SourceAcquisitionOutcome,
     SourceAcquisitionUnavailable,
     SourceArtifact,
+    SourceFact,
     stable_acquisition_source_ref,
+    stable_source_fact_id,
 )
 from tradingagents.market_history import PhysicalAttemptFailure, PhysicalAttemptOutcome
 
@@ -79,7 +112,9 @@ FINANCIAL_PROVIDER_CHAIN_VERSION = "1.0"
 FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
 FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
 FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION = "1.1"
+FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION = "1.2"
 FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
+FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION = "2.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
@@ -458,19 +493,27 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
             or self.routing_result.conflicted_annual_period_ends
             or self.routing_result.conflicted_reporting_period_ends
         )
+        manifest = self.routing_result.manifest
+        artifact = (
+            _financial_tool_manifest_envelope(
+                dispatch_result=self,
+            ).model_dump(mode="json")
+            if manifest.contract_version == "financial-manifest-v2"
+            else {
+                "contract_version": "financial-statement-selection-dispatch-v1",
+                "request_ref": self.request_key.request_key,
+                "disposition": self.disposition,
+                "manifest_identity": manifest.manifest_identity,
+                "physical_attempt_count": len(
+                    self.routing_result.physical_attempt_ids
+                ),
+            }
+        )
         return ToolMessage(
             content=self.rendered_value,
             tool_call_id=self.tool_call_id,
             name=self.request_key.tool_name,
-            artifact={
-                "contract_version": "financial-statement-selection-dispatch-v1",
-                "request_ref": self.request_key.request_key,
-                "disposition": self.disposition,
-                "manifest_identity": self.routing_result.manifest.manifest_identity,
-                "physical_attempt_count": len(
-                    self.routing_result.physical_attempt_ids
-                ),
-            },
+            artifact=artifact,
             status="error" if insufficient else "success",
         )
 
@@ -513,11 +556,16 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
         return self
 
     def to_tool_message(self) -> ToolMessage:
-        return ToolMessage(
-            content=self.rendered_value,
-            tool_call_id=self.tool_call_id,
-            name=self.request_key.tool_name,
-            artifact={
+        v2 = bool(self.routing_result.family_manifests) and all(
+            manifest.contract_version == "financial-manifest-v2"
+            for manifest in self.routing_result.family_manifests
+        )
+        artifact = (
+            _financial_tool_manifest_envelope(
+                dispatch_result=self,
+            ).model_dump(mode="json")
+            if v2
+            else {
                 "contract_version": "financial-indicator-selection-dispatch-v1",
                 "request_ref": self.request_key.request_key,
                 "disposition": self.disposition,
@@ -528,7 +576,13 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
                 "physical_attempt_count": len(
                     self.routing_result.physical_attempt_ids
                 ),
-            },
+            }
+        )
+        return ToolMessage(
+            content=self.rendered_value,
+            tool_call_id=self.tool_call_id,
+            name=self.request_key.tool_name,
+            artifact=artifact,
             status=(
                 "error"
                 if self.routing_result.missing_periods_by_family
@@ -563,6 +617,11 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
     QUALIFIED_SELECTION_INVALID = (
         "financial_dispatch_checkpoint_qualified_selection_invalid"
     )
+    MANIFEST_INVALID = "financial_dispatch_checkpoint_manifest_invalid"
+    ROUTING_PLAN_MISMATCH = (
+        "financial_dispatch_checkpoint_routing_plan_mismatch"
+    )
+    RUN_SCOPE_MISMATCH = "financial_dispatch_checkpoint_run_scope_mismatch"
 
 
 class FinancialDispatchCheckpointError(ValueError):
@@ -692,7 +751,9 @@ class FinancialDispatchCheckpointLedger(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1"] = FINANCIAL_DISPATCH_LEDGER_VERSION
+    contract_version: Literal["1.0", "1.1", "1.2"] = (
+        FINANCIAL_DISPATCH_LEDGER_VERSION
+    )
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     retry_policy: RetryPolicy
     provider_chain_identities: tuple[
@@ -704,6 +765,15 @@ class FinancialDispatchCheckpointLedger(BaseModel):
     )
     circuit_state: tuple[FinancialCircuitCheckpointState, ...] = ()
     provider_subrequest_cache: ProviderSubrequestCacheCheckpoint | None = None
+    capability_routing_plan_signature: str | None = Field(
+        default=None,
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$",
+    )
+    financial_manifest_version: Literal["financial-manifest-v2"] | None = None
+    run_scope_id: str | None = Field(
+        default=None,
+        pattern=ACQUISITION_TOKEN_PATTERN,
+    )
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
     qualified_statement_selections: tuple[
         FinancialStatementSelectionCheckpointEntry,
@@ -728,16 +798,47 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         ]
         if len(keys) != len(set(keys)):
             raise ValueError("financial checkpoint request key crosses dispatch channels")
-        has_qualified = bool(
-            self.qualified_statement_selections
-            or self.qualified_indicator_selections
+        manifests = tuple(
+            entry.terminal.routing_result.manifest
+            for entry in self.qualified_statement_selections
+        ) + tuple(
+            manifest
+            for entry in self.qualified_indicator_selections
+            for manifest in entry.terminal.routing_result.family_manifests
         )
-        if has_qualified != (
-            self.contract_version == FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
-        ):
+        manifest_versions = {manifest.contract_version for manifest in manifests}
+        if not manifests:
+            expected_version = FINANCIAL_DISPATCH_LEDGER_VERSION
+        elif manifest_versions == {"financial-manifest-v1"}:
+            expected_version = FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+        elif manifest_versions == {"financial-manifest-v2"}:
+            expected_version = FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+        else:
+            raise ValueError("financial checkpoint mixes manifest contract versions")
+        if self.contract_version != expected_version:
             raise ValueError(
                 "financial checkpoint version contradicts qualified selections"
             )
+        has_v2_identity = (
+            self.capability_routing_plan_signature is not None
+            or self.financial_manifest_version is not None
+            or self.run_scope_id is not None
+        )
+        if expected_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+            signatures = {
+                manifest.capability_routing_plan_signature
+                for manifest in manifests
+            }
+            if (
+                self.financial_manifest_version != "financial-manifest-v2"
+                or self.run_scope_id is None
+                or signatures != {self.capability_routing_plan_signature}
+            ):
+                raise ValueError("financial checkpoint v2 identity binding is incomplete")
+        elif has_v2_identity:
+            raise ValueError("legacy financial checkpoint carries v2 identity fields")
+        if expected_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+            assert_safe_financial_contract_payload(self.model_dump(mode="json"))
         return self
 
 
@@ -774,7 +875,7 @@ class FinancialDispatchAuditRequest(BaseModel):
     outcomes: tuple[FinancialDispatchAuditOutcome, ...] = Field(min_length=1)
 
 
-class FinancialDispatchAuditProjection(BaseModel):
+class FinancialDispatchAuditProjectionV1(BaseModel):
     """Safe immutable-audit projection of the run-scoped dispatch ledger."""
 
     model_config = _CLOSED_MODEL_CONFIG
@@ -786,7 +887,7 @@ class FinancialDispatchAuditProjection(BaseModel):
     requests: tuple[FinancialDispatchAuditRequest, ...] = ()
 
     @model_validator(mode="after")
-    def _validate_totals(self) -> FinancialDispatchAuditProjection:
+    def _validate_totals(self) -> FinancialDispatchAuditProjectionV1:
         if self.request_count != len(self.requests):
             raise ValueError("financial dispatch audit request count is inconsistent")
         if self.acquisition_attempt_count != sum(
@@ -798,6 +899,368 @@ class FinancialDispatchAuditProjection(BaseModel):
         ):
             raise ValueError("financial dispatch audit duplicate count is inconsistent")
         return self
+
+
+class FinancialCompletenessAuditRow(BaseModel):
+    """Payload-free deterministic completeness row for one normalized candidate."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-completeness-row-v2"] = (
+        "financial-completeness-row-v2"
+    )
+    manifest_identity: str = Field(
+        pattern=r"^financial-manifest:v2:[0-9a-f]{64}$"
+    )
+    capability: FinancialCapability
+    statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    period: date
+    frequency: FinancialReportingFrequency
+    provider: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    company_type: FinancialCompanyType
+    company_type_resolution_method: FinancialCompanyTypeResolutionMethod | None
+    company_type_provenance: tuple[str, ...] = ()
+    provider_declared_type: FinancialCompanyType | None = None
+    provider_declaration_qualified: bool
+    metadata_coverage: Decimal = Field(ge=0, le=1)
+    ann_date: date | None = None
+    f_ann_date: date | None = None
+    report_type: str | None = Field(default=None, max_length=64)
+    provider_comp_type: str | None = Field(default=None, max_length=64)
+    update_flag: str | None = Field(default=None, max_length=64)
+    revision_observed_at: datetime | None = None
+    local_provider_revision_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$",
+    )
+    provider_filing_revision_id: str | None = Field(
+        default=None,
+        pattern=ACQUISITION_TOKEN_PATTERN,
+    )
+    critical_coverage: Decimal = Field(ge=0, le=1)
+    critical_threshold: Decimal = Field(ge=0, le=1)
+    core_coverage: Decimal = Field(ge=0, le=1)
+    core_threshold: Decimal = Field(ge=0, le=1)
+    disposition: Literal[
+        "selected",
+        "current_only",
+        "unselected",
+        "rejected",
+        "conflicted",
+    ]
+    typed_reason: tuple[str, ...] = ()
+    pit_eligible: bool
+    artifact_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    provider_attempt_count: int = Field(ge=0)
+    since_listing_exception: bool = False
+    listing_date: date | None = None
+    listing_provider: str | None = Field(
+        default=None,
+        pattern=ACQUISITION_TOKEN_PATTERN,
+    )
+    listing_source_ref: str | None = Field(
+        default=None,
+        pattern=ACQUISITION_TOKEN_PATTERN,
+    )
+
+    @model_validator(mode="after")
+    def _validate_listing_binding(self) -> FinancialCompletenessAuditRow:
+        listing_values = (
+            self.listing_date,
+            self.listing_provider,
+            self.listing_source_ref,
+        )
+        if self.since_listing_exception != all(
+            item is not None for item in listing_values
+        ):
+            raise ValueError("financial completeness listing provenance is incomplete")
+        revision_values = (
+            self.revision_observed_at,
+            self.local_provider_revision_identity,
+        )
+        if (
+            self.artifact_identity is None
+            and any(item is not None for item in revision_values)
+        ) or (
+            self.artifact_identity is not None
+            and any(item is None for item in revision_values)
+        ):
+            raise ValueError("financial completeness revision lineage is incomplete")
+        if (
+            self.local_provider_revision_identity is not None
+            and self.local_provider_revision_identity != self.artifact_identity
+        ):
+            raise ValueError("financial completeness revision identity is contradictory")
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialAggregateCompletenessProjection(BaseModel):
+    """Exact completeness reference without authoritative identity provenance."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-aggregate-completeness-v2"] = (
+        "financial-aggregate-completeness-v2"
+    )
+    source_contract_version: Literal["financial-period-selection-v1"] = (
+        "financial-period-selection-v1"
+    )
+    assessment_ref: str = Field(
+        pattern=r"^financial-completeness-assessment=sha256:[0-9a-f]{64}$"
+    )
+    capability: FinancialCapability
+    statement_type: FinancialStatementType | None = None
+    ratio_family: FinancialRatioFamily | None = None
+    company_type: FinancialCompanyType
+    consolidation_scope: FinancialConsolidationScope
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    target_annual_period_ends: tuple[date, ...] = ()
+    target_reporting_period_ends: tuple[date, ...]
+    covered_annual_period_ends: tuple[date, ...] = ()
+    covered_reporting_period_ends: tuple[date, ...]
+    missing_annual_period_ends: tuple[date, ...] = ()
+    missing_reporting_period_ends: tuple[date, ...]
+    since_listing_exception: FinancialSinceListingException | None = None
+    rejection_reasons: tuple[FinancialPeriodRejectionReason, ...]
+    complete: bool
+
+    @model_validator(mode="after")
+    def _validate_capability_shape(
+        self,
+    ) -> FinancialAggregateCompletenessProjection:
+        if self.capability is FinancialCapability.STATEMENT:
+            if self.statement_type is None or self.ratio_family is not None:
+                raise ValueError(
+                    "statement completeness projection has contradictory family"
+                )
+        elif (
+            self.statement_type is not None
+            or self.ratio_family is None
+            or self.target_annual_period_ends
+            or self.covered_annual_period_ends
+            or self.missing_annual_period_ends
+            or self.since_listing_exception is not None
+        ):
+            raise ValueError("ratio completeness projection has contradictory family")
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialManifestAuditProjection(BaseModel):
+    """Identity-only manifest projection; normalized provider values stay excluded."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-manifest-audit-v2"] = (
+        "financial-manifest-audit-v2"
+    )
+    manifest_identity: str = Field(
+        pattern=r"^financial-manifest:v2:[0-9a-f]{64}$"
+    )
+    capability_routing_plan_signature: str = Field(
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
+    )
+    financial_manifest_version: Literal["financial-manifest-v2"] = (
+        "financial-manifest-v2"
+    )
+    capability: FinancialCapability
+    statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    disposition: FinancialEvidenceDisposition
+    final_rendered_artifact_identity: str = Field(
+        pattern=r"^financial-rendered-artifact:v1:[0-9a-f]{64}$"
+    )
+    artifact_identities: tuple[str, ...]
+    acquisition_outcomes: tuple[FinancialAcquisitionOutcome, ...]
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...]
+    candidate_identities: tuple[str, ...]
+    selections: tuple[FinancialPeriodSelection, ...]
+    rejected_periods: tuple[FinancialRejectedPeriod, ...]
+    overlaps: tuple[FinancialPeriodOverlapFinding, ...]
+    conflicts: tuple[FinancialCriticalValueConflict, ...]
+    aggregate_completeness: FinancialAggregateCompletenessProjection
+
+    @model_validator(mode="after")
+    def _validate_safe_projection(self) -> FinancialManifestAuditProjection:
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialManifestAuditRequest(BaseModel):
+    """One logical qualified request with distinct physical-attempt accounting."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-manifest-request-audit-v2"] = (
+        "financial-manifest-request-audit-v2"
+    )
+    request_ref: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    statement_type: FinancialStatementType
+    frequency: FinancialReportingFrequency
+    as_of_date: date
+    logical_provider_count: int = Field(ge=0)
+    logical_candidate_count: int = Field(ge=0)
+    physical_request_count: int = Field(ge=0)
+    duplicate_suppressed_count: int = Field(ge=0)
+    manifests: tuple[FinancialManifestAuditProjection, ...] = Field(min_length=1)
+
+
+class FinancialDispatchAuditProjectionV2(BaseModel):
+    """Ticket 11 audit projection for v2 financial manifests."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["2.0"] = FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION
+    capability_routing_plan_signature: str = Field(
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
+    )
+    financial_manifest_version: Literal["financial-manifest-v2"] = (
+        "financial-manifest-v2"
+    )
+    request_count: int = Field(ge=0)
+    logical_provider_count: int = Field(ge=0)
+    logical_candidate_count: int = Field(ge=0)
+    acquisition_attempt_count: int = Field(ge=0)
+    duplicate_suppressed_count: int = Field(ge=0)
+    requests: tuple[FinancialDispatchAuditRequest, ...] = ()
+    manifest_requests: tuple[FinancialManifestAuditRequest, ...] = ()
+    completeness_rows: tuple[FinancialCompletenessAuditRow, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_totals(self) -> FinancialDispatchAuditProjectionV2:
+        if self.request_count != len(self.requests) + len(self.manifest_requests):
+            raise ValueError("financial manifest audit request count is inconsistent")
+        if self.logical_provider_count != sum(
+            item.logical_provider_count for item in self.manifest_requests
+        ):
+            raise ValueError("financial manifest logical provider count is inconsistent")
+        if self.logical_candidate_count != sum(
+            item.logical_candidate_count for item in self.manifest_requests
+        ):
+            raise ValueError("financial manifest logical candidate count is inconsistent")
+        if self.acquisition_attempt_count != (
+            sum(item.acquisition_attempt_count for item in self.requests)
+            + sum(item.physical_request_count for item in self.manifest_requests)
+        ):
+            raise ValueError("financial manifest physical request count is inconsistent")
+        if self.duplicate_suppressed_count != (
+            sum(item.duplicate_suppressed_count for item in self.requests)
+            + sum(
+                item.duplicate_suppressed_count for item in self.manifest_requests
+            )
+        ):
+            raise ValueError("financial manifest duplicate count is inconsistent")
+        return self
+
+
+class FinancialToolManifestOperationalProjection(BaseModel):
+    """Tool-bound manifest references without coordinator or payload details."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-tool-manifest-v2"] = (
+        "financial-tool-manifest-v2"
+    )
+    manifest_identity: str = Field(
+        pattern=r"^financial-manifest:v2:[0-9a-f]{64}$"
+    )
+    capability_routing_plan_signature: str = Field(
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
+    )
+    capability: FinancialCapability
+    statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    disposition: FinancialEvidenceDisposition
+    final_rendered_artifact_identity: str = Field(
+        pattern=r"^financial-rendered-artifact:v1:[0-9a-f]{64}$"
+    )
+    artifact_identities: tuple[str, ...]
+    acquisition_outcomes: tuple[FinancialAcquisitionOutcome, ...]
+    physical_attempt_event_identities: tuple[str, ...]
+    candidate_identities: tuple[str, ...]
+    selections: tuple[FinancialPeriodSelection, ...]
+    rejected_periods: tuple[FinancialRejectedPeriod, ...]
+    overlaps: tuple[FinancialPeriodOverlapFinding, ...]
+    conflicts: tuple[FinancialCriticalValueConflict, ...]
+    aggregate_completeness: FinancialAggregateCompletenessProjection
+
+    @model_validator(mode="after")
+    def _validate_safe_projection(self) -> FinancialToolManifestOperationalProjection:
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialToolMessageManifestEnvelope(BaseModel):
+    """Closed operational ToolMessage envelope; model content stays separately bounded."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-tool-message-envelope-v2"] = (
+        "financial-tool-message-envelope-v2"
+    )
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    request_ref: str = Field(pattern=r"^financial-request:v1:[0-9a-f]{64}$")
+    capability: Literal["company_financials"] = "company_financials"
+    disposition: Literal["executed", "duplicate_suppressed"]
+    capability_routing_plan_signature: str = Field(
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
+    )
+    financial_manifest_version: Literal["financial-manifest-v2"] = (
+        "financial-manifest-v2"
+    )
+    logical_provider_count: int = Field(ge=0)
+    logical_candidate_count: int = Field(ge=0)
+    physical_request_count: int = Field(ge=0)
+    manifests: tuple[FinancialToolManifestOperationalProjection, ...] = Field(
+        min_length=1
+    )
+    completeness_rows: tuple[FinancialCompletenessAuditRow, ...]
+    selected_artifact: SourceArtifact
+
+    @model_validator(mode="after")
+    def _validate_envelope(self) -> FinancialToolMessageManifestEnvelope:
+        if {
+            manifest.capability_routing_plan_signature
+            for manifest in self.manifests
+        } != {self.capability_routing_plan_signature}:
+            raise ValueError("financial ToolMessage routing-plan binding is invalid")
+        if self.logical_candidate_count != len(
+            {
+                candidate_id
+                for manifest in self.manifests
+                for candidate_id in manifest.candidate_identities
+            }
+        ):
+            raise ValueError("financial ToolMessage candidate count is inconsistent")
+        attempt_ids = {
+            event_id
+            for manifest in self.manifests
+            for event_id in manifest.physical_attempt_event_identities
+        }
+        if self.physical_request_count != len(attempt_ids):
+            raise ValueError("financial ToolMessage attempt count is inconsistent")
+        rendered_digests = {
+            manifest.final_rendered_artifact_identity.rpartition(":")[2]
+            for manifest in self.manifests
+        }
+        if (
+            self.selected_artifact.tool_call_id != self.tool_call_id
+            or self.selected_artifact.tool_name != self.tool_name
+            or self.selected_artifact.source_ref != self.request_ref
+            or rendered_digests != {self.selected_artifact.artifact_sha256}
+        ):
+            raise ValueError("financial ToolMessage selected artifact is invalid")
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+FinancialDispatchAuditProjection = (
+    FinancialDispatchAuditProjectionV1 | FinancialDispatchAuditProjectionV2
+)
 
 
 class FinancialToolDispatcher:
@@ -821,6 +1284,7 @@ class FinancialToolDispatcher:
         ) = None,
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
         qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
+        run_scope_id: str | None = None,
     ) -> None:
         if not instrument_identity.is_authoritative:
             raise ValueError("financial dispatcher requires authoritative Instrument Identity")
@@ -842,6 +1306,8 @@ class FinancialToolDispatcher:
             is None
         ):
             raise ValueError("Capability Routing Plan signature is malformed")
+        if run_scope_id is not None and _ACQUISITION_TOKEN.fullmatch(run_scope_id) is None:
+            raise ValueError("financial run scope identity is malformed")
         copied_chains = {
             str(tool_name): tuple(providers)
             for tool_name, providers in provider_chains.items()
@@ -872,6 +1338,7 @@ class FinancialToolDispatcher:
         self._capability_routing_plan_signature = (
             router_signature or capability_routing_plan_signature
         )
+        self._run_scope_id = run_scope_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleeper = sleeper or time.sleep
         self._retry_policy = retry_policy or RetryPolicy()
@@ -913,6 +1380,7 @@ class FinancialToolDispatcher:
         ) = None,
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
         qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
+        run_scope_id: str | None = None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -991,6 +1459,7 @@ class FinancialToolDispatcher:
             checkpoint_ledger=checkpoint_ledger,
             provider_subrequest_cache=provider_subrequest_cache,
             qualified_statement_router=qualified_statement_router,
+            run_scope_id=run_scope_id,
         )
 
     def canonical_request_key(
@@ -1153,6 +1622,22 @@ class FinancialToolDispatcher:
 
         try:
             routing_result = router.route_statement(selection_request)
+            if self._run_scope_id is not None:
+                try:
+                    attempt_events = _validate_statement_routing_semantics(
+                        routing_result,
+                        selection_request=selection_request,
+                        router=router,
+                        require_complete_attempt_events=True,
+                    )
+                    routing_result = finalize_statement_routing_result(
+                        routing_result,
+                        physical_attempt_events=attempt_events,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
+                    ) from exc
             result = FinancialStatementSelectionDispatchResult(
                 tool_call_id=request.tool_call_id,
                 disposition="executed",
@@ -1236,6 +1721,23 @@ class FinancialToolDispatcher:
 
         try:
             routing_result = router.route_indicators(selection_request)
+            if self._run_scope_id is not None:
+                try:
+                    attempt_events = _validate_indicator_routing_semantics(
+                        routing_result,
+                        selection_request=selection_request,
+                        router=router,
+                        require_complete_attempt_events=True,
+                    )
+                    routing_result = finalize_indicator_routing_result(
+                        routing_result,
+                        request=selection_request,
+                        physical_attempt_events=attempt_events,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
+                    ) from exc
             result = FinancialIndicatorSelectionDispatchResult(
                 tool_call_id=request.tool_call_id,
                 disposition="executed",
@@ -1370,11 +1872,31 @@ class FinancialToolDispatcher:
                         ),
                     )
                 )
+        qualified_manifests = tuple(
+            entry.terminal.routing_result.manifest
+            for entry in qualified_entries
+        ) + tuple(
+            manifest
+            for entry in qualified_indicator_entries
+            for manifest in entry.terminal.routing_result.family_manifests
+        )
+        has_manifest_v2 = bool(qualified_manifests) and all(
+            manifest.contract_version == "financial-manifest-v2"
+            for manifest in qualified_manifests
+        )
+        if has_manifest_v2 and self._run_scope_id is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+            )
         ledger = FinancialDispatchCheckpointLedger(
             contract_version=(
-                FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
-                if qualified_entries or qualified_indicator_entries
-                else FINANCIAL_DISPATCH_LEDGER_VERSION
+                FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                if has_manifest_v2
+                else (
+                    FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+                    if qualified_entries or qualified_indicator_entries
+                    else FINANCIAL_DISPATCH_LEDGER_VERSION
+                )
             ),
             acquisition_policy_version=self._acquisition_policy_version,
             retry_policy=self._retry_policy,
@@ -1396,6 +1918,15 @@ class FinancialToolDispatcher:
                 if self._provider_subrequest_cache is not None
                 else None
             ),
+            capability_routing_plan_signature=(
+                self._capability_routing_plan_signature
+                if has_manifest_v2
+                else None
+            ),
+            financial_manifest_version=(
+                "financial-manifest-v2" if has_manifest_v2 else None
+            ),
+            run_scope_id=self._run_scope_id if has_manifest_v2 else None,
             entries=tuple(entries),
             qualified_statement_selections=tuple(qualified_entries),
             qualified_indicator_selections=tuple(qualified_indicator_entries),
@@ -1403,6 +1934,12 @@ class FinancialToolDispatcher:
         payload = ledger.model_dump(mode="json")
         if ledger.provider_subrequest_cache is None:
             payload.pop("provider_subrequest_cache", None)
+        if ledger.capability_routing_plan_signature is None:
+            payload.pop("capability_routing_plan_signature", None)
+        if ledger.financial_manifest_version is None:
+            payload.pop("financial_manifest_version", None)
+        if ledger.run_scope_id is None:
+            payload.pop("run_scope_id", None)
         if not ledger.qualified_statement_selections:
             payload.pop("qualified_statement_selections", None)
         if not ledger.qualified_indicator_selections:
@@ -1427,8 +1964,17 @@ class FinancialToolDispatcher:
         try:
             ledger = FinancialDispatchCheckpointLedger.model_validate(checkpoint_ledger)
         except (TypeError, ValueError) as exc:
+            raw_version = (
+                checkpoint_ledger.get("contract_version")
+                if isinstance(checkpoint_ledger, Mapping)
+                else checkpoint_ledger.contract_version
+            )
             raise FinancialDispatchCheckpointError(
-                FinancialDispatchCheckpointFailureReason.MALFORMED
+
+                    FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
+                    if raw_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                    else FinancialDispatchCheckpointFailureReason.MALFORMED
+
             ) from exc
         asset_configuration = self._run_asset_configuration
         if (
@@ -1447,6 +1993,25 @@ class FinancialToolDispatcher:
         ):
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.POLICY_MISMATCH
+            )
+        if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+            if ledger.run_scope_id != self._run_scope_id:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+                )
+            if (
+                ledger.capability_routing_plan_signature
+                != self._capability_routing_plan_signature
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+                )
+        elif (
+            ledger.contract_version == FINANCIAL_DISPATCH_LEDGER_VERSION
+            and self._qualified_statement_router is not None
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
             )
         restored_chains = {
             item.tool_name: item.provider_chain_identity
@@ -1541,6 +2106,20 @@ class FinancialToolDispatcher:
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
                 )
+            try:
+                _validate_statement_routing_semantics(
+                    result.routing_result,
+                    selection_request=result.selection_request,
+                    router=router,
+                    require_complete_attempt_events=(
+                        ledger.contract_version
+                        == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                ) from exc
             providers = self._provider_chains.get(key.tool_name)
             if (
                 providers is None
@@ -1590,6 +2169,20 @@ class FinancialToolDispatcher:
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
                 )
+            try:
+                _validate_indicator_routing_semantics(
+                    result.routing_result,
+                    selection_request=result.selection_request,
+                    router=router,
+                    require_complete_attempt_events=(
+                        ledger.contract_version
+                        == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                ) from exc
             providers = self._provider_chains.get(key.tool_name)
             if (
                 providers is None
@@ -2091,6 +2684,225 @@ def _canonical_financial_request_key_is_valid(
     return key.request_key == f"financial-request:v1:{sha256(encoded).hexdigest()}"
 
 
+_STATEMENT_ROUTING_CAPABILITY = {
+    FinancialStatementType.BALANCE_SHEET: MainlandCapability.BALANCE_SHEET,
+    FinancialStatementType.CASH_FLOW: MainlandCapability.CASH_FLOW,
+    FinancialStatementType.INCOME_STATEMENT: MainlandCapability.INCOME_STATEMENT,
+}
+
+
+def _validated_provider_call_attempts(
+    provider_calls: tuple[Any, ...],
+    *,
+    expected_attempt_ids: tuple[str, ...],
+    require_complete_attempt_events: bool,
+) -> tuple[ProviderSubrequestAttemptEvent, ...]:
+    call_attempt_ids = tuple(
+        attempt_id
+        for call in provider_calls
+        for attempt_id in call.physical_attempt_ids
+    )
+    call_events = tuple(
+        event
+        for call in provider_calls
+        for event in call.physical_attempt_events
+    )
+    event_ids = tuple(event.attempt_event_id for event in call_events)
+    if (
+        len(call_attempt_ids) != len(set(call_attempt_ids))
+        or set(call_attempt_ids) != set(expected_attempt_ids)
+        or len(event_ids) != len(set(event_ids))
+    ):
+        raise ValueError("financial provider-call attempt binding is invalid")
+    if require_complete_attempt_events:
+        if set(event_ids) != set(expected_attempt_ids) or any(
+            set(call.physical_attempt_ids)
+            != {
+                event.attempt_event_id
+                for event in call.physical_attempt_events
+            }
+            for call in provider_calls
+        ):
+            raise ValueError("financial provider-call attempt events are incomplete")
+    elif call_events and set(event_ids) != set(expected_attempt_ids):
+        raise ValueError("financial provider-call attempt events are contradictory")
+    return tuple(sorted(call_events, key=lambda item: item.attempt_event_id))
+
+
+def _validate_statement_routing_semantics(
+    result: FinancialStatementRoutingResult,
+    *,
+    selection_request: FinancialStatementRoutingRequest,
+    router: MainlandFinancialCapabilityRouter,
+    require_complete_attempt_events: bool,
+) -> tuple[ProviderSubrequestAttemptEvent, ...]:
+    capability = _STATEMENT_ROUTING_CAPABILITY[selection_request.statement_type]
+    expected_route = router.routing_plan.route_for(capability)
+    provider_ids = tuple(call.provider_id for call in result.provider_calls)
+    if (
+        result.route != expected_route
+        or provider_ids != expected_route[: len(provider_ids)]
+    ):
+        raise ValueError("statement routing result contradicts the active plan")
+    manifest = result.manifest
+    selected_ids = {
+        selection.candidate_identity for selection in manifest.selections
+    }
+    selected_assessments = tuple(
+        item.assessment
+        for item in manifest.provider_candidates
+        if item.candidate.candidate_identity in selected_ids
+    )
+    expected_aggregate = assess_financial_history_coverage(
+        instrument_identity=selection_request.instrument_identity,
+        statement_type=selection_request.statement_type,
+        company_type=selection_request.company_type,
+        consolidation_scope=selection_request.consolidation_scope,
+        currency=selection_request.currency,
+        assessments=selected_assessments,
+        eligible_annual_period_ends=tuple(
+            sorted(
+                set(selection_request.eligible_annual_period_ends),
+                reverse=True,
+            )[:5]
+        ),
+        eligible_reporting_period_ends=tuple(
+            sorted(
+                set(selection_request.eligible_reporting_period_ends),
+                reverse=True,
+            )[:8]
+        ),
+        listing_date=selection_request.listing_date,
+        listing_provenance=selection_request.listing_provenance,
+    )
+    if (
+        manifest.aggregate_completeness != expected_aggregate
+        or result.missing_annual_period_ends
+        != expected_aggregate.missing_annual_period_ends
+        or result.missing_reporting_period_ends
+        != expected_aggregate.missing_reporting_period_ends
+        or (
+            manifest.contract_version == "financial-manifest-v2"
+            and manifest.disposition
+            is not financial_statement_evidence_disposition(result)
+        )
+    ):
+        raise ValueError("statement routing completeness binding is invalid")
+    events = _validated_provider_call_attempts(
+        result.provider_calls,
+        expected_attempt_ids=result.physical_attempt_ids,
+        require_complete_attempt_events=require_complete_attempt_events,
+    )
+    if manifest.contract_version == "financial-manifest-v2":
+        manifest_events = {
+            event.attempt_event_id: event
+            for event in manifest.physical_attempt_events
+        }
+        call_events = {event.attempt_event_id: event for event in events}
+        if manifest_events != call_events:
+            raise ValueError("statement manifest attempt events are contradictory")
+    return events
+
+
+def _validate_indicator_routing_semantics(
+    result: FinancialIndicatorRoutingResult,
+    *,
+    selection_request: FinancialIndicatorRoutingRequest,
+    router: MainlandFinancialCapabilityRouter,
+    require_complete_attempt_events: bool,
+) -> tuple[ProviderSubrequestAttemptEvent, ...]:
+    expected_route = router.routing_plan.route_for(
+        MainlandCapability.FINANCIAL_INDICATORS
+    )
+    provider_ids = tuple(call.provider_id for call in result.provider_calls)
+    if (
+        result.route != expected_route
+        or provider_ids != expected_route[: len(provider_ids)]
+        or tuple(
+            manifest.requested_ratio_family
+            for manifest in result.family_manifests
+        )
+        != selection_request.ratio_families
+    ):
+        raise ValueError("indicator routing result contradicts the active plan")
+    expected_periods = tuple(
+        sorted(
+            set(selection_request.eligible_reporting_period_ends),
+            reverse=True,
+        )[:8]
+    )
+    expected_missing: list[
+        tuple[FinancialRatioFamily, tuple[date, ...]]
+    ] = []
+    expected_complete: list[FinancialRatioFamily] = []
+    for manifest in result.family_manifests:
+        family = manifest.requested_ratio_family
+        assert family is not None
+        selected_ids = {
+            selection.candidate_identity
+            for selection in manifest.selections
+        }
+        selected_assessments = tuple(
+            item.assessment
+            for item in manifest.provider_candidates
+            if item.candidate.candidate_identity in selected_ids
+        )
+        expected_aggregate = assess_financial_ratio_history_coverage(
+            instrument_identity=selection_request.instrument_identity,
+            ratio_family=family,
+            company_type=selection_request.company_type,
+            consolidation_scope=selection_request.consolidation_scope,
+            currency=selection_request.currency,
+            assessments=selected_assessments,
+            eligible_reporting_period_ends=expected_periods,
+        )
+        if manifest.aggregate_completeness != expected_aggregate:
+            raise ValueError("indicator routing completeness binding is invalid")
+        if expected_aggregate.complete:
+            expected_complete.append(family)
+        if expected_aggregate.missing_reporting_period_ends:
+            expected_missing.append(
+                (
+                    family,
+                    expected_aggregate.missing_reporting_period_ends,
+                )
+            )
+        if (
+            manifest.contract_version == "financial-manifest-v2"
+            and manifest.disposition
+            is not financial_indicator_evidence_disposition(
+                manifest,
+                result,
+                selection_request,
+            )
+        ):
+            raise ValueError("indicator routing disposition binding is invalid")
+    if (
+        result.complete_families != tuple(expected_complete)
+        or result.missing_periods_by_family != tuple(expected_missing)
+    ):
+        raise ValueError("indicator routing family summary is invalid")
+    events = _validated_provider_call_attempts(
+        result.provider_calls,
+        expected_attempt_ids=result.physical_attempt_ids,
+        require_complete_attempt_events=require_complete_attempt_events,
+    )
+    result_events = {
+        event.attempt_event_id: event
+        for event in result.physical_attempt_events
+    }
+    call_events = {event.attempt_event_id: event for event in events}
+    if result_events and result_events != call_events:
+        raise ValueError("indicator routing attempt events are contradictory")
+    for manifest in result.family_manifests:
+        if manifest.contract_version == "financial-manifest-v2" and {
+            event.attempt_event_id: event
+            for event in manifest.physical_attempt_events
+        } != call_events:
+            raise ValueError("indicator manifest attempt events are contradictory")
+    return events
+
+
 def _financial_provider_variant_progress(
     plan_outcomes: tuple[FinancialPlanOutcome, ...],
 ) -> tuple[FinancialProviderVariantProgress, ...]:
@@ -2125,6 +2937,773 @@ def _financial_provider_variant_progress(
     return tuple(progress.values())
 
 
+def _financial_tool_manifest_envelope(
+    *,
+    dispatch_result: (
+        FinancialStatementSelectionDispatchResult
+        | FinancialIndicatorSelectionDispatchResult
+    ),
+) -> FinancialToolMessageManifestEnvelope:
+    routing_result = dispatch_result.routing_result
+    if isinstance(dispatch_result, FinancialStatementSelectionDispatchResult):
+        manifests = (routing_result.manifest,)
+        provider_calls = routing_result.provider_calls
+    else:
+        manifests = routing_result.family_manifests
+        provider_calls = routing_result.provider_calls
+    provider_attempt_counts = {
+        call.provider_id: len(call.physical_attempt_events)
+        for call in provider_calls
+    }
+    projected_manifests = tuple(
+        _project_manifest_for_tool(manifest)
+        for manifest in manifests
+    )
+    completeness_rows = tuple(
+        row
+        for manifest in manifests
+        for row in _project_manifest_completeness_rows(
+            manifest,
+            provider_attempt_counts=provider_attempt_counts,
+        )
+    )
+    return FinancialToolMessageManifestEnvelope(
+        tool_call_id=dispatch_result.tool_call_id,
+        tool_name=dispatch_result.request_key.tool_name,
+        request_ref=dispatch_result.request_key.request_key,
+        disposition=dispatch_result.disposition,
+        capability_routing_plan_signature=(
+            dispatch_result.request_key.capability_routing_plan_signature
+        ),
+        logical_provider_count=len(provider_calls),
+        logical_candidate_count=len(
+            {
+                item.candidate.candidate_identity
+                for manifest in manifests
+                for item in manifest.provider_candidates
+            }
+        ),
+        physical_request_count=len(
+            {
+                event.attempt_event_id
+                for manifest in manifests
+                for event in manifest.physical_attempt_events
+            }
+        ),
+        manifests=projected_manifests,
+        completeness_rows=tuple(
+            sorted(
+                completeness_rows,
+                key=lambda item: (
+                    item.capability.value,
+                    item.statement_or_ratio_family,
+                    item.period,
+                    item.provider,
+                    item.artifact_identity or "",
+                ),
+            )
+        ),
+        selected_artifact=SourceArtifact(
+            artifact_sha256=sha256(
+                dispatch_result.rendered_value.encode("utf-8")
+            ).hexdigest(),
+            source_ref=dispatch_result.request_key.request_key,
+            tool_call_id=dispatch_result.tool_call_id,
+            tool_name=dispatch_result.request_key.tool_name,
+            raw_text=dispatch_result.rendered_value,
+        ),
+    )
+
+
+def _project_aggregate_completeness(
+    completeness: FinancialAggregateCompleteness,
+) -> FinancialAggregateCompletenessProjection:
+    serialized = json.dumps(
+        completeness.model_dump(mode="json"),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    common: dict[str, Any] = {
+        "assessment_ref": (
+            "financial-completeness-assessment=sha256:"
+            + sha256(serialized.encode("utf-8")).hexdigest()
+        ),
+        "company_type": completeness.company_type,
+        "consolidation_scope": completeness.consolidation_scope,
+        "currency": completeness.currency,
+        "target_reporting_period_ends": (
+            completeness.target_reporting_period_ends
+        ),
+        "covered_reporting_period_ends": (
+            completeness.covered_reporting_period_ends
+        ),
+        "missing_reporting_period_ends": (
+            completeness.missing_reporting_period_ends
+        ),
+        "rejection_reasons": completeness.rejection_reasons,
+        "complete": completeness.complete,
+    }
+    if isinstance(completeness, FinancialHistoryCompletenessAssessment):
+        return FinancialAggregateCompletenessProjection(
+            capability=FinancialCapability.STATEMENT,
+            statement_type=completeness.statement_type,
+            target_annual_period_ends=completeness.target_annual_period_ends,
+            covered_annual_period_ends=completeness.covered_annual_period_ends,
+            missing_annual_period_ends=completeness.missing_annual_period_ends,
+            since_listing_exception=completeness.since_listing_exception,
+            **common,
+        )
+    if isinstance(completeness, FinancialRatioHistoryCompletenessAssessment):
+        return FinancialAggregateCompletenessProjection(
+            capability=FinancialCapability.RATIO_FAMILY,
+            ratio_family=completeness.ratio_family,
+            **common,
+        )
+    raise TypeError("unsupported financial aggregate completeness assessment")
+
+
+def _project_manifest_for_tool(
+    manifest: FinancialAcquisitionManifest,
+) -> FinancialToolManifestOperationalProjection:
+    if (
+        manifest.contract_version != "financial-manifest-v2"
+        or manifest.disposition is None
+        or manifest.final_rendered_artifact is None
+    ):
+        raise ValueError("financial ToolMessage requires v2 manifest lineage")
+    return FinancialToolManifestOperationalProjection(
+        manifest_identity=manifest.manifest_identity,
+        capability_routing_plan_signature=(
+            manifest.capability_routing_plan_signature
+        ),
+        capability=manifest.requested_capability,
+        statement_or_ratio_family=_manifest_family(manifest),
+        disposition=manifest.disposition,
+        final_rendered_artifact_identity=(
+            manifest.final_rendered_artifact.artifact_identity
+        ),
+        artifact_identities=tuple(
+            item.artifact.artifact_identity for item in manifest.artifacts
+        ),
+        acquisition_outcomes=manifest.acquisition_outcomes,
+        physical_attempt_event_identities=tuple(
+            event.attempt_event_id
+            for event in manifest.physical_attempt_events
+        ),
+        candidate_identities=tuple(
+            item.candidate.candidate_identity
+            for item in manifest.provider_candidates
+        ),
+        selections=manifest.selections,
+        rejected_periods=manifest.rejected_periods,
+        overlaps=manifest.overlaps,
+        conflicts=manifest.conflicts,
+        aggregate_completeness=_project_aggregate_completeness(
+            manifest.aggregate_completeness
+        ),
+    )
+
+
+def _manifest_family(manifest: FinancialAcquisitionManifest) -> str:
+    family = (
+        manifest.requested_statement_type
+        if manifest.requested_capability is FinancialCapability.STATEMENT
+        else manifest.requested_ratio_family
+    )
+    if family is None:
+        raise ValueError("financial manifest family is absent")
+    return family.value
+
+
+def _project_manifest_for_audit(
+    manifest: FinancialAcquisitionManifest,
+) -> FinancialManifestAuditProjection:
+    if (
+        manifest.contract_version != "financial-manifest-v2"
+        or manifest.disposition is None
+        or manifest.final_rendered_artifact is None
+    ):
+        raise ValueError("financial manifest audit requires v2 lineage")
+    return FinancialManifestAuditProjection(
+        manifest_identity=manifest.manifest_identity,
+        capability_routing_plan_signature=(
+            manifest.capability_routing_plan_signature
+        ),
+        capability=manifest.requested_capability,
+        statement_or_ratio_family=_manifest_family(manifest),
+        disposition=manifest.disposition,
+        final_rendered_artifact_identity=(
+            manifest.final_rendered_artifact.artifact_identity
+        ),
+        artifact_identities=tuple(
+            item.artifact.artifact_identity for item in manifest.artifacts
+        ),
+        acquisition_outcomes=manifest.acquisition_outcomes,
+        physical_attempt_events=manifest.physical_attempt_events,
+        candidate_identities=tuple(
+            item.candidate.candidate_identity
+            for item in manifest.provider_candidates
+        ),
+        selections=manifest.selections,
+        rejected_periods=manifest.rejected_periods,
+        overlaps=manifest.overlaps,
+        conflicts=manifest.conflicts,
+        aggregate_completeness=_project_aggregate_completeness(
+            manifest.aggregate_completeness
+        ),
+    )
+
+
+def _project_manifest_completeness_rows(
+    manifest: FinancialAcquisitionManifest,
+    *,
+    provider_attempt_counts: Mapping[str, int],
+) -> tuple[FinancialCompletenessAuditRow, ...]:
+    selection_by_candidate = {
+        item.candidate_identity: item for item in manifest.selections
+    }
+    rejection_by_candidate = {
+        item.candidate_identity: item for item in manifest.rejected_periods
+    }
+    conflict_candidates = {
+        candidate_identity
+        for conflict in manifest.conflicts
+        for candidate_identity in (
+            conflict.selected_candidate_identity,
+            conflict.conflicting_candidate_identity,
+        )
+    }
+    overlap_reasons: dict[str, set[str]] = {}
+    for overlap in manifest.overlaps:
+        overlap_reasons.setdefault(
+            overlap.overlapping_candidate_identity,
+            set(),
+        ).add(overlap.disposition)
+    completeness = manifest.aggregate_completeness
+    since_listing = getattr(completeness, "since_listing_exception", None)
+    listing_provenance = (
+        since_listing.listing_provenance
+        if since_listing is not None
+        else None
+    )
+    rows: list[FinancialCompletenessAuditRow] = []
+    for provider_candidate in manifest.provider_candidates:
+        candidate = provider_candidate.candidate
+        assessment = provider_candidate.assessment
+        candidate_id = candidate.candidate_identity
+        selection = selection_by_candidate.get(candidate_id)
+        rejection = rejection_by_candidate.get(candidate_id)
+        if candidate_id in conflict_candidates or (
+            rejection is not None
+            and FinancialPeriodRejectionReason.CONFLICTING_CRITICAL_VALUES
+            in rejection.reasons
+        ):
+            disposition = "conflicted"
+        elif selection is not None:
+            disposition = (
+                "current_only"
+                if selection.disposition == "current_only"
+                else "selected"
+            )
+        elif rejection is not None:
+            disposition = "rejected"
+        else:
+            disposition = "unselected"
+        reasons = tuple(
+            reason.value for reason in assessment.rejection_reasons
+        )
+        if not reasons and disposition == "unselected":
+            reasons = tuple(
+                sorted(overlap_reasons.get(candidate_id, {"not_selected"}))
+            )
+        resolution = candidate.company_type_resolution
+        provider = candidate.artifact.dataset.provider_id
+        filing_metadata = candidate.filing_metadata
+        filing_metadata_values = (
+            filing_metadata.ann_date,
+            filing_metadata.f_ann_date,
+            filing_metadata.report_type,
+            filing_metadata.comp_type,
+            filing_metadata.update_flag,
+        )
+        rows.append(
+            FinancialCompletenessAuditRow(
+                manifest_identity=manifest.manifest_identity,
+                capability=manifest.requested_capability,
+                statement_or_ratio_family=_manifest_family(manifest),
+                period=assessment.period_end,
+                frequency=assessment.frequency,
+                provider=provider,
+                company_type=assessment.company_type,
+                company_type_resolution_method=resolution.method,
+                company_type_provenance=tuple(
+                    f"{item.key}={item.value}"
+                    for item in resolution.classifier_inputs
+                ),
+                provider_declared_type=resolution.provider_declared_type,
+                provider_declaration_qualified=(
+                    resolution.provider_declaration_qualified
+                ),
+                metadata_coverage=(
+                    Decimal(
+                        sum(
+                            item is not None
+                            for item in filing_metadata_values
+                        )
+                    )
+                    / Decimal(len(filing_metadata_values))
+                ),
+                ann_date=filing_metadata.ann_date,
+                f_ann_date=filing_metadata.f_ann_date,
+                report_type=filing_metadata.report_type,
+                provider_comp_type=filing_metadata.comp_type,
+                update_flag=filing_metadata.update_flag,
+                revision_observed_at=filing_metadata.observed_at,
+                local_provider_revision_identity=(
+                    filing_metadata.local_provider_revision_identity
+                ),
+                provider_filing_revision_id=(
+                    filing_metadata.provider_filing_revision_id
+                ),
+                critical_coverage=assessment.critical_coverage,
+                critical_threshold=Decimal("1"),
+                core_coverage=assessment.core_coverage,
+                core_threshold=Decimal("0.9"),
+                disposition=disposition,
+                typed_reason=reasons,
+                pit_eligible=assessment.strict_pit_eligible,
+                artifact_identity=candidate.artifact.artifact_identity,
+                provider_attempt_count=provider_attempt_counts.get(provider, 0),
+                since_listing_exception=since_listing is not None,
+                listing_date=(
+                    since_listing.listing_date
+                    if since_listing is not None
+                    else None
+                ),
+                listing_provider=(
+                    listing_provenance.provider_id
+                    if listing_provenance is not None
+                    else None
+                ),
+                listing_source_ref=(
+                    listing_provenance.source_ref
+                    if listing_provenance is not None
+                    else None
+                ),
+            )
+        )
+    if manifest.requested_capability is FinancialCapability.STATEMENT:
+        missing_periods = (
+            *(
+                (
+                    period,
+                    FinancialReportingFrequency.ANNUAL,
+                )
+                for period in completeness.missing_annual_period_ends
+            ),
+            *(
+                (
+                    period,
+                    FinancialReportingFrequency.QUARTERLY,
+                )
+                for period in completeness.missing_reporting_period_ends
+            ),
+        )
+    else:
+        missing_periods = tuple(
+            (
+                period,
+                FinancialReportingFrequency.QUARTERLY,
+            )
+            for period in completeness.missing_reporting_period_ends
+        )
+    for period, frequency in missing_periods:
+        rows.append(
+            FinancialCompletenessAuditRow(
+                manifest_identity=manifest.manifest_identity,
+                capability=manifest.requested_capability,
+                statement_or_ratio_family=_manifest_family(manifest),
+                period=period,
+                frequency=frequency,
+                provider="none",
+                company_type=completeness.company_type,
+                company_type_resolution_method=None,
+                company_type_provenance=(),
+                provider_declared_type=None,
+                provider_declaration_qualified=False,
+                metadata_coverage=Decimal("0"),
+                critical_coverage=Decimal("0"),
+                critical_threshold=Decimal("1"),
+                core_coverage=Decimal("0"),
+                core_threshold=Decimal("0.9"),
+                disposition="rejected",
+                typed_reason=tuple(
+                    reason.value for reason in completeness.rejection_reasons
+                ),
+                pit_eligible=False,
+                artifact_identity=None,
+                provider_attempt_count=0,
+                since_listing_exception=since_listing is not None,
+                listing_date=(
+                    since_listing.listing_date
+                    if since_listing is not None
+                    else None
+                ),
+                listing_provider=(
+                    listing_provenance.provider_id
+                    if listing_provenance is not None
+                    else None
+                ),
+                listing_source_ref=(
+                    listing_provenance.source_ref
+                    if listing_provenance is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(
+        sorted(
+            rows,
+            key=lambda item: (
+                item.capability.value,
+                item.statement_or_ratio_family,
+                item.period,
+                item.provider,
+                item.artifact_identity or "",
+            ),
+        )
+    )
+
+
+def _project_statement_manifest_audit_request(
+    entry: FinancialStatementSelectionCheckpointEntry,
+) -> tuple[FinancialManifestAuditRequest, tuple[FinancialCompletenessAuditRow, ...]]:
+    result = entry.terminal.routing_result
+    provider_attempt_counts = {
+        call.provider_id: len(call.physical_attempt_events)
+        for call in result.provider_calls
+    }
+    manifest = result.manifest
+    rows = _project_manifest_completeness_rows(
+        manifest,
+        provider_attempt_counts=provider_attempt_counts,
+    )
+    return (
+        FinancialManifestAuditRequest(
+            request_ref=entry.canonical_request_key.request_key,
+            tool_name=entry.canonical_request_key.tool_name,
+            statement_type=entry.canonical_request_key.statement_type,
+            frequency=entry.canonical_request_key.frequency,
+            as_of_date=entry.canonical_request_key.as_of_date,
+            logical_provider_count=len(result.provider_calls),
+            logical_candidate_count=len(manifest.provider_candidates),
+            physical_request_count=len(manifest.physical_attempt_events),
+            duplicate_suppressed_count=entry.reuse_count,
+            manifests=(_project_manifest_for_audit(manifest),),
+        ),
+        rows,
+    )
+
+
+def _project_indicator_manifest_audit_request(
+    entry: FinancialIndicatorSelectionCheckpointEntry,
+) -> tuple[FinancialManifestAuditRequest, tuple[FinancialCompletenessAuditRow, ...]]:
+    result = entry.terminal.routing_result
+    provider_attempt_counts = {
+        call.provider_id: len(call.physical_attempt_events)
+        for call in result.provider_calls
+    }
+    manifests = result.family_manifests
+    rows = tuple(
+        row
+        for manifest in manifests
+        for row in _project_manifest_completeness_rows(
+            manifest,
+            provider_attempt_counts=provider_attempt_counts,
+        )
+    )
+    candidate_ids = {
+        item.candidate.candidate_identity
+        for manifest in manifests
+        for item in manifest.provider_candidates
+    }
+    return (
+        FinancialManifestAuditRequest(
+            request_ref=entry.canonical_request_key.request_key,
+            tool_name=entry.canonical_request_key.tool_name,
+            statement_type=entry.canonical_request_key.statement_type,
+            frequency=entry.canonical_request_key.frequency,
+            as_of_date=entry.canonical_request_key.as_of_date,
+            logical_provider_count=len(result.provider_calls),
+            logical_candidate_count=len(candidate_ids),
+            physical_request_count=len(result.physical_attempt_events),
+            duplicate_suppressed_count=entry.reuse_count,
+            manifests=tuple(
+                _project_manifest_for_audit(manifest)
+                for manifest in manifests
+            ),
+        ),
+        tuple(
+            sorted(
+                rows,
+                key=lambda item: (
+                    item.capability.value,
+                    item.statement_or_ratio_family,
+                    item.period,
+                    item.provider,
+                    item.artifact_identity or "",
+                ),
+            )
+        ),
+    )
+
+
+def _provider_attempt_evidence(
+    events: tuple[ProviderSubrequestAttemptEvent, ...],
+) -> tuple[ProviderPhysicalAttemptEvidence, ...]:
+    counts_by_sequence: dict[str, int] = {}
+    for event in events:
+        counts_by_sequence[event.sequence_id] = (
+            counts_by_sequence.get(event.sequence_id, 0) + 1
+        )
+    return tuple(
+        ProviderPhysicalAttemptEvidence(
+            attempt_event_id=event.attempt_event_id,
+            sequence_id=event.sequence_id,
+            request_key=event.request_key,
+            upstream_service_id=event.upstream_service_id,
+            upstream_service_name=event.upstream_service_id,
+            capacity_scope=event.capacity_scope,
+            attempt_index=event.attempt_index,
+            attempted_at=event.attempted_at.isoformat(),
+            pacing_event=event.pacing_event,
+            pacing_wait_seconds=event.pacing_wait_seconds,
+            outcome=event.outcome.value,
+            retryable=event.retryable,
+            status_code=event.status_code,
+            retry_after_seconds=event.retry_after_seconds,
+            cooldown_changed=event.cooldown_changed,
+            cooldown_until=(
+                event.cooldown_until.isoformat()
+                if event.cooldown_until is not None
+                else None
+            ),
+            final_physical_attempt_count=counts_by_sequence[
+                event.sequence_id
+            ],
+        )
+        for event in sorted(
+            events,
+            key=lambda item: (item.sequence_id, item.attempt_index),
+        )
+    )
+
+
+def _selected_financial_evidence(
+    *,
+    dispatch_result: (
+        FinancialStatementSelectionDispatchResult
+        | FinancialIndicatorSelectionDispatchResult
+    ),
+    manifests: tuple[FinancialAcquisitionManifest, ...],
+) -> tuple[tuple[SourceArtifact, ...], tuple[SourceFact, ...]]:
+    artifacts: list[SourceArtifact] = []
+    facts: list[SourceFact] = []
+    for manifest in manifests:
+        selected_ids = {
+            selection.candidate_identity
+            for selection in manifest.selections
+            if selection.strict_pit_eligible
+        }
+        conflict_ids = {
+            candidate_id
+            for conflict in manifest.conflicts
+            for candidate_id in (
+                conflict.selected_candidate_identity,
+                conflict.conflicting_candidate_identity,
+            )
+        }
+        for provider_candidate in manifest.provider_candidates:
+            candidate = provider_candidate.candidate
+            assessment = provider_candidate.assessment
+            if (
+                candidate.candidate_identity not in selected_ids
+                or candidate.candidate_identity in conflict_ids
+                or not assessment.strict_pit_eligible
+            ):
+                continue
+            selected_fields = tuple(
+                field
+                for field in candidate.fields
+                if field.normalized_value is not None
+                and field.normalized_unit is not None
+            )
+            if not selected_fields:
+                continue
+            lines = tuple(
+                _canonical_json(
+                    {
+                        "artifact_identity": (
+                            candidate.artifact.artifact_identity
+                        ),
+                        "candidate_identity": candidate.candidate_identity,
+                        "canonical_field": field.normalized_field,
+                        "normalized_value": field.normalized_value,
+                        "period": assessment.period_end.isoformat(),
+                        "unit": field.normalized_unit,
+                    },
+                    label="financial selected period evidence",
+                )
+                for field in selected_fields
+            )
+            raw_text = "\n".join(lines)
+            source_ref = stable_acquisition_source_ref(
+                "financial.period",
+                manifest.manifest_identity,
+                candidate.candidate_identity,
+            )
+            artifact = SourceArtifact(
+                artifact_sha256=sha256(raw_text.encode("utf-8")).hexdigest(),
+                source_ref=source_ref,
+                tool_call_id=dispatch_result.tool_call_id,
+                tool_name=dispatch_result.request_key.tool_name,
+                raw_text=raw_text,
+            )
+            artifacts.append(artifact)
+            offset = 0
+            for field, line in zip(selected_fields, lines, strict=True):
+                effective_date = assessment.period_end.isoformat()
+                fact_id = stable_source_fact_id(
+                    source_ref=source_ref,
+                    artifact_sha256=artifact.artifact_sha256,
+                    source_span_start=offset,
+                    source_span_end=offset + len(line),
+                    canonical_field=field.normalized_field,
+                    instrument_symbol=(
+                        candidate.period_identity.instrument_identity.symbol
+                    ),
+                    effective_date=effective_date,
+                )
+                facts.append(
+                    SourceFact(
+                        fact_kind="canonical",
+                        fact_id=fact_id,
+                        source_ref=source_ref,
+                        tool_call_id=dispatch_result.tool_call_id,
+                        tool_name=dispatch_result.request_key.tool_name,
+                        artifact_sha256=artifact.artifact_sha256,
+                        raw_text=line,
+                        source_span_start=offset,
+                        source_span_end=offset + len(line),
+                        normalized_numeric_tokens=(
+                            field.normalized_value,
+                        ),
+                        canonical_field=field.normalized_field,
+                        normalized_value=field.normalized_value,
+                        unit=field.normalized_unit,
+                        instrument_symbol=(
+                            candidate.period_identity.instrument_identity.symbol
+                        ),
+                        effective_date=effective_date,
+                    )
+                )
+                offset += len(line) + 1
+    return tuple(artifacts), tuple(facts)
+
+
+def project_financial_selection_evidence(
+    evidence: EvidenceState | Mapping[str, Any] | None,
+    dispatch_result: (
+        FinancialStatementSelectionDispatchResult
+        | FinancialIndicatorSelectionDispatchResult
+    ),
+) -> EvidenceState:
+    """Project v2 operational attempts and strict selected periods into evidence."""
+
+    current = (
+        evidence
+        if isinstance(evidence, EvidenceState)
+        else EvidenceState.model_validate(evidence or {})
+    )
+    expected_identity = dispatch_result.selection_request.instrument_identity
+    if (
+        current.instrument_identity is not None
+        and current.instrument_identity != expected_identity
+    ):
+        raise ValueError("financial selection contradicts Evidence State identity")
+    manifests = (
+        (dispatch_result.routing_result.manifest,)
+        if isinstance(
+            dispatch_result,
+            FinancialStatementSelectionDispatchResult,
+        )
+        else dispatch_result.routing_result.family_manifests
+    )
+    if not manifests or any(
+        manifest.contract_version != "financial-manifest-v2"
+        for manifest in manifests
+    ):
+        return current
+    attempt_events = {
+        event.attempt_event_id: event
+        for manifest in manifests
+        for event in manifest.physical_attempt_events
+    }
+    projected_attempts = _provider_attempt_evidence(
+        tuple(attempt_events.values())
+    )
+    merged_attempts = {
+        (
+            event.attempt_event_id
+            or f"{event.sequence_id}:{event.attempt_index}"
+        ): event
+        for event in current.physical_attempt_events
+    }
+    for event in projected_attempts:
+        key = event.attempt_event_id or (
+            f"{event.sequence_id}:{event.attempt_index}"
+        )
+        prior = merged_attempts.get(key)
+        if prior is not None and prior != event:
+            raise ValueError("financial physical attempt evidence is contradictory")
+        merged_attempts[key] = event
+    new_artifacts, new_facts = _selected_financial_evidence(
+        dispatch_result=dispatch_result,
+        manifests=manifests,
+    )
+    artifact_by_sha = {
+        artifact.artifact_sha256: artifact
+        for artifact in current.source_artifacts
+    }
+    for artifact in new_artifacts:
+        prior = artifact_by_sha.get(artifact.artifact_sha256)
+        if prior is not None and prior.model_dump(
+            mode="python",
+            exclude={"tool_call_id"},
+        ) != artifact.model_dump(
+            mode="python",
+            exclude={"tool_call_id"},
+        ):
+            raise ValueError("financial Source Artifact identity is contradictory")
+        artifact_by_sha.setdefault(artifact.artifact_sha256, artifact)
+    payload = current.model_dump(mode="python")
+    payload["instrument_identity"] = expected_identity
+    payload["source_artifacts"] = tuple(artifact_by_sha.values())
+    payload["source_facts"] = (*current.source_facts, *new_facts)
+    payload["physical_attempt_events"] = tuple(
+        sorted(
+            merged_attempts.values(),
+            key=lambda item: (item.sequence_id, item.attempt_index),
+        )
+    )
+    payload["physical_attempt_count"] = len(
+        payload["physical_attempt_events"]
+    )
+    return EvidenceState.model_validate(payload)
+
+
 def _validate_financial_dispatch_audit_integrity(
     ledger: FinancialDispatchCheckpointLedger,
     *,
@@ -2132,6 +3711,8 @@ def _validate_financial_dispatch_audit_integrity(
         RunAssetConfiguration | RunAssetConfigurationProjection | None
     ),
     config: Mapping[str, Any] | None,
+    capability_routing_plan: MainlandCapabilityRoutingPlan | None,
+    run_scope_id: str | None,
 ) -> None:
     """Fail closed before checkpoint state is authenticated in immutable audit."""
 
@@ -2139,6 +3720,29 @@ def _validate_financial_dispatch_audit_integrity(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
         )
+    if (
+        ledger.run_asset_configuration_version
+        != run_asset_configuration.asset_configuration_version
+        or ledger.run_asset_configuration_signature
+        != run_asset_configuration.asset_configuration_signature
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+        )
+    if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+        if run_scope_id != ledger.run_scope_id:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+            )
+        if (
+            capability_routing_plan is None
+            or capability_routing_plan.plan_signature
+            != ledger.capability_routing_plan_signature
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+            )
+        return
     effective_config = config
     if effective_config is None:
         from tradingagents.dataflows.config import get_config
@@ -2169,6 +3773,8 @@ def project_financial_dispatch_ledger(
         RunAssetConfiguration | RunAssetConfigurationProjection | None
     ) = None,
     config: Mapping[str, Any] | None = None,
+    capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
+    run_scope_id: str | None = None,
 ) -> FinancialDispatchAuditProjection | None:
     """Project terminal dispatch state without provider payload or correlation text."""
 
@@ -2184,6 +3790,8 @@ def project_financial_dispatch_ledger(
         ledger,
         run_asset_configuration=run_asset_configuration,
         config=config,
+        capability_routing_plan=capability_routing_plan,
+        run_scope_id=run_scope_id,
     )
     requests: list[FinancialDispatchAuditRequest] = []
     for entry in sorted(
@@ -2236,7 +3844,65 @@ def project_financial_dispatch_ledger(
                 outcomes=tuple(outcomes),
             )
         )
-    return FinancialDispatchAuditProjection(
+    if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+        manifest_requests: list[FinancialManifestAuditRequest] = []
+        completeness_rows: list[FinancialCompletenessAuditRow] = []
+        for entry in sorted(
+            ledger.qualified_statement_selections,
+            key=lambda item: item.canonical_request_key.request_key,
+        ):
+            request_projection, rows = (
+                _project_statement_manifest_audit_request(entry)
+            )
+            manifest_requests.append(request_projection)
+            completeness_rows.extend(rows)
+        for entry in sorted(
+            ledger.qualified_indicator_selections,
+            key=lambda item: item.canonical_request_key.request_key,
+        ):
+            request_projection, rows = (
+                _project_indicator_manifest_audit_request(entry)
+            )
+            manifest_requests.append(request_projection)
+            completeness_rows.extend(rows)
+        manifest_requests.sort(key=lambda item: item.request_ref)
+        completeness_rows.sort(
+            key=lambda item: (
+                item.capability.value,
+                item.statement_or_ratio_family,
+                item.period,
+                item.provider,
+                item.artifact_identity or "",
+            )
+        )
+        assert ledger.capability_routing_plan_signature is not None
+        return FinancialDispatchAuditProjectionV2(
+            capability_routing_plan_signature=(
+                ledger.capability_routing_plan_signature
+            ),
+            request_count=len(requests) + len(manifest_requests),
+            logical_provider_count=sum(
+                item.logical_provider_count for item in manifest_requests
+            ),
+            logical_candidate_count=sum(
+                item.logical_candidate_count for item in manifest_requests
+            ),
+            acquisition_attempt_count=(
+                sum(item.acquisition_attempt_count for item in requests)
+                + sum(item.physical_request_count for item in manifest_requests)
+            ),
+            duplicate_suppressed_count=(
+                sum(item.duplicate_suppressed_count for item in requests)
+                + sum(
+                    item.duplicate_suppressed_count
+                    for item in manifest_requests
+                )
+            ),
+            requests=tuple(requests),
+            manifest_requests=tuple(manifest_requests),
+            completeness_rows=tuple(completeness_rows),
+        )
+    return FinancialDispatchAuditProjectionV1(
         request_count=len(requests),
         acquisition_attempt_count=sum(
             item.acquisition_attempt_count for item in requests
@@ -2791,9 +4457,14 @@ __all__ = [
     "DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION",
     "FINANCIAL_DISPATCH_AUDIT_VERSION",
     "FINANCIAL_DISPATCH_LEDGER_VERSION",
+    "FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION",
+    "FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION",
+    "FinancialCompletenessAuditRow",
     "FinancialCircuitCheckpointState",
     "FinancialDispatchAuditOutcome",
     "FinancialDispatchAuditProjection",
+    "FinancialDispatchAuditProjectionV1",
+    "FinancialDispatchAuditProjectionV2",
     "FinancialDispatchAuditRequest",
     "FinancialDispatchCheckpointEntry",
     "FinancialDispatchCheckpointError",
@@ -2801,6 +4472,8 @@ __all__ = [
     "FinancialDispatchCheckpointLedger",
     "FinancialDispatchResult",
     "FinancialPlanOutcome",
+    "FinancialManifestAuditProjection",
+    "FinancialManifestAuditRequest",
     "FinancialProvider",
     "FinancialProviderChainCheckpointBinding",
     "FinancialProviderVariant",
@@ -2810,6 +4483,9 @@ __all__ = [
     "FinancialTerminalUnavailableEnvelope",
     "FinancialToolDispatcher",
     "FinancialToolMessageAuditEnvelope",
+    "FinancialToolMessageManifestEnvelope",
+    "FinancialToolManifestOperationalProjection",
     "FinancialToolRequest",
     "project_financial_dispatch_ledger",
+    "project_financial_selection_evidence",
 ]

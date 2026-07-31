@@ -7,7 +7,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from tradingagents.dataflows.financial_dispatch import FinancialDispatchAuditProjection
+from pydantic import TypeAdapter
+
+from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchAuditProjection,
+    FinancialDispatchAuditProjectionV2,
+)
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import TradingDecisionContract
 from tradingagents.evidence import (
@@ -269,6 +274,214 @@ def _render_financial_dispatch_operations(
 ) -> list[str]:
     if financial_dispatch is None:
         return []
+    if isinstance(financial_dispatch, FinancialDispatchAuditProjectionV2):
+        lines = [
+            "## Financial dispatch operations",
+            "",
+            (
+                "- **Capability Routing Plan:** "
+                f"`{financial_dispatch.capability_routing_plan_signature}`"
+            ),
+            (
+                "- **Financial manifest version:** "
+                f"{financial_dispatch.financial_manifest_version}"
+            ),
+            f"- **Canonical request count:** {financial_dispatch.request_count}",
+            (
+                "- **Logical provider count:** "
+                f"{financial_dispatch.logical_provider_count}"
+            ),
+            (
+                "- **Logical candidate count:** "
+                f"{financial_dispatch.logical_candidate_count}"
+            ),
+            (
+                "- **Physical request count:** "
+                f"{financial_dispatch.acquisition_attempt_count}"
+            ),
+            (
+                "- **Duplicate-suppressed call count:** "
+                f"{financial_dispatch.duplicate_suppressed_count}"
+            ),
+            "",
+        ]
+        for request in financial_dispatch.manifest_requests:
+            lines.extend(
+                [
+                    f"### `{request.tool_name}` qualified request",
+                    "",
+                    f"- **Request reference:** `{request.request_ref}`",
+                    (
+                        "- **Logical providers / candidates:** "
+                        f"{request.logical_provider_count} / "
+                        f"{request.logical_candidate_count}"
+                    ),
+                    (
+                        "- **Physical requests:** "
+                        f"{request.physical_request_count}"
+                    ),
+                ]
+            )
+            for manifest in request.manifests:
+                lines.extend(
+                    [
+                        (
+                            f"- **{manifest.statement_or_ratio_family} manifest:** "
+                            f"`{manifest.manifest_identity}`"
+                        ),
+                        f"  - Disposition: `{manifest.disposition.value}`",
+                        (
+                            "  - Final rendered artifact: "
+                            f"`{manifest.final_rendered_artifact_identity}`"
+                        ),
+                        (
+                            "  - Retained provider artifacts: "
+                            f"{len(manifest.artifact_identities)}"
+                        ),
+                        (
+                            "  - Physical attempt events: "
+                            f"{len(manifest.physical_attempt_events)}"
+                        ),
+                    ]
+                )
+                for artifact_identity in manifest.artifact_identities:
+                    lines.append(
+                        "  - Retained provider artifact identity: "
+                        f"`{artifact_identity}`"
+                    )
+                for attempt in manifest.physical_attempt_events:
+                    lines.append(
+                        "  - Physical attempt event identity: "
+                        f"`{attempt.attempt_event_id}`"
+                    )
+                for selection in manifest.selections:
+                    lines.append(
+                        "  - Selected lineage: "
+                        f"`{selection.provider_id}` / "
+                        f"`{selection.period_identity}` / "
+                        f"`{selection.artifact_identity}`"
+                    )
+                for rejection in manifest.rejected_periods:
+                    lines.append(
+                        "  - Rejected candidate: "
+                        f"`{rejection.candidate_identity}` "
+                        f"({', '.join(reason.value for reason in rejection.reasons)})"
+                    )
+                for outcome in manifest.acquisition_outcomes:
+                    lines.append(
+                        "  - Acquisition outcome: "
+                        f"`{outcome.provider_id}` / `{outcome.outcome}` / "
+                        f"`{outcome.reason.value if outcome.reason else 'available'}`"
+                    )
+                for overlap in manifest.overlaps:
+                    lines.append(
+                        "  - Overlap: "
+                        f"`{overlap.disposition}` / "
+                        f"`{overlap.overlapping_candidate_identity}`"
+                    )
+                for conflict in manifest.conflicts:
+                    lines.append(
+                        "  - Critical conflict: "
+                        f"`{conflict.normalized_field}` / "
+                        f"`{conflict.conflict_identity}`"
+                    )
+            lines.append("")
+        lines.extend(
+            [
+                "### Financial completeness",
+                "",
+                (
+                    "| Capability | Family | Period | Provider | Company type | "
+                    "Classification provenance | Metadata coverage | Ann date | "
+                    "F ann date | Report type | Provider comp type | Update flag | "
+                    "Revision observed | Local revision identity | Provider revision "
+                    "ID | Critical actual / threshold | Core actual / threshold | "
+                    "Disposition | Typed reason | PIT eligible | Artifact identity | "
+                    "Provider attempts | Since-listing exception | Listing date | "
+                    "Listing provider | Listing source |"
+                ),
+                (
+                    "|---|---|---|---|---|---|---:|---|---|---|---|---|---|---|"
+                    "---|---:|---:|---|---|---|---|---:|---|---|---|---|"
+                ),
+            ]
+        )
+        for row in financial_dispatch.completeness_rows:
+            provenance = (
+                (
+                    row.company_type_resolution_method.value
+                    if row.company_type_resolution_method is not None
+                    else "not_available"
+                )
+                + (
+                    ":" + ",".join(row.company_type_provenance)
+                    if row.company_type_provenance
+                    else ""
+                )
+            )
+            reasons = ", ".join(row.typed_reason) if row.typed_reason else "none"
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        row.capability.value,
+                        row.statement_or_ratio_family,
+                        row.period.isoformat(),
+                        row.provider,
+                        row.company_type.value,
+                        provenance,
+                        format(row.metadata_coverage, "f"),
+                        (
+                            row.ann_date.isoformat()
+                            if row.ann_date is not None
+                            else "none"
+                        ),
+                        (
+                            row.f_ann_date.isoformat()
+                            if row.f_ann_date is not None
+                            else "none"
+                        ),
+                        row.report_type or "none",
+                        row.provider_comp_type or "none",
+                        row.update_flag or "none",
+                        (
+                            row.revision_observed_at.isoformat()
+                            if row.revision_observed_at is not None
+                            else "none"
+                        ),
+                        row.local_provider_revision_identity or "none",
+                        row.provider_filing_revision_id or "none",
+                        (
+                            f"{format(row.critical_coverage, 'f')} / "
+                            f"{format(row.critical_threshold, 'f')}"
+                        ),
+                        (
+                            f"{format(row.core_coverage, 'f')} / "
+                            f"{format(row.core_threshold, 'f')}"
+                        ),
+                        row.disposition,
+                        reasons,
+                        "yes" if row.pit_eligible else "no",
+                        row.artifact_identity or "none",
+                        str(row.provider_attempt_count),
+                        (
+                            "yes"
+                            if row.since_listing_exception
+                            else "no"
+                        ),
+                        (
+                            row.listing_date.isoformat()
+                            if row.listing_date is not None
+                            else "none"
+                        ),
+                        row.listing_provider or "none",
+                        row.listing_source_ref or "none",
+                    )
+                )
+                + " |"
+            )
+        lines.append("")
+        return lines
     lines = [
         "## Financial dispatch operations",
         "",
@@ -453,7 +666,9 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     financial_dispatch = (
         None
         if raw_financial_dispatch is None
-        else FinancialDispatchAuditProjection.model_validate(raw_financial_dispatch)
+        else TypeAdapter(FinancialDispatchAuditProjection).validate_python(
+            raw_financial_dispatch
+        )
     )
     if identity.audit_digest is None:
         raise ValueError("canonical export identity is missing its audit digest")

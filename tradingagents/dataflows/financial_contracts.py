@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -12,6 +13,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestAttemptEvent,
+)
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     InstrumentIdentityEvidence,
@@ -31,6 +35,8 @@ FINANCIAL_PERIOD_SELECTION_V2 = "financial-period-selection-v2"
 FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1 = (
     "financial-period-selection-baostock-v1"
 )
+FINANCIAL_MANIFEST_V1 = "financial-manifest-v1"
+FINANCIAL_MANIFEST_V2 = "financial-manifest-v2"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
@@ -52,6 +58,17 @@ _UNSAFE_CONTRACT_TEXT = (
     "token=",
     "traceback",
 )
+_UNSAFE_TOKEN_LIKE_TEXT = re.compile(
+    r"(?:"
+    r"gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
+    r"|\b(?:[A-Za-z][A-Za-z0-9_]*Error|"
+    r"[A-Za-z][A-Za-z0-9_]*Exception|Exception):"
+    r")",
+    re.IGNORECASE,
+)
+_UNSAFE_URL_QUERY = re.compile(r"https?://\S*\?", re.IGNORECASE)
 _SECRET_IDENTITY_KEY_MARKERS = (
     "access_key",
     "api_key",
@@ -113,10 +130,37 @@ def _assert_safe_contract_payload(value: object) -> None:
         for item in value:
             _assert_safe_contract_payload(item)
         return
-    if isinstance(value, str) and any(
-        marker in value.casefold() for marker in _UNSAFE_CONTRACT_TEXT
+    if isinstance(value, str) and (
+        any(marker in value.casefold() for marker in _UNSAFE_CONTRACT_TEXT)
+        or _UNSAFE_TOKEN_LIKE_TEXT.search(value) is not None
     ):
         raise ValueError("financial contract text contains unsafe operational data")
+
+
+def assert_safe_financial_contract_payload(value: object) -> None:
+    """Reject credential-, token-, and raw-error-like contract text."""
+
+    _assert_safe_contract_payload(value)
+
+
+def assert_safe_financial_projection(value: object) -> None:
+    """Reject unsafe contract text plus URL queries at external projections."""
+
+    _assert_safe_contract_payload(value)
+    projected = (
+        value.model_dump(mode="json")
+        if isinstance(value, BaseModel)
+        else value
+    )
+    serialized = json.dumps(
+        projected,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if _UNSAFE_URL_QUERY.search(serialized) is not None:
+        raise ValueError("financial projection contains a URL query")
 
 
 def _project_identity_material(value: object) -> object:
@@ -296,6 +340,14 @@ class FinancialPeriodRejectionReason(str, Enum):
     INCOMPATIBLE_CURRENCY = "incompatible_currency"
     INCOMPATIBLE_CONSOLIDATION_SCOPE = "incompatible_consolidation_scope"
     AMBIGUOUS_COMPANY_TYPE = "ambiguous_company_type"
+
+
+class FinancialEvidenceDisposition(str, Enum):
+    CURRENT_ONLY = "current_only"
+    STRICT_PIT_ELIGIBLE = "strict_pit_eligible"
+    DEGRADED = "degraded"
+    INSUFFICIENT = "insufficient"
+    CONFLICTED = "conflicted"
 
 
 class FinancialCompanyTypeClassifierInput(BaseModel):
@@ -2688,8 +2740,45 @@ FinancialAggregateCompleteness = (
 )
 
 
+class FinancialRenderedArtifactIdentity(BaseModel):
+    """Content identity for the bounded normalized rendering exposed to the model."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-rendered-artifact-v1"] = (
+        "financial-rendered-artifact-v1"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-rendered-artifact:v1:[0-9a-f]{64}$"
+    )
+    content_sha256: str = Field(pattern=_SHA256_PATTERN)
+    media_type: Literal["application/json"] = "application/json"
+    byte_length: int = Field(ge=1)
+
+    @classmethod
+    def create(cls, rendered_value: str) -> FinancialRenderedArtifactIdentity:
+        if not isinstance(rendered_value, str) or not rendered_value:
+            raise ValueError("financial rendered artifact requires bounded content")
+        encoded = rendered_value.encode("utf-8")
+        digest = sha256(encoded).hexdigest()
+        return cls(
+            artifact_identity=f"financial-rendered-artifact:v1:{digest}",
+            content_sha256=digest,
+            byte_length=len(encoded),
+        )
+
+    @model_validator(mode="after")
+    def _validate_identity(self) -> FinancialRenderedArtifactIdentity:
+        if self.artifact_identity != (
+            f"financial-rendered-artifact:v1:{self.content_sha256}"
+        ):
+            raise ValueError("financial rendered artifact identity mismatch")
+        return self
+
+
 def _manifest_identity_payload(
     *,
+    contract_version: Literal["financial-manifest-v1", "financial-manifest-v2"],
     capability_routing_plan_signature: str,
     instrument_identity: InstrumentIdentityEvidence,
     requested_capability: FinancialCapability,
@@ -2703,9 +2792,12 @@ def _manifest_identity_payload(
     overlaps: Sequence[FinancialPeriodOverlapFinding],
     conflicts: Sequence[FinancialCriticalValueConflict],
     aggregate_completeness: FinancialAggregateCompleteness,
+    physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent] = (),
+    disposition: FinancialEvidenceDisposition | None = None,
+    final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None,
 ) -> dict[str, object]:
-    return {
-        "contract_version": "financial-manifest-v1",
+    payload: dict[str, object] = {
+        "contract_version": contract_version,
         "capability_routing_plan_signature": capability_routing_plan_signature,
         "instrument_identity": _authoritative_instrument_payload(instrument_identity),
         "requested_capability": requested_capability.value,
@@ -2734,6 +2826,24 @@ def _manifest_identity_payload(
         "conflicts": [item.model_dump(mode="json") for item in conflicts],
         "aggregate_completeness": aggregate_completeness.model_dump(mode="json"),
     }
+    if contract_version == FINANCIAL_MANIFEST_V2:
+        payload.update(
+            {
+                "physical_attempt_events": [
+                    item.model_dump(mode="json")
+                    for item in physical_attempt_events
+                ],
+                "disposition": (
+                    disposition.value if disposition is not None else None
+                ),
+                "final_rendered_artifact": (
+                    final_rendered_artifact.model_dump(mode="json")
+                    if final_rendered_artifact is not None
+                    else None
+                ),
+            }
+        )
+    return payload
 
 
 class FinancialAcquisitionManifest(BaseModel):
@@ -2741,7 +2851,10 @@ class FinancialAcquisitionManifest(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-manifest-v1"] = "financial-manifest-v1"
+    contract_version: Literal[
+        "financial-manifest-v1",
+        "financial-manifest-v2",
+    ] = FINANCIAL_MANIFEST_V1
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
     )
@@ -2763,7 +2876,10 @@ class FinancialAcquisitionManifest(BaseModel):
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
     aggregate_completeness: FinancialAggregateCompleteness
-    manifest_identity: str = Field(pattern=r"^financial-manifest:v1:[0-9a-f]{64}$")
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
+    disposition: FinancialEvidenceDisposition | None = None
+    final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None
+    manifest_identity: str = Field(pattern=r"^financial-manifest:v[12]:[0-9a-f]{64}$")
 
     @classmethod
     def create(
@@ -2817,6 +2933,7 @@ class FinancialAcquisitionManifest(BaseModel):
             sorted(conflicts, key=lambda item: item.conflict_identity)
         )
         payload = _manifest_identity_payload(
+            contract_version=FINANCIAL_MANIFEST_V1,
             capability_routing_plan_signature=capability_routing_plan_signature,
             instrument_identity=instrument_identity,
             requested_capability=requested_capability,
@@ -2846,6 +2963,63 @@ class FinancialAcquisitionManifest(BaseModel):
             conflicts=canonical_conflicts,
             aggregate_completeness=aggregate_completeness,
             manifest_identity="financial-manifest:v1:" + _canonical_digest(payload),
+        )
+
+    def finalize(
+        self,
+        *,
+        physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
+        disposition: FinancialEvidenceDisposition,
+        rendered_value: str,
+    ) -> FinancialAcquisitionManifest:
+        """Bind the v1 selection contract to Ticket 11 operational lineage."""
+
+        if self.contract_version != FINANCIAL_MANIFEST_V1:
+            raise ValueError("only a v1 financial manifest may be finalized")
+        canonical_attempts = tuple(
+            sorted(
+                physical_attempt_events,
+                key=lambda item: item.attempt_event_id,
+            )
+        )
+        final_rendered_artifact = FinancialRenderedArtifactIdentity.create(
+            rendered_value
+        )
+        payload = _manifest_identity_payload(
+            contract_version=FINANCIAL_MANIFEST_V2,
+            capability_routing_plan_signature=self.capability_routing_plan_signature,
+            instrument_identity=self.instrument_identity,
+            requested_capability=self.requested_capability,
+            requested_statement_type=self.requested_statement_type,
+            requested_ratio_family=self.requested_ratio_family,
+            artifacts=self.artifacts,
+            acquisition_outcomes=self.acquisition_outcomes,
+            provider_candidates=self.provider_candidates,
+            selections=self.selections,
+            rejected_periods=self.rejected_periods,
+            overlaps=self.overlaps,
+            conflicts=self.conflicts,
+            aggregate_completeness=self.aggregate_completeness,
+            physical_attempt_events=canonical_attempts,
+            disposition=disposition,
+            final_rendered_artifact=final_rendered_artifact,
+        )
+        return FinancialAcquisitionManifest(
+            **self.model_dump(
+                mode="python",
+                exclude={
+                    "contract_version",
+                    "physical_attempt_events",
+                    "disposition",
+                    "final_rendered_artifact",
+                    "manifest_identity",
+                },
+            ),
+            contract_version=FINANCIAL_MANIFEST_V2,
+            physical_attempt_events=canonical_attempts,
+            disposition=disposition,
+            final_rendered_artifact=final_rendered_artifact,
+            manifest_identity="financial-manifest:v2:" + _canonical_digest(payload),
         )
 
     @model_validator(mode="after")
@@ -2924,6 +3098,28 @@ class FinancialAcquisitionManifest(BaseModel):
             sorted(self.conflicts, key=lambda item: item.conflict_identity)
         ):
             raise ValueError("manifest conflicts must be canonical")
+        if self.contract_version == FINANCIAL_MANIFEST_V1:
+            if (
+                self.physical_attempt_events
+                or self.disposition is not None
+                or self.final_rendered_artifact is not None
+            ):
+                raise ValueError("legacy financial manifest carries v2 lineage")
+        else:
+            if self.disposition is None or self.final_rendered_artifact is None:
+                raise ValueError("financial manifest v2 operational lineage is incomplete")
+            if self.physical_attempt_events != tuple(
+                sorted(
+                    self.physical_attempt_events,
+                    key=lambda item: item.attempt_event_id,
+                )
+            ):
+                raise ValueError("financial manifest attempts must be canonical")
+            attempt_ids = tuple(
+                item.attempt_event_id for item in self.physical_attempt_events
+            )
+            if len(attempt_ids) != len(set(attempt_ids)):
+                raise ValueError("financial manifest attempt identities must be unique")
         artifact_ids = tuple(item.artifact.artifact_identity for item in self.artifacts)
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("manifest artifact identities must be unique")
@@ -3018,6 +3214,7 @@ class FinancialAcquisitionManifest(BaseModel):
         ):
             raise ValueError("manifest overlap binding is absent")
         payload = _manifest_identity_payload(
+            contract_version=self.contract_version,
             capability_routing_plan_signature=self.capability_routing_plan_signature,
             instrument_identity=self.instrument_identity,
             requested_capability=self.requested_capability,
@@ -3031,8 +3228,15 @@ class FinancialAcquisitionManifest(BaseModel):
             overlaps=self.overlaps,
             conflicts=self.conflicts,
             aggregate_completeness=self.aggregate_completeness,
+            physical_attempt_events=self.physical_attempt_events,
+            disposition=self.disposition,
+            final_rendered_artifact=self.final_rendered_artifact,
         )
-        expected = "financial-manifest:v1:" + _canonical_digest(payload)
+        expected = (
+            "financial-manifest:"
+            f"{'v2' if self.contract_version == FINANCIAL_MANIFEST_V2 else 'v1'}:"
+            + _canonical_digest(payload)
+        )
         if self.manifest_identity != expected:
             raise ValueError("financial acquisition manifest identity mismatch")
         return self
@@ -3042,6 +3246,8 @@ __all__ = [
     "FINANCIAL_PERIOD_SELECTION_V1",
     "FINANCIAL_PERIOD_SELECTION_V2",
     "FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1",
+    "FINANCIAL_MANIFEST_V1",
+    "FINANCIAL_MANIFEST_V2",
     "FINANCIAL_RATIO_DECLARATION_V1",
     "FINANCIAL_RATIO_DECLARATION_V2",
     "FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1",
@@ -3053,6 +3259,7 @@ __all__ = [
     "FinancialCompanyTypeResolutionMethod",
     "FinancialConsolidationScope",
     "FinancialCriticalValueConflict",
+    "FinancialEvidenceDisposition",
     "FinancialFieldValue",
     "FinancialFieldSetDeclaration",
     "FinancialFilingMetadata",
@@ -3070,6 +3277,7 @@ __all__ = [
     "FinancialProviderCandidate",
     "FinancialProviderDatasetIdentity",
     "FinancialRejectedPeriod",
+    "FinancialRenderedArtifactIdentity",
     "FinancialRatioFieldSetDeclaration",
     "FinancialRatioFamily",
     "FinancialRatioHistoryCompletenessAssessment",
@@ -3080,6 +3288,8 @@ __all__ = [
     "assess_financial_period_candidate",
     "assess_financial_history_coverage",
     "assess_financial_ratio_history_coverage",
+    "assert_safe_financial_contract_payload",
+    "assert_safe_financial_projection",
     "compare_financial_period_candidates",
     "financial_ratio_field_declaration",
     "financial_statement_field_declaration",

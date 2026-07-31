@@ -11,6 +11,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date
 from enum import Enum
+from hashlib import sha256
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -27,6 +28,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialCompanyType,
     FinancialConsolidationScope,
     FinancialCriticalValueConflict,
+    FinancialEvidenceDisposition,
     FinancialListingProvenance,
     FinancialPeriodCandidate,
     FinancialPeriodCompletenessAssessment,
@@ -49,6 +51,9 @@ from tradingagents.dataflows.financial_contracts import (
     mark_financial_period_company_type_conflicted,
     mark_financial_period_conflicted,
 )
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestAttemptEvent,
+)
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     InstrumentIdentityEvidence,
@@ -69,6 +74,10 @@ _ROUTABLE_DATASET_CAPABILITIES = frozenset(
         MainlandCapability.ISSUER_LIFECYCLE,
     }
 )
+
+
+def _rendered_sha256(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
 
 
 class FinancialProviderResponseKind(str, Enum):
@@ -168,6 +177,7 @@ class FinancialProviderPeriodResponse(BaseModel):
     reason: AcquisitionUnavailableReason | None = None
     subrequest_keys: tuple[str, ...] = ()
     physical_attempt_ids: tuple[str, ...] = ()
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
     degraded_current_profile: bool = False
     subrequest_outcomes: tuple[FinancialSubrequestAcquisitionOutcome, ...] = ()
     adapter_row_rejections: tuple[FinancialAdapterRowRejection, ...] = ()
@@ -182,6 +192,7 @@ class FinancialProviderPeriodResponse(BaseModel):
         candidates: Sequence[FinancialPeriodCandidate],
         subrequest_keys: Sequence[str],
         physical_attempt_ids: Sequence[str],
+        physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent] = (),
         degraded_current_profile: bool = False,
         subrequest_outcomes: Sequence[FinancialSubrequestAcquisitionOutcome] = (),
         adapter_row_rejections: Sequence[FinancialAdapterRowRejection] = (),
@@ -194,6 +205,7 @@ class FinancialProviderPeriodResponse(BaseModel):
             candidates=tuple(candidates),
             subrequest_keys=tuple(subrequest_keys),
             physical_attempt_ids=tuple(physical_attempt_ids),
+            physical_attempt_events=tuple(physical_attempt_events),
             degraded_current_profile=degraded_current_profile,
             subrequest_outcomes=tuple(subrequest_outcomes),
             adapter_row_rejections=tuple(adapter_row_rejections),
@@ -207,6 +219,7 @@ class FinancialProviderPeriodResponse(BaseModel):
         reason: AcquisitionUnavailableReason | str,
         subrequest_keys: Sequence[str] = (),
         physical_attempt_ids: Sequence[str] = (),
+        physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent] = (),
         subrequest_outcomes: Sequence[FinancialSubrequestAcquisitionOutcome] = (),
     ) -> FinancialProviderPeriodResponse:
         return cls(
@@ -215,6 +228,7 @@ class FinancialProviderPeriodResponse(BaseModel):
             reason=AcquisitionUnavailableReason(reason),
             subrequest_keys=tuple(subrequest_keys),
             physical_attempt_ids=tuple(physical_attempt_ids),
+            physical_attempt_events=tuple(physical_attempt_events),
             subrequest_outcomes=tuple(subrequest_outcomes),
         )
 
@@ -224,6 +238,18 @@ class FinancialProviderPeriodResponse(BaseModel):
             raise ValueError("provider response subrequest keys must be unique")
         if len(self.physical_attempt_ids) != len(set(self.physical_attempt_ids)):
             raise ValueError("provider response physical attempts must be unique")
+        attempt_event_ids = tuple(
+            item.attempt_event_id for item in self.physical_attempt_events
+        )
+        if self.physical_attempt_events and (
+            len(attempt_event_ids) != len(set(attempt_event_ids))
+            or set(attempt_event_ids) != set(self.physical_attempt_ids)
+            or any(
+                item.request_key not in set(self.subrequest_keys)
+                for item in self.physical_attempt_events
+            )
+        ):
+            raise ValueError("provider response physical attempt events are invalid")
         if any(
             item.provider_id != self.provider_id
             or item.subrequest_key not in set(self.subrequest_keys)
@@ -380,6 +406,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     ratio_families: tuple[FinancialRatioFamily, ...]
     eligible_reporting_period_ends: tuple[date, ...]
+    remaining_evidence_decision_ready: bool = False
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialIndicatorRoutingRequest:
@@ -622,6 +649,7 @@ class FinancialProviderRouteCall(BaseModel):
     conflicted_reporting_period_ends: tuple[date, ...] = ()
     subrequest_keys: tuple[str, ...]
     physical_attempt_ids: tuple[str, ...]
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
     subrequest_outcomes: tuple[FinancialSubrequestAcquisitionOutcome, ...] = ()
     adapter_row_rejections: tuple[FinancialAdapterRowRejection, ...] = ()
 
@@ -636,6 +664,7 @@ class FinancialIndicatorProviderRouteCall(BaseModel):
     ]
     subrequest_keys: tuple[str, ...]
     physical_attempt_ids: tuple[str, ...]
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
     subrequest_outcomes: tuple[FinancialSubrequestAcquisitionOutcome, ...] = ()
     adapter_row_rejections: tuple[FinancialAdapterRowRejection, ...] = ()
 
@@ -665,6 +694,17 @@ class FinancialStatementRoutingResult(BaseModel):
             raise ValueError("statement routing candidates contradict manifest selections")
         if len(self.physical_attempt_ids) != len(set(self.physical_attempt_ids)):
             raise ValueError("statement routing attempts must be unique")
+        manifest_attempt_ids = tuple(
+            item.attempt_event_id
+            for item in self.manifest.physical_attempt_events
+        )
+        if self.manifest.contract_version == "financial-manifest-v2" and (
+            set(manifest_attempt_ids) != set(self.physical_attempt_ids)
+            or self.manifest.final_rendered_artifact is None
+            or self.manifest.final_rendered_artifact.content_sha256
+            != _rendered_sha256(render_statement_routing_result(self))
+        ):
+            raise ValueError("statement routing manifest operational binding is invalid")
         return self
 
 
@@ -687,6 +727,7 @@ class FinancialIndicatorRoutingResult(BaseModel):
     current_profile_degraded: bool = False
     current_profile_provider: Literal["yfinance"] | None = None
     physical_attempt_ids: tuple[str, ...]
+    physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
@@ -704,6 +745,13 @@ class FinancialIndicatorRoutingResult(BaseModel):
             raise ValueError("missing indicator families must be canonical")
         if len(self.physical_attempt_ids) != len(set(self.physical_attempt_ids)):
             raise ValueError("indicator routing attempts must be unique")
+        event_ids = tuple(
+            event.attempt_event_id for event in self.physical_attempt_events
+        )
+        if self.physical_attempt_events and set(event_ids) != set(
+            self.physical_attempt_ids
+        ):
+            raise ValueError("indicator routing attempt events are inconsistent")
         if self.current_profile_degraded != (
             self.current_profile_provider == "yfinance"
         ):
@@ -717,6 +765,26 @@ class FinancialIndicatorRoutingResult(BaseModel):
             candidate.candidate_identity for candidate in self.selected_candidates
         }:
             raise ValueError("indicator candidates contradict family manifests")
+        v2_manifests = tuple(
+            manifest
+            for manifest in self.family_manifests
+            if manifest.contract_version == "financial-manifest-v2"
+        )
+        if v2_manifests and (
+            len(v2_manifests) != len(self.family_manifests)
+            or any(
+                manifest.final_rendered_artifact is None
+                or manifest.final_rendered_artifact.content_sha256
+                != _rendered_sha256(render_indicator_routing_result(self))
+                or {
+                    event.attempt_event_id
+                    for event in manifest.physical_attempt_events
+                }
+                != set(self.physical_attempt_ids)
+                for manifest in v2_manifests
+            )
+        ):
+            raise ValueError("indicator manifest operational binding is invalid")
         return self
 
 
@@ -985,6 +1053,7 @@ class MainlandFinancialCapabilityRouter:
         conflicted_keys: set[tuple[str, date]] = set()
         provider_calls: list[FinancialProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
+        physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
 
         for provider_id in route:
             missing_keys = target_keys - set(selections)
@@ -1023,6 +1092,7 @@ class MainlandFinancialCapabilityRouter:
                     ),
                     subrequest_keys=response.subrequest_keys,
                     physical_attempt_ids=response.physical_attempt_ids,
+                    physical_attempt_events=response.physical_attempt_events,
                     subrequest_outcomes=response.subrequest_outcomes,
                     adapter_row_rejections=response.adapter_row_rejections,
                 )
@@ -1030,6 +1100,8 @@ class MainlandFinancialCapabilityRouter:
             for attempt_id in response.physical_attempt_ids:
                 if attempt_id not in physical_attempt_ids:
                     physical_attempt_ids.append(attempt_id)
+            for event in response.physical_attempt_events:
+                physical_attempt_events.setdefault(event.attempt_event_id, event)
             acquisition_outcomes.extend(
                 _manifest_acquisition_outcomes(
                     response,
@@ -1195,7 +1267,7 @@ class MainlandFinancialCapabilityRouter:
             conflicts=conflicts,
             aggregate_completeness=aggregate,
         )
-        return FinancialStatementRoutingResult(
+        result = FinancialStatementRoutingResult(
             route=route,
             provider_calls=tuple(provider_calls),
             manifest=manifest,
@@ -1220,6 +1292,15 @@ class MainlandFinancialCapabilityRouter:
             ),
             physical_attempt_ids=tuple(physical_attempt_ids),
         )
+        if not physical_attempt_events:
+            return result
+        disposition = financial_statement_evidence_disposition(result)
+        finalized_manifest = manifest.finalize(
+            physical_attempt_events=tuple(physical_attempt_events.values()),
+            disposition=disposition,
+            rendered_value=render_statement_routing_result(result),
+        )
+        return result.model_copy(update={"manifest": finalized_manifest})
 
     def route_indicators(
         self,
@@ -1250,6 +1331,7 @@ class MainlandFinancialCapabilityRouter:
         conflicted_keys: set[tuple[FinancialRatioFamily, date]] = set()
         provider_calls: list[FinancialIndicatorProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
+        physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
         current_profile_provider: Literal["yfinance"] | None = None
 
         for provider_id in route:
@@ -1285,6 +1367,7 @@ class MainlandFinancialCapabilityRouter:
                     missing_periods_by_family=missing_by_family,
                     subrequest_keys=response.subrequest_keys,
                     physical_attempt_ids=response.physical_attempt_ids,
+                    physical_attempt_events=response.physical_attempt_events,
                     subrequest_outcomes=response.subrequest_outcomes,
                     adapter_row_rejections=response.adapter_row_rejections,
                 )
@@ -1292,6 +1375,8 @@ class MainlandFinancialCapabilityRouter:
             for attempt_id in response.physical_attempt_ids:
                 if attempt_id not in physical_attempt_ids:
                     physical_attempt_ids.append(attempt_id)
+            for event in response.physical_attempt_events:
+                physical_attempt_events.setdefault(event.attempt_event_id, event)
             acquisition_outcomes.extend(
                 _manifest_acquisition_outcomes(
                     response,
@@ -1501,7 +1586,7 @@ class MainlandFinancialCapabilityRouter:
                 )
             )
 
-        return FinancialIndicatorRoutingResult(
+        result = FinancialIndicatorRoutingResult(
             route=route,
             provider_calls=tuple(provider_calls),
             family_manifests=tuple(family_manifests),
@@ -1538,7 +1623,24 @@ class MainlandFinancialCapabilityRouter:
             current_profile_degraded=current_profile_provider is not None,
             current_profile_provider=current_profile_provider,
             physical_attempt_ids=tuple(physical_attempt_ids),
+            physical_attempt_events=tuple(physical_attempt_events.values()),
         )
+        if not physical_attempt_events:
+            return result
+        rendered_value = render_indicator_routing_result(result)
+        finalized_manifests = tuple(
+            manifest.finalize(
+                physical_attempt_events=tuple(physical_attempt_events.values()),
+                disposition=financial_indicator_evidence_disposition(
+                    manifest,
+                    result,
+                    request,
+                ),
+                rendered_value=rendered_value,
+            )
+            for manifest in result.family_manifests
+        )
+        return result.model_copy(update={"family_manifests": finalized_manifests})
 
 
 def _statement_gap_request(
@@ -1657,6 +1759,11 @@ def financial_period_response_from_statement_adapter(
             reason=unavailable_reason,
             subrequest_keys=subrequest_keys,
             physical_attempt_ids=physical_attempt_ids,
+            physical_attempt_events=tuple(
+                event
+                for event in result.attempt_events
+                if isinstance(event, ProviderSubrequestAttemptEvent)
+            ),
             subrequest_outcomes=(
                 FinancialSubrequestAcquisitionOutcome(
                     provider_id=actual_provider,
@@ -1686,6 +1793,11 @@ def financial_period_response_from_statement_adapter(
         ),
         subrequest_keys=subrequest_keys,
         physical_attempt_ids=physical_attempt_ids,
+        physical_attempt_events=tuple(
+            event
+            for event in result.attempt_events
+            if isinstance(event, ProviderSubrequestAttemptEvent)
+        ),
         subrequest_outcomes=(
             FinancialSubrequestAcquisitionOutcome(
                 provider_id=actual_provider,
@@ -1719,6 +1831,7 @@ def financial_period_response_from_indicator_adapter(
         )
     subrequest_keys: list[str] = []
     physical_attempt_ids: list[str] = []
+    physical_attempt_events: list[ProviderSubrequestAttemptEvent] = []
     retained: dict[str, FinancialProviderArtifactIdentity] = {}
     candidates: list[FinancialPeriodCandidate] = []
     available_results: list[Any] = []
@@ -1740,6 +1853,8 @@ def financial_period_response_from_indicator_adapter(
             attempt_id = str(event.attempt_event_id)
             if attempt_id not in physical_attempt_ids:
                 physical_attempt_ids.append(attempt_id)
+                if isinstance(event, ProviderSubrequestAttemptEvent):
+                    physical_attempt_events.append(event)
         outcome_kind = str(operational.outcome.kind.value)
         if outcome_kind != "available":
             subrequest_outcomes.append(
@@ -1781,6 +1896,7 @@ def financial_period_response_from_indicator_adapter(
             reason=_subrequest_unavailable_reason(first_kind),
             subrequest_keys=subrequest_keys,
             physical_attempt_ids=physical_attempt_ids,
+            physical_attempt_events=physical_attempt_events,
             subrequest_outcomes=subrequest_outcomes,
         )
     response_artifact = available_results[0].artifact
@@ -1792,6 +1908,7 @@ def financial_period_response_from_indicator_adapter(
         candidates=candidates,
         subrequest_keys=subrequest_keys,
         physical_attempt_ids=physical_attempt_ids,
+        physical_attempt_events=physical_attempt_events,
         subrequest_outcomes=subrequest_outcomes,
         adapter_row_rejections=adapter_row_rejections,
     )
@@ -1910,6 +2027,96 @@ def _adapter_rejection_manifest_outcomes(
         for rejection in response.adapter_row_rejections
         for reason in rejection.reasons
     )
+
+
+def financial_statement_evidence_disposition(
+    result: FinancialStatementRoutingResult,
+) -> FinancialEvidenceDisposition:
+    if (
+        result.conflicted_annual_period_ends
+        or result.conflicted_reporting_period_ends
+        or result.manifest.conflicts
+    ):
+        return FinancialEvidenceDisposition.CONFLICTED
+    if not result.manifest.aggregate_completeness.complete:
+        return FinancialEvidenceDisposition.INSUFFICIENT
+    if any(
+        selection.disposition == "current_only"
+        for selection in result.manifest.selections
+    ):
+        return FinancialEvidenceDisposition.CURRENT_ONLY
+    return FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+
+
+def financial_indicator_evidence_disposition(
+    manifest: FinancialAcquisitionManifest,
+    result: FinancialIndicatorRoutingResult,
+    request: FinancialIndicatorRoutingRequest,
+) -> FinancialEvidenceDisposition:
+    if manifest.conflicts:
+        return FinancialEvidenceDisposition.CONFLICTED
+    if manifest.aggregate_completeness.complete:
+        if any(
+            selection.disposition == "current_only"
+            for selection in manifest.selections
+        ):
+            return FinancialEvidenceDisposition.CURRENT_ONLY
+        return FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+    if request.remaining_evidence_decision_ready and (
+        result.current_profile_degraded or manifest.selections
+    ):
+        return FinancialEvidenceDisposition.DEGRADED
+    return FinancialEvidenceDisposition.INSUFFICIENT
+
+
+def finalize_statement_routing_result(
+    result: FinancialStatementRoutingResult,
+    *,
+    physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
+) -> FinancialStatementRoutingResult:
+    """Upgrade one qualified statement result to the run-scoped v2 manifest."""
+
+    if result.manifest.contract_version == "financial-manifest-v2":
+        return result
+    finalized = result.manifest.finalize(
+        physical_attempt_events=physical_attempt_events,
+        disposition=financial_statement_evidence_disposition(result),
+        rendered_value=render_statement_routing_result(result),
+    )
+    payload = result.model_dump(mode="python")
+    payload["manifest"] = finalized
+    return FinancialStatementRoutingResult.model_validate(payload)
+
+
+def finalize_indicator_routing_result(
+    result: FinancialIndicatorRoutingResult,
+    *,
+    request: FinancialIndicatorRoutingRequest,
+    physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
+) -> FinancialIndicatorRoutingResult:
+    """Upgrade all families in one qualified indicator result to v2."""
+
+    if all(
+        manifest.contract_version == "financial-manifest-v2"
+        for manifest in result.family_manifests
+    ):
+        return result
+    rendered_value = render_indicator_routing_result(result)
+    finalized = tuple(
+        manifest.finalize(
+            physical_attempt_events=physical_attempt_events,
+            disposition=financial_indicator_evidence_disposition(
+                manifest,
+                result,
+                request,
+            ),
+            rendered_value=rendered_value,
+        )
+        for manifest in result.family_manifests
+    )
+    payload = result.model_dump(mode="python")
+    payload["family_manifests"] = finalized
+    return FinancialIndicatorRoutingResult.model_validate(payload)
 
 
 def render_statement_routing_result(

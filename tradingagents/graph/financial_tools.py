@@ -24,6 +24,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialStatementType,
     FinancialToolDispatcher,
     FinancialToolRequest,
+    project_financial_selection_evidence,
 )
 from tradingagents.evidence import EvidenceState
 
@@ -162,23 +163,29 @@ class FinancialDispatchToolNode:
                 is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                 and self._qualified_indicator_request_factory is not None
             ):
-                tool_messages.append(
-                    dispatcher.dispatch_indicator_selection_tool_message(
-                        request,
-                        self._qualified_indicator_request_factory(request),
-                    )
+                dispatch_result = dispatcher.dispatch_indicator_selection(
+                    request,
+                    self._qualified_indicator_request_factory(request),
                 )
+                evidence = project_financial_selection_evidence(
+                    evidence,
+                    dispatch_result,
+                )
+                tool_messages.append(dispatch_result.to_tool_message())
             elif (
                 request.statement_type
                 is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                 and self._qualified_statement_request_factory is not None
             ):
-                tool_messages.append(
-                    dispatcher.dispatch_statement_selection_tool_message(
-                        request,
-                        self._qualified_statement_request_factory(request),
-                    )
+                dispatch_result = dispatcher.dispatch_statement_selection(
+                    request,
+                    self._qualified_statement_request_factory(request),
                 )
+                evidence = project_financial_selection_evidence(
+                    evidence,
+                    dispatch_result,
+                )
+                tool_messages.append(dispatch_result.to_tool_message())
             else:
                 tool_messages.append(dispatcher.dispatch_tool_message(request))
         from tradingagents.dataflows.market_snapshot import (
@@ -259,6 +266,11 @@ class FinancialDispatchToolNode:
             sleeper=self._sleeper,
             checkpoint_ledger=state.get("financial_dispatch_ledger"),
             qualified_statement_router=self._qualified_statement_router,
+            run_scope_id=(
+                str(state["run_id"])
+                if state.get("run_id") is not None
+                else None
+            ),
         )
         return dispatcher, evidence
 

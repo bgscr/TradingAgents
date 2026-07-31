@@ -518,6 +518,12 @@ def build_decision_audit(
         final_state.get("financial_dispatch_ledger"),
         run_asset_configuration=asset_configuration,
         config=config,
+        capability_routing_plan=capability_routing_plan,
+        run_scope_id=(
+            str(final_state["run_id"])
+            if final_state.get("run_id") is not None
+            else None
+        ),
     )
     final_state["financial_dispatch_audit_projection"] = (
         financial_dispatch.model_dump(mode="json")
