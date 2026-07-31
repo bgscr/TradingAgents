@@ -38,6 +38,15 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
+from tradingagents.dataflows.financial_capability_routing import (
+    FinancialIndicatorRoutingRequest,
+    FinancialIndicatorRoutingResult,
+    FinancialStatementRoutingRequest,
+    FinancialStatementRoutingResult,
+    MainlandFinancialCapabilityRouter,
+    render_indicator_routing_result,
+    render_statement_routing_result,
+)
 from tradingagents.dataflows.financial_contracts import (
     FinancialCapability,
     FinancialConsolidationScope,
@@ -69,6 +78,7 @@ FINANCIAL_REQUEST_KEY_VERSION = "1.0"
 FINANCIAL_PROVIDER_CHAIN_VERSION = "1.0"
 FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
 FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
+FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION = "1.1"
 FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
@@ -411,6 +421,122 @@ class FinancialDispatchResult(BaseModel):
         )
 
 
+class FinancialStatementSelectionDispatchResult(BaseModel):
+    """Qualified-v1 terminal selection owned by the dispatcher single-flight."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-statement-selection-dispatch-v1"] = (
+        "financial-statement-selection-dispatch-v1"
+    )
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    disposition: Literal["executed", "duplicate_suppressed"]
+    request_key: CanonicalFinancialRequestKey
+    selection_request: FinancialStatementRoutingRequest
+    routing_result: FinancialStatementRoutingResult
+    rendered_value: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_result(self) -> FinancialStatementSelectionDispatchResult:
+        if (
+            self.request_key.statement_type is not self.selection_request.statement_type
+            or self.request_key.as_of_date != self.selection_request.as_of_date
+            or self.routing_result.manifest.instrument_identity
+            != self.selection_request.instrument_identity
+            or self.request_key.capability_routing_plan_signature
+            != self.routing_result.manifest.capability_routing_plan_signature
+            or self.rendered_value
+            != render_statement_routing_result(self.routing_result)
+        ):
+            raise ValueError("qualified financial selection binding is invalid")
+        return self
+
+    def to_tool_message(self) -> ToolMessage:
+        insufficient = bool(
+            self.routing_result.missing_annual_period_ends
+            or self.routing_result.missing_reporting_period_ends
+            or self.routing_result.conflicted_annual_period_ends
+            or self.routing_result.conflicted_reporting_period_ends
+        )
+        return ToolMessage(
+            content=self.rendered_value,
+            tool_call_id=self.tool_call_id,
+            name=self.request_key.tool_name,
+            artifact={
+                "contract_version": "financial-statement-selection-dispatch-v1",
+                "request_ref": self.request_key.request_key,
+                "disposition": self.disposition,
+                "manifest_identity": self.routing_result.manifest.manifest_identity,
+                "physical_attempt_count": len(
+                    self.routing_result.physical_attempt_ids
+                ),
+            },
+            status="error" if insufficient else "success",
+        )
+
+
+class FinancialIndicatorSelectionDispatchResult(BaseModel):
+    """Qualified-v1 indicator selection owned by dispatcher single-flight."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-indicator-selection-dispatch-v1"] = (
+        "financial-indicator-selection-dispatch-v1"
+    )
+    tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
+    disposition: Literal["executed", "duplicate_suppressed"]
+    request_key: CanonicalFinancialRequestKey
+    selection_request: FinancialIndicatorRoutingRequest
+    routing_result: FinancialIndicatorRoutingResult
+    rendered_value: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_result(self) -> FinancialIndicatorSelectionDispatchResult:
+        signatures = {
+            manifest.capability_routing_plan_signature
+            for manifest in self.routing_result.family_manifests
+        }
+        if (
+            self.request_key.statement_type
+            is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+            or self.request_key.as_of_date != self.selection_request.as_of_date
+            or any(
+                manifest.instrument_identity
+                != self.selection_request.instrument_identity
+                for manifest in self.routing_result.family_manifests
+            )
+            or signatures != {self.request_key.capability_routing_plan_signature}
+            or self.rendered_value
+            != render_indicator_routing_result(self.routing_result)
+        ):
+            raise ValueError("qualified indicator selection binding is invalid")
+        return self
+
+    def to_tool_message(self) -> ToolMessage:
+        return ToolMessage(
+            content=self.rendered_value,
+            tool_call_id=self.tool_call_id,
+            name=self.request_key.tool_name,
+            artifact={
+                "contract_version": "financial-indicator-selection-dispatch-v1",
+                "request_ref": self.request_key.request_key,
+                "disposition": self.disposition,
+                "manifest_identities": [
+                    manifest.manifest_identity
+                    for manifest in self.routing_result.family_manifests
+                ],
+                "physical_attempt_count": len(
+                    self.routing_result.physical_attempt_ids
+                ),
+            },
+            status=(
+                "error"
+                if self.routing_result.missing_periods_by_family
+                else "success"
+            ),
+        )
+
+
 class FinancialDispatchCheckpointFailureReason(str, Enum):
     MALFORMED = "financial_dispatch_checkpoint_malformed"
     UNSAFE_BOUNDARY = "financial_dispatch_checkpoint_unsafe_boundary"
@@ -433,6 +559,9 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
     )
     PROVIDER_SUBREQUEST_CACHE_INVALID = (
         "financial_dispatch_checkpoint_provider_subrequest_cache_invalid"
+    )
+    QUALIFIED_SELECTION_INVALID = (
+        "financial_dispatch_checkpoint_qualified_selection_invalid"
     )
 
 
@@ -524,12 +653,46 @@ class FinancialDispatchCheckpointEntry(BaseModel):
     reuse_count: int = Field(default=0, ge=0)
 
 
+class FinancialStatementSelectionCheckpointEntry(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-statement-selection-checkpoint-v1"] = (
+        "financial-statement-selection-checkpoint-v1"
+    )
+    canonical_request_key: CanonicalFinancialRequestKey
+    terminal: FinancialStatementSelectionDispatchResult
+    reuse_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_entry(self) -> FinancialStatementSelectionCheckpointEntry:
+        if self.terminal.request_key != self.canonical_request_key:
+            raise ValueError("qualified selection checkpoint request key mismatch")
+        return self
+
+
+class FinancialIndicatorSelectionCheckpointEntry(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-indicator-selection-checkpoint-v1"] = (
+        "financial-indicator-selection-checkpoint-v1"
+    )
+    canonical_request_key: CanonicalFinancialRequestKey
+    terminal: FinancialIndicatorSelectionDispatchResult
+    reuse_count: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_entry(self) -> FinancialIndicatorSelectionCheckpointEntry:
+        if self.terminal.request_key != self.canonical_request_key:
+            raise ValueError("qualified indicator checkpoint request key mismatch")
+        return self
+
+
 class FinancialDispatchCheckpointLedger(BaseModel):
     """Optional versioned state stored in the AgentState checkpoint channel."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = FINANCIAL_DISPATCH_LEDGER_VERSION
+    contract_version: Literal["1.0", "1.1"] = FINANCIAL_DISPATCH_LEDGER_VERSION
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     retry_policy: RetryPolicy
     provider_chain_identities: tuple[
@@ -542,6 +705,40 @@ class FinancialDispatchCheckpointLedger(BaseModel):
     circuit_state: tuple[FinancialCircuitCheckpointState, ...] = ()
     provider_subrequest_cache: ProviderSubrequestCacheCheckpoint | None = None
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
+    qualified_statement_selections: tuple[
+        FinancialStatementSelectionCheckpointEntry,
+        ...,
+    ] = ()
+    qualified_indicator_selections: tuple[
+        FinancialIndicatorSelectionCheckpointEntry,
+        ...,
+    ] = ()
+
+    @model_validator(mode="after")
+    def _validate_unique_request_channels(
+        self,
+    ) -> FinancialDispatchCheckpointLedger:
+        keys = [
+            entry.canonical_request_key.request_key
+            for entry in (
+                *self.entries,
+                *self.qualified_statement_selections,
+                *self.qualified_indicator_selections,
+            )
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("financial checkpoint request key crosses dispatch channels")
+        has_qualified = bool(
+            self.qualified_statement_selections
+            or self.qualified_indicator_selections
+        )
+        if has_qualified != (
+            self.contract_version == FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+        ):
+            raise ValueError(
+                "financial checkpoint version contradicts qualified selections"
+            )
+        return self
 
 
 class FinancialDispatchAuditOutcome(BaseModel):
@@ -623,6 +820,7 @@ class FinancialToolDispatcher:
             Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
         ) = None,
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
+        qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
     ) -> None:
         if not instrument_identity.is_authoritative:
             raise ValueError("financial dispatcher requires authoritative Instrument Identity")
@@ -660,8 +858,19 @@ class FinancialToolDispatcher:
         self._run_asset_configuration = run_asset_configuration
         self._provider_chains = copied_chains
         self._acquisition_policy_version = acquisition_policy_version
+        router_signature = (
+            qualified_statement_router.routing_plan.plan_signature
+            if qualified_statement_router is not None
+            else None
+        )
+        if (
+            capability_routing_plan_signature is not None
+            and router_signature is not None
+            and capability_routing_plan_signature != router_signature
+        ):
+            raise ValueError("qualified router contradicts Capability Routing Plan")
         self._capability_routing_plan_signature = (
-            capability_routing_plan_signature
+            router_signature or capability_routing_plan_signature
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleeper = sleeper or time.sleep
@@ -670,6 +879,17 @@ class FinancialToolDispatcher:
         self._dispatch_lock = threading.Lock()
         self._dispatch_results: dict[str, Future[FinancialDispatchResult]] = {}
         self._reuse_counts: dict[str, int] = {}
+        self._qualified_statement_router = qualified_statement_router
+        self._statement_selection_results: dict[
+            str,
+            Future[FinancialStatementSelectionDispatchResult],
+        ] = {}
+        self._statement_selection_reuse_counts: dict[str, int] = {}
+        self._indicator_selection_results: dict[
+            str,
+            Future[FinancialIndicatorSelectionDispatchResult],
+        ] = {}
+        self._indicator_selection_reuse_counts: dict[str, int] = {}
         self._provider_subrequest_cache = provider_subrequest_cache
         if checkpoint_ledger is not None:
             self._restore_checkpoint_ledger(checkpoint_ledger)
@@ -692,6 +912,7 @@ class FinancialToolDispatcher:
             Mapping[str, Any] | FinancialDispatchCheckpointLedger | None
         ) = None,
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
+        qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -703,6 +924,24 @@ class FinancialToolDispatcher:
             from tradingagents.dataflows.interface import VENDOR_METHODS
 
             vendor_methods = VENDOR_METHODS
+        if qualified_statement_router is not None:
+            if str(
+                config.get("mainland_capability_routing_mode", "legacy")
+            ).strip().casefold() != "qualified_v1":
+                raise ValueError(
+                    "qualified financial router requires explicit qualified_v1 mode"
+                )
+            configured_signature = config.get(
+                "mainland_capability_routing_plan_signature"
+            )
+            if (
+                configured_signature is not None
+                and str(configured_signature)
+                != qualified_statement_router.routing_plan.plan_signature
+            ):
+                raise ValueError(
+                    "configured Capability Routing Plan contradicts qualified router"
+                )
         market = _market_from_authoritative_identity(instrument_identity)
         provider_chains: dict[str, tuple[FinancialProvider, ...]] = {}
         for tool_name in _FINANCIAL_TOOL_SPECS:
@@ -751,6 +990,7 @@ class FinancialToolDispatcher:
             sleeper=sleeper,
             checkpoint_ledger=checkpoint_ledger,
             provider_subrequest_cache=provider_subrequest_cache,
+            qualified_statement_router=qualified_statement_router,
         )
 
     def canonical_request_key(
@@ -859,6 +1099,172 @@ class FinancialToolDispatcher:
 
         return self.dispatch(request).to_tool_message()
 
+    def dispatch_statement_selection(
+        self,
+        request: FinancialToolRequest,
+        selection_request: FinancialStatementRoutingRequest,
+    ) -> FinancialStatementSelectionDispatchResult:
+        """Single-flight one qualified statement plan without synthetic attempts."""
+
+        router = self._qualified_statement_router
+        if router is None:
+            raise ValueError("qualified financial statement router is not configured")
+        if (
+            request.statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+            or request.statement_type is not selection_request.statement_type
+            or request.as_of_date != selection_request.as_of_date
+            or selection_request.instrument_identity != self._instrument_identity
+        ):
+            raise ValueError("financial tool and statement selection requests contradict")
+        canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            shared = self._statement_selection_results.get(
+                canonical_key.request_key
+            )
+            is_leader = shared is None
+            if shared is None:
+                shared = Future()
+                self._statement_selection_results[canonical_key.request_key] = (
+                    shared
+                )
+
+        if not is_leader:
+            original = shared.result()
+            if original.selection_request != selection_request:
+                raise ValueError(
+                    "one financial request key cannot bind two selection requests"
+                )
+            with self._dispatch_lock:
+                self._statement_selection_reuse_counts[
+                    canonical_key.request_key
+                ] = (
+                    self._statement_selection_reuse_counts.get(
+                        canonical_key.request_key,
+                        0,
+                    )
+                    + 1
+                )
+            return original.model_copy(
+                update={
+                    "tool_call_id": request.tool_call_id,
+                    "disposition": "duplicate_suppressed",
+                }
+            )
+
+        try:
+            routing_result = router.route_statement(selection_request)
+            result = FinancialStatementSelectionDispatchResult(
+                tool_call_id=request.tool_call_id,
+                disposition="executed",
+                request_key=canonical_key,
+                selection_request=selection_request,
+                routing_result=routing_result,
+                rendered_value=render_statement_routing_result(routing_result),
+            )
+        except BaseException as exc:
+            shared.set_exception(exc)
+            raise
+        shared.set_result(result)
+        with self._dispatch_lock:
+            self._statement_selection_reuse_counts.setdefault(
+                canonical_key.request_key,
+                0,
+            )
+        return result
+
+    def dispatch_statement_selection_tool_message(
+        self,
+        request: FinancialToolRequest,
+        selection_request: FinancialStatementRoutingRequest,
+    ) -> ToolMessage:
+        return self.dispatch_statement_selection(
+            request,
+            selection_request,
+        ).to_tool_message()
+
+    def dispatch_indicator_selection(
+        self,
+        request: FinancialToolRequest,
+        selection_request: FinancialIndicatorRoutingRequest,
+    ) -> FinancialIndicatorSelectionDispatchResult:
+        """Single-flight one qualified indicator plan without synthetic attempts."""
+
+        router = self._qualified_statement_router
+        if router is None:
+            raise ValueError("qualified financial indicator router is not configured")
+        if (
+            request.statement_type
+            is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+            or request.as_of_date != selection_request.as_of_date
+            or selection_request.instrument_identity != self._instrument_identity
+        ):
+            raise ValueError("financial tool and indicator selection requests contradict")
+        canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            shared = self._indicator_selection_results.get(
+                canonical_key.request_key
+            )
+            is_leader = shared is None
+            if shared is None:
+                shared = Future()
+                self._indicator_selection_results[canonical_key.request_key] = (
+                    shared
+                )
+
+        if not is_leader:
+            original = shared.result()
+            if original.selection_request != selection_request:
+                raise ValueError(
+                    "one financial request key cannot bind two indicator requests"
+                )
+            with self._dispatch_lock:
+                self._indicator_selection_reuse_counts[
+                    canonical_key.request_key
+                ] = (
+                    self._indicator_selection_reuse_counts.get(
+                        canonical_key.request_key,
+                        0,
+                    )
+                    + 1
+                )
+            return original.model_copy(
+                update={
+                    "tool_call_id": request.tool_call_id,
+                    "disposition": "duplicate_suppressed",
+                }
+            )
+
+        try:
+            routing_result = router.route_indicators(selection_request)
+            result = FinancialIndicatorSelectionDispatchResult(
+                tool_call_id=request.tool_call_id,
+                disposition="executed",
+                request_key=canonical_key,
+                selection_request=selection_request,
+                routing_result=routing_result,
+                rendered_value=render_indicator_routing_result(routing_result),
+            )
+        except BaseException as exc:
+            shared.set_exception(exc)
+            raise
+        shared.set_result(result)
+        with self._dispatch_lock:
+            self._indicator_selection_reuse_counts.setdefault(
+                canonical_key.request_key,
+                0,
+            )
+        return result
+
+    def dispatch_indicator_selection_tool_message(
+        self,
+        request: FinancialToolRequest,
+        selection_request: FinancialIndicatorRoutingRequest,
+    ) -> ToolMessage:
+        return self.dispatch_indicator_selection(
+            request,
+            selection_request,
+        ).to_tool_message()
+
     def checkpoint_ledger(self) -> dict[str, Any]:
         """Return JSON-compatible terminal state at a normal checkpoint boundary."""
 
@@ -868,6 +1274,10 @@ class FinancialToolDispatcher:
                 FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
             )
         entries: list[FinancialDispatchCheckpointEntry] = []
+        qualified_entries: list[FinancialStatementSelectionCheckpointEntry] = []
+        qualified_indicator_entries: list[
+            FinancialIndicatorSelectionCheckpointEntry
+        ] = []
         with self._dispatch_lock:
             for request_key, shared in sorted(self._dispatch_results.items()):
                 if not shared.done():
@@ -904,7 +1314,68 @@ class FinancialToolDispatcher:
                         reuse_count=self._reuse_counts.get(request_key, 0),
                     )
                 )
+            for request_key, shared in sorted(
+                self._statement_selection_results.items()
+            ):
+                if not shared.done():
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                    )
+                try:
+                    result = shared.result()
+                except BaseException as exc:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                    ) from exc
+                qualified_entries.append(
+                    FinancialStatementSelectionCheckpointEntry(
+                        canonical_request_key=result.request_key,
+                        terminal=result.model_copy(
+                            update={
+                                "tool_call_id": "checkpoint-restored",
+                                "disposition": "executed",
+                            }
+                        ),
+                        reuse_count=self._statement_selection_reuse_counts.get(
+                            request_key,
+                            0,
+                        ),
+                    )
+                )
+            for request_key, shared in sorted(
+                self._indicator_selection_results.items()
+            ):
+                if not shared.done():
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                    )
+                try:
+                    result = shared.result()
+                except BaseException as exc:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                    ) from exc
+                qualified_indicator_entries.append(
+                    FinancialIndicatorSelectionCheckpointEntry(
+                        canonical_request_key=result.request_key,
+                        terminal=result.model_copy(
+                            update={
+                                "tool_call_id": "checkpoint-restored",
+                                "disposition": "executed",
+                            }
+                        ),
+                        reuse_count=self._indicator_selection_reuse_counts.get(
+                            request_key,
+                            0,
+                        ),
+                    )
+                )
         ledger = FinancialDispatchCheckpointLedger(
+            contract_version=(
+                FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+                if qualified_entries or qualified_indicator_entries
+                else FINANCIAL_DISPATCH_LEDGER_VERSION
+            ),
             acquisition_policy_version=self._acquisition_policy_version,
             retry_policy=self._retry_policy,
             provider_chain_identities=self._checkpoint_provider_chain_bindings(),
@@ -926,10 +1397,16 @@ class FinancialToolDispatcher:
                 else None
             ),
             entries=tuple(entries),
+            qualified_statement_selections=tuple(qualified_entries),
+            qualified_indicator_selections=tuple(qualified_indicator_entries),
         )
         payload = ledger.model_dump(mode="json")
         if ledger.provider_subrequest_cache is None:
             payload.pop("provider_subrequest_cache", None)
+        if not ledger.qualified_statement_selections:
+            payload.pop("qualified_statement_selections", None)
+        if not ledger.qualified_indicator_selections:
+            payload.pop("qualified_indicator_selections", None)
         return payload
 
     def _checkpoint_provider_chain_bindings(
@@ -1032,6 +1509,103 @@ class FinancialToolDispatcher:
             shared.set_result(result)
             self._dispatch_results[entry.canonical_request_key.request_key] = shared
             self._reuse_counts[entry.canonical_request_key.request_key] = entry.reuse_count
+        self._restore_qualified_statement_selections(ledger)
+        self._restore_qualified_indicator_selections(ledger)
+
+    def _restore_qualified_statement_selections(
+        self,
+        ledger: FinancialDispatchCheckpointLedger,
+    ) -> None:
+        entries = ledger.qualified_statement_selections
+        if not entries:
+            return
+        router = self._qualified_statement_router
+        if router is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+            )
+        seen: set[str] = set()
+        for entry in entries:
+            key = entry.canonical_request_key
+            result = entry.terminal
+            if (
+                key.request_key in seen
+                or not _canonical_financial_request_key_is_valid(key)
+                or key.capability_routing_plan_signature
+                != router.routing_plan.plan_signature
+                or result.routing_result.manifest.capability_routing_plan_signature
+                != router.routing_plan.plan_signature
+                or result.selection_request.instrument_identity
+                != self._instrument_identity
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                )
+            providers = self._provider_chains.get(key.tool_name)
+            if (
+                providers is None
+                or key.provider_chain_identity
+                != _provider_chain_identity(key.tool_name, providers)
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                )
+            seen.add(key.request_key)
+            shared: Future[FinancialStatementSelectionDispatchResult] = Future()
+            shared.set_result(result)
+            self._statement_selection_results[key.request_key] = shared
+            self._statement_selection_reuse_counts[key.request_key] = (
+                entry.reuse_count
+            )
+
+    def _restore_qualified_indicator_selections(
+        self,
+        ledger: FinancialDispatchCheckpointLedger,
+    ) -> None:
+        entries = ledger.qualified_indicator_selections
+        if not entries:
+            return
+        router = self._qualified_statement_router
+        if router is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+            )
+        seen: set[str] = set()
+        for entry in entries:
+            key = entry.canonical_request_key
+            result = entry.terminal
+            signatures = {
+                manifest.capability_routing_plan_signature
+                for manifest in result.routing_result.family_manifests
+            }
+            if (
+                key.request_key in seen
+                or not _canonical_financial_request_key_is_valid(key)
+                or key.capability_routing_plan_signature
+                != router.routing_plan.plan_signature
+                or signatures != {router.routing_plan.plan_signature}
+                or result.selection_request.instrument_identity
+                != self._instrument_identity
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                )
+            providers = self._provider_chains.get(key.tool_name)
+            if (
+                providers is None
+                or key.provider_chain_identity
+                != _provider_chain_identity(key.tool_name, providers)
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                )
+            seen.add(key.request_key)
+            shared: Future[FinancialIndicatorSelectionDispatchResult] = Future()
+            shared.set_result(result)
+            self._indicator_selection_results[key.request_key] = shared
+            self._indicator_selection_reuse_counts[key.request_key] = (
+                entry.reuse_count
+            )
 
     def _validate_checkpoint_entry(
         self,

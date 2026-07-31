@@ -41,6 +41,10 @@ from tradingagents.capability_routing import (
 )
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
+from tradingagents.dataflows.financial_capability_routing import (
+    FinancialCapabilityRoutingRequest,
+    FinancialCapabilityRoutingResult,
+)
 from tradingagents.dataflows.instrument_identity import RegistryFailureReason
 from tradingagents.dataflows.market_snapshot import (
     authoritative_snapshot_run,
@@ -80,7 +84,10 @@ from tradingagents.terminal_contract import (
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
-from .financial_tools import FinancialDispatchToolNode
+from .financial_tools import (
+    FinancialDispatchToolNode,
+    QualifiedFinancialRoutingComposition,
+)
 from .propagation import Propagator
 from .reflection import Reflector
 from .setup import GraphSetup
@@ -137,6 +144,7 @@ class TradingAgentsGraph:
         asset_type: str | None = None,
         asset_configuration: RunAssetConfiguration | None = None,
         capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
+        qualified_financial_routing: QualifiedFinancialRoutingComposition | None = None,
         instrument_symbol: str | None = None,
     ):
         """Initialize the trading agents graph and components.
@@ -151,6 +159,8 @@ class TradingAgentsGraph:
             asset_type: Legacy graph mode when no run asset configuration exists.
             asset_configuration: Authoritative immutable run asset resolved before
                 graph construction.
+            qualified_financial_routing: Optional immutable Ticket 10 composition
+                for qualified mainland statement and indicator routing.
             instrument_symbol: Programmatic resolution boundary used to resolve the
                 run asset before clients, workflow, or checkpoint state are built.
         """
@@ -228,6 +238,22 @@ class TradingAgentsGraph:
             requested_analysts,
             instrument_kind,
         )
+        if qualified_financial_routing is not None:
+            if (
+                capability_routing_plan is None
+                or capability_routing_plan.mode.value != "qualified_v1"
+            ):
+                raise ValueError(
+                    "qualified financial routing requires a qualified mainland "
+                    "Capability Routing Plan"
+                )
+            if (
+                qualified_financial_routing.router.routing_plan.plan_signature
+                != capability_routing_plan.plan_signature
+            ):
+                raise ValueError(
+                    "qualified financial routing Capability Routing Plan is immutable"
+                )
         self.debug = debug
         self.config = dict(resolved_config)
         if asset_configuration is not None:
@@ -266,6 +292,7 @@ class TradingAgentsGraph:
         self.callbacks = callbacks or []
         self.asset_configuration = asset_configuration
         self.capability_routing_plan = capability_routing_plan
+        self.qualified_financial_routing = qualified_financial_routing
         self.decision_policy = (
             decision_policy
             if decision_policy is not None
@@ -510,6 +537,11 @@ class TradingAgentsGraph:
 
     def _create_tool_nodes(self) -> dict[str, Any]:
         """Create tool nodes for different data sources using abstract methods."""
+        qualified_financial_routing = getattr(
+            self,
+            "qualified_financial_routing",
+            None,
+        )
         return {
             "market": ToolNode(
                 [
@@ -542,8 +574,43 @@ class TradingAgentsGraph:
             ),
             "fundamentals": FinancialDispatchToolNode(
                 config=getattr(self, "config", None),
+                qualified_statement_router=(
+                    qualified_financial_routing.router
+                    if qualified_financial_routing is not None
+                    else None
+                ),
+                qualified_statement_request_factory=(
+                    qualified_financial_routing.statement_request_factory
+                    if qualified_financial_routing is not None
+                    else None
+                ),
+                qualified_indicator_request_factory=(
+                    qualified_financial_routing.indicator_request_factory
+                    if qualified_financial_routing is not None
+                    else None
+                ),
             ),
         }
+
+    def route_mainland_financial_capability(
+        self,
+        request: FinancialCapabilityRoutingRequest,
+    ) -> FinancialCapabilityRoutingResult:
+        """Execute one qualified factor/status/name/lifecycle route at its owner seam."""
+
+        composition = self.qualified_financial_routing
+        if composition is None:
+            raise ValueError("qualified mainland financial routing is not configured")
+        asset_configuration = self.asset_configuration
+        if (
+            asset_configuration is None
+            or request.instrument_identity
+            != asset_configuration.instrument_identity
+        ):
+            raise ValueError(
+                "qualified capability request contradicts the run Instrument Identity"
+            )
+        return composition.router.route_capability(request)
 
     def _resolve_benchmark(self, ticker: str) -> str:
         """Pick the benchmark ticker for alpha calculation against ``ticker``.

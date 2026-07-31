@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -11,6 +12,11 @@ from tradingagents.asset_configuration import (
     RunAssetConfigurationProjection,
 )
 from tradingagents.dataflows.acquisition import RetryPolicy
+from tradingagents.dataflows.financial_capability_routing import (
+    FinancialIndicatorRoutingRequest,
+    FinancialStatementRoutingRequest,
+    MainlandFinancialCapabilityRouter,
+)
 from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
@@ -41,6 +47,32 @@ _FINANCIAL_TOOL_CONTRACTS = {
 }
 
 
+@dataclass(frozen=True)
+class QualifiedFinancialRoutingComposition:
+    """Immutable graph-owned wiring for qualified mainland financial routing."""
+
+    router: MainlandFinancialCapabilityRouter
+    statement_request_factory: (
+        Callable[[FinancialToolRequest], FinancialStatementRoutingRequest] | None
+    ) = None
+    indicator_request_factory: (
+        Callable[[FinancialToolRequest], FinancialIndicatorRoutingRequest] | None
+    ) = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.statement_request_factory is None
+            and self.indicator_request_factory is None
+        ):
+            raise ValueError(
+                "qualified financial routing requires at least one request factory"
+            )
+        if self.router.routing_plan.mode.value != "qualified_v1":
+            raise ValueError(
+                "qualified financial routing requires a qualified_v1 plan"
+            )
+
+
 class FinancialDispatchToolNode:
     """Execute one fundamentals tool turn through a checkpoint-aware dispatcher."""
 
@@ -52,12 +84,54 @@ class FinancialDispatchToolNode:
         retry_policy: RetryPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
+        qualified_statement_request_factory: (
+            Callable[[FinancialToolRequest], FinancialStatementRoutingRequest]
+            | None
+        ) = None,
+        qualified_indicator_request_factory: (
+            Callable[[FinancialToolRequest], FinancialIndicatorRoutingRequest]
+            | None
+        ) = None,
     ) -> None:
+        has_factory = (
+            qualified_statement_request_factory is not None
+            or qualified_indicator_request_factory is not None
+        )
+        if (qualified_statement_router is None) == has_factory:
+            raise ValueError(
+                "qualified router requires at least one matching request factory"
+            )
+        if qualified_statement_router is not None and config is not None:
+            if str(
+                config.get("mainland_capability_routing_mode", "legacy")
+            ).strip().casefold() != "qualified_v1":
+                raise ValueError(
+                    "qualified financial tool node requires explicit qualified_v1 mode"
+                )
+            configured_signature = config.get(
+                "mainland_capability_routing_plan_signature"
+            )
+            if (
+                configured_signature is not None
+                and str(configured_signature)
+                != qualified_statement_router.routing_plan.plan_signature
+            ):
+                raise ValueError(
+                    "financial tool node Capability Routing Plan is immutable"
+                )
         self._config = dict(config) if config is not None else None
         self._vendor_methods = vendor_methods
         self._retry_policy = retry_policy
         self._clock = clock
         self._sleeper = sleeper
+        self._qualified_statement_router = qualified_statement_router
+        self._qualified_statement_request_factory = (
+            qualified_statement_request_factory
+        )
+        self._qualified_indicator_request_factory = (
+            qualified_indicator_request_factory
+        )
 
     def __call__(self, state: Mapping[str, Any]) -> dict[str, Any]:
         messages = state.get("messages") or ()
@@ -70,19 +144,43 @@ class FinancialDispatchToolNode:
 
         dispatcher, evidence = self._dispatcher_from_state(state)
         graph_message_id = getattr(model_message, "id", None)
-        tool_messages = [
-            dispatcher.dispatch_tool_message(
-                _financial_request_from_tool_call(
-                    tool_call,
-                    canonical_symbol=evidence.instrument_identity.symbol,
-                    trade_date=str(state.get("trade_date") or ""),
-                    graph_message_id=(
-                        str(graph_message_id) if graph_message_id is not None else None
-                    ),
-                )
+        requests = [
+            _financial_request_from_tool_call(
+                tool_call,
+                canonical_symbol=evidence.instrument_identity.symbol,
+                trade_date=str(state.get("trade_date") or ""),
+                graph_message_id=(
+                    str(graph_message_id) if graph_message_id is not None else None
+                ),
             )
             for tool_call in tool_calls
         ]
+        tool_messages = []
+        for request in requests:
+            if (
+                request.statement_type
+                is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                and self._qualified_indicator_request_factory is not None
+            ):
+                tool_messages.append(
+                    dispatcher.dispatch_indicator_selection_tool_message(
+                        request,
+                        self._qualified_indicator_request_factory(request),
+                    )
+                )
+            elif (
+                request.statement_type
+                is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                and self._qualified_statement_request_factory is not None
+            ):
+                tool_messages.append(
+                    dispatcher.dispatch_statement_selection_tool_message(
+                        request,
+                        self._qualified_statement_request_factory(request),
+                    )
+                )
+            else:
+                tool_messages.append(dispatcher.dispatch_tool_message(request))
         from tradingagents.dataflows.market_snapshot import (
             refresh_active_evidence_physical_attempts,
         )
@@ -160,6 +258,7 @@ class FinancialDispatchToolNode:
             clock=self._clock,
             sleeper=self._sleeper,
             checkpoint_ledger=state.get("financial_dispatch_ledger"),
+            qualified_statement_router=self._qualified_statement_router,
         )
         return dispatcher, evidence
 
@@ -209,4 +308,7 @@ def _financial_request_from_tool_call(
     )
 
 
-__all__ = ["FinancialDispatchToolNode"]
+__all__ = [
+    "FinancialDispatchToolNode",
+    "QualifiedFinancialRoutingComposition",
+]
