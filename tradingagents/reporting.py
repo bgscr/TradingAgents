@@ -400,14 +400,17 @@ def _render_financial_dispatch_operations(
                     "Classification provenance | Metadata coverage | Ann date | "
                     "F ann date | Report type | Provider comp type | Update flag | "
                     "Revision observed | Local revision identity | Provider revision "
-                    "ID | Critical actual / threshold | Core actual / threshold | "
+                    "ID | Currency | Declared unit | Observed units | Declared critical "
+                    "fields | Declared core fields | Mapped normalized fields | Present "
+                    "critical fields | Present core fields | Missing critical fields | "
+                    "Missing core fields | Critical actual / threshold | Core actual / threshold | "
                     "Disposition | Typed reason | PIT eligible | Artifact identity | "
                     "Provider attempts | Since-listing exception | Listing date | "
                     "Listing provider | Listing source |"
                 ),
                 (
                     "|---|---|---|---|---|---|---:|---|---|---|---|---|---|---|"
-                    "---|---:|---:|---|---|---|---|---:|---|---|---|---|"
+                    "---|---|---|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---:|---|---|---|---|"
                 ),
             ]
         )
@@ -456,6 +459,16 @@ def _render_financial_dispatch_operations(
                         ),
                         row.local_provider_revision_identity or "none",
                         row.provider_filing_revision_id or "none",
+                        row.currency,
+                        row.declared_normalized_unit or "none",
+                        ", ".join(row.observed_normalized_units) or "none",
+                        ", ".join(row.declared_critical_fields) or "none",
+                        ", ".join(row.declared_core_fields) or "none",
+                        ", ".join(row.mapped_normalized_fields) or "none",
+                        ", ".join(row.present_critical_fields) or "none",
+                        ", ".join(row.present_core_fields) or "none",
+                        ", ".join(row.missing_critical_fields) or "none",
+                        ", ".join(row.missing_core_fields) or "none",
                         (
                             f"{format(row.critical_coverage, 'f')} / "
                             f"{format(row.critical_threshold, 'f')}"

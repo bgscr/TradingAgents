@@ -82,7 +82,6 @@ def _field(
 
 _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
     FinancialRatioFamily.PROFIT: (
-        _field("ebitda_margin", ("ebitda_margin", "PERCENT", "100")),
         _field("gross_margin", ("grossprofit_margin", "PERCENT", "100")),
         _field("net_margin", ("netprofit_margin", "PERCENT", "100")),
         _field("operating_margin", ("op_of_gr", "PERCENT", "100")),
@@ -98,24 +97,17 @@ _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
         _field("debt_to_assets", ("debt_to_assets", "PERCENT", "100")),
         _field("debt_to_equity", ("debt_to_eqt", "RATIO", "1")),
         _field("equity_multiplier", ("assets_to_eqt", "RATIO", "1")),
-        _field("interest_coverage", ("ebit_to_interest", "RATIO", "1")),
         _field("long_term_debt_ratio", ("longdeb_to_debt", "PERCENT", "100")),
         _field("quick_ratio", ("quick_ratio", "RATIO", "1")),
         _field(
             "tangible_asset_ratio",
             ("tbassets_to_totalassets", "PERCENT", "100"),
         ),
-        _field(
-            "working_capital_ratio",
-            ("working_capital_ratio", "RATIO", "1"),
-        ),
     ),
     FinancialRatioFamily.OPERATION: (
-        _field("accounts_payable_turnover", ("ap_turn", "RATIO", "1")),
         _field("asset_turnover", ("assets_turn", "RATIO", "1")),
         _field("current_asset_turnover", ("ca_turn", "RATIO", "1")),
         _field("fixed_asset_turnover", ("fa_turn", "RATIO", "1")),
-        _field("inventory_turnover", ("inv_turn", "RATIO", "1")),
         _field("receivables_turnover", ("ar_turn", "RATIO", "1")),
     ),
     FinancialRatioFamily.GROWTH: (
@@ -126,7 +118,6 @@ _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
             ("eqt_yoy", "PERCENT", "100"),
             ("equity_yoy", "PERCENT", "100"),
         ),
-        _field("gross_profit_growth", ("grossprofit_yoy", "PERCENT", "100")),
         _field("net_income_growth", ("netprofit_yoy", "PERCENT", "100")),
         _field("operating_profit_growth", ("op_yoy", "PERCENT", "100")),
         _field(
@@ -136,33 +127,12 @@ _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
         ),
         _field("return_on_equity_growth", ("roe_yoy", "PERCENT", "100")),
         _field("total_profit_growth", ("ebt_yoy", "PERCENT", "100")),
-        _field(
-            "working_capital_growth",
-            ("working_capital_yoy", "PERCENT", "100"),
-        ),
     ),
     FinancialRatioFamily.CASH_FLOW: (
-        _field("cash_flow_adequacy", ("cash_flow_adequacy", "RATIO", "1")),
         _field("cash_flow_to_debt", ("ocf_to_debt", "RATIO", "1")),
         _field(
-            "cash_flow_to_liabilities",
-            ("ocf_to_liabilities", "RATIO", "1"),
-        ),
-        _field("cash_flow_to_revenue", ("ocf_to_or", "RATIO", "1")),
-        _field(
-            "cash_return_on_assets",
-            ("cash_return_on_assets", "RATIO", "1"),
-        ),
-        _field("free_cash_flow_margin", ("fcff_to_or", "RATIO", "1")),
-        _field(
-            "operating_cash_flow_ratio",
-            ("ocf_to_opincome", "RATIO", "1"),
-        ),
-        _field("quality_of_income", ("ocf_to_profit", "RATIO", "1")),
-        _field("reinvestment_ratio", ("reinvestment_ratio", "RATIO", "1")),
-        _field(
-            "self_financing_ratio",
-            ("self_financing_ratio", "RATIO", "1"),
+            "cash_flow_to_revenue",
+            ("q_ocf_to_sales", "PERCENT", "100"),
         ),
     ),
     FinancialRatioFamily.DUPONT: (
@@ -170,13 +140,10 @@ _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
             "asset_turnover_component",
             ("assets_turn", "RATIO", "1"),
         ),
-        _field("debt_burden", ("debt_burden", "RATIO", "1")),
         _field(
             "equity_multiplier_component",
             ("assets_to_eqt", "RATIO", "1"),
         ),
-        _field("financial_leverage", ("financial_leverage", "RATIO", "1")),
-        _field("interest_burden", ("interest_burden", "RATIO", "1")),
         _field(
             "net_profit_margin_component",
             ("netprofit_margin", "PERCENT", "100"),
@@ -187,26 +154,14 @@ _NON_BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
         ),
         _field("return_on_assets_component", ("roa", "PERCENT", "100")),
         _field("return_on_equity_component", ("roe", "PERCENT", "100")),
-        _field("tax_burden", ("tax_burden", "RATIO", "1")),
     ),
 }
 
 _BANK_FIELDS: dict[FinancialRatioFamily, tuple[_NormalizedField, ...]] = {
     **_NON_BANK_FIELDS,
     FinancialRatioFamily.PROFIT: (
-        _field("cost_income_ratio", ("cost_income_ratio", "PERCENT", "100")),
-        _field("net_interest_margin", ("net_interest_margin", "PERCENT", "100")),
-        _field("net_interest_spread", ("net_interest_spread", "PERCENT", "100")),
         _field("net_margin", ("netprofit_margin", "PERCENT", "100")),
-        _field(
-            "non_performing_loan_ratio",
-            ("npl_ratio", "PERCENT", "100"),
-        ),
         _field("pre_tax_margin", ("profit_to_gr", "PERCENT", "100")),
-        _field(
-            "provision_coverage_ratio",
-            ("provision_coverage_ratio", "PERCENT", "100"),
-        ),
         _field("return_on_assets", ("roa", "PERCENT", "100")),
         _field("return_on_equity", ("roe", "PERCENT", "100")),
         _field("return_on_invested_capital", ("roic", "PERCENT", "100")),

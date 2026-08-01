@@ -778,6 +778,20 @@ def test_v2_audit_and_report_expose_safe_deterministic_completeness(
         row.local_provider_revision_identity
         == candidate.filing_metadata.local_provider_revision_identity
     )
+    assessment = dispatch.routing_result.manifest.provider_candidates[0].assessment
+    assert row.contract_version == "financial-completeness-row-v3"
+    assert row.currency == candidate.period_identity.currency
+    assert row.declared_normalized_unit == "CNY_BASE_UNIT"
+    assert row.observed_normalized_units == ("CNY_BASE_UNIT",)
+    assert row.declared_critical_fields == assessment.declared_critical_fields
+    assert row.declared_core_fields == assessment.declared_core_fields
+    assert row.mapped_normalized_fields == tuple(
+        field.normalized_field for field in candidate.fields
+    )
+    assert row.present_critical_fields == assessment.present_critical_fields
+    assert row.present_core_fields == assessment.present_core_fields
+    assert row.missing_critical_fields == assessment.missing_critical_fields
+    assert row.missing_core_fields == assessment.missing_core_fields
     assert row.critical_coverage == 1
     assert row.core_coverage == 1
     assert row.core_threshold == Decimal("0.9")

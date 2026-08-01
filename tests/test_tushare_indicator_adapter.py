@@ -455,7 +455,7 @@ def test_bank_history_uses_bank_qualified_indicator_fields(
     assert "earnings_per_share" in legacy_declaration.normalized_fields
     assert "net_interest_margin" not in legacy_declaration.normalized_fields
     assert declaration.declaration_version == FINANCIAL_RATIO_DECLARATION_V2
-    assert "net_interest_margin" in declaration.normalized_fields
+    assert "net_interest_margin" not in declaration.normalized_fields
     assert "gross_margin" not in declaration.normalized_fields
     profit_history = next(
         item
@@ -493,6 +493,106 @@ def test_bank_history_uses_bank_qualified_indicator_fields(
         item.contract_version == "financial-period-selection-v2"
         for item in result.period_completeness
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("company_type", "family", "expected_fields"),
+    (
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.PROFIT,
+            {
+                "gross_margin",
+                "net_margin",
+                "operating_margin",
+                "pre_tax_margin",
+                "profit_to_cost",
+                "return_on_assets",
+                "return_on_equity",
+                "return_on_invested_capital",
+            },
+        ),
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.OPERATION,
+            {
+                "asset_turnover",
+                "current_asset_turnover",
+                "fixed_asset_turnover",
+                "receivables_turnover",
+            },
+        ),
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.GROWTH,
+            {
+                "asset_growth",
+                "cash_flow_growth",
+                "equity_growth",
+                "net_income_growth",
+                "operating_profit_growth",
+                "revenue_growth",
+                "return_on_equity_growth",
+                "total_profit_growth",
+            },
+        ),
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.BALANCE,
+            {
+                "cash_ratio",
+                "current_ratio",
+                "debt_to_assets",
+                "debt_to_equity",
+                "equity_multiplier",
+                "long_term_debt_ratio",
+                "quick_ratio",
+                "tangible_asset_ratio",
+            },
+        ),
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.CASH_FLOW,
+            {"cash_flow_to_debt", "cash_flow_to_revenue"},
+        ),
+        (
+            FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            FinancialRatioFamily.DUPONT,
+            {
+                "asset_turnover_component",
+                "equity_multiplier_component",
+                "net_profit_margin_component",
+                "operating_margin_component",
+                "return_on_assets_component",
+                "return_on_equity_component",
+            },
+        ),
+        (
+            FinancialCompanyType.BANK,
+            FinancialRatioFamily.PROFIT,
+            {
+                "net_margin",
+                "pre_tax_margin",
+                "return_on_assets",
+                "return_on_equity",
+                "return_on_invested_capital",
+            },
+        ),
+    ),
+)
+def test_qualified_declarations_match_retained_fina_indicator_schema(
+    company_type: FinancialCompanyType,
+    family: FinancialRatioFamily,
+    expected_fields: set[str],
+) -> None:
+    declaration = financial_ratio_field_declaration(
+        company_type,
+        family,
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+    )
+
+    assert set(declaration.normalized_fields) == expected_fields
 
 
 @pytest.mark.unit
@@ -538,7 +638,7 @@ def test_sparse_family_period_is_rejected_without_discarding_usable_family(
         FinancialPeriodDisposition.REJECTED
     )
     assert affected[FinancialRatioFamily.PROFIT].core_coverage == (
-        Decimal(7) / Decimal(9)
+        Decimal(7) / Decimal(8)
     )
     assert FinancialPeriodRejectionReason.INSUFFICIENT_COMPLETENESS in (
         affected[FinancialRatioFamily.PROFIT].rejection_reasons

@@ -31,6 +31,9 @@ from tradingagents.dataflows.financial_capability_routing import (
     render_indicator_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+    FINANCIAL_RATIO_DECLARATION_V1,
+    FINANCIAL_RATIO_DECLARATION_V2,
     FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2,
     FinancialCapability,
     FinancialCompanyType,
@@ -262,9 +265,14 @@ def _ratio_candidate(
         observed_at=_OBSERVED_AT,
         payload={"period_end": period_end.isoformat(), "value": value},
     )
+    declaration_version, currency = {
+        "tushare": (FINANCIAL_RATIO_DECLARATION_V2, "XXX"),
+        "baostock": (FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1, "CNY"),
+    }.get(provider_id, (FINANCIAL_RATIO_DECLARATION_V1, "CNY"))
     declaration = financial_ratio_field_declaration(
         FinancialCompanyType.INDUSTRIAL_NON_BANK,
         ratio_family,
+        declaration_version=declaration_version,
     )
     fields = tuple(
         FinancialFieldValue(
@@ -294,7 +302,7 @@ def _ratio_candidate(
             frequency=FinancialReportingFrequency.QUARTERLY,
             company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
             consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
-            currency="CNY",
+            currency=currency,
             provider_revision_binding=artifact.artifact_identity,
         ),
         filing_metadata=FinancialFilingMetadata(
@@ -303,6 +311,81 @@ def _ratio_candidate(
             report_type="1",
             comp_type="1",
             update_flag="0",
+            retrieved_at=_OBSERVED_AT,
+            observed_at=_OBSERVED_AT,
+            local_provider_revision_identity=artifact.artifact_identity,
+        ),
+        company_type_resolution=resolution,
+        fields=fields,
+    )
+
+
+def _qualified_ratio_candidate(
+    *,
+    provider_id: str,
+    ratio_family: FinancialRatioFamily,
+    period_end: date,
+    declaration_version: str,
+    currency: str,
+) -> FinancialPeriodCandidate:
+    identity = _identity()
+    dataset = FinancialProviderDatasetIdentity.create(
+        provider_id=provider_id,
+        endpoint_id="financial_indicators",
+        dataset_id="single_stock_history",
+        schema_identity=f"{provider_id}-{ratio_family.value}-qualified-fixture-v1",
+    )
+    artifact = FinancialProviderArtifactIdentity.create(
+        dataset=dataset,
+        canonical_request={
+            "symbol": identity.symbol,
+            "period_end": period_end.isoformat(),
+            "ratio_family": ratio_family.value,
+        },
+        provider_metadata={"ann_date": "20260701"},
+        retrieved_at=_OBSERVED_AT,
+        observed_at=_OBSERVED_AT,
+        payload={"period_end": period_end.isoformat(), "value": "1"},
+    )
+    declaration = financial_ratio_field_declaration(
+        FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        ratio_family,
+        declaration_version=declaration_version,
+    )
+    fields = tuple(
+        FinancialFieldValue(
+            provider_field=field_name,
+            original_value="1",
+            original_unit=declaration.normalized_unit,
+            normalized_field=field_name,
+            normalized_value="1",
+            normalized_unit=declaration.normalized_unit,
+        )
+        for field_name in declaration.normalized_fields
+    )
+    resolution = resolve_financial_company_type(
+        provider_declared_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        provider_declaration_qualified=True,
+        classifier_metadata={},
+        present_fields=declaration.normalized_fields,
+    )
+    return FinancialPeriodCandidate.create(
+        artifact=artifact,
+        period_identity=FinancialPeriodIdentity.create(
+            instrument_identity=identity,
+            capability=FinancialCapability.RATIO_FAMILY,
+            statement_type=None,
+            ratio_family=ratio_family,
+            period_end=period_end,
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            consolidation_scope=FinancialConsolidationScope.UNKNOWN,
+            currency=currency,
+            provider_revision_binding=artifact.artifact_identity,
+        ),
+        filing_metadata=FinancialFilingMetadata(
+            ann_date=date(2026, 7, 1),
+            f_ann_date=None,
             retrieved_at=_OBSERVED_AT,
             observed_at=_OBSERVED_AT,
             local_provider_revision_identity=artifact.artifact_identity,
@@ -1025,6 +1108,76 @@ def test_indicator_routing_calls_only_missing_families_and_exact_periods(
     }
     assert result.missing_periods_by_family == ()
     assert len(result.family_manifests) == 2
+
+
+@pytest.mark.parametrize(
+    ("route_provider", "artifact_provider", "declaration_version", "currency"),
+    (
+        (
+            "tushare",
+            "tushare",
+            FINANCIAL_RATIO_DECLARATION_V2,
+            "XXX",
+        ),
+        (
+            "baostock_qualified_families",
+            "baostock",
+            FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+            "CNY",
+        ),
+    ),
+)
+def test_indicator_router_preserves_provider_qualified_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    route_provider: str,
+    artifact_provider: str,
+    declaration_version: str,
+    currency: str,
+) -> None:
+    candidates = tuple(
+        _qualified_ratio_candidate(
+            provider_id=artifact_provider,
+            ratio_family=FinancialRatioFamily.PROFIT,
+            period_end=period,
+            declaration_version=declaration_version,
+            currency=currency,
+        )
+        for period in _REPORTING_PERIODS
+    )
+    response = FinancialProviderPeriodResponse.available(
+        provider_id=route_provider,
+        response_artifact=candidates[0].artifact,
+        retained_artifacts=tuple(candidate.artifact for candidate in candidates),
+        candidates=candidates,
+        subrequest_keys=(f"{route_provider}-qualified-profit",),
+        physical_attempt_ids=(f"{route_provider}-attempt-1",),
+    )
+
+    result = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={route_provider: lambda _request: response},
+    ).route_indicators(
+        FinancialIndicatorRoutingRequest(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            consolidation_scope=FinancialConsolidationScope.UNKNOWN,
+            currency="CNY",
+            ratio_families=(FinancialRatioFamily.PROFIT,),
+            eligible_reporting_period_ends=_REPORTING_PERIODS,
+        )
+    )
+
+    assert result.complete_families == (FinancialRatioFamily.PROFIT,)
+    assert len(result.selected_candidates) == 8
+    selections = result.family_manifests[0].selections
+    assert all(selection.disposition == "current_only" for selection in selections)
+    assert not any(selection.strict_pit_eligible for selection in selections)
+    assert all(
+        candidate.assessment.core_coverage == 1
+        for candidate in result.family_manifests[0].provider_candidates
+    )
 
 
 def test_complete_tushare_indicators_stop_lower_providers(

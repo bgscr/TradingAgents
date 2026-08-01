@@ -906,8 +906,8 @@ class FinancialCompletenessAuditRow(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-completeness-row-v2"] = (
-        "financial-completeness-row-v2"
+    contract_version: Literal["financial-completeness-row-v3"] = (
+        "financial-completeness-row-v3"
     )
     manifest_identity: str = Field(
         pattern=r"^financial-manifest:v2:[0-9a-f]{64}$"
@@ -937,6 +937,16 @@ class FinancialCompletenessAuditRow(BaseModel):
         default=None,
         pattern=ACQUISITION_TOKEN_PATTERN,
     )
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    declared_normalized_unit: str | None = Field(default=None, max_length=64)
+    observed_normalized_units: tuple[str, ...] = ()
+    declared_critical_fields: tuple[str, ...] = ()
+    declared_core_fields: tuple[str, ...] = ()
+    mapped_normalized_fields: tuple[str, ...] = ()
+    present_critical_fields: tuple[str, ...] = ()
+    present_core_fields: tuple[str, ...] = ()
+    missing_critical_fields: tuple[str, ...] = ()
+    missing_core_fields: tuple[str, ...] = ()
     critical_coverage: Decimal = Field(ge=0, le=1)
     critical_threshold: Decimal = Field(ge=0, le=1)
     core_coverage: Decimal = Field(ge=0, le=1)
@@ -968,6 +978,21 @@ class FinancialCompletenessAuditRow(BaseModel):
 
     @model_validator(mode="after")
     def _validate_listing_binding(self) -> FinancialCompletenessAuditRow:
+        canonical_field_sets = (
+            self.declared_critical_fields,
+            self.declared_core_fields,
+            self.mapped_normalized_fields,
+            self.present_critical_fields,
+            self.present_core_fields,
+            self.missing_critical_fields,
+            self.missing_core_fields,
+            self.observed_normalized_units,
+        )
+        if any(
+            values != tuple(sorted(set(values)))
+            for values in canonical_field_sets
+        ):
+            raise ValueError("financial completeness fields must be canonical")
         listing_values = (
             self.listing_date,
             self.listing_provider,
@@ -3260,6 +3285,20 @@ def _project_manifest_completeness_rows(
             filing_metadata.comp_type,
             filing_metadata.update_flag,
         )
+        observed_normalized_units = tuple(sorted({
+            field.normalized_unit
+            for field in candidate.fields
+            if field.normalized_unit is not None
+        }))
+        declared_normalized_unit = (
+            "RATIO"
+            if assessment.capability is FinancialCapability.RATIO_FAMILY
+            else (
+                observed_normalized_units[0]
+                if len(observed_normalized_units) == 1
+                else None
+            )
+        )
         rows.append(
             FinancialCompletenessAuditRow(
                 manifest_identity=manifest.manifest_identity,
@@ -3299,6 +3338,18 @@ def _project_manifest_completeness_rows(
                 provider_filing_revision_id=(
                     filing_metadata.provider_filing_revision_id
                 ),
+                currency=assessment.currency,
+                declared_normalized_unit=declared_normalized_unit,
+                observed_normalized_units=observed_normalized_units,
+                declared_critical_fields=assessment.declared_critical_fields,
+                declared_core_fields=assessment.declared_core_fields,
+                mapped_normalized_fields=tuple(sorted({
+                    field.normalized_field for field in candidate.fields
+                })),
+                present_critical_fields=assessment.present_critical_fields,
+                present_core_fields=assessment.present_core_fields,
+                missing_critical_fields=assessment.missing_critical_fields,
+                missing_core_fields=assessment.missing_core_fields,
                 critical_coverage=assessment.critical_coverage,
                 critical_threshold=Decimal("1"),
                 core_coverage=assessment.core_coverage,
@@ -3366,6 +3417,7 @@ def _project_manifest_completeness_rows(
                 provider_declared_type=None,
                 provider_declaration_qualified=False,
                 metadata_coverage=Decimal("0"),
+                currency=completeness.currency,
                 critical_coverage=Decimal("0"),
                 critical_threshold=Decimal("1"),
                 core_coverage=Decimal("0"),

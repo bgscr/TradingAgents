@@ -905,32 +905,61 @@ _RATIO_FAMILY_FIELDS = {
 }
 
 _QUALIFIED_RATIO_FAMILY_FIELDS = {
-    **_RATIO_FAMILY_FIELDS,
-    FinancialRatioFamily.PROFIT: tuple(
-        field
-        for field in _RATIO_FAMILY_FIELDS[FinancialRatioFamily.PROFIT]
-        if field != "earnings_per_share"
+    FinancialRatioFamily.PROFIT: (
+        "gross_margin",
+        "net_margin",
+        "operating_margin",
+        "pre_tax_margin",
+        "profit_to_cost",
+        "return_on_assets",
+        "return_on_equity",
+        "return_on_invested_capital",
     ),
     FinancialRatioFamily.OPERATION: (
-        "accounts_payable_turnover",
         "asset_turnover",
         "current_asset_turnover",
         "fixed_asset_turnover",
-        "inventory_turnover",
         "receivables_turnover",
+    ),
+    FinancialRatioFamily.GROWTH: (
+        "asset_growth",
+        "cash_flow_growth",
+        "equity_growth",
+        "net_income_growth",
+        "operating_profit_growth",
+        "revenue_growth",
+        "return_on_equity_growth",
+        "total_profit_growth",
+    ),
+    FinancialRatioFamily.BALANCE: (
+        "cash_ratio",
+        "current_ratio",
+        "debt_to_assets",
+        "debt_to_equity",
+        "equity_multiplier",
+        "long_term_debt_ratio",
+        "quick_ratio",
+        "tangible_asset_ratio",
+    ),
+    FinancialRatioFamily.CASH_FLOW: (
+        "cash_flow_to_debt",
+        "cash_flow_to_revenue",
+    ),
+    FinancialRatioFamily.DUPONT: (
+        "asset_turnover_component",
+        "equity_multiplier_component",
+        "net_profit_margin_component",
+        "operating_margin_component",
+        "return_on_assets_component",
+        "return_on_equity_component",
     ),
 }
 
 _QUALIFIED_BANK_RATIO_FAMILY_FIELDS = {
     **_QUALIFIED_RATIO_FAMILY_FIELDS,
     FinancialRatioFamily.PROFIT: (
-        "cost_income_ratio",
-        "net_interest_margin",
-        "net_interest_spread",
         "net_margin",
-        "non_performing_loan_ratio",
         "pre_tax_margin",
-        "provision_coverage_ratio",
         "return_on_assets",
         "return_on_equity",
         "return_on_invested_capital",
@@ -2365,7 +2394,6 @@ def assess_financial_ratio_history_coverage(
         and item.ratio_family is ratio_family
         and item.company_type is company_type
         and item.consolidation_scope is consolidation_scope
-        and item.currency == currency.upper()
         and _authoritative_instrument_payload(item.instrument_identity)
         == expected_instrument_payload
         and item.frequency is FinancialReportingFrequency.QUARTERLY
@@ -2747,7 +2775,14 @@ def _period_compatibility_payload(candidate: FinancialPeriodCandidate) -> dict[s
         "period_end": identity.period_end.isoformat(),
         "frequency": identity.frequency.value,
         "consolidation_scope": identity.consolidation_scope.value,
-        "currency": identity.currency,
+        # Ratio fields are normalized to RATIO before overlap comparison. Keep
+        # provider currency metadata on each candidate, but do not treat the
+        # provider-specific XXX/CNY marker as a value compatibility boundary.
+        "currency": (
+            None
+            if identity.capability is FinancialCapability.RATIO_FAMILY
+            else identity.currency
+        ),
     }
 
 
@@ -3305,7 +3340,10 @@ class FinancialAcquisitionManifest(BaseModel):
             if (
                 identity.company_type is not aggregate.company_type
                 or identity.consolidation_scope is not aggregate.consolidation_scope
-                or identity.currency != aggregate.currency
+                or (
+                    identity.capability is not FinancialCapability.RATIO_FAMILY
+                    and identity.currency != aggregate.currency
+                )
                 or identity.capability is not self.requested_capability
                 or identity.statement_type is not self.requested_statement_type
                 or identity.ratio_family is not self.requested_ratio_family

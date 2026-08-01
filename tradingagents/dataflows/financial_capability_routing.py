@@ -22,6 +22,9 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingPlan,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+    FINANCIAL_RATIO_DECLARATION_V1,
+    FINANCIAL_RATIO_DECLARATION_V2,
     FinancialAcquisitionManifest,
     FinancialAcquisitionOutcome,
     FinancialCapability,
@@ -76,6 +79,11 @@ _ROUTABLE_DATASET_CAPABILITIES = frozenset(
 )
 _ROUTE_PROVIDER_ARTIFACT_PROVIDER = {
     "baostock_qualified_families": "baostock",
+}
+
+_INDICATOR_PROVIDER_ASSESSMENT_CONTRACT = {
+    "tushare": (FINANCIAL_RATIO_DECLARATION_V2, "XXX"),
+    "baostock": (FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1, "CNY"),
 }
 
 
@@ -1415,6 +1423,12 @@ class MainlandFinancialCapabilityRouter:
                 ratio_family = identity.ratio_family
                 if ratio_family is None or ratio_family not in request.ratio_families:
                     continue
+                declaration_version, expected_currency = (
+                    _INDICATOR_PROVIDER_ASSESSMENT_CONTRACT.get(
+                        candidate.artifact.dataset.provider_id,
+                        (FINANCIAL_RATIO_DECLARATION_V1, request.currency),
+                    )
+                )
                 assessment = assess_financial_period_candidate(
                     candidate,
                     requested_capability=FinancialCapability.RATIO_FAMILY,
@@ -1422,9 +1436,10 @@ class MainlandFinancialCapabilityRouter:
                     requested_ratio_family=ratio_family,
                     expected_instrument_identity=request.instrument_identity,
                     expected_frequency=FinancialReportingFrequency.QUARTERLY,
-                    expected_currency=request.currency,
+                    expected_currency=expected_currency,
                     expected_consolidation_scope=request.consolidation_scope,
                     pit_as_of_date=request.as_of_date,
+                    ratio_declaration_version=declaration_version,
                 )
                 if (
                     assessment.usable_for_current_analysis
@@ -1528,17 +1543,26 @@ class MainlandFinancialCapabilityRouter:
         ] = {}
         family_manifests: list[FinancialAcquisitionManifest] = []
         for family in request.ratio_families:
+            selected_family_assessments = tuple(
+                assessment
+                for (candidate_family, _), assessment in selected_assessments.items()
+                if candidate_family is family
+            )
+            selected_family_currencies = {
+                assessment.currency for assessment in selected_family_assessments
+            }
+            aggregate_currency = (
+                next(iter(selected_family_currencies))
+                if len(selected_family_currencies) == 1
+                else request.currency
+            )
             completeness = assess_financial_ratio_history_coverage(
                 instrument_identity=request.instrument_identity,
                 ratio_family=family,
                 company_type=request.company_type,
                 consolidation_scope=request.consolidation_scope,
-                currency=request.currency,
-                assessments=tuple(
-                    assessment
-                    for (candidate_family, _), assessment in selected_assessments.items()
-                    if candidate_family is family
-                ),
+                currency=aggregate_currency,
+                assessments=selected_family_assessments,
                 eligible_reporting_period_ends=target_periods,
             )
             family_assessments[family] = completeness
