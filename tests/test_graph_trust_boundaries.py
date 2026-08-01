@@ -137,11 +137,25 @@ def test_production_510500_identity_routes_away_from_company_fundamentals():
         expected_sha256=digest,
     )
     assert isinstance(resolved, IdentityRegistryAvailable)
+    identity_mapping = resolved.identity.as_mapping()
+    raw_provenance = identity_mapping["provenance"]
+    assert isinstance(raw_provenance, dict)
+    raw_source_ref = raw_provenance["source_ref"]
+    assert raw_source_ref == (
+        "https://www.sse.com.cn/assortment/fund/list/etfinfo/basic/"
+        "index.shtml?FUNDID=510500"
+    )
     evidence = build_evidence_state(
         symbol="510500.SS",
-        identity=resolved.identity.as_mapping(),
+        identity=identity_mapping,
         snapshot=None,
     )
+    assert evidence.instrument_identity is not None
+    assert evidence.instrument_identity.provenance is not None
+    canonical_source_ref = evidence.instrument_identity.provenance.source_ref
+    assert canonical_source_ref.startswith("acq.v1:identity.provenance:")
+    assert "?" not in canonical_source_ref
+    assert raw_provenance["source_ref"] == raw_source_ref
     factory = MagicMock()
     node = analyst_execution.create_capability_guarded_analyst_node(
         analyst_execution.ANALYST_NODE_SPECS["fundamentals"],

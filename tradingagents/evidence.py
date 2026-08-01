@@ -49,6 +49,24 @@ def stable_acquisition_source_ref(namespace: str, *components: object) -> str:
     return f"acq.v1:{namespace}:{digest.hexdigest()}"
 
 
+def checkpoint_safe_identity_source_ref(
+    *,
+    provider: str,
+    source_ref: str,
+    artifact_sha256: str,
+) -> str:
+    """Opaque query-bearing identity provenance at canonical state boundaries."""
+
+    if "://" not in source_ref or "?" not in source_ref:
+        return source_ref
+    return stable_acquisition_source_ref(
+        "identity.provenance",
+        provider,
+        source_ref,
+        artifact_sha256,
+    )
+
+
 def stable_market_snapshot_id(
     *,
     symbol: str,
@@ -2578,6 +2596,23 @@ def build_evidence_state(
         "crypto": InstrumentKind.CRYPTO,
     }
     provenance_value = identity.get("provenance")
+    if isinstance(provenance_value, Mapping):
+        canonical_provenance = dict(provenance_value)
+        provider = canonical_provenance.get("provider")
+        source_ref = canonical_provenance.get("source_ref")
+        artifact_sha256 = canonical_provenance.get("artifact_sha256")
+        if all(
+            isinstance(value, str)
+            for value in (provider, source_ref, artifact_sha256)
+        ):
+            canonical_provenance["source_ref"] = (
+                checkpoint_safe_identity_source_ref(
+                    provider=provider,
+                    source_ref=source_ref,
+                    artifact_sha256=artifact_sha256,
+                )
+            )
+        provenance_value = canonical_provenance
     instrument_identity = None
     if identity:
         instrument_identity = InstrumentIdentityEvidence(

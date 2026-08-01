@@ -25,7 +25,7 @@ from tradingagents.evidence import (
     InstrumentIdentityEvidence,
     InstrumentKind,
     capability_profile_for,
-    stable_acquisition_source_ref,
+    checkpoint_safe_identity_source_ref,
 )
 from tradingagents.strategy_registry import (
     CRYPTO_DECISION_HORIZON,
@@ -35,22 +35,6 @@ from tradingagents.strategy_registry import (
 
 ASSET_CONFIGURATION_VERSION = "1.0"
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
-
-
-def _checkpoint_safe_identity_source_ref(
-    *,
-    provider: str,
-    source_ref: str,
-    artifact_sha256: str,
-) -> str:
-    if "://" not in source_ref or "?" not in source_ref:
-        return source_ref
-    return stable_acquisition_source_ref(
-        "identity.provenance",
-        provider,
-        source_ref,
-        artifact_sha256,
-    )
 
 
 class ObservationCalendarKind(str, Enum):
@@ -292,7 +276,7 @@ def resolve_run_asset_configuration(
             currency=identity.currency,
             provenance=IdentityProvenance(
                 provider=identity.provenance_provider,
-                source_ref=_checkpoint_safe_identity_source_ref(
+                source_ref=checkpoint_safe_identity_source_ref(
                     provider=identity.provenance_provider,
                     source_ref=identity.provenance_source_ref,
                     artifact_sha256=identity.artifact_sha256,
