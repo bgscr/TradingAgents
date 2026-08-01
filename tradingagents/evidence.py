@@ -57,7 +57,7 @@ def checkpoint_safe_identity_source_ref(
 ) -> str:
     """Opaque query-bearing identity provenance at canonical state boundaries."""
 
-    if "://" not in source_ref or "?" not in source_ref:
+    if "?" not in source_ref:
         return source_ref
     return stable_acquisition_source_ref(
         "identity.provenance",
@@ -286,8 +286,8 @@ class IdentityProvenance(BaseModel):
     @field_validator("source_ref")
     @classmethod
     def _source_ref_is_checkpoint_safe(cls, value: str) -> str:
-        if "://" in value and "?" in value:
-            raise ValueError("identity provenance cannot contain a URL query")
+        if "?" in value:
+            raise ValueError("identity provenance cannot contain a query")
         return value
 
 

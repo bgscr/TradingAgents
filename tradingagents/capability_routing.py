@@ -51,6 +51,22 @@ class MainlandCapabilityRoutingMode(str, Enum):
     QUALIFIED_V1 = "qualified_v1"
 
 
+def _contract_versions_for_mode(
+    mode: MainlandCapabilityRoutingMode,
+) -> tuple[str, str, str]:
+    if mode is MainlandCapabilityRoutingMode.LEGACY:
+        return (
+            NORMALIZER_VERSION_V1,
+            COMPLETENESS_POLICY_VERSION_V1,
+            "financial-period-selection-v1",
+        )
+    return (
+        NORMALIZER_VERSION,
+        COMPLETENESS_POLICY_VERSION,
+        "financial-period-selection-statement-v2",
+    )
+
+
 class MainlandCapability(str, Enum):
     DAILY_MARKET_SNAPSHOT = "daily_market_snapshot"
     BALANCE_SHEET = "balance_sheet"
@@ -190,6 +206,13 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         )
         if self.qualification_profile != expected_profile:
             raise ValueError("routing mode and qualification profile contradict")
+        contract_versions = (
+            self.normalizer_version,
+            self.completeness_policy_version,
+            self.selection_contract_version,
+        )
+        if contract_versions != _contract_versions_for_mode(self.mode):
+            raise ValueError("routing mode and contract versions contradict")
         if (
             self.mode is MainlandCapabilityRoutingMode.LEGACY
             and self.enabled_tushare_capabilities
@@ -323,6 +346,13 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         )
         if self.qualification_profile != expected_profile:
             raise ValueError("routing rollout profile contradicts its mode")
+        contract_versions = (
+            self.normalizer_version,
+            self.completeness_policy_version,
+            self.selection_contract_version,
+        )
+        if contract_versions != _contract_versions_for_mode(self.mode):
+            raise ValueError("routing rollout mode and contract versions contradict")
         canonical_enablement = tuple(
             sorted(
                 set(self.enabled_tushare_capabilities),
@@ -730,7 +760,9 @@ def _build_plan(
     calls_per_minute: int,
     operator_calls_per_minute: int,
 ) -> MainlandCapabilityRoutingPlan:
-    legacy = mode is MainlandCapabilityRoutingMode.LEGACY
+    normalizer_version, completeness_policy_version, selection_contract_version = (
+        _contract_versions_for_mode(mode)
+    )
     payload: dict[str, Any] = {
         "plan_version": CAPABILITY_ROUTING_PLAN_VERSION,
         "policy_version": CAPABILITY_ROUTING_POLICY_VERSION,
@@ -738,14 +770,8 @@ def _build_plan(
         "qualification_profile": qualification_profile,
         "routes": [route.model_dump(mode="json") for route in _routes(mode, enabled)],
         "enabled_tushare_capabilities": [item.value for item in enabled],
-        "normalizer_version": (
-            NORMALIZER_VERSION_V1 if legacy else NORMALIZER_VERSION
-        ),
-        "completeness_policy_version": (
-            COMPLETENESS_POLICY_VERSION_V1
-            if legacy
-            else COMPLETENESS_POLICY_VERSION
-        ),
+        "normalizer_version": normalizer_version,
+        "completeness_policy_version": completeness_policy_version,
         "account_scope_label": account_scope_label,
         "endpoint_pacing_identities": [
             TushareEndpointPacingIdentity(
@@ -764,11 +790,7 @@ def _build_plan(
         ],
         "artifact_contract_version": "source-artifact-v1",
         "manifest_contract_version": "financial-manifest-v1",
-        "selection_contract_version": (
-            "financial-period-selection-v1"
-            if legacy
-            else "financial-period-selection-statement-v2"
-        ),
+        "selection_contract_version": selection_contract_version,
         "degradation_contract_version": "financial-degradation-v1",
     }
     return MainlandCapabilityRoutingPlan(

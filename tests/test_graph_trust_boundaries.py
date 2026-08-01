@@ -176,6 +176,44 @@ def test_production_510500_identity_routes_away_from_company_fundamentals():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_ref",
+    (
+        "urn:mainland-registry:identity?symbol=510500.SS",
+        "registry/identity?symbol=510500.SS",
+    ),
+)
+def test_identity_evidence_opaques_query_bearing_non_http_source_refs(
+    source_ref: str,
+) -> None:
+    raw_provenance = {
+        "provider": "mainland-security-master",
+        "source_ref": source_ref,
+        "retrieved_at": "2026-07-19T12:00:00+00:00",
+        "artifact_sha256": "a" * 64,
+    }
+
+    evidence = build_evidence_state(
+        symbol="510500.SS",
+        identity={
+            "canonical_symbol": "510500.SS",
+            "venue": "XSHG",
+            "instrument_kind": "fund",
+            "currency": "CNY",
+            "provenance": raw_provenance,
+        },
+        snapshot=None,
+    )
+
+    assert evidence.instrument_identity is not None
+    assert evidence.instrument_identity.provenance is not None
+    assert evidence.instrument_identity.provenance.source_ref.startswith(
+        "acq.v1:identity.provenance:"
+    )
+    assert raw_provenance["source_ref"] == source_ref
+
+
+@pytest.mark.unit
 def test_runtime_profile_skip_replaces_stale_applicable_analyst_source():
     stale = _authoritative_baseline().model_copy(
         update={

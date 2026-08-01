@@ -1063,12 +1063,22 @@ def test_rollout_projection_rejects_mode_profile_and_enablement_tampering(
         projection,
         enabled_tushare_capabilities=["statements", "statements"],
     )
+    wrong_contract_versions = dict(
+        projection,
+        normalizer_version="mainland-financial-normalizer-v1",
+        completeness_policy_version="mainland-financial-completeness-v1",
+        selection_contract_version="financial-period-selection-v1",
+    )
 
     with pytest.raises(ValueError):
         MainlandCapabilityRoutingRunProjection.model_validate(wrong_profile)
     with pytest.raises(ValueError):
         MainlandCapabilityRoutingRunProjection.model_validate(
             duplicate_enablement
+        )
+    with pytest.raises(ValueError, match="contract versions"):
+        MainlandCapabilityRoutingRunProjection.model_validate(
+            wrong_contract_versions
         )
 
 

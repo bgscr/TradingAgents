@@ -238,6 +238,25 @@ def test_self_signed_policy_invalid_plan_is_rejected_on_restore() -> None:
         MainlandCapabilityRoutingPlan.model_validate(payload)
 
 
+def test_self_signed_plan_rejects_contract_versions_for_another_mode() -> None:
+    result = preflight_mainland_capability_routing(
+        _mainland_asset_configuration(),
+        config=copy.deepcopy(DEFAULT_CONFIG),
+        environment={},
+    )
+    assert result.plan is not None
+    payload = result.plan.model_dump(mode="json")
+    payload.update(
+        normalizer_version="mainland-financial-normalizer-v2",
+        completeness_policy_version="mainland-financial-completeness-v2",
+        selection_contract_version="financial-period-selection-statement-v2",
+    )
+    _resign_plan_payload(payload)
+
+    with pytest.raises(ValidationError, match="contract versions"):
+        MainlandCapabilityRoutingPlan.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     ("overrides", "environment", "dependency_available", "expected_reason"),
     [
