@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from collections.abc import Callable
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     MainlandCapability,
+    MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
 )
 from tradingagents.dataflows.financial_capability_routing import (
@@ -2385,6 +2387,158 @@ def test_trading_graph_composes_qualified_financial_router(
     )
     assert capability_calls == ["tushare"]
     assert routed.selected_provider == "tushare"
+
+
+def test_bounded_production_composition_validates_factor_and_name_without_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    plan = _qualified_plan(monkeypatch)
+    asset = resolve_run_asset_configuration(
+        "600895.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    calls: list[tuple[MainlandCapability, str]] = []
+    factor_artifacts = (
+        "provider-artifact:baostock-daily",
+        "provider-artifact:baostock-status",
+        "provider-artifact:baostock-factor",
+    )
+    name_artifacts = ("provider-artifact:tushare-name-events",)
+
+    def factor_source(
+        request: FinancialCapabilityRoutingRequest,
+    ) -> FinancialCapabilityProviderResponse:
+        calls.append((request.capability, "request:baostock-factor-1"))
+        return FinancialCapabilityProviderResponse.available(
+            provider_id="baostock",
+            capability=request.capability,
+            retained_artifact_identities=factor_artifacts,
+            candidate_count=3,
+            subrequest_keys=("request:baostock-factor-1",),
+            physical_attempt_ids=("attempt:baostock-factor-1",),
+            provider_history_bundle_identity=(
+                "baostock-provider-history-bundle:v1:" + "a" * 64
+            ),
+            strict_bundle_component_artifact_identities=factor_artifacts,
+        )
+
+    def name_source(
+        request: FinancialCapabilityRoutingRequest,
+    ) -> FinancialCapabilityProviderResponse:
+        calls.append((request.capability, "request:tushare-name-1"))
+        return FinancialCapabilityProviderResponse.available(
+            provider_id="tushare",
+            capability=request.capability,
+            retained_artifact_identities=name_artifacts,
+            candidate_count=1,
+            subrequest_keys=("request:tushare-name-1",),
+            physical_attempt_ids=("attempt:tushare-name-1",),
+        )
+
+    composition = QualifiedFinancialRoutingComposition(
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            capability_sources={
+                MainlandCapability.ADJUSTMENT_FACTORS: {
+                    "baostock": factor_source,
+                },
+                MainlandCapability.NAME_EVENTS: {"tushare": name_source},
+            },
+        ),
+        statement_request_factory=lambda _request: _statement_request(),
+        indicator_request_factory=lambda _request: None,
+    )
+    graph = _production_composition_graph(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        plan=plan,
+        asset=asset,
+        composition=composition,
+    )
+    checkpoint_state = {
+        "capability_routing_plan": plan.model_dump(mode="json"),
+        "capability_routing_rollout": (
+            MainlandCapabilityRoutingRunProjection.from_plan(plan).model_dump(
+                mode="json"
+            )
+        ),
+    }
+    checkpoint_bytes = json.dumps(
+        checkpoint_state,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    checkpoint_compatibility = graph.tool_nodes[
+        "fundamentals"
+    ].validate_checkpoint_state(
+        checkpoint_state,
+        expected_asset_configuration=asset,
+        expected_capability_routing_plan=plan,
+    )
+    assert checkpoint_compatibility is not None
+
+    results = tuple(
+        graph.route_mainland_financial_capability(
+            FinancialCapabilityRoutingRequest(
+                instrument_identity=asset.instrument_identity,
+                capability=capability,
+                range_start=date(2021, 1, 1),
+                as_of_date=date(2026, 7, 30),
+            )
+        )
+        for capability in (
+            MainlandCapability.ADJUSTMENT_FACTORS,
+            MainlandCapability.NAME_EVENTS,
+        )
+    )
+
+    factor_result, name_result = results
+    assert calls == [
+        (MainlandCapability.ADJUSTMENT_FACTORS, "request:baostock-factor-1"),
+        (MainlandCapability.NAME_EVENTS, "request:tushare-name-1"),
+    ]
+    assert factor_result.retained_artifact_identities == factor_artifacts
+    assert factor_result.physical_attempt_ids == ("attempt:baostock-factor-1",)
+    assert factor_result.strict_bundle_established is True
+    assert name_result.retained_artifact_identities == name_artifacts
+    assert name_result.physical_attempt_ids == ("attempt:tushare-name-1",)
+    assert all(result.source_facts_created is False for result in results)
+    assert all(
+        result.status_or_lifecycle_fact_created is False for result in results
+    )
+    assert checkpoint_bytes == json.dumps(
+        checkpoint_state,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    rollback = preflight_mainland_capability_routing(
+        asset,
+        config=copy.deepcopy(DEFAULT_CONFIG),
+        environment={},
+    )
+    assert rollback.plan is not None
+    rollback_graph = TradingAgentsGraph(
+        selected_analysts=("fundamentals",),
+        config=copy.deepcopy(DEFAULT_CONFIG),
+        asset_configuration=asset,
+        capability_routing_plan=rollback.plan,
+    )
+    with pytest.raises(
+        ValueError,
+        match="qualified mainland financial routing is not configured",
+    ):
+        rollback_graph.route_mainland_financial_capability(
+            FinancialCapabilityRoutingRequest(
+                instrument_identity=asset.instrument_identity,
+                capability=MainlandCapability.NAME_EVENTS,
+                range_start=date(2021, 1, 1),
+                as_of_date=date(2026, 7, 30),
+            )
+        )
+    assert len(calls) == 2
 
 
 def test_production_composition_routes_tushare_gap_to_akshare_sina(
