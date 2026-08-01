@@ -244,6 +244,44 @@ def test_identical_subrequests_share_one_inflight_and_terminal_physical_attempt(
 
 
 @pytest.mark.unit
+def test_single_flight_leader_may_run_on_worker_thread(tmp_path) -> None:
+    now = datetime(2026, 7, 31, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(
+                tmp_path / "subrequest-artifacts"
+            ),
+            run_scope_id="ticket-03-worker-leader",
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(
+                cache.execute,
+                key,
+                owner_id="worker-leader",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="financial-statement:income",
+                media_type="application/json",
+                physical_request=lambda: b'{"safe_fixture":true}',
+            ).result(timeout=5)
+
+    assert result.outcome.kind is ProviderSubrequestOutcomeKind.AVAILABLE
+    assert len(result.attempt_events) == 1
+
+
+@pytest.mark.unit
 def test_checkpoint_resume_reuses_terminal_artifact_and_outcome_without_io(
     tmp_path,
 ) -> None:

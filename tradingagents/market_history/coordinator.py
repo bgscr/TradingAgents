@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sqlite3
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -319,6 +320,26 @@ class ProviderRequestCoordinator:
 
     def __init__(self, store: MarketHistoryStore) -> None:
         self._store = store
+        self._store_thread_id = threading.get_ident()
+        self._thread_state = threading.local()
+
+    def _database_connection(self) -> sqlite3.Connection:
+        """Use the store connection on its owner thread and a local peer elsewhere."""
+        if threading.get_ident() == self._store_thread_id:
+            return self._store._connection
+        connection = getattr(self._thread_state, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self._store.config.database_path,
+                isolation_level=None,
+                timeout=30.0,
+            )
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA busy_timeout = 30000")
+            self._thread_state.connection = connection
+        return connection
 
     def register_upstream_service(
         self,
@@ -330,7 +351,7 @@ class ProviderRequestCoordinator:
         if not upstream_service_id.strip() or not service_name.strip():
             raise ValueError("upstream service identity and name must not be blank")
         account_scope = _validate_account_scope(account_scope)
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT OR IGNORE INTO upstream_services "
             "(upstream_service_id, service_name, account_scope, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -341,7 +362,7 @@ class ProviderRequestCoordinator:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
-        persisted = self._store._connection.execute(
+        persisted = self._database_connection().execute(
             "SELECT account_scope FROM upstream_services "
             "WHERE upstream_service_id = ?",
             (upstream_service_id,),
@@ -378,7 +399,7 @@ class ProviderRequestCoordinator:
             "allow_prewarming": allow_prewarming,
             "configured_at": configured_at.isoformat(),
         }
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "UPDATE upstream_services SET operator_ceiling_json = ? "
             "WHERE upstream_service_id = ?",
             (
@@ -436,14 +457,14 @@ class ProviderRequestCoordinator:
         upstream_service_id: str,
     ) -> datetime | None:
         attempts: list[datetime] = []
-        typed_latest = self._store._connection.execute(
+        typed_latest = self._database_connection().execute(
             "SELECT MAX(attempted_at) FROM provider_request_attempts "
             "WHERE upstream_service_id = ?",
             (upstream_service_id,),
         ).fetchone()
         if typed_latest is not None and typed_latest[0] is not None:
             attempts.append(datetime.fromisoformat(str(typed_latest[0])))
-        for occurred_at, raw_detail in self._store._connection.execute(
+        for occurred_at, raw_detail in self._database_connection().execute(
             "SELECT occurred_at, detail FROM history_store_diagnostics "
             "WHERE operation = 'provider_request' AND code = 'physical_attempt'"
         ):
@@ -469,7 +490,7 @@ class ProviderRequestCoordinator:
         """Close durable attempt rows left behind by an expired request owner."""
 
         expired = tuple(
-            self._store._connection.execute(
+            self._database_connection().execute(
                 "SELECT request_key, upstream_service_id, owner_id "
                 "FROM request_leases WHERE expires_at <= ?",
                 (now.isoformat(),),
@@ -478,7 +499,7 @@ class ProviderRequestCoordinator:
         for request_key, upstream_service_id, owner_id in expired:
             sequence_ids = {
                 str(row[0])
-                for row in self._store._connection.execute(
+                for row in self._database_connection().execute(
                     "SELECT sequence_id FROM provider_request_sequences "
                     "WHERE request_key = ? AND upstream_service_id = ? "
                     "AND owner_id = ? AND status = 'running'",
@@ -487,7 +508,7 @@ class ProviderRequestCoordinator:
             }
             sequence_ids.update(
                 str(row[0])
-                for row in self._store._connection.execute(
+                for row in self._database_connection().execute(
                     "SELECT DISTINCT sequence_id FROM provider_request_attempts "
                     "WHERE request_key = ? AND upstream_service_id = ? "
                     "AND owner_id = ? AND final_physical_attempt_count IS NULL",
@@ -521,7 +542,7 @@ class ProviderRequestCoordinator:
             raise ValueError("lease duration must be positive")
         cooldown_scope = _validate_capacity_scope(cooldown_scope)
         expires_at = now + lease_duration
-        connection = self._store._connection
+        connection = self._database_connection()
         connection.execute("BEGIN IMMEDIATE")
         try:
             self._recover_expired_retry_sequences(now)
@@ -666,7 +687,7 @@ class ProviderRequestCoordinator:
         now: datetime,
     ) -> None:
         expires_at = now + timedelta(minutes=5)
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT INTO request_queue "
             "(request_key, upstream_service_id, priority, first_enqueued_at, updated_at, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?) "
@@ -707,7 +728,7 @@ class ProviderRequestCoordinator:
             raise ValueError("provider code must be a bounded provider-code token")
         candidate_until = observed_at + retry_after
         retry_after_seconds = retry_after.total_seconds()
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT INTO request_cooldowns "
             "(upstream_service_id, cooldown_scope, cooldown_until, reason, "
             "retry_after_seconds, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
@@ -726,7 +747,7 @@ class ProviderRequestCoordinator:
                 observed_at.isoformat(),
             ),
         )
-        row = self._store._connection.execute(
+        row = self._database_connection().execute(
             "SELECT cooldown_until, reason, retry_after_seconds, updated_at "
             "FROM request_cooldowns WHERE upstream_service_id = ? AND cooldown_scope = ?",
             (upstream_service_id, cooldown_scope),
@@ -1050,7 +1071,7 @@ class ProviderRequestCoordinator:
                     if pacing_wait_seconds
                     else "permit_acquired"
                 )
-                connection = self._store._connection
+                connection = self._database_connection()
                 attempt_recorded = False
                 diagnostic_id: str | None = None
 
@@ -1299,12 +1320,12 @@ class ProviderRequestCoordinator:
                 )
             raise AssertionError("unreachable physical-attempt budget state")
         finally:
-            row = self._store._connection.execute(
+            row = self._database_connection().execute(
                 "SELECT status FROM provider_request_sequences WHERE sequence_id = ?",
                 (sequence_id,),
             ).fetchone()
             if row is not None and str(row[0]) == "running":
-                connection = self._store._connection
+                connection = self._database_connection()
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     self._close_running_sequence(
@@ -1338,7 +1359,7 @@ class ProviderRequestCoordinator:
         sequence_id: str,
         lease: RequestLease,
     ) -> None:
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT INTO provider_request_sequences "
             "(sequence_id, request_key, upstream_service_id, owner_id, started_at, "
             "status, capacity_scope) VALUES (?, ?, ?, ?, ?, 'running', ?)",
@@ -1360,7 +1381,7 @@ class ProviderRequestCoordinator:
         final_count: int,
         result_payload: bytes,
     ) -> None:
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "UPDATE provider_request_sequences SET status = 'succeeded', "
             "completed_at = ?, final_physical_attempt_count = ?, result_payload = ?, "
             "result_sha256 = ? WHERE sequence_id = ? AND status = 'running'",
@@ -1392,7 +1413,7 @@ class ProviderRequestCoordinator:
             }
             else failure.outcome
         )
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "UPDATE provider_request_sequences SET status = 'failed', "
             "completed_at = ?, final_physical_attempt_count = ?, "
             "failure_outcome = ?, failure_outcome_kind = ?, failure_retryable = ?, "
@@ -1424,7 +1445,7 @@ class ProviderRequestCoordinator:
         sleep: Callable[[float], None],
     ) -> CoordinatedRequestResult[T]:
         while True:
-            row = self._store._connection.execute(
+            row = self._database_connection().execute(
                 "SELECT sequence_id, status, final_physical_attempt_count, "
                 "result_payload, result_sha256, "
                 "COALESCE(failure_outcome_kind, failure_outcome), "
@@ -1438,13 +1459,13 @@ class ProviderRequestCoordinator:
                 return self._load_persisted_sequence(row)
 
             current = _as_utc(now(), label="coordinator time")
-            lease_row = self._store._connection.execute(
+            lease_row = self._database_connection().execute(
                 "SELECT expires_at FROM request_leases WHERE request_key = ? "
                 "AND upstream_service_id = ? AND owner_id = ?",
                 (request_key, upstream_service_id, owner_id),
             ).fetchone()
             if lease_row is not None and datetime.fromisoformat(str(lease_row[0])) <= current:
-                connection = self._store._connection
+                connection = self._database_connection()
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     self._recover_expired_retry_sequences(current)
@@ -1458,7 +1479,7 @@ class ProviderRequestCoordinator:
                     raise
                 continue
             if lease_row is None and row is not None and str(row[1]) == "running":
-                connection = self._store._connection
+                connection = self._database_connection()
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     self._close_running_sequence(
@@ -1528,13 +1549,13 @@ class ProviderRequestCoordinator:
         completed_at: datetime,
         error_code: str,
     ) -> None:
-        count_row = self._store._connection.execute(
+        count_row = self._database_connection().execute(
             "SELECT COALESCE(MAX(attempt_index), 0) "
             "FROM provider_request_attempts WHERE sequence_id = ?",
             (sequence_id,),
         ).fetchone()
         final_count = int(count_row[0]) if count_row is not None else 0
-        self._store._connection.execute(
+        self._database_connection().execute(
             "UPDATE provider_request_attempts SET outcome = 'provider_error', "
             "terminal_outcome = 'abandoned', terminal_outcome_kind = 'abandoned', "
             "retryable = 0, error_code = ? "
@@ -1542,7 +1563,7 @@ class ProviderRequestCoordinator:
             (error_code, sequence_id),
         )
         self._finalize_attempt_sequence(sequence_id, final_count)
-        self._store._connection.execute(
+        self._database_connection().execute(
             "UPDATE provider_request_sequences SET status = 'failed', "
             "completed_at = ?, final_physical_attempt_count = ?, "
             "failure_outcome = 'provider_error', failure_outcome_kind = 'abandoned', "
@@ -1552,7 +1573,7 @@ class ProviderRequestCoordinator:
         )
 
     def _delete_lease(self, lease: RequestLease) -> None:
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "DELETE FROM request_leases WHERE request_key = ? AND owner_id = ?",
             (lease.request_key, lease.owner_id),
         )
@@ -1560,7 +1581,7 @@ class ProviderRequestCoordinator:
             raise RuntimeError("request lease release affected multiple rows")
 
     def _service_name(self, upstream_service_id: str) -> str:
-        row = self._store._connection.execute(
+        row = self._database_connection().execute(
             "SELECT service_name FROM upstream_services WHERE upstream_service_id = ?",
             (upstream_service_id,),
         ).fetchone()
@@ -1581,7 +1602,7 @@ class ProviderRequestCoordinator:
         pacing_wait_seconds: float,
     ) -> str:
         attempt_event_id = _physical_attempt_event_id(sequence_id, attempt_index)
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT INTO provider_request_attempts "
             "(attempt_event_id, sequence_id, attempt_index, request_key, upstream_service_id, "
             "upstream_service_name, owner_id, priority, operation, attempted_at, "
@@ -1626,7 +1647,7 @@ class ProviderRequestCoordinator:
             }
             else outcome
         )
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "UPDATE provider_request_attempts SET outcome = ?, terminal_outcome = ?, "
             "terminal_outcome_kind = ?, "
             "retryable = ?, "
@@ -1653,7 +1674,7 @@ class ProviderRequestCoordinator:
     def _finalize_attempt_sequence(self, sequence_id: str, final_count: int) -> None:
         if final_count < 0:
             raise ValueError("final physical-attempt count cannot be negative")
-        self._store._connection.execute(
+        self._database_connection().execute(
             "UPDATE provider_request_attempts SET final_physical_attempt_count = ? "
             "WHERE sequence_id = ?",
             (final_count, sequence_id),
@@ -1663,7 +1684,7 @@ class ProviderRequestCoordinator:
         self,
         sequence_id: str,
     ) -> tuple[ProviderPhysicalAttemptEvent, ...]:
-        rows = self._store._connection.execute(
+        rows = self._database_connection().execute(
             "SELECT attempt_event_id, request_key, upstream_service_id, "
             "upstream_service_name, COALESCE(capacity_scope, 'all'), "
             "attempt_index, attempted_at, pacing_event, pacing_wait_seconds, "
@@ -1721,7 +1742,7 @@ class ProviderRequestCoordinator:
         if lease is None:
             raise ValueError("an acquired request lease is required")
         requested_at = _as_utc(requested_at, label="physical-attempt time")
-        row = self._store._connection.execute(
+        row = self._database_connection().execute(
             "SELECT operator_ceiling_json FROM upstream_services "
             "WHERE upstream_service_id = ?",
             (lease.upstream_service_id,),
@@ -1752,7 +1773,7 @@ class ProviderRequestCoordinator:
         if lease_duration <= timedelta(0):
             raise ValueError("lease duration must be positive")
         expires_at = now + lease_duration
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "UPDATE request_leases SET expires_at = ? "
             "WHERE request_key = ? AND upstream_service_id = ? AND owner_id = ? "
             "AND expires_at > ?",
@@ -1782,7 +1803,7 @@ class ProviderRequestCoordinator:
         now: datetime,
     ) -> ProviderRequestOperationalSummary:
         now = _as_utc(now, label="operational-summary time")
-        connection = self._store._connection
+        connection = self._database_connection()
         diagnostic_counts = {
             str(code): int(count)
             for code, count in connection.execute(
@@ -1834,7 +1855,7 @@ class ProviderRequestCoordinator:
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
         diagnostic_id = f"history-diagnostic=sha256:{digest.hexdigest()}"
-        self._store._connection.execute(
+        self._database_connection().execute(
             "INSERT OR IGNORE INTO history_store_diagnostics "
             "(diagnostic_id, occurred_at, operation, severity, code, detail) "
             "VALUES (?, ?, 'provider_request', ?, ?, ?)",
@@ -1862,7 +1883,7 @@ class ProviderRequestCoordinator:
         """Remove a waiter when its caller abandons retrying this request."""
         if not request_key.strip() or not upstream_service_id.strip():
             raise ValueError("request and upstream identities must not be blank")
-        cursor = self._store._connection.execute(
+        cursor = self._database_connection().execute(
             "DELETE FROM request_queue WHERE request_key = ? "
             "AND upstream_service_id = ?",
             (request_key, upstream_service_id),
