@@ -23,6 +23,9 @@ from tradingagents.capability_routing import (
     TushareCapability,
     preflight_mainland_capability_routing,
 )
+from tradingagents.dataflows.financial_capability_routing import (
+    MainlandFinancialCapabilityRouter,
+)
 from tradingagents.decision_audit import prepare_decision_audit
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import (
@@ -37,6 +40,7 @@ from tradingagents.evidence import (
     stable_acquisition_source_ref,
 )
 from tradingagents.graph.checkpointer import get_checkpointer
+from tradingagents.graph.financial_tools import QualifiedFinancialRoutingComposition
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 
@@ -716,6 +720,13 @@ def test_resolved_plan_is_checkpointed_and_environment_changes_are_ignored(
         config=config,
         asset_configuration=asset_configuration,
         capability_routing_plan=plan,
+        qualified_financial_routing=QualifiedFinancialRoutingComposition(
+            router=MainlandFinancialCapabilityRouter(
+                routing_plan=plan,
+                statement_sources={},
+            ),
+            statement_request_factory=lambda _request: None,
+        ),
     )
     state = graph.create_initial_state(
         "601328.SS",

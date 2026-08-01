@@ -45,6 +45,7 @@ _RESERVED_ACCOUNT_SCOPE_MARKERS = (
 
 class MainlandCapabilityRoutingMode(str, Enum):
     LEGACY = "legacy"
+    QUALIFIED_V1_SHADOW = "qualified_v1_shadow"
     QUALIFIED_V1 = "qualified_v1"
 
 
@@ -67,6 +68,14 @@ class TushareCapability(str, Enum):
     NAME_EVENTS = "name_events"
 
 
+class MainlandCapabilityRoutingDisposition(str, Enum):
+    """Whether qualified selections may influence the authoritative run."""
+
+    LEGACY_AUTHORITATIVE = "legacy_authoritative"
+    SHADOW_NON_AUTHORITATIVE = "shadow_non_authoritative"
+    QUALIFIED_AUTHORITATIVE = "qualified_authoritative"
+
+
 class MainlandCapabilityRoutingFailureReason(str, Enum):
     INSTRUMENT_NOT_MAINLAND_EQUITY = "instrument_not_mainland_equity"
     INVALID_ROUTING_MODE = "invalid_routing_mode"
@@ -83,6 +92,9 @@ class MainlandCapabilityRoutingFailureReason(str, Enum):
         "tushare_operator_safety_ceiling_invalid"
     )
     TUSHARE_ACCOUNT_SCOPE_INVALID = "tushare_account_scope_invalid"
+    QUALIFIED_ROUTING_COMPOSITION_MISSING = (
+        "qualified_routing_composition_missing"
+    )
 
 
 class MainlandCapabilityRoute(BaseModel):
@@ -237,6 +249,238 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         raise KeyError(capability.value)
 
 
+class MainlandCapabilityRoutingRunProjection(BaseModel):
+    """Closed checkpoint/audit projection of one rollout-bound run."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = "1.0"
+    mode: MainlandCapabilityRoutingMode
+    plan_version: Literal["1.0"]
+    policy_version: Literal["mainland-capability-routing-policy-v1"]
+    plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
+    enabled_tushare_capabilities: tuple[TushareCapability, ...]
+    qualification_profile: Literal["legacy", "cn-a-2000-20260729-v1"]
+    normalizer_version: Literal["mainland-financial-normalizer-v1"]
+    completeness_policy_version: Literal["mainland-financial-completeness-v1"]
+    manifest_contract_version: Literal["financial-manifest-v1"]
+    selection_contract_version: Literal["financial-period-selection-v1"]
+    degradation_contract_version: Literal["financial-degradation-v1"]
+    disposition: MainlandCapabilityRoutingDisposition
+    rollback_compatible: Literal[True] = True
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: MainlandCapabilityRoutingPlan,
+    ) -> MainlandCapabilityRoutingRunProjection:
+        disposition = {
+            MainlandCapabilityRoutingMode.LEGACY: (
+                MainlandCapabilityRoutingDisposition.LEGACY_AUTHORITATIVE
+            ),
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW: (
+                MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
+            ),
+            MainlandCapabilityRoutingMode.QUALIFIED_V1: (
+                MainlandCapabilityRoutingDisposition.QUALIFIED_AUTHORITATIVE
+            ),
+        }[plan.mode]
+        return cls(
+            mode=plan.mode,
+            plan_version=plan.plan_version,
+            policy_version=plan.policy_version,
+            plan_signature=plan.plan_signature,
+            enabled_tushare_capabilities=plan.enabled_tushare_capabilities,
+            qualification_profile=plan.qualification_profile,
+            normalizer_version=plan.normalizer_version,
+            completeness_policy_version=plan.completeness_policy_version,
+            manifest_contract_version=plan.manifest_contract_version,
+            selection_contract_version=plan.selection_contract_version,
+            degradation_contract_version=plan.degradation_contract_version,
+            disposition=disposition,
+        )
+
+    @model_validator(mode="after")
+    def _validate_plan_disposition(self) -> MainlandCapabilityRoutingRunProjection:
+        expected_profile = (
+            "legacy"
+            if self.mode is MainlandCapabilityRoutingMode.LEGACY
+            else QUALIFICATION_PROFILE
+        )
+        if self.qualification_profile != expected_profile:
+            raise ValueError("routing rollout profile contradicts its mode")
+        canonical_enablement = tuple(
+            sorted(
+                set(self.enabled_tushare_capabilities),
+                key=tuple(TushareCapability).index,
+            )
+        )
+        if self.enabled_tushare_capabilities != canonical_enablement:
+            raise ValueError("routing rollout enablement must be canonical")
+        if (
+            self.mode is MainlandCapabilityRoutingMode.LEGACY
+            and self.enabled_tushare_capabilities
+        ):
+            raise ValueError("legacy rollout cannot enable Tushare capabilities")
+        expected = {
+            MainlandCapabilityRoutingMode.LEGACY: (
+                MainlandCapabilityRoutingDisposition.LEGACY_AUTHORITATIVE
+            ),
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW: (
+                MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
+            ),
+            MainlandCapabilityRoutingMode.QUALIFIED_V1: (
+                MainlandCapabilityRoutingDisposition.QUALIFIED_AUTHORITATIVE
+            ),
+        }[self.mode]
+        if self.disposition is not expected:
+            raise ValueError("routing rollout disposition contradicts its mode")
+        if (
+            self.mode is MainlandCapabilityRoutingMode.LEGACY
+            and self.plan_signature != _legacy_plan_signature()
+        ):
+            raise ValueError("legacy rollout signature is not authoritative")
+        return self
+
+
+class MainlandCapabilityRoutingShadowFailure(BaseModel):
+    """Bounded non-authoritative failure marker with no provider detail."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = "1.0"
+    diagnostic_code: Literal["shadow_dispatch_failed"] = "shadow_dispatch_failed"
+    failure_count: int = Field(ge=1)
+
+
+class MainlandCapabilityRoutingCheckpointAction(str, Enum):
+    RESUME = "resume"
+    START_NEW = "start_new"
+
+
+class MainlandCapabilityRoutingCheckpointFailureReason(str, Enum):
+    UNVERSIONED_LEGACY_REQUIRES_NEW_RUN = "unversioned_legacy_requires_new_run"
+    LEGACY_PLAN_REQUIRES_NEW_RUN = "legacy_plan_requires_new_run"
+    QUALIFIED_PLAN_DOWNGRADE_FORBIDDEN = "qualified_plan_downgrade_forbidden"
+    ROLLOUT_MODE_MISMATCH = "rollout_mode_mismatch"
+    PLAN_MISMATCH = "plan_mismatch"
+    TAMPERED_PROJECTION = "tampered_projection"
+
+
+class MainlandCapabilityRoutingCheckpointError(ValueError):
+    """Typed, secret-free refusal to reuse an incompatible checkpoint."""
+
+    def __init__(
+        self,
+        reason: MainlandCapabilityRoutingCheckpointFailureReason,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic_code = reason.value
+        super().__init__(reason.value)
+
+
+class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
+    """Pure resume decision that never rewrites historical checkpoint state."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = "1.0"
+    action: MainlandCapabilityRoutingCheckpointAction
+    reason: MainlandCapabilityRoutingCheckpointFailureReason | None = None
+    active: MainlandCapabilityRoutingRunProjection
+    checkpoint: MainlandCapabilityRoutingRunProjection | None
+    provider_io_performed: Literal[False] = False
+    checkpoint_rewrite_permitted: Literal[False] = False
+    historical_state_preserved: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _validate_action(self) -> MainlandCapabilityRoutingCheckpointCompatibility:
+        if self.action is MainlandCapabilityRoutingCheckpointAction.RESUME:
+            if (
+                self.reason is not None
+                or self.checkpoint is None
+                or self.active != self.checkpoint
+            ):
+                raise ValueError("resume requires an exact routing plan match")
+        elif (
+            self.reason
+            is MainlandCapabilityRoutingCheckpointFailureReason.UNVERSIONED_LEGACY_REQUIRES_NEW_RUN
+        ):
+            if self.checkpoint is not None:
+                raise ValueError("unversioned legacy new-run state has no projection")
+        elif (
+            self.reason
+            is MainlandCapabilityRoutingCheckpointFailureReason.LEGACY_PLAN_REQUIRES_NEW_RUN
+        ):
+            if (
+                self.checkpoint is None
+                or self.checkpoint.mode is not MainlandCapabilityRoutingMode.LEGACY
+                or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
+            ):
+                raise ValueError("legacy new-run state requires a qualified active plan")
+        else:
+            raise ValueError("new-run routing decision requires a legacy mismatch")
+        return self
+
+
+def validate_mainland_capability_routing_checkpoint(
+    *,
+    active_plan: MainlandCapabilityRoutingPlan,
+    checkpoint_plan: Mapping[str, Any] | MainlandCapabilityRoutingPlan | None,
+) -> MainlandCapabilityRoutingCheckpointCompatibility:
+    """Classify resume compatibility without provider I/O or state mutation."""
+
+    active_projection = MainlandCapabilityRoutingRunProjection.from_plan(active_plan)
+    if checkpoint_plan is None:
+        return MainlandCapabilityRoutingCheckpointCompatibility(
+            action=MainlandCapabilityRoutingCheckpointAction.START_NEW,
+            reason=(
+                MainlandCapabilityRoutingCheckpointFailureReason.UNVERSIONED_LEGACY_REQUIRES_NEW_RUN
+            ),
+            active=active_projection,
+            checkpoint=None,
+        )
+    try:
+        restored = MainlandCapabilityRoutingPlan.model_validate(checkpoint_plan)
+    except (TypeError, ValueError) as exc:
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.TAMPERED_PROJECTION
+        ) from exc
+    checkpoint_projection = MainlandCapabilityRoutingRunProjection.from_plan(restored)
+    if restored == active_plan:
+        return MainlandCapabilityRoutingCheckpointCompatibility(
+            action=MainlandCapabilityRoutingCheckpointAction.RESUME,
+            active=active_projection,
+            checkpoint=checkpoint_projection,
+        )
+    if (
+        restored.mode is MainlandCapabilityRoutingMode.LEGACY
+        and active_plan.mode is not MainlandCapabilityRoutingMode.LEGACY
+    ):
+        return MainlandCapabilityRoutingCheckpointCompatibility(
+            action=MainlandCapabilityRoutingCheckpointAction.START_NEW,
+            reason=(
+                MainlandCapabilityRoutingCheckpointFailureReason.LEGACY_PLAN_REQUIRES_NEW_RUN
+            ),
+            active=active_projection,
+            checkpoint=checkpoint_projection,
+        )
+    if (
+        restored.mode is not MainlandCapabilityRoutingMode.LEGACY
+        and active_plan.mode is MainlandCapabilityRoutingMode.LEGACY
+    ):
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.QUALIFIED_PLAN_DOWNGRADE_FORBIDDEN
+        )
+    if restored.mode is not active_plan.mode:
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.ROLLOUT_MODE_MISMATCH
+        )
+    raise MainlandCapabilityRoutingCheckpointError(
+        MainlandCapabilityRoutingCheckpointFailureReason.PLAN_MISMATCH
+    )
+
+
 class MainlandCapabilityRoutingFailure(BaseModel):
     """Typed, payload-free configuration blocker for Evidence Preflight."""
 
@@ -259,9 +503,14 @@ class MainlandCapabilityRoutingFailure(BaseModel):
 class MainlandCapabilityRoutingPreflightError(ValueError):
     """Typed pre-construction stop carrying only the safe failure contract."""
 
-    def __init__(self, failure: MainlandCapabilityRoutingFailure) -> None:
+    def __init__(
+        self,
+        failure: MainlandCapabilityRoutingFailure,
+        *,
+        message: str | None = None,
+    ) -> None:
         self.failure = failure
-        super().__init__(failure.reason.value)
+        super().__init__(message or failure.reason.value)
 
 
 class MainlandCapabilityRoutingPreflight(BaseModel):
@@ -347,6 +596,17 @@ def _blocked(
             analysis_outcome=outcome,
         ),
     )
+
+
+def mainland_capability_routing_failure(
+    reason: MainlandCapabilityRoutingFailureReason,
+) -> MainlandCapabilityRoutingFailure:
+    """Build one public, typed, secret-free activation failure."""
+
+    result = _blocked(reason)
+    if result.failure is None:  # pragma: no cover - closed model invariant
+        raise RuntimeError("routing failure projection is unavailable")
+    return result.failure
 
 
 def _routes(
@@ -492,6 +752,17 @@ def _build_plan(
     )
 
 
+def _legacy_plan_signature() -> str:
+    return _build_plan(
+        mode=MainlandCapabilityRoutingMode.LEGACY,
+        enabled=(),
+        qualification_profile="legacy",
+        account_scope_label="not-applicable",
+        calls_per_minute=40,
+        operator_calls_per_minute=40,
+    ).plan_signature
+
+
 def preflight_mainland_capability_routing(
     asset_configuration: RunAssetConfiguration | None,
     *,
@@ -622,16 +893,25 @@ def preflight_mainland_capability_routing(
 
 __all__ = [
     "MainlandCapability",
+    "MainlandCapabilityRoutingCheckpointAction",
+    "MainlandCapabilityRoutingCheckpointCompatibility",
+    "MainlandCapabilityRoutingCheckpointError",
+    "MainlandCapabilityRoutingCheckpointFailureReason",
+    "MainlandCapabilityRoutingDisposition",
     "MainlandCapabilityRoutingFailure",
     "MainlandCapabilityRoutingFailureReason",
     "MainlandCapabilityRoutingMode",
     "MainlandCapabilityRoutingPlan",
     "MainlandCapabilityRoutingPreflight",
     "MainlandCapabilityRoutingPreflightError",
+    "MainlandCapabilityRoutingRunProjection",
+    "MainlandCapabilityRoutingShadowFailure",
     "MainlandRequestBudgetIdentity",
     "TushareCapability",
     "TushareEndpointPacingIdentity",
     "capability_routing_configuration_is_explicit",
     "is_mainland_equity_configuration",
+    "mainland_capability_routing_failure",
     "preflight_mainland_capability_routing",
+    "validate_mainland_capability_routing_checkpoint",
 ]

@@ -16,10 +16,15 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from tradingagents.asset_configuration import RunAssetConfigurationProjection
 from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingCheckpointCompatibility,
     MainlandCapabilityRoutingFailureReason,
+    MainlandCapabilityRoutingMode,
     MainlandCapabilityRoutingPlan,
+    MainlandCapabilityRoutingRunProjection,
+    MainlandCapabilityRoutingShadowFailure,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchAuditProjectionV2,
     project_financial_dispatch_ledger,
 )
 from tradingagents.decision_policy import (
@@ -485,7 +490,8 @@ def build_decision_audit(
                 "Capability Routing Plan requires an authoritative asset configuration"
             )
         if (
-            capability_routing_plan.mode.value == "qualified_v1"
+            capability_routing_plan.mode.value
+            in {"qualified_v1", "qualified_v1_shadow"}
             and (
                 graph_signature is None
                 or capability_routing_plan.plan_signature not in graph_signature
@@ -504,6 +510,53 @@ def build_decision_audit(
     )
     if capability_routing_plan is not None and capability_routing_failure is not None:
         raise ValueError("run cannot contain both a routing plan and routing failure")
+    raw_rollout = final_state.get("capability_routing_rollout")
+    capability_routing_rollout = (
+        None
+        if raw_rollout is None
+        else MainlandCapabilityRoutingRunProjection.model_validate(raw_rollout)
+    )
+    if capability_routing_plan is None:
+        if capability_routing_rollout is not None:
+            raise ValueError("routing rollout projection requires a routing plan")
+    else:
+        expected_rollout = MainlandCapabilityRoutingRunProjection.from_plan(
+            capability_routing_plan
+        )
+        if capability_routing_rollout is None:
+            capability_routing_rollout = expected_rollout
+        elif capability_routing_rollout != expected_rollout:
+            raise ValueError("routing rollout projection contradicts its plan")
+    raw_checkpoint_compatibility = final_state.get(
+        "capability_routing_checkpoint_compatibility"
+    )
+    capability_routing_checkpoint_compatibility = (
+        None
+        if raw_checkpoint_compatibility is None
+        else MainlandCapabilityRoutingCheckpointCompatibility.model_validate(
+            raw_checkpoint_compatibility
+        )
+    )
+    if (
+        capability_routing_checkpoint_compatibility is not None
+        and capability_routing_checkpoint_compatibility.active
+        != capability_routing_rollout
+    ):
+        raise ValueError("checkpoint compatibility contradicts the active rollout")
+    raw_shadow_failure = final_state.get("financial_dispatch_shadow_failure")
+    shadow_failure = (
+        None
+        if raw_shadow_failure is None
+        else MainlandCapabilityRoutingShadowFailure.model_validate(
+            raw_shadow_failure
+        )
+    )
+    if shadow_failure is not None and (
+        capability_routing_plan is None
+        or capability_routing_plan.mode
+        is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+    ):
+        raise ValueError("shadow failure requires a shadow rollout plan")
     raw_telemetry = final_state.get("run_telemetry")
     telemetry = (
         RunTelemetryProjection.empty(
@@ -525,9 +578,42 @@ def build_decision_audit(
             else None
         ),
     )
+    financial_dispatch_shadow = project_financial_dispatch_ledger(
+        final_state.get("financial_dispatch_shadow_ledger"),
+        run_asset_configuration=asset_configuration,
+        config=config,
+        capability_routing_plan=capability_routing_plan,
+        run_scope_id=(
+            str(final_state["run_id"])
+            if final_state.get("run_id") is not None
+            else None
+        ),
+    )
+    if financial_dispatch_shadow is not None and (
+        capability_routing_plan is None
+        or capability_routing_plan.mode
+        is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+        or not isinstance(
+            financial_dispatch_shadow,
+            FinancialDispatchAuditProjectionV2,
+        )
+    ):
+        raise ValueError("shadow financial dispatch requires a shadow rollout plan")
+    if (
+        capability_routing_plan is not None
+        and capability_routing_plan.mode
+        is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+        and isinstance(financial_dispatch, FinancialDispatchAuditProjectionV2)
+    ):
+        raise ValueError("shadow qualified selections cannot be authoritative")
     final_state["financial_dispatch_audit_projection"] = (
         financial_dispatch.model_dump(mode="json")
         if financial_dispatch is not None
+        else None
+    )
+    final_state["financial_dispatch_shadow_audit_projection"] = (
+        financial_dispatch_shadow.model_dump(mode="json")
+        if financial_dispatch_shadow is not None
         else None
     )
     payload: dict[str, Any] = {
@@ -551,6 +637,16 @@ def build_decision_audit(
             if financial_dispatch is not None
             else None
         ),
+        "financial_dispatch_shadow": (
+            financial_dispatch_shadow.model_dump(mode="json")
+            if financial_dispatch_shadow is not None
+            else None
+        ),
+        "financial_dispatch_shadow_failure": (
+            shadow_failure.model_dump(mode="json")
+            if shadow_failure is not None
+            else None
+        ),
         "asset_configuration": (
             asset_configuration.model_dump(mode="json")
             if asset_configuration is not None
@@ -564,6 +660,16 @@ def build_decision_audit(
         "capability_routing_plan": (
             capability_routing_plan.model_dump(mode="json")
             if capability_routing_plan is not None
+            else None
+        ),
+        "capability_routing_rollout": (
+            capability_routing_rollout.model_dump(mode="json")
+            if capability_routing_rollout is not None
+            else None
+        ),
+        "capability_routing_checkpoint_compatibility": (
+            capability_routing_checkpoint_compatibility.model_dump(mode="json")
+            if capability_routing_checkpoint_compatibility is not None
             else None
         ),
         "capability_routing_failure": (

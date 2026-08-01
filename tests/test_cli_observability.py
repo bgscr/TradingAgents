@@ -117,6 +117,9 @@ def _run_with_chunks(
     checkpoint_clear_error=None,
     resume_from_checkpoint=False,
     observed_graph_inputs=None,
+    checkpoint_session=None,
+    observed_initial_kwargs=None,
+    observed_checkpoint_clears=None,
 ):
     class FakeStream:
         def __init__(self):
@@ -157,6 +160,9 @@ def _run_with_chunks(
 
         @contextmanager
         def checkpoint_scope(self, ticker, trade_date, asset_type="stock"):
+            if checkpoint_session is not None:
+                yield checkpoint_session
+                return
             if self.config["checkpoint_enabled"]:
                 yield cli_main.CheckpointSession(
                     {
@@ -170,12 +176,16 @@ def _run_with_chunks(
                 yield cli_main.CheckpointSession({}, False)
 
         def clear_run_checkpoint(self, *args, **kwargs):
+            if observed_checkpoint_clears is not None:
+                observed_checkpoint_clears.append((args, kwargs))
             if checkpoint_clear_error is not None:
                 raise checkpoint_clear_error
             if self.config["checkpoint_enabled"] and checkpoint_marker is not None:
                 checkpoint_marker.unlink()
 
         def create_initial_state(self, *args, **kwargs):
+            if observed_initial_kwargs is not None:
+                observed_initial_kwargs.append(dict(kwargs))
             return self.propagator.create_initial_state(*args, **kwargs)
 
         def resolve_instrument_context(self, *args, **kwargs):
@@ -338,6 +348,59 @@ def test_cli_clears_checkpoint_after_completed_analysis_outcome(
 
     assert graph_inputs == [None]
     assert not checkpoint_marker.exists()
+
+
+@pytest.mark.unit
+def test_cli_binds_start_new_checkpoint_session_to_state_and_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    compatibility_projection = {
+        "contract_version": "1.0",
+        "action": "start_new",
+        "reason": "legacy_plan_requires_new_run",
+    }
+    compatibility = SimpleNamespace(
+        model_dump=lambda **_kwargs: dict(compatibility_projection)
+    )
+    session = cli_main.CheckpointSession(
+        graph_config={"configurable": {"thread_id": "migration-thread"}},
+        resume_from_checkpoint=False,
+        routing_compatibility=compatibility,
+        run_signature="migration-signature",
+    )
+    initial_kwargs = []
+    clear_calls = []
+    graph_inputs = []
+
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+                "capability_routing_checkpoint_compatibility": None,
+            }
+        ],
+        checkpoint=True,
+        checkpoint_session=session,
+        observed_initial_kwargs=initial_kwargs,
+        observed_checkpoint_clears=clear_calls,
+        observed_graph_inputs=graph_inputs,
+    )
+
+    assert initial_kwargs[0]["checkpoint_thread_id"] == "migration-thread"
+    assert graph_inputs[0]["capability_routing_checkpoint_compatibility"] == (
+        compatibility_projection
+    )
+    assert clear_calls == [
+        (
+            ("601658.SS", "2026-07-09", "stock"),
+            {"run_signature": "migration-signature"},
+        )
+    ]
 
 
 @pytest.mark.unit

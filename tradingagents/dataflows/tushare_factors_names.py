@@ -853,7 +853,11 @@ def _row_artifact_identities(
 
 def _validate_factor_plan(plan: MainlandCapabilityRoutingPlan) -> None:
     if (
-        plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1
+        plan.mode
+        not in {
+            MainlandCapabilityRoutingMode.QUALIFIED_V1,
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+        }
         or TushareCapability.ADJUSTMENT_FACTORS
         not in plan.enabled_tushare_capabilities
     ):
@@ -872,7 +876,11 @@ def _validate_factor_plan(plan: MainlandCapabilityRoutingPlan) -> None:
 
 def _validate_name_plan(plan: MainlandCapabilityRoutingPlan) -> None:
     if (
-        plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1
+        plan.mode
+        not in {
+            MainlandCapabilityRoutingMode.QUALIFIED_V1,
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+        }
         or TushareCapability.NAME_EVENTS not in plan.enabled_tushare_capabilities
     ):
         raise TushareFactorNameAdapterConfigurationError(

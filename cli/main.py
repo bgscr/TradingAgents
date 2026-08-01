@@ -1,4 +1,5 @@
 import datetime
+import importlib
 import json
 import os
 import re
@@ -7,7 +8,7 @@ from collections import deque
 from contextlib import ExitStack, nullcontext, suppress
 from functools import wraps
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -54,8 +55,10 @@ from tradingagents.asset_configuration import (
 )
 from tradingagents.capability_routing import (
     MainlandCapabilityRoutingFailure,
+    MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingPlan,
     is_mainland_equity_configuration,
+    mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
 )
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
@@ -76,6 +79,7 @@ from tradingagents.graph.analyst_execution import (
     get_initial_analyst_node,
 )
 from tradingagents.graph.evidence_gate import create_preflight_gate_node
+from tradingagents.graph.financial_tools import QualifiedFinancialRoutingComposition
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import CheckpointSession, TradingAgentsGraph
 from tradingagents.recorded_replay import (
@@ -136,6 +140,12 @@ _ERROR_SECRET_HEADER_RE = re.compile(
 _ERROR_BEARER_TOKEN_RE = re.compile(
     r"\b(bearer|basic)\s+[a-z0-9._~+/=-]+",
     re.IGNORECASE,
+)
+_QUALIFIED_ROUTING_FACTORY_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$"
+)
+_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY = (
+    "_qualified_routing_composition_factory"
 )
 _ERROR_SECRET_FIELD_RE = re.compile(
     r"(?<![\w-])"
@@ -1707,7 +1717,49 @@ def _complete_capability_routing_failure(
     return final_state
 
 
-def run_analysis(checkpoint: bool | None = None):
+def build_qualified_financial_routing_composition(
+    *,
+    plan: MainlandCapabilityRoutingPlan,
+    asset_configuration: Any,
+    config: dict[str, Any],
+    validation_workload: bool,
+) -> QualifiedFinancialRoutingComposition | None:
+    """Host integration seam for a plan-bound deterministic routing composition.
+
+    Ticket 12 owns activation and authority boundaries. Provider transports remain
+    explicit inputs at this seam so ordinary CLI analysis cannot silently add
+    shadow traffic and tests never need live providers.
+    """
+
+    factory_ref = config.get(_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY)
+    if factory_ref is None:
+        return None
+    if (
+        not isinstance(factory_ref, str)
+        or _QUALIFIED_ROUTING_FACTORY_RE.fullmatch(factory_ref) is None
+    ):
+        raise ValueError("qualified routing composition factory is invalid")
+    module_name, attribute_name = factory_ref.split(":", 1)
+    factory = getattr(importlib.import_module(module_name), attribute_name, None)
+    if not callable(factory):
+        raise ValueError("qualified routing composition factory is unavailable")
+    safe_config = dict(config)
+    safe_config.pop(_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY, None)
+    return factory(
+        plan=plan,
+        asset_configuration=asset_configuration,
+        config=safe_config,
+        validation_workload=validation_workload,
+    )
+
+
+def run_analysis(
+    checkpoint: bool | None = None,
+    *,
+    qualified_financial_routing: Any | None = None,
+    qualified_routing_validation: bool = False,
+    qualified_routing_composition_factory: str | None = None,
+):
     # First get all user selections
     selections = get_user_selections()
 
@@ -1761,7 +1813,8 @@ def run_analysis(checkpoint: bool | None = None):
                     capability_routing_plan = routing_preflight.plan
                     if (
                         capability_routing_plan is not None
-                        and capability_routing_plan.mode.value == "qualified_v1"
+                        and capability_routing_plan.mode.value
+                        in {"qualified_v1", "qualified_v1_shadow"}
                     ):
                         config["mainland_capability_routing_plan_signature"] = (
                             capability_routing_plan.plan_signature
@@ -1773,6 +1826,57 @@ def run_analysis(checkpoint: bool | None = None):
                         )
                 else:
                     capability_routing_failure = routing_preflight.failure
+    if capability_routing_plan is not None:
+        mode = capability_routing_plan.mode.value
+        needs_composition = bool(
+            capability_routing_plan.enabled_tushare_capabilities
+        ) and (
+            mode == "qualified_v1"
+            or (mode == "qualified_v1_shadow" and qualified_routing_validation)
+        )
+        if needs_composition and qualified_financial_routing is None:
+            composition_config = dict(config)
+            if qualified_routing_composition_factory is not None:
+                composition_config[_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY] = (
+                    qualified_routing_composition_factory
+                )
+            try:
+                qualified_financial_routing = (
+                    build_qualified_financial_routing_composition(
+                        plan=capability_routing_plan,
+                        asset_configuration=asset_configuration,
+                        config=composition_config,
+                        validation_workload=qualified_routing_validation,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - typed, secret-free preflight boundary
+                qualified_financial_routing = None
+            if qualified_financial_routing is None:
+                capability_routing_failure = mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                )
+    if capability_routing_plan is not None and qualified_financial_routing is not None:
+        enabled_values = {
+            item.value
+            for item in capability_routing_plan.enabled_tushare_capabilities
+        }
+        try:
+            composition_incomplete = (
+                qualified_financial_routing.router.routing_plan.plan_signature
+                != capability_routing_plan.plan_signature
+            ) or (
+                "statements" in enabled_values
+                and qualified_financial_routing.statement_request_factory is None
+            ) or (
+                "financial_indicators" in enabled_values
+                and qualified_financial_routing.indicator_request_factory is None
+            )
+        except (AttributeError, TypeError, ValueError):
+            composition_incomplete = True
+        if composition_incomplete:
+            capability_routing_failure = mainland_capability_routing_failure(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+            )
 
     artifacts = None
     current_phase = "setup"
@@ -1829,6 +1933,7 @@ def run_analysis(checkpoint: bool | None = None):
             asset_type=selections["asset_type"],
             asset_configuration=asset_configuration,
             capability_routing_plan=capability_routing_plan,
+            qualified_financial_routing=qualified_financial_routing,
         )
 
         # Initialize message buffer with selected analysts
@@ -1982,12 +2087,27 @@ def run_analysis(checkpoint: bool | None = None):
         evidence_state = graph.resolve_evidence_state(
             selections["ticker"], selections["analysis_date"]
         )
+        checkpoint_thread_id = checkpoint_graph_config.get(
+            "configurable",
+            {},
+        ).get("thread_id")
+        initial_state_kwargs: dict[str, Any] = {
+            "asset_type": selections["asset_type"],
+            "evidence_state": evidence_state,
+        }
+        if checkpoint_thread_id is not None:
+            initial_state_kwargs["checkpoint_thread_id"] = str(
+                checkpoint_thread_id
+            )
         init_agent_state = graph.create_initial_state(
             selections["ticker"],
             selections["analysis_date"],
-            asset_type=selections["asset_type"],
-            evidence_state=evidence_state,
+            **initial_state_kwargs,
         )
+        if checkpoint_session.routing_compatibility is not None:
+            init_agent_state[
+                "capability_routing_checkpoint_compatibility"
+            ] = checkpoint_session.routing_compatibility.model_dump(mode="json")
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
         args = graph.propagator.get_graph_args(
@@ -2170,10 +2290,16 @@ def run_analysis(checkpoint: bool | None = None):
             current_phase = "checkpoint_cleanup"
             _update_run_status(artifacts, current_phase=current_phase)
         if callable(checkpoint_clearer):
+            checkpoint_clear_kwargs: dict[str, Any] = {}
+            if checkpoint_session.run_signature is not None:
+                checkpoint_clear_kwargs["run_signature"] = (
+                    checkpoint_session.run_signature
+                )
             checkpoint_clearer(
                 selections["ticker"],
                 selections["analysis_date"],
                 selections["asset_type"],
+                **checkpoint_clear_kwargs,
             )
         elif config.get("checkpoint_enabled"):
             raise RuntimeError(
@@ -2233,6 +2359,22 @@ def default_analysis_command(
         "--clear-checkpoints",
         help="Delete all saved checkpoints before running.",
     ),
+    qualified_routing_validation: bool = typer.Option(
+        False,
+        "--qualified-routing-validation",
+        help=(
+            "Explicitly execute a configured qualified_v1_shadow composition; "
+            "ordinary analysis never runs shadow provider requests."
+        ),
+    ),
+    qualified_routing_composition_factory: str | None = typer.Option(
+        None,
+        "--qualified-routing-composition-factory",
+        help=(
+            "Explicit MODULE:CALLABLE factory that supplies plan-bound provider "
+            "transports for qualified routing."
+        ),
+    ),
 ) -> None:
     """Run the legacy default analysis when no subcommand is supplied."""
     if ctx.invoked_subcommand is not None:
@@ -2242,7 +2384,17 @@ def default_analysis_command(
 
         count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {count} checkpoint(s).[/yellow]")
-    run_analysis(checkpoint=checkpoint)
+    analysis_kwargs: dict[str, Any] = {"checkpoint": checkpoint}
+    if qualified_routing_validation:
+        analysis_kwargs["qualified_routing_validation"] = True
+    if (
+        isinstance(qualified_routing_composition_factory, str)
+        and qualified_routing_composition_factory
+    ):
+        analysis_kwargs["qualified_routing_composition_factory"] = (
+            qualified_routing_composition_factory
+        )
+    run_analysis(**analysis_kwargs)
 
 
 @app.command("runtime-artifacts-gc")
@@ -2430,12 +2582,38 @@ def analyze(
         "--clear-checkpoints",
         help="Delete all saved checkpoints before running (force fresh start).",
     ),
+    qualified_routing_validation: bool = typer.Option(
+        False,
+        "--qualified-routing-validation",
+        help=(
+            "Explicitly execute a configured qualified_v1_shadow composition; "
+            "ordinary analysis never runs shadow provider requests."
+        ),
+    ),
+    qualified_routing_composition_factory: str | None = typer.Option(
+        None,
+        "--qualified-routing-composition-factory",
+        help=(
+            "Explicit MODULE:CALLABLE factory that supplies plan-bound provider "
+            "transports for qualified routing."
+        ),
+    ),
 ):
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
-    run_analysis(checkpoint=checkpoint)
+    analysis_kwargs: dict[str, Any] = {"checkpoint": checkpoint}
+    if qualified_routing_validation:
+        analysis_kwargs["qualified_routing_validation"] = True
+    if (
+        isinstance(qualified_routing_composition_factory, str)
+        and qualified_routing_composition_factory
+    ):
+        analysis_kwargs["qualified_routing_composition_factory"] = (
+            qualified_routing_composition_factory
+        )
+    run_analysis(**analysis_kwargs)
 
 
 @app.command("replay-recorded")

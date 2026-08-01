@@ -349,7 +349,11 @@ class TushareStatementAdapter:
 
 def _validate_enabled_plan(plan: MainlandCapabilityRoutingPlan) -> None:
     if (
-        plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1
+        plan.mode
+        not in {
+            MainlandCapabilityRoutingMode.QUALIFIED_V1,
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+        }
         or TushareCapability.STATEMENTS not in plan.enabled_tushare_capabilities
     ):
         raise TushareStatementAdapterConfigurationError(

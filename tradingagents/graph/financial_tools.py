@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -10,6 +11,17 @@ from typing import Any
 from tradingagents.asset_configuration import (
     RunAssetConfiguration,
     RunAssetConfigurationProjection,
+)
+from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingCheckpointAction,
+    MainlandCapabilityRoutingCheckpointCompatibility,
+    MainlandCapabilityRoutingCheckpointError,
+    MainlandCapabilityRoutingCheckpointFailureReason,
+    MainlandCapabilityRoutingPlan,
+    MainlandCapabilityRoutingRunProjection,
+    MainlandCapabilityRoutingShadowFailure,
+    TushareCapability,
+    validate_mainland_capability_routing_checkpoint,
 )
 from tradingagents.dataflows.acquisition import RetryPolicy
 from tradingagents.dataflows.financial_capability_routing import (
@@ -61,14 +73,24 @@ class QualifiedFinancialRoutingComposition:
     ) = None
 
     def __post_init__(self) -> None:
+        financial_capabilities = {
+            TushareCapability.STATEMENTS,
+            TushareCapability.FINANCIAL_INDICATORS,
+        }
         if (
             self.statement_request_factory is None
             and self.indicator_request_factory is None
+            and financial_capabilities.intersection(
+                self.router.routing_plan.enabled_tushare_capabilities
+            )
         ):
             raise ValueError(
                 "qualified financial routing requires at least one request factory"
             )
-        if self.router.routing_plan.mode.value != "qualified_v1":
+        if self.router.routing_plan.mode.value not in {
+            "qualified_v1",
+            "qualified_v1_shadow",
+        }:
             raise ValueError(
                 "qualified financial routing requires a qualified_v1 plan"
             )
@@ -106,7 +128,7 @@ class FinancialDispatchToolNode:
         if qualified_statement_router is not None and config is not None:
             if str(
                 config.get("mainland_capability_routing_mode", "legacy")
-            ).strip().casefold() != "qualified_v1":
+            ).strip().casefold() not in {"qualified_v1", "qualified_v1_shadow"}:
                 raise ValueError(
                     "qualified financial tool node requires explicit qualified_v1 mode"
                 )
@@ -143,7 +165,14 @@ class FinancialDispatchToolNode:
         if not tool_calls:
             raise ValueError("financial tool node requires at least one tool call")
 
+        rollout_mode = self._routing_mode()
         dispatcher, evidence = self._dispatcher_from_state(state)
+        shadow_dispatcher = (
+            self._dispatcher_from_state(state, shadow=True)[0]
+            if rollout_mode == "qualified_v1_shadow"
+            else None
+        )
+        shadow_checkpoint_dispatcher = shadow_dispatcher
         graph_message_id = getattr(model_message, "id", None)
         requests = [
             _financial_request_from_tool_call(
@@ -157,8 +186,36 @@ class FinancialDispatchToolNode:
             for tool_call in tool_calls
         ]
         tool_messages = []
+        shadow_executed = False
+        shadow_failure_count = 0
         for request in requests:
-            if (
+            if rollout_mode == "qualified_v1_shadow":
+                tool_messages.append(dispatcher.dispatch_tool_message(request))
+                if self._qualified_route_enabled(request):
+                    shadow_executed = True
+                    try:
+                        assert shadow_dispatcher is not None
+                        if (
+                            request.statement_type
+                            is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                            and self._qualified_indicator_request_factory is not None
+                        ):
+                            shadow_dispatcher.dispatch_indicator_selection(
+                                request,
+                                self._qualified_indicator_request_factory(request),
+                            )
+                        elif self._qualified_statement_request_factory is not None:
+                            shadow_dispatcher.dispatch_statement_selection(
+                                request,
+                                self._qualified_statement_request_factory(request),
+                            )
+                    except Exception:  # noqa: BLE001 - shadow cannot affect authority
+                        shadow_failure_count += 1
+                        with suppress(Exception):
+                            shadow_dispatcher.discard_failed_qualified_selection(request)
+            elif (
+                self._qualified_route_enabled(request)
+                and
                 request.statement_type
                 is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                 and self._qualified_indicator_request_factory is not None
@@ -173,6 +230,8 @@ class FinancialDispatchToolNode:
                 )
                 tool_messages.append(dispatch_result.to_tool_message())
             elif (
+                self._qualified_route_enabled(request)
+                and
                 request.statement_type
                 is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                 and self._qualified_statement_request_factory is not None
@@ -193,11 +252,50 @@ class FinancialDispatchToolNode:
         )
 
         evidence = refresh_active_evidence_physical_attempts(evidence)
-        return {
+        result = {
             "messages": tool_messages,
             "evidence_state": evidence.model_dump(mode="json"),
             "financial_dispatch_ledger": dispatcher.checkpoint_ledger(),
         }
+        if shadow_checkpoint_dispatcher is not None:
+            try:
+                shadow_ledger = shadow_checkpoint_dispatcher.checkpoint_ledger()
+            except Exception:  # noqa: BLE001 - shadow cannot affect authority
+                shadow_failure_count += 1
+            else:
+                if shadow_executed or state.get("financial_dispatch_shadow_ledger"):
+                    result["financial_dispatch_shadow_ledger"] = shadow_ledger
+        if shadow_failure_count:
+            result["financial_dispatch_shadow_failure"] = {
+                "contract_version": "1.0",
+                "diagnostic_code": "shadow_dispatch_failed",
+                "failure_count": shadow_failure_count,
+            }
+        return result
+
+    def _qualified_route_enabled(self, request: FinancialToolRequest) -> bool:
+        router = self._qualified_statement_router
+        if router is None:
+            return False
+        required = (
+            TushareCapability.FINANCIAL_INDICATORS
+            if request.statement_type
+            is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+            else TushareCapability.STATEMENTS
+        )
+        return required in router.routing_plan.enabled_tushare_capabilities
+
+    def _routing_mode(self) -> str:
+        router = self._qualified_statement_router
+        if router is not None:
+            return router.routing_plan.mode.value
+        config = self._config or {}
+        configured_mode = str(
+            config.get("mainland_capability_routing_mode", "legacy")
+        )
+        if configured_mode == "qualified_v1_shadow":
+            return "legacy"
+        return configured_mode
 
     def validate_checkpoint_state(
         self,
@@ -206,11 +304,68 @@ class FinancialDispatchToolNode:
         expected_asset_configuration: (
             RunAssetConfiguration | RunAssetConfigurationProjection | None
         ),
-    ) -> None:
+        expected_capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
+    ) -> MainlandCapabilityRoutingCheckpointCompatibility | None:
         """Fail closed on contradictory restored state before graph work begins."""
 
-        if state.get("financial_dispatch_ledger") is None:
-            return
+        compatibility = None
+        if expected_capability_routing_plan is not None:
+            compatibility = validate_mainland_capability_routing_checkpoint(
+                active_plan=expected_capability_routing_plan,
+                checkpoint_plan=state.get("capability_routing_plan"),
+            )
+            expected_checkpoint_rollout = compatibility.checkpoint
+            raw_rollout = state.get("capability_routing_rollout")
+            try:
+                restored_rollout = (
+                    None
+                    if raw_rollout is None
+                    else MainlandCapabilityRoutingRunProjection.model_validate(
+                        raw_rollout
+                    )
+                )
+                if (
+                    restored_rollout is not None
+                    and restored_rollout != expected_checkpoint_rollout
+                ):
+                    raise ValueError("checkpoint rollout contradicts its plan")
+                raw_stored_compatibility = state.get(
+                    "capability_routing_checkpoint_compatibility"
+                )
+                if raw_stored_compatibility is not None:
+                    stored_compatibility = (
+                        MainlandCapabilityRoutingCheckpointCompatibility.model_validate(
+                            raw_stored_compatibility
+                        )
+                    )
+                    if stored_compatibility.active != compatibility.active:
+                        raise ValueError(
+                            "checkpoint compatibility contradicts active rollout"
+                        )
+                raw_shadow_failure = state.get("financial_dispatch_shadow_failure")
+                if raw_shadow_failure is not None:
+                    MainlandCapabilityRoutingShadowFailure.model_validate(
+                        raw_shadow_failure
+                    )
+                    if expected_capability_routing_plan.mode.value != (
+                        "qualified_v1_shadow"
+                    ):
+                        raise ValueError(
+                            "shadow failure contradicts active routing mode"
+                        )
+            except (TypeError, ValueError) as exc:
+                raise MainlandCapabilityRoutingCheckpointError(
+                    MainlandCapabilityRoutingCheckpointFailureReason.TAMPERED_PROJECTION
+                ) from exc
+            if (
+                compatibility.action
+                is MainlandCapabilityRoutingCheckpointAction.START_NEW
+            ):
+                return compatibility
+        authoritative_ledger = state.get("financial_dispatch_ledger")
+        shadow_ledger = state.get("financial_dispatch_shadow_ledger")
+        if authoritative_ledger is None and shadow_ledger is None:
+            return compatibility
         try:
             if expected_asset_configuration is None:
                 raise FinancialDispatchCheckpointError(
@@ -226,17 +381,23 @@ class FinancialDispatchToolNode:
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
                 )
-            self._dispatcher_from_state(state)
+            if authoritative_ledger is not None:
+                self._dispatcher_from_state(state)
+            if shadow_ledger is not None:
+                self._dispatcher_from_state(state, shadow=True)
         except FinancialDispatchCheckpointError:
             raise
         except (TypeError, ValueError) as exc:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.MALFORMED
             ) from exc
+        return compatibility
 
     def _dispatcher_from_state(
         self,
         state: Mapping[str, Any],
+        *,
+        shadow: bool = False,
     ) -> tuple[FinancialToolDispatcher, EvidenceState]:
         evidence = EvidenceState.model_validate(state.get("evidence_state") or {})
         identity = evidence.instrument_identity
@@ -251,6 +412,22 @@ class FinancialDispatchToolNode:
             from tradingagents.dataflows.config import get_config
 
             effective_config = get_config()
+        effective_config = dict(effective_config)
+        rollout_mode = self._routing_mode()
+        qualified_router = self._qualified_statement_router
+        checkpoint_key = "financial_dispatch_ledger"
+        if rollout_mode == "qualified_v1_shadow":
+            if shadow:
+                checkpoint_key = "financial_dispatch_shadow_ledger"
+            else:
+                effective_config["mainland_capability_routing_mode"] = "legacy"
+                effective_config.pop(
+                    "mainland_capability_routing_plan_signature",
+                    None,
+                )
+                qualified_router = None
+        elif shadow:
+            raise ValueError("shadow dispatcher requires qualified_v1_shadow mode")
         retry_policy = self._retry_policy
         if retry_policy is None:
             configured_retry_policy = effective_config.get("financial_dispatch_retry_policy")
@@ -264,8 +441,8 @@ class FinancialDispatchToolNode:
             retry_policy=retry_policy,
             clock=self._clock,
             sleeper=self._sleeper,
-            checkpoint_ledger=state.get("financial_dispatch_ledger"),
-            qualified_statement_router=self._qualified_statement_router,
+            checkpoint_ledger=state.get(checkpoint_key),
+            qualified_statement_router=qualified_router,
             run_scope_id=(
                 str(state["run_id"])
                 if state.get("run_id") is not None

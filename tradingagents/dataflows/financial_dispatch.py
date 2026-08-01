@@ -1395,7 +1395,7 @@ class FinancialToolDispatcher:
         if qualified_statement_router is not None:
             if str(
                 config.get("mainland_capability_routing_mode", "legacy")
-            ).strip().casefold() != "qualified_v1":
+            ).strip().casefold() not in {"qualified_v1", "qualified_v1_shadow"}:
                 raise ValueError(
                     "qualified financial router requires explicit qualified_v1 mode"
                 )
@@ -1766,6 +1766,38 @@ class FinancialToolDispatcher:
             request,
             selection_request,
         ).to_tool_message()
+
+    def discard_failed_qualified_selection(
+        self,
+        request: FinancialToolRequest,
+    ) -> None:
+        """Remove one failed shadow-only terminal before checkpoint projection."""
+
+        canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            for results, reuse_counts in (
+                (
+                    self._statement_selection_results,
+                    self._statement_selection_reuse_counts,
+                ),
+                (
+                    self._indicator_selection_results,
+                    self._indicator_selection_reuse_counts,
+                ),
+            ):
+                shared = results.get(canonical_key.request_key)
+                if shared is None:
+                    continue
+                if not shared.done() or shared.exception() is None:
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                    )
+                del results[canonical_key.request_key]
+                reuse_counts.pop(canonical_key.request_key, None)
+                return
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.TERMINAL_OUTCOME_INVALID
+        )
 
     def checkpoint_ledger(self) -> dict[str, Any]:
         """Return JSON-compatible terminal state at a normal checkpoint boundary."""

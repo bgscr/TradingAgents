@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -33,11 +34,17 @@ from tradingagents.asset_configuration import (
     resolve_run_asset_configuration,
 )
 from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingCheckpointAction,
+    MainlandCapabilityRoutingCheckpointCompatibility,
+    MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingPreflightError,
+    TushareCapability,
     capability_routing_configuration_is_explicit,
     is_mainland_equity_configuration,
+    mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
+    validate_mainland_capability_routing_checkpoint,
 )
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
@@ -82,7 +89,7 @@ from tradingagents.terminal_contract import (
     authorized_trading_decision_from_state,
 )
 
-from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
+from .checkpointer import clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
 from .financial_tools import (
     FinancialDispatchToolNode,
@@ -102,6 +109,8 @@ class CheckpointSession:
 
     graph_config: dict[str, Any]
     resume_from_checkpoint: bool
+    routing_compatibility: MainlandCapabilityRoutingCheckpointCompatibility | None = None
+    run_signature: str | None = None
 
 
 def _coerce_max_retries(value):
@@ -241,7 +250,8 @@ class TradingAgentsGraph:
         if qualified_financial_routing is not None:
             if (
                 capability_routing_plan is None
-                or capability_routing_plan.mode.value != "qualified_v1"
+                or capability_routing_plan.mode.value
+                not in {"qualified_v1", "qualified_v1_shadow"}
             ):
                 raise ValueError(
                     "qualified financial routing requires a qualified mainland "
@@ -251,8 +261,42 @@ class TradingAgentsGraph:
                 qualified_financial_routing.router.routing_plan.plan_signature
                 != capability_routing_plan.plan_signature
             ):
-                raise ValueError(
-                    "qualified financial routing Capability Routing Plan is immutable"
+                raise MainlandCapabilityRoutingPreflightError(
+                    mainland_capability_routing_failure(
+                        MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                    ),
+                    message=(
+                        "qualified financial routing Capability Routing Plan "
+                        "is immutable"
+                    ),
+                )
+        if (
+            capability_routing_plan is not None
+            and capability_routing_plan.mode.value == "qualified_v1"
+            and capability_routing_plan.enabled_tushare_capabilities
+            and qualified_financial_routing is None
+        ):
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                )
+            )
+        if qualified_financial_routing is not None and capability_routing_plan is not None:
+            enabled_capabilities = set(
+                capability_routing_plan.enabled_tushare_capabilities
+            )
+            composition_incomplete = (
+                TushareCapability.STATEMENTS in enabled_capabilities
+                and qualified_financial_routing.statement_request_factory is None
+            ) or (
+                TushareCapability.FINANCIAL_INDICATORS in enabled_capabilities
+                and qualified_financial_routing.indicator_request_factory is None
+            )
+            if composition_incomplete:
+                raise MainlandCapabilityRoutingPreflightError(
+                    mainland_capability_routing_failure(
+                        MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                    )
                 )
         self.debug = debug
         self.config = dict(resolved_config)
@@ -273,7 +317,8 @@ class TradingAgentsGraph:
             )
         if (
             capability_routing_plan is not None
-            and capability_routing_plan.mode.value == "qualified_v1"
+            and capability_routing_plan.mode.value
+            in {"qualified_v1", "qualified_v1_shadow"}
         ):
             configured_routing_signature = self.config.get(
                 "mainland_capability_routing_plan_signature"
@@ -542,6 +587,15 @@ class TradingAgentsGraph:
             "qualified_financial_routing",
             None,
         )
+        qualified_financial_tool_routing = (
+            qualified_financial_routing
+            if qualified_financial_routing is not None
+            and (
+                qualified_financial_routing.statement_request_factory is not None
+                or qualified_financial_routing.indicator_request_factory is not None
+            )
+            else None
+        )
         return {
             "market": ToolNode(
                 [
@@ -575,18 +629,18 @@ class TradingAgentsGraph:
             "fundamentals": FinancialDispatchToolNode(
                 config=getattr(self, "config", None),
                 qualified_statement_router=(
-                    qualified_financial_routing.router
-                    if qualified_financial_routing is not None
+                    qualified_financial_tool_routing.router
+                    if qualified_financial_tool_routing is not None
                     else None
                 ),
                 qualified_statement_request_factory=(
-                    qualified_financial_routing.statement_request_factory
-                    if qualified_financial_routing is not None
+                    qualified_financial_tool_routing.statement_request_factory
+                    if qualified_financial_tool_routing is not None
                     else None
                 ),
                 qualified_indicator_request_factory=(
-                    qualified_financial_routing.indicator_request_factory
-                    if qualified_financial_routing is not None
+                    qualified_financial_tool_routing.indicator_request_factory
+                    if qualified_financial_tool_routing is not None
                     else None
                 ),
             ),
@@ -782,6 +836,7 @@ class TradingAgentsGraph:
         evidence_state: EvidenceState,
         past_context: str = "",
         run_id: str | None = None,
+        checkpoint_thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Build the shared CLI/programmatic state for one resumable run."""
 
@@ -792,10 +847,13 @@ class TradingAgentsGraph:
         )
         if run_id is None:
             if self.config.get("checkpoint_enabled"):
-                run_seed = "checkpoint:" + thread_id(
-                    company_name,
-                    str(trade_date),
-                    self._run_signature(asset_type),
+                run_seed = "checkpoint:" + (
+                    checkpoint_thread_id
+                    or thread_id(
+                        company_name,
+                        str(trade_date),
+                        self._run_signature(asset_type),
+                    )
                 )
             else:
                 run_seed = "|".join(
@@ -810,6 +868,17 @@ class TradingAgentsGraph:
             run_id = f"run:{sha256(run_seed.encode('utf-8')).hexdigest()}"
         if not is_canonical_run_id(run_id):
             raise ValueError("run_id must be a canonical run ID")
+        checkpoint_graph_identity = self._run_signature(asset_type)
+        capability_routing_plan = getattr(self, "capability_routing_plan", None)
+        if (
+            capability_routing_plan is not None
+            and capability_routing_plan.mode.value
+            in {"qualified_v1", "qualified_v1_shadow"}
+        ):
+            checkpoint_graph_identity = self._run_signature(
+                asset_type,
+                include_capability_routing=False,
+            )
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -818,11 +887,17 @@ class TradingAgentsGraph:
             instrument_context=instrument_context,
             evidence_state=evidence_state,
             asset_configuration=getattr(self, "asset_configuration", None),
-            capability_routing_plan=getattr(self, "capability_routing_plan", None),
+            capability_routing_plan=capability_routing_plan,
+            checkpoint_graph_identity=checkpoint_graph_identity,
             run_id=run_id,
         )
 
-    def _run_signature(self, asset_type: str) -> str:
+    def _run_signature(
+        self,
+        asset_type: str,
+        *,
+        include_capability_routing: bool = True,
+    ) -> str:
         """Graph-shape inputs that must invalidate a checkpoint if changed.
 
         Keyed into the checkpoint thread ID so a resume under a different analyst
@@ -862,8 +937,11 @@ class TradingAgentsGraph:
             )
         capability_routing_plan = getattr(self, "capability_routing_plan", None)
         if (
+            include_capability_routing
+            and
             capability_routing_plan is not None
-            and capability_routing_plan.mode.value == "qualified_v1"
+            and capability_routing_plan.mode.value
+            in {"qualified_v1", "qualified_v1_shadow"}
         ):
             signature_fields.extend(
                 (
@@ -892,21 +970,36 @@ class TradingAgentsGraph:
         with get_checkpointer(self.config["data_cache_dir"], company_name) as saver:
             self.graph = self.workflow.compile(checkpointer=saver)
             try:
-                graph_config = {
-                    "configurable": {
-                        "thread_id": thread_id(
-                            company_name,
-                            str(trade_date),
-                            signature,
-                        )
+                def graph_config_for(run_signature: str) -> dict[str, Any]:
+                    return {
+                        "configurable": {
+                            "thread_id": thread_id(
+                                company_name,
+                                str(trade_date),
+                                run_signature,
+                            )
+                        }
                     }
-                }
-                step = checkpoint_step(
-                    self.config["data_cache_dir"],
-                    company_name,
-                    str(trade_date),
-                    signature,
+
+                def checkpoint_values(checkpoint) -> dict[str, Any]:
+                    channel_values = checkpoint.checkpoint.get("channel_values")
+                    if not isinstance(channel_values, dict):
+                        raise ValueError("checkpoint channel values must be a mapping")
+                    return channel_values
+
+                financial_tool_node = getattr(self, "tool_nodes", {}).get(
+                    "fundamentals"
                 )
+                active_plan = getattr(self, "capability_routing_plan", None)
+                selected_signature = signature
+                graph_config = graph_config_for(signature)
+                checkpoint = saver.get_tuple(graph_config)
+                step = (
+                    checkpoint.metadata.get("step")
+                    if checkpoint is not None
+                    else None
+                )
+                routing_compatibility = None
                 if step is not None:
                     logger.info(
                         "Resuming from step %d for %s on %s",
@@ -914,27 +1007,139 @@ class TradingAgentsGraph:
                         company_name,
                         trade_date,
                     )
-                    checkpoint = saver.get_tuple(graph_config)
-                    if checkpoint is None:
-                        raise RuntimeError(
-                            "checkpoint disappeared during resume validation"
-                        )
-                    channel_values = checkpoint.checkpoint.get("channel_values")
-                    if not isinstance(channel_values, dict):
-                        raise ValueError("checkpoint channel values must be a mapping")
-                    financial_tool_node = getattr(self, "tool_nodes", {}).get(
-                        "fundamentals"
-                    )
+                    if checkpoint is None:  # pragma: no cover - saver invariant
+                        raise RuntimeError("checkpoint disappeared during validation")
+                    channel_values = checkpoint_values(checkpoint)
                     if isinstance(financial_tool_node, FinancialDispatchToolNode):
-                        financial_tool_node.validate_checkpoint_state(
-                            channel_values,
-                            expected_asset_configuration=getattr(
-                                self,
-                                "asset_configuration",
-                                None,
-                            ),
+                        routing_compatibility = (
+                            financial_tool_node.validate_checkpoint_state(
+                                channel_values,
+                                expected_asset_configuration=getattr(
+                                    self,
+                                    "asset_configuration",
+                                    None,
+                                ),
+                                expected_capability_routing_plan=active_plan,
+                            )
                         )
+                    if (
+                        routing_compatibility is not None
+                        and routing_compatibility.action
+                        is MainlandCapabilityRoutingCheckpointAction.START_NEW
+                        and active_plan is not None
+                    ):
+                        migration_signature = "|".join(
+                            (
+                                signature,
+                                "routing_checkpoint=" + active_plan.plan_signature,
+                            )
+                        )
+                        selected_signature = migration_signature
+                        graph_config = graph_config_for(migration_signature)
+                        migrated_checkpoint = saver.get_tuple(graph_config)
+                        if migrated_checkpoint is None:
+                            step = None
+                        else:
+                            migrated_values = checkpoint_values(migrated_checkpoint)
+                            if isinstance(
+                                financial_tool_node,
+                                FinancialDispatchToolNode,
+                            ):
+                                resumed_compatibility = (
+                                    financial_tool_node.validate_checkpoint_state(
+                                        migrated_values,
+                                        expected_asset_configuration=getattr(
+                                            self,
+                                            "asset_configuration",
+                                            None,
+                                        ),
+                                        expected_capability_routing_plan=active_plan,
+                                    )
+                                )
+                                if (
+                                    resumed_compatibility is None
+                                    or resumed_compatibility.action
+                                    is not MainlandCapabilityRoutingCheckpointAction.RESUME
+                                ):
+                                    raise ValueError(
+                                        "migrated routing checkpoint is incompatible"
+                                    )
+                            step = migrated_checkpoint.metadata.get("step")
                 else:
+                    if (
+                        active_plan is not None
+                        and active_plan.mode.value != "legacy"
+                    ):
+                        pending_legacy_compatibility = None
+                        active_graph_identity = self._run_signature(
+                            asset_type,
+                            include_capability_routing=False,
+                        )
+                        seen_threads: set[str] = set()
+                        for candidate in saver.list(None):
+                            candidate_thread = str(
+                                candidate.config.get("configurable", {}).get(
+                                    "thread_id",
+                                    "",
+                                )
+                            )
+                            if not candidate_thread or candidate_thread in seen_threads:
+                                continue
+                            seen_threads.add(candidate_thread)
+                            values = checkpoint_values(candidate)
+                            if (
+                                str(values.get("company_of_interest", "")).upper()
+                                != str(company_name).upper()
+                                or str(values.get("trade_date", ""))
+                                != str(trade_date)
+                                or str(values.get("asset_type", "stock"))
+                                != str(asset_type)
+                            ):
+                                continue
+                            candidate_graph_identity = values.get(
+                                "checkpoint_graph_identity"
+                            )
+                            if (
+                                candidate_graph_identity is not None
+                                and str(candidate_graph_identity)
+                                != active_graph_identity
+                            ):
+                                continue
+                            raw_candidate_plan = values.get(
+                                "capability_routing_plan"
+                            )
+                            candidate_plan = None
+                            if raw_candidate_plan is not None:
+                                try:
+                                    candidate_plan = (
+                                        MainlandCapabilityRoutingPlan.model_validate(
+                                            raw_candidate_plan
+                                        )
+                                    )
+                                except (TypeError, ValueError):
+                                    candidate_plan = None
+                                if candidate_plan == active_plan:
+                                    continue
+                                if (
+                                    candidate_graph_identity is None
+                                    and candidate_plan is not None
+                                    and candidate_plan.mode.value != "legacy"
+                                ):
+                                    continue
+                            routing_compatibility = (
+                                validate_mainland_capability_routing_checkpoint(
+                                    active_plan=active_plan,
+                                    checkpoint_plan=raw_candidate_plan,
+                                )
+                            )
+                            if (
+                                routing_compatibility.action
+                                is MainlandCapabilityRoutingCheckpointAction.START_NEW
+                            ):
+                                pending_legacy_compatibility = routing_compatibility
+                                routing_compatibility = None
+                        if routing_compatibility is None:
+                            routing_compatibility = pending_legacy_compatibility
                     logger.info(
                         "Starting fresh for %s on %s",
                         company_name,
@@ -943,6 +1148,8 @@ class TradingAgentsGraph:
                 yield CheckpointSession(
                     graph_config=graph_config,
                     resume_from_checkpoint=step is not None,
+                    routing_compatibility=routing_compatibility,
+                    run_signature=selected_signature,
                 )
             finally:
                 self.graph = self.workflow.compile()
@@ -952,6 +1159,8 @@ class TradingAgentsGraph:
         company_name: str,
         trade_date: str,
         asset_type: str = "stock",
+        *,
+        run_signature: str | None = None,
     ) -> None:
         """Clear the compatible checkpoint after a completed terminal run."""
         if not self.config.get("checkpoint_enabled"):
@@ -960,7 +1169,7 @@ class TradingAgentsGraph:
             self.config["data_cache_dir"],
             company_name,
             str(trade_date),
-            self._run_signature(asset_type),
+            run_signature or self._run_signature(asset_type),
         )
 
     def propagate(
@@ -1008,6 +1217,11 @@ class TradingAgentsGraph:
                 trade_date,
                 asset_type=effective_asset_type,
                 resume_from_checkpoint=checkpoint_session.resume_from_checkpoint,
+                checkpoint_graph_config=checkpoint_session.graph_config,
+                routing_checkpoint_compatibility=(
+                    checkpoint_session.routing_compatibility
+                ),
+                checkpoint_run_signature=checkpoint_session.run_signature,
             )
 
     def save_reports(self, final_state, ticker, save_path=None) -> Path:
@@ -1032,11 +1246,24 @@ class TradingAgentsGraph:
         asset_type: str = "stock",
         *,
         resume_from_checkpoint: bool = False,
+        checkpoint_graph_config: Mapping[str, Any] | None = None,
+        routing_checkpoint_compatibility: (
+            MainlandCapabilityRoutingCheckpointCompatibility | None
+        ) = None,
+        checkpoint_run_signature: str | None = None,
     ):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Acquire trusted baseline evidence before any optional provider enrichment
         # or model-mediated work.  A missing registry identity must reach Evidence
         # Preflight without first spending Yahoo/AKShare or reflection calls.
+        checkpoint_thread_id = None
+        if checkpoint_graph_config is not None:
+            checkpoint_thread_id = checkpoint_graph_config.get(
+                "configurable",
+                {},
+            ).get("thread_id")
+            if checkpoint_thread_id is not None:
+                checkpoint_thread_id = str(checkpoint_thread_id)
         past_context = self.memory_log.get_past_context(company_name)
         evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
         init_agent_state = self.create_initial_state(
@@ -1045,7 +1272,12 @@ class TradingAgentsGraph:
             asset_type=asset_type,
             evidence_state=evidence_state,
             past_context=past_context,
+            checkpoint_thread_id=checkpoint_thread_id,
         )
+        if routing_checkpoint_compatibility is not None:
+            init_agent_state["capability_routing_checkpoint_compatibility"] = (
+                routing_checkpoint_compatibility.model_dump(mode="json")
+            )
         telemetry_ledger = get_active_run_telemetry()
         telemetry_callbacks = (
             [RunTelemetryCallbackHandler(telemetry_ledger)]
@@ -1060,7 +1292,11 @@ class TradingAgentsGraph:
         # Inject thread_id so same ticker+date+graph-shape resumes; a different
         # date or graph shape starts fresh (#1089).
         if self.config.get("checkpoint_enabled"):
-            tid = thread_id(company_name, str(trade_date), self._run_signature(asset_type))
+            tid = checkpoint_thread_id or thread_id(
+                company_name,
+                str(trade_date),
+                self._run_signature(asset_type),
+            )
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
 
         graph_input = None if resume_from_checkpoint else init_agent_state
@@ -1157,7 +1393,12 @@ class TradingAgentsGraph:
             self.config.get("checkpoint_enabled")
             and terminal.lifecycle_status is RunLifecycleStatus.COMPLETED
         ):
-            self.clear_run_checkpoint(company_name, str(trade_date), asset_type)
+            self.clear_run_checkpoint(
+                company_name,
+                str(trade_date),
+                asset_type,
+                run_signature=checkpoint_run_signature,
+            )
 
         return final_state, processed_signal
 

@@ -9,6 +9,11 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
+from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingDisposition,
+    MainlandCapabilityRoutingRunProjection,
+    MainlandCapabilityRoutingShadowFailure,
+)
 from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchAuditProjection,
     FinancialDispatchAuditProjectionV2,
@@ -537,11 +542,73 @@ def _render_financial_dispatch_operations(
     return lines
 
 
+def _render_shadow_financial_dispatch_comparison(
+    rollout: MainlandCapabilityRoutingRunProjection | None,
+    authoritative: FinancialDispatchAuditProjection | None,
+    shadow: FinancialDispatchAuditProjection | None,
+    failure: MainlandCapabilityRoutingShadowFailure | None = None,
+) -> list[str]:
+    """Render bounded shadow coverage without provider rows or candidate identities."""
+
+    if shadow is None and failure is None:
+        return []
+    if (
+        rollout is None
+        or rollout.disposition
+        is not MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
+        or (shadow is not None and not isinstance(shadow, FinancialDispatchAuditProjectionV2))
+    ):
+        raise ValueError("shadow financial report requires a non-authoritative rollout")
+    authoritative_requests = authoritative.request_count if authoritative is not None else 0
+    authoritative_attempts = (
+        authoritative.acquisition_attempt_count if authoritative is not None else 0
+    )
+    shadow_request_count = shadow.request_count if shadow is not None else 0
+    shadow_provider_count = (
+        shadow.logical_provider_count if shadow is not None else 0
+    )
+    shadow_candidate_count = (
+        shadow.logical_candidate_count if shadow is not None else 0
+    )
+    shadow_attempt_count = (
+        shadow.acquisition_attempt_count if shadow is not None else 0
+    )
+    lines = [
+        "## Qualified routing shadow comparison",
+        "",
+        "Shadow selections are non-authoritative. Legacy-selected financial output "
+        "remains authoritative for model-visible facts, evidence gates, terminal "
+        "outcomes, signals, reports, and memory writes.",
+        "",
+        f"- **Rollout mode:** `{rollout.mode.value}`",
+        f"- **Authority disposition:** `{rollout.disposition.value}`",
+        f"- **Plan version:** {rollout.plan_version}",
+        f"- **Plan signature:** `{rollout.plan_signature}`",
+        f"- **Enabled Tushare capabilities:** {len(rollout.enabled_tushare_capabilities)}",
+        f"- **Legacy authoritative requests:** {authoritative_requests}",
+        f"- **Legacy authoritative physical requests:** {authoritative_attempts}",
+        f"- **Shadow logical requests:** {shadow_request_count}",
+        f"- **Shadow logical providers:** {shadow_provider_count}",
+        f"- **Shadow candidate coverage:** {shadow_candidate_count}",
+        f"- **Shadow physical requests:** {shadow_attempt_count}",
+        "",
+    ]
+    if failure is not None:
+        lines[-1:-1] = [
+            f"- **Sanitized shadow failures:** {failure.failure_count}",
+        ]
+    return lines
+
+
 def render_decision_report(
     decision: TradingDecisionContract,
     terminal: TerminalContract,
     evidence: EvidenceState | None = None,
     financial_dispatch: FinancialDispatchAuditProjection | None = None,
+    *,
+    capability_routing_rollout: MainlandCapabilityRoutingRunProjection | None = None,
+    shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
+    shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
 ) -> str:
     """Render only canonical facts and rule semantics from the gated decision."""
 
@@ -578,6 +645,14 @@ def render_decision_report(
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend(_render_financial_dispatch_operations(financial_dispatch))
+    lines.extend(
+        _render_shadow_financial_dispatch_comparison(
+            capability_routing_rollout,
+            financial_dispatch,
+            shadow_financial_dispatch,
+            shadow_failure,
+        )
+    )
     lines.extend(["## Canonical Source Facts", ""])
     for index, fact in enumerate(sorted(decision.facts, key=lambda item: item.fact_id), 1):
         lines.extend(_render_fact(index, fact))
@@ -607,6 +682,10 @@ def render_analysis_outcome_report(
     terminal: TerminalContract,
     evidence: EvidenceState | None = None,
     financial_dispatch: FinancialDispatchAuditProjection | None = None,
+    *,
+    capability_routing_rollout: MainlandCapabilityRoutingRunProjection | None = None,
+    shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
+    shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
 ) -> str:
     outcome = AnalysisOutcome.model_validate(outcome)
     lines = [
@@ -624,6 +703,14 @@ def render_analysis_outcome_report(
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend(_render_financial_dispatch_operations(financial_dispatch))
+    lines.extend(
+        _render_shadow_financial_dispatch_comparison(
+            capability_routing_rollout,
+            financial_dispatch,
+            shadow_financial_dispatch,
+            shadow_failure,
+        )
+    )
     lines.extend([render_analysis_outcome(outcome), ""])
     return "\n".join(lines)
 
@@ -670,6 +757,30 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             raw_financial_dispatch
         )
     )
+    raw_shadow_financial_dispatch = final_state.get(
+        "financial_dispatch_shadow_audit_projection"
+    )
+    shadow_financial_dispatch = (
+        None
+        if raw_shadow_financial_dispatch is None
+        else TypeAdapter(FinancialDispatchAuditProjection).validate_python(
+            raw_shadow_financial_dispatch
+        )
+    )
+    raw_rollout = final_state.get("capability_routing_rollout")
+    capability_routing_rollout = (
+        None
+        if raw_rollout is None
+        else MainlandCapabilityRoutingRunProjection.model_validate(raw_rollout)
+    )
+    raw_shadow_failure = final_state.get("financial_dispatch_shadow_failure")
+    shadow_failure = (
+        None
+        if raw_shadow_failure is None
+        else MainlandCapabilityRoutingShadowFailure.model_validate(
+            raw_shadow_failure
+        )
+    )
     if identity.audit_digest is None:
         raise ValueError("canonical export identity is missing its audit digest")
 
@@ -683,6 +794,9 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             terminal,
             evidence,
             financial_dispatch,
+            capability_routing_rollout=capability_routing_rollout,
+            shadow_financial_dispatch=shadow_financial_dispatch,
+            shadow_failure=shadow_failure,
         )
         _write_markdown(save_path / "5_portfolio" / "analysis_outcome.md", body)
     elif terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
@@ -692,6 +806,9 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             terminal,
             evidence,
             financial_dispatch,
+            capability_routing_rollout=capability_routing_rollout,
+            shadow_financial_dispatch=shadow_financial_dispatch,
+            shadow_failure=shadow_failure,
         )
         _write_markdown(save_path / "5_portfolio" / "decision.md", body)
     else:

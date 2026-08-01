@@ -890,7 +890,10 @@ class MainlandFinancialCapabilityRouter:
             | None
         ) = None,
     ) -> None:
-        if routing_plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1:
+        if routing_plan.mode not in {
+            MainlandCapabilityRoutingMode.QUALIFIED_V1,
+            MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+        }:
             raise ValueError("qualified financial router requires qualified_v1")
         self._routing_plan = routing_plan
         self._statement_sources = dict(statement_sources)

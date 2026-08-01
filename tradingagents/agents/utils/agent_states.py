@@ -55,6 +55,22 @@ class AgentState(MessagesState):
         dict[str, Any] | None,
         "Immutable mainland capability routes and policy identities for this run",
     ]
+    capability_routing_rollout: Annotated[
+        dict[str, Any] | None,
+        "Checkpoint-safe rollout mode and authority disposition for this run",
+    ]
+    capability_routing_checkpoint_compatibility: NotRequired[
+        Annotated[
+            dict[str, Any],
+            "Pure routing-plan resume classification for this checkpoint",
+        ]
+    ]
+    checkpoint_graph_identity: NotRequired[
+        Annotated[
+            str,
+            "Routing-neutral graph identity used only for checkpoint matching",
+        ]
+    ]
     instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
     evidence_state: Annotated[dict[str, Any], "Validated shared evidence for gates"]
     evidence_preflight: Annotated[
@@ -105,6 +121,18 @@ class AgentState(MessagesState):
         Annotated[
             dict[str, Any],
             "Versioned checkpoint ledger for deterministic financial dispatch",
+        ]
+    ]
+    financial_dispatch_shadow_ledger: NotRequired[
+        Annotated[
+            dict[str, Any],
+            "Non-authoritative qualified shadow financial dispatch ledger",
+        ]
+    ]
+    financial_dispatch_shadow_failure: NotRequired[
+        Annotated[
+            dict[str, Any],
+            "Sanitized non-authoritative shadow execution failure projection",
         ]
     ]
 

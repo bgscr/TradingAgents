@@ -1394,7 +1394,10 @@ def _row_artifact_identities(
 
 
 def _validate_plan(plan: MainlandCapabilityRoutingPlan) -> None:
-    if plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1:
+    if plan.mode not in {
+        MainlandCapabilityRoutingMode.QUALIFIED_V1,
+        MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+    }:
         raise BaoStockRatioAdapterConfigurationError(
             BaoStockRatioAdapterFailureReason.NOT_ENABLED
         )

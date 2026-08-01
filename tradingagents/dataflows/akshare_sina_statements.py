@@ -410,7 +410,10 @@ class AkshareSinaStatementAdapter:
 
 
 def _validate_enabled_plan(plan: MainlandCapabilityRoutingPlan) -> None:
-    if plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1:
+    if plan.mode not in {
+        MainlandCapabilityRoutingMode.QUALIFIED_V1,
+        MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW,
+    }:
         raise AkshareSinaStatementAdapterConfigurationError(
             AkshareSinaStatementAdapterFailureReason.NOT_ENABLED
         )
