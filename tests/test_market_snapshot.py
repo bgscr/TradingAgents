@@ -787,9 +787,10 @@ def test_production_baostock_snapshot_uses_same_adjustment_basis(monkeypatch):
         error_msg = ""
 
         def __init__(self):
+            self.fields = baostock_data.CURRENT_SNAPSHOT_FIELDS.split(",")
             self._rows = [[
                 "2026-07-15", "sz.000021", "12.55", "13.10", "12.40",
-                "12.58", "1000000", "12580000",
+                "12.58", "12.50", "1000000", "12580000", "1",
             ]]
             self._index = -1
 
@@ -921,9 +922,10 @@ def test_china_indicator_tool_derives_from_accepted_core_snapshot(monkeypatch):
         error_msg = ""
 
         def __init__(self):
+            self.fields = baostock_data.CURRENT_SNAPSHOT_FIELDS.split(",")
             self._rows = [[
                 "2026-07-15", "sz.000725", "12.55", "13.10", "12.40",
-                "12.58", "1000000", "12580000",
+                "12.58", "12.50", "1000000", "12580000", "1",
             ]]
             self._index = -1
 
@@ -1108,9 +1110,10 @@ def test_china_stock_data_tool_renders_same_authoritative_provider(monkeypatch):
         error_msg = ""
 
         def __init__(self):
+            self.fields = baostock_data.CURRENT_SNAPSHOT_FIELDS.split(",")
             self._rows = [[
                 "2026-07-15", "sz.000725", "12.55", "13.10", "12.40",
-                "12.58", "1000000", "12580000",
+                "12.58", "12.50", "1000000", "12580000", "1",
             ]]
             self._index = -1
 
@@ -1332,9 +1335,16 @@ def test_production_baostock_cannot_silently_drop_invalid_date_row(monkeypatch):
         error_msg = ""
 
         def __init__(self):
+            self.fields = baostock_data.CURRENT_SNAPSHOT_FIELDS.split(",")
             self._rows = [
-                ["not-a-date", "sz.000725", "12.5", "13", "12.4", "12.6", "900000", "11000000"],
-                ["2026-07-15", "sz.000725", "12.55", "13.1", "12.4", "12.58", "1000000", "12580000"],
+                [
+                    "not-a-date", "sz.000725", "12.5", "13", "12.4",
+                    "12.6", "12.4", "900000", "11000000", "1",
+                ],
+                [
+                    "2026-07-15", "sz.000725", "12.55", "13.1", "12.4",
+                    "12.58", "12.5", "1000000", "12580000", "1",
+                ],
             ]
             self._index = -1
 
@@ -1381,3 +1391,114 @@ def test_production_baostock_cannot_silently_drop_invalid_date_row(monkeypatch):
 
     assert snapshot.provider == "yfinance"
     assert "invalid Date at row(s) 0" in snapshot.quarantined[0].reason
+
+
+@pytest.mark.unit
+def test_production_baostock_shadow_snapshot_retains_exact_current_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class Login:
+        error_code = "0"
+        error_msg = ""
+
+    class Query:
+        error_code = "0"
+        error_msg = ""
+
+        def __init__(self, fields: str):
+            self.fields = fields.split(",")
+            source_rows = (
+                {
+                    "date": "2026-07-30",
+                    "code": "sh.600895",
+                    "open": "10",
+                    "high": "11",
+                    "low": "9",
+                    "close": "10.5",
+                    "preclose": "9.8",
+                    "volume": "100",
+                    "amount": "1000",
+                    "tradestatus": "1",
+                },
+                {
+                    "date": "2026-07-31",
+                    "code": "sh.600895",
+                    "open": "10.5",
+                    "high": "11.5",
+                    "low": "10",
+                    "close": "11",
+                    "preclose": "10.5",
+                    "volume": "120",
+                    "amount": "1320",
+                    "tradestatus": "1",
+                },
+            )
+            self.rows = [
+                [row[field] for field in self.fields] for row in source_rows
+            ]
+            self.index = -1
+
+        def next(self):
+            self.index += 1
+            return self.index < len(self.rows)
+
+        def get_row_data(self):
+            return self.rows[self.index]
+
+    requested_fields: list[str] = []
+
+    def query_history(*args, **_kwargs):
+        fields = str(args[1])
+        requested_fields.append(fields)
+        return Query(fields)
+
+    runtime_config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    history_root = tmp_path / "history"
+    runtime_config.update(
+        {
+            "market_history_mode": "shadow",
+            "market_history_database_path": str(
+                history_root / "market_history.sqlite3"
+            ),
+            "market_history_payload_root": str(history_root / "payloads"),
+            "market_history_backup_root": str(history_root / "backups"),
+        }
+    )
+    runtime_config["market_data_vendors"]["cn_a"][
+        "core_stock_apis"
+    ] = "baostock"
+    monkeypatch.setattr(config_module, "_config", runtime_config)
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: Login())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "query_history_k_data_plus",
+        query_history,
+    )
+
+    snapshot = get_authoritative_market_snapshot(
+        "600895.SS",
+        "2026-07-30",
+        "2026-08-01",
+    )
+
+    assert requested_fields == [baostock_data.CURRENT_SNAPSHOT_FIELDS]
+    assert snapshot.effective_trading_date == "2026-07-31"
+    assert snapshot.current_tradeability == "tradeable"
+    assert snapshot.current_status_provenance is not None
+    assert snapshot.current_status_provenance.session_date == date(2026, 7, 31)
+    assert snapshot.current_status_provenance.status is TradingStatus.TRADED
+    assert snapshot.status_artifact is not None
+    assert snapshot.current_status_provenance.revision_id == (
+        "artifact:sha256:" + snapshot.status_artifact.artifact_sha256
+    )
+    manifest = json.loads(snapshot.snapshot_manifest_json)
+    assert manifest["authoritative_status"]["identity"] == (
+        snapshot.current_status_provenance.revision_id
+    )
+    assert snapshot.status_artifact.artifact_sha256 in {
+        outcome.artifact.artifact_sha256
+        for outcome in snapshot.acquisition_outcomes
+        if outcome.outcome == "available"
+    }

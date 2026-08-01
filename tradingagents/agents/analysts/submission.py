@@ -571,9 +571,17 @@ def build_analyst_update(
                 str(state["trade_date"]),
             )
             if snapshot_record is not None:
-                if snapshot_record.source_artifact is not None:
+                snapshot_artifacts = tuple(
+                    artifact
+                    for artifact in (
+                        snapshot_record.source_artifact,
+                        snapshot_record.status_artifact,
+                    )
+                    if artifact is not None
+                )
+                if snapshot_artifacts:
                     evidence = merge_source_artifacts(
-                        evidence, (snapshot_record.source_artifact,)
+                        evidence, snapshot_artifacts
                     )
                 evidence = merge_source_acquisition_outcomes(
                     evidence, snapshot_record.outcomes

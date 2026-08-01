@@ -108,6 +108,7 @@ class AuthoritativeMarketSnapshot:
     quarantined: tuple[QuarantinedSnapshot, ...] = ()
     acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
     source_artifact: SourceArtifact | None = None
+    status_artifact: SourceArtifact | None = None
     history_store_status: str = "live"
     history_store_diagnostic: str | None = None
     current_tradeability: str = "unknown"
@@ -171,6 +172,14 @@ class AuthoritativeMarketSnapshot:
                 f"invalid current tradeability {self.current_tradeability!r}"
             )
         provenance = self.current_status_provenance
+        if self.status_artifact is not None and (
+            provenance is None
+            or provenance.revision_id
+            != f"artifact:sha256:{self.status_artifact.artifact_sha256}"
+        ):
+            raise AuthoritativeTradingStatusValidationError(
+                "status artifact is not bound to current status provenance"
+            )
         if self.current_tradeability == "unknown":
             if (
                 provenance is not None
@@ -239,6 +248,7 @@ class MarketSnapshotAcquisitionRecord:
     snapshot: AuthoritativeMarketSnapshot | None
     outcomes: tuple[SourceAcquisitionOutcome, ...]
     source_artifact: SourceArtifact | None
+    status_artifact: SourceArtifact | None = None
 
 
 def _normalized_frame_text(frame: pd.DataFrame) -> str:
@@ -602,10 +612,10 @@ def _load_baostock(
     end_date: str,
     *,
     before_physical_request: Callable[[str], None] | None = None,
-) -> pd.DataFrame:
-    from .baostock_data import load_ohlcv_range
+) -> object:
+    from .baostock_data import load_current_snapshot
 
-    return load_ohlcv_range(
+    return load_current_snapshot(
         symbol,
         start_date,
         end_date,
@@ -1471,6 +1481,119 @@ def _validated_candidate_status(
     )
 
 
+def _validated_current_candidate_status(
+    candidate: object,
+    frame: pd.DataFrame,
+    *,
+    provider_name: str,
+    requested_date: str,
+) -> tuple[
+    str,
+    TradingStatusProvenance,
+    Decimal | None,
+    str | None,
+    Decimal | None,
+    SourceArtifact,
+]:
+    try:
+        statuses = tuple(candidate.trading_statuses)
+        current_tradeability = str(candidate.current_tradeability)
+        provenance = candidate.current_status_provenance
+        status_artifact = candidate.status_artifact
+        latest_traded_close = candidate.latest_traded_close
+        latest_traded_close_diagnostic = candidate.latest_traded_close_diagnostic
+        carried_suspension_close = candidate.carried_suspension_close
+    except AttributeError as exc:
+        raise AuthoritativeTradingStatusValidationError(
+            "selected current provider candidate dropped explicit status evidence"
+        ) from exc
+    if not isinstance(status_artifact, SourceArtifact) or not statuses:
+        raise AuthoritativeTradingStatusValidationError(
+            "selected current provider candidate has incomplete status artifacts"
+        )
+    frame_dates = tuple(value.date() for value in frame["Date"].dt.to_pydatetime())
+    status_dates = tuple(item.session_date for item in statuses)
+    if status_dates != frame_dates:
+        raise AuthoritativeTradingStatusValidationError(
+            "current status membership contradicts the selected provider frame"
+        )
+    latest_status = statuses[-1]
+    if latest_status.session_date > date.fromisoformat(requested_date):
+        raise AuthoritativeTradingStatusValidationError(
+            "current status session is later than the requested as-of date"
+        )
+    expected_tradeability = (
+        "suspended"
+        if latest_status.status is TradingStatus.SUSPENDED
+        else "tradeable"
+    )
+    if current_tradeability != expected_tradeability:
+        raise AuthoritativeTradingStatusValidationError(
+            "current provider tradeability contradicts its explicit status"
+        )
+    if not isinstance(provenance, TradingStatusProvenance) or (
+        provenance.provider != provider_name
+        or provenance.session_date != latest_status.session_date
+        or provenance.status is not latest_status.status
+        or provenance.revision_id
+        != f"artifact:sha256:{status_artifact.artifact_sha256}"
+    ):
+        raise AuthoritativeTradingStatusValidationError(
+            "current status provenance contradicts its retained artifact"
+        )
+    traded_dates = tuple(
+        item.session_date
+        for item in statuses
+        if item.status is TradingStatus.TRADED
+    )
+    expected_latest_traded_close = (
+        Decimal(str(frame.loc[frame["Date"].dt.date == traded_dates[-1], "Close"].iloc[-1]))
+        if traded_dates
+        else None
+    )
+    if latest_traded_close != expected_latest_traded_close:
+        raise AuthoritativeTradingStatusValidationError(
+            "latest traded close contradicts explicit current status history"
+        )
+    expected_diagnostic = (
+        None
+        if expected_latest_traded_close is not None
+        else "no_genuinely_traded_close_in_retained_history"
+    )
+    if latest_traded_close_diagnostic != expected_diagnostic:
+        raise AuthoritativeTradingStatusValidationError(
+            "latest traded close diagnostic contradicts current status history"
+        )
+    latest_frame = frame.iloc[-1]
+    expected_carried = (
+        Decimal(str(latest_frame["Close"]))
+        if latest_status.status is TradingStatus.SUSPENDED
+        else None
+    )
+    if carried_suspension_close != expected_carried:
+        raise AuthoritativeTradingStatusValidationError(
+            "carried suspension close contradicts explicit current status"
+        )
+    if latest_status.status is TradingStatus.SUSPENDED and (
+        Decimal(str(latest_frame["Volume"])) != Decimal("0")
+        or len({
+            Decimal(str(latest_frame[column]))
+            for column in ("Open", "High", "Low", "Close")
+        }) != 1
+    ):
+        raise AuthoritativeTradingStatusValidationError(
+            "explicit current suspension contradicts its carried frame row"
+        )
+    return (
+        current_tradeability,
+        provenance,
+        latest_traded_close,
+        latest_traded_close_diagnostic,
+        carried_suspension_close,
+        status_artifact,
+    )
+
+
 def _resolve_snapshot_asset_configuration(
     symbol: str,
     *,
@@ -1634,6 +1757,7 @@ def _acquire_authoritative_market_snapshot(
     validation_quarantine: dict[str, QuarantinedSnapshot] = {}
     validated_frames: dict[str, pd.DataFrame] = {}
     history_candidates: dict[str, object] = {}
+    current_status_candidates: dict[str, object] = {}
     crypto_provider_datasets: dict[str, CryptoProviderDatasetDescriptor] = {}
     physical_attempt_events: list[ProviderPhysicalAttemptEvent] = []
 
@@ -1673,6 +1797,11 @@ def _acquire_authoritative_market_snapshot(
             and hasattr(raw_candidate, "calendar")
         ):
             history_candidates[provider_name] = raw_candidate
+        elif (
+            hasattr(raw_candidate, "trading_statuses")
+            and hasattr(raw_candidate, "status_artifact")
+        ):
+            current_status_candidates[provider_name] = raw_candidate
         try:
             validated = validate_ohlcv_frame(raw_frame, end_date, start_date)
             blocking_gap_dates = (
@@ -1800,14 +1929,40 @@ def _acquire_authoritative_market_snapshot(
                     )
         quarantined = tuple(quarantined_items)
         history_candidate = history_candidates.get(provider_name)
-        if history_candidate is None:
-            status_values = ("unknown", None, None, None, None)
-        else:
+        current_status_candidate = current_status_candidates.get(provider_name)
+        if history_candidate is not None:
             status_values = _validated_candidate_status(
                 history_candidate,
                 frame,
                 provider_name=provider_name,
                 requested_date=end_date,
+            )
+            status_artifact = None
+        elif current_status_candidate is not None:
+            current_status_values = _validated_current_candidate_status(
+                current_status_candidate,
+                frame,
+                provider_name=provider_name,
+                requested_date=end_date,
+            )
+            status_values = current_status_values[:5]
+            status_artifact = current_status_values[5]
+        else:
+            status_values = ("unknown", None, None, None, None)
+            status_artifact = None
+        acquisition_outcomes = result.outcomes
+        if status_artifact is not None:
+            acquisition_outcomes = (
+                *acquisition_outcomes,
+                SourceAcquisitionAvailable(
+                    provider=provider_name,
+                    provider_order=0,
+                    capability="current_tradeability",
+                    source_ref=status_artifact.source_ref,
+                    attempt=1,
+                    retrieved_at=datetime.now(timezone.utc).isoformat(),
+                    artifact=status_artifact,
+                ),
             )
         snapshot = AuthoritativeMarketSnapshot(
             symbol=symbol,
@@ -1818,8 +1973,9 @@ def _acquire_authoritative_market_snapshot(
             requested_date=end_date,
             effective_trading_date=effective_date,
             quarantined=quarantined,
-            acquisition_outcomes=result.outcomes,
+            acquisition_outcomes=acquisition_outcomes,
             source_artifact=result.artifact,
+            status_artifact=status_artifact,
             history_store_status=("degraded" if history_read.attempted else "live"),
             history_store_diagnostic=history_read.diagnostic,
             physical_attempt_events=tuple(physical_attempt_events),
@@ -1878,8 +2034,9 @@ def _acquire_authoritative_market_snapshot(
         if active is not None:
             record = MarketSnapshotAcquisitionRecord(
                 snapshot=snapshot,
-                outcomes=result.outcomes,
+                outcomes=acquisition_outcomes,
                 source_artifact=result.artifact,
+                status_artifact=status_artifact,
             )
             key = (symbol, start_date, end_date)
             active.acquisition_records[key] = record

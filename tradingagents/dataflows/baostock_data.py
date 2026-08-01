@@ -19,9 +19,11 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from stockstats import wrap
 
+from tradingagents.evidence import SourceArtifact, stable_acquisition_source_ref
 from tradingagents.market_history.calendar import MarketSessionCalendarPublication
 from tradingagents.market_history.models import (
     ProviderHistoryBundlePublication,
+    TradingStatusObservation,
     TradingStatusProvenance,
 )
 
@@ -34,6 +36,9 @@ from .symbol_utils import resolve_china_a_symbol
 logger = logging.getLogger(__name__)
 
 FIELDS = "date,code,open,high,low,close,volume,amount"
+CURRENT_SNAPSHOT_FIELDS = (
+    "date,code,open,high,low,close,preclose,volume,amount,tradestatus"
+)
 RAW_HISTORY_FIELDS = (
     "date,code,open,high,low,close,preclose,volume,amount,tradestatus"
 )
@@ -48,6 +53,18 @@ class BaoStockSnapshotHistoryCandidate:
     calendar: MarketSessionCalendarPublication
     current_tradeability: str
     current_status_provenance: TradingStatusProvenance
+    latest_traded_close: Decimal | None
+    latest_traded_close_diagnostic: str | None
+    carried_suspension_close: Decimal | None
+
+
+@dataclass(frozen=True)
+class BaoStockCurrentSnapshotCandidate:
+    frame: pd.DataFrame
+    trading_statuses: tuple[TradingStatusObservation, ...]
+    current_tradeability: str
+    current_status_provenance: TradingStatusProvenance
+    status_artifact: SourceArtifact
     latest_traded_close: Decimal | None
     latest_traded_close_diagnostic: str | None
     carried_suspension_close: Decimal | None
@@ -135,6 +152,190 @@ def load_ohlcv_range(
     frame = validate_ohlcv_frame(frame, end_date)
     _assert_ohlcv_not_stale(frame, end_date, symbol, instrument.yahoo_symbol)
     return frame
+
+
+def load_current_snapshot(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    before_physical_request: Callable[[str], None] | None = None,
+) -> BaoStockCurrentSnapshotCandidate:
+    """Acquire adjusted OHLCV and explicit trade status in one BaoStock request."""
+    from tradingagents.market_history.coordinator import (
+        upstream_service_identity_for_provider,
+    )
+    from tradingagents.market_history.models import TradingStatus
+    from tradingagents.market_history.suspension import normalize_mainland_session
+
+    instrument = resolve_china_a_symbol(symbol)
+    if instrument is None:
+        raise NoMarketDataError(
+            symbol,
+            symbol,
+            "BaoStock supports China A-share symbols only",
+        )
+    with _session():
+        if before_physical_request is not None:
+            before_physical_request("adjusted-history-status")
+        result = bs.query_history_k_data_plus(
+            instrument.baostock_code,
+            CURRENT_SNAPSHOT_FIELDS,
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2",
+        )
+        raw_rows = _named_query_rows(result, "current adjusted history status")
+    if not raw_rows:
+        raise NoMarketDataError(
+            symbol,
+            instrument.yahoo_symbol,
+            "BaoStock returned no current adjusted history rows",
+        )
+
+    invalid_date_rows: list[int] = []
+    parsed_session_dates: list[date | None] = []
+    for index, row in enumerate(raw_rows):
+        try:
+            parsed_session_dates.append(date.fromisoformat(row["date"]))
+        except (KeyError, ValueError):
+            invalid_date_rows.append(index)
+            parsed_session_dates.append(None)
+    if invalid_date_rows:
+        rows = ", ".join(str(index) for index in invalid_date_rows)
+        raise ValueError(f"invalid Date at row(s) {rows}")
+
+    normalized_sessions = []
+    for row, session_date in zip(raw_rows, parsed_session_dates, strict=True):
+        assert session_date is not None
+        status_value = row.get("tradestatus", "").strip()
+        if status_value == "1":
+            status = TradingStatus.TRADED
+        elif status_value == "0":
+            status = TradingStatus.SUSPENDED
+        else:
+            raise NoMarketDataError(
+                symbol,
+                instrument.yahoo_symbol,
+                "BaoStock returned an unknown explicit trading status",
+            )
+        normalized_sessions.append(
+            normalize_mainland_session(
+                session_date=session_date,
+                open_value=_optional_decimal(row.get("open")),
+                high_value=_optional_decimal(row.get("high")),
+                low_value=_optional_decimal(row.get("low")),
+                close_value=_optional_decimal(row.get("close")),
+                volume=_optional_decimal(row.get("volume")),
+                authoritative_status=status,
+                official_carried_close=(
+                    _optional_decimal(row.get("preclose"))
+                    if status is TradingStatus.SUSPENDED
+                    else None
+                ),
+            )
+        )
+    normalized_sessions.sort(key=lambda item: item.observation.session_date)
+    session_dates = tuple(
+        item.observation.session_date for item in normalized_sessions
+    )
+    if len(session_dates) != len(set(session_dates)):
+        raise NoMarketDataError(
+            symbol,
+            instrument.yahoo_symbol,
+            "BaoStock returned duplicate current status sessions",
+        )
+
+    frame = pd.DataFrame(
+        (
+            {
+                "Date": pd.Timestamp(item.observation.session_date),
+                "Open": float(item.observation.open),
+                "High": float(item.observation.high),
+                "Low": float(item.observation.low),
+                "Close": float(item.observation.close),
+                "Volume": float(item.observation.volume),
+            }
+            for item in normalized_sessions
+        ),
+        columns=["Date", "Open", "High", "Low", "Close", "Volume"],
+    )
+    observed_at = datetime.now(timezone.utc)
+    upstream_service_id, _ = upstream_service_identity_for_provider("baostock")
+    provider_dataset_id = _history_identity(
+        "provider-dataset",
+        upstream_service_id,
+        "mainland-current-adjusted-status-v1",
+    )
+    raw_text = json.dumps(
+        {
+            "adjustment_basis": "qfq",
+            "as_of_date": end_date,
+            "fields": CURRENT_SNAPSHOT_FIELDS.split(","),
+            "provider": "baostock",
+            "requested_start": start_date,
+            "rows": raw_rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    artifact_digest = sha256(raw_text.encode("utf-8")).hexdigest()
+    source_ref = stable_acquisition_source_ref(
+        "baostock-current-status",
+        instrument.yahoo_symbol,
+        start_date,
+        end_date,
+        artifact_digest,
+    )
+    status_artifact = SourceArtifact(
+        artifact_sha256=artifact_digest,
+        source_ref=source_ref,
+        tool_call_id=source_ref,
+        tool_name="baostock_current_adjusted_status_v1",
+        raw_text=raw_text,
+    )
+    latest = normalized_sessions[-1]
+    latest_status = latest.status
+    latest_traded_close = next(
+        (
+            item.observation.close
+            for item in reversed(normalized_sessions)
+            if item.status.status is TradingStatus.TRADED
+        ),
+        None,
+    )
+    provenance = TradingStatusProvenance(
+        provider="baostock",
+        provider_dataset_id=provider_dataset_id,
+        session_date=latest_status.session_date,
+        status=latest_status.status,
+        observed_at=observed_at,
+        revision_id=f"artifact:sha256:{artifact_digest}",
+    )
+    return BaoStockCurrentSnapshotCandidate(
+        frame=frame,
+        trading_statuses=tuple(item.status for item in normalized_sessions),
+        current_tradeability=(
+            "suspended"
+            if latest_status.status is TradingStatus.SUSPENDED
+            else "tradeable"
+        ),
+        current_status_provenance=provenance,
+        status_artifact=status_artifact,
+        latest_traded_close=latest_traded_close,
+        latest_traded_close_diagnostic=(
+            None
+            if latest_traded_close is not None
+            else "no_genuinely_traded_close_in_retained_history"
+        ),
+        carried_suspension_close=(
+            latest.observation.close
+            if latest_status.status is TradingStatus.SUSPENDED
+            else None
+        ),
+    )
 
 
 def load_snapshot_with_history(

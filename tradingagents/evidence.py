@@ -2883,8 +2883,19 @@ def acquire_run_evidence(
             if snapshot_record is not None
             else getattr(snapshot, "source_artifact", None)
         )
-        artifacts = (artifact,) + (
-            (market_artifact,) if market_artifact is not None else ()
+        market_status_artifact = (
+            snapshot_record.status_artifact
+            if snapshot_record is not None
+            else getattr(snapshot, "status_artifact", None)
+        )
+        artifacts = (
+            artifact,
+            *((market_artifact,) if market_artifact is not None else ()),
+            *(
+                (market_status_artifact,)
+                if market_status_artifact is not None
+                else ()
+            ),
         )
         market_outcomes = (
             snapshot_record.outcomes
