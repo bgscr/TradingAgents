@@ -40,7 +40,7 @@ def _git_status(repo: Path) -> str:
     ).stdout
 
 
-def test_default_market_history_runtime_is_gitignored_without_hiding_other_data() -> None:
+def test_default_runtime_market_history_is_gitignored_without_hiding_other_data() -> None:
     tracked_before = subprocess.run(
         ["git", "ls-files"],
         cwd=REPO_ROOT,
@@ -105,7 +105,7 @@ def test_default_market_history_runtime_is_gitignored_without_hiding_other_data(
     assert tracked_after == tracked_before
 
 
-def test_default_market_history_cli_smoke_is_gitignored(tmp_path: Path) -> None:
+def test_default_runtime_cli_smoke_preserves_clean_worktree(tmp_path: Path) -> None:
     smoke_repo = tmp_path / "smoke-repo"
     smoke_repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=smoke_repo, check=True)

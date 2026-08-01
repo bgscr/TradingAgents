@@ -156,6 +156,7 @@ def test_rich_display_replaces_waiting_copy_with_final_report():
         color_system=None,
         width=120,
         height=40,
+        _environ={"TERM": "xterm-256color"},
     )
     buffer = FakeBuffer()
     stats = SimpleNamespace(
