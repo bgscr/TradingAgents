@@ -74,6 +74,9 @@ _ROUTABLE_DATASET_CAPABILITIES = frozenset(
         MainlandCapability.ISSUER_LIFECYCLE,
     }
 )
+_ROUTE_PROVIDER_ARTIFACT_PROVIDER = {
+    "baostock_qualified_families": "baostock",
+}
 
 
 def _rendered_sha256(value: str) -> str:
@@ -281,8 +284,12 @@ class FinancialProviderPeriodResponse(BaseModel):
                 for candidate in self.candidates
             ):
                 raise ValueError("provider response candidate artifact must be retained")
+            artifact_provider_id = _ROUTE_PROVIDER_ARTIFACT_PROVIDER.get(
+                self.provider_id,
+                self.provider_id,
+            )
             if any(
-                candidate.artifact.dataset.provider_id != self.provider_id
+                candidate.artifact.dataset.provider_id != artifact_provider_id
                 for candidate in self.candidates
             ):
                 raise ValueError("provider response candidate has another provider")

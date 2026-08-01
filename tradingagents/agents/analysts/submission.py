@@ -19,6 +19,7 @@ from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
     get_active_authoritative_market_snapshot,
     get_active_market_snapshot_acquisition_record,
+    refresh_active_evidence_physical_attempts,
 )
 from tradingagents.evidence import (
     AnalystEvidenceReport,
@@ -436,6 +437,22 @@ def process_analyst_response(
     )
 
 
+def _same_market_snapshot_observation(
+    checkpointed: MarketSnapshotEvidence | None,
+    active: MarketSnapshotEvidence,
+) -> bool:
+    if checkpointed is None:
+        return False
+    runtime_fields = {
+        "retrieved_at",
+        "physical_attempt_events",
+        "physical_attempt_count",
+    }
+    return checkpointed.model_dump(
+        mode="python", exclude=runtime_fields
+    ) == active.model_dump(mode="python", exclude=runtime_fields)
+
+
 def build_analyst_update(
     state: Mapping[str, Any],
     result: AnalystSubmissionResult,
@@ -466,9 +483,7 @@ def build_analyst_update(
         str(state["trade_date"]),
     )
     if active_snapshot is not None:
-        evidence = evidence.model_copy(
-            update={
-                "market_snapshot": MarketSnapshotEvidence(
+        active_snapshot_evidence = MarketSnapshotEvidence(
                     symbol=active_snapshot.symbol,
                     provider=active_snapshot.provider,
                     retrieved_at=active_snapshot.retrieved_at,
@@ -544,20 +559,26 @@ def build_analyst_update(
                         active_snapshot.physical_attempt_events
                     ),
                 )
-            }
-        )
-        snapshot_record = get_active_market_snapshot_acquisition_record(
-            str(state["company_of_interest"]),
-            str(state["trade_date"]),
-        )
-        if snapshot_record is not None:
-            if snapshot_record.source_artifact is not None:
-                evidence = merge_source_artifacts(
-                    evidence, (snapshot_record.source_artifact,)
-                )
-            evidence = merge_source_acquisition_outcomes(
-                evidence, snapshot_record.outcomes
+        if not _same_market_snapshot_observation(
+            evidence.market_snapshot,
+            active_snapshot_evidence,
+        ):
+            evidence = evidence.model_copy(
+                update={"market_snapshot": active_snapshot_evidence}
             )
+            snapshot_record = get_active_market_snapshot_acquisition_record(
+                str(state["company_of_interest"]),
+                str(state["trade_date"]),
+            )
+            if snapshot_record is not None:
+                if snapshot_record.source_artifact is not None:
+                    evidence = merge_source_artifacts(
+                        evidence, (snapshot_record.source_artifact,)
+                    )
+                evidence = merge_source_acquisition_outcomes(
+                    evidence, snapshot_record.outcomes
+                )
+        evidence = refresh_active_evidence_physical_attempts(evidence)
     try:
         evidence = merge_material_claims(
             evidence,

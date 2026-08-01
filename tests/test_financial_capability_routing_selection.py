@@ -1085,7 +1085,7 @@ def test_sparse_baostock_family_preserves_sibling_and_yahoo_is_degraded_only(
 ) -> None:
     profit = tuple(
         _ratio_candidate(
-            provider_id="baostock_qualified_families",
+            provider_id="baostock",
             ratio_family=FinancialRatioFamily.PROFIT,
             period_end=period,
         )
@@ -1093,7 +1093,7 @@ def test_sparse_baostock_family_preserves_sibling_and_yahoo_is_degraded_only(
     )
     growth = tuple(
         _ratio_candidate(
-            provider_id="baostock_qualified_families",
+            provider_id="baostock",
             ratio_family=FinancialRatioFamily.GROWTH,
             period_end=period,
         )
@@ -1293,6 +1293,62 @@ def test_indicator_adapter_projection_retains_every_subrequest_and_row_rejection
     assert routed.provider_calls[0].adapter_row_rejections == (
         response.adapter_row_rejections
     )
+
+
+def test_baostock_indicator_projection_preserves_physical_provider_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    period = _REPORTING_PERIODS[-1]
+    candidate = _ratio_candidate(
+        provider_id="baostock",
+        ratio_family=FinancialRatioFamily.PROFIT,
+        period_end=period,
+    )
+    operational = SimpleNamespace(
+        request=SimpleNamespace(
+            subrequest_key="provider-subrequest:v1:" + "6" * 64
+        ),
+        outcome=SimpleNamespace(kind=SimpleNamespace(value="available")),
+        attempt_events=(
+            SimpleNamespace(
+                attempt_event_id="provider-physical-attempt=sha256:" + "7" * 64
+            ),
+        ),
+        artifact=candidate.artifact,
+        row_artifacts=(),
+        candidates=(candidate,),
+        row_rejections=(),
+    )
+
+    response = financial_period_response_from_indicator_adapter(
+        provider_id="baostock_qualified_families",
+        result=SimpleNamespace(operational_results=(operational,)),
+    )
+
+    assert response.provider_id == "baostock_qualified_families"
+    assert response.candidates[0].artifact.dataset.provider_id == "baostock"
+    routed = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={
+            "baostock_qualified_families": lambda _request: response,
+        },
+    ).route_indicators(
+        FinancialIndicatorRoutingRequest(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+            currency="CNY",
+            ratio_families=(FinancialRatioFamily.PROFIT,),
+            eligible_reporting_period_ends=(period,),
+        )
+    )
+    assert any(
+        call.provider_id == "baostock_qualified_families"
+        for call in routed.provider_calls
+    )
+    assert routed.family_manifests[0].selections[0].provider_id == "baostock"
 
 
 def test_statement_adapter_projection_retains_subrequest_and_row_rejection() -> None:

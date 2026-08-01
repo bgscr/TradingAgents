@@ -910,6 +910,36 @@ class TestCheckpointResume(unittest.TestCase):
 
         self.assertEqual(result["count"], 11)
 
+    def test_clear_checkpoint_removes_query_text_from_database_bytes(self):
+        """Cleared checkpoint provenance must not remain in SQLite free pages."""
+        raw_provenance = (
+            "https://provider.invalid/financials?request_id=checkpoint-remnant"
+        )
+        workflow = StateGraph(AgentState)
+        workflow.add_node(
+            "capture_provenance",
+            lambda _state: {"fundamentals_report": raw_provenance},
+        )
+        workflow.set_entry_point("capture_provenance")
+        workflow.add_edge("capture_provenance", END)
+        tid = thread_id(self.ticker, self.date)
+        config = {"configurable": {"thread_id": tid}}
+
+        with get_checkpointer(self.tmpdir, self.ticker) as saver:
+            workflow.compile(checkpointer=saver).invoke(
+                {"messages": []},
+                config=config,
+            )
+
+        db_path = Path(self.tmpdir) / "checkpoints" / f"{self.ticker}.db"
+        encoded_provenance = raw_provenance.encode()
+        self.assertIn(encoded_provenance, db_path.read_bytes())
+
+        clear_checkpoint(self.tmpdir, self.ticker, self.date)
+
+        self.assertFalse(has_checkpoint(self.tmpdir, self.ticker, self.date))
+        self.assertNotIn(encoded_provenance, db_path.read_bytes())
+
     def test_clear_checkpoint_surfaces_storage_failure(self):
         """A failed cleanup must not masquerade as a cleared checkpoint."""
         checkpoint_dir = Path(self.tmpdir) / "checkpoints"

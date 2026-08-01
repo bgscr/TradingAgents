@@ -500,6 +500,106 @@ def test_reacquired_snapshot_becomes_shared_authority_for_analyst_claims(monkeyp
 
 
 @pytest.mark.unit
+def test_resume_keeps_checkpointed_attempt_for_identical_active_snapshot(monkeypatch):
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({"data_vendors": {"core_stock_apis": "only"}})
+
+    def provider(_symbol, _start_date, _end_date):
+        dates = market_snapshot.pd.bdate_range(end="2026-01-15", periods=10)
+        return market_snapshot.pd.DataFrame(
+            {
+                "Date": dates,
+                "Open": [10.0] * 10,
+                "High": [11.0] * 10,
+                "Low": [9.0] * 10,
+                "Close": [10.0] * 10,
+                "Volume": [1] * 10,
+            }
+        )
+
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {"only": SnapshotProvider(provider, "qfq")},
+    )
+    with authoritative_snapshot_run():
+        checkpointed = get_authoritative_market_snapshot(
+            "NVDA", "2025-01-01", "2026-01-15"
+        )
+        checkpointed_record = (
+            market_snapshot.get_active_market_snapshot_acquisition_record(
+                "NVDA", "2026-01-15"
+            )
+        )
+        assert checkpointed_record is not None
+        fresh_retrieved_at = "2026-07-20T00:00:00+00:00"
+        fresh_outcomes = tuple(
+            outcome.model_copy(update={"retrieved_at": fresh_retrieved_at})
+            for outcome in checkpointed_record.outcomes
+        )
+        active = replace(
+            checkpointed,
+            retrieved_at=fresh_retrieved_at,
+            acquisition_outcomes=fresh_outcomes,
+        )
+        active_record = replace(checkpointed_record, outcomes=fresh_outcomes)
+        monkeypatch.setattr(
+            submission,
+            "get_active_authoritative_market_snapshot",
+            lambda *_args: active,
+        )
+        monkeypatch.setattr(
+            submission,
+            "get_active_market_snapshot_acquisition_record",
+            lambda *_args: active_record,
+        )
+        checkpointed_evidence = EvidenceState(
+            market_snapshot=MarketSnapshotEvidence(
+                symbol=checkpointed.symbol,
+                provider=checkpointed.provider,
+                retrieved_at=checkpointed.retrieved_at,
+                adjustment_basis=checkpointed.adjustment_basis,
+                requested_date=checkpointed.requested_date,
+                effective_trading_date=checkpointed.effective_trading_date,
+                history_rows=len(checkpointed.frame),
+                frame_sha256=checkpointed.frame_sha256,
+                snapshot_id=checkpointed.snapshot_id,
+                snapshot_id_version=checkpointed.snapshot_id_version,
+                pin_membership_digest=checkpointed.pin_membership_digest,
+                snapshot_manifest_json=checkpointed.snapshot_manifest_json,
+                history_store_status=checkpointed.history_store_status,
+                history_store_diagnostic=checkpointed.history_store_diagnostic,
+            ),
+            source_artifacts=(checkpointed_record.source_artifact,),
+            acquisition_outcomes=checkpointed_record.outcomes,
+        )
+        result = submission.AnalystSubmissionResult(
+            message=AIMessage(content="finalized"),
+            report="Market report",
+            submission_source=EvidenceSource(
+                source_id="analyst.market.submission",
+                status=EvidenceStatus.AVAILABLE,
+                required=True,
+            ),
+        )
+
+        update = submission.build_analyst_update(
+            {
+                "company_of_interest": "NVDA",
+                "trade_date": "2026-01-15",
+                "messages": [],
+                "evidence_state": checkpointed_evidence.model_dump(mode="json"),
+            },
+            result,
+            "market_report",
+        )
+
+    evidence = EvidenceState.model_validate(update["evidence_state"])
+    assert evidence.market_snapshot == checkpointed_evidence.market_snapshot
+    assert evidence.acquisition_outcomes == checkpointed_evidence.acquisition_outcomes
+
+
+@pytest.mark.unit
 def test_evidence_coverage_counts_an_authoritative_snapshot_once():
     snapshot = MarketSnapshotEvidence(symbol="NVDA", provider="test", retrieved_at="now", adjustment_basis="qfq", requested_date="2026-01-15", effective_trading_date="2026-01-15", history_rows=10, snapshot_id="snapshot:abc")
     evidence = EvidenceState(

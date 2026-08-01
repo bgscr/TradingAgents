@@ -87,15 +87,21 @@ def clear_all_checkpoints(data_dir: str | Path) -> int:
 
 
 def clear_checkpoint(data_dir: str | Path, ticker: str, date: str, signature: str = "") -> None:
-    """Remove checkpoint for a specific ticker+date by deleting the thread's rows."""
+    """Remove one thread and physically discard its checkpoint payloads."""
     db = _db_path(data_dir, ticker)
     if not db.exists():
         return
     tid = thread_id(ticker, date, signature)
     conn = sqlite3.connect(str(db))
     try:
+        conn.execute("PRAGMA secure_delete = ON")
         for table in ("writes", "checkpoints"):
             conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (tid,))
         conn.commit()
+        # LangGraph replaces checkpoint rows throughout a run.  VACUUM removes
+        # payloads from pages freed by those earlier replacements as well as by
+        # the scoped deletes above, while retaining checkpoints for other
+        # threads in this per-ticker database.
+        conn.execute("VACUUM")
     finally:
         conn.close()
