@@ -47,6 +47,45 @@ class ActiveRuntimeArtifactRunError(RuntimeError):
     """Raised when offline collection is attempted during an active run."""
 
 
+def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
+    """Persist an exact JSON payload inside the designated raw-artifact boundary."""
+    encoded = json.dumps(
+        payload,
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    target_dir = Path(artifact_root) / "sha256" / digest[:2]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{digest}.json.gz"
+    if target.exists():
+        return digest
+    compressed = gzip.compress(encoded, mtime=0)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target_dir,
+            prefix=f".{digest}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(compressed)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_path = Path(temp_file.name)
+        try:
+            os.link(temp_path, target)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    return digest
+
+
 def collect_runtime_artifacts(
     results_root: Path,
     *,

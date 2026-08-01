@@ -27,6 +27,7 @@ from cli.runtime_artifacts import (
     ActiveRuntimeArtifactRunError,
     RuntimeArtifactWriter,
     collect_runtime_artifacts,
+    persist_runtime_artifact,
 )
 from cli.stats_handler import StatsCallbackHandler
 from cli.utils import (
@@ -1521,9 +1522,39 @@ def _exception_log_summary(summary: str, diagnostics: dict) -> str:
 def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: str) -> None:
     if artifacts is None:
         return
-    summary = _exception_summary(exc)
-    diagnostics = _exception_chain_diagnostics(exc)
-    log_summary = _exception_log_summary(summary, diagnostics)
+    error_category = (
+        "report_publication"
+        if current_phase in {"report_writing", "checkpoint_cleanup"}
+        else (
+            "configuration"
+            if current_phase in {"setup", "graph_initializing"}
+            else "graph_execution"
+        )
+    )
+    detail_digest: str | None = None
+    with suppress(Exception):
+        detail_digest = persist_runtime_artifact(
+            artifacts["artifact_root"],
+            {
+                "contract_version": "operational-failure-detail-v1",
+                "operational_error_category": error_category,
+                "failed_phase": current_phase,
+                "exception_diagnostics": _exception_chain_diagnostics(exc),
+            },
+        )
+    detail_artifact = (
+        f"artifact=sha256:{detail_digest}"
+        if detail_digest is not None
+        else None
+    )
+    summary = f"operational_failure:{error_category}"
+    diagnostics = {
+        "contract_version": "operational-failure-public-v1",
+        "outcome": "operational_failure",
+        "category": error_category,
+        "phase": current_phase,
+        "detail_artifact": detail_artifact,
+    }
     with suppress(Exception):
         telemetry_ledger = artifacts.get("run_telemetry_ledger")
         if telemetry_ledger is not None:
@@ -1537,15 +1568,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             current_phase=None,
             failed_phase=current_phase,
             terminal_outcome_kind="operational_failure",
-            operational_error_category=(
-                "report_publication"
-                if current_phase in {"report_writing", "checkpoint_cleanup"}
-                else (
-                    "configuration"
-                    if current_phase in {"setup", "graph_initializing"}
-                    else "graph_execution"
-                )
-            ),
+            operational_error_category=error_category,
             error_summary=summary,
             error_diagnostics=diagnostics,
         )
@@ -1555,13 +1578,18 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             runtime_writer.record_critical(
                 datetime.datetime.now().strftime("%H:%M:%S"),
                 "System",
-                f"Run failed during {current_phase}: {log_summary}",
+                (
+                    f"Run failed during {current_phase}: operational_failure "
+                    f"category={error_category} detail_artifact={detail_artifact or 'unavailable'}"
+                ),
             )
         else:
             _append_line_to_run_logs(
                 [artifacts["log_file"], artifacts["latest_log_file"]],
                 f"{datetime.datetime.now().strftime('%H:%M:%S')} "
-                f"[System] Run failed during {current_phase}: {log_summary}\n",
+                f"[System] Run failed during {current_phase}: operational_failure "
+                f"category={error_category} "
+                f"detail_artifact={detail_artifact or 'unavailable'}\n",
             )
 
 

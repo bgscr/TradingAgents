@@ -2553,6 +2553,12 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         "diagnostic_code": "shadow_dispatch_failed",
         "failure_count": 1,
     }
+    raw_failure_text = (
+        "ProviderTransportError GET "
+        "https://provider.example.test/v1/indicator?token=query-secret "
+        'payload={"account":"private-payload"} credential=provider-secret'
+    )
+    failed_shadow_state["provider_failure_debug"] = raw_failure_text
     failed_shadow_audit = prepare_decision_audit(
         failed_shadow_state,
         tmp_path / "failed-shadow-audit",
@@ -2570,7 +2576,16 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     )
     failed_shadow_report = failed_shadow_report_path.read_text(encoding="utf-8")
     assert "Sanitized shadow failures:** 1" in failed_shadow_report
-    assert "raw-provider-secret" not in json.dumps(
+    exposed_failed_surfaces = failed_shadow_report + json.dumps(
         failed_shadow_audit,
         sort_keys=True,
     )
+    for forbidden in (
+        "ProviderTransportError",
+        "provider.example.test",
+        "token=query-secret",
+        "private-payload",
+        "provider-secret",
+        raw_failure_text,
+    ):
+        assert forbidden not in exposed_failed_surfaces

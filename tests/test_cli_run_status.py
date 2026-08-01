@@ -1,3 +1,4 @@
+import gzip
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -63,6 +64,31 @@ class NoOpDisplay:
 
     def close(self):
         self.closed = True
+
+
+def _raw_failure_detail(artifacts: dict) -> dict:
+    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
+    reference = payload["error_diagnostics"]["detail_artifact"]
+    assert reference.startswith("artifact=sha256:")
+    digest = reference.removeprefix("artifact=sha256:")
+    artifact_path = (
+        artifacts["artifact_root"]
+        / "sha256"
+        / digest[:2]
+        / f"{digest}.json.gz"
+    )
+    with gzip.open(artifact_path, "rt", encoding="utf-8") as artifact_file:
+        return json.load(artifact_file)
+
+
+def _public_failure_surfaces(artifacts: dict) -> str:
+    return "\n".join(
+        (
+            artifacts["status_file"].read_text(encoding="utf-8"),
+            artifacts["log_file"].read_text(encoding="utf-8"),
+            artifacts["latest_log_file"].read_text(encoding="utf-8"),
+        )
+    )
 
 
 @pytest.mark.unit
@@ -299,7 +325,7 @@ def test_mark_run_completed_publishes_canonical_identity_after_reports(
 
 
 @pytest.mark.unit
-def test_mark_run_failed_records_error_summary(tmp_path):
+def test_mark_run_failed_exposes_only_typed_public_outcome(tmp_path):
     artifacts = cli_main._prepare_run_artifacts(
         {"results_dir": str(tmp_path)},
         _selections(),
@@ -322,13 +348,31 @@ def test_mark_run_failed_records_error_summary(tmp_path):
     assert payload["completed_at"] is None
     assert payload["failed_at"] is not None
     assert payload["terminal_at"] == payload["failed_at"]
-    assert payload["error_summary"] == "RuntimeError: stream stopped"
-    assert "Run failed during graph_stream: RuntimeError: stream stopped" in artifacts[
+    assert payload["error_summary"] == "operational_failure:graph_execution"
+    assert payload["error_diagnostics"] == {
+        "contract_version": "operational-failure-public-v1",
+        "outcome": "operational_failure",
+        "category": "graph_execution",
+        "phase": "graph_stream",
+        "detail_artifact": payload["error_diagnostics"]["detail_artifact"],
+    }
+    assert "operational_failure category=graph_execution" in artifacts[
         "log_file"
     ].read_text(encoding="utf-8")
+    assert "RuntimeError" not in _public_failure_surfaces(artifacts)
+    assert "stream stopped" not in _public_failure_surfaces(artifacts)
     assert artifacts["latest_log_file"].read_text(encoding="utf-8") == artifacts[
         "log_file"
     ].read_text(encoding="utf-8")
+    raw_detail = _raw_failure_detail(artifacts)
+    assert raw_detail["operational_error_category"] == "graph_execution"
+    assert raw_detail["failed_phase"] == "graph_stream"
+    assert raw_detail["exception_diagnostics"]["root_cause"]["exception_type"] == (
+        "RuntimeError"
+    )
+    assert raw_detail["exception_diagnostics"]["root_cause"]["message"] == (
+        "stream stopped"
+    )
 
 
 @pytest.mark.unit
@@ -357,8 +401,7 @@ def test_mark_run_failed_records_sanitized_chained_error_diagnostics(
         current_phase="graph_stream",
     )
 
-    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    diagnostics = payload["error_diagnostics"]
+    diagnostics = _raw_failure_detail(artifacts)["exception_diagnostics"]
     assert diagnostics["contract_version"] == "1.0"
     assert diagnostics["chain"] == [
         {
@@ -380,7 +423,12 @@ def test_mark_run_failed_records_sanitized_chained_error_diagnostics(
     assert diagnostics["root_cause"] == diagnostics["chain"][-1]
     assert diagnostics["chain_truncated"] is False
     assert diagnostics["cycle_detected"] is False
-    serialized = json.dumps(payload)
+    public_surfaces = _public_failure_surfaces(artifacts)
+    assert "RuntimeError" not in public_surfaces
+    assert "ConnectionError" not in public_surfaces
+    assert "analysis wrapper failed" not in public_surfaces
+    assert "api.example.test" not in public_surfaces
+    serialized = public_surfaces + json.dumps(diagnostics)
     for secret in (
         "password",
         "query-secret",
@@ -411,7 +459,9 @@ def test_mark_run_failed_redacts_common_structured_secret_renderings(tmp_path):
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    message = payload["error_diagnostics"]["root_cause"]["message"]
+    message = _raw_failure_detail(artifacts)["exception_diagnostics"]["root_cause"][
+        "message"
+    ]
     assert message == (
         'provider rejected Bearer <redacted>; '
         '{"api_key": "<redacted>", "password": "<redacted>", '
@@ -452,7 +502,9 @@ def test_mark_run_failed_redacts_prefixed_secret_fields(tmp_path):
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    message = payload["error_diagnostics"]["root_cause"]["message"]
+    message = _raw_failure_detail(artifacts)["exception_diagnostics"]["root_cause"][
+        "message"
+    ]
     assert message == (
         '{"OPENAI_API_KEY": "<redacted>", '
         '"x-api-key": "<redacted>", '
@@ -500,7 +552,9 @@ def test_mark_run_failed_redacts_unquoted_secret_values_with_whitespace(tmp_path
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    message = payload["error_diagnostics"]["root_cause"]["message"]
+    message = _raw_failure_detail(artifacts)["exception_diagnostics"]["root_cause"][
+        "message"
+    ]
     assert message == "password=<redacted>; private_key=<redacted>; provider failed"
     serialized = json.dumps(payload)
     assert "my secret phrase" not in serialized
@@ -526,7 +580,9 @@ def test_mark_run_failed_redacts_escaped_quotes_inside_secret_values(tmp_path):
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    message = payload["error_diagnostics"]["root_cause"]["message"]
+    message = _raw_failure_detail(artifacts)["exception_diagnostics"]["root_cause"][
+        "message"
+    ]
     assert message == (
         '{"api_key": "<redacted>", '
         "'password': '<redacted>', "
@@ -557,7 +613,9 @@ def test_mark_run_failed_redacts_container_secret_values(tmp_path):
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    message = payload["error_diagnostics"]["root_cause"]["message"]
+    message = _raw_failure_detail(artifacts)["exception_diagnostics"]["root_cause"][
+        "message"
+    ]
     assert message == (
         '{"credentials": <redacted>, '
         '"private_key": <redacted>, '
@@ -571,7 +629,7 @@ def test_mark_run_failed_redacts_container_secret_values(tmp_path):
 
 
 @pytest.mark.unit
-def test_mark_run_failed_logs_sanitized_outer_and_root_cause(tmp_path):
+def test_mark_run_failed_logs_only_typed_outcome_and_artifact_reference(tmp_path):
     artifacts = cli_main._prepare_run_artifacts(
         {"results_dir": str(tmp_path)},
         _selections(),
@@ -589,10 +647,12 @@ def test_mark_run_failed_logs_sanitized_outer_and_root_cause(tmp_path):
     )
 
     log_text = artifacts["log_file"].read_text(encoding="utf-8")
-    assert (
-        "Run failed during graph_stream: RuntimeError: analysis stream stopped; "
-        "root cause: TimeoutError: request to feed.example.test timed out"
-    ) in log_text
+    assert "operational_failure category=graph_execution" in log_text
+    assert "artifact=sha256:" in log_text
+    assert "RuntimeError" not in log_text
+    assert "analysis stream stopped" not in log_text
+    assert "TimeoutError" not in log_text
+    assert "feed.example.test" not in log_text
     assert "/private" not in log_text
     assert "password" not in log_text
     assert artifacts["latest_log_file"].read_text(encoding="utf-8") == log_text
@@ -615,8 +675,7 @@ def test_error_diagnostics_bound_implicit_context_chain_and_message_length(tmp_p
         current_phase="graph_stream",
     )
 
-    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    diagnostics = payload["error_diagnostics"]
+    diagnostics = _raw_failure_detail(artifacts)["exception_diagnostics"]
     assert len(diagnostics["chain"]) == 8
     assert [entry["message"] for entry in diagnostics["chain"][:-1]] == [
         f"level-{index}" for index in range(7)
@@ -647,8 +706,7 @@ def test_error_diagnostics_detect_exception_chain_cycles(tmp_path):
         current_phase="graph_stream",
     )
 
-    payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    diagnostics = payload["error_diagnostics"]
+    diagnostics = _raw_failure_detail(artifacts)["exception_diagnostics"]
     assert [entry["exception_type"] for entry in diagnostics["chain"]] == [
         "RuntimeError",
         "ValueError",
@@ -676,7 +734,7 @@ def test_error_diagnostics_do_not_follow_suppressed_context(tmp_path):
     )
 
     payload = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
-    assert payload["error_diagnostics"]["chain"] == [
+    assert _raw_failure_detail(artifacts)["exception_diagnostics"]["chain"] == [
         {
             "exception_type": "RuntimeError",
             "message": "public failure",
@@ -713,7 +771,16 @@ def test_run_analysis_marks_failed_when_graph_initialization_fails(
     assert payload["current_phase"] is None
     assert payload["failed_phase"] == "graph_initializing"
     assert payload["operational_error_category"] == "configuration"
-    assert payload["error_summary"] == "RuntimeError: graph boot failed"
+    assert payload["error_summary"] == "operational_failure:configuration"
+    public_surfaces = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            status_files[0],
+            status_files[0].parent / "message_tool.log",
+        )
+    )
+    assert "RuntimeError" not in public_surfaces
+    assert "graph boot failed" not in public_surfaces
 
 
 @pytest.mark.unit
@@ -794,7 +861,16 @@ def test_run_analysis_marks_failed_when_graph_stream_is_interrupted(
     assert payload["current_phase"] is None
     assert payload["failed_phase"] == "graph_stream"
     assert payload["operational_error_category"] == "graph_execution"
-    assert payload["error_summary"] == "KeyboardInterrupt: ctrl-c"
+    assert payload["error_summary"] == "operational_failure:graph_execution"
+    public_surfaces = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            status_files[0],
+            status_files[0].parent / "message_tool.log",
+        )
+    )
+    assert "KeyboardInterrupt" not in public_surfaces
+    assert "ctrl-c" not in public_surfaces
     assert display.closed is True
     assert snapshot_scope_events == ["entered", "exited"]
     metrics = json.loads(
@@ -852,10 +928,16 @@ def test_run_analysis_marks_failed_when_display_start_fails(tmp_path, monkeypatc
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     payload = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert payload["error_summary"] == "RuntimeError: display failed"
+    assert payload["error_summary"] == "operational_failure:configuration"
     assert "Run failed during graph_initializing" in (
         run_dir / "message_tool.log"
     ).read_text(encoding="utf-8")
+    assert "RuntimeError" not in (run_dir / "message_tool.log").read_text(
+        encoding="utf-8"
+    )
+    assert "display failed" not in (run_dir / "message_tool.log").read_text(
+        encoding="utf-8"
+    )
     assert (run_dir / "runtime_metrics.json").exists()
 
 
@@ -888,8 +970,14 @@ def test_run_analysis_marks_failed_when_display_construction_fails(
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     payload = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert payload["error_summary"] == "RuntimeError: display construction failed"
+    assert payload["error_summary"] == "operational_failure:configuration"
     assert "Run failed during graph_initializing" in (
+        run_dir / "message_tool.log"
+    ).read_text(encoding="utf-8")
+    assert "RuntimeError" not in (run_dir / "message_tool.log").read_text(
+        encoding="utf-8"
+    )
+    assert "display construction failed" not in (
         run_dir / "message_tool.log"
     ).read_text(encoding="utf-8")
     assert (run_dir / "runtime_metrics.json").exists()
