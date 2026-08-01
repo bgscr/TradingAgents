@@ -17,6 +17,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialFilingMetadata,
     FinancialListingProvenance,
     FinancialPeriodCandidate,
+    FinancialPeriodCompletenessAssessment,
     FinancialPeriodDisposition,
     FinancialPeriodIdentity,
     FinancialPeriodRejectionReason,
@@ -462,6 +463,13 @@ def test_statement_completeness_uses_declared_bank_and_non_bank_cores() -> None:
     assert industrial.disposition is FinancialPeriodDisposition.ACCEPTED
     assert bank.critical_coverage == 1
     assert bank.core_coverage == 1
+    assert bank.contract_version == "financial-period-selection-v1"
+    assert (
+        FinancialPeriodCompletenessAssessment.model_validate(
+            bank.model_dump(mode="json")
+        )
+        == bank
+    )
 
 
 def test_unknown_or_contradictory_company_type_is_rejected() -> None:

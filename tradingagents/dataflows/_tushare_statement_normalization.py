@@ -62,11 +62,23 @@ _BALANCE_FIELDS: dict[FinancialCompanyType, dict[str, tuple[str, ...]]] = {
     FinancialCompanyType.BANK: {
         "cash_and_central_bank": ("cash_reser_cb", "cash_and_central_bank"),
         "customer_deposits": ("depos", "customer_deposits"),
+        "financial_assets_at_amortized_cost": (
+            "cost_fin_assets",
+            "financial_assets_at_amortized_cost",
+        ),
+        "financial_assets_at_fair_value": (
+            "fair_value_fin_assets",
+            "financial_assets_at_fair_value",
+        ),
         "financial_investments": ("fin_assets", "financial_investments"),
         "interbank_assets": ("depos_in_oth_bfi", "interbank_assets"),
         "interbank_liabilities": ("depos_oth_bfi", "interbank_liabilities"),
         "loan_loss_allowance": ("loan_loss_reser", "loan_loss_allowance"),
-        "loans_and_advances": ("loans", "loans_and_advances"),
+        "loans_and_advances": (
+            "decr_in_disbur",
+            "loans",
+            "loans_and_advances",
+        ),
         "total_assets": ("total_assets",),
         "total_equity": (
             "total_hldr_eqy_inc_min_int",
@@ -78,6 +90,7 @@ _BALANCE_FIELDS: dict[FinancialCompanyType, dict[str, tuple[str, ...]]] = {
 }
 _INCOME_FIELDS: dict[FinancialCompanyType, dict[str, tuple[str, ...]]] = {
     FinancialCompanyType.INDUSTRIAL_NON_BANK: {
+        "administrative_expense": ("admin_exp", "administrative_expense"),
         "cost_of_revenue": ("oper_cost", "cost_of_revenue"),
         "finance_costs": ("fin_exp", "finance_costs"),
         "gross_profit": ("gross_profit",),
@@ -87,10 +100,12 @@ _INCOME_FIELDS: dict[FinancialCompanyType, dict[str, tuple[str, ...]]] = {
         "operating_profit": ("operate_profit", "operating_profit"),
         "operating_revenue": ("total_revenue", "revenue", "operating_revenue"),
         "other_income": ("oth_income", "other_income"),
+        "profit_before_tax": ("total_profit", "profit_before_tax"),
         "research_development_expense": (
             "rd_exp",
             "research_development_expense",
         ),
+        "selling_expense": ("sell_exp", "selling_expense"),
     },
     FinancialCompanyType.BANK: {
         "credit_impairment_loss": ("credit_impa_loss", "credit_impairment_loss"),
@@ -99,10 +114,15 @@ _INCOME_FIELDS: dict[FinancialCompanyType, dict[str, tuple[str, ...]]] = {
         "interest_expense": ("int_exp", "interest_expense"),
         "interest_income": ("int_income", "interest_income"),
         "investment_income": ("invest_income", "investment_income"),
+        "net_fee_commission_income": (
+            "n_commis_income",
+            "net_fee_commission_income",
+        ),
         "net_income": ("n_income_attr_p", "n_income", "net_income"),
         "net_interest_income": ("n_int_income", "net_interest_income"),
-        "operating_expense": ("oper_cost", "operating_expense"),
+        "operating_expense": ("oper_exp", "oper_cost", "operating_expense"),
         "operating_profit": ("operate_profit", "operating_profit"),
+        "profit_before_tax": ("total_profit", "profit_before_tax"),
     },
 }
 _CASH_FLOW_FIELDS = {
@@ -119,6 +139,17 @@ _CASH_FLOW_FIELDS = {
     "effect_of_exchange_rates": ("eff_fx_flu_cash", "effect_of_exchange_rates"),
     "net_change_in_cash": ("n_incr_cash_cash_equ", "net_change_in_cash"),
     "opening_cash": ("c_cash_equ_beg_period", "opening_cash"),
+}
+_BANK_CASH_FLOW_FIELDS = {
+    **_CASH_FLOW_FIELDS,
+    "cash_inflows_from_operations": (
+        "c_inf_fr_operate_a",
+        "cash_inflows_from_operations",
+    ),
+    "cash_paid_for_dividends_profit_and_interest": (
+        "c_pay_dist_dpcp_int_exp",
+        "cash_paid_for_dividends_profit_and_interest",
+    ),
 }
 
 
@@ -367,7 +398,7 @@ def _classifier_present_fields(
     """Collect signatures independently of the provider-declared company type."""
 
     if statement_type is FinancialStatementType.CASH_FLOW:
-        mappings = (_CASH_FLOW_FIELDS,)
+        mappings = (_CASH_FLOW_FIELDS, _BANK_CASH_FLOW_FIELDS)
     elif statement_type is FinancialStatementType.BALANCE_SHEET:
         mappings = tuple(_BALANCE_FIELDS.values())
     else:
@@ -388,7 +419,11 @@ def _normalized_fields(
     company_type: FinancialCompanyType,
 ) -> tuple[FinancialFieldValue, ...]:
     if statement_type is FinancialStatementType.CASH_FLOW:
-        mappings = _CASH_FLOW_FIELDS
+        mappings = (
+            _BANK_CASH_FLOW_FIELDS
+            if company_type is FinancialCompanyType.BANK
+            else _CASH_FLOW_FIELDS
+        )
     else:
         mappings = {
             FinancialStatementType.BALANCE_SHEET: _BALANCE_FIELDS,

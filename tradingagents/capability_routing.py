@@ -25,8 +25,10 @@ from tradingagents.evidence import (
 CAPABILITY_ROUTING_PLAN_VERSION = "1.0"
 CAPABILITY_ROUTING_POLICY_VERSION = "mainland-capability-routing-policy-v1"
 QUALIFICATION_PROFILE = "cn-a-2000-20260729-v1"
-NORMALIZER_VERSION = "mainland-financial-normalizer-v1"
-COMPLETENESS_POLICY_VERSION = "mainland-financial-completeness-v1"
+NORMALIZER_VERSION_V1 = "mainland-financial-normalizer-v1"
+NORMALIZER_VERSION = "mainland-financial-normalizer-v2"
+COMPLETENESS_POLICY_VERSION_V1 = "mainland-financial-completeness-v1"
+COMPLETENESS_POLICY_VERSION = "mainland-financial-completeness-v2"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _PLAN_SIGNATURE_PREFIX = "mainland-routing-plan:v1:"
@@ -152,10 +154,12 @@ class MainlandCapabilityRoutingPlan(BaseModel):
     routes: tuple[MainlandCapabilityRoute, ...]
     enabled_tushare_capabilities: tuple[TushareCapability, ...] = ()
     normalizer_version: Literal[
-        "mainland-financial-normalizer-v1"
+        "mainland-financial-normalizer-v1",
+        "mainland-financial-normalizer-v2",
     ] = NORMALIZER_VERSION
     completeness_policy_version: Literal[
-        "mainland-financial-completeness-v1"
+        "mainland-financial-completeness-v1",
+        "mainland-financial-completeness-v2",
     ] = COMPLETENESS_POLICY_VERSION
     account_scope_label: str = Field(
         min_length=1,
@@ -169,8 +173,9 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         "financial-manifest-v1"
     ] = "financial-manifest-v1"
     selection_contract_version: Literal[
-        "financial-period-selection-v1"
-    ] = "financial-period-selection-v1"
+        "financial-period-selection-v1",
+        "financial-period-selection-statement-v2",
+    ] = "financial-period-selection-statement-v2"
     degradation_contract_version: Literal[
         "financial-degradation-v1"
     ] = "financial-degradation-v1"
@@ -261,10 +266,19 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
     enabled_tushare_capabilities: tuple[TushareCapability, ...]
     qualification_profile: Literal["legacy", "cn-a-2000-20260729-v1"]
-    normalizer_version: Literal["mainland-financial-normalizer-v1"]
-    completeness_policy_version: Literal["mainland-financial-completeness-v1"]
+    normalizer_version: Literal[
+        "mainland-financial-normalizer-v1",
+        "mainland-financial-normalizer-v2",
+    ]
+    completeness_policy_version: Literal[
+        "mainland-financial-completeness-v1",
+        "mainland-financial-completeness-v2",
+    ]
     manifest_contract_version: Literal["financial-manifest-v1"]
-    selection_contract_version: Literal["financial-period-selection-v1"]
+    selection_contract_version: Literal[
+        "financial-period-selection-v1",
+        "financial-period-selection-statement-v2",
+    ]
     degradation_contract_version: Literal["financial-degradation-v1"]
     disposition: MainlandCapabilityRoutingDisposition
     rollback_compatible: Literal[True] = True
@@ -716,6 +730,7 @@ def _build_plan(
     calls_per_minute: int,
     operator_calls_per_minute: int,
 ) -> MainlandCapabilityRoutingPlan:
+    legacy = mode is MainlandCapabilityRoutingMode.LEGACY
     payload: dict[str, Any] = {
         "plan_version": CAPABILITY_ROUTING_PLAN_VERSION,
         "policy_version": CAPABILITY_ROUTING_POLICY_VERSION,
@@ -723,8 +738,14 @@ def _build_plan(
         "qualification_profile": qualification_profile,
         "routes": [route.model_dump(mode="json") for route in _routes(mode, enabled)],
         "enabled_tushare_capabilities": [item.value for item in enabled],
-        "normalizer_version": NORMALIZER_VERSION,
-        "completeness_policy_version": COMPLETENESS_POLICY_VERSION,
+        "normalizer_version": (
+            NORMALIZER_VERSION_V1 if legacy else NORMALIZER_VERSION
+        ),
+        "completeness_policy_version": (
+            COMPLETENESS_POLICY_VERSION_V1
+            if legacy
+            else COMPLETENESS_POLICY_VERSION
+        ),
         "account_scope_label": account_scope_label,
         "endpoint_pacing_identities": [
             TushareEndpointPacingIdentity(
@@ -743,7 +764,11 @@ def _build_plan(
         ],
         "artifact_contract_version": "source-artifact-v1",
         "manifest_contract_version": "financial-manifest-v1",
-        "selection_contract_version": "financial-period-selection-v1",
+        "selection_contract_version": (
+            "financial-period-selection-v1"
+            if legacy
+            else "financial-period-selection-statement-v2"
+        ),
         "degradation_contract_version": "financial-degradation-v1",
     }
     return MainlandCapabilityRoutingPlan(

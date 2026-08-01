@@ -267,11 +267,11 @@ def _non_bank_income_rows() -> pd.DataFrame:
                 "n_income": 120,
                 "oper_cost": 500,
                 "fin_exp": 20,
-                "gross_profit": 400,
                 "income_tax": 30,
                 "total_cogs": 650,
-                "oth_income": 10,
-                "rd_exp": 25,
+                "admin_exp": 35,
+                "sell_exp": 15,
+                "total_profit": 150,
             }
         ]
     )
@@ -316,11 +316,11 @@ def _bank_balance_rows() -> pd.DataFrame:
                 "update_flag": "0",
                 "cash_reser_cb": 100,
                 "depos": 800,
-                "fin_assets": 300,
+                "cost_fin_assets": 180,
+                "fair_value_fin_assets": 120,
                 "depos_in_oth_bfi": 120,
                 "depos_oth_bfi": 90,
-                "loan_loss_reser": 20,
-                "loans": 700,
+                "decr_in_disbur": 700,
                 "total_assets": 1500,
                 "total_hldr_eqy_inc_min_int": 200,
                 "total_liab": 1300,
@@ -346,16 +346,42 @@ def _bank_income_rows() -> pd.DataFrame:
                 "int_exp": 40,
                 "int_income": 180,
                 "n_income": 90,
-                "n_int_income": 140,
-                "credit_impa_loss": 15,
                 "comm_income": 30,
+                "n_commis_income": 22,
                 "income_tax": 20,
                 "invest_income": 12,
-                "oper_cost": 70,
+                "oper_exp": 70,
                 "operate_profit": 110,
+                "total_profit": 105,
                 "total_revenue": None,
                 "gross_profit": None,
                 "rd_exp": None,
+            }
+        ]
+    )
+
+
+def _bank_cashflow_rows() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ts_code": "601328.SH",
+                "ann_date": "20260429",
+                "f_ann_date": "20260430",
+                "end_date": "20251231",
+                "report_type": "1",
+                "comp_type": "2",
+                "update_flag": "0",
+                "n_cash_flows_fnc_act": 50,
+                "n_cashflow_inv_act": -80,
+                "n_cashflow_act": 160,
+                "c_inf_fr_operate_a": 930,
+                "c_pay_dist_dpcp_int_exp": 45,
+                "c_paid_for_taxes": 30,
+                "c_cash_equ_end_period": 300,
+                "eff_fx_flu_cash": 1,
+                "n_incr_cash_cash_equ": 131,
+                "c_cash_equ_beg_period": 169,
             }
         ]
     )
@@ -442,6 +468,9 @@ def test_complete_non_bank_balance_sheet_persists_before_normalizing_and_project
         expected_currency="CNY",
         expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
         pit_as_of_date=date(2026, 7, 30),
+    )
+    assert assessment.contract_version == (
+        "financial-period-selection-tushare-statement-v2"
     )
     assert assessment.usable_for_current_analysis is True
     assert assessment.strict_pit_eligible is True
@@ -576,6 +605,11 @@ def test_bank_comp_type_uses_bank_contract_without_industrial_fields(
     )
     assert assessment.critical_coverage == 1
     assert assessment.core_coverage == 1
+    assert {
+        "financial_assets_at_amortized_cost",
+        "financial_assets_at_fair_value",
+        "loans_and_advances",
+    } <= {field.normalized_field for field in candidate.fields}
     assert "inventory" not in assessment.declared_core_fields
 
 
@@ -618,7 +652,59 @@ def test_bank_income_uses_bank_fields_without_non_bank_revenue_fields(
     assert candidate.period_identity.company_type is FinancialCompanyType.BANK
     assert assessment.critical_coverage == 1
     assert assessment.core_coverage == 1
+    assert {
+        "net_fee_commission_income",
+        "operating_expense",
+        "profit_before_tax",
+    } <= {field.normalized_field for field in candidate.fields}
+    assert "net_interest_income" not in assessment.declared_critical_fields
     assert "operating_revenue" not in assessment.declared_core_fields
+
+
+@pytest.mark.unit
+def test_bank_cash_flow_uses_bank_specific_declared_core(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _qualified_plan(monkeypatch)
+    client = _FakeTushareClient(cashflow=_bank_cashflow_rows())
+    artifact_store = ProviderSubrequestArtifactStore(tmp_path / "artifacts")
+    bank_identity = _identity().model_copy(update={"symbol": "601328.SS"})
+
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_adapter_harness(
+            plan=plan,
+            client=client,
+            store=store,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-04-bank-cash-flow",
+        )
+        result = harness.adapter.acquire_cash_flow(
+            instrument_identity=bank_identity,
+            range_start=date(2021, 1, 1),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    candidate = result.annual_candidates[0]
+    assessment = assess_financial_period_candidate(
+        candidate,
+        requested_capability=candidate.period_identity.capability,
+        requested_statement_type=FinancialStatementType.CASH_FLOW,
+        requested_ratio_family=None,
+        expected_instrument_identity=bank_identity,
+        expected_frequency=FinancialReportingFrequency.ANNUAL,
+        expected_currency="CNY",
+        expected_consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        pit_as_of_date=date(2026, 7, 30),
+    )
+    assert assessment.critical_coverage == 1
+    assert assessment.core_coverage == 1
+    assert {
+        "cash_inflows_from_operations",
+        "cash_paid_for_dividends_profit_and_interest",
+    } <= {field.normalized_field for field in candidate.fields}
+    assert "cash_received_from_customers" not in assessment.declared_core_fields
+    assert "cash_paid_for_interest" not in assessment.declared_core_fields
 
 
 @pytest.mark.unit

@@ -28,6 +28,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     render_indicator_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2,
     FinancialCapability,
     FinancialCompanyType,
     FinancialConsolidationScope,
@@ -175,6 +176,11 @@ def _candidate(
     declaration = financial_statement_field_declaration(
         declaration_company_type,
         statement_type,
+        declaration_version=(
+            FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2
+            if provider_id == "tushare"
+            else "financial-field-declarations-v1"
+        ),
     )
     selected_fields = declaration.core_fields[:core_field_limit]
     fields = tuple(

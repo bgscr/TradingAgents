@@ -91,6 +91,12 @@ def test_default_configuration_resolves_the_legacy_plan_without_tushare() -> Non
     assert result.plan is not None
     assert result.plan.mode is MainlandCapabilityRoutingMode.LEGACY
     assert result.plan.enabled_tushare_capabilities == ()
+    assert result.plan.normalizer_version == "mainland-financial-normalizer-v1"
+    assert (
+        result.plan.completeness_policy_version
+        == "mainland-financial-completeness-v1"
+    )
+    assert result.plan.selection_contract_version == "financial-period-selection-v1"
     assert result.plan.route_for(MainlandCapability.DAILY_MARKET_SNAPSHOT) == (
         "akshare",
         "baostock",
@@ -194,12 +200,14 @@ def test_qualified_v1_resolves_closed_versioned_routes_and_signature(
         "akshare",
     )
     assert plan.route_for(MainlandCapability.ISSUER_LIFECYCLE) == ("baostock",)
-    assert plan.normalizer_version == "mainland-financial-normalizer-v1"
-    assert plan.completeness_policy_version == "mainland-financial-completeness-v1"
+    assert plan.normalizer_version == "mainland-financial-normalizer-v2"
+    assert plan.completeness_policy_version == "mainland-financial-completeness-v2"
     assert plan.account_scope_label == "personal-research-primary"
     assert plan.artifact_contract_version == "source-artifact-v1"
     assert plan.manifest_contract_version == "financial-manifest-v1"
-    assert plan.selection_contract_version == "financial-period-selection-v1"
+    assert plan.selection_contract_version == (
+        "financial-period-selection-statement-v2"
+    )
     assert plan.degradation_contract_version == "financial-degradation-v1"
     assert tuple(item.endpoint_id for item in plan.endpoint_pacing_identities) == (
         "adj_factor",

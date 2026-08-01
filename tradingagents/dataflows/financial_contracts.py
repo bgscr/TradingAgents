@@ -25,6 +25,10 @@ FINANCIAL_CONTRACT_VERSION = "1.0"
 FINANCIAL_PROVIDER_DATASET_IDENTITY_VERSION = "financial-provider-dataset:v1"
 FINANCIAL_PROVIDER_ARTIFACT_IDENTITY_VERSION = "financial-provider-artifact:v1"
 FINANCIAL_PERIOD_IDENTITY_VERSION = "financial-period:v1"
+FINANCIAL_STATEMENT_DECLARATION_V1 = "financial-field-declarations-v1"
+FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2 = (
+    "financial-field-declarations-tushare-v2"
+)
 FINANCIAL_RATIO_DECLARATION_V1 = "financial-ratio-declarations-v1"
 FINANCIAL_RATIO_DECLARATION_V2 = "financial-ratio-declarations-v2"
 FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1 = (
@@ -32,6 +36,9 @@ FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1 = (
 )
 FINANCIAL_PERIOD_SELECTION_V1 = "financial-period-selection-v1"
 FINANCIAL_PERIOD_SELECTION_V2 = "financial-period-selection-v2"
+FINANCIAL_PERIOD_SELECTION_TUSHARE_STATEMENT_V2 = (
+    "financial-period-selection-tushare-statement-v2"
+)
 FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1 = (
     "financial-period-selection-baostock-v1"
 )
@@ -592,9 +599,10 @@ class FinancialFieldSetDeclaration(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = FINANCIAL_CONTRACT_VERSION
-    declaration_version: Literal["financial-field-declarations-v1"] = (
-        "financial-field-declarations-v1"
-    )
+    declaration_version: Literal[
+        "financial-field-declarations-v1",
+        "financial-field-declarations-tushare-v2",
+    ] = FINANCIAL_STATEMENT_DECLARATION_V1
     company_type: FinancialCompanyType
     statement_type: FinancialStatementType
     critical_fields: tuple[str, ...]
@@ -616,7 +624,7 @@ class FinancialFieldSetDeclaration(BaseModel):
         return self
 
 
-_BALANCE_CORES = {
+_BALANCE_CORES_V1 = {
     FinancialCompanyType.BANK: (
         ("customer_deposits", "loans_and_advances", "total_assets", "total_equity", "total_liabilities"),
         ("cash_and_central_bank", "customer_deposits", "financial_investments", "interbank_assets", "interbank_liabilities", "loan_loss_allowance", "loans_and_advances", "total_assets", "total_equity", "total_liabilities"),
@@ -639,7 +647,7 @@ _BALANCE_CORES = {
     ),
 }
 
-_INCOME_CORES = {
+_INCOME_CORES_V1 = {
     FinancialCompanyType.BANK: (
         ("interest_expense", "interest_income", "net_income", "net_interest_income"),
         ("credit_impairment_loss", "fee_commission_income", "income_tax_expense", "interest_expense", "interest_income", "investment_income", "net_income", "net_interest_income", "operating_expense", "operating_profit"),
@@ -662,7 +670,7 @@ _INCOME_CORES = {
     ),
 }
 
-_CASH_FLOW_COMMON = (
+_CASH_FLOW_COMMON_V1 = (
     "cash_from_financing",
     "cash_from_investing",
     "cash_from_operations",
@@ -675,21 +683,119 @@ _CASH_FLOW_COMMON = (
     "opening_cash",
 )
 
+# Tushare's qualified statement schema exposes different, semantically precise
+# line items from the AKShare-Sina fallback. Keep this declaration provider-bound
+# so fallback candidates and v1 checkpoints continue to use their original core.
+_BALANCE_CORES_TUSHARE_V2 = {
+    **_BALANCE_CORES_V1,
+    FinancialCompanyType.BANK: (
+        (
+            "customer_deposits",
+            "loans_and_advances",
+            "total_assets",
+            "total_equity",
+            "total_liabilities",
+        ),
+        (
+            "cash_and_central_bank",
+            "customer_deposits",
+            "financial_assets_at_amortized_cost",
+            "financial_assets_at_fair_value",
+            "interbank_assets",
+            "interbank_liabilities",
+            "loans_and_advances",
+            "total_assets",
+            "total_equity",
+            "total_liabilities",
+        ),
+    ),
+}
+_INCOME_CORES_TUSHARE_V2 = {
+    **_INCOME_CORES_V1,
+    FinancialCompanyType.BANK: (
+        (
+            "interest_expense",
+            "interest_income",
+            "net_income",
+            "operating_profit",
+        ),
+        (
+            "fee_commission_income",
+            "income_tax_expense",
+            "interest_expense",
+            "interest_income",
+            "investment_income",
+            "net_fee_commission_income",
+            "net_income",
+            "operating_expense",
+            "operating_profit",
+            "profit_before_tax",
+        ),
+    ),
+    FinancialCompanyType.INDUSTRIAL_NON_BANK: (
+        ("net_income", "operating_profit", "operating_revenue"),
+        (
+            "administrative_expense",
+            "cost_of_revenue",
+            "finance_costs",
+            "income_tax_expense",
+            "net_income",
+            "operating_expense",
+            "operating_profit",
+            "operating_revenue",
+            "profit_before_tax",
+            "selling_expense",
+        ),
+    ),
+}
+_BANK_CASH_FLOW_TUSHARE_V2 = (
+    "cash_from_financing",
+    "cash_from_investing",
+    "cash_from_operations",
+    "cash_inflows_from_operations",
+    "cash_paid_for_dividends_profit_and_interest",
+    "cash_paid_for_taxes",
+    "closing_cash",
+    "effect_of_exchange_rates",
+    "net_change_in_cash",
+    "opening_cash",
+)
+
 
 def financial_statement_field_declaration(
     company_type: FinancialCompanyType,
     statement_type: FinancialStatementType,
+    *,
+    declaration_version: Literal[
+        "financial-field-declarations-v1",
+        "financial-field-declarations-tushare-v2",
+    ] = FINANCIAL_STATEMENT_DECLARATION_V1,
 ) -> FinancialFieldSetDeclaration:
+    if declaration_version == FINANCIAL_STATEMENT_DECLARATION_V1:
+        balance_cores = _BALANCE_CORES_V1
+        income_cores = _INCOME_CORES_V1
+        cash_flow_core = _CASH_FLOW_COMMON_V1
+    elif declaration_version == FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2:
+        balance_cores = _BALANCE_CORES_TUSHARE_V2
+        income_cores = _INCOME_CORES_TUSHARE_V2
+        cash_flow_core = (
+            _BANK_CASH_FLOW_TUSHARE_V2
+            if company_type is FinancialCompanyType.BANK
+            else _CASH_FLOW_COMMON_V1
+        )
+    else:
+        raise ValueError("unsupported financial statement declaration version")
     if statement_type is FinancialStatementType.BALANCE_SHEET:
-        critical, core = _BALANCE_CORES[company_type]
+        critical, core = balance_cores[company_type]
     elif statement_type is FinancialStatementType.INCOME_STATEMENT:
-        critical, core = _INCOME_CORES[company_type]
+        critical, core = income_cores[company_type]
     elif statement_type is FinancialStatementType.CASH_FLOW:
         critical = ("cash_from_operations", "closing_cash", "net_change_in_cash")
-        core = _CASH_FLOW_COMMON
+        core = cash_flow_core
     else:
         raise ValueError("full-statement declaration requires a statement type")
     return FinancialFieldSetDeclaration(
+        declaration_version=declaration_version,
         company_type=company_type,
         statement_type=statement_type,
         critical_fields=tuple(sorted(critical)),
@@ -1367,6 +1473,7 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
         "financial-period-selection-v1",
         "financial-period-selection-v2",
         "financial-period-selection-baostock-v1",
+        "financial-period-selection-tushare-statement-v2",
     ] = FINANCIAL_PERIOD_SELECTION_V1
     candidate_identity: str = Field(
         pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
@@ -1431,14 +1538,8 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
         expected_critical: tuple[str, ...] = ()
         expected_core: tuple[str, ...] = ()
         ratio_assessment = False
-        ratio_contract = (
-            self.capability is FinancialCapability.RATIO_FAMILY
-            and self.statement_type is None
-            and self.ratio_family is not None
-        )
-        if (
+        statement_contract = (
             self.capability is FinancialCapability.STATEMENT
-            and self.company_type is not FinancialCompanyType.UNKNOWN
             and self.statement_type
             in {
                 FinancialStatementType.BALANCE_SHEET,
@@ -1446,10 +1547,32 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
                 FinancialStatementType.INCOME_STATEMENT,
             }
             and self.ratio_family is None
-        ):
+        )
+        declarable_statement = (
+            statement_contract
+            and self.company_type is not FinancialCompanyType.UNKNOWN
+        )
+        ratio_contract = (
+            self.capability is FinancialCapability.RATIO_FAMILY
+            and self.statement_type is None
+            and self.ratio_family is not None
+        )
+        if declarable_statement:
+            declaration_version = {
+                FINANCIAL_PERIOD_SELECTION_V1: FINANCIAL_STATEMENT_DECLARATION_V1,
+                FINANCIAL_PERIOD_SELECTION_TUSHARE_STATEMENT_V2: (
+                    FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2
+                ),
+            }.get(self.contract_version)
+            if declaration_version is None:
+                raise ValueError(
+                    "statement assessment requires a statement selection contract"
+                )
+            assert self.statement_type is not None
             declaration = financial_statement_field_declaration(
                 self.company_type,
                 self.statement_type,
+                declaration_version=declaration_version,
             )
             expected_critical = declaration.critical_fields
             expected_core = declaration.core_fields
@@ -1484,6 +1607,14 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             and not ratio_contract
         ):
             raise ValueError("financial period selection v2 requires a ratio assessment")
+        if (
+            self.contract_version
+            == FINANCIAL_PERIOD_SELECTION_TUSHARE_STATEMENT_V2
+            and not statement_contract
+        ):
+            raise ValueError(
+                "statement selection v2 requires a statement assessment"
+            )
 
         if (
             self.declared_critical_fields != expected_critical
@@ -1648,6 +1779,11 @@ def assess_financial_period_candidate(
     if candidate.filing_metadata.ann_date is None:
         reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA)
 
+    statement_declaration_version = (
+        FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2
+        if candidate.artifact.dataset.provider_id == "tushare"
+        else FINANCIAL_STATEMENT_DECLARATION_V1
+    )
     declared_critical: tuple[str, ...] = ()
     declared_core: tuple[str, ...] = ()
     present_critical: tuple[str, ...] = ()
@@ -1670,6 +1806,7 @@ def assess_financial_period_candidate(
         declaration = financial_statement_field_declaration(
             identity.company_type,
             identity.statement_type,
+            declaration_version=statement_declaration_version,
         )
         declared_critical = declaration.critical_fields
         declared_core = declaration.core_fields
@@ -1753,13 +1890,22 @@ def assess_financial_period_candidate(
         disposition = FinancialPeriodDisposition.CURRENT_ONLY
     else:
         disposition = FinancialPeriodDisposition.REJECTED
-    assessment_contract_version = {
-        FINANCIAL_RATIO_DECLARATION_V1: FINANCIAL_PERIOD_SELECTION_V1,
-        FINANCIAL_RATIO_DECLARATION_V2: FINANCIAL_PERIOD_SELECTION_V2,
-        FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1: (
-            FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1
-        ),
-    }[ratio_declaration_version]
+    assessment_contract_version = (
+        {
+            FINANCIAL_STATEMENT_DECLARATION_V1: FINANCIAL_PERIOD_SELECTION_V1,
+            FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2: (
+                FINANCIAL_PERIOD_SELECTION_TUSHARE_STATEMENT_V2
+            ),
+        }[statement_declaration_version]
+        if identity.capability is FinancialCapability.STATEMENT
+        else {
+            FINANCIAL_RATIO_DECLARATION_V1: FINANCIAL_PERIOD_SELECTION_V1,
+            FINANCIAL_RATIO_DECLARATION_V2: FINANCIAL_PERIOD_SELECTION_V2,
+            FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1: (
+                FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1
+            ),
+        }[ratio_declaration_version]
+    )
     return FinancialPeriodCompletenessAssessment(
         contract_version=assessment_contract_version,
         candidate_identity=candidate.candidate_identity,
@@ -3246,6 +3392,9 @@ __all__ = [
     "FINANCIAL_PERIOD_SELECTION_V1",
     "FINANCIAL_PERIOD_SELECTION_V2",
     "FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1",
+    "FINANCIAL_PERIOD_SELECTION_TUSHARE_STATEMENT_V2",
+    "FINANCIAL_STATEMENT_DECLARATION_V1",
+    "FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2",
     "FINANCIAL_MANIFEST_V1",
     "FINANCIAL_MANIFEST_V2",
     "FINANCIAL_RATIO_DECLARATION_V1",
