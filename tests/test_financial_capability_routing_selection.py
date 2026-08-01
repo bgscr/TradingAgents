@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -335,6 +336,79 @@ def _statement_request() -> FinancialStatementRoutingRequest:
         eligible_annual_period_ends=_ANNUAL_PERIODS,
         eligible_reporting_period_ends=_REPORTING_PERIODS,
     )
+
+
+def _production_composition_graph(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    plan,
+    asset,
+    composition: QualifiedFinancialRoutingComposition,
+) -> TradingAgentsGraph:
+    unused = lambda *_args, **_kwargs: "must not be called"  # noqa: E731
+    vendor_methods = {
+        tool_name: {"legacy-placeholder": unused}
+        for tool_name in (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        )
+    }
+    monkeypatch.setattr(
+        "tradingagents.dataflows.interface.VENDOR_METHODS",
+        vendor_methods,
+    )
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.create_llm_client",
+        lambda **_kwargs: SimpleNamespace(get_llm=MagicMock()),
+    )
+    runtime_config = copy.deepcopy(DEFAULT_CONFIG)
+    runtime_config.update(
+        {
+            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_plan_signature": plan.plan_signature,
+            "tool_vendors": dict.fromkeys(vendor_methods, "legacy-placeholder"),
+            "data_cache_dir": str(tmp_path / "cache"),
+            "results_dir": str(tmp_path / "results"),
+        }
+    )
+    return TradingAgentsGraph(
+        selected_analysts=("fundamentals",),
+        config=runtime_config,
+        asset_configuration=asset,
+        capability_routing_plan=plan,
+        qualified_financial_routing=composition,
+    )
+
+
+def _qualified_tool_state(asset, *, target: date) -> dict[str, object]:
+    assert target <= date(2026, 7, 30)
+    return {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_balance_sheet",
+                        "args": {
+                            "ticker": asset.instrument_identity.symbol,
+                            "freq": "quarterly",
+                            "curr_date": "2026-07-30",
+                        },
+                        "id": "production-composition-balance-sheet",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ],
+        "evidence_state": EvidenceState(
+            instrument_identity=asset.instrument_identity
+        ).model_dump(mode="json"),
+        "asset_configuration": asset.model_dump(mode="json"),
+        "trade_date": "2026-07-30",
+    }
 
 
 def test_complete_tushare_statement_coverage_stops_fallback(
@@ -2255,6 +2329,250 @@ def test_trading_graph_composes_qualified_financial_router(
     )
     assert capability_calls == ["tushare"]
     assert routed.selected_provider == "tushare"
+
+
+def test_production_composition_routes_tushare_gap_to_akshare_sina(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    plan = _qualified_plan(monkeypatch)
+    asset = resolve_run_asset_configuration(
+        "600895.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    target = _REPORTING_PERIODS[-1]
+    sparse_tushare = _candidate(
+        provider_id="tushare",
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        period_end=target,
+        frequency=FinancialReportingFrequency.QUARTERLY,
+        core_field_limit=1,
+        instrument_identity=asset.instrument_identity,
+    )
+    akshare_fill = _candidate(
+        provider_id="akshare_sina",
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        period_end=target,
+        frequency=FinancialReportingFrequency.QUARTERLY,
+        instrument_identity=asset.instrument_identity,
+    )
+    calls: list[tuple[str, FinancialProviderGapRequest]] = []
+
+    def tushare(
+        request: FinancialProviderGapRequest,
+    ) -> FinancialProviderPeriodResponse:
+        calls.append(("tushare", request))
+        return _available_response("tushare", (sparse_tushare,))
+
+    def akshare_sina(
+        request: FinancialProviderGapRequest,
+    ) -> FinancialProviderPeriodResponse:
+        calls.append(("akshare_sina", request))
+        return _available_response("akshare_sina", (akshare_fill,))
+
+    def yahoo(_request: FinancialProviderGapRequest) -> FinancialProviderPeriodResponse:
+        raise AssertionError("AKShare-Sina filled the exact Tushare gap")
+
+    selection_request = FinancialStatementRoutingRequest(
+        instrument_identity=asset.instrument_identity,
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        as_of_date=date(2026, 7, 30),
+        company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        currency="CNY",
+        eligible_annual_period_ends=(),
+        eligible_reporting_period_ends=(target,),
+    )
+    composition = QualifiedFinancialRoutingComposition(
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={
+                "tushare": tushare,
+                "akshare_sina": akshare_sina,
+                "yfinance": yahoo,
+            },
+        ),
+        statement_request_factory=lambda _request: selection_request,
+        indicator_request_factory=lambda _request: None,
+    )
+    graph = _production_composition_graph(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        plan=plan,
+        asset=asset,
+        composition=composition,
+    )
+
+    result = graph.tool_nodes["fundamentals"](
+        _qualified_tool_state(asset, target=target)
+    )
+
+    assert [provider for provider, _ in calls] == ["tushare", "akshare_sina"]
+    assert calls[1][1].missing_annual_period_ends == ()
+    assert calls[1][1].missing_reporting_period_ends == (target,)
+    terminal = result["financial_dispatch_ledger"][
+        "qualified_statement_selections"
+    ][0]["terminal"]
+    manifest = terminal["routing_result"]["manifest"]
+    assert manifest["selections"][0]["provider_id"] == "akshare_sina"
+    assert any(
+        "insufficient_completeness" in rejection["reasons"]
+        for rejection in manifest["rejected_periods"]
+    )
+
+
+def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    plan = _qualified_plan(monkeypatch)
+    asset = resolve_run_asset_configuration(
+        "600895.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    target = _REPORTING_PERIODS[-1]
+    yahoo_candidate = _candidate(
+        provider_id="yfinance",
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        period_end=target,
+        frequency=FinancialReportingFrequency.QUARTERLY,
+        f_ann_date=None,
+        instrument_identity=asset.instrument_identity,
+    )
+    calls: list[str] = []
+
+    def unavailable(
+        provider_id: str,
+    ) -> Callable[[FinancialProviderGapRequest], FinancialProviderPeriodResponse]:
+        def invoke(
+            _request: FinancialProviderGapRequest,
+        ) -> FinancialProviderPeriodResponse:
+            calls.append(provider_id)
+            return FinancialProviderPeriodResponse.unavailable(
+                provider_id=provider_id,
+                reason=AcquisitionUnavailableReason.NO_DATA,
+                physical_attempt_ids=(f"attempt:{provider_id}",),
+            )
+
+        return invoke
+
+    def yahoo(
+        _request: FinancialProviderGapRequest,
+    ) -> FinancialProviderPeriodResponse:
+        calls.append("yfinance")
+        return _available_response("yfinance", (yahoo_candidate,))
+
+    selection_request = FinancialStatementRoutingRequest(
+        instrument_identity=asset.instrument_identity,
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        as_of_date=date(2026, 7, 30),
+        company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        currency="CNY",
+        eligible_annual_period_ends=(),
+        eligible_reporting_period_ends=(target,),
+    )
+    composition = QualifiedFinancialRoutingComposition(
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={
+                "tushare": unavailable("tushare"),
+                "akshare_sina": unavailable("akshare_sina"),
+                "yfinance": yahoo,
+            },
+        ),
+        statement_request_factory=lambda _request: selection_request,
+        indicator_request_factory=lambda _request: None,
+    )
+    graph = _production_composition_graph(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        plan=plan,
+        asset=asset,
+        composition=composition,
+    )
+
+    result = graph.tool_nodes["fundamentals"](
+        _qualified_tool_state(asset, target=target)
+    )
+
+    assert calls == ["tushare", "akshare_sina", "yfinance"]
+    terminal = result["financial_dispatch_ledger"][
+        "qualified_statement_selections"
+    ][0]["terminal"]
+    manifest = terminal["routing_result"]["manifest"]
+    selection = manifest["selections"][0]
+    assert selection["provider_id"] == "yfinance"
+    assert selection["disposition"] == "current_only"
+    assert selection["strict_pit_eligible"] is False
+    assert EvidenceState.model_validate(result["evidence_state"]).source_facts == ()
+
+
+@pytest.mark.parametrize("tradeability", ["tradeable", "suspended"])
+def test_production_composition_keeps_baostock_status_authoritative(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    tradeability: str,
+) -> None:
+    plan = _qualified_plan(monkeypatch)
+    asset = resolve_run_asset_configuration(
+        "600895.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    calls: list[str] = []
+
+    def baostock(
+        request: FinancialCapabilityRoutingRequest,
+    ) -> FinancialCapabilityProviderResponse:
+        calls.append("baostock")
+        return FinancialCapabilityProviderResponse.available(
+            provider_id="baostock",
+            capability=request.capability,
+            retained_artifact_identities=(
+                f"provider-artifact:baostock-status-{tradeability}",
+            ),
+            candidate_count=1,
+            subrequest_keys=(f"subrequest:baostock-status-{tradeability}",),
+            physical_attempt_ids=(f"attempt:baostock-status-{tradeability}",),
+            current_tradeability=tradeability,
+        )
+
+    composition = QualifiedFinancialRoutingComposition(
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            capability_sources={
+                MainlandCapability.SUSPENSION_STATUS: {
+                    "baostock": baostock,
+                },
+            },
+        ),
+        statement_request_factory=lambda _request: _statement_request(),
+        indicator_request_factory=lambda _request: None,
+    )
+    graph = _production_composition_graph(
+        monkeypatch=monkeypatch,
+        tmp_path=tmp_path,
+        plan=plan,
+        asset=asset,
+        composition=composition,
+    )
+
+    result = graph.route_mainland_financial_capability(
+        FinancialCapabilityRoutingRequest(
+            instrument_identity=asset.instrument_identity,
+            capability=MainlandCapability.SUSPENSION_STATUS,
+            range_start=date(2026, 7, 30),
+            as_of_date=date(2026, 7, 30),
+        )
+    )
+
+    assert calls == ["baostock"]
+    assert result.route == ("baostock",)
+    assert result.selected_provider == "baostock"
+    assert result.authoritative_provider == "baostock"
+    assert result.current_tradeability == tradeability
+    assert result.source_facts_created is False
 
 
 def test_trading_graph_rejects_mismatched_qualified_composition_before_models(
