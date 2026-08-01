@@ -47,8 +47,7 @@ class ActiveRuntimeArtifactRunError(RuntimeError):
     """Raised when offline collection is attempted during an active run."""
 
 
-def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
-    """Persist an exact JSON payload inside the designated raw-artifact boundary."""
+def _encode_runtime_artifact(payload: Any) -> tuple[bytes, str]:
     encoded = json.dumps(
         payload,
         default=str,
@@ -56,14 +55,21 @@ def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()
+    return encoded, hashlib.sha256(encoded).hexdigest()
+
+
+def _write_runtime_artifact_once(
+    artifact_root: Path,
+    digest: str,
+    compressed: bytes,
+) -> bool:
     target_dir = Path(artifact_root) / "sha256" / digest[:2]
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{digest}.json.gz"
     if target.exists():
-        return digest
-    compressed = gzip.compress(encoded, mtime=0)
+        return False
     temp_path: Path | None = None
+    created = False
     try:
         with tempfile.NamedTemporaryFile(
             dir=target_dir,
@@ -77,12 +83,33 @@ def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
             temp_path = Path(temp_file.name)
         try:
             os.link(temp_path, target)
+            created = True
         except OSError as exc:
             if exc.errno != errno.EEXIST:
                 raise
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+    return created
+
+
+def _persist_encoded_runtime_artifact(
+    artifact_root: Path,
+    encoded: bytes,
+    digest: str,
+) -> tuple[int, bool, bool]:
+    target = Path(artifact_root) / "sha256" / digest[:2] / f"{digest}.json.gz"
+    if target.exists():
+        return target.stat().st_size, False, False
+    compressed = gzip.compress(encoded, mtime=0)
+    created = _write_runtime_artifact_once(artifact_root, digest, compressed)
+    return len(compressed), created, True
+
+
+def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
+    """Persist an exact JSON payload inside the designated raw-artifact boundary."""
+    encoded, digest = _encode_runtime_artifact(payload)
+    _persist_encoded_runtime_artifact(artifact_root, encoded, digest)
     return digest
 
 
@@ -588,14 +615,7 @@ class RuntimeArtifactWriter:
 
     @staticmethod
     def _encode_payload(payload: Any) -> tuple[bytes, str]:
-        encoded = json.dumps(
-            payload,
-            default=str,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return encoded, hashlib.sha256(encoded).hexdigest()
+        return _encode_runtime_artifact(payload)
 
     def _persist_payload(self, encoded: bytes, digest: str) -> int:
         known_size = self._compressed_sizes.get(digest)
@@ -604,21 +624,17 @@ class RuntimeArtifactWriter:
                 self._artifacts_deduplicated += 1
             return known_size
 
-        target = self.artifact_root / "sha256" / digest[:2] / f"{digest}.json.gz"
-        if target.exists():
-            compressed_size = target.stat().st_size
-            self._compressed_sizes[digest] = compressed_size
-            with self._metrics_lock:
-                self._artifacts_deduplicated += 1
-            return compressed_size
-
-        compressed = gzip.compress(encoded, mtime=0)
-        with self._metrics_lock:
-            self._artifact_compression_operations += 1
-        created = self._write_artifact_once(digest, compressed)
-        compressed_size = len(compressed)
+        compressed_size, created, compression_performed = (
+            _persist_encoded_runtime_artifact(
+                self.artifact_root,
+                encoded,
+                digest,
+            )
+        )
         self._compressed_sizes[digest] = compressed_size
         with self._metrics_lock:
+            if compression_performed:
+                self._artifact_compression_operations += 1
             if created:
                 self._artifacts_created += 1
                 self._payload_uncompressed_bytes += len(encoded)
@@ -626,37 +642,6 @@ class RuntimeArtifactWriter:
             else:
                 self._artifacts_deduplicated += 1
         return compressed_size
-
-    def _write_artifact_once(self, digest: str, compressed: bytes) -> bool:
-        target_dir = self.artifact_root / "sha256" / digest[:2]
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{digest}.json.gz"
-        if target.exists():
-            return False
-
-        temp_path: Path | None = None
-        created = False
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=target_dir,
-                prefix=f".{digest}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temp_file:
-                temp_file.write(compressed)
-                temp_file.flush()
-                os.fsync(temp_file.fileno())
-                temp_path = Path(temp_file.name)
-            try:
-                os.link(temp_path, target)
-                created = True
-            except OSError as exc:
-                if exc.errno != errno.EEXIST:
-                    raise
-        finally:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
-        return created
 
     def _append_log_line(self, line: str) -> None:
         encoded_bytes = len(line.encode("utf-8"))
