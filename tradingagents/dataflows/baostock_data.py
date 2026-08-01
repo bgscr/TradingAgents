@@ -215,10 +215,8 @@ def load_current_snapshot(
         elif status_value == "0":
             status = TradingStatus.SUSPENDED
         else:
-            raise NoMarketDataError(
-                symbol,
-                instrument.yahoo_symbol,
-                "BaoStock returned an unknown explicit trading status",
+            raise ValueError(
+                "BaoStock returned a missing or unknown explicit trading status"
             )
         normalized_sessions.append(
             normalize_mainland_session(

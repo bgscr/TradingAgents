@@ -1394,9 +1394,62 @@ def test_production_baostock_cannot_silently_drop_invalid_date_row(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    (
+        "latest_row",
+        "expected_tradeability",
+        "expected_status",
+        "expected_latest_traded_close",
+        "expected_carried_close",
+    ),
+    (
+        (
+            {
+                "date": "2026-07-31",
+                "code": "sh.600895",
+                "open": "10.5",
+                "high": "11.5",
+                "low": "10",
+                "close": "11",
+                "preclose": "10.5",
+                "volume": "120",
+                "amount": "1320",
+                "tradestatus": "1",
+            },
+            "tradeable",
+            TradingStatus.TRADED,
+            Decimal("11"),
+            None,
+        ),
+        (
+            {
+                "date": "2026-07-31",
+                "code": "sh.600895",
+                "open": "",
+                "high": "",
+                "low": "",
+                "close": "",
+                "preclose": "10.5",
+                "volume": "",
+                "amount": "",
+                "tradestatus": "0",
+            },
+            "suspended",
+            TradingStatus.SUSPENDED,
+            Decimal("10.5"),
+            Decimal("10.5"),
+        ),
+    ),
+    ids=("explicit-traded", "explicit-suspended"),
+)
 def test_production_baostock_shadow_snapshot_retains_exact_current_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    latest_row: dict[str, str],
+    expected_tradeability: str,
+    expected_status: TradingStatus,
+    expected_latest_traded_close: Decimal,
+    expected_carried_close: Decimal | None,
 ) -> None:
     class Login:
         error_code = "0"
@@ -1421,18 +1474,7 @@ def test_production_baostock_shadow_snapshot_retains_exact_current_status(
                     "amount": "1000",
                     "tradestatus": "1",
                 },
-                {
-                    "date": "2026-07-31",
-                    "code": "sh.600895",
-                    "open": "10.5",
-                    "high": "11.5",
-                    "low": "10",
-                    "close": "11",
-                    "preclose": "10.5",
-                    "volume": "120",
-                    "amount": "1320",
-                    "tradestatus": "1",
-                },
+                latest_row,
             )
             self.rows = [
                 [row[field] for field in self.fields] for row in source_rows
@@ -1484,12 +1526,17 @@ def test_production_baostock_shadow_snapshot_retains_exact_current_status(
     )
 
     assert requested_fields == [baostock_data.CURRENT_SNAPSHOT_FIELDS]
+    assert snapshot.requested_date == "2026-08-01"
     assert snapshot.effective_trading_date == "2026-07-31"
-    assert snapshot.current_tradeability == "tradeable"
+    assert snapshot.current_tradeability == expected_tradeability
     assert snapshot.current_status_provenance is not None
     assert snapshot.current_status_provenance.session_date == date(2026, 7, 31)
-    assert snapshot.current_status_provenance.status is TradingStatus.TRADED
+    assert snapshot.current_status_provenance.status is expected_status
+    assert snapshot.latest_traded_close == expected_latest_traded_close
+    assert snapshot.carried_suspension_close == expected_carried_close
     assert snapshot.status_artifact is not None
+    retained_status = json.loads(snapshot.status_artifact.raw_text)
+    assert retained_status["rows"][-1] == latest_row
     assert snapshot.current_status_provenance.revision_id == (
         "artifact:sha256:" + snapshot.status_artifact.artifact_sha256
     )
@@ -1502,3 +1549,95 @@ def test_production_baostock_shadow_snapshot_retains_exact_current_status(
         for outcome in snapshot.acquisition_outcomes
         if outcome.outcome == "available"
     }
+
+
+@pytest.mark.unit
+def test_production_baostock_does_not_infer_missing_trade_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Login:
+        error_code = "0"
+        error_msg = ""
+
+    class Query:
+        error_code = "0"
+        error_msg = ""
+        fields = baostock_data.CURRENT_SNAPSHOT_FIELDS.split(",")
+
+        def __init__(self) -> None:
+            row = {
+                "date": "2026-07-31",
+                "code": "sh.600895",
+                "open": "10.5",
+                "high": "11.5",
+                "low": "10",
+                "close": "11",
+                "preclose": "10.5",
+                "volume": "120",
+                "amount": "1320",
+                "tradestatus": "",
+            }
+            self.rows = [[row[field] for field in self.fields]]
+            self.index = -1
+
+        def next(self) -> bool:
+            self.index += 1
+            return self.index < len(self.rows)
+
+        def get_row_data(self) -> list[str]:
+            return self.rows[self.index]
+
+    config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    set_config({
+        "market_data_vendors": {
+            "cn_a": {"core_stock_apis": "baostock,yfinance"}
+        }
+    })
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: Login())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "query_history_k_data_plus",
+        lambda *args, **kwargs: Query(),
+    )
+    accepted = pd.DataFrame({
+        "Date": ["2026-07-31"],
+        "Open": [10.5],
+        "High": [11.5],
+        "Low": [10.0],
+        "Close": [11.0],
+        "Volume": [120.0],
+    })
+    monkeypatch.setattr(
+        market_snapshot,
+        "SNAPSHOT_PROVIDERS",
+        {
+            "baostock": market_snapshot.SNAPSHOT_PROVIDERS["baostock"],
+            "yfinance": SnapshotProvider(
+                lambda *args: accepted,
+                "auto_adjusted",
+            ),
+        },
+    )
+
+    snapshot = get_authoritative_market_snapshot(
+        "600895.SS",
+        "2026-07-30",
+        "2026-08-01",
+    )
+
+    assert snapshot.provider == "yfinance"
+    assert snapshot.current_tradeability == "unknown"
+    assert snapshot.current_status_provenance is None
+    assert snapshot.status_artifact is None
+    assert snapshot.quarantined[0].reason == (
+        "BaoStock returned a missing or unknown explicit trading status"
+    )
+    baostock_outcome = next(
+        outcome
+        for outcome in snapshot.acquisition_outcomes
+        if outcome.provider == "baostock"
+    )
+    assert baostock_outcome.reason is (
+        AcquisitionUnavailableReason.MALFORMED_RESPONSE
+    )
