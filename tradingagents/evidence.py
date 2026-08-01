@@ -265,6 +265,13 @@ class IdentityProvenance(BaseModel):
     retrieved_at: str = Field(min_length=1)
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @field_validator("source_ref")
+    @classmethod
+    def _source_ref_is_checkpoint_safe(cls, value: str) -> str:
+        if "://" in value and "?" in value:
+            raise ValueError("identity provenance cannot contain a URL query")
+        return value
+
 
 class TradingStatusProvenanceEvidence(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG

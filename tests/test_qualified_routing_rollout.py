@@ -220,6 +220,31 @@ def test_checkpoint_state_identifies_rollout_mode_and_disposition(
     )
 
 
+@pytest.mark.parametrize("symbol", ("600895.SS", "601328.SS", "510500.SS"))
+def test_checkpointed_asset_identity_opaques_query_bearing_provenance(
+    symbol: str,
+) -> None:
+    asset = resolve_run_asset_configuration(
+        symbol,
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+
+    state = Propagator().create_initial_state(
+        symbol,
+        "2026-07-30",
+        asset_configuration=asset,
+    )
+
+    assert "?" in asset.registry_artifact
+    checkpoint_text = json.dumps(state, sort_keys=True)
+    checkpoint_source_ref = state["asset_configuration"]["instrument_identity"][
+        "provenance"
+    ]["source_ref"]
+    assert checkpoint_source_ref.startswith("acq.v1:identity.provenance:")
+    assert "?" not in checkpoint_source_ref
+    assert "?" not in checkpoint_text
+
+
 @pytest.mark.parametrize(
     "capability",
     [
