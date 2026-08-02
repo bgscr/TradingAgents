@@ -2904,12 +2904,20 @@ def _validate_indicator_routing_semantics(
             for item in manifest.provider_candidates
             if item.candidate.candidate_identity in selected_ids
         )
+        selected_currencies = {
+            assessment.currency for assessment in selected_assessments
+        }
+        aggregate_currency = (
+            next(iter(selected_currencies))
+            if len(selected_currencies) == 1
+            else selection_request.currency
+        )
         expected_aggregate = assess_financial_ratio_history_coverage(
             instrument_identity=selection_request.instrument_identity,
             ratio_family=family,
             company_type=selection_request.company_type,
             consolidation_scope=selection_request.consolidation_scope,
-            currency=selection_request.currency,
+            currency=aggregate_currency,
             assessments=selected_assessments,
             eligible_reporting_period_ends=expected_periods,
         )

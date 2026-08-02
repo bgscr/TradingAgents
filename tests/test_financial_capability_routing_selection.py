@@ -59,6 +59,10 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolDispatcher,
     FinancialToolRequest,
 )
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestAttemptEvent,
+    ProviderSubrequestOutcomeKind,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
@@ -2368,6 +2372,114 @@ def test_compiled_tool_node_routes_fundamentals_through_indicator_families(
         result["financial_dispatch_ledger"]["qualified_indicator_selections"]
     ) == 1
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.1"
+
+
+def test_run_scoped_indicator_dispatch_preserves_provider_qualified_currency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = resolve_run_asset_configuration(
+        "600895.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    identity = asset.instrument_identity
+    candidates = tuple(
+        _ratio_candidate(
+            provider_id="tushare",
+            ratio_family=FinancialRatioFamily.PROFIT,
+            period_end=period,
+            instrument_identity=identity,
+        )
+        for period in _REPORTING_PERIODS
+    )
+    attempt_event_id = "provider-physical-attempt=sha256:" + "1" * 64
+    attempt_event = ProviderSubrequestAttemptEvent(
+        attempt_event_id=attempt_event_id,
+        sequence_id="provider-request-sequence=sha256:" + "2" * 64,
+        request_key="provider-subrequest:v1:" + "3" * 64,
+        upstream_service_id="upstream-service=sha256:" + "4" * 64,
+        capacity_scope="fina_indicator",
+        attempt_index=1,
+        attempted_at=_OBSERVED_AT,
+        pacing_event="permit_acquired",
+        pacing_wait_seconds=0,
+        outcome=ProviderSubrequestOutcomeKind.AVAILABLE,
+        retryable=False,
+        cooldown_changed=False,
+        cooldown_until=None,
+        final_physical_attempt_count=1,
+    )
+    response = FinancialProviderPeriodResponse.available(
+        provider_id="tushare",
+        response_artifact=candidates[0].artifact,
+        retained_artifacts=tuple(candidate.artifact for candidate in candidates),
+        candidates=candidates,
+        subrequest_keys=(attempt_event.request_key,),
+        physical_attempt_ids=(attempt_event_id,),
+        physical_attempt_events=(attempt_event,),
+    )
+    plan = _qualified_plan(monkeypatch)
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        indicator_sources={"tushare": lambda _request: response},
+    )
+    unused = lambda *_args, **_kwargs: "must not be called"  # noqa: E731
+    vendor_methods = {
+        tool_name: {"legacy-placeholder": unused}
+        for tool_name in (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        )
+    }
+    runtime_config = copy.deepcopy(DEFAULT_CONFIG)
+    runtime_config.update(
+        {
+            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_plan_signature": plan.plan_signature,
+            "tool_vendors": dict.fromkeys(
+                vendor_methods,
+                "legacy-placeholder",
+            ),
+        }
+    )
+    dispatcher = FinancialToolDispatcher.from_configured_vendors(
+        instrument_identity=identity,
+        run_asset_configuration=asset,
+        config=runtime_config,
+        vendor_methods=vendor_methods,
+        qualified_statement_router=router,
+        run_scope_id="provider-qualified-currency-regression",
+    )
+    tool_request = FinancialToolRequest(
+        tool_name="get_fundamentals",
+        statement_type=FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS,
+        frequency=FinancialReportingFrequency.NOT_APPLICABLE,
+        as_of_date=date(2026, 7, 30),
+        tool_call_id="provider-qualified-currency-regression",
+    )
+    indicator_request = FinancialIndicatorRoutingRequest(
+        instrument_identity=identity,
+        as_of_date=tool_request.as_of_date,
+        company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        currency="CNY",
+        ratio_families=(FinancialRatioFamily.PROFIT,),
+        eligible_reporting_period_ends=_REPORTING_PERIODS,
+    )
+
+    result = dispatcher.dispatch_indicator_selection(
+        tool_request,
+        indicator_request,
+    )
+
+    assert result.routing_result.complete_families == (
+        FinancialRatioFamily.PROFIT,
+    )
+    assert result.routing_result.family_manifests[0].aggregate_completeness.currency == (
+        "XXX"
+    )
 
 
 def test_compiled_tool_node_keeps_fundamentals_legacy_without_indicator_factory(
