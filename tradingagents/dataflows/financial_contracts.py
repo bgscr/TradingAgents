@@ -370,6 +370,7 @@ class FinancialPeriodRejectionReason(str, Enum):
     INCOMPATIBLE_UNIT = "incompatible_unit"
     INCOMPATIBLE_CURRENCY = "incompatible_currency"
     INCOMPATIBLE_CONSOLIDATION_SCOPE = "incompatible_consolidation_scope"
+    INCOMPATIBLE_COMPANY_TYPE = "incompatible_company_type"
     AMBIGUOUS_COMPANY_TYPE = "ambiguous_company_type"
     ANNOUNCEMENT_AFTER_CUTOFF = "announcement_after_cutoff"
     MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT = (
@@ -1814,6 +1815,10 @@ class FinancialFilingMetadata(BaseModel):
         default=None,
         pattern=_SAFE_ID_PATTERN,
     )
+    provider_filing_revision_sequence: int | None = Field(default=None, ge=0)
+    provider_filing_revision_sequence_qualification: Literal[
+        "financial-provider-revision-sequence-qualified-v1"
+    ] | None = None
 
     @field_validator("retrieved_at", "observed_at")
     @classmethod
@@ -1829,6 +1834,23 @@ class FinancialFilingMetadata(BaseModel):
             and self.provider_filing_revision_id == self.update_flag
         ):
             raise ValueError("binary update_flag cannot establish restatement lineage")
+        if (
+            self.provider_filing_revision_sequence is not None
+            and self.provider_filing_revision_id is None
+        ):
+            raise ValueError(
+                "provider filing revision sequence requires a stable revision identity"
+            )
+        if (
+            self.provider_filing_revision_sequence_qualification is not None
+            and (
+                self.provider_filing_revision_id is None
+                or self.provider_filing_revision_sequence is None
+            )
+        ):
+            raise ValueError(
+                "provider filing revision qualification requires identity and sequence"
+            )
         return self
 
     def is_strict_pit_eligible(self, *, as_of_date: date) -> bool:
@@ -1842,7 +1864,7 @@ class FinancialFilingMetadata(BaseModel):
 
     @property
     def provider_restatement_lineage_established(self) -> bool:
-        return self.provider_filing_revision_id is not None
+        return self.provider_filing_revision_sequence_qualification is not None
 
 
 def _authoritative_instrument_payload(
@@ -3730,10 +3752,19 @@ class FinancialPeriodOverlapFinding(BaseModel):
     )
     disposition: Literal[
         "equivalent_unselected",
+        "non_critical_difference",
         "critical_conflict",
         "company_type_conflict",
     ]
     compared_critical_fields: tuple[str, ...]
+    compared_declared_core_fields: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+    differing_non_critical_fields: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     conflict_identities: tuple[str, ...]
     rejection_reasons: tuple[FinancialPeriodRejectionReason, ...] = ()
     overlap_identity: str = Field(pattern=r"^financial-overlap:v1:[0-9a-f]{64}$")
@@ -3746,6 +3777,18 @@ class FinancialPeriodOverlapFinding(BaseModel):
             raise ValueError("overlap critical fields must be unique and canonical")
         if self.conflict_identities != tuple(sorted(set(self.conflict_identities))):
             raise ValueError("overlap conflicts must be unique and canonical")
+        if self.compared_declared_core_fields != tuple(
+            sorted(set(self.compared_declared_core_fields))
+        ) or self.differing_non_critical_fields != tuple(
+            sorted(set(self.differing_non_critical_fields))
+        ):
+            raise ValueError("overlap declared-core fields must be unique and canonical")
+        if not set(self.differing_non_critical_fields) <= set(
+            self.compared_declared_core_fields
+        ) or set(self.differing_non_critical_fields) & set(
+            self.compared_critical_fields
+        ):
+            raise ValueError("overlap non-critical differences are inconsistent")
         canonical_reasons = tuple(
             reason
             for reason in FinancialPeriodRejectionReason
@@ -3755,6 +3798,7 @@ class FinancialPeriodOverlapFinding(BaseModel):
             raise ValueError("overlap rejection reasons must be unique and canonical")
         expected_reasons = {
             "equivalent_unselected": (),
+            "non_critical_difference": (),
             "critical_conflict": (
                 FinancialPeriodRejectionReason.CONFLICTING_CRITICAL_VALUES,
             ),
@@ -3766,6 +3810,14 @@ class FinancialPeriodOverlapFinding(BaseModel):
             (self.disposition == "critical_conflict")
             != bool(self.conflict_identities)
             or self.rejection_reasons != expected_reasons
+            or (
+                self.disposition == "non_critical_difference"
+                and not self.differing_non_critical_fields
+            )
+            or (
+                self.disposition == "equivalent_unselected"
+                and bool(self.differing_non_critical_fields)
+            )
         ):
             raise ValueError("overlap disposition is inconsistent")
         payload = self.model_dump(mode="json", exclude={"overlap_identity"})
@@ -3773,6 +3825,492 @@ class FinancialPeriodOverlapFinding(BaseModel):
         if self.overlap_identity != expected:
             raise ValueError("financial overlap identity mismatch")
         return self
+
+
+class FinancialRevisionCandidateDisposition(BaseModel):
+    """Immutable disposition of one observation within an exact selection key."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-revision-selection-v1"] = (
+        "financial-revision-selection-v1"
+    )
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    local_provider_revision_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    provider_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    provider_route_rank: int = Field(ge=0)
+    disposition: Literal[
+        "selected",
+        "operational_winner_conflicted",
+        "superseded",
+        "equivalent_unselected",
+        "non_critical_difference_unselected",
+        "conflicted_unselected",
+    ]
+
+    @model_validator(mode="after")
+    def _validate_revision_binding(self) -> FinancialRevisionCandidateDisposition:
+        if self.local_provider_revision_identity != self.artifact_identity:
+            raise ValueError("revision disposition local identity is contradictory")
+        return self
+
+
+class FinancialRevisionSelection(BaseModel):
+    """Deterministic operational winner and all exact-key alternatives."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-revision-selection-v1"] = (
+        "financial-revision-selection-v1"
+    )
+    selection_key_identity: str = Field(
+        pattern=r"^financial-selection-key:v1:[0-9a-f]{64}$"
+    )
+    instrument_identity: InstrumentIdentityEvidence
+    company_type: FinancialCompanyType
+    capability: FinancialCapability
+    statement_type: FinancialStatementType | None = None
+    ratio_family: FinancialRatioFamily | None = None
+    period_end: date
+    frequency: FinancialReportingFrequency
+    consolidation_scope: FinancialConsolidationScope
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    normalized_unit: str = Field(min_length=1, max_length=64)
+    selected_candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    selected_artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    selected_provider_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    selected_provider_route_rank: int = Field(ge=0)
+    ordering_basis: Literal[
+        "qualified_provider_revision_sequence",
+        "ann_date_observed_at_retrieved_at_local_revision_identity",
+    ]
+    chronology_claim: Literal["qualified_provider_sequence", "operational_only"]
+    provider_selection_basis: Literal["immutable_route_rank"] = (
+        "immutable_route_rank"
+    )
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+    conflicted: bool
+    candidate_dispositions: tuple[FinancialRevisionCandidateDisposition, ...]
+    selection_identity: str = Field(
+        pattern=r"^financial-revision-selection:v1:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_selection(self) -> FinancialRevisionSelection:
+        if self.capability is FinancialCapability.STATEMENT:
+            if self.statement_type is None or self.ratio_family is not None:
+                raise ValueError("statement revision selection family is invalid")
+        elif self.statement_type is not None or self.ratio_family is None:
+            raise ValueError("ratio revision selection family is invalid")
+        if self.candidate_dispositions != tuple(
+            sorted(
+                self.candidate_dispositions,
+                key=lambda item: item.candidate_identity,
+            )
+        ):
+            raise ValueError("revision candidate dispositions must be canonical")
+        disposition_by_id = {
+            item.candidate_identity: item for item in self.candidate_dispositions
+        }
+        if len(disposition_by_id) != len(self.candidate_dispositions):
+            raise ValueError("revision candidate dispositions must be unique")
+        selected = disposition_by_id.get(self.selected_candidate_identity)
+        expected_selected_disposition = (
+            "operational_winner_conflicted" if self.conflicted else "selected"
+        )
+        if (
+            selected is None
+            or selected.artifact_identity != self.selected_artifact_identity
+            or selected.provider_id != self.selected_provider_id
+            or selected.provider_route_rank != self.selected_provider_route_rank
+            or selected.disposition != expected_selected_disposition
+        ):
+            raise ValueError("revision operational winner binding is inconsistent")
+        expected_claim = (
+            "qualified_provider_sequence"
+            if self.ordering_basis == "qualified_provider_revision_sequence"
+            else "operational_only"
+        )
+        if self.chronology_claim != expected_claim:
+            raise ValueError("revision ordering chronology claim is inconsistent")
+        key_payload = {
+            "instrument_identity": _authoritative_instrument_payload(
+                self.instrument_identity
+            ),
+            "company_type": self.company_type.value,
+            "capability": self.capability.value,
+            "statement_type": (
+                self.statement_type.value if self.statement_type is not None else None
+            ),
+            "ratio_family": (
+                self.ratio_family.value if self.ratio_family is not None else None
+            ),
+            "period_end": self.period_end.isoformat(),
+            "frequency": self.frequency.value,
+            "consolidation_scope": self.consolidation_scope.value,
+            "currency": self.currency,
+            "normalized_unit": self.normalized_unit,
+        }
+        if self.selection_key_identity != (
+            "financial-selection-key:v1:" + _canonical_digest(key_payload)
+        ):
+            raise ValueError("financial revision selection key identity mismatch")
+        payload = self.model_dump(mode="json", exclude={"selection_identity"})
+        expected = "financial-revision-selection:v1:" + _canonical_digest(payload)
+        if self.selection_identity != expected:
+            raise ValueError("financial revision selection identity mismatch")
+        return self
+
+
+def _revision_normalized_unit(
+    provider_candidate: FinancialProviderCandidate,
+) -> str:
+    candidate = provider_candidate.candidate
+    assessment = provider_candidate.assessment
+    compared_fields = {
+        *assessment.present_critical_fields,
+        *assessment.present_core_fields,
+    }
+    units = {
+        field.normalized_unit
+        for field in candidate.fields
+        if field.normalized_field in compared_fields
+        and field.normalized_value is not None
+        and field.normalized_unit is not None
+    }
+    if len(units) != 1:
+        raise ValueError("eligible financial revision requires one normalized unit")
+    return next(iter(units))
+
+
+def _revision_selection_key_payload(
+    provider_candidate: FinancialProviderCandidate,
+) -> dict[str, object]:
+    identity = provider_candidate.candidate.period_identity
+    return {
+        "instrument_identity": _authoritative_instrument_payload(
+            identity.instrument_identity
+        ),
+        "company_type": identity.company_type.value,
+        "capability": identity.capability.value,
+        "statement_type": (
+            identity.statement_type.value if identity.statement_type is not None else None
+        ),
+        "ratio_family": (
+            identity.ratio_family.value if identity.ratio_family is not None else None
+        ),
+        "period_end": identity.period_end.isoformat(),
+        "frequency": identity.frequency.value,
+        "consolidation_scope": identity.consolidation_scope.value,
+        "currency": identity.currency,
+        "normalized_unit": _revision_normalized_unit(provider_candidate),
+    }
+
+
+def financial_revision_selection_key(
+    provider_candidate: FinancialProviderCandidate,
+) -> str:
+    """Return the exact, provider-independent Ticket 05 grouping identity."""
+
+    return "financial-selection-key:v1:" + _canonical_digest(
+        _revision_selection_key_payload(provider_candidate)
+    )
+
+
+def reject_financial_period_for_incompatible_selection_key(
+    assessment: FinancialPeriodCompletenessAssessment,
+    *,
+    selected_candidate: FinancialProviderCandidate,
+    overlapping_candidate: FinancialProviderCandidate,
+) -> FinancialPeriodCompletenessAssessment:
+    """Reject exact-key mismatches before overlap or conflict comparison."""
+
+    selected = _revision_selection_key_payload(selected_candidate)
+    overlapping = _revision_selection_key_payload(overlapping_candidate)
+    if selected == overlapping:
+        return assessment
+
+    mismatch_reasons: set[FinancialPeriodRejectionReason] = set()
+    if selected["instrument_identity"] != overlapping["instrument_identity"]:
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA)
+    if any(
+        selected[field] != overlapping[field]
+        for field in ("capability", "statement_type", "ratio_family")
+    ):
+        mismatch_reasons.add(FinancialPeriodRejectionReason.CAPABILITY_MISMATCH)
+    if any(
+        selected[field] != overlapping[field]
+        for field in ("period_end", "frequency")
+    ):
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA)
+    if selected["company_type"] != overlapping["company_type"]:
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_COMPANY_TYPE)
+    if selected["consolidation_scope"] != overlapping["consolidation_scope"]:
+        mismatch_reasons.add(
+            FinancialPeriodRejectionReason.INCOMPATIBLE_CONSOLIDATION_SCOPE
+        )
+    if selected["currency"] != overlapping["currency"]:
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_CURRENCY)
+    if selected["normalized_unit"] != overlapping["normalized_unit"]:
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_UNIT)
+    if not mismatch_reasons:
+        mismatch_reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA)
+
+    reasons = tuple(
+        reason
+        for reason in FinancialPeriodRejectionReason
+        if reason in {*assessment.rejection_reasons, *mismatch_reasons}
+    )
+    return FinancialPeriodCompletenessAssessment.model_validate(
+        {
+            **assessment.model_dump(mode="json"),
+            "disposition": FinancialPeriodDisposition.REJECTED.value,
+            "rejection_reasons": [reason.value for reason in reasons],
+            "usable_for_current_analysis": False,
+        }
+    )
+
+
+def financial_provider_revision_sequence_is_qualified(
+    candidates: Sequence[FinancialPeriodCandidate],
+) -> bool:
+    """Return whether provider revision IDs and sequence positions are one-to-one."""
+
+    revisions = tuple(candidates)
+    if not revisions or len(
+        {item.artifact.dataset.provider_id for item in revisions}
+    ) != 1:
+        return False
+    revision_ids = tuple(
+        item.filing_metadata.provider_filing_revision_id for item in revisions
+    )
+    revision_sequences = tuple(
+        item.filing_metadata.provider_filing_revision_sequence for item in revisions
+    )
+    return (
+        all(
+            item.filing_metadata.provider_filing_revision_sequence_qualification
+            == "financial-provider-revision-sequence-qualified-v1"
+            for item in revisions
+        )
+        and
+        all(revision_id is not None for revision_id in revision_ids)
+        and all(sequence is not None for sequence in revision_sequences)
+        and len(set(revision_ids)) == len(revision_ids)
+        and len(set(revision_sequences)) == len(revision_sequences)
+    )
+
+
+def order_financial_provider_revisions(
+    provider_candidates: Sequence[FinancialProviderCandidate],
+) -> tuple[
+    tuple[FinancialProviderCandidate, ...],
+    Literal[
+        "qualified_provider_revision_sequence",
+        "ann_date_observed_at_retrieved_at_local_revision_identity",
+    ],
+]:
+    """Order one provider's eligible exact-key observations deterministically."""
+
+    candidates = tuple(provider_candidates)
+    if not candidates:
+        raise ValueError("financial revision ordering requires candidates")
+    key_identities = {financial_revision_selection_key(item) for item in candidates}
+    provider_ids = {
+        item.candidate.artifact.dataset.provider_id for item in candidates
+    }
+    if len(key_identities) != 1 or len(provider_ids) != 1:
+        raise ValueError("financial revision ordering requires one provider and key")
+    qualified_sequence = financial_provider_revision_sequence_is_qualified(
+        tuple(item.candidate for item in candidates)
+    )
+    if qualified_sequence:
+        ordered = tuple(
+            sorted(
+                candidates,
+                key=lambda item: (
+                    -int(
+                        item.candidate.filing_metadata.provider_filing_revision_sequence
+                    ),
+                    item.candidate.filing_metadata.local_provider_revision_identity,
+                ),
+            )
+        )
+        return ordered, "qualified_provider_revision_sequence"
+
+    def operational_key(item: FinancialProviderCandidate) -> tuple[object, ...]:
+        filing = item.candidate.filing_metadata
+        if filing.ann_date is None:
+            raise ValueError("eligible financial revision requires ann_date")
+        return (
+            -filing.ann_date.toordinal(),
+            -item.assessment.revision_observed_at.timestamp(),
+            -filing.retrieved_at.timestamp(),
+            filing.local_provider_revision_identity,
+        )
+
+    return (
+        tuple(sorted(candidates, key=operational_key)),
+        "ann_date_observed_at_retrieved_at_local_revision_identity",
+    )
+
+
+def create_financial_revision_selection(
+    *,
+    provider_candidates: Sequence[FinancialProviderCandidate],
+    selected_candidate_identity: str,
+    provider_route_ranks: Mapping[str, int],
+    conflicted: bool,
+    requested_analysis_scope: FinancialAvailabilityScope | None,
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ],
+) -> FinancialRevisionSelection:
+    """Bind an exact key's route winner and all retained alternatives."""
+
+    candidates = tuple(provider_candidates)
+    by_id = {item.candidate.candidate_identity: item for item in candidates}
+    if len(by_id) != len(candidates) or selected_candidate_identity not in by_id:
+        raise ValueError("financial revision selection candidates are incomplete")
+    key_identities = {financial_revision_selection_key(item) for item in candidates}
+    if len(key_identities) != 1:
+        raise ValueError("financial revision selection mixed incompatible keys")
+    selected = by_id[selected_candidate_identity]
+    selected_candidate = selected.candidate
+    selected_provider = selected_candidate.artifact.dataset.provider_id
+    if selected_provider not in provider_route_ranks:
+        raise ValueError("selected financial provider has no immutable route rank")
+    selected_provider_candidates = tuple(
+        item
+        for item in candidates
+        if item.candidate.artifact.dataset.provider_id == selected_provider
+    )
+    ordered_selected_provider, ordering_basis = order_financial_provider_revisions(
+        selected_provider_candidates
+    )
+    if ordered_selected_provider[0].candidate.candidate_identity != (
+        selected_candidate_identity
+    ):
+        raise ValueError("financial revision winner contradicts its ordering basis")
+    provider_winners: list[FinancialProviderCandidate] = []
+    for provider_id in sorted(
+        {
+            item.candidate.artifact.dataset.provider_id
+            for item in candidates
+        },
+        key=lambda item: provider_route_ranks[item],
+    ):
+        ordered, _ = order_financial_provider_revisions(
+            tuple(
+                item
+                for item in candidates
+                if item.candidate.artifact.dataset.provider_id == provider_id
+            )
+        )
+        provider_winners.append(ordered[0])
+    if min(
+        provider_winners,
+        key=lambda item: provider_route_ranks[
+            item.candidate.artifact.dataset.provider_id
+        ],
+    ).candidate.candidate_identity != selected_candidate_identity:
+        raise ValueError("financial revision winner contradicts provider route rank")
+
+    dispositions: list[FinancialRevisionCandidateDisposition] = []
+    for item in candidates:
+        candidate = item.candidate
+        provider_id = candidate.artifact.dataset.provider_id
+        if candidate.candidate_identity == selected_candidate_identity:
+            disposition = (
+                "operational_winner_conflicted" if conflicted else "selected"
+            )
+        else:
+            same_provider = provider_id == selected_provider
+            if same_provider and ordering_basis == "qualified_provider_revision_sequence":
+                disposition = "superseded"
+            else:
+                overlap, candidate_conflicts = compare_financial_period_candidates(
+                    selected_candidate,
+                    candidate,
+                    selected_assessment=selected.assessment,
+                    overlapping_assessment=item.assessment,
+                )
+                if candidate_conflicts:
+                    disposition = "conflicted_unselected"
+                elif overlap.disposition == "equivalent_unselected":
+                    disposition = "equivalent_unselected"
+                else:
+                    disposition = "non_critical_difference_unselected"
+        dispositions.append(
+            FinancialRevisionCandidateDisposition(
+                candidate_identity=candidate.candidate_identity,
+                artifact_identity=candidate.artifact.artifact_identity,
+                local_provider_revision_identity=(
+                    candidate.filing_metadata.local_provider_revision_identity
+                ),
+                provider_id=provider_id,
+                provider_route_rank=provider_route_ranks[provider_id],
+                disposition=disposition,
+            )
+        )
+    identity = selected_candidate.period_identity
+    key_payload = _revision_selection_key_payload(selected)
+    payload: dict[str, object] = {
+        "contract_version": "financial-revision-selection-v1",
+        "selection_key_identity": next(iter(key_identities)),
+        "instrument_identity": identity.instrument_identity,
+        "company_type": identity.company_type,
+        "capability": identity.capability,
+        "statement_type": identity.statement_type,
+        "ratio_family": identity.ratio_family,
+        "period_end": identity.period_end,
+        "frequency": identity.frequency,
+        "consolidation_scope": identity.consolidation_scope,
+        "currency": identity.currency,
+        "normalized_unit": key_payload["normalized_unit"],
+        "selected_candidate_identity": selected_candidate_identity,
+        "selected_artifact_identity": selected_candidate.artifact.artifact_identity,
+        "selected_provider_id": selected_provider,
+        "selected_provider_route_rank": provider_route_ranks[selected_provider],
+        "ordering_basis": ordering_basis,
+        "chronology_claim": (
+            "qualified_provider_sequence"
+            if ordering_basis == "qualified_provider_revision_sequence"
+            else "operational_only"
+        ),
+        "provider_selection_basis": "immutable_route_rank",
+        "eligibility_policy_version": eligibility_policy_version,
+        "conflicted": conflicted,
+        "candidate_dispositions": tuple(
+            sorted(dispositions, key=lambda item: item.candidate_identity)
+        ),
+    }
+    if requested_analysis_scope is not None:
+        payload["requested_analysis_scope"] = requested_analysis_scope
+    return FinancialRevisionSelection(
+        **payload,
+        selection_identity=(
+            "financial-revision-selection:v1:"
+            + _canonical_digest(payload)
+        ),
+    )
 
 
 def _period_compatibility_payload(candidate: FinancialPeriodCandidate) -> dict[str, object]:
@@ -3805,6 +4343,9 @@ def _period_compatibility_payload(candidate: FinancialPeriodCandidate) -> dict[s
 def compare_financial_period_candidates(
     selected: FinancialPeriodCandidate,
     overlapping: FinancialPeriodCandidate,
+    *,
+    selected_assessment: FinancialPeriodCompletenessAssessment | None = None,
+    overlapping_assessment: FinancialPeriodCompletenessAssessment | None = None,
 ) -> tuple[FinancialPeriodOverlapFinding, tuple[FinancialCriticalValueConflict, ...]]:
     """Compare compatible overlap and isolate critical conflicts to one period."""
 
@@ -3834,6 +4375,8 @@ def compare_financial_period_candidates(
             ),
             (),
         )
+    if (selected_assessment is None) != (overlapping_assessment is None):
+        raise ValueError("financial overlap assessments must be supplied together")
     if (
         identity.capability is FinancialCapability.STATEMENT
         and identity.statement_type is not None
@@ -3844,6 +4387,24 @@ def compare_financial_period_candidates(
         ).critical_fields
     else:
         critical_fields = ()
+    core_fields: tuple[str, ...] = ()
+    if selected_assessment is not None and overlapping_assessment is not None:
+        critical_fields = tuple(
+            sorted(
+                {
+                    *selected_assessment.declared_critical_fields,
+                    *overlapping_assessment.declared_critical_fields,
+                }
+            )
+        )
+        core_fields = tuple(
+            sorted(
+                {
+                    *selected_assessment.declared_core_fields,
+                    *overlapping_assessment.declared_core_fields,
+                }
+            )
+        )
     selected_values = {
         field.normalized_field: field.normalized_value for field in selected.fields
     }
@@ -3853,6 +4414,12 @@ def compare_financial_period_candidates(
     compared_fields = tuple(
         field
         for field in critical_fields
+        if selected_values.get(field) is not None
+        and overlapping_values.get(field) is not None
+    )
+    compared_core_fields = tuple(
+        field
+        for field in core_fields
         if selected_values.get(field) is not None
         and overlapping_values.get(field) is not None
     )
@@ -3868,12 +4435,25 @@ def compare_financial_period_candidates(
         if Decimal(str(selected_values[field]))
         != Decimal(str(overlapping_values[field]))
     )
+    differing_non_critical_fields = tuple(
+        field
+        for field in compared_core_fields
+        if field not in compared_fields
+        and Decimal(str(selected_values[field]))
+        != Decimal(str(overlapping_values[field]))
+    )
     payload = {
         "contract_version": "financial-period-selection-v1",
         "selected_candidate_identity": selected.candidate_identity,
         "overlapping_candidate_identity": overlapping.candidate_identity,
         "disposition": (
-            "critical_conflict" if conflicts else "equivalent_unselected"
+            "critical_conflict"
+            if conflicts
+            else (
+                "non_critical_difference"
+                if differing_non_critical_fields
+                else "equivalent_unselected"
+            )
         ),
         "compared_critical_fields": list(compared_fields),
         "conflict_identities": sorted(
@@ -3885,6 +4465,12 @@ def compare_financial_period_candidates(
             else []
         ),
     }
+    if compared_core_fields:
+        payload["compared_declared_core_fields"] = list(compared_core_fields)
+    if differing_non_critical_fields:
+        payload["differing_non_critical_fields"] = list(
+            differing_non_critical_fields
+        )
     overlap = FinancialPeriodOverlapFinding(
         **payload,
         overlap_identity="financial-overlap:v1:" + _canonical_digest(payload),
@@ -3926,6 +4512,30 @@ def mark_financial_period_company_type_conflicted(
             "rejection_reasons": [
                 FinancialPeriodRejectionReason.AMBIGUOUS_COMPANY_TYPE.value
             ],
+            "usable_for_current_analysis": False,
+        }
+    )
+
+
+def reject_financial_period_for_company_type(
+    assessment: FinancialPeriodCompletenessAssessment,
+) -> FinancialPeriodCompletenessAssessment:
+    """Reject an incompatible exact-key dimension before v2 overlap selection."""
+
+    reasons = tuple(
+        reason
+        for reason in FinancialPeriodRejectionReason
+        if reason
+        in {
+            *assessment.rejection_reasons,
+            FinancialPeriodRejectionReason.INCOMPATIBLE_COMPANY_TYPE,
+        }
+    )
+    return FinancialPeriodCompletenessAssessment.model_validate(
+        {
+            **assessment.model_dump(mode="json"),
+            "disposition": FinancialPeriodDisposition.REJECTED.value,
+            "rejection_reasons": [reason.value for reason in reasons],
             "usable_for_current_analysis": False,
         }
     )
@@ -3988,6 +4598,7 @@ def _manifest_identity_payload(
     rejected_periods: Sequence[FinancialRejectedPeriod],
     overlaps: Sequence[FinancialPeriodOverlapFinding],
     conflicts: Sequence[FinancialCriticalValueConflict],
+    revision_selections: Sequence[FinancialRevisionSelection],
     aggregate_completeness: FinancialAggregateCompleteness,
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
@@ -4033,6 +4644,10 @@ def _manifest_identity_payload(
         "conflicts": [item.model_dump(mode="json") for item in conflicts],
         "aggregate_completeness": aggregate_completeness.model_dump(mode="json"),
     }
+    if revision_selections:
+        payload["revision_selections"] = [
+            item.model_dump(mode="json") for item in revision_selections
+        ]
     if contract_version == FINANCIAL_MANIFEST_V2:
         payload.update(
             {
@@ -4107,6 +4722,7 @@ class FinancialAcquisitionManifest(BaseModel):
     rejected_periods: tuple[FinancialRejectedPeriod, ...]
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
+    revision_selections: tuple[FinancialRevisionSelection, ...] = ()
     aggregate_completeness: FinancialAggregateCompleteness
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
@@ -4152,6 +4768,7 @@ class FinancialAcquisitionManifest(BaseModel):
         overlaps: Sequence[FinancialPeriodOverlapFinding],
         conflicts: Sequence[FinancialCriticalValueConflict],
         aggregate_completeness: FinancialAggregateCompleteness,
+        revision_selections: Sequence[FinancialRevisionSelection] = (),
     ) -> FinancialAcquisitionManifest:
         canonical_artifacts = tuple(
             sorted(artifacts, key=lambda item: item.artifact.artifact_identity)
@@ -4186,6 +4803,12 @@ class FinancialAcquisitionManifest(BaseModel):
         canonical_conflicts = tuple(
             sorted(conflicts, key=lambda item: item.conflict_identity)
         )
+        canonical_revision_selections = tuple(
+            sorted(
+                revision_selections,
+                key=lambda item: item.selection_identity,
+            )
+        )
         payload = _manifest_identity_payload(
             contract_version=FINANCIAL_MANIFEST_V1,
             capability_routing_plan_signature=capability_routing_plan_signature,
@@ -4200,6 +4823,7 @@ class FinancialAcquisitionManifest(BaseModel):
             rejected_periods=canonical_rejections,
             overlaps=canonical_overlaps,
             conflicts=canonical_conflicts,
+            revision_selections=canonical_revision_selections,
             aggregate_completeness=aggregate_completeness,
         )
         return cls(
@@ -4215,6 +4839,7 @@ class FinancialAcquisitionManifest(BaseModel):
             rejected_periods=canonical_rejections,
             overlaps=canonical_overlaps,
             conflicts=canonical_conflicts,
+            revision_selections=canonical_revision_selections,
             aggregate_completeness=aggregate_completeness,
             manifest_identity="financial-manifest:v1:" + _canonical_digest(payload),
         )
@@ -4329,6 +4954,7 @@ class FinancialAcquisitionManifest(BaseModel):
             rejected_periods=self.rejected_periods,
             overlaps=self.overlaps,
             conflicts=self.conflicts,
+            revision_selections=self.revision_selections,
             aggregate_completeness=self.aggregate_completeness,
             publication_target_construction=publication_target_construction,
             physical_attempt_events=canonical_attempts,
@@ -4446,6 +5072,13 @@ class FinancialAcquisitionManifest(BaseModel):
             sorted(self.conflicts, key=lambda item: item.conflict_identity)
         ):
             raise ValueError("manifest conflicts must be canonical")
+        if self.revision_selections != tuple(
+            sorted(
+                self.revision_selections,
+                key=lambda item: item.selection_identity,
+            )
+        ):
+            raise ValueError("manifest revision selections must be canonical")
         if self.contract_version == FINANCIAL_MANIFEST_V1:
             if (
                 self.physical_attempt_events
@@ -4591,6 +5224,94 @@ class FinancialAcquisitionManifest(BaseModel):
             for overlap in self.overlaps
         ):
             raise ValueError("manifest overlap binding is absent")
+        selection_candidate_ids = {
+            item.candidate_identity for item in self.selections
+        }
+        revision_rank_by_provider: dict[str, int] = {}
+        revision_provider_by_rank: dict[int, str] = {}
+        for revision_selection in self.revision_selections:
+            revision_candidate_ids = {
+                item.candidate_identity
+                for item in revision_selection.candidate_dispositions
+            }
+            if (
+                not revision_candidate_ids <= set(candidate_by_id)
+                or revision_selection.selected_candidate_identity
+                not in revision_candidate_ids
+                or revision_selection.selected_candidate_identity
+                not in selection_candidate_ids
+            ):
+                raise ValueError("manifest revision selection candidate is absent")
+            provider_route_ranks: dict[str, int] = {}
+            for disposition in revision_selection.candidate_dispositions:
+                candidate = candidate_by_id[disposition.candidate_identity].candidate
+                provider_id = candidate.artifact.dataset.provider_id
+                if (
+                    disposition.artifact_identity
+                    != candidate.artifact.artifact_identity
+                    or disposition.local_provider_revision_identity
+                    != candidate.filing_metadata.local_provider_revision_identity
+                    or disposition.provider_id != provider_id
+                ):
+                    raise ValueError(
+                        "manifest revision selection provenance mismatch"
+                    )
+                provider_rank = provider_route_ranks.setdefault(
+                    provider_id,
+                    disposition.provider_route_rank,
+                )
+                if provider_rank != disposition.provider_route_rank:
+                    raise ValueError(
+                        "manifest revision selection route rank mismatch"
+                    )
+                existing_rank = revision_rank_by_provider.setdefault(
+                    provider_id,
+                    disposition.provider_route_rank,
+                )
+                existing_provider = revision_provider_by_rank.setdefault(
+                    disposition.provider_route_rank,
+                    provider_id,
+                )
+                if (
+                    existing_rank != disposition.provider_route_rank
+                    or existing_provider != provider_id
+                ):
+                    raise ValueError(
+                        "manifest revision selection route rank mismatch"
+                    )
+            conflict_present = any(
+                {
+                    conflict.selected_candidate_identity,
+                    conflict.conflicting_candidate_identity,
+                }
+                <= revision_candidate_ids
+                for conflict in self.conflicts
+            )
+            if revision_selection.conflicted != conflict_present:
+                raise ValueError(
+                    "manifest revision selection conflict binding mismatch"
+                )
+            expected_revision_selection = create_financial_revision_selection(
+                provider_candidates=tuple(
+                    candidate_by_id[candidate_id]
+                    for candidate_id in revision_candidate_ids
+                ),
+                selected_candidate_identity=(
+                    revision_selection.selected_candidate_identity
+                ),
+                provider_route_ranks=provider_route_ranks,
+                conflicted=revision_selection.conflicted,
+                requested_analysis_scope=(
+                    revision_selection.requested_analysis_scope
+                ),
+                eligibility_policy_version=(
+                    revision_selection.eligibility_policy_version
+                ),
+            )
+            if expected_revision_selection != revision_selection:
+                raise ValueError(
+                    "manifest revision selection provenance mismatch"
+                )
         payload = _manifest_identity_payload(
             contract_version=self.contract_version,
             capability_routing_plan_signature=self.capability_routing_plan_signature,
@@ -4605,6 +5326,7 @@ class FinancialAcquisitionManifest(BaseModel):
             rejected_periods=self.rejected_periods,
             overlaps=self.overlaps,
             conflicts=self.conflicts,
+            revision_selections=self.revision_selections,
             aggregate_completeness=self.aggregate_completeness,
             publication_target_construction=self.publication_target_construction,
             physical_attempt_events=self.physical_attempt_events,
@@ -4667,6 +5389,8 @@ __all__ = [
     "FinancialProviderDatasetIdentity",
     "FinancialRejectedPeriod",
     "FinancialRenderedArtifactIdentity",
+    "FinancialRevisionCandidateDisposition",
+    "FinancialRevisionSelection",
     "FinancialRatioFieldSetDeclaration",
     "FinancialRatioFamily",
     "FinancialRatioHistoryCompletenessAssessment",
@@ -4680,10 +5404,16 @@ __all__ = [
     "assert_safe_financial_contract_payload",
     "assert_safe_financial_projection",
     "compare_financial_period_candidates",
+    "create_financial_revision_selection",
+    "financial_provider_revision_sequence_is_qualified",
+    "financial_revision_selection_key",
     "financial_ratio_field_declaration",
     "financial_statement_field_declaration",
     "mark_financial_period_conflicted",
     "mark_financial_period_company_type_conflicted",
+    "order_financial_provider_revisions",
+    "reject_financial_period_for_company_type",
+    "reject_financial_period_for_incompatible_selection_key",
     "reject_financial_period_for_strict_pit",
     "resolve_financial_company_type",
 ]

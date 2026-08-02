@@ -545,6 +545,29 @@ def _render_financial_dispatch_operations(
                         f"`{selection.period_identity}` / "
                         f"`{selection.artifact_identity}`"
                     )
+                for revision_selection in manifest.revision_selections:
+                    lines.append(
+                        "  - Revision selection: "
+                        f"`{revision_selection.selection_key_identity}` / "
+                        f"winner `{revision_selection.selected_candidate_identity}` / "
+                        f"route rank {revision_selection.selected_provider_route_rank} / "
+                        f"`{revision_selection.ordering_basis}` / "
+                        f"`{revision_selection.chronology_claim}` / "
+                        f"conflicted={_format_scalar(revision_selection.conflicted)} / "
+                        f"policy `{revision_selection.eligibility_policy_version}` / "
+                        "scope "
+                        f"`{revision_selection.requested_analysis_scope.value if revision_selection.requested_analysis_scope is not None else 'not_applicable'}`"
+                    )
+                    for candidate_disposition in (
+                        revision_selection.candidate_dispositions
+                    ):
+                        lines.append(
+                            "    - Revision observation: "
+                            f"`{candidate_disposition.candidate_identity}` / "
+                            f"`{candidate_disposition.artifact_identity}` / "
+                            f"route rank {candidate_disposition.provider_route_rank} / "
+                            f"`{candidate_disposition.disposition}`"
+                        )
                 for rejection in manifest.rejected_periods:
                     lines.append(
                         "  - Rejected candidate: "

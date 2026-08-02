@@ -1576,6 +1576,188 @@ class FinancialFamilyAggregateEvidenceAssessment(
         return self
 
 
+class FinancialRevisionCandidateDispositionEvidence(
+    _FinancialFamilyEvidenceProjection
+):
+    contract_version: Literal["financial-revision-selection-v1"]
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    local_provider_revision_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    provider_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    provider_route_rank: int = Field(ge=0)
+    disposition: Literal[
+        "selected",
+        "operational_winner_conflicted",
+        "superseded",
+        "equivalent_unselected",
+        "non_critical_difference_unselected",
+        "conflicted_unselected",
+    ]
+
+
+class FinancialRevisionSelectionEvidence(_FinancialFamilyEvidenceProjection):
+    """Exact Ticket 05 selection state retained in Evidence State."""
+
+    contract_version: Literal["financial-revision-selection-v1"]
+    selection_key_identity: str = Field(
+        pattern=r"^financial-selection-key:v1:[0-9a-f]{64}$"
+    )
+    instrument_identity: InstrumentIdentityEvidence
+    company_type: Literal[
+        "bank",
+        "industrial/non-bank",
+        "insurance",
+        "securities",
+        "other-financial",
+        "unknown",
+    ]
+    capability: Literal["financial_statement", "financial_ratio_family"]
+    statement_type: Literal[
+        "comprehensive_fundamentals",
+        "balance_sheet",
+        "cash_flow",
+        "income_statement",
+    ] | None = None
+    ratio_family: Literal[
+        "profit",
+        "operation",
+        "growth",
+        "balance",
+        "cash_flow",
+        "dupont",
+    ] | None = None
+    period_end: date
+    frequency: Literal["annual", "quarterly", "not_applicable"]
+    consolidation_scope: Literal[
+        "consolidated",
+        "parent",
+        "unknown",
+    ]
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    normalized_unit: str = Field(min_length=1, max_length=64)
+    selected_candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    selected_artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    selected_provider_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    selected_provider_route_rank: int = Field(ge=0)
+    ordering_basis: Literal[
+        "qualified_provider_revision_sequence",
+        "ann_date_observed_at_retrieved_at_local_revision_identity",
+    ]
+    chronology_claim: Literal["qualified_provider_sequence", "operational_only"]
+    provider_selection_basis: Literal["immutable_route_rank"]
+    requested_analysis_scope: Literal[
+        "current_only",
+        "strict_pit_eligible",
+    ] | None = None
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+    conflicted: bool
+    candidate_dispositions: tuple[
+        FinancialRevisionCandidateDispositionEvidence, ...
+    ]
+    selection_identity: str = Field(
+        pattern=r"^financial-revision-selection:v1:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_revision_selection(self) -> FinancialRevisionSelectionEvidence:
+        from tradingagents.dataflows.financial_contracts import (
+            FinancialRevisionSelection,
+        )
+
+        FinancialRevisionSelection.model_validate(self.model_dump(mode="python"))
+        return self
+
+
+class FinancialRevisionObservationEvidence(_FinancialFamilyEvidenceProjection):
+    """Payload-free identity and disposition of every retained local observation."""
+
+    contract_version: Literal["financial-revision-observation-v1"] = (
+        "financial-revision-observation-v1"
+    )
+    manifest_identity: str = Field(
+        pattern=r"^financial-manifest:v2:[0-9a-f]{64}$"
+    )
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    local_provider_revision_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    provider_route_rank: int = Field(ge=0)
+    family: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    period: date
+    frequency: Literal["annual", "quarterly", "not_applicable"]
+    company_type: Literal[
+        "bank",
+        "industrial/non-bank",
+        "insurance",
+        "securities",
+        "other-financial",
+        "unknown",
+    ]
+    consolidation_scope: Literal["consolidated", "parent", "unknown"]
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    normalized_units: tuple[str, ...]
+    assessment_disposition: Literal[
+        "accepted",
+        "current_only",
+        "rejected",
+        "conflicted",
+        "unselected",
+    ]
+    revision_disposition: Literal[
+        "selected",
+        "operational_winner_conflicted",
+        "superseded",
+        "equivalent_unselected",
+        "non_critical_difference_unselected",
+        "conflicted_unselected",
+        "rejected",
+    ]
+    revision_selection_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-revision-selection:v1:[0-9a-f]{64}$",
+    )
+    rejection_reasons: tuple[str, ...]
+    conflicted: bool
+    requested_analysis_scope: Literal[
+        "current_only",
+        "strict_pit_eligible",
+    ] | None = None
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+
+    @model_validator(mode="after")
+    def _validate_observation(self) -> FinancialRevisionObservationEvidence:
+        if self.local_provider_revision_identity != self.artifact_identity:
+            raise ValueError("financial revision observation identity is contradictory")
+        if self.normalized_units != tuple(sorted(set(self.normalized_units))):
+            raise ValueError("financial revision observation units must be canonical")
+        if (self.revision_selection_identity is None) != (
+            self.revision_disposition == "rejected"
+        ):
+            raise ValueError("financial revision observation selection is incomplete")
+        return self
+
+
 def _canonicalize_source_facts(
     facts: Iterable[SourceFact],
 ) -> tuple[SourceFact, ...]:
@@ -1621,6 +1803,12 @@ class EvidenceState(BaseModel):
     financial_family_aggregate_assessments: tuple[
         FinancialFamilyAggregateEvidenceAssessment, ...
     ] = ()
+    financial_revision_selections: tuple[
+        FinancialRevisionSelectionEvidence, ...
+    ] = Field(default=(), exclude_if=lambda value: not value)
+    financial_revision_observations: tuple[
+        FinancialRevisionObservationEvidence, ...
+    ] = Field(default=(), exclude_if=lambda value: not value)
 
     def source_facts_for_analysis_scope(
         self,

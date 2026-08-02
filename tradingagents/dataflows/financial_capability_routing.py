@@ -54,13 +54,19 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialRatioHistoryCompletenessAssessment,
     FinancialRejectedPeriod,
     FinancialReportingFrequency,
+    FinancialRevisionSelection,
     FinancialStatementType,
     assess_financial_history_coverage,
     assess_financial_period_candidate,
     assess_financial_ratio_history_coverage,
     compare_financial_period_candidates,
+    create_financial_revision_selection,
+    financial_provider_revision_sequence_is_qualified,
+    financial_revision_selection_key,
     mark_financial_period_company_type_conflicted,
     mark_financial_period_conflicted,
+    reject_financial_period_for_company_type,
+    reject_financial_period_for_incompatible_selection_key,
     reject_financial_period_for_strict_pit,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
@@ -108,6 +114,138 @@ _INDICATOR_PROVIDER_ASSESSMENT_CONTRACT = {
     "tushare": (FINANCIAL_RATIO_DECLARATION_V2, "XXX"),
     "baostock": (FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1, "CNY"),
 }
+
+
+def _v2_candidate_group_key(candidate: FinancialPeriodCandidate) -> tuple[object, ...]:
+    identity = candidate.period_identity
+    instrument = identity.instrument_identity
+    return (
+        instrument.symbol,
+        instrument.venue,
+        instrument.instrument_kind.value,
+        instrument.currency,
+        identity.company_type.value,
+        identity.capability.value,
+        identity.statement_type.value if identity.statement_type is not None else "",
+        identity.ratio_family.value if identity.ratio_family is not None else "",
+        identity.period_end,
+        identity.frequency.value,
+        identity.consolidation_scope.value,
+        identity.currency,
+        tuple(
+            sorted(
+                {
+                    field.normalized_unit or ""
+                    for field in candidate.fields
+                    if field.normalized_value is not None
+                }
+            )
+        ),
+    )
+
+
+def _ordered_v2_response_candidates(
+    candidates: Sequence[FinancialPeriodCandidate],
+) -> tuple[FinancialPeriodCandidate, ...]:
+    """Canonicalize response rows before any first-winner state is mutated."""
+
+    grouped: dict[tuple[object, ...], list[FinancialPeriodCandidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(_v2_candidate_group_key(candidate), []).append(candidate)
+    ordered: list[FinancialPeriodCandidate] = []
+    for group_key in sorted(grouped):
+        group = grouped[group_key]
+        qualified_sequence = financial_provider_revision_sequence_is_qualified(
+            group
+        )
+        if qualified_sequence:
+            group.sort(
+                key=lambda item: (
+                    -int(item.filing_metadata.provider_filing_revision_sequence),
+                    item.filing_metadata.local_provider_revision_identity,
+                )
+            )
+        else:
+            group.sort(
+                key=lambda item: (
+                    -(
+                        item.filing_metadata.ann_date.toordinal()
+                        if item.filing_metadata.ann_date is not None
+                        else -1
+                    ),
+                    -max(
+                        item.artifact.observed_at,
+                        item.filing_metadata.observed_at,
+                    ).timestamp(),
+                    -item.filing_metadata.retrieved_at.timestamp(),
+                    item.filing_metadata.local_provider_revision_identity,
+                )
+            )
+        ordered.extend(group)
+    return tuple(ordered)
+
+
+def _qualified_v2_revision_candidate_identities(
+    candidates: Sequence[FinancialPeriodCandidate],
+) -> frozenset[str]:
+    grouped: dict[tuple[object, ...], list[FinancialPeriodCandidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(_v2_candidate_group_key(candidate), []).append(candidate)
+    return frozenset(
+        candidate.candidate_identity
+        for group in grouped.values()
+        if financial_provider_revision_sequence_is_qualified(group)
+        for candidate in group
+    )
+
+
+def _v2_revision_selections(
+    *,
+    provider_candidates: Mapping[str, FinancialProviderCandidate],
+    selected_candidates: Sequence[FinancialPeriodCandidate],
+    conflicted_candidate_identities: set[str],
+    route: Sequence[str],
+    requested_analysis_scope: FinancialAvailabilityScope | None,
+) -> tuple[FinancialRevisionSelection, ...]:
+    route_ranks = {
+        _ROUTE_PROVIDER_ARTIFACT_PROVIDER.get(provider_id, provider_id): rank
+        for rank, provider_id in enumerate(route)
+    }
+    eligible_or_conflicted = tuple(
+        item
+        for item in provider_candidates.values()
+        if item.assessment.disposition
+        in {
+            FinancialPeriodDisposition.ACCEPTED,
+            FinancialPeriodDisposition.CURRENT_ONLY,
+        }
+        or item.candidate.candidate_identity in conflicted_candidate_identities
+    )
+    by_key: dict[str, list[FinancialProviderCandidate]] = {}
+    for item in eligible_or_conflicted:
+        by_key.setdefault(financial_revision_selection_key(item), []).append(item)
+    revision_selections = []
+    for selected in selected_candidates:
+        selected_binding = provider_candidates[selected.candidate_identity]
+        key = financial_revision_selection_key(selected_binding)
+        group = tuple(by_key[key])
+        revision_selections.append(
+            create_financial_revision_selection(
+                provider_candidates=group,
+                selected_candidate_identity=selected.candidate_identity,
+                provider_route_ranks=route_ranks,
+                conflicted=any(
+                    item.candidate.candidate_identity
+                    in conflicted_candidate_identities
+                    for item in group
+                ),
+                requested_analysis_scope=requested_analysis_scope,
+                eligibility_policy_version=MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+            )
+        )
+    return tuple(
+        sorted(revision_selections, key=lambda item: item.selection_identity)
+    )
 
 
 def _qualified_publication_provider_ids(
@@ -1333,6 +1471,7 @@ class MainlandFinancialCapabilityRouter:
         overlaps: list[FinancialPeriodOverlapFinding] = []
         conflicts: list[FinancialCriticalValueConflict] = []
         conflicted_keys: set[tuple[str, date]] = set()
+        conflicted_candidate_identities: set[str] = set()
         provider_calls: list[FinancialProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
         physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
@@ -1440,7 +1579,17 @@ class MainlandFinancialCapabilityRouter:
                     artifact.artifact_identity,
                     FinancialProviderArtifactEntry(artifact=artifact),
                 )
-            for candidate in response.candidates:
+            response_candidates = (
+                _ordered_v2_response_candidates(response.candidates)
+                if publication_aware
+                else response.candidates
+            )
+            qualified_revision_candidate_identities = (
+                _qualified_v2_revision_candidate_identities(response_candidates)
+                if publication_aware
+                else frozenset()
+            )
+            for candidate in response_candidates:
                 publication_candidates.setdefault(
                     candidate.candidate_identity,
                     candidate,
@@ -1450,13 +1599,22 @@ class MainlandFinancialCapabilityRouter:
                     target_annual=target_annual,
                     target_reporting=target_reporting,
                 )
+                expected_frequency = candidate.period_identity.frequency
+                if publication_aware:
+                    period_end = candidate.period_identity.period_end
+                    in_annual = period_end in target_annual
+                    in_reporting = period_end in target_reporting
+                    if in_annual and not in_reporting:
+                        expected_frequency = FinancialReportingFrequency.ANNUAL
+                    elif in_reporting and not in_annual:
+                        expected_frequency = FinancialReportingFrequency.QUARTERLY
                 assessment = assess_financial_period_candidate(
                     candidate,
                     requested_capability=FinancialCapability.STATEMENT,
                     requested_statement_type=request.statement_type,
                     requested_ratio_family=None,
                     expected_instrument_identity=request.instrument_identity,
-                    expected_frequency=candidate.period_identity.frequency,
+                    expected_frequency=expected_frequency,
                     expected_currency=request.currency,
                     expected_consolidation_scope=request.consolidation_scope,
                     pit_as_of_date=request.as_of_date,
@@ -1465,7 +1623,11 @@ class MainlandFinancialCapabilityRouter:
                     assessment.usable_for_current_analysis
                     and candidate.period_identity.company_type is not request.company_type
                 ):
-                    assessment = mark_financial_period_company_type_conflicted(assessment)
+                    assessment = (
+                        reject_financial_period_for_company_type(assessment)
+                        if publication_aware
+                        else mark_financial_period_company_type_conflicted(assessment)
+                    )
                 provider_candidates[candidate.candidate_identity] = (
                     FinancialProviderCandidate(
                         candidate=candidate,
@@ -1492,6 +1654,7 @@ class MainlandFinancialCapabilityRouter:
                 if key is None:
                     continue
                 if key in conflicted_keys:
+                    conflicted_candidate_identities.add(candidate.candidate_identity)
                     conflicted_assessment = mark_financial_period_conflicted(assessment)
                     provider_candidates[candidate.candidate_identity] = (
                         FinancialProviderCandidate(
@@ -1516,15 +1679,86 @@ class MainlandFinancialCapabilityRouter:
                     selected_assessments[key] = assessment
                     continue
 
+                if publication_aware:
+                    selected_binding = provider_candidates[
+                        selected.candidate_identity
+                    ]
+                    overlapping_binding = provider_candidates[
+                        candidate.candidate_identity
+                    ]
+                    if financial_revision_selection_key(
+                        selected_binding
+                    ) != financial_revision_selection_key(overlapping_binding):
+                        assessment = (
+                            reject_financial_period_for_incompatible_selection_key(
+                                assessment,
+                                selected_candidate=selected_binding,
+                                overlapping_candidate=overlapping_binding,
+                            )
+                        )
+                        provider_candidates[candidate.candidate_identity] = (
+                            FinancialProviderCandidate(
+                                candidate=candidate,
+                                assessment=assessment,
+                            )
+                        )
+                        rejected_periods[candidate.candidate_identity] = (
+                            FinancialRejectedPeriod.create(
+                                candidate=candidate,
+                                assessment=assessment,
+                            )
+                        )
+                        continue
+
+                if (
+                    publication_aware
+                    and selected.artifact.dataset.provider_id
+                    == candidate.artifact.dataset.provider_id
+                    and selected.candidate_identity
+                    in qualified_revision_candidate_identities
+                    and candidate.candidate_identity
+                    in qualified_revision_candidate_identities
+                ):
+                    continue
+
                 overlap, candidate_conflicts = compare_financial_period_candidates(
                     selected,
                     candidate,
+                    selected_assessment=(
+                        selected_assessments[key] if publication_aware else None
+                    ),
+                    overlapping_assessment=(assessment if publication_aware else None),
                 )
                 overlaps.append(overlap)
                 conflicts.extend(candidate_conflicts)
-                if not candidate_conflicts and overlap.disposition == "equivalent_unselected":
+                if not candidate_conflicts and overlap.disposition in {
+                    "equivalent_unselected",
+                    "non_critical_difference",
+                }:
                     continue
                 conflicted_keys.add(key)
+                conflicted_candidate_identities.update(
+                    (selected.candidate_identity, candidate.candidate_identity)
+                )
+                if publication_aware:
+                    current_assessment = (
+                        mark_financial_period_company_type_conflicted(assessment)
+                        if overlap.disposition == "company_type_conflict"
+                        else mark_financial_period_conflicted(assessment)
+                    )
+                    provider_candidates[candidate.candidate_identity] = (
+                        FinancialProviderCandidate(
+                            candidate=candidate,
+                            assessment=current_assessment,
+                        )
+                    )
+                    rejected_periods[candidate.candidate_identity] = (
+                        FinancialRejectedPeriod.create(
+                            candidate=candidate,
+                            assessment=current_assessment,
+                        )
+                    )
+                    continue
                 previous_assessment = mark_financial_period_conflicted(
                     selected_assessments[key]
                 )
@@ -1625,6 +1859,17 @@ class MainlandFinancialCapabilityRouter:
             listing_date=request.listing_date,
             listing_provenance=request.listing_provenance,
         )
+        revision_selections = (
+            _v2_revision_selections(
+                provider_candidates=provider_candidates,
+                selected_candidates=tuple(selected_candidates.values()),
+                conflicted_candidate_identities=conflicted_candidate_identities,
+                route=route,
+                requested_analysis_scope=None,
+            )
+            if publication_aware
+            else ()
+        )
         manifest = FinancialAcquisitionManifest.create(
             capability_routing_plan_signature=self._routing_plan.plan_signature,
             instrument_identity=request.instrument_identity,
@@ -1639,6 +1884,7 @@ class MainlandFinancialCapabilityRouter:
             overlaps=overlaps,
             conflicts=conflicts,
             aggregate_completeness=aggregate,
+            revision_selections=revision_selections,
         )
         result = FinancialStatementRoutingResult(
             route=route,
@@ -1720,6 +1966,7 @@ class MainlandFinancialCapabilityRouter:
         overlaps: list[FinancialPeriodOverlapFinding] = []
         conflicts: list[FinancialCriticalValueConflict] = []
         conflicted_keys: set[tuple[FinancialRatioFamily, date]] = set()
+        conflicted_candidate_identities: set[str] = set()
         provider_calls: list[FinancialIndicatorProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
         physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
@@ -1813,7 +2060,17 @@ class MainlandFinancialCapabilityRouter:
                 )
             if response.degraded_current_profile:
                 current_profile_provider = "yfinance"
-            for candidate in response.candidates:
+            response_candidates = (
+                _ordered_v2_response_candidates(response.candidates)
+                if publication_aware
+                else response.candidates
+            )
+            qualified_revision_candidate_identities = (
+                _qualified_v2_revision_candidate_identities(response_candidates)
+                if publication_aware
+                else frozenset()
+            )
+            for candidate in response_candidates:
                 publication_candidates.setdefault(
                     candidate.candidate_identity,
                     candidate,
@@ -1851,8 +2108,12 @@ class MainlandFinancialCapabilityRouter:
                     assessment.usable_for_current_analysis
                     and identity.company_type is not request.company_type
                 ):
-                    assessment = mark_financial_period_company_type_conflicted(
-                        assessment
+                    assessment = (
+                        reject_financial_period_for_company_type(assessment)
+                        if publication_aware
+                        else mark_financial_period_company_type_conflicted(
+                            assessment
+                        )
                     )
                 provider_candidates[candidate.candidate_identity] = (
                     FinancialProviderCandidate(
@@ -1875,6 +2136,7 @@ class MainlandFinancialCapabilityRouter:
                 if identity.period_end not in target_periods:
                     continue
                 if key in conflicted_keys:
+                    conflicted_candidate_identities.add(candidate.candidate_identity)
                     conflicted_assessment = mark_financial_period_conflicted(
                         assessment
                     )
@@ -1896,18 +2158,85 @@ class MainlandFinancialCapabilityRouter:
                     selected_candidates[key] = candidate
                     selected_assessments[key] = assessment
                     continue
+                if publication_aware:
+                    selected_binding = provider_candidates[
+                        selected.candidate_identity
+                    ]
+                    overlapping_binding = provider_candidates[
+                        candidate.candidate_identity
+                    ]
+                    if financial_revision_selection_key(
+                        selected_binding
+                    ) != financial_revision_selection_key(overlapping_binding):
+                        assessment = (
+                            reject_financial_period_for_incompatible_selection_key(
+                                assessment,
+                                selected_candidate=selected_binding,
+                                overlapping_candidate=overlapping_binding,
+                            )
+                        )
+                        provider_candidates[candidate.candidate_identity] = (
+                            FinancialProviderCandidate(
+                                candidate=candidate,
+                                assessment=assessment,
+                            )
+                        )
+                        rejected_periods[candidate.candidate_identity] = (
+                            FinancialRejectedPeriod.create(
+                                candidate=candidate,
+                                assessment=assessment,
+                            )
+                        )
+                        continue
+                if (
+                    publication_aware
+                    and selected.artifact.dataset.provider_id
+                    == candidate.artifact.dataset.provider_id
+                    and selected.candidate_identity
+                    in qualified_revision_candidate_identities
+                    and candidate.candidate_identity
+                    in qualified_revision_candidate_identities
+                ):
+                    continue
                 overlap, candidate_conflicts = compare_financial_period_candidates(
                     selected,
                     candidate,
+                    selected_assessment=(
+                        selected_assessments[key] if publication_aware else None
+                    ),
+                    overlapping_assessment=(assessment if publication_aware else None),
                 )
                 overlaps.append(overlap)
                 conflicts.extend(candidate_conflicts)
                 if (
                     not candidate_conflicts
-                    and overlap.disposition == "equivalent_unselected"
+                    and overlap.disposition
+                    in {"equivalent_unselected", "non_critical_difference"}
                 ):
                     continue
                 conflicted_keys.add(key)
+                conflicted_candidate_identities.update(
+                    (selected.candidate_identity, candidate.candidate_identity)
+                )
+                if publication_aware:
+                    current_assessment = (
+                        mark_financial_period_company_type_conflicted(assessment)
+                        if overlap.disposition == "company_type_conflict"
+                        else mark_financial_period_conflicted(assessment)
+                    )
+                    provider_candidates[candidate.candidate_identity] = (
+                        FinancialProviderCandidate(
+                            candidate=candidate,
+                            assessment=current_assessment,
+                        )
+                    )
+                    rejected_periods[candidate.candidate_identity] = (
+                        FinancialRejectedPeriod.create(
+                            candidate=candidate,
+                            assessment=current_assessment,
+                        )
+                    )
+                    continue
                 previous_assessment = mark_financial_period_conflicted(
                     selected_assessments[key]
                 )
@@ -2046,6 +2375,23 @@ class MainlandFinancialCapabilityRouter:
                 .candidate.period_identity.ratio_family
                 is family
             )
+            family_revision_selections = (
+                tuple(
+                    item
+                    for item in _v2_revision_selections(
+                        provider_candidates=provider_candidates,
+                        selected_candidates=tuple(selected_candidates.values()),
+                        conflicted_candidate_identities=(
+                            conflicted_candidate_identities
+                        ),
+                        route=route,
+                        requested_analysis_scope=request.requested_analysis_scope,
+                    )
+                    if item.ratio_family is family
+                )
+                if publication_aware
+                else ()
+            )
             family_manifests.append(
                 FinancialAcquisitionManifest.create(
                     capability_routing_plan_signature=self._routing_plan.plan_signature,
@@ -2083,6 +2429,7 @@ class MainlandFinancialCapabilityRouter:
                         in family_candidate_ids
                     ),
                     aggregate_completeness=completeness,
+                    revision_selections=family_revision_selections,
                 )
             )
 

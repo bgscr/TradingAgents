@@ -80,6 +80,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialRatioHistoryCompletenessAssessment,
     FinancialRejectedPeriod,
     FinancialReportingFrequency,
+    FinancialRevisionSelection,
     FinancialSinceListingException,
     FinancialStatementType,
     assert_safe_financial_contract_payload,
@@ -103,6 +104,8 @@ from tradingagents.evidence import (
     EvidenceState,
     FinancialFamilyAggregateEvidenceAssessment,
     FinancialFamilyEvidenceAssessment,
+    FinancialRevisionObservationEvidence,
+    FinancialRevisionSelectionEvidence,
     InstrumentIdentityEvidence,
     InstrumentKind,
     ProviderPhysicalAttemptEvidence,
@@ -1209,6 +1212,10 @@ class FinancialManifestAuditProjection(BaseModel):
     rejected_periods: tuple[FinancialRejectedPeriod, ...]
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
+    revision_selections: tuple[FinancialRevisionSelection, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     aggregate_completeness: FinancialAggregateCompletenessProjection
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
@@ -1343,6 +1350,10 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     rejected_periods: tuple[FinancialRejectedPeriod, ...]
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
+    revision_selections: tuple[FinancialRevisionSelection, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     aggregate_completeness: FinancialAggregateCompletenessProjection
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
@@ -3335,6 +3346,7 @@ def _project_manifest_for_tool(
         rejected_periods=manifest.rejected_periods,
         overlaps=manifest.overlaps,
         conflicts=manifest.conflicts,
+        revision_selections=manifest.revision_selections,
         aggregate_completeness=_project_aggregate_completeness(
             manifest.aggregate_completeness
         ),
@@ -3393,6 +3405,7 @@ def _project_manifest_for_audit(
         rejected_periods=manifest.rejected_periods,
         overlaps=manifest.overlaps,
         conflicts=manifest.conflicts,
+        revision_selections=manifest.revision_selections,
         aggregate_completeness=_project_aggregate_completeness(
             manifest.aggregate_completeness
         ),
@@ -4162,6 +4175,136 @@ def project_financial_selection_evidence(
     )
     payload["physical_attempt_count"] = len(
         payload["physical_attempt_events"]
+    )
+    projected_revision_selections = tuple(
+        FinancialRevisionSelectionEvidence.model_validate(
+            selection.model_dump(mode="python")
+        )
+        for manifest in manifests
+        for selection in manifest.revision_selections
+    )
+    revision_selection_by_id = {
+        item.selection_identity: item
+        for item in current.financial_revision_selections
+    }
+    for selection in projected_revision_selections:
+        prior = revision_selection_by_id.get(selection.selection_identity)
+        if prior is not None and prior != selection:
+            raise ValueError("financial revision selection evidence is contradictory")
+        revision_selection_by_id[selection.selection_identity] = selection
+    payload["financial_revision_selections"] = tuple(
+        sorted(
+            revision_selection_by_id.values(),
+            key=lambda item: item.selection_identity,
+        )
+    )
+
+    route = dispatch_result.routing_result.route
+    route_rank_by_provider = {
+        ("baostock" if provider_id == "baostock_qualified_families" else provider_id): rank
+        for rank, provider_id in enumerate(route)
+    }
+    conflict_candidate_ids = {
+        candidate_id
+        for manifest in manifests
+        for conflict in manifest.conflicts
+        for candidate_id in (
+            conflict.selected_candidate_identity,
+            conflict.conflicting_candidate_identity,
+        )
+    }
+    revision_binding_by_candidate = {
+        disposition.candidate_identity: (selection, disposition)
+        for manifest in manifests
+        for selection in manifest.revision_selections
+        for disposition in selection.candidate_dispositions
+    }
+    projected_observations: list[FinancialRevisionObservationEvidence] = []
+    for manifest in manifests:
+        if not manifest.revision_selections:
+            continue
+        manifest_policy = manifest.revision_selections[0].eligibility_policy_version
+        for provider_candidate in manifest.provider_candidates:
+            candidate = provider_candidate.candidate
+            identity = candidate.period_identity
+            provider_id = candidate.artifact.dataset.provider_id
+            selection_binding = revision_binding_by_candidate.get(
+                candidate.candidate_identity
+            )
+            if selection_binding is None:
+                revision_disposition = "rejected"
+                revision_selection_identity = None
+                requested_analysis_scope = manifest.requested_analysis_scope
+            else:
+                revision_selection, candidate_disposition = selection_binding
+                revision_disposition = candidate_disposition.disposition
+                revision_selection_identity = revision_selection.selection_identity
+                requested_analysis_scope = (
+                    revision_selection.requested_analysis_scope
+                )
+            family = identity.statement_type or identity.ratio_family
+            if family is None:
+                raise ValueError("financial revision observation family is absent")
+            projected_observations.append(
+                FinancialRevisionObservationEvidence(
+                    manifest_identity=manifest.manifest_identity,
+                    candidate_identity=candidate.candidate_identity,
+                    artifact_identity=candidate.artifact.artifact_identity,
+                    local_provider_revision_identity=(
+                        candidate.filing_metadata.local_provider_revision_identity
+                    ),
+                    payload_sha256=candidate.artifact.payload_sha256,
+                    provider_id=provider_id,
+                    provider_route_rank=route_rank_by_provider[provider_id],
+                    family=family.value,
+                    period=identity.period_end,
+                    frequency=identity.frequency.value,
+                    company_type=identity.company_type.value,
+                    consolidation_scope=identity.consolidation_scope.value,
+                    currency=identity.currency,
+                    normalized_units=tuple(
+                        sorted(
+                            {
+                                field.normalized_unit
+                                for field in candidate.fields
+                                if field.normalized_unit is not None
+                            }
+                        )
+                    ),
+                    assessment_disposition=(
+                        provider_candidate.assessment.disposition.value
+                    ),
+                    revision_disposition=revision_disposition,
+                    revision_selection_identity=revision_selection_identity,
+                    rejection_reasons=tuple(
+                        reason.value
+                        for reason in provider_candidate.assessment.rejection_reasons
+                    ),
+                    conflicted=(
+                        candidate.candidate_identity in conflict_candidate_ids
+                    ),
+                    requested_analysis_scope=(
+                        requested_analysis_scope.value
+                        if requested_analysis_scope is not None
+                        else None
+                    ),
+                    eligibility_policy_version=manifest_policy,
+                )
+            )
+    observation_by_id = {
+        item.candidate_identity: item
+        for item in current.financial_revision_observations
+    }
+    for observation in projected_observations:
+        prior = observation_by_id.get(observation.candidate_identity)
+        if prior is not None and prior != observation:
+            raise ValueError("financial revision observation evidence is contradictory")
+        observation_by_id[observation.candidate_identity] = observation
+    payload["financial_revision_observations"] = tuple(
+        sorted(
+            observation_by_id.values(),
+            key=lambda item: item.candidate_identity,
+        )
     )
     if isinstance(dispatch_result, FinancialIndicatorSelectionDispatchResult):
         routed_family_assessments = tuple(
