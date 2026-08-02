@@ -1,63 +1,53 @@
-# AGENTS.md — Project Agent Guide
+# AGENTS.md - Project Agent Guide
 
 ## Project Context
+- **Tech Stack**: Python 3.10+, LangGraph, Typer/Rich, market-data providers, point-in-time ingestion, LLM-based trading analysis.
+- **Domain & Architecture Authority**: Read `CONTEXT.md` for strict terminology, evidence contracts, and decisions. Check `docs/adr/` for architecture history.
+- **Local Triage & Specs**: Follow `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
 
-- This is a Python 3.10+ project built around LangGraph, Typer/Rich, market-data providers, point-in-time ingestion, and LLM-based trading analysis.
-- Before changing domain terminology, evidence handling, trading decisions, or architecture, read `CONTEXT.md` and the relevant accepted decisions in `docs/adr/`.
-- Use the glossary terms from `CONTEXT.md`. Surface conflicts with an accepted ADR instead of silently overriding it.
-- For local specifications, issues, and triage, follow:
-  - `docs/agents/issue-tracker.md`
-  - `docs/agents/triage-labels.md`
-  - `docs/agents/domain.md`
+## Exploration & Editing Rules
+- **Code Graph First**: When `.codegraph/` exists, use CodeGraph first for symbols, callers, dependencies, and call paths.
+- **Direct Search Fallback**: Use direct file reads/grep for docs, configs, exact text, unindexed files, or when CodeGraph misses/is unavailable.
+- **Direct Investigation**: Primary agent inspects affected behavior directly before edit. No separate investigator subagent is needed if context can be built directly.
+- **Minimal Scope**: Make the smallest coherent edit. Preserve unrelated worktree changes.
+- **Ignored State**: Treat `.venv/`, `build/`, `dist/`, `reports/`, `.pytest_cache/`, `.ruff_cache/`, and `.worktrees/` as local generated state unless explicitly targeted.
+- **@RTK.md**
 
-## Exploration and Editing
-
-- When `.codegraph/` exists and CodeGraph is available, use CodeGraph first for indexed source code, symbols, callers, dependencies, and call paths.
-- Use direct file reads or shell search for documentation, configuration, exact-text searches, generated or non-indexed files, CodeGraph misses, or when CodeGraph is unavailable.
-- Inspect the affected behavior and its dependencies before implementation. A separate investigation agent is not required when the primary agent can establish the necessary context directly.
-- Preserve unrelated worktree changes and make the smallest coherent change that satisfies the request.
-- Treat `.venv/`, `build/`, `dist/`, `reports/`, `.pytest_cache/`, `.ruff_cache/`, and `.worktrees/` as generated or local state unless the task explicitly places them in scope.
-- RTK is optional output compression for compatible external commands. Do not force it for PowerShell built-ins, unsupported commands, or cases requiring exact raw output. See `RTK.md`.
-
-## Delegation and Ownership
-
-- The primary agent may handle trivial or non-trivial work directly.
-- Only the primary agent may delegate. Subagents must not create further subagents.
-- Delegate only a concrete, bounded subtask when specialist expertise or independent parallel work materially improves correctness or efficiency.
-- Prefer one most-specific specialist instead of assigning every role whose trigger could apply.
-- At most one writing subagent and one read-only subagent may run concurrently.
-- Never give multiple writers overlapping file or responsibility ownership.
-- The primary agent retains synthesis, conflict resolution, implementation coordination, and final user communication.
-- `.codex/agents/*.toml` is the source of truth for available role names, model settings, reasoning effort, and sandbox mode. Do not override those profile defaults unless a higher-priority instruction explicitly requires it.
+## Delegation & Subagent Rules
+### Hard Constraints
+1. **Delegation Authority**: Only the primary agent can delegate. **Subagents must never create subagents.**
+2. **Concurrency Cap**: Maximum **1 writing subagent + 1 read-only subagent** running concurrently.
+3. **Strict File Ownership**: Never assign overlapping write scopes or files to multiple writers.
+4. **Primary Responsibilities**: Primary agent retains synthesis, conflict resolution, implementation coordination, and final user communication.
+5. **Profile Standard**: `.codex/agents/*.toml` is the source of truth for agent role names, model settings, reasoning effort, and sandbox modes.
 
 ### Specialist Routing
+Select the **single most-specific role** matching the task's primary risk:
 
-Choose the role matching the task's dominant risk:
+| Role Name | Access Mode | Dominant Risk / Task Scope |
+| :--- | :--- | :--- |
+| `cli-developer` | **Write** | Typer/Rich CLI behavior, config precedence, output contracts, shell workflows, exit codes. |
+| `data-engineer` | **Write** | Ingestion pipelines, point-in-time data, schema/cache changes, lineage, provider state, quality. |
+| `python-pro` | **Write** | General Python runtime, packaging, typing, framework implementation (when no specific writer owns it). |
+| `test-automator` | **Write** | Substantial automated test suites, test harnesses, and testing infrastructure implementation. |
+| `debugger` | Read-Only | Deep-dive investigation of cross-layer, intermittent, or difficult runtime failures. |
+| `llm-architect` | Read-Only | LangGraph topology, prompts, tool contracts, retrieval, structured outputs, LLM workflows. |
+| `quant-analyst` | Read-Only | Financial indicators, rankings, simulations, lookahead bias, portfolio logic, risk math. |
+| `security-auditor` | Read-Only | Secrets handling, auth, untrusted input validation, infra/dependency security. |
+| `model-risk-manager` | Read-Only | LLM failure modes, unsafe/misleading outputs, tool misuse, model risk mitigations. |
+| `prompt-regression-tester` | Read-Only | Design/assessment of regression test coverage for prompts, models, tools, and AI chains. |
+| `docs-researcher` | Read-Only | External API validation, framework specs, version-specific documentation research. |
+| `reviewer` | Read-Only | Final formal review of material code changes for correctness, security, and missing tests. |
 
-- `cli-developer`: Typer/Rich CLI behavior, configuration precedence, output contracts, shell workflows, and exit behavior.
-- `data-engineer`: ingestion, point-in-time data, cache or schema changes, lineage, provider state, and data quality.
-- `python-pro`: general Python runtime, packaging, typing, or framework implementation when no more specific writing role owns the task.
-- `test-automator`: independently substantial automated-test or test-harness implementation.
-- `debugger`: read-only investigation of cross-layer, intermittent, or difficult failures.
-- `llm-architect`: read-only review of LangGraph topology, prompts, tool contracts, retrieval, structured outputs, and LLM workflow design.
-- `quant-analyst`: read-only review of indicators, rankings, simulations, lookahead bias, portfolio logic, and risk mathematics.
-- `security-auditor`: read-only review of secrets, authentication, untrusted input, validation, or infrastructure security.
-- `model-risk-manager`: read-only analysis of LLM failure modes, unsafe or misleading outputs, tool misuse, and model-risk mitigations.
-- `prompt-regression-tester`: read-only design or assessment of regression coverage for prompts, models, tools, and AI workflows.
-- `docs-researcher`: read-only verification of external APIs, framework behavior, and version-specific documentation.
-- `reviewer`: read-only final review of material changes for correctness, regressions, security, and missing tests.
+*Note: Read-only specialists investigate/review; implementation is performed by the primary agent or one writing specialist. Run read-only specialists sequentially unless scopes are strictly independent.*
 
-Read-only specialists investigate or review; the primary agent or one appropriate writing specialist performs implementation. Additional specialists should run sequentially unless their scopes are independent and the concurrency limit permits parallel work.
-
-## Verification and Review
-
-- Scale verification to the change. Run targeted tests first.
-- For broad or cross-module code changes, use the repository's CI commands when feasible:
+## Verification & Review Process
+- **Scaled Verification**: Run targeted tests first. For broad or cross-module changes, run repository CI checks:
   - `pytest -q`
   - `ruff check .`
-- Small, localized changes may be self-reviewed by the primary agent. Use `reviewer` for material, high-risk, or cross-module changes.
-- Review in two stages:
-  1. **Spec Compliance:** Confirm requested behavior, interfaces, data contracts, domain terminology, and relevant ADRs.
-  2. **Code Quality:** Check error handling, state or durability boundaries where applicable, security and evidence boundaries, regression coverage, and maintainability.
-- Classify review findings as `Critical`, `Important`, or `Minor`.
-- Verify the current codebase before recommending or applying an edit. If a request conflicts with the specification, domain model, or an accepted ADR, report the conflict explicitly.
+- **Review Strategy**: Small localized edits may be self-reviewed by the primary agent. High-risk/cross-module changes require the `reviewer` role.
+- **Two-Stage Review Framework**:
+  1. **Spec Compliance**: Verify requested behavior, explicit interfaces, data contracts, terminology (`CONTEXT.md`), and ADR adherence.
+  2. **Code Quality**: Audit error handling, durability boundaries, security/evidence boundaries, regression coverage, and maintainability.
+- **Findings Classification**: Categorize all review findings as `Critical`, `Important`, or `Minor`.
+- **Conflict Reporting**: Verify actual codebase state before editing. Explicitly report any conflict between user requests and specifications/ADRs rather than silently overriding them.
