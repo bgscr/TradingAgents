@@ -71,6 +71,7 @@ from tradingagents.dataflows.financial_contracts import (
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+    MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
 )
 from tradingagents.dataflows.financial_period_targets import (
@@ -564,6 +565,9 @@ class FinancialStatementRoutingRequest(BaseModel):
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: InstrumentIdentityEvidence
     statement_type: FinancialStatementType
     as_of_date: date
@@ -589,6 +593,12 @@ class FinancialStatementRoutingRequest(BaseModel):
             == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
         ):
             raise ValueError("statement routing request policy identity is inconsistent")
+        if self.financial_eligibility_binding is not None and (
+            not v2
+            or self.financial_eligibility_binding.eligibility_policy_version
+            != self.eligibility_policy_version
+        ):
+            raise ValueError("statement routing eligibility binding is inconsistent")
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -610,6 +620,9 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     requested_analysis_scope: FinancialAvailabilityScope | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -660,6 +673,12 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
         ):
             raise ValueError("indicator routing request policy identity is inconsistent")
+        if self.financial_eligibility_binding is not None and (
+            not policy_bound
+            or self.financial_eligibility_binding.eligibility_policy_version
+            != self.eligibility_policy_version
+        ):
+            raise ValueError("indicator routing eligibility binding is inconsistent")
         availability_bound = (
             self.contract_version
             in {
@@ -955,6 +974,9 @@ class FinancialStatementRoutingResult(BaseModel):
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialStatementRoutingResult:
@@ -967,6 +989,12 @@ class FinancialStatementRoutingResult(BaseModel):
             != self.publication_target_construction
         ):
             raise ValueError("statement publication targets contradict manifest")
+        if (
+            self.manifest.contract_version == "financial-manifest-v2"
+            and self.manifest.financial_eligibility_binding
+            != self.financial_eligibility_binding
+        ):
+            raise ValueError("statement eligibility binding contradicts manifest")
         selection_ids = {item.candidate_identity for item in self.manifest.selections}
         if selection_ids != {
             item.candidate_identity for item in self.selected_candidates
@@ -1021,6 +1049,9 @@ class FinancialIndicatorRoutingResult(BaseModel):
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = Field(
         default=(),
         exclude_if=lambda value: not value,
@@ -1106,6 +1137,11 @@ class FinancialIndicatorRoutingResult(BaseModel):
             self.eligibility_policy_version is None
         ):
             raise ValueError("indicator result analysis scope binding is incomplete")
+        if self.financial_eligibility_binding is not None and (
+            self.eligibility_policy_version
+            != self.financial_eligibility_binding.eligibility_policy_version
+        ):
+            raise ValueError("indicator result eligibility binding is contradictory")
         manifest_target_constructions = {
             manifest.publication_target_construction
             for manifest in self.family_manifests
@@ -1173,6 +1209,12 @@ class FinancialIndicatorRoutingResult(BaseModel):
             )
         }:
             raise ValueError("indicator manifest analysis scope binding is invalid")
+        if v2_manifests and any(
+            manifest.financial_eligibility_binding
+            != self.financial_eligibility_binding
+            for manifest in v2_manifests
+        ):
+            raise ValueError("indicator manifest eligibility binding is invalid")
         if v2_manifests and (
             len(v2_manifests) != len(self.family_manifests)
             or any(
@@ -1435,10 +1477,21 @@ class MainlandFinancialCapabilityRouter:
         capability = _STATEMENT_CAPABILITY[request.statement_type]
         route = self._routing_plan.route_for(capability)
         publication_aware = request.eligibility_policy_version is not None
+        expected_eligibility_binding = (
+            self._routing_plan.financial_eligibility_binding
+            if publication_aware
+            else None
+        )
+        eligibility_binding = request.financial_eligibility_binding
         if publication_aware and (
             self._routing_plan.eligibility_policy_version
             != request.eligibility_policy_version
             or self._routing_plan.financial_eligibility_policy is None
+            or (
+                request.financial_eligibility_binding is not None
+                and request.financial_eligibility_binding
+                != expected_eligibility_binding
+            )
         ):
             raise ValueError("statement target construction policy mismatch")
         acquisition_annual = tuple(
@@ -1911,8 +1964,12 @@ class MainlandFinancialCapabilityRouter:
             ),
             physical_attempt_ids=tuple(physical_attempt_ids),
             publication_target_construction=publication_target_construction,
+            financial_eligibility_binding=eligibility_binding,
         )
-        if not physical_attempt_events:
+        if (
+            not physical_attempt_events
+            and request.financial_eligibility_binding is None
+        ):
             return result
         disposition = financial_statement_evidence_disposition(result)
         finalized_manifest = manifest.finalize(
@@ -1920,6 +1977,12 @@ class MainlandFinancialCapabilityRouter:
             disposition=disposition,
             rendered_value=render_statement_routing_result(result),
             publication_target_construction=publication_target_construction,
+            eligibility_policy_version=(
+                request.eligibility_policy_version
+                if eligibility_binding is not None
+                else None
+            ),
+            financial_eligibility_binding=eligibility_binding,
         )
         return result.model_copy(update={"manifest": finalized_manifest})
 
@@ -1933,6 +1996,12 @@ class MainlandFinancialCapabilityRouter:
             MainlandCapability.FINANCIAL_INDICATORS
         )
         publication_aware = request.eligibility_policy_version is not None
+        expected_eligibility_binding = (
+            self._routing_plan.financial_eligibility_binding
+            if publication_aware
+            else None
+        )
+        eligibility_binding = request.financial_eligibility_binding
         availability_policy_version = (
             request.eligibility_policy_version
             if request.requested_analysis_scope is not None
@@ -1942,6 +2011,11 @@ class MainlandFinancialCapabilityRouter:
             self._routing_plan.eligibility_policy_version
             != request.eligibility_policy_version
             or self._routing_plan.financial_eligibility_policy is None
+            or (
+                request.financial_eligibility_binding is not None
+                and request.financial_eligibility_binding
+                != expected_eligibility_binding
+            )
         ):
             raise ValueError("indicator target construction policy mismatch")
         acquisition_periods = tuple(
@@ -2494,10 +2568,14 @@ class MainlandFinancialCapabilityRouter:
             publication_target_construction=publication_target_construction,
             requested_analysis_scope=request.requested_analysis_scope,
             eligibility_policy_version=availability_policy_version,
+            financial_eligibility_binding=eligibility_binding,
             family_assessments=family_assessments,
             aggregate_family_assessment=aggregate_family_assessment,
         )
-        if not physical_attempt_events:
+        if (
+            not physical_attempt_events
+            and request.financial_eligibility_binding is None
+        ):
             return result
         rendered_value = render_indicator_routing_result(result)
         finalized_manifests = tuple(
@@ -2512,6 +2590,7 @@ class MainlandFinancialCapabilityRouter:
                 publication_target_construction=publication_target_construction,
                 requested_analysis_scope=request.requested_analysis_scope,
                 eligibility_policy_version=availability_policy_version,
+                financial_eligibility_binding=eligibility_binding,
             )
             for manifest in result.family_manifests
         )
@@ -3316,6 +3395,12 @@ def finalize_statement_routing_result(
         disposition=financial_statement_evidence_disposition(result),
         rendered_value=render_statement_routing_result(result),
         publication_target_construction=result.publication_target_construction,
+        eligibility_policy_version=(
+            result.financial_eligibility_binding.eligibility_policy_version
+            if result.financial_eligibility_binding is not None
+            else None
+        ),
+        financial_eligibility_binding=result.financial_eligibility_binding,
     )
     payload = result.model_dump(mode="python")
     payload["manifest"] = finalized
@@ -3353,6 +3438,9 @@ def finalize_indicator_routing_result(
                 request.eligibility_policy_version
                 if request.requested_analysis_scope is not None
                 else None
+            ),
+            financial_eligibility_binding=(
+                result.financial_eligibility_binding
             ),
         )
         for manifest in result.family_manifests

@@ -36,6 +36,12 @@ MAINLAND_FINANCIAL_AUDIT_PROJECTION_V2 = (
 MAINLAND_FINANCIAL_REPORT_PROJECTION_V2 = (
     "mainland-financial-report-projection-v2"
 )
+MAINLAND_FINANCIAL_AVAILABILITY_SCOPE_V2 = (
+    "mainland-financial-availability-scope-v2"
+)
+MAINLAND_FINANCIAL_ELIGIBILITY_BINDING_V2 = (
+    "mainland-financial-eligibility-binding-v2"
+)
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _POLICY_SIGNATURE_PREFIX = "mainland-financial-eligibility-policy:v2:"
@@ -743,6 +749,113 @@ class MainlandFinancialEligibilityPolicy(BaseModel):
         return self.model_dump(mode="json", exclude={"policy_signature"})
 
 
+class MainlandFinancialEligibilityProjectionBinding(BaseModel):
+    """Closed identity inventory shared by every corrected v2 projection."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "mainland-financial-eligibility-binding-v2"
+    ] = MAINLAND_FINANCIAL_ELIGIBILITY_BINDING_V2
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] = MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+    reporting_calendar_deadline_contract_identity: Literal[
+        "mainland-financial-reporting-calendar-v2"
+    ] = MAINLAND_FINANCIAL_REPORTING_CALENDAR_V2
+    target_construction_contract_identity: Literal[
+        "mainland-financial-target-construction-v2"
+    ] = MAINLAND_FINANCIAL_TARGET_CONSTRUCTION_V2
+    completeness_policy_identity: Literal[
+        "mainland-financial-completeness-v2"
+    ] = "mainland-financial-completeness-v2"
+    candidate_selection_contract_identity: Literal[
+        "mainland-financial-candidate-selection-v2"
+    ] = MAINLAND_FINANCIAL_CANDIDATE_SELECTION_V2
+    financial_manifest_version: Literal["financial-manifest-v2"] = (
+        "financial-manifest-v2"
+    )
+    checkpoint_projection_version: Literal[
+        "mainland-financial-checkpoint-projection-v2"
+    ] = MAINLAND_FINANCIAL_CHECKPOINT_PROJECTION_V2
+    audit_projection_version: Literal[
+        "mainland-financial-audit-projection-v2"
+    ] = MAINLAND_FINANCIAL_AUDIT_PROJECTION_V2
+    report_projection_version: Literal[
+        "mainland-financial-report-projection-v2"
+    ] = MAINLAND_FINANCIAL_REPORT_PROJECTION_V2
+    availability_scope: Literal[
+        "mainland-financial-availability-scope-v2"
+    ] = MAINLAND_FINANCIAL_AVAILABILITY_SCOPE_V2
+    rollout_authority_disposition: Literal["shadow_non_authoritative"] = (
+        "shadow_non_authoritative"
+    )
+    qualified_v1_authority_enabled: Literal[False] = False
+    policy_signature: str = Field(
+        pattern=r"^mainland-financial-eligibility-policy:v2:[0-9a-f]{64}$"
+    )
+
+    @classmethod
+    def from_policy(
+        cls,
+        policy: MainlandFinancialEligibilityPolicy,
+    ) -> MainlandFinancialEligibilityProjectionBinding:
+        return cls(
+            eligibility_policy_version=policy.eligibility_policy_version,
+            reporting_calendar_deadline_contract_identity=(
+                policy.reporting_calendar.calendar_version
+            ),
+            target_construction_contract_identity=(
+                policy.target_construction_contract_version
+            ),
+            completeness_policy_identity=policy.completeness_policy_version,
+            candidate_selection_contract_identity=(
+                policy.candidate_selection_contract_version
+            ),
+            financial_manifest_version=policy.manifest_projection_version,
+            checkpoint_projection_version=policy.checkpoint_projection_version,
+            audit_projection_version=policy.audit_projection_version,
+            report_projection_version=policy.report_projection_version,
+            rollout_authority_disposition=policy.authority_disposition,
+            qualified_v1_authority_enabled=(
+                policy.qualified_v1_authority_enabled
+            ),
+            policy_signature=policy.policy_signature,
+        )
+
+
+def restore_mainland_financial_eligibility_projection_binding(
+    value: (
+        Mapping[str, Any]
+        | MainlandFinancialEligibilityProjectionBinding
+    ),
+) -> MainlandFinancialEligibilityProjectionBinding:
+    """Restore one exact, safe v2 inventory with typed mismatch outcomes."""
+
+    if isinstance(value, MainlandFinancialEligibilityProjectionBinding):
+        return value
+    if not isinstance(value, Mapping):
+        raise MainlandFinancialEligibilityPolicyError(
+            MainlandFinancialEligibilityPolicyFailureReason.INVALID_POLICY_CONTRACT
+        )
+    _assert_safe_policy_projection(value)
+    identity = value.get("eligibility_policy_version")
+    if identity is None:
+        raise MainlandFinancialEligibilityPolicyError(
+            MainlandFinancialEligibilityPolicyFailureReason.MISSING_POLICY_IDENTITY
+        )
+    if identity != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2:
+        raise MainlandFinancialEligibilityPolicyError(
+            MainlandFinancialEligibilityPolicyFailureReason.UNKNOWN_POLICY_IDENTITY
+        )
+    try:
+        return MainlandFinancialEligibilityProjectionBinding.model_validate(value)
+    except (TypeError, ValidationError, ValueError) as exc:
+        raise MainlandFinancialEligibilityPolicyError(
+            MainlandFinancialEligibilityPolicyFailureReason.CONTRADICTORY_POLICY_IDENTITY
+        ) from exc
+
+
 def _assert_safe_policy_projection(value: object) -> None:
     if isinstance(value, BaseModel):
         _assert_safe_policy_projection(value.model_dump(mode="json"))
@@ -900,11 +1013,14 @@ def restore_mainland_financial_eligibility_policy(
 
 
 __all__ = [
+    "MAINLAND_FINANCIAL_AVAILABILITY_SCOPE_V2",
+    "MAINLAND_FINANCIAL_ELIGIBILITY_BINDING_V2",
     "MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2",
     "MAINLAND_FINANCIAL_REPORTING_CALENDAR_V2",
     "MainlandFinancialEligibilityPolicy",
     "MainlandFinancialEligibilityPolicyError",
     "MainlandFinancialEligibilityPolicyFailureReason",
+    "MainlandFinancialEligibilityProjectionBinding",
     "MainlandFinancialListingProvenanceBinding",
     "MainlandFinancialPeriodTargetConstruction",
     "MainlandFinancialPeriodTargetFailureReason",
@@ -917,5 +1033,6 @@ __all__ = [
     "MainlandFinancialSinceListingTargetException",
     "build_mainland_financial_eligibility_policy_v2",
     "mainland_financial_eligibility_policy_signature",
+    "restore_mainland_financial_eligibility_projection_binding",
     "restore_mainland_financial_eligibility_policy",
 ]

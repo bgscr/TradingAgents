@@ -166,6 +166,16 @@ class FinancialDispatchToolNode:
             raise ValueError("financial tool node requires at least one tool call")
 
         rollout_mode = self._routing_mode()
+        configured_mode = str(
+            (self._config or {}).get(
+                "mainland_capability_routing_mode",
+                "legacy",
+            )
+        ).strip().casefold()
+        if rollout_mode == "qualified_v1" and configured_mode != rollout_mode:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+            )
         dispatcher, evidence = self._dispatcher_from_state(state)
         shadow_dispatcher = (
             self._dispatcher_from_state(state, shadow=True)[0]
@@ -428,6 +438,26 @@ class FinancialDispatchToolNode:
                 qualified_router = None
         elif shadow:
             raise ValueError("shadow dispatcher requires qualified_v1_shadow mode")
+        if qualified_router is not None:
+            expected_binding = (
+                qualified_router.routing_plan.financial_eligibility_binding
+            )
+            if expected_binding is None:
+                if (
+                    state.get("financial_eligibility_binding") is not None
+                    or evidence.financial_eligibility_binding is not None
+                ):
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                    )
+            elif (
+                state.get("financial_eligibility_binding")
+                != expected_binding.model_dump(mode="json")
+                or evidence.financial_eligibility_binding != expected_binding
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                )
         retry_policy = self._retry_policy
         if retry_policy is None:
             configured_retry_policy = effective_config.get("financial_dispatch_retry_policy")

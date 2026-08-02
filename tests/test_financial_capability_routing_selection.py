@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
-from collections.abc import Callable
 from datetime import date, datetime, timezone
 from hashlib import sha256
 from types import SimpleNamespace
@@ -156,6 +155,7 @@ def _qualified_plan(
     historical_payload["manifest_contract_version"] = "financial-manifest-v1"
     historical_payload.pop("eligibility_policy_version")
     historical_payload.pop("financial_eligibility_policy")
+    historical_payload.pop("financial_eligibility_binding")
     signature_payload = dict(historical_payload)
     signature_payload.pop("plan_signature")
     encoded = json.dumps(
@@ -501,8 +501,10 @@ def _production_composition_graph(
     )
 
 
-def _qualified_tool_state(asset, *, target: date) -> dict[str, object]:
+def _qualified_tool_state(asset, plan, *, target: date) -> dict[str, object]:
     assert target <= date(2026, 7, 30)
+    binding = plan.financial_eligibility_binding
+    assert binding is not None
     return {
         "messages": [
             AIMessage(
@@ -522,9 +524,12 @@ def _qualified_tool_state(asset, *, target: date) -> dict[str, object]:
             )
         ],
         "evidence_state": EvidenceState(
+            financial_eligibility_binding=binding,
             instrument_identity=asset.instrument_identity
         ).model_dump(mode="json"),
+        "financial_eligibility_binding": binding.model_dump(mode="json"),
         "asset_configuration": asset.model_dump(mode="json"),
+        "run_id": "ticket-06-production-composition",
         "trade_date": "2026-07-30",
     }
 
@@ -2862,22 +2867,40 @@ def test_production_composition_routes_tushare_gap_to_akshare_sina(
     )
     calls: list[tuple[str, FinancialProviderGapRequest]] = []
 
+    def available(
+        provider_id: str,
+        candidate: FinancialPeriodCandidate,
+    ) -> FinancialProviderPeriodResponse:
+        return FinancialProviderPeriodResponse.available(
+            provider_id=provider_id,
+            response_artifact=candidate.artifact,
+            retained_artifacts=(candidate.artifact,),
+            candidates=(candidate,),
+            subrequest_keys=(),
+            physical_attempt_ids=(),
+        )
+
     def tushare(
         request: FinancialProviderGapRequest,
     ) -> FinancialProviderPeriodResponse:
         calls.append(("tushare", request))
-        return _available_response("tushare", (sparse_tushare,))
+        return available("tushare", sparse_tushare)
 
     def akshare_sina(
         request: FinancialProviderGapRequest,
     ) -> FinancialProviderPeriodResponse:
         calls.append(("akshare_sina", request))
-        return _available_response("akshare_sina", (akshare_fill,))
+        return available("akshare_sina", akshare_fill)
 
     def yahoo(_request: FinancialProviderGapRequest) -> FinancialProviderPeriodResponse:
         raise AssertionError("AKShare-Sina filled the exact Tushare gap")
 
     selection_request = FinancialStatementRoutingRequest(
+        contract_version="financial-statement-routing-request-v2",
+        eligibility_policy_version=(
+            "mainland-financial-period-eligibility-v2"
+        ),
+        financial_eligibility_binding=plan.financial_eligibility_binding,
         instrument_identity=asset.instrument_identity,
         statement_type=FinancialStatementType.BALANCE_SHEET,
         as_of_date=date(2026, 7, 30),
@@ -2908,10 +2931,11 @@ def test_production_composition_routes_tushare_gap_to_akshare_sina(
     )
 
     result = graph.tool_nodes["fundamentals"](
-        _qualified_tool_state(asset, target=target)
+        _qualified_tool_state(asset, plan, target=target)
     )
 
     assert [provider for provider, _ in calls] == ["tushare", "akshare_sina"]
+    assert "financial_dispatch_shadow_failure" not in result
     assert calls[1][1].missing_annual_period_ends == ()
     assert calls[1][1].missing_reporting_period_ends == (target,)
     terminal = result["financial_dispatch_shadow_ledger"][
@@ -2934,7 +2958,15 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
     )
-    target = _REPORTING_PERIODS[-1]
+    target = _REPORTING_PERIODS[-2]
+    sparse_tushare = _candidate(
+        provider_id="tushare",
+        statement_type=FinancialStatementType.BALANCE_SHEET,
+        period_end=target,
+        frequency=FinancialReportingFrequency.QUARTERLY,
+        core_field_limit=1,
+        instrument_identity=asset.instrument_identity,
+    )
     yahoo_candidate = _candidate(
         provider_id="yfinance",
         statement_type=FinancialStatementType.BALANCE_SHEET,
@@ -2945,28 +2977,47 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
     )
     calls: list[str] = []
 
-    def unavailable(
+    def available(
         provider_id: str,
-    ) -> Callable[[FinancialProviderGapRequest], FinancialProviderPeriodResponse]:
-        def invoke(
-            _request: FinancialProviderGapRequest,
-        ) -> FinancialProviderPeriodResponse:
-            calls.append(provider_id)
-            return FinancialProviderPeriodResponse.unavailable(
-                provider_id=provider_id,
-                reason=AcquisitionUnavailableReason.NO_DATA,
-                physical_attempt_ids=(f"attempt:{provider_id}",),
-            )
+        candidates: tuple[FinancialPeriodCandidate, ...],
+    ) -> FinancialProviderPeriodResponse:
+        artifacts = tuple(candidate.artifact for candidate in candidates)
+        return FinancialProviderPeriodResponse.available(
+            provider_id=provider_id,
+            response_artifact=artifacts[0],
+            retained_artifacts=artifacts,
+            candidates=candidates,
+            subrequest_keys=(),
+            physical_attempt_ids=(),
+        )
 
-        return invoke
+    def tushare(
+        _request: FinancialProviderGapRequest,
+    ) -> FinancialProviderPeriodResponse:
+        calls.append("tushare")
+        return available("tushare", (sparse_tushare,))
+
+    def akshare_sina(
+        _request: FinancialProviderGapRequest,
+    ) -> FinancialProviderPeriodResponse:
+        calls.append("akshare_sina")
+        return FinancialProviderPeriodResponse.unavailable(
+            provider_id="akshare_sina",
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
 
     def yahoo(
         _request: FinancialProviderGapRequest,
     ) -> FinancialProviderPeriodResponse:
         calls.append("yfinance")
-        return _available_response("yfinance", (yahoo_candidate,))
+        return available("yfinance", (yahoo_candidate,))
 
     selection_request = FinancialStatementRoutingRequest(
+        contract_version="financial-statement-routing-request-v2",
+        eligibility_policy_version=(
+            "mainland-financial-period-eligibility-v2"
+        ),
+        financial_eligibility_binding=plan.financial_eligibility_binding,
         instrument_identity=asset.instrument_identity,
         statement_type=FinancialStatementType.BALANCE_SHEET,
         as_of_date=date(2026, 7, 30),
@@ -2980,8 +3031,8 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
         router=MainlandFinancialCapabilityRouter(
             routing_plan=plan,
             statement_sources={
-                "tushare": unavailable("tushare"),
-                "akshare_sina": unavailable("akshare_sina"),
+                "tushare": tushare,
+                "akshare_sina": akshare_sina,
                 "yfinance": yahoo,
             },
         ),
@@ -2997,14 +3048,16 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
     )
 
     result = graph.tool_nodes["fundamentals"](
-        _qualified_tool_state(asset, target=target)
+        _qualified_tool_state(asset, plan, target=target)
     )
 
     assert calls == ["tushare", "akshare_sina", "yfinance"]
+    assert "financial_dispatch_shadow_failure" not in result
     terminal = result["financial_dispatch_shadow_ledger"][
         "qualified_statement_selections"
     ][0]["terminal"]
     manifest = terminal["routing_result"]["manifest"]
+    assert manifest["selections"], json.dumps(manifest, sort_keys=True)
     selection = manifest["selections"][0]
     assert selection["provider_id"] == "yfinance"
     assert selection["disposition"] == "current_only"

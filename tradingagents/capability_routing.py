@@ -17,6 +17,7 @@ from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
     MainlandFinancialEligibilityPolicy,
+    MainlandFinancialEligibilityProjectionBinding,
     build_mainland_financial_eligibility_policy_v2,
 )
 from tradingagents.evidence import (
@@ -209,6 +210,9 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -235,12 +239,21 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         if self.manifest_contract_version != expected_manifest_version:
             raise ValueError("routing mode and manifest contract version contradict")
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
-            if (
+            historical_pre_v2 = (
+                self.eligibility_policy_version is None
+                and self.financial_eligibility_policy is None
+                and self.financial_eligibility_binding is None
+            )
+            if not historical_pre_v2 and (
                 self.eligibility_policy_version
                 != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
                 or self.financial_eligibility_policy is None
                 or self.financial_eligibility_policy.eligibility_policy_version
                 != self.eligibility_policy_version
+                or self.financial_eligibility_binding
+                != MainlandFinancialEligibilityProjectionBinding.from_policy(
+                    self.financial_eligibility_policy
+                )
             ):
                 raise ValueError(
                     "qualified shadow routing requires the exact v2 eligibility policy"
@@ -248,6 +261,7 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         elif (
             self.eligibility_policy_version is not None
             or self.financial_eligibility_policy is not None
+            or self.financial_eligibility_binding is not None
         ):
             raise ValueError(
                 "legacy and historical qualified plans cannot carry synthetic v2 policy data"
@@ -352,6 +366,9 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     disposition: MainlandCapabilityRoutingDisposition
     rollback_compatible: Literal[True] = True
 
@@ -385,6 +402,7 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
             degradation_contract_version=plan.degradation_contract_version,
             eligibility_policy_version=plan.eligibility_policy_version,
             financial_eligibility_policy=plan.financial_eligibility_policy,
+            financial_eligibility_binding=plan.financial_eligibility_binding,
             disposition=disposition,
         )
 
@@ -414,12 +432,21 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
                 "routing rollout mode and manifest contract version contradict"
             )
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
-            if (
+            historical_pre_v2 = (
+                self.eligibility_policy_version is None
+                and self.financial_eligibility_policy is None
+                and self.financial_eligibility_binding is None
+            )
+            if not historical_pre_v2 and (
                 self.eligibility_policy_version
                 != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
                 or self.financial_eligibility_policy is None
                 or self.financial_eligibility_policy.eligibility_policy_version
                 != self.eligibility_policy_version
+                or self.financial_eligibility_binding
+                != MainlandFinancialEligibilityProjectionBinding.from_policy(
+                    self.financial_eligibility_policy
+                )
             ):
                 raise ValueError(
                     "qualified shadow rollout requires the exact v2 eligibility policy"
@@ -427,6 +454,7 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         elif (
             self.eligibility_policy_version is not None
             or self.financial_eligibility_policy is not None
+            or self.financial_eligibility_binding is not None
         ):
             raise ValueError(
                 "legacy and historical qualified rollouts cannot carry synthetic v2 policy data"
@@ -514,6 +542,16 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
     reason: MainlandCapabilityRoutingCheckpointFailureReason | None = None
     active: MainlandCapabilityRoutingRunProjection
     checkpoint: MainlandCapabilityRoutingRunProjection | None
+    previous_run_id: str | None = Field(
+        default=None,
+        pattern=r"^run:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    new_run_id: str | None = Field(
+        default=None,
+        pattern=r"^run:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     provider_io_performed: Literal[False] = False
     checkpoint_rewrite_permitted: Literal[False] = False
     historical_state_preserved: Literal[True] = True
@@ -525,6 +563,8 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 self.reason is not None
                 or self.checkpoint is None
                 or self.active != self.checkpoint
+                or self.previous_run_id is not None
+                or self.new_run_id is not None
             ):
                 raise ValueError("resume requires an exact routing plan match")
         elif (
@@ -543,8 +583,29 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
             ):
                 raise ValueError("legacy new-run state requires a qualified active plan")
+        elif (
+            self.reason
+            is MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        ):
+            if (
+                self.checkpoint is None
+                or self.checkpoint.mode is MainlandCapabilityRoutingMode.LEGACY
+                or self.active.financial_eligibility_binding is None
+                or self.previous_run_id is None
+                or self.new_run_id is None
+                or self.previous_run_id == self.new_run_id
+            ):
+                raise ValueError(
+                    "policy-mismatch new-run state requires distinct run identities"
+                )
         else:
             raise ValueError("new-run routing decision requires a legacy mismatch")
+        if self.reason is not (
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        ) and (
+            self.previous_run_id is not None or self.new_run_id is not None
+        ):
+            raise ValueError("legacy new-run compatibility cannot relabel run identity")
         return self
 
 
@@ -578,11 +639,15 @@ def validate_mainland_capability_routing_checkpoint(
             if isinstance(checkpoint_policy, Mapping)
             else None
         )
+        checkpoint_binding = checkpoint_plan.get("financial_eligibility_binding")
         if (
             checkpoint_mode != MainlandCapabilityRoutingMode.LEGACY.value
             and (
                 checkpoint_identity != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
                 or nested_identity != checkpoint_identity
+                or active_plan.financial_eligibility_binding is None
+                or checkpoint_binding
+                != active_plan.financial_eligibility_binding.model_dump(mode="json")
             )
         ):
             raise MainlandCapabilityRoutingCheckpointError(
@@ -634,6 +699,45 @@ def validate_mainland_capability_routing_checkpoint(
         )
     raise MainlandCapabilityRoutingCheckpointError(
         MainlandCapabilityRoutingCheckpointFailureReason.PLAN_MISMATCH
+    )
+
+
+def start_new_mainland_capability_routing_run(
+    *,
+    active_plan: MainlandCapabilityRoutingPlan,
+    checkpoint_plan: Mapping[str, Any] | MainlandCapabilityRoutingPlan,
+    previous_run_id: str,
+    new_run_id: str,
+) -> MainlandCapabilityRoutingCheckpointCompatibility:
+    """Explicitly classify a distinct v2 run after a typed policy mismatch."""
+
+    try:
+        validate_mainland_capability_routing_checkpoint(
+            active_plan=active_plan,
+            checkpoint_plan=checkpoint_plan,
+        )
+    except MainlandCapabilityRoutingCheckpointError as exc:
+        if exc.reason is not (
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        ):
+            raise
+    else:
+        raise ValueError("START_NEW requires a financial eligibility-policy mismatch")
+    try:
+        restored = MainlandCapabilityRoutingPlan.model_validate(checkpoint_plan)
+    except (TypeError, ValueError) as exc:
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.TAMPERED_PROJECTION
+        ) from exc
+    return MainlandCapabilityRoutingCheckpointCompatibility(
+        action=MainlandCapabilityRoutingCheckpointAction.START_NEW,
+        reason=(
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        ),
+        active=MainlandCapabilityRoutingRunProjection.from_plan(active_plan),
+        checkpoint=MainlandCapabilityRoutingRunProjection.from_plan(restored),
+        previous_run_id=previous_run_id,
+        new_run_id=new_run_id,
     )
 
 
@@ -911,11 +1015,17 @@ def _build_plan(
     }
     if mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
         eligibility_policy = build_mainland_financial_eligibility_policy_v2()
+        eligibility_binding = (
+            MainlandFinancialEligibilityProjectionBinding.from_policy(
+                eligibility_policy
+            )
+        )
         payload.update(
             eligibility_policy_version=(
                 eligibility_policy.eligibility_policy_version
             ),
             financial_eligibility_policy=eligibility_policy.model_dump(mode="json"),
+            financial_eligibility_binding=eligibility_binding.model_dump(mode="json"),
         )
     return MainlandCapabilityRoutingPlan(
         **payload,
@@ -1088,5 +1198,6 @@ __all__ = [
     "is_mainland_equity_configuration",
     "mainland_capability_routing_failure",
     "preflight_mainland_capability_routing",
+    "start_new_mainland_capability_routing_run",
     "validate_mainland_capability_routing_checkpoint",
 ]

@@ -42,7 +42,27 @@ class Propagator:
         fall back to ticker-only context via
         ``get_instrument_context_from_state``.
         """
-        return {
+        resolved_evidence = evidence_state or EvidenceState()
+        financial_eligibility_binding = (
+            capability_routing_plan.financial_eligibility_binding
+            if capability_routing_plan is not None
+            else None
+        )
+        if financial_eligibility_binding is not None:
+            if (
+                resolved_evidence.financial_eligibility_binding is not None
+                and resolved_evidence.financial_eligibility_binding
+                != financial_eligibility_binding
+            ):
+                raise ValueError(
+                    "Evidence State contradicts the financial eligibility binding"
+                )
+            resolved_evidence = resolved_evidence.model_copy(
+                update={
+                    "financial_eligibility_binding": financial_eligibility_binding
+                }
+            )
+        state = {
             "messages": [("human", company_name)],
             "company_of_interest": company_name,
             "asset_type": asset_type,
@@ -68,7 +88,7 @@ class Propagator:
             "trade_date": str(trade_date),
             "run_id": run_id,
             "past_context": past_context,
-            "evidence_state": (evidence_state or EvidenceState()).model_dump(mode="json"),
+            "evidence_state": resolved_evidence.model_dump(mode="json"),
             # Gate and selector payloads stay JSON-compatible because LangGraph
             # checkpoints serialize state independently of the in-memory models.
             "evidence_preflight": {},
@@ -114,6 +134,11 @@ class Propagator:
             "sentiment_report": "",
             "news_report": "",
         }
+        if financial_eligibility_binding is not None:
+            state["financial_eligibility_binding"] = (
+                financial_eligibility_binding.model_dump(mode="json")
+            )
+        return state
 
     def get_graph_args(
         self,

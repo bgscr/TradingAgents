@@ -90,7 +90,10 @@ from tradingagents.dataflows.financial_contracts import (
     assess_financial_ratio_history_coverage,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
+    MainlandFinancialEligibilityPolicyError,
+    MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
+    restore_mainland_financial_eligibility_projection_binding,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
@@ -126,6 +129,7 @@ FINANCIAL_TOOL_MESSAGE_ENVELOPE_VERSION = "1.0"
 FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
 FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION = "1.1"
 FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION = "1.2"
+FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION = "1.3"
 FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
 FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION = "2.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
@@ -493,6 +497,11 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
             != self.selection_request.instrument_identity
             or self.request_key.capability_routing_plan_signature
             != self.routing_result.manifest.capability_routing_plan_signature
+            or (
+                self.selection_request.financial_eligibility_binding is not None
+                and self.selection_request.financial_eligibility_binding
+                != self.routing_result.financial_eligibility_binding
+            )
             or self.rendered_value
             != render_statement_routing_result(self.routing_result)
         ):
@@ -563,6 +572,11 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             is not self.selection_request.requested_analysis_scope
             or self.routing_result.eligibility_policy_version
             != expected_eligibility_policy
+            or (
+                self.selection_request.financial_eligibility_binding is not None
+                and self.selection_request.financial_eligibility_binding
+                != self.routing_result.financial_eligibility_binding
+            )
         ):
             raise ValueError(
                 "qualified indicator selection analysis scope binding is invalid"
@@ -677,6 +691,7 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
         "financial_dispatch_checkpoint_routing_plan_mismatch"
     )
     RUN_SCOPE_MISMATCH = "financial_dispatch_checkpoint_run_scope_mismatch"
+    ELIGIBILITY_POLICY_MISMATCH = "financial_eligibility_policy_mismatch"
 
 
 class FinancialDispatchCheckpointError(ValueError):
@@ -806,7 +821,7 @@ class FinancialDispatchCheckpointLedger(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1", "1.2"] = (
+    contract_version: Literal["1.0", "1.1", "1.2", "1.3"] = (
         FINANCIAL_DISPATCH_LEDGER_VERSION
     )
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
@@ -825,6 +840,9 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$",
     )
     financial_manifest_version: Literal["financial-manifest-v2"] | None = None
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     run_scope_id: str | None = Field(
         default=None,
         pattern=ACQUISITION_TOKEN_PATTERN,
@@ -862,12 +880,30 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             for manifest in entry.terminal.routing_result.family_manifests
         )
         manifest_versions = {manifest.contract_version for manifest in manifests}
+        manifest_bindings = {
+            json.dumps(
+                manifest.financial_eligibility_binding.model_dump(mode="json"),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if manifest.financial_eligibility_binding is not None
+            else None
+            for manifest in manifests
+        }
         if not manifests:
             expected_version = FINANCIAL_DISPATCH_LEDGER_VERSION
         elif manifest_versions == {"financial-manifest-v1"}:
             expected_version = FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
         elif manifest_versions == {"financial-manifest-v2"}:
-            expected_version = FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+            if len(manifest_bindings) != 1:
+                raise ValueError(
+                    "financial checkpoint mixes eligibility projection bindings"
+                )
+            expected_version = (
+                FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                if None not in manifest_bindings
+                else FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+            )
         else:
             raise ValueError("financial checkpoint mixes manifest contract versions")
         if self.contract_version != expected_version:
@@ -877,9 +913,13 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         has_v2_identity = (
             self.capability_routing_plan_signature is not None
             or self.financial_manifest_version is not None
+            or self.financial_eligibility_binding is not None
             or self.run_scope_id is not None
         )
-        if expected_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+        if expected_version in {
+            FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+        }:
             signatures = {
                 manifest.capability_routing_plan_signature
                 for manifest in manifests
@@ -890,9 +930,25 @@ class FinancialDispatchCheckpointLedger(BaseModel):
                 or signatures != {self.capability_routing_plan_signature}
             ):
                 raise ValueError("financial checkpoint v2 identity binding is incomplete")
+            if expected_version == FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION:
+                if self.financial_eligibility_binding is None or any(
+                    manifest.financial_eligibility_binding
+                    != self.financial_eligibility_binding
+                    for manifest in manifests
+                ):
+                    raise ValueError(
+                        "financial checkpoint eligibility binding is incomplete"
+                    )
+            elif self.financial_eligibility_binding is not None:
+                raise ValueError(
+                    "historical v2 checkpoint carries a corrected eligibility binding"
+                )
         elif has_v2_identity:
             raise ValueError("legacy financial checkpoint carries v2 identity fields")
-        if expected_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+        if expected_version in {
+            FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+        }:
             assert_safe_financial_contract_payload(self.model_dump(mode="json"))
         return self
 
@@ -1098,14 +1154,17 @@ class FinancialCompletenessAuditRow(BaseModel):
             and self.local_provider_revision_identity != self.artifact_identity
         ):
             raise ValueError("financial completeness revision identity is contradictory")
-        if self.eligibility_policy_version is not None and (
-            self.requested_analysis_scope is None
-            or self.availability_scope is None
-            or self.availability_basis is None
-            or self.f_ann_date_state
-            != ("present" if self.f_ann_date is not None else "absent")
-        ):
-            raise ValueError("financial completeness availability is incomplete")
+        if self.eligibility_policy_version is not None:
+            if self.f_ann_date_state != (
+                "present" if self.f_ann_date is not None else "absent"
+            ):
+                raise ValueError("financial completeness availability is incomplete")
+            if self.capability is FinancialCapability.RATIO_FAMILY and (
+                self.requested_analysis_scope is None
+                or self.availability_scope is None
+                or self.availability_basis is None
+            ):
+                raise ValueError("financial completeness availability is incomplete")
         assert_safe_financial_projection(self.model_dump(mode="json"))
         return self
 
@@ -1179,6 +1238,9 @@ class FinancialManifestAuditProjection(BaseModel):
     financial_manifest_version: Literal["financial-manifest-v2"] = (
         "financial-manifest-v2"
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     capability: FinancialCapability
     statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     disposition: FinancialEvidenceDisposition
@@ -1267,6 +1329,9 @@ class FinancialDispatchAuditProjectionV2(BaseModel):
     financial_manifest_version: Literal["financial-manifest-v2"] = (
         "financial-manifest-v2"
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     request_count: int = Field(ge=0)
     logical_provider_count: int = Field(ge=0)
     logical_candidate_count: int = Field(ge=0)
@@ -1278,6 +1343,16 @@ class FinancialDispatchAuditProjectionV2(BaseModel):
 
     @model_validator(mode="after")
     def _validate_totals(self) -> FinancialDispatchAuditProjectionV2:
+        manifest_bindings = tuple(
+            manifest.financial_eligibility_binding
+            for request in self.manifest_requests
+            for manifest in request.manifests
+        )
+        if manifest_bindings and any(
+            binding != self.financial_eligibility_binding
+            for binding in manifest_bindings
+        ):
+            raise ValueError("financial audit eligibility binding is inconsistent")
         if self.request_count != len(self.requests) + len(self.manifest_requests):
             raise ValueError("financial manifest audit request count is inconsistent")
         if self.logical_provider_count != sum(
@@ -1317,6 +1392,9 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     capability: FinancialCapability
     statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     disposition: FinancialEvidenceDisposition
@@ -1384,6 +1462,9 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
     financial_manifest_version: Literal["financial-manifest-v2"] = (
         "financial-manifest-v2"
     )
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     logical_provider_count: int = Field(ge=0)
     logical_candidate_count: int = Field(ge=0)
     physical_request_count: int = Field(ge=0)
@@ -1408,6 +1489,12 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
             for manifest in self.manifests
         } != {self.capability_routing_plan_signature}:
             raise ValueError("financial ToolMessage routing-plan binding is invalid")
+        if any(
+            manifest.financial_eligibility_binding
+            != self.financial_eligibility_binding
+            for manifest in self.manifests
+        ):
+            raise ValueError("financial ToolMessage eligibility binding is invalid")
         if self.logical_candidate_count != len(
             {
                 candidate_id
@@ -1517,6 +1604,11 @@ class FinancialToolDispatcher:
             raise ValueError("qualified router contradicts Capability Routing Plan")
         self._capability_routing_plan_signature = (
             router_signature or capability_routing_plan_signature
+        )
+        self._financial_eligibility_binding = (
+            qualified_statement_router.routing_plan.financial_eligibility_binding
+            if qualified_statement_router is not None
+            else None
         )
         self._run_scope_id = run_scope_id
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -1758,6 +1850,33 @@ class FinancialToolDispatcher:
         router = self._qualified_statement_router
         if router is None:
             raise ValueError("qualified financial statement router is not configured")
+        binding = self._financial_eligibility_binding
+        if binding is not None:
+            if (
+                selection_request.eligibility_policy_version
+                != binding.eligibility_policy_version
+                or (
+                    selection_request.financial_eligibility_binding is not None
+                    and selection_request.financial_eligibility_binding != binding
+                )
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                )
+            if selection_request.financial_eligibility_binding is None:
+                selection_request = FinancialStatementRoutingRequest.model_validate(
+                    {
+                        **selection_request.model_dump(mode="python"),
+                        "financial_eligibility_binding": binding,
+                    }
+                )
+        elif (
+            selection_request.eligibility_policy_version is not None
+            or selection_request.financial_eligibility_binding is not None
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+            )
         if (
             request.statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
             or request.statement_type is not selection_request.statement_type
@@ -1857,6 +1976,33 @@ class FinancialToolDispatcher:
         router = self._qualified_statement_router
         if router is None:
             raise ValueError("qualified financial indicator router is not configured")
+        binding = self._financial_eligibility_binding
+        if binding is not None:
+            if (
+                selection_request.eligibility_policy_version
+                != binding.eligibility_policy_version
+                or (
+                    selection_request.financial_eligibility_binding is not None
+                    and selection_request.financial_eligibility_binding != binding
+                )
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                )
+            if selection_request.financial_eligibility_binding is None:
+                selection_request = FinancialIndicatorRoutingRequest.model_validate(
+                    {
+                        **selection_request.model_dump(mode="python"),
+                        "financial_eligibility_binding": binding,
+                    }
+                )
+        elif (
+            selection_request.eligibility_policy_version is not None
+            or selection_request.financial_eligibility_binding is not None
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+            )
         if (
             request.statement_type
             is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
@@ -2096,18 +2242,28 @@ class FinancialToolDispatcher:
             manifest.contract_version == "financial-manifest-v2"
             for manifest in qualified_manifests
         )
+        has_eligibility_binding = has_manifest_v2 and all(
+            manifest.financial_eligibility_binding
+            == self._financial_eligibility_binding
+            and manifest.financial_eligibility_binding is not None
+            for manifest in qualified_manifests
+        )
         if has_manifest_v2 and self._run_scope_id is None:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
             )
         ledger = FinancialDispatchCheckpointLedger(
             contract_version=(
-                FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
-                if has_manifest_v2
+                FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                if has_eligibility_binding
                 else (
-                    FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
-                    if qualified_entries or qualified_indicator_entries
-                    else FINANCIAL_DISPATCH_LEDGER_VERSION
+                    FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                    if has_manifest_v2
+                    else (
+                        FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+                        if qualified_entries or qualified_indicator_entries
+                        else FINANCIAL_DISPATCH_LEDGER_VERSION
+                    )
                 )
             ),
             acquisition_policy_version=self._acquisition_policy_version,
@@ -2138,6 +2294,11 @@ class FinancialToolDispatcher:
             financial_manifest_version=(
                 "financial-manifest-v2" if has_manifest_v2 else None
             ),
+            financial_eligibility_binding=(
+                self._financial_eligibility_binding
+                if has_eligibility_binding
+                else None
+            ),
             run_scope_id=self._run_scope_id if has_manifest_v2 else None,
             entries=tuple(entries),
             qualified_statement_selections=tuple(qualified_entries),
@@ -2150,6 +2311,8 @@ class FinancialToolDispatcher:
             payload.pop("capability_routing_plan_signature", None)
         if ledger.financial_manifest_version is None:
             payload.pop("financial_manifest_version", None)
+        if ledger.financial_eligibility_binding is None:
+            payload.pop("financial_eligibility_binding", None)
         if ledger.run_scope_id is None:
             payload.pop("run_scope_id", None)
         if not ledger.qualified_statement_selections:
@@ -2173,6 +2336,34 @@ class FinancialToolDispatcher:
         self,
         checkpoint_ledger: Mapping[str, Any] | FinancialDispatchCheckpointLedger,
     ) -> None:
+        if self._financial_eligibility_binding is not None:
+            raw_version = (
+                checkpoint_ledger.get("contract_version")
+                if isinstance(checkpoint_ledger, Mapping)
+                else checkpoint_ledger.contract_version
+            )
+            raw_binding = (
+                checkpoint_ledger.get("financial_eligibility_binding")
+                if isinstance(checkpoint_ledger, Mapping)
+                else checkpoint_ledger.financial_eligibility_binding
+            )
+            try:
+                restored_binding = (
+                    restore_mainland_financial_eligibility_projection_binding(
+                        raw_binding
+                    )
+                )
+            except MainlandFinancialEligibilityPolicyError as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                ) from exc
+            if (
+                raw_version != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                or restored_binding != self._financial_eligibility_binding
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                )
         try:
             ledger = FinancialDispatchCheckpointLedger.model_validate(checkpoint_ledger)
         except (TypeError, ValueError) as exc:
@@ -2184,7 +2375,10 @@ class FinancialToolDispatcher:
             raise FinancialDispatchCheckpointError(
 
                     FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
-                    if raw_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                    if raw_version in {
+                        FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+                        FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                    }
                     else FinancialDispatchCheckpointFailureReason.MALFORMED
 
             ) from exc
@@ -2206,7 +2400,10 @@ class FinancialToolDispatcher:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.POLICY_MISMATCH
             )
-        if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+        if ledger.contract_version in {
+            FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+        }:
             if ledger.run_scope_id != self._run_scope_id:
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
@@ -2325,7 +2522,10 @@ class FinancialToolDispatcher:
                     router=router,
                     require_complete_attempt_events=(
                         ledger.contract_version
-                        == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                        in {
+                            FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                        }
                     ),
                 )
             except (TypeError, ValueError) as exc:
@@ -2388,7 +2588,10 @@ class FinancialToolDispatcher:
                     router=router,
                     require_complete_attempt_events=(
                         ledger.contract_version
-                        == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                        in {
+                            FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                        }
                     ),
                 )
             except (TypeError, ValueError) as exc:
@@ -3214,6 +3417,9 @@ def _financial_tool_manifest_envelope(
         capability_routing_plan_signature=(
             dispatch_result.request_key.capability_routing_plan_signature
         ),
+        financial_eligibility_binding=(
+            routing_result.financial_eligibility_binding
+        ),
         logical_provider_count=len(provider_calls),
         logical_candidate_count=len(
             {
@@ -3319,6 +3525,9 @@ def _project_manifest_for_tool(
         capability_routing_plan_signature=(
             manifest.capability_routing_plan_signature
         ),
+        financial_eligibility_binding=(
+            manifest.financial_eligibility_binding
+        ),
         capability=manifest.requested_capability,
         statement_or_ratio_family=_manifest_family(manifest),
         disposition=manifest.disposition,
@@ -3380,6 +3589,9 @@ def _project_manifest_for_audit(
         manifest_identity=manifest.manifest_identity,
         capability_routing_plan_signature=(
             manifest.capability_routing_plan_signature
+        ),
+        financial_eligibility_binding=(
+            manifest.financial_eligibility_binding
         ),
         capability=manifest.requested_capability,
         statement_or_ratio_family=_manifest_family(manifest),
@@ -4105,6 +4317,14 @@ def project_financial_selection_evidence(
         for manifest in manifests
     ):
         return current
+    bindings = tuple(
+        manifest.financial_eligibility_binding for manifest in manifests
+    )
+    if not bindings or any(binding != bindings[0] for binding in bindings) or (
+        current.financial_eligibility_binding is not None
+        and bindings[0] != current.financial_eligibility_binding
+    ):
+        raise ValueError("financial selection eligibility binding is contradictory")
     attempt_events = {
         event.attempt_event_id: event
         for manifest in manifests
@@ -4148,6 +4368,7 @@ def project_financial_selection_evidence(
             raise ValueError("financial Source Artifact identity is contradictory")
         artifact_by_sha.setdefault(artifact.artifact_sha256, artifact)
     payload = current.model_dump(mode="python")
+    payload["financial_eligibility_binding"] = bindings[0]
     payload["instrument_identity"] = expected_identity
     payload["source_artifacts"] = tuple(artifact_by_sha.values())
     current_analysis_facts = tuple(
@@ -4393,7 +4614,10 @@ def _validate_financial_dispatch_audit_integrity(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
         )
-    if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+    if ledger.contract_version in {
+        FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+        FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+    }:
         if run_scope_id != ledger.run_scope_id:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
@@ -4405,6 +4629,18 @@ def _validate_financial_dispatch_audit_integrity(
         ):
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+            )
+        if (
+            ledger.contract_version
+            == FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+            and (
+                capability_routing_plan.financial_eligibility_binding is None
+                or ledger.financial_eligibility_binding
+                != capability_routing_plan.financial_eligibility_binding
+            )
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
             )
         return
     effective_config = config
@@ -4508,7 +4744,10 @@ def project_financial_dispatch_ledger(
                 outcomes=tuple(outcomes),
             )
         )
-    if ledger.contract_version == FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION:
+    if ledger.contract_version in {
+        FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+        FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+    }:
         manifest_requests: list[FinancialManifestAuditRequest] = []
         completeness_rows: list[FinancialCompletenessAuditRow] = []
         for entry in sorted(
@@ -4543,6 +4782,9 @@ def project_financial_dispatch_ledger(
         return FinancialDispatchAuditProjectionV2(
             capability_routing_plan_signature=(
                 ledger.capability_routing_plan_signature
+            ),
+            financial_eligibility_binding=(
+                ledger.financial_eligibility_binding
             ),
             request_count=len(requests) + len(manifest_requests),
             logical_provider_count=sum(

@@ -438,7 +438,7 @@ def build_decision_audit(
     if not created_at:
         created_at = datetime.now(timezone.utc).isoformat()
         final_state["decision_audit_created_at"] = created_at
-    EvidenceState.model_validate(final_state.get("evidence_state", {}))
+    evidence = EvidenceState.model_validate(final_state.get("evidence_state", {}))
     analysis_outcome_contract = final_state.get("analysis_outcome_contract")
     if analysis_outcome_contract is not None:
         analysis_outcome_contract = AnalysisOutcome.model_validate(
@@ -527,6 +527,24 @@ def build_decision_audit(
             capability_routing_rollout = expected_rollout
         elif capability_routing_rollout != expected_rollout:
             raise ValueError("routing rollout projection contradicts its plan")
+    expected_financial_binding = (
+        capability_routing_plan.financial_eligibility_binding
+        if capability_routing_plan is not None
+        else None
+    )
+    raw_financial_binding = final_state.get("financial_eligibility_binding")
+    if expected_financial_binding is None:
+        if raw_financial_binding is not None:
+            raise ValueError("legacy run carries a synthetic eligibility binding")
+    elif (
+        raw_financial_binding
+        != expected_financial_binding.model_dump(mode="json")
+        or evidence.financial_eligibility_binding
+        != expected_financial_binding
+        or _evidence_projection.financial_eligibility_binding
+        != expected_financial_binding
+    ):
+        raise ValueError("financial eligibility projections contradict the routing plan")
     raw_checkpoint_compatibility = final_state.get(
         "capability_routing_checkpoint_compatibility"
     )
@@ -543,6 +561,13 @@ def build_decision_audit(
         != capability_routing_rollout
     ):
         raise ValueError("checkpoint compatibility contradicts the active rollout")
+    if (
+        capability_routing_checkpoint_compatibility is not None
+        and capability_routing_checkpoint_compatibility.new_run_id is not None
+        and capability_routing_checkpoint_compatibility.new_run_id
+        != final_state.get("run_id")
+    ):
+        raise ValueError("checkpoint compatibility contradicts the new run identity")
     raw_shadow_failure = final_state.get("financial_dispatch_shadow_failure")
     shadow_failure = (
         None
@@ -599,6 +624,11 @@ def build_decision_audit(
         )
     ):
         raise ValueError("shadow financial dispatch requires a shadow rollout plan")
+    if financial_dispatch_shadow is not None and (
+        financial_dispatch_shadow.financial_eligibility_binding
+        != expected_financial_binding
+    ):
+        raise ValueError("shadow financial audit eligibility binding is invalid")
     if (
         capability_routing_plan is not None
         and capability_routing_plan.mode
@@ -645,6 +675,11 @@ def build_decision_audit(
         "financial_dispatch_shadow_failure": (
             shadow_failure.model_dump(mode="json")
             if shadow_failure is not None
+            else None
+        ),
+        "financial_eligibility_binding": (
+            expected_financial_binding.model_dump(mode="json")
+            if expected_financial_binding is not None
             else None
         ),
         "asset_configuration": (

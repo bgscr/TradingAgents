@@ -13,6 +13,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MainlandFinancialEligibilityProjectionBinding,
+)
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     CalculationLineage,
@@ -265,6 +268,9 @@ class AuditEvidenceProjection(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = SOURCE_ARTIFACT_MANIFEST_VERSION
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: AuditInstrumentIdentity | None = None
     market_snapshot: AuditMarketSnapshot | None = None
     artifact_manifest: SourceArtifactManifest
@@ -590,6 +596,7 @@ def project_evidence_for_audit(
         )
 
     return AuditEvidenceProjection(
+        financial_eligibility_binding=evidence.financial_eligibility_binding,
         instrument_identity=projected_identity,
         market_snapshot=projected_snapshot,
         artifact_manifest=canonical_manifest,

@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -120,6 +121,60 @@ class TestCheckpointResume(unittest.TestCase):
 
         # analyst added 1, trader added 10 → 11
         self.assertEqual(result["count"], 11)
+
+    def test_trading_graph_resume_uses_checkpoint_state_without_reacquiring_evidence(self):
+        from tradingagents.graph.propagation import Propagator
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        checkpoint_state = {
+            "run_id": "run:" + "a" * 64,
+            "company_of_interest": self.ticker,
+            "trade_date": self.date,
+        }
+        graph_config = {"configurable": {"thread_id": "ticket-06-resume"}}
+
+        class ResumeProbeGraph:
+            def get_state(self, config):
+                self_outer.assertEqual(config, graph_config)
+                return SimpleNamespace(values=checkpoint_state)
+
+            def invoke(self, graph_input, **kwargs):
+                self_outer.assertIsNone(graph_input)
+                self_outer.assertEqual(
+                    kwargs["config"]["configurable"]["run_id"],
+                    checkpoint_state["run_id"],
+                )
+                self_outer.assertEqual(
+                    kwargs["config"]["configurable"]["thread_id"],
+                    "ticket-06-resume",
+                )
+                raise RuntimeError("resume probe reached graph invocation")
+
+        self_outer = self
+        graph = object.__new__(TradingAgentsGraph)
+        graph.graph = ResumeProbeGraph()
+        graph.propagator = Propagator()
+        graph.debug = False
+        graph.config = {"checkpoint_enabled": True}
+        graph.memory_log = SimpleNamespace(
+            get_past_context=lambda _ticker: self.fail(
+                "checkpoint resume reacquired memory context"
+            )
+        )
+        graph.resolve_evidence_state = lambda *_args: self.fail(
+            "checkpoint resume reacquired provider evidence"
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "resume probe reached graph invocation",
+        ):
+            graph._run_graph(
+                self.ticker,
+                self.date,
+                resume_from_checkpoint=True,
+                checkpoint_graph_config=graph_config,
+            )
 
     def test_financial_success_resume_reuses_terminal_without_provider_io(self):
         asset_configuration = resolve_run_asset_configuration(

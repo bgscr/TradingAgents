@@ -6,7 +6,7 @@ from decimal import Decimal
 from hashlib import sha256
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage
 
 from tests.test_financial_capability_routing_selection import (
     _ANNUAL_PERIODS,
@@ -1868,7 +1868,7 @@ def test_checkpoint_replay_admits_only_observed_strict_pit_periods(
     assert current_row.pit_eligible is False
 
 
-def test_graph_persists_v2_manifest_and_evidence_without_repeating_io(
+def test_historical_qualified_graph_injection_is_rejected_without_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset = resolve_run_asset_configuration(
@@ -1956,36 +1956,9 @@ def test_graph_persists_v2_manifest_and_evidence_without_repeating_io(
         "run_id": "ticket-11-graph",
     }
 
-    first = node(state)
-    restored = node(
-        {
-            **state,
-            "evidence_state": first["evidence_state"],
-            "financial_dispatch_ledger": first[
-                "financial_dispatch_ledger"
-            ],
-        }
+    with pytest.raises(FinancialDispatchCheckpointError) as caught:
+        node(state)
+    assert caught.value.reason is (
+        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
     )
-
-    assert calls == 1
-    message = next(
-        item for item in first["messages"] if isinstance(item, ToolMessage)
-    )
-    assert message.artifact["contract_version"] == (
-        "financial-tool-message-envelope-v2"
-    )
-    assert first["financial_dispatch_ledger"]["contract_version"] == "1.2"
-    assert first["financial_dispatch_ledger"]["run_scope_id"] == (
-        "ticket-11-graph"
-    )
-    evidence = EvidenceState.model_validate(first["evidence_state"])
-    assert evidence.physical_attempt_count == 1
-    assert len(evidence.source_facts) == len(candidate.fields)
-    assert (
-        restored["financial_dispatch_ledger"][
-            "qualified_statement_selections"
-        ][0]["terminal"]["routing_result"]
-        == first["financial_dispatch_ledger"][
-            "qualified_statement_selections"
-        ][0]["terminal"]["routing_result"]
-    )
+    assert calls == 0

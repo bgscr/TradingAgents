@@ -36,6 +36,8 @@ from tradingagents.asset_configuration import (
 from tradingagents.capability_routing import (
     MainlandCapabilityRoutingCheckpointAction,
     MainlandCapabilityRoutingCheckpointCompatibility,
+    MainlandCapabilityRoutingCheckpointError,
+    MainlandCapabilityRoutingCheckpointFailureReason,
     MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingPreflightError,
@@ -44,6 +46,7 @@ from tradingagents.capability_routing import (
     is_mainland_equity_configuration,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
+    start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
 from tradingagents.dataflows.config import set_config
@@ -129,6 +132,14 @@ def _coerce_max_retries(value):
     if n < 0:
         raise ValueError(f"llm_max_retries must be >= 0, got {n}")
     return n
+
+
+def _checkpoint_run_id(checkpoint_thread_id: str) -> str:
+    """Derive the canonical run identity bound to one checkpoint thread."""
+
+    return "run:" + sha256(
+        f"checkpoint:{checkpoint_thread_id}".encode()
+    ).hexdigest()
 
 
 def _render_recoverable_vendor_error(exc: VendorError) -> str:
@@ -856,7 +867,7 @@ class TradingAgentsGraph:
         )
         if run_id is None:
             if self.config.get("checkpoint_enabled"):
-                run_seed = "checkpoint:" + (
+                checkpoint_identity = (
                     checkpoint_thread_id
                     or thread_id(
                         company_name,
@@ -864,6 +875,7 @@ class TradingAgentsGraph:
                         self._run_signature(asset_type),
                     )
                 )
+                run_id = _checkpoint_run_id(checkpoint_identity)
             else:
                 run_seed = "|".join(
                     (
@@ -874,7 +886,7 @@ class TradingAgentsGraph:
                         stable_evidence_semantic_digest(evidence_state),
                     )
                 )
-            run_id = f"run:{sha256(run_seed.encode('utf-8')).hexdigest()}"
+                run_id = f"run:{sha256(run_seed.encode('utf-8')).hexdigest()}"
         if not is_canonical_run_id(run_id):
             raise ValueError("run_id must be a canonical run ID")
         checkpoint_graph_identity = self._run_signature(asset_type)
@@ -1080,6 +1092,7 @@ class TradingAgentsGraph:
                         and active_plan.mode.value != "legacy"
                     ):
                         pending_legacy_compatibility = None
+                        pending_policy_compatibility = None
                         active_graph_identity = self._run_signature(
                             asset_type,
                             include_capability_routing=False,
@@ -1135,19 +1148,47 @@ class TradingAgentsGraph:
                                     and candidate_plan.mode.value != "legacy"
                                 ):
                                     continue
-                            routing_compatibility = (
-                                validate_mainland_capability_routing_checkpoint(
-                                    active_plan=active_plan,
-                                    checkpoint_plan=raw_candidate_plan,
+                            try:
+                                routing_compatibility = (
+                                    validate_mainland_capability_routing_checkpoint(
+                                        active_plan=active_plan,
+                                        checkpoint_plan=raw_candidate_plan,
+                                    )
                                 )
-                            )
+                            except MainlandCapabilityRoutingCheckpointError as exc:
+                                if exc.reason is not (
+                                    MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+                                ):
+                                    raise
+                                previous_run_id = values.get("run_id")
+                                if not isinstance(
+                                    previous_run_id, str
+                                ) or not is_canonical_run_id(previous_run_id):
+                                    raise MainlandCapabilityRoutingCheckpointError(
+                                        MainlandCapabilityRoutingCheckpointFailureReason.TAMPERED_PROJECTION
+                                    ) from exc
+                                new_thread_id = str(
+                                    graph_config["configurable"]["thread_id"]
+                                )
+                                pending_policy_compatibility = (
+                                    start_new_mainland_capability_routing_run(
+                                        active_plan=active_plan,
+                                        checkpoint_plan=raw_candidate_plan,
+                                        previous_run_id=previous_run_id,
+                                        new_run_id=_checkpoint_run_id(new_thread_id),
+                                    )
+                                )
+                                routing_compatibility = None
+                                continue
                             if (
                                 routing_compatibility.action
                                 is MainlandCapabilityRoutingCheckpointAction.START_NEW
                             ):
                                 pending_legacy_compatibility = routing_compatibility
                                 routing_compatibility = None
-                        if routing_compatibility is None:
+                        if pending_policy_compatibility is not None:
+                            routing_compatibility = pending_policy_compatibility
+                        elif routing_compatibility is None:
                             routing_compatibility = pending_legacy_compatibility
                     logger.info(
                         "Starting fresh for %s on %s",
@@ -1273,20 +1314,33 @@ class TradingAgentsGraph:
             ).get("thread_id")
             if checkpoint_thread_id is not None:
                 checkpoint_thread_id = str(checkpoint_thread_id)
-        past_context = self.memory_log.get_past_context(company_name)
-        evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
-        init_agent_state = self.create_initial_state(
-            company_name,
-            trade_date,
-            asset_type=asset_type,
-            evidence_state=evidence_state,
-            past_context=past_context,
-            checkpoint_thread_id=checkpoint_thread_id,
-        )
-        if routing_checkpoint_compatibility is not None:
-            init_agent_state["capability_routing_checkpoint_compatibility"] = (
-                routing_checkpoint_compatibility.model_dump(mode="json")
+        if resume_from_checkpoint:
+            if checkpoint_graph_config is None:
+                raise ValueError("checkpoint graph config is required to resume")
+            initial_merge_state = dict(
+                self.graph.get_state(checkpoint_graph_config).values
             )
+            run_id = initial_merge_state.get("run_id")
+            if not isinstance(run_id, str):
+                raise ValueError("checkpoint state is missing its run identity")
+            init_agent_state = None
+        else:
+            past_context = self.memory_log.get_past_context(company_name)
+            evidence_state = self.resolve_evidence_state(company_name, str(trade_date))
+            init_agent_state = self.create_initial_state(
+                company_name,
+                trade_date,
+                asset_type=asset_type,
+                evidence_state=evidence_state,
+                past_context=past_context,
+                checkpoint_thread_id=checkpoint_thread_id,
+            )
+            if routing_checkpoint_compatibility is not None:
+                init_agent_state["capability_routing_checkpoint_compatibility"] = (
+                    routing_checkpoint_compatibility.model_dump(mode="json")
+                )
+            initial_merge_state = init_agent_state
+            run_id = init_agent_state["run_id"]
         telemetry_ledger = get_active_run_telemetry()
         telemetry_callbacks = (
             [RunTelemetryCallbackHandler(telemetry_ledger)]
@@ -1295,7 +1349,7 @@ class TradingAgentsGraph:
         )
         args = self.propagator.get_graph_args(
             callbacks=telemetry_callbacks,
-            run_id=init_agent_state["run_id"],
+            run_id=run_id,
         )
 
         # Inject thread_id so same ticker+date+graph-shape resumes; a different
@@ -1325,11 +1379,15 @@ class TradingAgentsGraph:
                     trace.append(chunk)
             # Streamed chunks are per-node deltas. Merge them so the returned
             # state matches what graph.invoke() yields in the non-debug path.
-            final_state = dict(init_agent_state)
+            final_state = dict(initial_merge_state)
             for chunk in trace:
                 final_state.update(chunk)
         else:
             final_state = self.graph.invoke(graph_input, **args)
+        if routing_checkpoint_compatibility is not None:
+            final_state["capability_routing_checkpoint_compatibility"] = (
+                routing_checkpoint_compatibility.model_dump(mode="json")
+            )
 
         # The audit is a critical terminal artifact: publish it before exposing
         # a directional decision to memory, signal processing, or the caller.

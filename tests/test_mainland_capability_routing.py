@@ -807,6 +807,7 @@ def test_audit_projection_round_trips_the_safe_plan(
         raw_text=asset_configuration.registry_artifact,
     )
     evidence = EvidenceState(
+        financial_eligibility_binding=plan.financial_eligibility_binding,
         instrument_identity=asset_configuration.instrument_identity,
         source_artifacts=(identity_artifact,),
         acquisition_outcomes=(
@@ -841,6 +842,9 @@ def test_audit_projection_round_trips_the_safe_plan(
         "evidence_gate_mode": "enforce",
         "asset_configuration": asset_configuration.model_dump(mode="json"),
         "capability_routing_plan": plan.model_dump(mode="json"),
+        "financial_eligibility_binding": (
+            plan.financial_eligibility_binding.model_dump(mode="json")
+        ),
         "evidence_state": evidence.model_dump(mode="json"),
         "evidence_preflight": {
             "passed": False,

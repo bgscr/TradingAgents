@@ -59,6 +59,12 @@ class AgentState(MessagesState):
         dict[str, Any] | None,
         "Checkpoint-safe rollout mode and authority disposition for this run",
     ]
+    financial_eligibility_binding: NotRequired[
+        Annotated[
+            dict[str, Any],
+            "Closed corrected-v2 financial policy and projection inventory",
+        ]
+    ]
     capability_routing_checkpoint_compatibility: NotRequired[
         Annotated[
             dict[str, Any],

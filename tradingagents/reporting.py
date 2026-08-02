@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import TypeAdapter
 
 from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingCheckpointCompatibility,
     MainlandCapabilityRoutingDisposition,
     MainlandCapabilityRoutingRunProjection,
     MainlandCapabilityRoutingShadowFailure,
@@ -276,6 +277,8 @@ def _render_market_snapshot_binding(evidence: EvidenceState) -> list[str]:
 
 def _render_financial_dispatch_operations(
     financial_dispatch: FinancialDispatchAuditProjection | None,
+    *,
+    include_candidate_identities: bool = True,
 ) -> list[str]:
     if financial_dispatch is None:
         return []
@@ -310,6 +313,55 @@ def _render_financial_dispatch_operations(
             ),
             "",
         ]
+        binding = financial_dispatch.financial_eligibility_binding
+        if binding is not None:
+            lines[2:2] = [
+                (
+                    "- **Eligibility binding contract:** "
+                    f"`{binding.contract_version}`"
+                ),
+                (
+                    "- **Eligibility policy version:** "
+                    f"`{binding.eligibility_policy_version}`"
+                ),
+                (
+                    "- **Reporting calendar/deadline contract:** "
+                    f"`{binding.reporting_calendar_deadline_contract_identity}`"
+                ),
+                (
+                    "- **Target-construction contract:** "
+                    f"`{binding.target_construction_contract_identity}`"
+                ),
+                (
+                    "- **Completeness-policy identity:** "
+                    f"`{binding.completeness_policy_identity}`"
+                ),
+                (
+                    "- **Candidate-selection contract:** "
+                    f"`{binding.candidate_selection_contract_identity}`"
+                ),
+                (
+                    "- **Checkpoint projection:** "
+                    f"`{binding.checkpoint_projection_version}`"
+                ),
+                (
+                    "- **Audit projection:** "
+                    f"`{binding.audit_projection_version}`"
+                ),
+                (
+                    "- **Report projection:** "
+                    f"`{binding.report_projection_version}`"
+                ),
+                (
+                    "- **Availability-scope contract:** "
+                    f"`{binding.availability_scope}`"
+                ),
+                (
+                    "- **Rollout authority disposition:** "
+                    f"`{binding.rollout_authority_disposition}`"
+                ),
+                f"- **Eligibility policy signature:** `{binding.policy_signature}`",
+            ]
         for request in financial_dispatch.manifest_requests:
             lines.extend(
                 [
@@ -528,6 +580,84 @@ def _render_financial_dispatch_operations(
                             f"`{manifest.availability_reason.value if manifest.availability_reason is not None else 'none'}`",
                         ]
                     )
+                targets = manifest.publication_target_construction
+                if targets is not None:
+                    lines.extend(
+                        [
+                            "  - Annual publication frontier: "
+                            + (
+                                targets.annual_publication_frontier.isoformat()
+                                if targets.annual_publication_frontier is not None
+                                else "none"
+                            ),
+                            "  - Reporting publication frontier: "
+                            + (
+                                targets.reporting_publication_frontier.isoformat()
+                                if targets.reporting_publication_frontier is not None
+                                else "none"
+                            ),
+                            "  - Annual target periods: "
+                            + (
+                                ", ".join(
+                                    period.isoformat()
+                                    for period in targets.annual_target_period_ends
+                                )
+                                or "none"
+                            ),
+                            "  - Reporting target periods: "
+                            + (
+                                ", ".join(
+                                    period.isoformat()
+                                    for period in targets.reporting_target_period_ends
+                                )
+                                or "none"
+                            ),
+                            "  - Target evidence integrity status: "
+                            f"`{targets.evidence_integrity_status}`",
+                            "  - Target failure reason: "
+                            f"`{targets.failure_reason.value if targets.failure_reason is not None else 'none'}`",
+                        ]
+                    )
+                    for excluded in targets.excluded_periods:
+                        lines.append(
+                            "  - Excluded publication period: "
+                            f"{excluded.period_end.isoformat()} / "
+                            f"`{excluded.publication_state.value}` / deadline "
+                            f"{excluded.filing_deadline.isoformat()} / announcements "
+                            + (
+                                ", ".join(
+                                    value.isoformat()
+                                    for value in excluded.valid_announcement_dates
+                                )
+                                or "none"
+                            )
+                        )
+                    for proof in targets.publication_evidence_bindings:
+                        proof_identity = (
+                            f"`{proof.candidate_identity}` / "
+                            if include_candidate_identities
+                            else ""
+                        )
+                        lines.append(
+                            "  - Publication proof binding: "
+                            f"{proof.period_end.isoformat()} / "
+                            f"{proof.ann_date.isoformat()} / `{proof.provider_id}` / "
+                            f"{proof_identity}`{proof.artifact_identity}`"
+                        )
+                    exception = targets.since_listing_exception
+                    if exception is not None:
+                        lines.extend(
+                            [
+                                "  - Since-listing exception: "
+                                f"`{exception.reason}` / supported="
+                                f"{_format_scalar(exception.supported)}",
+                                "  - Since-listing provenance: "
+                                f"{exception.listing_date.isoformat()} / "
+                                f"`{exception.listing_provenance.provider_id}` / "
+                                f"`{exception.listing_provenance.source_ref}` / "
+                                f"{exception.listing_provenance.observed_at.isoformat()}",
+                            ]
+                        )
                 for artifact_identity in manifest.artifact_identities:
                     lines.append(
                         "  - Retained provider artifact identity: "
@@ -546,10 +676,15 @@ def _render_financial_dispatch_operations(
                         f"`{selection.artifact_identity}`"
                     )
                 for revision_selection in manifest.revision_selections:
+                    winner_identity = (
+                        revision_selection.selected_candidate_identity
+                        if include_candidate_identities
+                        else revision_selection.selected_artifact_identity
+                    )
                     lines.append(
                         "  - Revision selection: "
                         f"`{revision_selection.selection_key_identity}` / "
-                        f"winner `{revision_selection.selected_candidate_identity}` / "
+                        f"winner `{winner_identity}` / "
                         f"route rank {revision_selection.selected_provider_route_rank} / "
                         f"`{revision_selection.ordering_basis}` / "
                         f"`{revision_selection.chronology_claim}` / "
@@ -561,17 +696,27 @@ def _render_financial_dispatch_operations(
                     for candidate_disposition in (
                         revision_selection.candidate_dispositions
                     ):
+                        observation_identity = (
+                            candidate_disposition.candidate_identity
+                            if include_candidate_identities
+                            else candidate_disposition.artifact_identity
+                        )
                         lines.append(
                             "    - Revision observation: "
-                            f"`{candidate_disposition.candidate_identity}` / "
-                            f"`{candidate_disposition.artifact_identity}` / "
+                            f"`{observation_identity}` / "
+                            f"`{candidate_disposition.provider_id}` / "
                             f"route rank {candidate_disposition.provider_route_rank} / "
                             f"`{candidate_disposition.disposition}`"
                         )
                 for rejection in manifest.rejected_periods:
+                    rejection_identity = (
+                        rejection.candidate_identity
+                        if include_candidate_identities
+                        else rejection.artifact_identity
+                    )
                     lines.append(
-                        "  - Rejected candidate: "
-                        f"`{rejection.candidate_identity}` "
+                        "  - Rejected revision: "
+                        f"`{rejection_identity}` "
                         f"({', '.join(reason.value for reason in rejection.reasons)})"
                     )
                 for outcome in manifest.acquisition_outcomes:
@@ -581,10 +726,15 @@ def _render_financial_dispatch_operations(
                         f"`{outcome.reason.value if outcome.reason else 'available'}`"
                     )
                 for overlap in manifest.overlaps:
+                    overlap_reference = (
+                        overlap.overlapping_candidate_identity
+                        if include_candidate_identities
+                        else overlap.overlap_identity
+                    )
                     lines.append(
                         "  - Overlap: "
                         f"`{overlap.disposition}` / "
-                        f"`{overlap.overlapping_candidate_identity}`"
+                        f"`{overlap_reference}`"
                     )
                 for conflict in manifest.conflicts:
                     lines.append(
@@ -792,7 +942,7 @@ def _render_shadow_financial_dispatch_comparison(
     shadow: FinancialDispatchAuditProjection | None,
     failure: MainlandCapabilityRoutingShadowFailure | None = None,
 ) -> list[str]:
-    """Render bounded shadow coverage without provider rows or candidate identities."""
+    """Render non-authoritative shadow coverage and its audit-only operations."""
 
     if shadow is None and failure is None:
         return []
@@ -841,6 +991,61 @@ def _render_shadow_financial_dispatch_comparison(
         lines[-1:-1] = [
             f"- **Sanitized shadow failures:** {failure.failure_count}",
         ]
+    if shadow is not None:
+        shadow_operations = _render_financial_dispatch_operations(
+            shadow,
+            include_candidate_identities=False,
+        )
+        if shadow_operations:
+            shadow_operations[0] = (
+                "## Qualified routing shadow financial operations "
+                "(non-authoritative)"
+            )
+            shadow_operations[2:2] = [
+                "These audit-only shadow rows create no authoritative Source Facts, "
+                "Decision Gate changes, Trading Decisions, signals, or memory writes.",
+                "",
+            ]
+            lines.extend(shadow_operations)
+    return lines
+
+
+def _render_checkpoint_compatibility(
+    compatibility: MainlandCapabilityRoutingCheckpointCompatibility | None,
+) -> list[str]:
+    if compatibility is None:
+        return []
+    lines = [
+        "## Checkpoint / new-run compatibility",
+        "",
+        f"- **Compatibility action:** `{compatibility.action.value}`",
+        (
+            "- **Typed compatibility reason:** `"
+            + (
+                compatibility.reason.value
+                if compatibility.reason is not None
+                else "none"
+            )
+            + "`"
+        ),
+        (
+            "- **Provider I/O during compatibility check:** "
+            f"{_format_scalar(compatibility.provider_io_performed)}"
+        ),
+        (
+            "- **Checkpoint rewrite permitted:** "
+            f"{_format_scalar(compatibility.checkpoint_rewrite_permitted)}"
+        ),
+        (
+            "- **Historical state preserved:** "
+            f"{_format_scalar(compatibility.historical_state_preserved)}"
+        ),
+    ]
+    if compatibility.previous_run_id is not None:
+        lines.append(f"- **Previous run ID:** `{compatibility.previous_run_id}`")
+    if compatibility.new_run_id is not None:
+        lines.append(f"- **New run ID:** `{compatibility.new_run_id}`")
+    lines.append("")
     return lines
 
 
@@ -851,6 +1056,9 @@ def render_decision_report(
     financial_dispatch: FinancialDispatchAuditProjection | None = None,
     *,
     capability_routing_rollout: MainlandCapabilityRoutingRunProjection | None = None,
+    checkpoint_compatibility: (
+        MainlandCapabilityRoutingCheckpointCompatibility | None
+    ) = None,
     shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
     shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
 ) -> str:
@@ -889,6 +1097,7 @@ def render_decision_report(
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend(_render_financial_dispatch_operations(financial_dispatch))
+    lines.extend(_render_checkpoint_compatibility(checkpoint_compatibility))
     lines.extend(
         _render_shadow_financial_dispatch_comparison(
             capability_routing_rollout,
@@ -928,6 +1137,9 @@ def render_analysis_outcome_report(
     financial_dispatch: FinancialDispatchAuditProjection | None = None,
     *,
     capability_routing_rollout: MainlandCapabilityRoutingRunProjection | None = None,
+    checkpoint_compatibility: (
+        MainlandCapabilityRoutingCheckpointCompatibility | None
+    ) = None,
     shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
     shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
 ) -> str:
@@ -947,6 +1159,7 @@ def render_analysis_outcome_report(
         lines.extend(_render_market_snapshot_binding(evidence))
         lines.extend(_render_acquisition_outcomes(evidence))
     lines.extend(_render_financial_dispatch_operations(financial_dispatch))
+    lines.extend(_render_checkpoint_compatibility(checkpoint_compatibility))
     lines.extend(
         _render_shadow_financial_dispatch_comparison(
             capability_routing_rollout,
@@ -1017,6 +1230,16 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
         if raw_rollout is None
         else MainlandCapabilityRoutingRunProjection.model_validate(raw_rollout)
     )
+    raw_checkpoint_compatibility = final_state.get(
+        "capability_routing_checkpoint_compatibility"
+    )
+    checkpoint_compatibility = (
+        None
+        if raw_checkpoint_compatibility is None
+        else MainlandCapabilityRoutingCheckpointCompatibility.model_validate(
+            raw_checkpoint_compatibility
+        )
+    )
     raw_shadow_failure = final_state.get("financial_dispatch_shadow_failure")
     shadow_failure = (
         None
@@ -1039,6 +1262,7 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             evidence,
             financial_dispatch,
             capability_routing_rollout=capability_routing_rollout,
+            checkpoint_compatibility=checkpoint_compatibility,
             shadow_financial_dispatch=shadow_financial_dispatch,
             shadow_failure=shadow_failure,
         )
@@ -1051,6 +1275,7 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             evidence,
             financial_dispatch,
             capability_routing_rollout=capability_routing_rollout,
+            checkpoint_compatibility=checkpoint_compatibility,
             shadow_financial_dispatch=shadow_financial_dispatch,
             shadow_failure=shadow_failure,
         )

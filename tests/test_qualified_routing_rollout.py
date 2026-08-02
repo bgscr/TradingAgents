@@ -40,6 +40,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingRunProjection,
     TushareCapability,
     preflight_mainland_capability_routing,
+    start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
 from tradingagents.dataflows.financial_capability_routing import (
@@ -52,6 +53,10 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialConsolidationScope,
     FinancialReportingFrequency,
     FinancialStatementType,
+)
+from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchCheckpointError,
+    FinancialDispatchCheckpointFailureReason,
 )
 from tradingagents.decision_audit import prepare_decision_audit
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -123,6 +128,7 @@ def _preflight(
     historical_payload["manifest_contract_version"] = "financial-manifest-v1"
     historical_payload.pop("eligibility_policy_version")
     historical_payload.pop("financial_eligibility_policy")
+    historical_payload.pop("financial_eligibility_binding")
     _resign_plan_payload(historical_payload)
     return MainlandCapabilityRoutingPreflight(
         passed=True,
@@ -352,6 +358,7 @@ def test_pre_v2_qualified_checkpoint_cannot_resume_as_v2_shadow(
     historical_payload["manifest_contract_version"] = "financial-manifest-v1"
     historical_payload.pop("eligibility_policy_version")
     historical_payload.pop("financial_eligibility_policy")
+    historical_payload.pop("financial_eligibility_binding")
     _resign_plan_payload(historical_payload)
     historical = MainlandCapabilityRoutingPlan.model_validate(historical_payload)
 
@@ -1476,6 +1483,108 @@ def test_graph_starts_new_for_legacy_checkpoint_without_rewrite(
     assert after == before
 
 
+def test_graph_starts_distinct_v2_run_for_pre_v2_qualified_checkpoint(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.create_llm_client",
+        lambda **_kwargs: SimpleNamespace(get_llm=lambda: object()),
+    )
+    asset = _asset()
+    historical = _preflight(monkeypatch, "qualified_v1").plan
+    active = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert historical is not None
+    assert active is not None
+    ticker = asset.instrument_identity.symbol
+    trade_date = "2026-07-30"
+    graph = TradingAgentsGraph(
+        selected_analysts=("fundamentals",),
+        config=_graph_config(tmp_path, active),
+        asset_configuration=asset,
+        capability_routing_plan=active,
+        qualified_financial_routing=_composition(active, asset),
+    )
+    old_run_id = "run:" + "a" * 64
+    historical_state = graph.create_initial_state(
+        ticker,
+        trade_date,
+        evidence_state=EvidenceState(
+            instrument_identity=asset.instrument_identity
+        ),
+        run_id=old_run_id,
+    )
+    historical_state["capability_routing_plan"] = historical.model_dump(
+        mode="json"
+    )
+    historical_state["capability_routing_rollout"] = (
+        MainlandCapabilityRoutingRunProjection.from_plan(historical).model_dump(
+            mode="json"
+        )
+    )
+    historical_state.pop("financial_eligibility_binding", None)
+    historical_state["evidence_state"].pop(
+        "financial_eligibility_binding",
+        None,
+    )
+    active_signature = graph._run_signature("stock")
+    historical_signature = active_signature.replace(
+        active.plan_signature,
+        historical.plan_signature,
+    )
+    old_config = {
+        "configurable": {
+            "thread_id": thread_id(
+                ticker,
+                trade_date,
+                historical_signature,
+            )
+        }
+    }
+    workflow = StateGraph(AgentState)
+    workflow.add_node("checkpoint", lambda _state: {})
+    workflow.set_entry_point("checkpoint")
+    workflow.add_edge("checkpoint", END)
+    with get_checkpointer(graph.config["data_cache_dir"], ticker) as saver:
+        workflow.compile(checkpointer=saver).invoke(
+            historical_state,
+            config=old_config,
+        )
+        before = saver.get_tuple(old_config).checkpoint
+
+    with graph.checkpoint_scope(ticker, trade_date) as session:
+        compatibility = session.routing_compatibility
+        assert session.resume_from_checkpoint is False
+        assert compatibility is not None
+        assert compatibility.action is (
+            MainlandCapabilityRoutingCheckpointAction.START_NEW
+        )
+        assert compatibility.reason is (
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        )
+        assert compatibility.previous_run_id == old_run_id
+        assert compatibility.new_run_id is not None
+        assert compatibility.new_run_id != old_run_id
+        new_state = graph.create_initial_state(
+            ticker,
+            trade_date,
+            evidence_state=EvidenceState(
+                instrument_identity=asset.instrument_identity
+            ),
+            checkpoint_thread_id=session.graph_config["configurable"][
+                "thread_id"
+            ],
+        )
+        assert new_state["run_id"] == compatibility.new_run_id
+        assert new_state["capability_routing_plan"] == active.model_dump(
+            mode="json"
+        )
+
+    with get_checkpointer(graph.config["data_cache_dir"], ticker) as saver:
+        assert saver.get_tuple(old_config).checkpoint == before
+
+
 def test_graph_rollback_starts_legacy_without_opening_qualified_checkpoint(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1979,6 +2088,8 @@ def test_tampered_checkpoint_plan_fails_typed_without_secret_echo(
 
 def _statement_request(asset) -> FinancialStatementRoutingRequest:
     return FinancialStatementRoutingRequest(
+        contract_version="financial-statement-routing-request-v2",
+        eligibility_policy_version="mainland-financial-period-eligibility-v2",
         instrument_identity=asset.instrument_identity,
         statement_type=FinancialStatementType.BALANCE_SHEET,
         as_of_date=date(2026, 7, 30),
@@ -2003,7 +2114,25 @@ def _financial_tool_state(asset, plan) -> dict[str, object]:
         tool_name="instrument_identity_registry",
         raw_text=asset.registry_artifact,
     )
-    return {
+    binding = plan.financial_eligibility_binding
+    evidence = EvidenceState(
+        financial_eligibility_binding=binding,
+        instrument_identity=asset.instrument_identity,
+        source_artifacts=(identity_artifact,),
+        acquisition_outcomes=(
+            SourceAcquisitionAvailable(
+                provider="instrument-identity-registry",
+                capability="instrument_identity",
+                source_ref=identity_source_ref,
+                attempt=1,
+                retrieved_at=(
+                    asset.instrument_identity.provenance.retrieved_at
+                ),
+                artifact=identity_artifact,
+            ),
+        ),
+    )
+    state = {
         "messages": [
             AIMessage(
                 content="",
@@ -2026,23 +2155,11 @@ def _financial_tool_state(asset, plan) -> dict[str, object]:
         "run_id": "run:" + "b" * 64,
         "asset_configuration": asset.model_dump(mode="json"),
         "capability_routing_plan": plan.model_dump(mode="json"),
-        "evidence_state": EvidenceState(
-            instrument_identity=asset.instrument_identity,
-            source_artifacts=(identity_artifact,),
-            acquisition_outcomes=(
-                SourceAcquisitionAvailable(
-                    provider="instrument-identity-registry",
-                    capability="instrument_identity",
-                    source_ref=identity_source_ref,
-                    attempt=1,
-                    retrieved_at=(
-                        asset.instrument_identity.provenance.retrieved_at
-                    ),
-                    artifact=identity_artifact,
-                ),
-            ),
-        ).model_dump(mode="json"),
+        "evidence_state": evidence.model_dump(mode="json"),
     }
+    if binding is not None:
+        state["financial_eligibility_binding"] = binding.model_dump(mode="json")
+    return state
 
 
 def test_shadow_mode_without_validation_composition_uses_only_legacy_dispatch(
@@ -2625,7 +2742,10 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
     assert "financial_dispatch_shadow_ledger" in result
     shadow_ledger = result["financial_dispatch_shadow_ledger"]
-    assert shadow_ledger["contract_version"] == "1.2"
+    assert shadow_ledger["contract_version"] == "1.3"
+    assert shadow_ledger["financial_eligibility_binding"] == (
+        plan.financial_eligibility_binding.model_dump(mode="json")
+    )
     manifest = shadow_ledger["qualified_statement_selections"][0]["terminal"][
         "routing_result"
     ]["manifest"]
@@ -2660,6 +2780,25 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         qualified_statement_router=resumed_router,
         qualified_statement_request_factory=lambda _request: _statement_request(asset),
     )
+    missing_state_binding = _financial_tool_state(asset, plan)
+    missing_state_binding.pop("financial_eligibility_binding")
+    with pytest.raises(FinancialDispatchCheckpointError) as missing_state_error:
+        resumed_node(missing_state_binding)
+    assert missing_state_error.value.reason is (
+        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+    )
+
+    missing_evidence_binding = _financial_tool_state(asset, plan)
+    missing_evidence_binding["evidence_state"].pop(
+        "financial_eligibility_binding"
+    )
+    with pytest.raises(FinancialDispatchCheckpointError) as missing_evidence_error:
+        resumed_node(missing_evidence_binding)
+    assert missing_evidence_error.value.reason is (
+        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+    )
+    assert legacy_calls == initial_legacy_calls
+    assert shadow_calls == initial_shadow_calls
     resumed_state = _financial_tool_state(asset, plan)
     resumed_state["financial_dispatch_ledger"] = result[
         "financial_dispatch_ledger"
@@ -2694,10 +2833,19 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
             ),
             "asset_configuration": asset.model_dump(mode="json"),
             "capability_routing_plan": plan.model_dump(mode="json"),
+            "financial_eligibility_binding": (
+                plan.financial_eligibility_binding.model_dump(mode="json")
+            ),
             "capability_routing_rollout": (
                 MainlandCapabilityRoutingRunProjection.from_plan(plan).model_dump(
                     mode="json"
                 )
+            ),
+            "capability_routing_checkpoint_compatibility": (
+                validate_mainland_capability_routing_checkpoint(
+                    active_plan=plan,
+                    checkpoint_plan=plan,
+                ).model_dump(mode="json")
             ),
             "financial_dispatch_ledger": result["financial_dispatch_ledger"],
             "financial_dispatch_shadow_ledger": shadow_ledger,
@@ -2705,6 +2853,7 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         }
     )
 
+    start_new_state = copy.deepcopy(final_state)
     audit = prepare_decision_audit(
         final_state,
         tmp_path / "audit-artifacts",
@@ -2714,6 +2863,9 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     assert audit["capability_routing_rollout"]["mode"] == "qualified_v1_shadow"
     assert audit["capability_routing_rollout"]["disposition"] == (
         "shadow_non_authoritative"
+    )
+    assert audit["capability_routing_checkpoint_compatibility"]["action"] == (
+        "resume"
     )
     assert audit["financial_dispatch"]["contract_version"] == "1.0"
     assert audit["financial_dispatch_shadow"]["contract_version"] == "2.0"
@@ -2763,7 +2915,80 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     assert "Qualified routing shadow comparison" in report
     assert "non-authoritative" in report
     assert "Legacy-selected financial output remains authoritative" in report
+    assert "Qualified routing shadow financial operations" in report
+    assert "mainland-financial-period-eligibility-v2" in report
+    assert "mainland-financial-reporting-calendar-v2" in report
+    assert "Reporting target periods" in report
+    assert "Selected lineage" in report
+    assert "Checkpoint / new-run compatibility" in report
+    assert "**Compatibility action:** `resume`" in report
+    assert "**Provider I/O during compatibility check:** false" in report
+    assert "**Historical state preserved:** true" in report
     assert "financial-period-candidate" not in report
+
+    historical_payload = plan.model_dump(mode="json")
+    historical_payload.pop("eligibility_policy_version")
+    historical_payload.pop("financial_eligibility_policy")
+    historical_payload.pop("financial_eligibility_binding")
+    signature_payload = {
+        key: value
+        for key, value in historical_payload.items()
+        if key != "plan_signature"
+    }
+    historical_payload["plan_signature"] = (
+        "mainland-routing-plan:v1:"
+        + sha256(
+            json.dumps(
+                signature_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
+    historical_plan = MainlandCapabilityRoutingPlan.model_validate(
+        historical_payload
+    )
+    start_new_compatibility = start_new_mainland_capability_routing_run(
+        active_plan=plan,
+        checkpoint_plan=historical_plan,
+        previous_run_id="run:" + "a" * 64,
+        new_run_id=start_new_state["run_id"],
+    )
+    start_new_state["capability_routing_checkpoint_compatibility"] = (
+        start_new_compatibility.model_dump(mode="json")
+    )
+    cross_run_state = copy.deepcopy(start_new_state)
+    cross_run_state["capability_routing_checkpoint_compatibility"][
+        "new_run_id"
+    ] = "run:" + "c" * 64
+    with pytest.raises(ValueError, match="new run identity"):
+        prepare_decision_audit(
+            cross_run_state,
+            tmp_path / "cross-run-audit",
+            config=config,
+        )
+    start_new_audit = prepare_decision_audit(
+        start_new_state,
+        tmp_path / "start-new-audit-artifacts",
+        config=config,
+    )
+    assert start_new_audit["capability_routing_checkpoint_compatibility"] == (
+        start_new_compatibility.model_dump(mode="json")
+    )
+    start_new_report = write_report_tree(
+        start_new_state,
+        asset.instrument_identity.symbol,
+        tmp_path / "start-new-report",
+    ).read_text(encoding="utf-8")
+    for expected in (
+        "**Compatibility action:** `start_new`",
+        "financial_eligibility_policy_mismatch",
+        "run:" + "a" * 64,
+        start_new_state["run_id"],
+    ):
+        assert expected in start_new_report
 
     failed_shadow_state = copy.deepcopy(final_state)
     failed_shadow_state["financial_dispatch_shadow_failure"] = {
@@ -2774,7 +2999,8 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     raw_failure_text = (
         "ProviderTransportError GET "
         "https://provider.example.test/v1/indicator?token=query-secret "
-        'payload={"account":"private-payload"} credential=provider-secret'
+        'payload={"account":"private-payload"} credential=provider-secret '
+        r"raw_text=C:\Users\operator\provider-payload.json"
     )
     failed_shadow_state["provider_failure_debug"] = raw_failure_text
     failed_shadow_audit = prepare_decision_audit(
@@ -2804,6 +3030,8 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         "token=query-secret",
         "private-payload",
         "provider-secret",
+        r"C:\Users\operator\provider-payload.json",
+        "raw_text",
         raw_failure_text,
     ):
         assert forbidden not in exposed_failed_surfaces

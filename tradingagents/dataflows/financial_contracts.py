@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+    MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
 )
 from tradingagents.dataflows.provider_subrequests import (
@@ -4612,6 +4613,9 @@ def _manifest_identity_payload(
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = None,
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = None,
     availability_reason: FinancialPeriodRejectionReason | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -4686,6 +4690,10 @@ def _manifest_identity_payload(
                 ),
             }
         )
+        if financial_eligibility_binding is not None:
+            payload["financial_eligibility_binding"] = (
+                financial_eligibility_binding.model_dump(mode="json")
+            )
     if publication_target_construction is not None:
         payload["publication_target_construction"] = (
             publication_target_construction.model_dump(mode="json")
@@ -4745,6 +4753,9 @@ class FinancialAcquisitionManifest(BaseModel):
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     availability_reason: FinancialPeriodRejectionReason | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -4857,6 +4868,9 @@ class FinancialAcquisitionManifest(BaseModel):
         eligibility_policy_version: Literal[
             "mainland-financial-period-eligibility-v2"
         ] | None = None,
+        financial_eligibility_binding: (
+            MainlandFinancialEligibilityProjectionBinding | None
+        ) = None,
     ) -> FinancialAcquisitionManifest:
         """Bind the v1 selection contract to Ticket 11 operational lineage."""
 
@@ -4964,6 +4978,7 @@ class FinancialAcquisitionManifest(BaseModel):
             availability_scope=availability_scope,
             availability_basis=availability_basis,
             eligibility_policy_version=eligibility_policy_version,
+            financial_eligibility_binding=financial_eligibility_binding,
             availability_reason=availability_reason,
         )
         return FinancialAcquisitionManifest(
@@ -4980,6 +4995,7 @@ class FinancialAcquisitionManifest(BaseModel):
                     "availability_scope",
                     "availability_basis",
                     "eligibility_policy_version",
+                    "financial_eligibility_binding",
                     "availability_reason",
                 },
             ),
@@ -4992,6 +5008,7 @@ class FinancialAcquisitionManifest(BaseModel):
             availability_scope=availability_scope,
             availability_basis=availability_basis,
             eligibility_policy_version=eligibility_policy_version,
+            financial_eligibility_binding=financial_eligibility_binding,
             availability_reason=availability_reason,
             manifest_identity="financial-manifest:v2:" + _canonical_digest(payload),
         )
@@ -5089,6 +5106,7 @@ class FinancialAcquisitionManifest(BaseModel):
                 or self.availability_scope is not None
                 or self.availability_basis is not None
                 or self.eligibility_policy_version is not None
+                or self.financial_eligibility_binding is not None
                 or self.availability_reason is not None
             ):
                 raise ValueError("legacy financial manifest carries v2 lineage")
@@ -5116,13 +5134,26 @@ class FinancialAcquisitionManifest(BaseModel):
             elif (
                 self.eligibility_policy_version
                 != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
-                or self.requested_analysis_scope is None
+                or (
+                    self.requested_capability
+                    is FinancialCapability.RATIO_FAMILY
+                    and self.requested_analysis_scope is None
+                )
             ):
                 raise ValueError("v2 manifest availability lineage is incomplete")
             elif (self.availability_scope is None) != (
                 self.availability_basis is None
             ):
                 raise ValueError("manifest availability scope and basis are incomplete")
+            if self.financial_eligibility_binding is not None and (
+                self.eligibility_policy_version
+                != self.financial_eligibility_binding.eligibility_policy_version
+                or self.financial_eligibility_binding.financial_manifest_version
+                != self.contract_version
+            ):
+                raise ValueError(
+                    "financial manifest eligibility binding is contradictory"
+                )
             attempt_ids = tuple(
                 item.attempt_event_id for item in self.physical_attempt_events
             )
@@ -5336,6 +5367,7 @@ class FinancialAcquisitionManifest(BaseModel):
             availability_scope=self.availability_scope,
             availability_basis=self.availability_basis,
             eligibility_policy_version=self.eligibility_policy_version,
+            financial_eligibility_binding=self.financial_eligibility_binding,
             availability_reason=self.availability_reason,
         )
         expected = (

@@ -23,6 +23,10 @@ from pydantic import (
     model_validator,
 )
 
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MainlandFinancialEligibilityProjectionBinding,
+)
+
 if TYPE_CHECKING:
     from tradingagents.asset_configuration import RunAssetConfiguration
     from tradingagents.decision_policy import DecisionHorizon, DecisionPolicyEngine
@@ -1783,6 +1787,9 @@ class EvidenceState(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    financial_eligibility_binding: (
+        MainlandFinancialEligibilityProjectionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: InstrumentIdentityEvidence | None = None
     market_snapshot: MarketSnapshotEvidence | None = None
     material_claims: tuple[MaterialClaim, ...] = ()
@@ -1864,6 +1871,23 @@ class EvidenceState(BaseModel):
             fact.fact_id for fact in current_facts
         }:
             raise ValueError("Source Fact cannot cross analysis-scope collections")
+        if self.financial_eligibility_binding is not None:
+            policy_version = (
+                self.financial_eligibility_binding.eligibility_policy_version
+            )
+            if any(
+                assessment.eligibility_policy_version != policy_version
+                for assessment in (
+                    *self.financial_family_assessments,
+                    *self.financial_family_aggregate_assessments,
+                )
+            ) or any(
+                selection.eligibility_policy_version != policy_version
+                for selection in self.financial_revision_selections
+            ):
+                raise ValueError(
+                    "Evidence State financial eligibility binding is contradictory"
+                )
         return self
 
     @field_validator("acquisition_outcomes")
