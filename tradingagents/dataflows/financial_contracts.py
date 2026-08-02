@@ -13,6 +13,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MainlandFinancialPeriodTargetConstruction,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
 )
@@ -2973,6 +2976,9 @@ def _manifest_identity_payload(
     overlaps: Sequence[FinancialPeriodOverlapFinding],
     conflicts: Sequence[FinancialCriticalValueConflict],
     aggregate_completeness: FinancialAggregateCompleteness,
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = None,
     physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent] = (),
     disposition: FinancialEvidenceDisposition | None = None,
     final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None,
@@ -3024,6 +3030,10 @@ def _manifest_identity_payload(
                 ),
             }
         )
+    if publication_target_construction is not None:
+        payload["publication_target_construction"] = (
+            publication_target_construction.model_dump(mode="json")
+        )
     return payload
 
 
@@ -3057,6 +3067,9 @@ class FinancialAcquisitionManifest(BaseModel):
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
     aggregate_completeness: FinancialAggregateCompleteness
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
     disposition: FinancialEvidenceDisposition | None = None
     final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None
@@ -3152,6 +3165,9 @@ class FinancialAcquisitionManifest(BaseModel):
         physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
         disposition: FinancialEvidenceDisposition,
         rendered_value: str,
+        publication_target_construction: (
+            MainlandFinancialPeriodTargetConstruction | None
+        ) = None,
     ) -> FinancialAcquisitionManifest:
         """Bind the v1 selection contract to Ticket 11 operational lineage."""
 
@@ -3181,6 +3197,7 @@ class FinancialAcquisitionManifest(BaseModel):
             overlaps=self.overlaps,
             conflicts=self.conflicts,
             aggregate_completeness=self.aggregate_completeness,
+            publication_target_construction=publication_target_construction,
             physical_attempt_events=canonical_attempts,
             disposition=disposition,
             final_rendered_artifact=final_rendered_artifact,
@@ -3194,9 +3211,11 @@ class FinancialAcquisitionManifest(BaseModel):
                     "disposition",
                     "final_rendered_artifact",
                     "manifest_identity",
+                    "publication_target_construction",
                 },
             ),
             contract_version=FINANCIAL_MANIFEST_V2,
+            publication_target_construction=publication_target_construction,
             physical_attempt_events=canonical_attempts,
             disposition=disposition,
             final_rendered_artifact=final_rendered_artifact,
@@ -3284,6 +3303,7 @@ class FinancialAcquisitionManifest(BaseModel):
                 self.physical_attempt_events
                 or self.disposition is not None
                 or self.final_rendered_artifact is not None
+                or self.publication_target_construction is not None
             ):
                 raise ValueError("legacy financial manifest carries v2 lineage")
         else:
@@ -3412,6 +3432,7 @@ class FinancialAcquisitionManifest(BaseModel):
             overlaps=self.overlaps,
             conflicts=self.conflicts,
             aggregate_completeness=self.aggregate_completeness,
+            publication_target_construction=self.publication_target_construction,
             physical_attempt_events=self.physical_attempt_events,
             disposition=self.disposition,
             final_rendered_artifact=self.final_rendered_artifact,

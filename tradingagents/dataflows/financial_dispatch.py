@@ -84,6 +84,9 @@ from tradingagents.dataflows.financial_contracts import (
     assess_financial_period_candidate,
     assess_financial_ratio_history_coverage,
 )
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MainlandFinancialPeriodTargetConstruction,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
     ProviderSubrequestCache,
@@ -492,6 +495,11 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
             or self.routing_result.missing_reporting_period_ends
             or self.routing_result.conflicted_annual_period_ends
             or self.routing_result.conflicted_reporting_period_ends
+            or (
+                self.routing_result.publication_target_construction is not None
+                and self.routing_result.publication_target_construction.failure_reason
+                is not None
+            )
         )
         manifest = self.routing_result.manifest
         artifact = (
@@ -586,6 +594,11 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             status=(
                 "error"
                 if self.routing_result.missing_periods_by_family
+                or (
+                    self.routing_result.publication_target_construction is not None
+                    and self.routing_result.publication_target_construction.failure_reason
+                    is not None
+                )
                 else "success"
             ),
         )
@@ -1107,6 +1120,9 @@ class FinancialManifestAuditProjection(BaseModel):
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
     aggregate_completeness: FinancialAggregateCompletenessProjection
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_safe_projection(self) -> FinancialManifestAuditProjection:
@@ -1211,6 +1227,9 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     overlaps: tuple[FinancialPeriodOverlapFinding, ...]
     conflicts: tuple[FinancialCriticalValueConflict, ...]
     aggregate_completeness: FinancialAggregateCompletenessProjection
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_safe_projection(self) -> FinancialToolManifestOperationalProjection:
@@ -2810,6 +2829,27 @@ def _validate_statement_routing_semantics(
         for item in manifest.provider_candidates
         if item.candidate.candidate_identity in selected_ids
     )
+    target_construction = result.publication_target_construction
+    expected_annual_periods = (
+        target_construction.annual_target_period_ends
+        if target_construction is not None
+        else tuple(
+            sorted(
+                set(selection_request.eligible_annual_period_ends),
+                reverse=True,
+            )[:5]
+        )
+    )
+    expected_reporting_periods = (
+        target_construction.reporting_target_period_ends
+        if target_construction is not None
+        else tuple(
+            sorted(
+                set(selection_request.eligible_reporting_period_ends),
+                reverse=True,
+            )[:8]
+        )
+    )
     expected_aggregate = assess_financial_history_coverage(
         instrument_identity=selection_request.instrument_identity,
         statement_type=selection_request.statement_type,
@@ -2817,18 +2857,8 @@ def _validate_statement_routing_semantics(
         consolidation_scope=selection_request.consolidation_scope,
         currency=selection_request.currency,
         assessments=selected_assessments,
-        eligible_annual_period_ends=tuple(
-            sorted(
-                set(selection_request.eligible_annual_period_ends),
-                reverse=True,
-            )[:5]
-        ),
-        eligible_reporting_period_ends=tuple(
-            sorted(
-                set(selection_request.eligible_reporting_period_ends),
-                reverse=True,
-            )[:8]
-        ),
+        eligible_annual_period_ends=expected_annual_periods,
+        eligible_reporting_period_ends=expected_reporting_periods,
         listing_date=selection_request.listing_date,
         listing_provenance=selection_request.listing_provenance,
     )
@@ -2882,11 +2912,15 @@ def _validate_indicator_routing_semantics(
         != selection_request.ratio_families
     ):
         raise ValueError("indicator routing result contradicts the active plan")
-    expected_periods = tuple(
-        sorted(
-            set(selection_request.eligible_reporting_period_ends),
-            reverse=True,
-        )[:8]
+    expected_periods = (
+        result.publication_target_construction.reporting_target_period_ends
+        if result.publication_target_construction is not None
+        else tuple(
+            sorted(
+                set(selection_request.eligible_reporting_period_ends),
+                reverse=True,
+            )[:8]
+        )
     )
     expected_missing: list[
         tuple[FinancialRatioFamily, tuple[date, ...]]
@@ -3168,6 +3202,9 @@ def _project_manifest_for_tool(
         aggregate_completeness=_project_aggregate_completeness(
             manifest.aggregate_completeness
         ),
+        publication_target_construction=(
+            manifest.publication_target_construction
+        ),
     )
 
 
@@ -3217,6 +3254,9 @@ def _project_manifest_for_audit(
         conflicts=manifest.conflicts,
         aggregate_completeness=_project_aggregate_completeness(
             manifest.aggregate_completeness
+        ),
+        publication_target_construction=(
+            manifest.publication_target_construction
         ),
     )
 

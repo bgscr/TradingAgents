@@ -54,6 +54,14 @@ from tradingagents.dataflows.financial_contracts import (
     mark_financial_period_company_type_conflicted,
     mark_financial_period_conflicted,
 )
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+    MainlandFinancialPeriodTargetConstruction,
+)
+from tradingagents.dataflows.financial_period_targets import (
+    construct_mainland_financial_period_targets,
+    filter_mainland_financial_acquisition_periods,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
 )
@@ -80,11 +88,32 @@ _ROUTABLE_DATASET_CAPABILITIES = frozenset(
 _ROUTE_PROVIDER_ARTIFACT_PROVIDER = {
     "baostock_qualified_families": "baostock",
 }
+_QUALIFIED_PUBLICATION_PROVIDERS = {
+    FinancialCapability.STATEMENT: frozenset({"akshare_sina", "tushare"}),
+    FinancialCapability.RATIO_FAMILY: frozenset(
+        {"akshare", "baostock", "tushare"}
+    ),
+}
 
 _INDICATOR_PROVIDER_ASSESSMENT_CONTRACT = {
     "tushare": (FINANCIAL_RATIO_DECLARATION_V2, "XXX"),
     "baostock": (FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1, "CNY"),
 }
+
+
+def _qualified_publication_provider_ids(
+    route: Sequence[str],
+    *,
+    capability: FinancialCapability,
+) -> tuple[str, ...]:
+    qualified = _QUALIFIED_PUBLICATION_PROVIDERS[capability]
+    artifact_providers = tuple(
+        _ROUTE_PROVIDER_ARTIFACT_PROVIDER.get(provider_id, provider_id)
+        for provider_id in route
+    )
+    return tuple(
+        provider_id for provider_id in artifact_providers if provider_id in qualified
+    )
 
 
 def _rendered_sha256(value: str) -> str:
@@ -379,9 +408,15 @@ FinancialIndicatorSource = Callable[
 class FinancialStatementRoutingRequest(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-statement-routing-request-v1"] = (
+    contract_version: Literal[
+        "financial-statement-routing-request-v1",
+        "financial-statement-routing-request-v2",
+    ] = (
         "financial-statement-routing-request-v1"
     )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: InstrumentIdentityEvidence
     statement_type: FinancialStatementType
     as_of_date: date
@@ -401,6 +436,12 @@ class FinancialStatementRoutingRequest(BaseModel):
             raise ValueError("statement routing requires a resolved company type")
         if (self.listing_date is None) != (self.listing_provenance is None):
             raise ValueError("listing exception requires authoritative date and provenance")
+        v2 = self.contract_version == "financial-statement-routing-request-v2"
+        if v2 != (
+            self.eligibility_policy_version
+            == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+        ):
+            raise ValueError("statement routing request policy identity is inconsistent")
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -411,9 +452,15 @@ class FinancialStatementRoutingRequest(BaseModel):
 class FinancialIndicatorRoutingRequest(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-indicator-routing-request-v1"] = (
+    contract_version: Literal[
+        "financial-indicator-routing-request-v1",
+        "financial-indicator-routing-request-v2",
+    ] = (
         "financial-indicator-routing-request-v1"
     )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date
     company_type: FinancialCompanyType
@@ -422,6 +469,11 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     ratio_families: tuple[FinancialRatioFamily, ...]
     eligible_reporting_period_ends: tuple[date, ...]
     remaining_evidence_decision_ready: bool = False
+    listing_date: date | None = Field(default=None, exclude_if=lambda value: value is None)
+    listing_provenance: FinancialListingProvenance | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialIndicatorRoutingRequest:
@@ -432,6 +484,14 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             raise ValueError("indicator families must be non-empty, unique, and canonical")
         if self.company_type is FinancialCompanyType.UNKNOWN:
             raise ValueError("indicator routing requires a resolved company type")
+        if (self.listing_date is None) != (self.listing_provenance is None):
+            raise ValueError("listing exception requires authoritative date and provenance")
+        v2 = self.contract_version == "financial-indicator-routing-request-v2"
+        if v2 != (
+            self.eligibility_policy_version
+            == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+        ):
+            raise ValueError("indicator routing request policy identity is inconsistent")
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -699,9 +759,21 @@ class FinancialStatementRoutingResult(BaseModel):
     conflicted_annual_period_ends: tuple[date, ...]
     conflicted_reporting_period_ends: tuple[date, ...]
     physical_attempt_ids: tuple[str, ...]
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialStatementRoutingResult:
+        if self.manifest.contract_version == "financial-manifest-v1" and (
+            self.manifest.publication_target_construction is not None
+        ):
+            raise ValueError("statement v1 manifest carries publication targets")
+        if self.manifest.contract_version == "financial-manifest-v2" and (
+            self.manifest.publication_target_construction
+            != self.publication_target_construction
+        ):
+            raise ValueError("statement publication targets contradict manifest")
         selection_ids = {item.candidate_identity for item in self.manifest.selections}
         if selection_ids != {
             item.candidate_identity for item in self.selected_candidates
@@ -743,9 +815,27 @@ class FinancialIndicatorRoutingResult(BaseModel):
     current_profile_provider: Literal["yfinance"] | None = None
     physical_attempt_ids: tuple[str, ...]
     physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
+        manifest_target_constructions = {
+            manifest.publication_target_construction
+            for manifest in self.family_manifests
+            if manifest.contract_version == "financial-manifest-v2"
+        }
+        if any(
+            manifest.contract_version == "financial-manifest-v1"
+            and manifest.publication_target_construction is not None
+            for manifest in self.family_manifests
+        ):
+            raise ValueError("indicator v1 manifest carries publication targets")
+        if manifest_target_constructions and manifest_target_constructions != {
+            self.publication_target_construction
+        }:
+            raise ValueError("indicator publication targets contradict manifests")
         family_order = tuple(FinancialRatioFamily)
         if self.complete_families != tuple(
             family for family in family_order if family in self.complete_families
@@ -1046,11 +1136,24 @@ class MainlandFinancialCapabilityRouter:
     ) -> FinancialStatementRoutingResult:
         capability = _STATEMENT_CAPABILITY[request.statement_type]
         route = self._routing_plan.route_for(capability)
-        target_annual = tuple(
-            sorted(set(request.eligible_annual_period_ends), reverse=True)[:5]
+        publication_aware = request.eligibility_policy_version is not None
+        if publication_aware and (
+            self._routing_plan.eligibility_policy_version
+            != request.eligibility_policy_version
+            or self._routing_plan.financial_eligibility_policy is None
+        ):
+            raise ValueError("statement target construction policy mismatch")
+        acquisition_annual = tuple(
+            sorted(set(request.eligible_annual_period_ends), reverse=True)
         )
-        target_reporting = tuple(
-            sorted(set(request.eligible_reporting_period_ends), reverse=True)[:8]
+        acquisition_reporting = tuple(
+            sorted(set(request.eligible_reporting_period_ends), reverse=True)
+        )
+        target_annual = (
+            acquisition_annual if publication_aware else acquisition_annual[:5]
+        )
+        target_reporting = (
+            acquisition_reporting if publication_aware else acquisition_reporting[:8]
         )
         target_keys = {
             *(("annual", item) for item in target_annual),
@@ -1060,6 +1163,7 @@ class MainlandFinancialCapabilityRouter:
         artifacts: dict[str, FinancialProviderArtifactEntry] = {}
         acquisition_outcomes: list[FinancialAcquisitionOutcome] = []
         provider_candidates: dict[str, FinancialProviderCandidate] = {}
+        publication_candidates: dict[str, FinancialPeriodCandidate] = {}
         rejected_periods: dict[str, FinancialRejectedPeriod] = {}
         selections: dict[tuple[str, date], FinancialPeriodSelection] = {}
         selected_candidates: dict[tuple[str, date], FinancialPeriodCandidate] = {}
@@ -1072,6 +1176,36 @@ class MainlandFinancialCapabilityRouter:
         provider_calls: list[FinancialProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
         physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
+        qualified_publication_providers = _qualified_publication_provider_ids(
+            route,
+            capability=FinancialCapability.STATEMENT,
+        )
+
+        def publication_gap_targets() -> tuple[tuple[date, ...], tuple[date, ...]]:
+            if not publication_aware:
+                return target_annual, target_reporting
+            assert self._routing_plan.financial_eligibility_policy is not None
+            common = {
+                "run_as_of_date": request.as_of_date,
+                "expected_instrument_identity": request.instrument_identity,
+                "expected_company_type": request.company_type,
+                "expected_consolidation_scope": request.consolidation_scope,
+                "candidates": tuple(publication_candidates.values()),
+                "qualified_provider_ids": qualified_publication_providers,
+                "listing_date": request.listing_date,
+                "listing_provenance": request.listing_provenance,
+                "policy": self._routing_plan.financial_eligibility_policy,
+            }
+            return (
+                filter_mainland_financial_acquisition_periods(
+                    period_ends=acquisition_annual,
+                    **common,
+                ),
+                filter_mainland_financial_acquisition_periods(
+                    period_ends=acquisition_reporting,
+                    **common,
+                ),
+            )
 
         for provider_id in route:
             missing_keys = target_keys - set(selections)
@@ -1133,6 +1267,11 @@ class MainlandFinancialCapabilityRouter:
                 )
             )
             if response.kind is FinancialProviderResponseKind.UNAVAILABLE:
+                target_annual, target_reporting = publication_gap_targets()
+                target_keys = {
+                    *(('annual', item) for item in target_annual),
+                    *(('reporting', item) for item in target_reporting),
+                }
                 continue
 
             assert response.response_artifact is not None
@@ -1142,6 +1281,10 @@ class MainlandFinancialCapabilityRouter:
                     FinancialProviderArtifactEntry(artifact=artifact),
                 )
             for candidate in response.candidates:
+                publication_candidates.setdefault(
+                    candidate.candidate_identity,
+                    candidate,
+                )
                 key = _statement_candidate_target_key(
                     candidate,
                     target_annual=target_annual,
@@ -1258,6 +1401,58 @@ class MainlandFinancialCapabilityRouter:
                 selected_candidates.pop(key, None)
                 selected_assessments.pop(key, None)
 
+            target_annual, target_reporting = publication_gap_targets()
+            target_keys = {
+                *(('annual', item) for item in target_annual),
+                *(('reporting', item) for item in target_reporting),
+            }
+
+        publication_target_construction = None
+        if publication_aware:
+            assert self._routing_plan.financial_eligibility_policy is not None
+            publication_target_construction = (
+                construct_mainland_financial_period_targets(
+                    run_as_of_date=request.as_of_date,
+                    expected_instrument_identity=request.instrument_identity,
+                    expected_company_type=request.company_type,
+                    expected_consolidation_scope=request.consolidation_scope,
+                    candidates=tuple(publication_candidates.values()),
+                    qualified_provider_ids=qualified_publication_providers,
+                    acquisition_annual_period_ends=(
+                        request.eligible_annual_period_ends
+                    ),
+                    acquisition_reporting_period_ends=(
+                        request.eligible_reporting_period_ends
+                    ),
+                    listing_date=request.listing_date,
+                    listing_provenance=request.listing_provenance,
+                    policy=self._routing_plan.financial_eligibility_policy,
+                )
+            )
+            target_annual = (
+                publication_target_construction.annual_target_period_ends
+            )
+            target_reporting = (
+                publication_target_construction.reporting_target_period_ends
+            )
+            target_keys = {
+                *(("annual", item) for item in target_annual),
+                *(("reporting", item) for item in target_reporting),
+            }
+            selections = {
+                key: value for key, value in selections.items() if key in target_keys
+            }
+            selected_candidates = {
+                key: value
+                for key, value in selected_candidates.items()
+                if key in target_keys
+            }
+            selected_assessments = {
+                key: value
+                for key, value in selected_assessments.items()
+                if key in target_keys
+            }
+
         aggregate = assess_financial_history_coverage(
             instrument_identity=request.instrument_identity,
             statement_type=request.statement_type,
@@ -1309,6 +1504,7 @@ class MainlandFinancialCapabilityRouter:
                 if ("reporting", period) in conflicted_keys
             ),
             physical_attempt_ids=tuple(physical_attempt_ids),
+            publication_target_construction=publication_target_construction,
         )
         if not physical_attempt_events:
             return result
@@ -1317,6 +1513,7 @@ class MainlandFinancialCapabilityRouter:
             physical_attempt_events=tuple(physical_attempt_events.values()),
             disposition=disposition,
             rendered_value=render_statement_routing_result(result),
+            publication_target_construction=publication_target_construction,
         )
         return result.model_copy(update={"manifest": finalized_manifest})
 
@@ -1329,8 +1526,18 @@ class MainlandFinancialCapabilityRouter:
         route = self._routing_plan.route_for(
             MainlandCapability.FINANCIAL_INDICATORS
         )
-        target_periods = tuple(
-            sorted(set(request.eligible_reporting_period_ends), reverse=True)[:8]
+        publication_aware = request.eligibility_policy_version is not None
+        if publication_aware and (
+            self._routing_plan.eligibility_policy_version
+            != request.eligibility_policy_version
+            or self._routing_plan.financial_eligibility_policy is None
+        ):
+            raise ValueError("indicator target construction policy mismatch")
+        acquisition_periods = tuple(
+            sorted(set(request.eligible_reporting_period_ends), reverse=True)
+        )
+        target_periods = (
+            acquisition_periods if publication_aware else acquisition_periods[:8]
         )
         selected_candidates: dict[
             tuple[FinancialRatioFamily, date],
@@ -1341,6 +1548,7 @@ class MainlandFinancialCapabilityRouter:
             FinancialPeriodCompletenessAssessment,
         ] = {}
         provider_candidates: dict[str, FinancialProviderCandidate] = {}
+        publication_candidates: dict[str, FinancialPeriodCandidate] = {}
         rejected_periods: dict[str, FinancialRejectedPeriod] = {}
         artifacts: dict[str, FinancialProviderArtifactEntry] = {}
         acquisition_outcomes: list[FinancialAcquisitionOutcome] = []
@@ -1351,6 +1559,27 @@ class MainlandFinancialCapabilityRouter:
         physical_attempt_ids: list[str] = []
         physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
         current_profile_provider: Literal["yfinance"] | None = None
+        qualified_publication_providers = _qualified_publication_provider_ids(
+            route,
+            capability=FinancialCapability.RATIO_FAMILY,
+        )
+
+        def publication_gap_periods() -> tuple[date, ...]:
+            if not publication_aware:
+                return target_periods
+            assert self._routing_plan.financial_eligibility_policy is not None
+            return filter_mainland_financial_acquisition_periods(
+                period_ends=acquisition_periods,
+                run_as_of_date=request.as_of_date,
+                expected_instrument_identity=request.instrument_identity,
+                expected_company_type=request.company_type,
+                expected_consolidation_scope=request.consolidation_scope,
+                candidates=tuple(publication_candidates.values()),
+                qualified_provider_ids=qualified_publication_providers,
+                listing_date=request.listing_date,
+                listing_provenance=request.listing_provenance,
+                policy=self._routing_plan.financial_eligibility_policy,
+            )
 
         for provider_id in route:
             missing_by_family = _indicator_missing_periods(
@@ -1408,6 +1637,7 @@ class MainlandFinancialCapabilityRouter:
                 )
             )
             if response.kind is FinancialProviderResponseKind.UNAVAILABLE:
+                target_periods = publication_gap_periods()
                 continue
 
             assert response.response_artifact is not None
@@ -1419,6 +1649,10 @@ class MainlandFinancialCapabilityRouter:
             if response.degraded_current_profile:
                 current_profile_provider = "yfinance"
             for candidate in response.candidates:
+                publication_candidates.setdefault(
+                    candidate.candidate_identity,
+                    candidate,
+                )
                 identity = candidate.period_identity
                 ratio_family = identity.ratio_family
                 if ratio_family is None or ratio_family not in request.ratio_families:
@@ -1536,6 +1770,42 @@ class MainlandFinancialCapabilityRouter:
                 )
                 selected_candidates.pop(key, None)
                 selected_assessments.pop(key, None)
+
+            target_periods = publication_gap_periods()
+
+        publication_target_construction = None
+        if publication_aware:
+            assert self._routing_plan.financial_eligibility_policy is not None
+            publication_target_construction = (
+                construct_mainland_financial_period_targets(
+                    run_as_of_date=request.as_of_date,
+                    expected_instrument_identity=request.instrument_identity,
+                    expected_company_type=request.company_type,
+                    expected_consolidation_scope=request.consolidation_scope,
+                    candidates=tuple(publication_candidates.values()),
+                    qualified_provider_ids=qualified_publication_providers,
+                    acquisition_annual_period_ends=(),
+                    acquisition_reporting_period_ends=(
+                        request.eligible_reporting_period_ends
+                    ),
+                    listing_date=request.listing_date,
+                    listing_provenance=request.listing_provenance,
+                    policy=self._routing_plan.financial_eligibility_policy,
+                )
+            )
+            target_periods = (
+                publication_target_construction.reporting_target_period_ends
+            )
+            selected_candidates = {
+                key: value
+                for key, value in selected_candidates.items()
+                if key[1] in target_periods
+            }
+            selected_assessments = {
+                key: value
+                for key, value in selected_assessments.items()
+                if key[1] in target_periods
+            }
 
         family_assessments: dict[
             FinancialRatioFamily,
@@ -1658,6 +1928,7 @@ class MainlandFinancialCapabilityRouter:
             current_profile_provider=current_profile_provider,
             physical_attempt_ids=tuple(physical_attempt_ids),
             physical_attempt_events=tuple(physical_attempt_events.values()),
+            publication_target_construction=publication_target_construction,
         )
         if not physical_attempt_events:
             return result
@@ -1671,6 +1942,7 @@ class MainlandFinancialCapabilityRouter:
                     request,
                 ),
                 rendered_value=rendered_value,
+                publication_target_construction=publication_target_construction,
             )
             for manifest in result.family_manifests
         )
@@ -2067,6 +2339,11 @@ def financial_statement_evidence_disposition(
     result: FinancialStatementRoutingResult,
 ) -> FinancialEvidenceDisposition:
     if (
+        result.publication_target_construction is not None
+        and result.publication_target_construction.failure_reason is not None
+    ):
+        return FinancialEvidenceDisposition.INSUFFICIENT
+    if (
         result.conflicted_annual_period_ends
         or result.conflicted_reporting_period_ends
         or result.manifest.conflicts
@@ -2087,6 +2364,11 @@ def financial_indicator_evidence_disposition(
     result: FinancialIndicatorRoutingResult,
     request: FinancialIndicatorRoutingRequest,
 ) -> FinancialEvidenceDisposition:
+    if (
+        result.publication_target_construction is not None
+        and result.publication_target_construction.failure_reason is not None
+    ):
+        return FinancialEvidenceDisposition.INSUFFICIENT
     if manifest.conflicts:
         return FinancialEvidenceDisposition.CONFLICTED
     if manifest.aggregate_completeness.complete:
@@ -2116,6 +2398,7 @@ def finalize_statement_routing_result(
         physical_attempt_events=physical_attempt_events,
         disposition=financial_statement_evidence_disposition(result),
         rendered_value=render_statement_routing_result(result),
+        publication_target_construction=result.publication_target_construction,
     )
     payload = result.model_dump(mode="python")
     payload["manifest"] = finalized
@@ -2145,6 +2428,9 @@ def finalize_indicator_routing_result(
                 request,
             ),
             rendered_value=rendered_value,
+            publication_target_construction=(
+                result.publication_target_construction
+            ),
         )
         for manifest in result.family_manifests
     )
@@ -2163,6 +2449,11 @@ def render_statement_routing_result(
         for selection in result.manifest.selections
     }
     if (
+        result.publication_target_construction is not None
+        and result.publication_target_construction.failure_reason is not None
+    ):
+        status = "insufficient_evidence"
+    elif (
         result.conflicted_annual_period_ends
         or result.conflicted_reporting_period_ends
     ):
@@ -2177,7 +2468,11 @@ def render_statement_routing_result(
     else:
         status = "complete"
     payload = {
-        "contract_version": "financial-selected-periods-v1",
+        "contract_version": (
+            "financial-selected-periods-v2"
+            if result.publication_target_construction is not None
+            else "financial-selected-periods-v1"
+        ),
         "status": status,
         "statement_type": result.manifest.requested_statement_type.value,
         "periods": [
@@ -2235,6 +2530,10 @@ def render_statement_routing_result(
             for period in result.conflicted_reporting_period_ends
         ],
     }
+    if result.publication_target_construction is not None:
+        payload["publication_target_construction"] = (
+            result.publication_target_construction.model_dump(mode="json")
+        )
     return json.dumps(
         payload,
         allow_nan=False,
@@ -2254,7 +2553,12 @@ def render_indicator_routing_result(
         for manifest in result.family_manifests
         for selection in manifest.selections
     }
-    if result.missing_periods_by_family and result.current_profile_degraded:
+    if (
+        result.publication_target_construction is not None
+        and result.publication_target_construction.failure_reason is not None
+    ):
+        status = "insufficient_evidence"
+    elif result.missing_periods_by_family and result.current_profile_degraded:
         status = "insufficient_history_with_degraded_current_profile"
     elif result.missing_periods_by_family:
         status = "incomplete"
@@ -2266,7 +2570,11 @@ def render_indicator_routing_result(
     else:
         status = "complete"
     payload = {
-        "contract_version": "financial-selected-indicators-v1",
+        "contract_version": (
+            "financial-selected-indicators-v2"
+            if result.publication_target_construction is not None
+            else "financial-selected-indicators-v1"
+        ),
         "status": status,
         "complete_families": [
             family.value for family in result.complete_families
@@ -2299,6 +2607,10 @@ def render_indicator_routing_result(
         },
         "current_profile_provider": result.current_profile_provider,
     }
+    if result.publication_target_construction is not None:
+        payload["publication_target_construction"] = (
+            result.publication_target_construction.model_dump(mode="json")
+        )
     return json.dumps(
         payload,
         allow_nan=False,
