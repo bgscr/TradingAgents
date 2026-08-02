@@ -349,6 +349,21 @@ def _render_financial_dispatch_operations(
                         ),
                     ]
                 )
+                if manifest.requested_analysis_scope is not None:
+                    lines.extend(
+                        [
+                            "  - Requested analysis scope: "
+                            f"`{manifest.requested_analysis_scope.value}`",
+                            "  - Availability scope: "
+                            f"`{manifest.availability_scope.value if manifest.availability_scope is not None else 'none'}`",
+                            "  - Availability basis: "
+                            f"`{manifest.availability_basis.value if manifest.availability_basis is not None else 'none'}`",
+                            "  - Eligibility policy version: "
+                            f"`{manifest.eligibility_policy_version or 'none'}`",
+                            "  - Availability reason: "
+                            f"`{manifest.availability_reason.value if manifest.availability_reason is not None else 'none'}`",
+                        ]
+                    )
                 for artifact_identity in manifest.artifact_identities:
                     lines.append(
                         "  - Retained provider artifact identity: "
@@ -398,8 +413,10 @@ def _render_financial_dispatch_operations(
                 (
                     "| Capability | Family | Period | Provider | Company type | "
                     "Classification provenance | Metadata coverage | Ann date | "
-                    "F ann date | Report type | Provider comp type | Update flag | "
-                    "Revision observed | Local revision identity | Provider revision "
+                    "F ann date | F ann date state | Requested analysis scope | "
+                    "Availability scope | Availability basis | Eligibility policy | "
+                    "Availability reason | Report type | Provider comp type | Update flag | "
+                    "Revision observed | Retrieved at | Local revision identity | Provider revision "
                     "ID | Currency | Declared unit | Observed units | Declared critical "
                     "fields | Declared core fields | Mapped normalized fields | Present "
                     "critical fields | Present core fields | Missing critical fields | "
@@ -449,12 +466,39 @@ def _render_financial_dispatch_operations(
                             if row.f_ann_date is not None
                             else "none"
                         ),
+                        row.f_ann_date_state or "not_applicable",
+                        (
+                            row.requested_analysis_scope.value
+                            if row.requested_analysis_scope is not None
+                            else "not_applicable"
+                        ),
+                        (
+                            row.availability_scope.value
+                            if row.availability_scope is not None
+                            else "none"
+                        ),
+                        (
+                            row.availability_basis.value
+                            if row.availability_basis is not None
+                            else "none"
+                        ),
+                        row.eligibility_policy_version or "none",
+                        (
+                            row.availability_reason.value
+                            if row.availability_reason is not None
+                            else "none"
+                        ),
                         row.report_type or "none",
                         row.provider_comp_type or "none",
                         row.update_flag or "none",
                         (
                             row.revision_observed_at.isoformat()
                             if row.revision_observed_at is not None
+                            else "none"
+                        ),
+                        (
+                            row.retrieved_at.isoformat()
+                            if row.retrieved_at is not None
                             else "none"
                         ),
                         row.local_provider_revision_identity or "none",

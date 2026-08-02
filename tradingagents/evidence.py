@@ -6,7 +6,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
@@ -816,6 +816,88 @@ def stable_source_fact_id(
     return f"fact:{sha256(canonical_identity.encode()).hexdigest()}"
 
 
+class SourceFactAvailabilityLineage(BaseModel):
+    """Closed financial availability proof carried by a v2 Source Fact."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-source-fact-availability-v2"] = (
+        "financial-source-fact-availability-v2"
+    )
+    requested_analysis_scope: Literal["current_only", "strict_pit_eligible"]
+    availability_scope: Literal["current_only", "strict_pit_eligible"]
+    availability_basis: Literal[
+        "ann_date_without_first_publication",
+        "ann_date_with_strict_pit_cutoff_failure",
+        "ann_date_first_publication_and_observed_revision",
+    ]
+    analysis_as_of_date: date
+    ann_date: date
+    f_ann_date: date | None = None
+    provider_artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    local_provider_revision_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    observed_at: datetime
+    retrieved_at: datetime
+    family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    period: date
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+    availability_reason: Literal[
+        "missing_first_publication_for_strict_pit",
+        "pit_cutoff_not_satisfied",
+    ] | None = None
+
+    @field_validator("observed_at", "retrieved_at")
+    @classmethod
+    def _canonicalize_availability_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("financial Source Fact availability time must be concrete")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _validate_availability(self) -> SourceFactAvailabilityLineage:
+        if self.local_provider_revision_identity != self.provider_artifact_identity:
+            raise ValueError("financial Source Fact revision lineage is contradictory")
+        if self.ann_date > self.analysis_as_of_date:
+            raise ValueError("financial Source Fact announcement is after the cutoff")
+        if self.availability_scope == "current_only":
+            if self.f_ann_date is None:
+                expected_basis = "ann_date_without_first_publication"
+                expected_reason = "missing_first_publication_for_strict_pit"
+            else:
+                expected_basis = "ann_date_with_strict_pit_cutoff_failure"
+                expected_reason = "pit_cutoff_not_satisfied"
+            if (
+                self.availability_basis != expected_basis
+                or self.availability_reason != expected_reason
+                or self.requested_analysis_scope != "current_only"
+            ):
+                raise ValueError("current-only Source Fact availability is inconsistent")
+        elif (
+            self.f_ann_date is None
+            or self.f_ann_date > self.analysis_as_of_date
+            or self.observed_at.date() > self.analysis_as_of_date
+            or self.availability_basis
+            != "ann_date_first_publication_and_observed_revision"
+            or self.availability_reason is not None
+        ):
+            raise ValueError("strict-PIT Source Fact availability is incomplete")
+        return self
+
+    def supports_analysis_scope(
+        self,
+        requested_scope: Literal["current_only", "strict_pit_eligible"],
+    ) -> bool:
+        if requested_scope == "current_only":
+            return True
+        return self.availability_scope == "strict_pit_eligible"
+
+
 class SourceFact(BaseModel):
     """Canonical observation bound to, but separate from, a raw source artifact.
 
@@ -843,6 +925,10 @@ class SourceFact(BaseModel):
     instrument_symbol: str = ""
     effective_date: str = ""
     calculation_lineage: CalculationLineage | None = None
+    availability_lineage: SourceFactAvailabilityLineage | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_semantics(self) -> SourceFact:
@@ -1287,6 +1373,10 @@ class EvidenceState(BaseModel):
     market_snapshot: MarketSnapshotEvidence | None = None
     material_claims: tuple[MaterialClaim, ...] = ()
     source_facts: tuple[SourceFact, ...] = ()
+    current_analysis_source_facts: tuple[SourceFact, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     source_artifacts: tuple[SourceArtifact, ...] = ()
     claim_validations: tuple[ClaimValidation, ...] = ()
     sources: tuple[EvidenceSource, ...] = ()
@@ -1294,11 +1384,60 @@ class EvidenceState(BaseModel):
     physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
     physical_attempt_count: int = Field(default=0, ge=0)
 
+    def source_facts_for_analysis_scope(
+        self,
+        requested_scope: Literal["current_only", "strict_pit_eligible"],
+    ) -> tuple[SourceFact, ...]:
+        """Return only Source Facts whose availability contract accepts the scope."""
+
+        if requested_scope not in {"current_only", "strict_pit_eligible"}:
+            raise ValueError("unknown Source Fact analysis scope")
+        admitted = (
+            self.current_analysis_source_facts
+            if requested_scope == "current_only"
+            else ()
+        )
+        return (*admitted, *(
+            fact
+            for fact in self.source_facts
+            if fact.availability_lineage is not None
+            and fact.availability_lineage.supports_analysis_scope(requested_scope)
+        ))
+
     @model_validator(mode="after")
     def _canonicalize_source_fact_collection(self) -> EvidenceState:
         canonical_facts = _canonicalize_source_facts(self.source_facts)
         if canonical_facts != self.source_facts:
             object.__setattr__(self, "source_facts", canonical_facts)
+        current_facts = _canonicalize_source_facts(
+            self.current_analysis_source_facts
+        )
+        if current_facts != self.current_analysis_source_facts:
+            object.__setattr__(
+                self,
+                "current_analysis_source_facts",
+                current_facts,
+            )
+        if any(
+            fact.availability_lineage is not None
+            and fact.availability_lineage.requested_analysis_scope == "current_only"
+            for fact in canonical_facts
+        ):
+            raise ValueError(
+                "current-only Source Facts cannot enter general Evidence Admission"
+            )
+        if any(
+            fact.availability_lineage is None
+            or fact.availability_lineage.requested_analysis_scope != "current_only"
+            for fact in current_facts
+        ):
+            raise ValueError(
+                "current-analysis Source Facts require explicit availability lineage"
+            )
+        if {fact.fact_id for fact in canonical_facts} & {
+            fact.fact_id for fact in current_facts
+        }:
+            raise ValueError("Source Fact cannot cross analysis-scope collections")
         return self
 
     @field_validator("acquisition_outcomes")

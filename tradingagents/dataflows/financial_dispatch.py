@@ -60,6 +60,8 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialAcquisitionManifest,
     FinancialAcquisitionOutcome,
     FinancialAggregateCompleteness,
+    FinancialAvailabilityBasis,
+    FinancialAvailabilityScope,
     FinancialCapability,
     FinancialCompanyType,
     FinancialCompanyTypeResolutionMethod,
@@ -105,6 +107,7 @@ from tradingagents.evidence import (
     SourceAcquisitionUnavailable,
     SourceArtifact,
     SourceFact,
+    SourceFactAvailabilityLineage,
     stable_acquisition_source_ref,
     stable_source_fact_id,
 )
@@ -543,6 +546,20 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorSelectionDispatchResult:
+        expected_eligibility_policy = (
+            self.selection_request.eligibility_policy_version
+            if self.selection_request.requested_analysis_scope is not None
+            else None
+        )
+        if (
+            self.routing_result.requested_analysis_scope
+            is not self.selection_request.requested_analysis_scope
+            or self.routing_result.eligibility_policy_version
+            != expected_eligibility_policy
+        ):
+            raise ValueError(
+                "qualified indicator selection analysis scope binding is invalid"
+            )
         signatures = {
             manifest.capability_routing_plan_signature
             for manifest in self.routing_result.family_manifests
@@ -594,6 +611,10 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             status=(
                 "error"
                 if self.routing_result.missing_periods_by_family
+                or any(
+                    manifest.disposition is FinancialEvidenceDisposition.INSUFFICIENT
+                    for manifest in self.routing_result.family_manifests
+                )
                 or (
                     self.routing_result.publication_target_construction is not None
                     and self.routing_result.publication_target_construction.failure_reason
@@ -938,10 +959,34 @@ class FinancialCompletenessAuditRow(BaseModel):
     metadata_coverage: Decimal = Field(ge=0, le=1)
     ann_date: date | None = None
     f_ann_date: date | None = None
+    f_ann_date_state: Literal["present", "absent"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_basis: FinancialAvailabilityBasis | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    availability_reason: FinancialPeriodRejectionReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     report_type: str | None = Field(default=None, max_length=64)
     provider_comp_type: str | None = Field(default=None, max_length=64)
     update_flag: str | None = Field(default=None, max_length=64)
     revision_observed_at: datetime | None = None
+    retrieved_at: datetime | None = None
     local_provider_revision_identity: str | None = Field(
         default=None,
         pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$",
@@ -1032,6 +1077,14 @@ class FinancialCompletenessAuditRow(BaseModel):
             and self.local_provider_revision_identity != self.artifact_identity
         ):
             raise ValueError("financial completeness revision identity is contradictory")
+        if self.eligibility_policy_version is not None and (
+            self.requested_analysis_scope is None
+            or self.availability_scope is None
+            or self.availability_basis is None
+            or self.f_ann_date_state
+            != ("present" if self.f_ann_date is not None else "absent")
+        ):
+            raise ValueError("financial completeness availability is incomplete")
         assert_safe_financial_projection(self.model_dump(mode="json"))
         return self
 
@@ -1108,6 +1161,25 @@ class FinancialManifestAuditProjection(BaseModel):
     capability: FinancialCapability
     statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     disposition: FinancialEvidenceDisposition
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_basis: FinancialAvailabilityBasis | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    availability_reason: FinancialPeriodRejectionReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     final_rendered_artifact_identity: str = Field(
         pattern=r"^financial-rendered-artifact:v1:[0-9a-f]{64}$"
     )
@@ -1215,6 +1287,25 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     capability: FinancialCapability
     statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     disposition: FinancialEvidenceDisposition
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_basis: FinancialAvailabilityBasis | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    availability_reason: FinancialPeriodRejectionReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     final_rendered_artifact_identity: str = Field(
         pattern=r"^financial-rendered-artifact:v1:[0-9a-f]{64}$"
     )
@@ -3180,6 +3271,11 @@ def _project_manifest_for_tool(
         capability=manifest.requested_capability,
         statement_or_ratio_family=_manifest_family(manifest),
         disposition=manifest.disposition,
+        requested_analysis_scope=manifest.requested_analysis_scope,
+        availability_scope=manifest.availability_scope,
+        availability_basis=manifest.availability_basis,
+        eligibility_policy_version=manifest.eligibility_policy_version,
+        availability_reason=manifest.availability_reason,
         final_rendered_artifact_identity=(
             manifest.final_rendered_artifact.artifact_identity
         ),
@@ -3236,6 +3332,11 @@ def _project_manifest_for_audit(
         capability=manifest.requested_capability,
         statement_or_ratio_family=_manifest_family(manifest),
         disposition=manifest.disposition,
+        requested_analysis_scope=manifest.requested_analysis_scope,
+        availability_scope=manifest.availability_scope,
+        availability_basis=manifest.availability_basis,
+        eligibility_policy_version=manifest.eligibility_policy_version,
+        availability_reason=manifest.availability_reason,
         final_rendered_artifact_identity=(
             manifest.final_rendered_artifact.artifact_identity
         ),
@@ -3326,6 +3427,57 @@ def _project_manifest_completeness_rows(
         resolution = candidate.company_type_resolution
         provider = candidate.artifact.dataset.provider_id
         filing_metadata = candidate.filing_metadata
+        availability_scope = (
+            selection.availability_scope
+            if selection is not None
+            else (
+                FinancialAvailabilityScope.CURRENT_ONLY
+                if manifest.requested_analysis_scope
+                is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+                and (
+                    FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                    in assessment.rejection_reasons
+                    or FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+                    in assessment.rejection_reasons
+                )
+                else manifest.availability_scope
+            )
+        )
+        availability_basis = (
+            selection.availability_basis
+            if selection is not None
+            else (
+                FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
+                if FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                in assessment.rejection_reasons
+                else (
+                    FinancialAvailabilityBasis.ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE
+                    if FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+                    in assessment.rejection_reasons
+                    else manifest.availability_basis
+                )
+            )
+        )
+        availability_reason = (
+            selection.availability_reason.value
+            if selection is not None
+            and selection.availability_reason is not None
+            else (
+                FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT.value
+                if FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                in assessment.rejection_reasons
+                else (
+                    FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED.value
+                    if FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+                    in assessment.rejection_reasons
+                    else (
+                        manifest.availability_reason.value
+                        if manifest.availability_reason is not None
+                        else None
+                    )
+                )
+            )
+        )
         filing_metadata_values = (
             filing_metadata.ann_date,
             filing_metadata.f_ann_date,
@@ -3376,10 +3528,21 @@ def _project_manifest_completeness_rows(
                 ),
                 ann_date=filing_metadata.ann_date,
                 f_ann_date=filing_metadata.f_ann_date,
+                f_ann_date_state=(
+                    "present" if filing_metadata.f_ann_date is not None else "absent"
+                )
+                if manifest.eligibility_policy_version is not None
+                else None,
+                requested_analysis_scope=manifest.requested_analysis_scope,
+                availability_scope=availability_scope,
+                availability_basis=availability_basis,
+                eligibility_policy_version=manifest.eligibility_policy_version,
+                availability_reason=availability_reason,
                 report_type=filing_metadata.report_type,
                 provider_comp_type=filing_metadata.comp_type,
                 update_flag=filing_metadata.update_flag,
                 revision_observed_at=filing_metadata.observed_at,
+                retrieved_at=filing_metadata.retrieved_at,
                 local_provider_revision_identity=(
                     filing_metadata.local_provider_revision_identity
                 ),
@@ -3644,10 +3807,17 @@ def _selected_financial_evidence(
     artifacts: list[SourceArtifact] = []
     facts: list[SourceFact] = []
     for manifest in manifests:
-        selected_ids = {
-            selection.candidate_identity
+        selected_by_id = {
+            selection.candidate_identity: selection
             for selection in manifest.selections
             if selection.strict_pit_eligible
+            or (
+                selection.contract_version == "financial-period-selection-v2"
+                and manifest.requested_analysis_scope
+                is FinancialAvailabilityScope.CURRENT_ONLY
+                and selection.availability_scope
+                is FinancialAvailabilityScope.CURRENT_ONLY
+            )
         }
         conflict_ids = {
             candidate_id
@@ -3661,9 +3831,8 @@ def _selected_financial_evidence(
             candidate = provider_candidate.candidate
             assessment = provider_candidate.assessment
             if (
-                candidate.candidate_identity not in selected_ids
+                candidate.candidate_identity not in selected_by_id
                 or candidate.candidate_identity in conflict_ids
-                or not assessment.strict_pit_eligible
             ):
                 continue
             selected_fields = tuple(
@@ -3674,16 +3843,118 @@ def _selected_financial_evidence(
             )
             if not selected_fields:
                 continue
+            selection = selected_by_id[candidate.candidate_identity]
+            availability_lineage = None
+            rendering_scope = None
+            if selection.contract_version == "financial-period-selection-v2":
+                if (
+                    selection.requested_analysis_scope is None
+                    or selection.availability_scope is None
+                    or selection.availability_basis is None
+                    or selection.analysis_as_of_date is None
+                    or selection.ann_date is None
+                    or selection.local_provider_revision_identity is None
+                    or selection.observed_at is None
+                    or selection.retrieved_at is None
+                    or selection.ratio_family is None
+                    or selection.period_end is None
+                    or selection.eligibility_policy_version is None
+                ):
+                    raise ValueError("financial Source Fact availability is incomplete")
+                rendering_scope = (
+                    "current_analysis"
+                    if selection.requested_analysis_scope
+                    is FinancialAvailabilityScope.CURRENT_ONLY
+                    else "strict_pit"
+                )
+                availability_lineage = SourceFactAvailabilityLineage(
+                    requested_analysis_scope=(
+                        selection.requested_analysis_scope.value
+                    ),
+                    availability_scope=selection.availability_scope.value,
+                    availability_basis=selection.availability_basis.value,
+                    analysis_as_of_date=selection.analysis_as_of_date,
+                    ann_date=selection.ann_date,
+                    f_ann_date=selection.f_ann_date,
+                    provider_artifact_identity=selection.artifact_identity,
+                    local_provider_revision_identity=(
+                        selection.local_provider_revision_identity
+                    ),
+                    observed_at=selection.observed_at,
+                    retrieved_at=selection.retrieved_at,
+                    family=selection.ratio_family.value,
+                    period=selection.period_end,
+                    eligibility_policy_version=(
+                        selection.eligibility_policy_version
+                    ),
+                    availability_reason=(
+                        selection.availability_reason.value
+                        if selection.availability_reason is not None
+                        else None
+                    ),
+                )
             lines = tuple(
                 _canonical_json(
                     {
+                        "analysis_as_of_date": (
+                            selection.analysis_as_of_date.isoformat()
+                            if selection.analysis_as_of_date is not None
+                            else None
+                        ),
+                        "ann_date": (
+                            selection.ann_date.isoformat()
+                            if selection.ann_date is not None
+                            else None
+                        ),
                         "artifact_identity": (
                             candidate.artifact.artifact_identity
                         ),
+                        "availability_basis": (
+                            selection.availability_basis.value
+                            if selection.availability_basis is not None
+                            else None
+                        ),
+                        "availability_reason": (
+                            selection.availability_reason.value
+                            if selection.availability_reason is not None
+                            else None
+                        ),
+                        "availability_scope": (
+                            selection.availability_scope.value
+                            if selection.availability_scope is not None
+                            else None
+                        ),
                         "candidate_identity": candidate.candidate_identity,
                         "canonical_field": field.normalized_field,
+                        "eligibility_policy_version": (
+                            selection.eligibility_policy_version
+                        ),
+                        "f_ann_date": (
+                            selection.f_ann_date.isoformat()
+                            if selection.f_ann_date is not None
+                            else None
+                        ),
+                        "local_provider_revision_identity": (
+                            selection.local_provider_revision_identity
+                        ),
                         "normalized_value": field.normalized_value,
+                        "observed_at": (
+                            selection.observed_at.isoformat()
+                            if selection.observed_at is not None
+                            else None
+                        ),
                         "period": assessment.period_end.isoformat(),
+                        "rendering_scope": rendering_scope,
+                        "requested_analysis_scope": (
+                            selection.requested_analysis_scope.value
+                            if selection.requested_analysis_scope is not None
+                            else None
+                        ),
+                        "retrieved_at": (
+                            selection.retrieved_at.isoformat()
+                            if selection.retrieved_at is not None
+                            else None
+                        ),
                         "unit": field.normalized_unit,
                     },
                     label="financial selected period evidence",
@@ -3739,6 +4010,7 @@ def _selected_financial_evidence(
                             candidate.period_identity.instrument_identity.symbol
                         ),
                         effective_date=effective_date,
+                        availability_lineage=availability_lineage,
                     )
                 )
                 offset += len(line) + 1
@@ -3823,7 +4095,23 @@ def project_financial_selection_evidence(
     payload = current.model_dump(mode="python")
     payload["instrument_identity"] = expected_identity
     payload["source_artifacts"] = tuple(artifact_by_sha.values())
-    payload["source_facts"] = (*current.source_facts, *new_facts)
+    current_analysis_facts = tuple(
+        fact
+        for fact in new_facts
+        if fact.availability_lineage is not None
+        and fact.availability_lineage.requested_analysis_scope == "current_only"
+    )
+    generally_admitted_facts = tuple(
+        fact for fact in new_facts if fact not in current_analysis_facts
+    )
+    payload["source_facts"] = (
+        *current.source_facts,
+        *generally_admitted_facts,
+    )
+    payload["current_analysis_source_facts"] = (
+        *current.current_analysis_source_facts,
+        *current_analysis_facts,
+    )
     payload["physical_attempt_events"] = tuple(
         sorted(
             merged_attempts.values(),

@@ -14,6 +14,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tradingagents.dataflows.financial_eligibility_policy import (
+    MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
     MainlandFinancialPeriodTargetConstruction,
 )
 from tradingagents.dataflows.provider_subrequests import (
@@ -336,6 +337,23 @@ class FinancialPeriodDisposition(str, Enum):
     UNSELECTED = "unselected"
 
 
+class FinancialAvailabilityScope(str, Enum):
+    CURRENT_ONLY = "current_only"
+    STRICT_PIT_ELIGIBLE = "strict_pit_eligible"
+
+
+class FinancialAvailabilityBasis(str, Enum):
+    ANN_DATE_WITHOUT_FIRST_PUBLICATION = (
+        "ann_date_without_first_publication"
+    )
+    ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE = (
+        "ann_date_with_strict_pit_cutoff_failure"
+    )
+    ANN_DATE_FIRST_PUBLICATION_AND_OBSERVED_REVISION = (
+        "ann_date_first_publication_and_observed_revision"
+    )
+
+
 class FinancialPeriodRejectionReason(str, Enum):
     PERMISSION_DENIED = "permission_denied"
     INSUFFICIENT_COMPLETENESS = "insufficient_completeness"
@@ -350,6 +368,10 @@ class FinancialPeriodRejectionReason(str, Enum):
     INCOMPATIBLE_CURRENCY = "incompatible_currency"
     INCOMPATIBLE_CONSOLIDATION_SCOPE = "incompatible_consolidation_scope"
     AMBIGUOUS_COMPANY_TYPE = "ambiguous_company_type"
+    ANNOUNCEMENT_AFTER_CUTOFF = "announcement_after_cutoff"
+    MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT = (
+        "missing_first_publication_for_strict_pit"
+    )
 
 
 class FinancialEvidenceDisposition(str, Enum):
@@ -1129,7 +1151,9 @@ class FinancialFilingMetadata(BaseModel):
 
     def is_strict_pit_eligible(self, *, as_of_date: date) -> bool:
         return (
-            self.f_ann_date is not None
+            self.ann_date is not None
+            and self.ann_date <= as_of_date
+            and self.f_ann_date is not None
             and self.f_ann_date <= as_of_date
             and self.observed_at.date() <= as_of_date
         )
@@ -1539,6 +1563,13 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
     metadata_complete: bool
     usable_for_current_analysis: bool
     strict_pit_eligible: bool
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    announcement_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("revision_observed_at")
     @classmethod
@@ -1707,8 +1738,32 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
         ):
             raise ValueError("missing announcement metadata must be rejected")
 
+        v2_eligibility = (
+            self.eligibility_policy_version
+            == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+        )
+        if not v2_eligibility and self.announcement_date is not None:
+            raise ValueError("legacy assessment carries v2 announcement eligibility")
+        announcement_eligible = (
+            not v2_eligibility
+            or (
+                self.announcement_date is not None
+                and self.announcement_date <= self.pit_as_of_date
+            )
+        )
+        announcement_after_cutoff = (
+            FinancialPeriodRejectionReason.ANNOUNCEMENT_AFTER_CUTOFF
+            in self.rejection_reasons
+        )
+        if announcement_after_cutoff != (
+            v2_eligibility
+            and self.announcement_date is not None
+            and self.announcement_date > self.pit_as_of_date
+        ):
+            raise ValueError("announcement-cutoff rejection is inconsistent")
         expected_strict_pit = (
-            self.first_publication_date is not None
+            announcement_eligible
+            and self.first_publication_date is not None
             and self.first_publication_date <= self.pit_as_of_date
             and self.revision_observed_at.date() <= self.pit_as_of_date
         )
@@ -1718,11 +1773,26 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_DATE
             in self.rejection_reasons
         )
+        strict_missing_publication = (
+            FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+            in self.rejection_reasons
+        )
         cutoff_failed = (
             FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
             in self.rejection_reasons
         )
-        if missing_publication != (self.first_publication_date is None):
+        if strict_missing_publication:
+            missing_reason_consistent = (
+                self.first_publication_date is None
+                and not missing_publication
+                and v2_eligibility
+                and self.disposition is FinancialPeriodDisposition.REJECTED
+            )
+        else:
+            missing_reason_consistent = missing_publication == (
+                self.first_publication_date is None
+            )
+        if not missing_reason_consistent:
             raise ValueError("first-publication rejection is inconsistent")
         if cutoff_failed != (
             self.first_publication_date is not None and not expected_strict_pit
@@ -1732,6 +1802,7 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
         pit_only_reasons = {
             FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_DATE,
             FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED,
+            FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT,
         }
         reason_set = set(self.rejection_reasons)
         if self.disposition is FinancialPeriodDisposition.ACCEPTED:
@@ -1741,7 +1812,13 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
             if not reason_set or not reason_set <= pit_only_reasons:
                 raise ValueError("current-only period may fail only strict-PIT gates")
         elif self.disposition is FinancialPeriodDisposition.REJECTED:
-            if not reason_set or reason_set <= pit_only_reasons:
+            if not reason_set or (
+                reason_set <= pit_only_reasons
+                and FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                not in reason_set
+                and self.eligibility_policy_version
+                != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+            ):
                 raise ValueError("rejected financial period requires a non-PIT reason")
         elif self.disposition is FinancialPeriodDisposition.CONFLICTED:
             if not reason_set & {
@@ -1778,6 +1855,9 @@ def assess_financial_period_candidate(
         "financial-ratio-declarations-v2",
         "financial-ratio-declarations-baostock-v1",
     ] = FINANCIAL_RATIO_DECLARATION_V1,
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = None,
 ) -> FinancialPeriodCompletenessAssessment:
     """Apply capability, identity, metadata, and declared completeness gates."""
 
@@ -1810,6 +1890,11 @@ def assess_financial_period_candidate(
         )
     if candidate.filing_metadata.ann_date is None:
         reasons.add(FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA)
+    elif (
+        eligibility_policy_version == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+        and candidate.filing_metadata.ann_date > pit_as_of_date
+    ):
+        reasons.add(FinancialPeriodRejectionReason.ANNOUNCEMENT_AFTER_CUTOFF)
 
     statement_declaration_version = (
         FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2
@@ -1901,7 +1986,14 @@ def assess_financial_period_candidate(
     )
     first_publication_date = candidate.filing_metadata.f_ann_date
     strict_pit_eligible = (
-        first_publication_date is not None
+        (
+            eligibility_policy_version is None
+            or (
+                candidate.filing_metadata.ann_date is not None
+                and candidate.filing_metadata.ann_date <= pit_as_of_date
+            )
+        )
+        and first_publication_date is not None
         and first_publication_date <= pit_as_of_date
         and revision_observed_at.date() <= pit_as_of_date
     )
@@ -1972,7 +2064,43 @@ def assess_financial_period_candidate(
             FinancialPeriodDisposition.CURRENT_ONLY,
         },
         strict_pit_eligible=strict_pit_eligible,
+        eligibility_policy_version=eligibility_policy_version,
+        announcement_date=(
+            candidate.filing_metadata.ann_date
+            if eligibility_policy_version is not None
+            else None
+        ),
     )
+
+
+def reject_financial_period_for_strict_pit(
+    assessment: FinancialPeriodCompletenessAssessment,
+) -> FinancialPeriodCompletenessAssessment:
+    """Fail one otherwise current-usable v2 candidate closed for strict PIT."""
+
+    if assessment.strict_pit_eligible:
+        return assessment
+    if assessment.disposition is not FinancialPeriodDisposition.CURRENT_ONLY:
+        return assessment
+    reasons = set(assessment.rejection_reasons)
+    if assessment.first_publication_date is None:
+        reasons.discard(
+            FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_DATE
+        )
+        reasons.add(
+            FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+        )
+    payload = assessment.model_dump(mode="python")
+    payload.update(
+        {
+            "disposition": FinancialPeriodDisposition.REJECTED,
+            "rejection_reasons": tuple(
+                reason for reason in FinancialPeriodRejectionReason if reason in reasons
+            ),
+            "usable_for_current_analysis": False,
+        }
+    )
+    return FinancialPeriodCompletenessAssessment.model_validate(payload)
 
 
 class FinancialListingProvenance(BaseModel):
@@ -2536,7 +2664,10 @@ class FinancialProviderCandidate(BaseModel):
 class FinancialPeriodSelection(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-period-selection-v1"] = (
+    contract_version: Literal[
+        "financial-period-selection-v1",
+        "financial-period-selection-v2",
+    ] = (
         "financial-period-selection-v1"
     )
     candidate_identity: str = Field(
@@ -2549,9 +2680,70 @@ class FinancialPeriodSelection(BaseModel):
     provider_id: str = Field(pattern=_SAFE_ID_PATTERN)
     disposition: Literal["accepted", "current_only"]
     strict_pit_eligible: bool
-    selection_identity: str = Field(
-        pattern=r"^financial-period-selection:v1:[0-9a-f]{64}$"
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
+    availability_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_basis: FinancialAvailabilityBasis | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    analysis_as_of_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    ann_date: date | None = Field(default=None, exclude_if=lambda value: value is None)
+    f_ann_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    local_provider_revision_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    observed_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    retrieved_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    ratio_family: FinancialRatioFamily | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    period_end: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    availability_reason: FinancialPeriodRejectionReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    selection_identity: str = Field(
+        pattern=r"^financial-period-selection:v[12]:[0-9a-f]{64}$"
+    )
+
+    @field_validator("observed_at", "retrieved_at")
+    @classmethod
+    def _canonicalize_availability_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("financial availability time must be concrete")
+        return value.astimezone(timezone.utc)
 
     @classmethod
     def create(
@@ -2559,6 +2751,10 @@ class FinancialPeriodSelection(BaseModel):
         *,
         candidate: FinancialPeriodCandidate,
         assessment: FinancialPeriodCompletenessAssessment,
+        requested_analysis_scope: FinancialAvailabilityScope | None = None,
+        eligibility_policy_version: Literal[
+            "mainland-financial-period-eligibility-v2"
+        ] | None = None,
     ) -> FinancialPeriodSelection:
         if assessment.disposition not in {
             FinancialPeriodDisposition.ACCEPTED,
@@ -2571,8 +2767,15 @@ class FinancialPeriodSelection(BaseModel):
             or assessment.period_identity != candidate.period_identity.period_identity
         ):
             raise ValueError("financial selection candidate binding mismatch")
-        payload = {
-            "contract_version": "financial-period-selection-v1",
+        v2 = eligibility_policy_version is not None
+        if v2 != (requested_analysis_scope is not None):
+            raise ValueError("financial selection availability request is incomplete")
+        payload: dict[str, object] = {
+            "contract_version": (
+                "financial-period-selection-v2"
+                if v2
+                else "financial-period-selection-v1"
+            ),
             "candidate_identity": candidate.candidate_identity,
             "artifact_identity": candidate.artifact.artifact_identity,
             "period_identity": candidate.period_identity.period_identity,
@@ -2580,21 +2783,149 @@ class FinancialPeriodSelection(BaseModel):
             "disposition": assessment.disposition.value,
             "strict_pit_eligible": assessment.strict_pit_eligible,
         }
+        if v2:
+            filing = candidate.filing_metadata
+            if filing.ann_date is None or candidate.period_identity.ratio_family is None:
+                raise ValueError("v2 financial availability requires indicator filing lineage")
+            availability_scope = (
+                FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+                if assessment.strict_pit_eligible
+                else FinancialAvailabilityScope.CURRENT_ONLY
+            )
+            if availability_scope is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE:
+                availability_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_FIRST_PUBLICATION_AND_OBSERVED_REVISION
+                )
+                availability_reason = None
+            elif filing.f_ann_date is None:
+                availability_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
+                )
+                availability_reason = (
+                    FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                )
+            else:
+                availability_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE
+                )
+                availability_reason = FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+            payload.update(
+                {
+                    "requested_analysis_scope": requested_analysis_scope.value,
+                    "availability_scope": availability_scope.value,
+                    "availability_basis": availability_basis.value,
+                    "analysis_as_of_date": assessment.pit_as_of_date.isoformat(),
+                    "ann_date": filing.ann_date.isoformat(),
+                    "f_ann_date": (
+                        filing.f_ann_date.isoformat()
+                        if filing.f_ann_date is not None
+                        else None
+                    ),
+                    "local_provider_revision_identity": (
+                        filing.local_provider_revision_identity
+                    ),
+                    "observed_at": _utc_text(assessment.revision_observed_at),
+                    "retrieved_at": _utc_text(filing.retrieved_at),
+                    "ratio_family": candidate.period_identity.ratio_family.value,
+                    "period_end": candidate.period_identity.period_end.isoformat(),
+                    "eligibility_policy_version": eligibility_policy_version,
+                    "availability_reason": (
+                        availability_reason.value
+                        if availability_reason is not None
+                        else None
+                    ),
+                }
+            )
+        prefix = "v2" if v2 else "v1"
+        identity_payload = {
+            key: value for key, value in payload.items() if value is not None
+        }
         return cls(
             **payload,
             selection_identity=(
-                "financial-period-selection:v1:" + _canonical_digest(payload)
+                f"financial-period-selection:{prefix}:"
+                + _canonical_digest(identity_payload)
             ),
         )
 
     @model_validator(mode="after")
     def _validate_identity(self) -> FinancialPeriodSelection:
         payload = self.model_dump(mode="json", exclude={"selection_identity"})
-        expected = "financial-period-selection:v1:" + _canonical_digest(payload)
+        prefix = "v2" if self.contract_version == "financial-period-selection-v2" else "v1"
+        expected = f"financial-period-selection:{prefix}:" + _canonical_digest(payload)
         if self.selection_identity != expected:
             raise ValueError("financial period selection identity mismatch")
         if self.strict_pit_eligible != (self.disposition == "accepted"):
             raise ValueError("financial selection PIT disposition is inconsistent")
+        availability_values = (
+            self.requested_analysis_scope,
+            self.availability_scope,
+            self.availability_basis,
+            self.analysis_as_of_date,
+            self.ann_date,
+            self.local_provider_revision_identity,
+            self.observed_at,
+            self.retrieved_at,
+            self.ratio_family,
+            self.period_end,
+            self.eligibility_policy_version,
+        )
+        if self.contract_version == "financial-period-selection-v1":
+            if any(value is not None for value in availability_values) or (
+                self.f_ann_date is not None or self.availability_reason is not None
+            ):
+                raise ValueError("legacy financial selection carries v2 availability")
+            return self
+        if any(value is None for value in availability_values):
+            raise ValueError("v2 financial selection availability is incomplete")
+        if self.local_provider_revision_identity != self.artifact_identity:
+            raise ValueError("financial availability revision identity is contradictory")
+        assert self.analysis_as_of_date is not None
+        assert self.ann_date is not None
+        assert self.observed_at is not None
+        if self.ann_date > self.analysis_as_of_date:
+            raise ValueError("selected financial announcement is after the cutoff")
+        if self.availability_scope is FinancialAvailabilityScope.CURRENT_ONLY:
+            if (
+                self.strict_pit_eligible
+                or self.requested_analysis_scope
+                is not FinancialAvailabilityScope.CURRENT_ONLY
+            ):
+                raise ValueError("current-only financial availability is not degraded")
+            if self.f_ann_date is None:
+                expected_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
+                )
+                expected_reason = (
+                    FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                )
+            else:
+                expected_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE
+                )
+                expected_reason = FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+                if (
+                    self.f_ann_date <= self.analysis_as_of_date
+                    and self.observed_at.date() <= self.analysis_as_of_date
+                ):
+                    raise ValueError("current-only financial PIT cutoff is satisfied")
+            if (
+                self.availability_basis is not expected_basis
+                or self.availability_reason is not expected_reason
+            ):
+                raise ValueError("current-only financial availability is inconsistent")
+        else:
+            if (
+                not self.strict_pit_eligible
+                or self.f_ann_date is None
+                or self.f_ann_date > self.analysis_as_of_date
+                or self.observed_at.date() > self.analysis_as_of_date
+                or self.availability_reason is not None
+                or self.availability_basis is not (
+                    FinancialAvailabilityBasis.ANN_DATE_FIRST_PUBLICATION_AND_OBSERVED_REVISION
+                )
+            ):
+                raise ValueError("strict-PIT financial availability is incomplete")
         return self
 
 
@@ -2982,6 +3313,13 @@ def _manifest_identity_payload(
     physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent] = (),
     disposition: FinancialEvidenceDisposition | None = None,
     final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None,
+    requested_analysis_scope: FinancialAvailabilityScope | None = None,
+    availability_scope: FinancialAvailabilityScope | None = None,
+    availability_basis: FinancialAvailabilityBasis | None = None,
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = None,
+    availability_reason: FinancialPeriodRejectionReason | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "contract_version": contract_version,
@@ -3026,6 +3364,27 @@ def _manifest_identity_payload(
                 "final_rendered_artifact": (
                     final_rendered_artifact.model_dump(mode="json")
                     if final_rendered_artifact is not None
+                    else None
+                ),
+                "requested_analysis_scope": (
+                    requested_analysis_scope.value
+                    if requested_analysis_scope is not None
+                    else None
+                ),
+                "availability_scope": (
+                    availability_scope.value
+                    if availability_scope is not None
+                    else None
+                ),
+                "availability_basis": (
+                    availability_basis.value
+                    if availability_basis is not None
+                    else None
+                ),
+                "eligibility_policy_version": eligibility_policy_version,
+                "availability_reason": (
+                    availability_reason.value
+                    if availability_reason is not None
                     else None
                 ),
             }
@@ -3073,6 +3432,25 @@ class FinancialAcquisitionManifest(BaseModel):
     physical_attempt_events: tuple[ProviderSubrequestAttemptEvent, ...] = ()
     disposition: FinancialEvidenceDisposition | None = None
     final_rendered_artifact: FinancialRenderedArtifactIdentity | None = None
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    availability_basis: FinancialAvailabilityBasis | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    availability_reason: FinancialPeriodRejectionReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     manifest_identity: str = Field(pattern=r"^financial-manifest:v[12]:[0-9a-f]{64}$")
 
     @classmethod
@@ -3168,6 +3546,10 @@ class FinancialAcquisitionManifest(BaseModel):
         publication_target_construction: (
             MainlandFinancialPeriodTargetConstruction | None
         ) = None,
+        requested_analysis_scope: FinancialAvailabilityScope | None = None,
+        eligibility_policy_version: Literal[
+            "mainland-financial-period-eligibility-v2"
+        ] | None = None,
     ) -> FinancialAcquisitionManifest:
         """Bind the v1 selection contract to Ticket 11 operational lineage."""
 
@@ -3182,6 +3564,75 @@ class FinancialAcquisitionManifest(BaseModel):
         final_rendered_artifact = FinancialRenderedArtifactIdentity.create(
             rendered_value
         )
+        v2_selections = tuple(
+            selection
+            for selection in self.selections
+            if selection.contract_version == "financial-period-selection-v2"
+        )
+        availability_scope = (
+            FinancialAvailabilityScope.CURRENT_ONLY
+            if any(
+                selection.availability_scope
+                is FinancialAvailabilityScope.CURRENT_ONLY
+                for selection in v2_selections
+            )
+            else (
+                FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+                if v2_selections
+                else None
+            )
+        )
+        availability_basis = (
+            FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
+            if availability_scope is FinancialAvailabilityScope.CURRENT_ONLY
+            and any(selection.f_ann_date is None for selection in v2_selections)
+            else (
+                FinancialAvailabilityBasis.ANN_DATE_FIRST_PUBLICATION_AND_OBSERVED_REVISION
+                if availability_scope is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+                else (
+                    FinancialAvailabilityBasis.ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE
+                    if availability_scope is FinancialAvailabilityScope.CURRENT_ONLY
+                    else None
+                )
+            )
+        )
+        availability_reason = next(
+            (
+                selection.availability_reason
+                for selection in v2_selections
+                if selection.availability_reason is not None
+            ),
+            None,
+        )
+        rejection_reasons = {
+            reason
+            for rejection in self.rejected_periods
+            for reason in rejection.reasons
+        }
+        if availability_scope is None and requested_analysis_scope is (
+            FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+        ):
+            if (
+                FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                in rejection_reasons
+            ):
+                availability_scope = FinancialAvailabilityScope.CURRENT_ONLY
+                availability_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
+                )
+                availability_reason = (
+                    FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                )
+            elif FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED in (
+                rejection_reasons
+            ):
+                availability_scope = FinancialAvailabilityScope.CURRENT_ONLY
+                availability_basis = (
+                    FinancialAvailabilityBasis.ANN_DATE_WITH_STRICT_PIT_CUTOFF_FAILURE
+                )
+                availability_reason = (
+                    FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
+                )
         payload = _manifest_identity_payload(
             contract_version=FINANCIAL_MANIFEST_V2,
             capability_routing_plan_signature=self.capability_routing_plan_signature,
@@ -3201,6 +3652,11 @@ class FinancialAcquisitionManifest(BaseModel):
             physical_attempt_events=canonical_attempts,
             disposition=disposition,
             final_rendered_artifact=final_rendered_artifact,
+            requested_analysis_scope=requested_analysis_scope,
+            availability_scope=availability_scope,
+            availability_basis=availability_basis,
+            eligibility_policy_version=eligibility_policy_version,
+            availability_reason=availability_reason,
         )
         return FinancialAcquisitionManifest(
             **self.model_dump(
@@ -3212,6 +3668,11 @@ class FinancialAcquisitionManifest(BaseModel):
                     "final_rendered_artifact",
                     "manifest_identity",
                     "publication_target_construction",
+                    "requested_analysis_scope",
+                    "availability_scope",
+                    "availability_basis",
+                    "eligibility_policy_version",
+                    "availability_reason",
                 },
             ),
             contract_version=FINANCIAL_MANIFEST_V2,
@@ -3219,6 +3680,11 @@ class FinancialAcquisitionManifest(BaseModel):
             physical_attempt_events=canonical_attempts,
             disposition=disposition,
             final_rendered_artifact=final_rendered_artifact,
+            requested_analysis_scope=requested_analysis_scope,
+            availability_scope=availability_scope,
+            availability_basis=availability_basis,
+            eligibility_policy_version=eligibility_policy_version,
+            availability_reason=availability_reason,
             manifest_identity="financial-manifest:v2:" + _canonical_digest(payload),
         )
 
@@ -3304,6 +3770,11 @@ class FinancialAcquisitionManifest(BaseModel):
                 or self.disposition is not None
                 or self.final_rendered_artifact is not None
                 or self.publication_target_construction is not None
+                or self.requested_analysis_scope is not None
+                or self.availability_scope is not None
+                or self.availability_basis is not None
+                or self.eligibility_policy_version is not None
+                or self.availability_reason is not None
             ):
                 raise ValueError("legacy financial manifest carries v2 lineage")
         else:
@@ -3316,6 +3787,27 @@ class FinancialAcquisitionManifest(BaseModel):
                 )
             ):
                 raise ValueError("financial manifest attempts must be canonical")
+            availability_values = (
+                self.requested_analysis_scope,
+                self.availability_scope,
+                self.availability_basis,
+                self.eligibility_policy_version,
+            )
+            if self.eligibility_policy_version is None:
+                if any(value is not None for value in availability_values) or (
+                    self.availability_reason is not None
+                ):
+                    raise ValueError("pre-v2 manifest carries eligibility availability")
+            elif (
+                self.eligibility_policy_version
+                != MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+                or self.requested_analysis_scope is None
+            ):
+                raise ValueError("v2 manifest availability lineage is incomplete")
+            elif (self.availability_scope is None) != (
+                self.availability_basis is None
+            ):
+                raise ValueError("manifest availability scope and basis are incomplete")
             attempt_ids = tuple(
                 item.attempt_event_id for item in self.physical_attempt_events
             )
@@ -3436,6 +3928,11 @@ class FinancialAcquisitionManifest(BaseModel):
             physical_attempt_events=self.physical_attempt_events,
             disposition=self.disposition,
             final_rendered_artifact=self.final_rendered_artifact,
+            requested_analysis_scope=self.requested_analysis_scope,
+            availability_scope=self.availability_scope,
+            availability_basis=self.availability_basis,
+            eligibility_policy_version=self.eligibility_policy_version,
+            availability_reason=self.availability_reason,
         )
         expected = (
             "financial-manifest:"
@@ -3461,6 +3958,8 @@ __all__ = [
     "FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1",
     "FinancialAcquisitionManifest",
     "FinancialAcquisitionOutcome",
+    "FinancialAvailabilityBasis",
+    "FinancialAvailabilityScope",
     "FinancialCapability",
     "FinancialCompanyType",
     "FinancialCompanyTypeResolution",
@@ -3503,5 +4002,6 @@ __all__ = [
     "financial_statement_field_declaration",
     "mark_financial_period_conflicted",
     "mark_financial_period_company_type_conflicted",
+    "reject_financial_period_for_strict_pit",
     "resolve_financial_company_type",
 ]

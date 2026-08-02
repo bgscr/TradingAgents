@@ -27,6 +27,7 @@ from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_RATIO_DECLARATION_V2,
     FinancialAcquisitionManifest,
     FinancialAcquisitionOutcome,
+    FinancialAvailabilityScope,
     FinancialCapability,
     FinancialCompanyType,
     FinancialConsolidationScope,
@@ -53,6 +54,7 @@ from tradingagents.dataflows.financial_contracts import (
     compare_financial_period_candidates,
     mark_financial_period_company_type_conflicted,
     mark_financial_period_conflicted,
+    reject_financial_period_for_strict_pit,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
@@ -455,12 +457,17 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     contract_version: Literal[
         "financial-indicator-routing-request-v1",
         "financial-indicator-routing-request-v2",
+        "financial-indicator-routing-request-v3",
     ] = (
         "financial-indicator-routing-request-v1"
     )
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date
     company_type: FinancialCompanyType
@@ -486,12 +493,24 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             raise ValueError("indicator routing requires a resolved company type")
         if (self.listing_date is None) != (self.listing_provenance is None):
             raise ValueError("listing exception requires authoritative date and provenance")
-        v2 = self.contract_version == "financial-indicator-routing-request-v2"
-        if v2 != (
+        policy_bound = self.contract_version in {
+            "financial-indicator-routing-request-v2",
+            "financial-indicator-routing-request-v3",
+        }
+        if policy_bound != (
             self.eligibility_policy_version
             == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
         ):
             raise ValueError("indicator routing request policy identity is inconsistent")
+        availability_bound = (
+            self.contract_version == "financial-indicator-routing-request-v3"
+        )
+        if availability_bound and self.requested_analysis_scope is None:
+            raise ValueError(
+                "Ticket 03 routing requires an explicit availability scope"
+            )
+        if not availability_bound and self.requested_analysis_scope is not None:
+            raise ValueError("indicator routing request availability scope is inconsistent")
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -818,9 +837,20 @@ class FinancialIndicatorRoutingResult(BaseModel):
     publication_target_construction: (
         MainlandFinancialPeriodTargetConstruction | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
+        if (self.requested_analysis_scope is None) != (
+            self.eligibility_policy_version is None
+        ):
+            raise ValueError("indicator result analysis scope binding is incomplete")
         manifest_target_constructions = {
             manifest.publication_target_construction
             for manifest in self.family_manifests
@@ -875,6 +905,19 @@ class FinancialIndicatorRoutingResult(BaseModel):
             for manifest in self.family_manifests
             if manifest.contract_version == "financial-manifest-v2"
         )
+        if v2_manifests and {
+            (
+                manifest.requested_analysis_scope,
+                manifest.eligibility_policy_version,
+            )
+            for manifest in v2_manifests
+        } != {
+            (
+                self.requested_analysis_scope,
+                self.eligibility_policy_version,
+            )
+        }:
+            raise ValueError("indicator manifest analysis scope binding is invalid")
         if v2_manifests and (
             len(v2_manifests) != len(self.family_manifests)
             or any(
@@ -1527,6 +1570,11 @@ class MainlandFinancialCapabilityRouter:
             MainlandCapability.FINANCIAL_INDICATORS
         )
         publication_aware = request.eligibility_policy_version is not None
+        availability_policy_version = (
+            request.eligibility_policy_version
+            if request.requested_analysis_scope is not None
+            else None
+        )
         if publication_aware and (
             self._routing_plan.eligibility_policy_version
             != request.eligibility_policy_version
@@ -1674,7 +1722,14 @@ class MainlandFinancialCapabilityRouter:
                     expected_consolidation_scope=request.consolidation_scope,
                     pit_as_of_date=request.as_of_date,
                     ratio_declaration_version=declaration_version,
+                    eligibility_policy_version=availability_policy_version,
                 )
+                if request.requested_analysis_scope is (
+                    FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+                ):
+                    assessment = reject_financial_period_for_strict_pit(
+                        assessment
+                    )
                 if (
                     assessment.usable_for_current_analysis
                     and identity.company_type is not request.company_type
@@ -1848,6 +1903,8 @@ class MainlandFinancialCapabilityRouter:
                 FinancialPeriodSelection.create(
                     candidate=candidate,
                     assessment=selected_assessments[(family, period)],
+                    requested_analysis_scope=request.requested_analysis_scope,
+                    eligibility_policy_version=availability_policy_version,
                 )
                 for (candidate_family, period), candidate in selected_candidates.items()
                 if candidate_family is family
@@ -1929,6 +1986,8 @@ class MainlandFinancialCapabilityRouter:
             physical_attempt_ids=tuple(physical_attempt_ids),
             physical_attempt_events=tuple(physical_attempt_events.values()),
             publication_target_construction=publication_target_construction,
+            requested_analysis_scope=request.requested_analysis_scope,
+            eligibility_policy_version=availability_policy_version,
         )
         if not physical_attempt_events:
             return result
@@ -1943,6 +2002,8 @@ class MainlandFinancialCapabilityRouter:
                 ),
                 rendered_value=rendered_value,
                 publication_target_construction=publication_target_construction,
+                requested_analysis_scope=request.requested_analysis_scope,
+                eligibility_policy_version=availability_policy_version,
             )
             for manifest in result.family_manifests
         )
@@ -2376,7 +2437,11 @@ def financial_indicator_evidence_disposition(
             selection.disposition == "current_only"
             for selection in manifest.selections
         ):
-            return FinancialEvidenceDisposition.CURRENT_ONLY
+            return (
+                FinancialEvidenceDisposition.DEGRADED
+                if request.requested_analysis_scope is not None
+                else FinancialEvidenceDisposition.CURRENT_ONLY
+            )
         return FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
     if request.remaining_evidence_decision_ready and (
         result.current_profile_degraded or manifest.selections
@@ -2430,6 +2495,12 @@ def finalize_indicator_routing_result(
             rendered_value=rendered_value,
             publication_target_construction=(
                 result.publication_target_construction
+            ),
+            requested_analysis_scope=request.requested_analysis_scope,
+            eligibility_policy_version=(
+                request.eligibility_policy_version
+                if request.requested_analysis_scope is not None
+                else None
             ),
         )
         for manifest in result.family_manifests
@@ -2553,9 +2624,41 @@ def render_indicator_routing_result(
         for manifest in result.family_manifests
         for selection in manifest.selections
     }
+    requested_analysis_scope = result.requested_analysis_scope
+    availability_reason = next(
+        (
+            reason
+            for manifest in result.family_manifests
+            for reason in (
+                (
+                    manifest.availability_reason,
+                    *(
+                        selection.availability_reason
+                        for selection in manifest.selections
+                    ),
+                    *(
+                        rejection_reason
+                        for rejection in manifest.rejected_periods
+                        for rejection_reason in rejection.reasons
+                        if rejection_reason
+                        in {
+                            FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT,
+                            FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED,
+                        }
+                    ),
+                )
+            )
+            if reason is not None
+        ),
+        None,
+    )
     if (
         result.publication_target_construction is not None
         and result.publication_target_construction.failure_reason is not None
+    ) or (
+        requested_analysis_scope
+        is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+        and availability_reason is not None
     ):
         status = "insufficient_evidence"
     elif result.missing_periods_by_family and result.current_profile_degraded:
@@ -2569,6 +2672,49 @@ def render_indicator_routing_result(
         status = "current_only_degraded"
     else:
         status = "complete"
+    rendered_periods: list[dict[str, object]] = []
+    for candidate in result.selected_candidates:
+        selection = selections[candidate.candidate_identity]
+        rendered_period: dict[str, object] = {
+            "ratio_family": candidate.period_identity.ratio_family.value,
+            "period_end": candidate.period_identity.period_end.isoformat(),
+            "provider": candidate.artifact.dataset.provider_id,
+            "selection_disposition": selection.disposition,
+            "strict_pit_eligible": selection.strict_pit_eligible,
+            "values": {
+                field.normalized_field: {
+                    "value": field.normalized_value,
+                    "unit": field.normalized_unit,
+                }
+                for field in candidate.fields
+                if field.normalized_value is not None
+            },
+        }
+        if selection.contract_version == "financial-period-selection-v2":
+            assert selection.availability_scope is not None
+            assert selection.availability_basis is not None
+            assert selection.ann_date is not None
+            rendered_period.update(
+                {
+                    "availability_scope": selection.availability_scope.value,
+                    "availability_basis": selection.availability_basis.value,
+                    "availability_reason": (
+                        selection.availability_reason.value
+                        if selection.availability_reason is not None
+                        else None
+                    ),
+                    "ann_date": selection.ann_date.isoformat(),
+                    "f_ann_date": (
+                        selection.f_ann_date.isoformat()
+                        if selection.f_ann_date is not None
+                        else None
+                    ),
+                    "eligibility_policy_version": (
+                        selection.eligibility_policy_version
+                    ),
+                }
+            )
+        rendered_periods.append(rendered_period)
     payload = {
         "contract_version": (
             "financial-selected-indicators-v2"
@@ -2579,34 +2725,30 @@ def render_indicator_routing_result(
         "complete_families": [
             family.value for family in result.complete_families
         ],
-        "periods": [
-            {
-                "ratio_family": candidate.period_identity.ratio_family.value,
-                "period_end": candidate.period_identity.period_end.isoformat(),
-                "provider": candidate.artifact.dataset.provider_id,
-                "selection_disposition": selections[
-                    candidate.candidate_identity
-                ].disposition,
-                "strict_pit_eligible": selections[
-                    candidate.candidate_identity
-                ].strict_pit_eligible,
-                "values": {
-                    field.normalized_field: {
-                        "value": field.normalized_value,
-                        "unit": field.normalized_unit,
-                    }
-                    for field in candidate.fields
-                    if field.normalized_value is not None
-                },
-            }
-            for candidate in result.selected_candidates
-        ],
+        "periods": rendered_periods,
         "missing_periods_by_family": {
             family.value: [period.isoformat() for period in periods]
             for family, periods in result.missing_periods_by_family
         },
         "current_profile_provider": result.current_profile_provider,
     }
+    if requested_analysis_scope is not None:
+        payload.update(
+            {
+                "requested_analysis_scope": requested_analysis_scope.value,
+                "rendering_scope": (
+                    "current_analysis"
+                    if requested_analysis_scope
+                    is FinancialAvailabilityScope.CURRENT_ONLY
+                    else "strict_pit"
+                ),
+                "availability_reason": (
+                    availability_reason.value
+                    if availability_reason is not None
+                    else None
+                ),
+            }
+        )
     if result.publication_target_construction is not None:
         payload["publication_target_construction"] = (
             result.publication_target_construction.model_dump(mode="json")
