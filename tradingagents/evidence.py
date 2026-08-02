@@ -1344,6 +1344,238 @@ class EvidenceSource(BaseModel):
     detail: str = ""
 
 
+_FINANCIAL_FAMILY_TOKEN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+_FINANCIAL_FAMILY_SHA_REF = r"^[A-Za-z0-9._:-]+=sha256:[0-9a-f]{64}$"
+_UNSAFE_FINANCIAL_FAMILY_PROJECTION_TEXT = (
+    "api-key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer ",
+    "client_secret",
+    "credential",
+    "password",
+    "payload_body",
+    "raw_error",
+    "secret",
+    "traceback",
+)
+_UNSAFE_FINANCIAL_FAMILY_URL_QUERY = re.compile(r"https?://\S*\?", re.IGNORECASE)
+
+
+class _FinancialFamilyEvidenceProjection(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    @model_validator(mode="after")
+    def _validate_safe_projection(self) -> _FinancialFamilyEvidenceProjection:
+        serialized = json.dumps(
+            self.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        folded = serialized.casefold()
+        if any(
+            marker in folded
+            for marker in _UNSAFE_FINANCIAL_FAMILY_PROJECTION_TEXT
+        ) or _UNSAFE_FINANCIAL_FAMILY_URL_QUERY.search(serialized) is not None:
+            raise ValueError("financial family evidence projection is unsafe")
+        return self
+
+
+class FinancialFamilyAuthorityEvidence(_FinancialFamilyEvidenceProjection):
+    authority: Literal[
+        "canonical_evidence_contract",
+        "capability_profile",
+        "strategy_rules",
+    ]
+    authority_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    required: bool
+
+
+class FinancialFamilyRequirementEvidence(_FinancialFamilyEvidenceProjection):
+    family: Literal[
+        "profit",
+        "operation",
+        "growth",
+        "balance",
+        "cash_flow",
+        "dupont",
+    ]
+    status: Literal["required", "optional"]
+    authority_bindings: tuple[FinancialFamilyAuthorityEvidence, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
+    material_premise_ids: tuple[str, ...] = ()
+
+
+class FinancialFamilyPeriodCoverageEvidence(_FinancialFamilyEvidenceProjection):
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    provider_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    period: date
+    disposition: Literal[
+        "accepted",
+        "current_only",
+        "rejected",
+        "conflicted",
+        "unselected",
+    ]
+    critical_threshold: Decimal
+    core_threshold: Decimal
+    critical_coverage: Decimal = Field(ge=0, le=1)
+    core_coverage: Decimal = Field(ge=0, le=1)
+    declared_critical_fields: tuple[str, ...] = ()
+    declared_core_fields: tuple[str, ...] = ()
+    rejection_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_fixed_thresholds(self) -> FinancialFamilyPeriodCoverageEvidence:
+        if self.critical_threshold != Decimal("1") or self.core_threshold != Decimal(
+            "0.9"
+        ):
+            raise ValueError("financial family evidence thresholds are fixed")
+        return self
+
+
+class FinancialMaterialPremiseFamilyEvidence(_FinancialFamilyEvidenceProjection):
+    premise_id: str = Field(pattern=_FINANCIAL_FAMILY_TOKEN)
+    family: Literal[
+        "profit",
+        "operation",
+        "growth",
+        "balance",
+        "cash_flow",
+        "dupont",
+    ]
+    affected_periods: tuple[date, ...]
+
+
+class FinancialFamilyEvidenceAssessment(_FinancialFamilyEvidenceProjection):
+    """Payload-free family outcome retained in Evidence State."""
+
+    contract_version: Literal["financial-family-assessment-v2"]
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+    requested_analysis_scope: Literal["current_only", "strict_pit_eligible"]
+    company_type: Literal[
+        "bank",
+        "industrial/non-bank",
+        "insurance",
+        "securities",
+        "other-financial",
+        "unknown",
+    ]
+    family: Literal[
+        "profit",
+        "operation",
+        "growth",
+        "balance",
+        "cash_flow",
+        "dupont",
+    ]
+    target_periods: tuple[date, ...]
+    candidate_identities: tuple[str, ...]
+    selected_periods: tuple[date, ...]
+    current_only_periods: tuple[date, ...]
+    rejected_periods: tuple[date, ...]
+    conflicted_periods: tuple[date, ...]
+    missing_periods: tuple[date, ...]
+    coverage: tuple[FinancialFamilyPeriodCoverageEvidence, ...]
+    requirement: FinancialFamilyRequirementEvidence
+    missing_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyEvidence, ...
+    ] = ()
+    conflicted_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyEvidence, ...
+    ] = ()
+    complete: bool
+    disposition: Literal[
+        "current_only",
+        "strict_pit_eligible",
+        "degraded",
+        "insufficient",
+        "conflicted",
+    ]
+    typed_reasons: tuple[str, ...]
+    artifact_identities: tuple[str, ...]
+    selection_identities: tuple[str, ...]
+    conflict_identities: tuple[str, ...]
+    assessment_ref: str = Field(pattern=_FINANCIAL_FAMILY_SHA_REF)
+
+    @model_validator(mode="after")
+    def _validate_family_binding(self) -> FinancialFamilyEvidenceAssessment:
+        from tradingagents.dataflows.financial_contracts import (
+            FinancialIndicatorFamilyAssessment,
+        )
+
+        FinancialIndicatorFamilyAssessment.model_validate(
+            self.model_dump(mode="python")
+        )
+        return self
+
+
+class FinancialFamilyAggregateEvidenceAssessment(
+    _FinancialFamilyEvidenceProjection
+):
+    """Payload-free aggregate retaining its independent family assessments."""
+
+    contract_version: Literal["financial-family-aggregate-v2"]
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ]
+    requested_analysis_scope: Literal["current_only", "strict_pit_eligible"]
+    company_type: Literal[
+        "bank",
+        "industrial/non-bank",
+        "insurance",
+        "securities",
+        "other-financial",
+        "unknown",
+    ]
+    requirements_identity: str = Field(
+        pattern=r"^financial-family-requirements:v1:[0-9a-f]{64}$"
+    )
+    requested_families: tuple[str, ...]
+    family_assessments: tuple[FinancialFamilyEvidenceAssessment, ...]
+    complete_families: tuple[str, ...]
+    missing_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyEvidence, ...
+    ] = ()
+    conflicted_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyEvidence, ...
+    ] = ()
+    disposition: Literal[
+        "current_only",
+        "strict_pit_eligible",
+        "degraded",
+        "insufficient",
+        "conflicted",
+    ]
+    typed_reasons: tuple[str, ...]
+    assessment_ref: str = Field(pattern=_FINANCIAL_FAMILY_SHA_REF)
+
+    @model_validator(mode="after")
+    def _validate_aggregate_binding(
+        self,
+    ) -> FinancialFamilyAggregateEvidenceAssessment:
+        from tradingagents.dataflows.financial_contracts import (
+            FinancialIndicatorAggregateAssessment,
+        )
+
+        FinancialIndicatorAggregateAssessment.model_validate(
+            self.model_dump(mode="python")
+        )
+        return self
+
+
 def _canonicalize_source_facts(
     facts: Iterable[SourceFact],
 ) -> tuple[SourceFact, ...]:
@@ -1383,6 +1615,12 @@ class EvidenceState(BaseModel):
     acquisition_outcomes: tuple[SourceAcquisitionOutcome, ...] = ()
     physical_attempt_events: tuple[ProviderPhysicalAttemptEvidence, ...] = ()
     physical_attempt_count: int = Field(default=0, ge=0)
+    financial_family_assessments: tuple[FinancialFamilyEvidenceAssessment, ...] = (
+        ()
+    )
+    financial_family_aggregate_assessments: tuple[
+        FinancialFamilyAggregateEvidenceAssessment, ...
+    ] = ()
 
     def source_facts_for_analysis_scope(
         self,

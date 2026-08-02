@@ -33,7 +33,14 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialConsolidationScope,
     FinancialCriticalValueConflict,
     FinancialEvidenceDisposition,
+    FinancialFamilyAssessmentReason,
+    FinancialFamilyPeriodCoverage,
+    FinancialFamilyRequirementStatus,
+    FinancialIndicatorAggregateAssessment,
+    FinancialIndicatorEvidenceRequirements,
+    FinancialIndicatorFamilyAssessment,
     FinancialListingProvenance,
+    FinancialMaterialPremiseFamilyBinding,
     FinancialPeriodCandidate,
     FinancialPeriodCompletenessAssessment,
     FinancialPeriodDisposition,
@@ -458,6 +465,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         "financial-indicator-routing-request-v1",
         "financial-indicator-routing-request-v2",
         "financial-indicator-routing-request-v3",
+        "financial-indicator-routing-request-v4",
     ] = (
         "financial-indicator-routing-request-v1"
     )
@@ -476,6 +484,10 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     ratio_families: tuple[FinancialRatioFamily, ...]
     eligible_reporting_period_ends: tuple[date, ...]
     remaining_evidence_decision_ready: bool = False
+    family_evidence_requirements: FinancialIndicatorEvidenceRequirements | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     listing_date: date | None = Field(default=None, exclude_if=lambda value: value is None)
     listing_provenance: FinancialListingProvenance | None = Field(
         default=None,
@@ -487,8 +499,15 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         canonical = tuple(
             family for family in FinancialRatioFamily if family in self.ratio_families
         )
-        if not canonical or self.ratio_families != canonical:
+        family_bound = self.contract_version == "financial-indicator-routing-request-v4"
+        if not canonical or len(self.ratio_families) != len(canonical):
             raise ValueError("indicator families must be non-empty, unique, and canonical")
+        if self.ratio_families != canonical:
+            if not family_bound:
+                raise ValueError(
+                    "indicator families must be non-empty, unique, and canonical"
+                )
+            object.__setattr__(self, "ratio_families", canonical)
         if self.company_type is FinancialCompanyType.UNKNOWN:
             raise ValueError("indicator routing requires a resolved company type")
         if (self.listing_date is None) != (self.listing_provenance is None):
@@ -496,6 +515,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         policy_bound = self.contract_version in {
             "financial-indicator-routing-request-v2",
             "financial-indicator-routing-request-v3",
+            "financial-indicator-routing-request-v4",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -503,7 +523,11 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         ):
             raise ValueError("indicator routing request policy identity is inconsistent")
         availability_bound = (
-            self.contract_version == "financial-indicator-routing-request-v3"
+            self.contract_version
+            in {
+                "financial-indicator-routing-request-v3",
+                "financial-indicator-routing-request-v4",
+            }
         )
         if availability_bound and self.requested_analysis_scope is None:
             raise ValueError(
@@ -511,6 +535,18 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             )
         if not availability_bound and self.requested_analysis_scope is not None:
             raise ValueError("indicator routing request availability scope is inconsistent")
+        if family_bound != (self.family_evidence_requirements is not None):
+            raise ValueError("Ticket 04 routing requires family evidence requirements")
+        if family_bound:
+            assert self.family_evidence_requirements is not None
+            if (
+                self.family_evidence_requirements.requested_families
+                != self.ratio_families
+                or self.family_evidence_requirements.eligibility_policy_version
+                != self.eligibility_policy_version
+                or self.remaining_evidence_decision_ready
+            ):
+                raise ValueError("indicator family requirement binding is inconsistent")
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -817,7 +853,10 @@ class FinancialStatementRoutingResult(BaseModel):
 class FinancialIndicatorRoutingResult(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-indicator-routing-result-v1"] = (
+    contract_version: Literal[
+        "financial-indicator-routing-result-v1",
+        "financial-indicator-routing-result-v2",
+    ] = (
         "financial-indicator-routing-result-v1"
     )
     route: tuple[str, ...]
@@ -844,9 +883,87 @@ class FinancialIndicatorRoutingResult(BaseModel):
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+    aggregate_family_assessment: FinancialIndicatorAggregateAssessment | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
+        family_bound = self.contract_version == "financial-indicator-routing-result-v2"
+        if family_bound != (
+            bool(self.family_assessments)
+            and self.aggregate_family_assessment is not None
+        ):
+            raise ValueError("indicator family assessment binding is incomplete")
+        if family_bound:
+            assert self.aggregate_family_assessment is not None
+            manifest_families = tuple(
+                manifest.requested_ratio_family
+                for manifest in self.family_manifests
+            )
+            if (
+                self.aggregate_family_assessment.family_assessments
+                != self.family_assessments
+                or self.aggregate_family_assessment.complete_families
+                != self.complete_families
+                or manifest_families
+                != self.aggregate_family_assessment.requested_families
+                or self.aggregate_family_assessment.requested_analysis_scope
+                is not self.requested_analysis_scope
+                or self.aggregate_family_assessment.eligibility_policy_version
+                != self.eligibility_policy_version
+            ):
+                raise ValueError("indicator aggregate family assessment is inconsistent")
+            for manifest, assessment in zip(
+                self.family_manifests,
+                self.family_assessments,
+                strict=True,
+            ):
+                if (
+                    assessment.target_periods
+                    != manifest.aggregate_completeness.target_reporting_period_ends
+                    or assessment.candidate_identities
+                    != tuple(
+                        sorted(
+                            item.candidate.candidate_identity
+                            for item in manifest.provider_candidates
+                        )
+                    )
+                    or assessment.artifact_identities
+                    != tuple(
+                        sorted(
+                            item.artifact.artifact_identity
+                            for item in manifest.artifacts
+                        )
+                    )
+                    or assessment.selection_identities
+                    != tuple(
+                        sorted(
+                            item.selection_identity for item in manifest.selections
+                        )
+                    )
+                    or assessment.conflict_identities
+                    != tuple(
+                        sorted(
+                            item.conflict_identity for item in manifest.conflicts
+                        )
+                    )
+                ):
+                    raise ValueError("indicator family manifest binding is inconsistent")
+            publication_failed = (
+                self.publication_target_construction is not None
+                and self.publication_target_construction.failure_reason is not None
+            )
+            if publication_failed != (
+                FinancialFamilyAssessmentReason.PUBLICATION_METADATA_UNPROVEN
+                in self.aggregate_family_assessment.typed_reasons
+            ):
+                raise ValueError("indicator publication failure binding is inconsistent")
         if (self.requested_analysis_scope is None) != (
             self.eligibility_policy_version is None
         ):
@@ -1862,11 +1979,20 @@ class MainlandFinancialCapabilityRouter:
                 if key[1] in target_periods
             }
 
-        family_assessments: dict[
+        family_completeness_assessments: dict[
             FinancialRatioFamily,
             FinancialRatioHistoryCompletenessAssessment,
         ] = {}
         family_manifests: list[FinancialAcquisitionManifest] = []
+        candidate_artifact_ids = {
+            item.candidate.artifact.artifact_identity
+            for item in provider_candidates.values()
+        }
+        response_lineage_artifact_ids = {
+            artifact_identity
+            for artifact_identity in artifacts
+            if artifact_identity not in candidate_artifact_ids
+        }
         for family in request.ratio_families:
             selected_family_assessments = tuple(
                 assessment
@@ -1890,7 +2016,7 @@ class MainlandFinancialCapabilityRouter:
                 assessments=selected_family_assessments,
                 eligible_reporting_period_ends=target_periods,
             )
-            family_assessments[family] = completeness
+            family_completeness_assessments[family] = completeness
             family_candidates = tuple(
                 item
                 for item in provider_candidates.values()
@@ -1899,6 +2025,10 @@ class MainlandFinancialCapabilityRouter:
             family_candidate_ids = {
                 item.candidate.candidate_identity for item in family_candidates
             }
+            family_artifact_ids = {
+                item.candidate.artifact.artifact_identity
+                for item in family_candidates
+            } | response_lineage_artifact_ids
             family_selections = tuple(
                 FinancialPeriodSelection.create(
                     candidate=candidate,
@@ -1923,8 +2053,17 @@ class MainlandFinancialCapabilityRouter:
                     requested_capability=FinancialCapability.RATIO_FAMILY,
                     requested_statement_type=None,
                     requested_ratio_family=family,
-                    artifacts=tuple(artifacts.values()),
-                    acquisition_outcomes=tuple(acquisition_outcomes),
+                    artifacts=tuple(
+                        item
+                        for item in artifacts.values()
+                        if item.artifact.artifact_identity in family_artifact_ids
+                    ),
+                    acquisition_outcomes=tuple(
+                        outcome
+                        for outcome in acquisition_outcomes
+                        if outcome.artifact_identity is None
+                        or outcome.artifact_identity in family_artifact_ids
+                    ),
                     provider_candidates=family_candidates,
                     selections=family_selections,
                     rejected_periods=family_rejections,
@@ -1947,7 +2086,23 @@ class MainlandFinancialCapabilityRouter:
                 )
             )
 
+        family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = ()
+        aggregate_family_assessment = None
+        if request.contract_version == "financial-indicator-routing-request-v4":
+            (
+                family_assessments,
+                aggregate_family_assessment,
+            ) = assess_financial_indicator_family_outcomes(
+                request=request,
+                family_manifests=family_manifests,
+                publication_target_construction=publication_target_construction,
+            )
         result = FinancialIndicatorRoutingResult(
+            contract_version=(
+                "financial-indicator-routing-result-v2"
+                if aggregate_family_assessment is not None
+                else "financial-indicator-routing-result-v1"
+            ),
             route=route,
             provider_calls=tuple(provider_calls),
             family_manifests=tuple(family_manifests),
@@ -1964,15 +2119,19 @@ class MainlandFinancialCapabilityRouter:
             complete_families=tuple(
                 family
                 for family in request.ratio_families
-                if family_assessments[family].complete
+                if family_completeness_assessments[family].complete
             ),
             missing_periods_by_family=tuple(
                 (
                     family,
-                    family_assessments[family].missing_reporting_period_ends,
+                    family_completeness_assessments[
+                        family
+                    ].missing_reporting_period_ends,
                 )
                 for family in request.ratio_families
-                if family_assessments[family].missing_reporting_period_ends
+                if family_completeness_assessments[
+                    family
+                ].missing_reporting_period_ends
             ),
             retained_artifacts=tuple(
                 entry.artifact
@@ -1988,6 +2147,8 @@ class MainlandFinancialCapabilityRouter:
             publication_target_construction=publication_target_construction,
             requested_analysis_scope=request.requested_analysis_scope,
             eligibility_policy_version=availability_policy_version,
+            family_assessments=family_assessments,
+            aggregate_family_assessment=aggregate_family_assessment,
         )
         if not physical_attempt_events:
             return result
@@ -2396,6 +2557,343 @@ def _adapter_rejection_manifest_outcomes(
     )
 
 
+def assess_financial_indicator_family_outcomes(
+    *,
+    request: FinancialIndicatorRoutingRequest,
+    family_manifests: Sequence[FinancialAcquisitionManifest],
+    publication_target_construction: (
+        MainlandFinancialPeriodTargetConstruction | None
+    ),
+) -> tuple[
+    tuple[FinancialIndicatorFamilyAssessment, ...],
+    FinancialIndicatorAggregateAssessment,
+]:
+    """Assess every Ticket 04 family without collapsing sibling outcomes."""
+
+    requirements = request.family_evidence_requirements
+    if (
+        request.contract_version != "financial-indicator-routing-request-v4"
+        or requirements is None
+        or request.requested_analysis_scope is None
+    ):
+        raise ValueError("Ticket 04 family assessment requires a v4 request")
+    manifest_by_family = {
+        manifest.requested_ratio_family: manifest for manifest in family_manifests
+    }
+    if set(manifest_by_family) != set(request.ratio_families) or None in (
+        manifest_by_family
+    ):
+        raise ValueError("Ticket 04 family manifests are incomplete")
+    requirement_by_family = {item.family: item for item in requirements.families}
+
+    family_assessments: list[FinancialIndicatorFamilyAssessment] = []
+    strict_current_only_candidates = False
+    for family in request.ratio_families:
+        manifest = manifest_by_family[family]
+        assert manifest is not None
+        requirement = requirement_by_family[family]
+        completeness = manifest.aggregate_completeness
+        target_periods = tuple(completeness.target_reporting_period_ends)
+        provider_candidates = {
+            item.candidate.candidate_identity: item
+            for item in manifest.provider_candidates
+        }
+        candidate_periods = {
+            candidate_id: item.candidate.period_identity.period_end
+            for candidate_id, item in provider_candidates.items()
+        }
+        conflict_candidate_ids = {
+            candidate_id
+            for conflict in manifest.conflicts
+            for candidate_id in (
+                conflict.selected_candidate_identity,
+                conflict.conflicting_candidate_identity,
+            )
+        }
+        conflicted_periods = tuple(
+            sorted(
+                {
+                    candidate_periods[candidate_id]
+                    for candidate_id in conflict_candidate_ids
+                    if candidate_id in candidate_periods
+                    and candidate_periods[candidate_id] in target_periods
+                },
+                reverse=True,
+            )
+        )
+        selected_periods = tuple(
+            sorted(
+                {
+                    candidate_periods[selection.candidate_identity]
+                    for selection in manifest.selections
+                    if selection.candidate_identity not in conflict_candidate_ids
+                    and candidate_periods.get(selection.candidate_identity)
+                    in target_periods
+                },
+                reverse=True,
+            )
+        )
+        current_only_periods = tuple(
+            sorted(
+                {
+                    candidate_periods[selection.candidate_identity]
+                    for selection in manifest.selections
+                    if selection.candidate_identity not in conflict_candidate_ids
+                    and candidate_periods.get(selection.candidate_identity)
+                    in target_periods
+                    and selection.disposition == "current_only"
+                },
+                reverse=True,
+            )
+        )
+        rejected_periods = tuple(
+            sorted(
+                {
+                    candidate_periods[rejection.candidate_identity]
+                    for rejection in manifest.rejected_periods
+                    if rejection.candidate_identity not in conflict_candidate_ids
+                    and candidate_periods.get(rejection.candidate_identity)
+                    in target_periods
+                },
+                reverse=True,
+            )
+        )
+        missing_periods = tuple(
+            period
+            for period in target_periods
+            if period not in selected_periods and period not in conflicted_periods
+        )
+        complete = bool(target_periods) and not missing_periods and not (
+            conflicted_periods
+        ) and set(selected_periods) == set(target_periods)
+        if complete:
+            disposition = (
+                FinancialEvidenceDisposition.DEGRADED
+                if current_only_periods
+                else FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+            )
+        elif conflicted_periods:
+            disposition = FinancialEvidenceDisposition.CONFLICTED
+        elif requirement.status is FinancialFamilyRequirementStatus.REQUIRED:
+            disposition = FinancialEvidenceDisposition.INSUFFICIENT
+        else:
+            disposition = FinancialEvidenceDisposition.DEGRADED
+
+        reason_set: set[FinancialFamilyAssessmentReason] = set()
+        if current_only_periods:
+            reason_set.add(FinancialFamilyAssessmentReason.CURRENT_ONLY_LINEAGE)
+        if conflicted_periods:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.CRITICAL_FAMILY_PERIOD_CONFLICT
+            )
+        if not complete and not conflicted_periods:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.REQUIRED_FAMILY_INCOMPLETE
+                if requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+                else FinancialFamilyAssessmentReason.OPTIONAL_FAMILY_INCOMPLETE
+            )
+        missing_bindings = tuple(
+            FinancialMaterialPremiseFamilyBinding(
+                premise_id=premise_id,
+                family=family,
+                affected_periods=missing_periods,
+            )
+            for premise_id in requirement.material_premise_ids
+            if missing_periods
+        )
+        conflicted_bindings = tuple(
+            FinancialMaterialPremiseFamilyBinding(
+                premise_id=premise_id,
+                family=family,
+                affected_periods=conflicted_periods,
+            )
+            for premise_id in requirement.material_premise_ids
+            if conflicted_periods
+        )
+        if missing_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_INCOMPLETE
+            )
+        if conflicted_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_CONFLICTED
+            )
+        coverage = tuple(
+            sorted(
+                (
+                    FinancialFamilyPeriodCoverage(
+                        candidate_identity=candidate_id,
+                        artifact_identity=item.candidate.artifact.artifact_identity,
+                        provider_id=item.candidate.artifact.dataset.provider_id,
+                        period=item.candidate.period_identity.period_end,
+                        disposition=item.assessment.disposition,
+                        critical_coverage=item.assessment.critical_coverage,
+                        core_coverage=item.assessment.core_coverage,
+                        declared_critical_fields=(
+                            item.assessment.declared_critical_fields
+                        ),
+                        declared_core_fields=item.assessment.declared_core_fields,
+                        rejection_reasons=item.assessment.rejection_reasons,
+                    )
+                    for candidate_id, item in provider_candidates.items()
+                ),
+                key=lambda item: (item.period, item.candidate_identity),
+                reverse=True,
+            )
+        )
+        family_assessments.append(
+            FinancialIndicatorFamilyAssessment.create(
+                requested_analysis_scope=request.requested_analysis_scope,
+                company_type=request.company_type,
+                family=family,
+                target_periods=target_periods,
+                candidate_identities=tuple(sorted(provider_candidates)),
+                selected_periods=selected_periods,
+                current_only_periods=current_only_periods,
+                rejected_periods=rejected_periods,
+                conflicted_periods=conflicted_periods,
+                missing_periods=missing_periods,
+                coverage=coverage,
+                requirement=requirement,
+                missing_material_premise_bindings=missing_bindings,
+                conflicted_material_premise_bindings=conflicted_bindings,
+                complete=complete,
+                disposition=disposition,
+                typed_reasons=tuple(
+                    reason
+                    for reason in FinancialFamilyAssessmentReason
+                    if reason in reason_set
+                ),
+                artifact_identities=tuple(
+                    sorted(
+                        item.artifact.artifact_identity for item in manifest.artifacts
+                    )
+                ),
+                selection_identities=tuple(
+                    sorted(item.selection_identity for item in manifest.selections)
+                ),
+                conflict_identities=tuple(
+                    sorted(item.conflict_identity for item in manifest.conflicts)
+                ),
+            )
+        )
+        strict_current_only_candidates = strict_current_only_candidates or (
+            request.requested_analysis_scope
+            is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+            and (
+                manifest.availability_scope is FinancialAvailabilityScope.CURRENT_ONLY
+                or any(
+                    FinancialPeriodRejectionReason.MISSING_FIRST_PUBLICATION_FOR_STRICT_PIT
+                    in rejection.reasons
+                    for rejection in manifest.rejected_periods
+                )
+            )
+        )
+
+    family_assessment_tuple = tuple(family_assessments)
+    complete_families = tuple(
+        item.family for item in family_assessment_tuple if item.complete
+    )
+    missing_bindings = tuple(
+        binding
+        for item in family_assessment_tuple
+        for binding in item.missing_material_premise_bindings
+    )
+    conflicted_bindings = tuple(
+        binding
+        for item in family_assessment_tuple
+        for binding in item.conflicted_material_premise_bindings
+    )
+    required_conflicts = tuple(
+        item
+        for item in family_assessment_tuple
+        if item.conflicted_periods
+        and item.requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+    )
+    required_incomplete = tuple(
+        item
+        for item in family_assessment_tuple
+        if not item.complete
+        and not item.conflicted_periods
+        and item.requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+    )
+    optional_incomplete = tuple(
+        item
+        for item in family_assessment_tuple
+        if not item.complete
+        and item.requirement.status is FinancialFamilyRequirementStatus.OPTIONAL
+    )
+    publication_failed = (
+        publication_target_construction is not None
+        and publication_target_construction.failure_reason is not None
+    )
+    if publication_failed or strict_current_only_candidates or not complete_families:
+        aggregate_disposition = FinancialEvidenceDisposition.INSUFFICIENT
+    elif required_conflicts or conflicted_bindings:
+        aggregate_disposition = FinancialEvidenceDisposition.CONFLICTED
+    elif required_incomplete or missing_bindings:
+        aggregate_disposition = FinancialEvidenceDisposition.INSUFFICIENT
+    elif optional_incomplete or any(
+        item.current_only_periods for item in family_assessment_tuple
+    ):
+        aggregate_disposition = FinancialEvidenceDisposition.DEGRADED
+    else:
+        aggregate_disposition = FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+
+    aggregate_reasons: set[FinancialFamilyAssessmentReason] = set()
+    if publication_failed:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.PUBLICATION_METADATA_UNPROVEN
+        )
+    if strict_current_only_candidates:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.STRICT_PIT_CURRENT_ONLY_CANDIDATES
+        )
+    if not complete_families:
+        aggregate_reasons.add(FinancialFamilyAssessmentReason.NO_COMPLETE_FAMILY)
+    if required_incomplete:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.REQUIRED_FAMILY_INCOMPLETE
+        )
+    if optional_incomplete:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.OPTIONAL_FAMILY_INCOMPLETE
+        )
+    if missing_bindings:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_INCOMPLETE
+        )
+    if required_conflicts or any(
+        item.conflicted_periods for item in family_assessment_tuple
+    ):
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.CRITICAL_FAMILY_PERIOD_CONFLICT
+        )
+    if conflicted_bindings:
+        aggregate_reasons.add(
+            FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_CONFLICTED
+        )
+    if any(item.current_only_periods for item in family_assessment_tuple):
+        aggregate_reasons.add(FinancialFamilyAssessmentReason.CURRENT_ONLY_LINEAGE)
+    aggregate = FinancialIndicatorAggregateAssessment.create(
+        requested_analysis_scope=request.requested_analysis_scope,
+        company_type=request.company_type,
+        requirements_identity=requirements.requirements_identity,
+        requested_families=request.ratio_families,
+        family_assessments=family_assessment_tuple,
+        complete_families=complete_families,
+        missing_material_premise_bindings=missing_bindings,
+        conflicted_material_premise_bindings=conflicted_bindings,
+        disposition=aggregate_disposition,
+        typed_reasons=tuple(
+            reason
+            for reason in FinancialFamilyAssessmentReason
+            if reason in aggregate_reasons
+        ),
+    )
+    return family_assessment_tuple, aggregate
+
+
 def financial_statement_evidence_disposition(
     result: FinancialStatementRoutingResult,
 ) -> FinancialEvidenceDisposition:
@@ -2425,6 +2923,13 @@ def financial_indicator_evidence_disposition(
     result: FinancialIndicatorRoutingResult,
     request: FinancialIndicatorRoutingRequest,
 ) -> FinancialEvidenceDisposition:
+    if result.aggregate_family_assessment is not None:
+        family = manifest.requested_ratio_family
+        return next(
+            assessment.disposition
+            for assessment in result.family_assessments
+            if assessment.family is family
+        )
     if (
         result.publication_target_construction is not None
         and result.publication_target_construction.failure_reason is not None
@@ -2652,13 +3157,24 @@ def render_indicator_routing_result(
         ),
         None,
     )
-    if (
-        result.publication_target_construction is not None
-        and result.publication_target_construction.failure_reason is not None
-    ) or (
-        requested_analysis_scope
-        is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
-        and availability_reason is not None
+    if result.aggregate_family_assessment is not None:
+        status = {
+            FinancialEvidenceDisposition.DEGRADED: "degraded_evidence",
+            FinancialEvidenceDisposition.INSUFFICIENT: "insufficient_evidence",
+            FinancialEvidenceDisposition.CONFLICTED: "conflicted_evidence",
+            FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE: "complete",
+            FinancialEvidenceDisposition.CURRENT_ONLY: "current_only_degraded",
+        }[result.aggregate_family_assessment.disposition]
+    elif (
+        (
+            result.publication_target_construction is not None
+            and result.publication_target_construction.failure_reason is not None
+        )
+        or (
+            requested_analysis_scope
+            is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+            and availability_reason is not None
+        )
     ):
         status = "insufficient_evidence"
     elif result.missing_periods_by_family and result.current_profile_degraded:
@@ -2732,6 +3248,18 @@ def render_indicator_routing_result(
         },
         "current_profile_provider": result.current_profile_provider,
     }
+    if result.aggregate_family_assessment is not None:
+        payload.update(
+            {
+                "family_assessments": [
+                    item.model_dump(mode="json")
+                    for item in result.family_assessments
+                ],
+                "aggregate_family_assessment": (
+                    result.aggregate_family_assessment.model_dump(mode="json")
+                ),
+            }
+        )
     if requested_analysis_scope is not None:
         payload.update(
             {

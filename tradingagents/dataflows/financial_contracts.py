@@ -48,6 +48,9 @@ FINANCIAL_PERIOD_SELECTION_BAOSTOCK_V1 = (
 )
 FINANCIAL_MANIFEST_V1 = "financial-manifest-v1"
 FINANCIAL_MANIFEST_V2 = "financial-manifest-v2"
+FINANCIAL_FAMILY_REQUIREMENTS_V1 = "financial-family-requirements-v1"
+FINANCIAL_FAMILY_ASSESSMENT_V2 = "financial-family-assessment-v2"
+FINANCIAL_FAMILY_AGGREGATE_V2 = "financial-family-aggregate-v2"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
@@ -380,6 +383,685 @@ class FinancialEvidenceDisposition(str, Enum):
     DEGRADED = "degraded"
     INSUFFICIENT = "insufficient"
     CONFLICTED = "conflicted"
+
+
+class FinancialFamilyRequirementStatus(str, Enum):
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+
+
+class FinancialFamilyRequirementAuthority(str, Enum):
+    CANONICAL_EVIDENCE_CONTRACT = "canonical_evidence_contract"
+    CAPABILITY_PROFILE = "capability_profile"
+    STRATEGY_RULES = "strategy_rules"
+
+
+class FinancialFamilyAssessmentReason(str, Enum):
+    CURRENT_ONLY_LINEAGE = "current_only_lineage"
+    OPTIONAL_FAMILY_INCOMPLETE = "optional_family_incomplete"
+    REQUIRED_FAMILY_INCOMPLETE = "required_family_incomplete"
+    MATERIAL_PREMISE_FAMILY_INCOMPLETE = "material_premise_family_incomplete"
+    MATERIAL_PREMISE_FAMILY_CONFLICTED = "material_premise_family_conflicted"
+    NO_COMPLETE_FAMILY = "no_complete_family"
+    STRICT_PIT_CURRENT_ONLY_CANDIDATES = "strict_pit_current_only_candidates"
+    PUBLICATION_METADATA_UNPROVEN = "publication_metadata_unproven"
+    CRITICAL_FAMILY_PERIOD_CONFLICT = "critical_family_period_conflict"
+
+
+class FinancialFamilyAuthorityBinding(BaseModel):
+    """One applicable authority's fixed requirement for one indicator family."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    authority: FinancialFamilyRequirementAuthority
+    authority_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    required: bool
+
+
+class FinancialMaterialPremiseRequirement(BaseModel):
+    """A proposed material premise may only add required family bindings."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    premise_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    required_families: tuple[FinancialRatioFamily, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_premise(self) -> FinancialMaterialPremiseRequirement:
+        canonical = tuple(
+            family
+            for family in FinancialRatioFamily
+            if family in self.required_families
+        )
+        if self.required_families != canonical:
+            raise ValueError("material-premise families must be unique and canonical")
+        return self
+
+
+class FinancialFamilyRequirement(BaseModel):
+    """Required/optional status derived from all fixed authorities and premises."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    family: FinancialRatioFamily
+    status: FinancialFamilyRequirementStatus
+    authority_bindings: tuple[FinancialFamilyAuthorityBinding, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
+    material_premise_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_requirement(self) -> FinancialFamilyRequirement:
+        canonical_bindings = tuple(
+            binding
+            for authority in FinancialFamilyRequirementAuthority
+            for binding in self.authority_bindings
+            if binding.authority is authority
+        )
+        if (
+            self.authority_bindings != canonical_bindings
+            or tuple(binding.authority for binding in self.authority_bindings)
+            != tuple(FinancialFamilyRequirementAuthority)
+        ):
+            raise ValueError("family requirement authorities must be exact and canonical")
+        canonical_premises = tuple(sorted(set(self.material_premise_ids)))
+        if self.material_premise_ids != canonical_premises:
+            raise ValueError("material-premise identities must be unique and canonical")
+        expected = (
+            FinancialFamilyRequirementStatus.REQUIRED
+            if any(binding.required for binding in self.authority_bindings)
+            or self.material_premise_ids
+            else FinancialFamilyRequirementStatus.OPTIONAL
+        )
+        if self.status is not expected:
+            raise ValueError(
+                "family requirement status must be derived from every authority and premise"
+            )
+        assert_safe_financial_contract_payload(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialIndicatorEvidenceRequirements(BaseModel):
+    """Closed authority snapshot for one v2 indicator-family assessment."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-family-requirements-v1"] = (
+        FINANCIAL_FAMILY_REQUIREMENTS_V1
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] = MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+    requested_families: tuple[FinancialRatioFamily, ...] = Field(min_length=1)
+    families: tuple[FinancialFamilyRequirement, ...] = Field(min_length=1)
+    material_premises: tuple[FinancialMaterialPremiseRequirement, ...] = ()
+    requirements_identity: str = Field(
+        pattern=r"^financial-family-requirements:v1:[0-9a-f]{64}$"
+    )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        requested_families: Sequence[FinancialRatioFamily],
+        canonical_evidence_contract_id: str,
+        canonical_evidence_contract_required_families: Sequence[
+            FinancialRatioFamily
+        ] = (),
+        capability_profile_id: str,
+        capability_profile_required_families: Sequence[FinancialRatioFamily] = (),
+        strategy_rules_id: str,
+        strategy_rules_required_families: Sequence[FinancialRatioFamily] = (),
+        material_premises: Sequence[FinancialMaterialPremiseRequirement] = (),
+    ) -> FinancialIndicatorEvidenceRequirements:
+        requested_set = set(requested_families)
+        canonical_requested = tuple(
+            family for family in FinancialRatioFamily if family in requested_set
+        )
+        if len(canonical_requested) != len(tuple(requested_families)):
+            raise ValueError("requested indicator families must be unique and canonical")
+        authority_inputs = (
+            (
+                FinancialFamilyRequirementAuthority.CANONICAL_EVIDENCE_CONTRACT,
+                canonical_evidence_contract_id,
+                set(canonical_evidence_contract_required_families),
+            ),
+            (
+                FinancialFamilyRequirementAuthority.CAPABILITY_PROFILE,
+                capability_profile_id,
+                set(capability_profile_required_families),
+            ),
+            (
+                FinancialFamilyRequirementAuthority.STRATEGY_RULES,
+                strategy_rules_id,
+                set(strategy_rules_required_families),
+            ),
+        )
+        authoritative_required = set().union(
+            *(required for _, _, required in authority_inputs)
+        )
+        premise_required = {
+            family
+            for premise in material_premises
+            for family in premise.required_families
+        }
+        if not authoritative_required | premise_required <= requested_set:
+            raise ValueError("family authorities cannot require an unrequested family")
+        canonical_premises = tuple(
+            sorted(material_premises, key=lambda item: item.premise_id)
+        )
+        if len({item.premise_id for item in canonical_premises}) != len(
+            canonical_premises
+        ):
+            raise ValueError("material-premise identities must be unique")
+        family_requirements = tuple(
+            FinancialFamilyRequirement(
+                family=family,
+                status=(
+                    FinancialFamilyRequirementStatus.REQUIRED
+                    if family in authoritative_required | premise_required
+                    else FinancialFamilyRequirementStatus.OPTIONAL
+                ),
+                authority_bindings=tuple(
+                    FinancialFamilyAuthorityBinding(
+                        authority=authority,
+                        authority_id=authority_id,
+                        required=family in required,
+                    )
+                    for authority, authority_id, required in authority_inputs
+                ),
+                material_premise_ids=tuple(
+                    premise.premise_id
+                    for premise in canonical_premises
+                    if family in premise.required_families
+                ),
+            )
+            for family in canonical_requested
+        )
+        payload = {
+            "contract_version": FINANCIAL_FAMILY_REQUIREMENTS_V1,
+            "eligibility_policy_version": MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+            "requested_families": [family.value for family in canonical_requested],
+            "families": [item.model_dump(mode="json") for item in family_requirements],
+            "material_premises": [
+                item.model_dump(mode="json") for item in canonical_premises
+            ],
+        }
+        return cls(
+            **payload,
+            requirements_identity=(
+                "financial-family-requirements:v1:" + _canonical_digest(payload)
+            ),
+        )
+
+    @model_validator(mode="after")
+    def _validate_requirements(self) -> FinancialIndicatorEvidenceRequirements:
+        canonical_requested = tuple(
+            family
+            for family in FinancialRatioFamily
+            if family in self.requested_families
+        )
+        if self.requested_families != canonical_requested:
+            raise ValueError("requested indicator families must be unique and canonical")
+        if tuple(item.family for item in self.families) != self.requested_families:
+            raise ValueError("family requirements must cover every requested family")
+        if self.material_premises != tuple(
+            sorted(self.material_premises, key=lambda item: item.premise_id)
+        ) or len({item.premise_id for item in self.material_premises}) != len(
+            self.material_premises
+        ):
+            raise ValueError("material premises must be unique and canonical")
+        if any(
+            not set(premise.required_families) <= set(self.requested_families)
+            for premise in self.material_premises
+        ):
+            raise ValueError("material premise requires an unrequested family")
+        for authority in FinancialFamilyRequirementAuthority:
+            authority_ids = {
+                binding.authority_id
+                for family in self.families
+                for binding in family.authority_bindings
+                if binding.authority is authority
+            }
+            if len(authority_ids) != 1:
+                raise ValueError("family requirement authority identity is inconsistent")
+        premise_ids_by_family = {
+            family: tuple(
+                premise.premise_id
+                for premise in self.material_premises
+                if family in premise.required_families
+            )
+            for family in self.requested_families
+        }
+        if any(
+            item.material_premise_ids != premise_ids_by_family[item.family]
+            for item in self.families
+        ):
+            raise ValueError(
+                "family requirement status must be derived from every authority and premise"
+            )
+        payload = self.model_dump(mode="json", exclude={"requirements_identity"})
+        expected = "financial-family-requirements:v1:" + _canonical_digest(payload)
+        if self.requirements_identity != expected:
+            raise ValueError("financial family requirements identity mismatch")
+        assert_safe_financial_contract_payload(payload)
+        return self
+
+
+class FinancialFamilyPeriodCoverage(BaseModel):
+    """Payload-free measured gates and lineage for one family candidate."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    provider_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    period: date
+    disposition: FinancialPeriodDisposition
+    critical_threshold: Decimal = Decimal("1")
+    core_threshold: Decimal = Decimal("0.9")
+    critical_coverage: Decimal = Field(ge=0, le=1)
+    core_coverage: Decimal = Field(ge=0, le=1)
+    declared_critical_fields: tuple[str, ...] = ()
+    declared_core_fields: tuple[str, ...] = ()
+    rejection_reasons: tuple[FinancialPeriodRejectionReason, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_coverage(self) -> FinancialFamilyPeriodCoverage:
+        if self.critical_threshold != Decimal("1") or self.core_threshold != Decimal(
+            "0.9"
+        ):
+            raise ValueError("family completeness thresholds are fixed")
+        if self.declared_critical_fields != tuple(
+            sorted(set(self.declared_critical_fields))
+        ) or self.declared_core_fields != tuple(sorted(set(self.declared_core_fields))):
+            raise ValueError("family coverage declarations must be canonical")
+        canonical_reasons = tuple(
+            reason
+            for reason in FinancialPeriodRejectionReason
+            if reason in self.rejection_reasons
+        )
+        if self.rejection_reasons != canonical_reasons:
+            raise ValueError("family coverage reasons must be canonical")
+        return self
+
+
+class FinancialMaterialPremiseFamilyBinding(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    premise_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    family: FinancialRatioFamily
+    affected_periods: tuple[date, ...]
+
+    @model_validator(mode="after")
+    def _validate_binding(self) -> FinancialMaterialPremiseFamilyBinding:
+        if self.affected_periods != _canonical_dates(
+            self.affected_periods,
+            reverse=True,
+        ):
+            raise ValueError("material-premise periods must be canonical")
+        return self
+
+
+class FinancialIndicatorFamilyAssessment(BaseModel):
+    """Closed independent outcome for one requested indicator family."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-family-assessment-v2"] = (
+        FINANCIAL_FAMILY_ASSESSMENT_V2
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] = MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+    requested_analysis_scope: FinancialAvailabilityScope
+    company_type: FinancialCompanyType
+    family: FinancialRatioFamily
+    target_periods: tuple[date, ...]
+    candidate_identities: tuple[str, ...]
+    selected_periods: tuple[date, ...]
+    current_only_periods: tuple[date, ...]
+    rejected_periods: tuple[date, ...]
+    conflicted_periods: tuple[date, ...]
+    missing_periods: tuple[date, ...]
+    coverage: tuple[FinancialFamilyPeriodCoverage, ...]
+    requirement: FinancialFamilyRequirement
+    missing_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyBinding, ...
+    ] = ()
+    conflicted_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyBinding, ...
+    ] = ()
+    complete: bool
+    disposition: FinancialEvidenceDisposition
+    typed_reasons: tuple[FinancialFamilyAssessmentReason, ...]
+    artifact_identities: tuple[str, ...]
+    selection_identities: tuple[str, ...]
+    conflict_identities: tuple[str, ...]
+    assessment_ref: str = Field(
+        pattern=r"^financial-family-assessment=sha256:[0-9a-f]{64}$"
+    )
+
+    @classmethod
+    def create(cls, **values: object) -> FinancialIndicatorFamilyAssessment:
+        payload = {
+            "contract_version": FINANCIAL_FAMILY_ASSESSMENT_V2,
+            "eligibility_policy_version": MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+            **values,
+        }
+        return cls(
+            **payload,
+            assessment_ref=(
+                "financial-family-assessment=sha256:" + _canonical_digest(payload)
+            ),
+        )
+
+    @model_validator(mode="after")
+    def _validate_family_assessment(self) -> FinancialIndicatorFamilyAssessment:
+        if self.requirement.family is not self.family:
+            raise ValueError("family assessment requirement binding is invalid")
+        for values in (
+            self.target_periods,
+            self.selected_periods,
+            self.current_only_periods,
+            self.rejected_periods,
+            self.conflicted_periods,
+            self.missing_periods,
+        ):
+            if values != _canonical_dates(values, reverse=True):
+                raise ValueError("family assessment periods must be canonical")
+        if not set(self.current_only_periods) <= set(self.selected_periods):
+            raise ValueError("current-only family periods must be selected")
+        if (
+            set(self.selected_periods) & set(self.rejected_periods)
+            or set(self.selected_periods) & set(self.conflicted_periods)
+            or set(self.rejected_periods) & set(self.conflicted_periods)
+            or not set(self.rejected_periods) <= set(self.missing_periods)
+        ):
+            raise ValueError("family period outcomes are contradictory")
+        if not (
+            set(self.selected_periods)
+            | set(self.rejected_periods)
+            | set(self.conflicted_periods)
+            | set(self.missing_periods)
+        ) <= set(self.target_periods):
+            raise ValueError("family assessment contains a non-target outcome")
+        expected_missing = tuple(
+            period
+            for period in self.target_periods
+            if period not in self.selected_periods
+            and period not in self.conflicted_periods
+        )
+        if self.missing_periods != expected_missing:
+            raise ValueError("family missing periods are inconsistent")
+        expected_complete = bool(self.target_periods) and (
+            set(self.selected_periods) == set(self.target_periods)
+            and not self.conflicted_periods
+            and not self.missing_periods
+        )
+        if self.complete != expected_complete:
+            raise ValueError("family completeness is inconsistent")
+        if self.complete:
+            expected_disposition = (
+                FinancialEvidenceDisposition.DEGRADED
+                if self.current_only_periods
+                else FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+            )
+        elif self.conflicted_periods:
+            expected_disposition = FinancialEvidenceDisposition.CONFLICTED
+        elif self.requirement.status is FinancialFamilyRequirementStatus.REQUIRED:
+            expected_disposition = FinancialEvidenceDisposition.INSUFFICIENT
+        else:
+            expected_disposition = FinancialEvidenceDisposition.DEGRADED
+        if self.disposition is not expected_disposition:
+            raise ValueError("family evidence disposition is inconsistent")
+        expected_missing_bindings = tuple(
+            FinancialMaterialPremiseFamilyBinding(
+                premise_id=premise_id,
+                family=self.family,
+                affected_periods=self.missing_periods,
+            )
+            for premise_id in self.requirement.material_premise_ids
+            if self.missing_periods
+        )
+        expected_conflicted_bindings = tuple(
+            FinancialMaterialPremiseFamilyBinding(
+                premise_id=premise_id,
+                family=self.family,
+                affected_periods=self.conflicted_periods,
+            )
+            for premise_id in self.requirement.material_premise_ids
+            if self.conflicted_periods
+        )
+        if (
+            self.missing_material_premise_bindings != expected_missing_bindings
+            or self.conflicted_material_premise_bindings
+            != expected_conflicted_bindings
+        ):
+            raise ValueError("family material-premise bindings are inconsistent")
+        reason_set: set[FinancialFamilyAssessmentReason] = set()
+        if self.current_only_periods:
+            reason_set.add(FinancialFamilyAssessmentReason.CURRENT_ONLY_LINEAGE)
+        if self.conflicted_periods:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.CRITICAL_FAMILY_PERIOD_CONFLICT
+            )
+        if not self.complete and not self.conflicted_periods:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.REQUIRED_FAMILY_INCOMPLETE
+                if self.requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+                else FinancialFamilyAssessmentReason.OPTIONAL_FAMILY_INCOMPLETE
+            )
+        if expected_missing_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_INCOMPLETE
+            )
+        if expected_conflicted_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_CONFLICTED
+            )
+        expected_reasons = tuple(
+            reason for reason in FinancialFamilyAssessmentReason if reason in reason_set
+        )
+        if self.typed_reasons != expected_reasons:
+            raise ValueError("family assessment reasons are inconsistent")
+        for values, label in (
+            (self.candidate_identities, "candidate"),
+            (self.artifact_identities, "artifact"),
+            (self.selection_identities, "selection"),
+            (self.conflict_identities, "conflict"),
+        ):
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"family {label} identities must be canonical")
+        if self.coverage != tuple(
+            sorted(
+                self.coverage,
+                key=lambda item: (item.period, item.candidate_identity),
+                reverse=True,
+            )
+        ):
+            raise ValueError("family period coverage must be canonical")
+        if set(self.candidate_identities) != {
+            item.candidate_identity for item in self.coverage
+        }:
+            raise ValueError("family candidate coverage is incomplete")
+        payload = self.model_dump(mode="json", exclude={"assessment_ref"})
+        expected_ref = "financial-family-assessment=sha256:" + _canonical_digest(
+            payload
+        )
+        if self.assessment_ref != expected_ref:
+            raise ValueError("financial family assessment identity mismatch")
+        assert_safe_financial_projection(payload)
+        return self
+
+
+class FinancialIndicatorAggregateAssessment(BaseModel):
+    """Material-premise-aware aggregate retaining every independent family."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-family-aggregate-v2"] = (
+        FINANCIAL_FAMILY_AGGREGATE_V2
+    )
+    eligibility_policy_version: Literal[
+        "mainland-financial-period-eligibility-v2"
+    ] = MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+    requested_analysis_scope: FinancialAvailabilityScope
+    company_type: FinancialCompanyType
+    requirements_identity: str = Field(
+        pattern=r"^financial-family-requirements:v1:[0-9a-f]{64}$"
+    )
+    requested_families: tuple[FinancialRatioFamily, ...] = Field(min_length=1)
+    family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = Field(
+        min_length=1
+    )
+    complete_families: tuple[FinancialRatioFamily, ...]
+    missing_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyBinding, ...
+    ] = ()
+    conflicted_material_premise_bindings: tuple[
+        FinancialMaterialPremiseFamilyBinding, ...
+    ] = ()
+    disposition: FinancialEvidenceDisposition
+    typed_reasons: tuple[FinancialFamilyAssessmentReason, ...]
+    assessment_ref: str = Field(
+        pattern=r"^financial-family-aggregate=sha256:[0-9a-f]{64}$"
+    )
+
+    @classmethod
+    def create(cls, **values: object) -> FinancialIndicatorAggregateAssessment:
+        payload = {
+            "contract_version": FINANCIAL_FAMILY_AGGREGATE_V2,
+            "eligibility_policy_version": MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+            **values,
+        }
+        return cls(
+            **payload,
+            assessment_ref=(
+                "financial-family-aggregate=sha256:" + _canonical_digest(payload)
+            ),
+        )
+
+    @model_validator(mode="after")
+    def _validate_aggregate(self) -> FinancialIndicatorAggregateAssessment:
+        canonical_requested = tuple(
+            family
+            for family in FinancialRatioFamily
+            if family in self.requested_families
+        )
+        if self.requested_families != canonical_requested or tuple(
+            item.family for item in self.family_assessments
+        ) != canonical_requested:
+            raise ValueError("aggregate family assessments must be exact and canonical")
+        expected_complete = tuple(
+            item.family for item in self.family_assessments if item.complete
+        )
+        if self.complete_families != expected_complete:
+            raise ValueError("aggregate complete families are inconsistent")
+        expected_missing_bindings = tuple(
+            binding
+            for item in self.family_assessments
+            for binding in item.missing_material_premise_bindings
+        )
+        expected_conflicted_bindings = tuple(
+            binding
+            for item in self.family_assessments
+            for binding in item.conflicted_material_premise_bindings
+        )
+        if (
+            self.missing_material_premise_bindings != expected_missing_bindings
+            or self.conflicted_material_premise_bindings
+            != expected_conflicted_bindings
+        ):
+            raise ValueError("aggregate material-premise bindings are inconsistent")
+        required_conflicts = tuple(
+            item
+            for item in self.family_assessments
+            if item.conflicted_periods
+            and item.requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+        )
+        required_incomplete = tuple(
+            item
+            for item in self.family_assessments
+            if not item.complete
+            and not item.conflicted_periods
+            and item.requirement.status is FinancialFamilyRequirementStatus.REQUIRED
+        )
+        optional_incomplete = tuple(
+            item
+            for item in self.family_assessments
+            if not item.complete
+            and item.requirement.status is FinancialFamilyRequirementStatus.OPTIONAL
+        )
+        publication_failed = (
+            FinancialFamilyAssessmentReason.PUBLICATION_METADATA_UNPROVEN
+            in self.typed_reasons
+        )
+        strict_current_only = (
+            FinancialFamilyAssessmentReason.STRICT_PIT_CURRENT_ONLY_CANDIDATES
+            in self.typed_reasons
+        )
+        if publication_failed or strict_current_only or not expected_complete:
+            expected_disposition = FinancialEvidenceDisposition.INSUFFICIENT
+        elif required_conflicts or expected_conflicted_bindings:
+            expected_disposition = FinancialEvidenceDisposition.CONFLICTED
+        elif required_incomplete or expected_missing_bindings:
+            expected_disposition = FinancialEvidenceDisposition.INSUFFICIENT
+        elif optional_incomplete or any(
+            item.current_only_periods for item in self.family_assessments
+        ):
+            expected_disposition = FinancialEvidenceDisposition.DEGRADED
+        else:
+            expected_disposition = FinancialEvidenceDisposition.STRICT_PIT_ELIGIBLE
+        if self.disposition is not expected_disposition:
+            raise ValueError("aggregate family disposition is inconsistent")
+        reason_set: set[FinancialFamilyAssessmentReason] = set()
+        if publication_failed:
+            reason_set.add(FinancialFamilyAssessmentReason.PUBLICATION_METADATA_UNPROVEN)
+        if strict_current_only:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.STRICT_PIT_CURRENT_ONLY_CANDIDATES
+            )
+        if not expected_complete:
+            reason_set.add(FinancialFamilyAssessmentReason.NO_COMPLETE_FAMILY)
+        if required_incomplete:
+            reason_set.add(FinancialFamilyAssessmentReason.REQUIRED_FAMILY_INCOMPLETE)
+        if optional_incomplete:
+            reason_set.add(FinancialFamilyAssessmentReason.OPTIONAL_FAMILY_INCOMPLETE)
+        if expected_missing_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_INCOMPLETE
+            )
+        if required_conflicts or any(
+            item.conflicted_periods for item in self.family_assessments
+        ):
+            reason_set.add(
+                FinancialFamilyAssessmentReason.CRITICAL_FAMILY_PERIOD_CONFLICT
+            )
+        if expected_conflicted_bindings:
+            reason_set.add(
+                FinancialFamilyAssessmentReason.MATERIAL_PREMISE_FAMILY_CONFLICTED
+            )
+        if any(item.current_only_periods for item in self.family_assessments):
+            reason_set.add(FinancialFamilyAssessmentReason.CURRENT_ONLY_LINEAGE)
+        expected_reasons = tuple(
+            reason for reason in FinancialFamilyAssessmentReason if reason in reason_set
+        )
+        if self.typed_reasons != expected_reasons:
+            raise ValueError("aggregate family reasons are inconsistent")
+        payload = self.model_dump(mode="json", exclude={"assessment_ref"})
+        expected_ref = "financial-family-aggregate=sha256:" + _canonical_digest(
+            payload
+        )
+        if self.assessment_ref != expected_ref:
+            raise ValueError("financial family aggregate identity mismatch")
+        assert_safe_financial_projection(payload)
+        return self
 
 
 class FinancialCompanyTypeClassifierInput(BaseModel):

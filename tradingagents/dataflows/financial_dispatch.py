@@ -69,6 +69,8 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialCriticalValueConflict,
     FinancialEvidenceDisposition,
     FinancialHistoryCompletenessAssessment,
+    FinancialIndicatorAggregateAssessment,
+    FinancialIndicatorFamilyAssessment,
     FinancialPeriodCandidate,
     FinancialPeriodCompletenessAssessment,
     FinancialPeriodOverlapFinding,
@@ -99,6 +101,8 @@ from tradingagents.evidence import (
     ACQUISITION_TOKEN_PATTERN,
     AcquisitionUnavailableReason,
     EvidenceState,
+    FinancialFamilyAggregateEvidenceAssessment,
+    FinancialFamilyEvidenceAssessment,
     InstrumentIdentityEvidence,
     InstrumentKind,
     ProviderPhysicalAttemptEvidence,
@@ -560,6 +564,16 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             raise ValueError(
                 "qualified indicator selection analysis scope binding is invalid"
             )
+        aggregate = self.routing_result.aggregate_family_assessment
+        requirements = self.selection_request.family_evidence_requirements
+        if (aggregate is None) != (requirements is None):
+            raise ValueError("qualified indicator family contract binding is incomplete")
+        if aggregate is not None and requirements is not None and (
+            aggregate.company_type is not self.selection_request.company_type
+            or aggregate.requested_families != self.selection_request.ratio_families
+            or aggregate.requirements_identity != requirements.requirements_identity
+        ):
+            raise ValueError("qualified indicator family contract binding is invalid")
         signatures = {
             manifest.capability_routing_plan_signature
             for manifest in self.routing_result.family_manifests
@@ -603,14 +617,12 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
                 ),
             }
         )
-        return ToolMessage(
-            content=self.rendered_value,
-            tool_call_id=self.tool_call_id,
-            name=self.request_key.tool_name,
-            artifact=artifact,
-            status=(
-                "error"
-                if self.routing_result.missing_periods_by_family
+        aggregate = self.routing_result.aggregate_family_assessment
+        operational_failure = (
+            False
+            if aggregate is not None
+            else bool(
+                self.routing_result.missing_periods_by_family
                 or any(
                     manifest.disposition is FinancialEvidenceDisposition.INSUFFICIENT
                     for manifest in self.routing_result.family_manifests
@@ -620,8 +632,14 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
                     and self.routing_result.publication_target_construction.failure_reason
                     is not None
                 )
-                else "success"
-            ),
+            )
+        )
+        return ToolMessage(
+            content=self.rendered_value,
+            tool_call_id=self.tool_call_id,
+            name=self.request_key.tool_name,
+            artifact=artifact,
+            status="error" if operational_failure else "success",
         )
 
 
@@ -1220,6 +1238,14 @@ class FinancialManifestAuditRequest(BaseModel):
     physical_request_count: int = Field(ge=0)
     duplicate_suppressed_count: int = Field(ge=0)
     manifests: tuple[FinancialManifestAuditProjection, ...] = Field(min_length=1)
+    family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+    aggregate_family_assessment: FinancialIndicatorAggregateAssessment | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class FinancialDispatchAuditProjectionV2(BaseModel):
@@ -1354,6 +1380,14 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
         min_length=1
     )
     completeness_rows: tuple[FinancialCompletenessAuditRow, ...]
+    family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+    aggregate_family_assessment: FinancialIndicatorAggregateAssessment | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     selected_artifact: SourceArtifact
 
     @model_validator(mode="after")
@@ -3138,9 +3172,13 @@ def _financial_tool_manifest_envelope(
     if isinstance(dispatch_result, FinancialStatementSelectionDispatchResult):
         manifests = (routing_result.manifest,)
         provider_calls = routing_result.provider_calls
+        family_assessments = ()
+        aggregate_family_assessment = None
     else:
         manifests = routing_result.family_manifests
         provider_calls = routing_result.provider_calls
+        family_assessments = routing_result.family_assessments
+        aggregate_family_assessment = routing_result.aggregate_family_assessment
     provider_attempt_counts = {
         call.provider_id: len(call.physical_attempt_events)
         for call in provider_calls
@@ -3193,6 +3231,8 @@ def _financial_tool_manifest_envelope(
                 ),
             )
         ),
+        family_assessments=family_assessments,
+        aggregate_family_assessment=aggregate_family_assessment,
         selected_artifact=SourceArtifact(
             artifact_sha256=sha256(
                 dispatch_result.rendered_value.encode("utf-8")
@@ -3739,6 +3779,8 @@ def _project_indicator_manifest_audit_request(
                 _project_manifest_for_audit(manifest)
                 for manifest in manifests
             ),
+            family_assessments=result.family_assessments,
+            aggregate_family_assessment=result.aggregate_family_assessment,
         ),
         tuple(
             sorted(
@@ -4121,6 +4163,65 @@ def project_financial_selection_evidence(
     payload["physical_attempt_count"] = len(
         payload["physical_attempt_events"]
     )
+    if isinstance(dispatch_result, FinancialIndicatorSelectionDispatchResult):
+        routed_family_assessments = tuple(
+            FinancialFamilyEvidenceAssessment.model_validate(
+                item.model_dump(mode="python")
+            )
+            for item in dispatch_result.routing_result.family_assessments
+        )
+        family_by_ref = {
+            item.assessment_ref: item
+            for item in current.financial_family_assessments
+        }
+        for assessment in routed_family_assessments:
+            prior = family_by_ref.get(assessment.assessment_ref)
+            if prior is not None and prior != assessment:
+                raise ValueError("financial family evidence identity is contradictory")
+            family_by_ref[assessment.assessment_ref] = assessment
+        family_order = {
+            "profit": 0,
+            "operation": 1,
+            "growth": 2,
+            "balance": 3,
+            "cash_flow": 4,
+            "dupont": 5,
+        }
+        payload["financial_family_assessments"] = tuple(
+            sorted(
+                family_by_ref.values(),
+                key=lambda item: (
+                    item.eligibility_policy_version,
+                    item.requested_analysis_scope,
+                    item.company_type,
+                    family_order[item.family],
+                    item.assessment_ref,
+                ),
+            )
+        )
+        aggregate = dispatch_result.routing_result.aggregate_family_assessment
+        if aggregate is not None:
+            projected_aggregate = (
+                FinancialFamilyAggregateEvidenceAssessment.model_validate(
+                    aggregate.model_dump(mode="python")
+                )
+            )
+            aggregate_by_ref = {
+                item.assessment_ref: item
+                for item in current.financial_family_aggregate_assessments
+            }
+            prior = aggregate_by_ref.get(projected_aggregate.assessment_ref)
+            if prior is not None and prior != projected_aggregate:
+                raise ValueError(
+                    "financial family aggregate evidence identity is contradictory"
+                )
+            aggregate_by_ref[projected_aggregate.assessment_ref] = projected_aggregate
+            payload["financial_family_aggregate_assessments"] = tuple(
+                sorted(
+                    aggregate_by_ref.values(),
+                    key=lambda item: item.assessment_ref,
+                )
+            )
     return EvidenceState.model_validate(payload)
 
 

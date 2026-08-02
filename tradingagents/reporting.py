@@ -327,6 +327,170 @@ def _render_financial_dispatch_operations(
                     ),
                 ]
             )
+            aggregate = request.aggregate_family_assessment
+            if aggregate is not None:
+                lines.extend(
+                    [
+                        "",
+                        "#### Family-level financial evidence",
+                        "",
+                        (
+                            "- **Eligibility policy version:** "
+                            f"`{aggregate.eligibility_policy_version}`"
+                        ),
+                        (
+                            "- **Requested analysis scope:** "
+                            f"`{aggregate.requested_analysis_scope.value}`"
+                        ),
+                        f"- **Company type:** `{aggregate.company_type.value}`",
+                        f"- **Aggregate disposition:** `{aggregate.disposition.value}`",
+                        (
+                            "- **Aggregate typed reasons:** "
+                            + (
+                                ", ".join(
+                                    f"`{reason.value}`"
+                                    for reason in aggregate.typed_reasons
+                                )
+                                or "none"
+                            )
+                        ),
+                        (
+                            "- **Complete families:** "
+                            + (
+                                ", ".join(
+                                    f"`{family.value}`"
+                                    for family in aggregate.complete_families
+                                )
+                                or "none"
+                            )
+                        ),
+                        f"- **Requirements identity:** `{aggregate.requirements_identity}`",
+                    ]
+                )
+                for assessment in request.family_assessments:
+                    lines.extend(
+                        [
+                            "",
+                            f"##### `{assessment.family.value}` family",
+                            "",
+                            f"- **Complete:** {_format_scalar(assessment.complete)}",
+                            f"- **Disposition:** `{assessment.disposition.value}`",
+                            (
+                                "- **Requirement:** "
+                                f"`{assessment.requirement.status.value}`"
+                            ),
+                            (
+                                "- **Target periods:** "
+                                + ", ".join(
+                                    period.isoformat()
+                                    for period in assessment.target_periods
+                                )
+                            ),
+                            (
+                                "- **Selected periods:** "
+                                + (
+                                    ", ".join(
+                                        period.isoformat()
+                                        for period in assessment.selected_periods
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Current-only periods:** "
+                                + (
+                                    ", ".join(
+                                        period.isoformat()
+                                        for period in assessment.current_only_periods
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Rejected periods:** "
+                                + (
+                                    ", ".join(
+                                        period.isoformat()
+                                        for period in assessment.rejected_periods
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Conflicted periods:** "
+                                + (
+                                    ", ".join(
+                                        period.isoformat()
+                                        for period in assessment.conflicted_periods
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Missing periods:** "
+                                + (
+                                    ", ".join(
+                                        period.isoformat()
+                                        for period in assessment.missing_periods
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Typed reasons:** "
+                                + (
+                                    ", ".join(
+                                        f"`{reason.value}`"
+                                        for reason in assessment.typed_reasons
+                                    )
+                                    or "none"
+                                )
+                            ),
+                            (
+                                "- **Provider artifacts / selected lineage / conflicts:** "
+                                f"{len(assessment.artifact_identities)} / "
+                                f"{len(assessment.selection_identities)} / "
+                                f"{len(assessment.conflict_identities)}"
+                            ),
+                        ]
+                    )
+                    for authority in assessment.requirement.authority_bindings:
+                        lines.append(
+                            "- **Requirement authority:** "
+                            f"`{authority.authority.value}` / "
+                            f"`{authority.authority_id}` / "
+                            f"required={_format_scalar(authority.required)}"
+                        )
+                    for binding_label, bindings in (
+                        (
+                            "Missing material-premise binding",
+                            assessment.missing_material_premise_bindings,
+                        ),
+                        (
+                            "Conflicted material-premise binding",
+                            assessment.conflicted_material_premise_bindings,
+                        ),
+                    ):
+                        for binding in bindings:
+                            lines.append(
+                                f"- **{binding_label}:** `{binding.premise_id}` / "
+                                + ", ".join(
+                                    period.isoformat()
+                                    for period in binding.affected_periods
+                                )
+                            )
+                    for coverage in assessment.coverage:
+                        lines.append(
+                            "- **Period coverage:** "
+                            f"{coverage.period.isoformat()} / "
+                            f"`{coverage.disposition.value}` / "
+                            "critical "
+                            f"{_format_scalar(coverage.critical_coverage)} / "
+                            f"{_format_scalar(coverage.critical_threshold)} / "
+                            "core "
+                            f"{_format_scalar(coverage.core_coverage)} / "
+                            f"{_format_scalar(coverage.core_threshold)}"
+                        )
             for manifest in request.manifests:
                 lines.extend(
                     [
