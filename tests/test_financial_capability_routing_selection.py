@@ -5,6 +5,7 @@ import importlib.util
 import json
 from collections.abc import Callable
 from datetime import date, datetime, timezone
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,6 +15,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     MainlandCapability,
+    MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
 )
@@ -106,7 +108,7 @@ def _identity() -> InstrumentIdentityEvidence:
     )
 
 
-def _qualified_plan(
+def _shadow_plan(
     monkeypatch: pytest.MonkeyPatch,
     *,
     account_scope_label: str = "personal-research-primary",
@@ -115,7 +117,7 @@ def _qualified_plan(
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": [
                 "statements",
                 "financial_indicators",
@@ -139,6 +141,33 @@ def _qualified_plan(
     )
     assert preflight.plan is not None
     return preflight.plan
+
+
+def _qualified_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    account_scope_label: str = "personal-research-primary",
+):
+    historical_payload = _shadow_plan(
+        monkeypatch,
+        account_scope_label=account_scope_label,
+    ).model_dump(mode="json")
+    historical_payload["mode"] = "qualified_v1"
+    historical_payload["manifest_contract_version"] = "financial-manifest-v1"
+    historical_payload.pop("eligibility_policy_version")
+    historical_payload.pop("financial_eligibility_policy")
+    signature_payload = dict(historical_payload)
+    signature_payload.pop("plan_signature")
+    encoded = json.dumps(
+        signature_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    historical_payload["plan_signature"] = (
+        "mainland-routing-plan:v1:" + sha256(encoded).hexdigest()
+    )
+    return MainlandCapabilityRoutingPlan.model_validate(historical_payload)
 
 
 def _candidate(
@@ -456,7 +485,7 @@ def _production_composition_graph(
     runtime_config = copy.deepcopy(DEFAULT_CONFIG)
     runtime_config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "mainland_capability_routing_plan_signature": plan.plan_signature,
             "tool_vendors": dict.fromkeys(vendor_methods, "legacy-placeholder"),
             "data_cache_dir": str(tmp_path / "cache"),
@@ -2568,7 +2597,7 @@ def test_trading_graph_composes_qualified_financial_router(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
+    plan = _shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -2610,7 +2639,7 @@ def test_trading_graph_composes_qualified_financial_router(
     runtime_config = copy.deepcopy(DEFAULT_CONFIG)
     runtime_config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "data_cache_dir": str(tmp_path / "cache"),
             "results_dir": str(tmp_path / "results"),
         }
@@ -2658,7 +2687,7 @@ def test_bounded_production_composition_validates_factor_and_name_without_author
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
+    plan = _shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -2810,7 +2839,7 @@ def test_production_composition_routes_tushare_gap_to_akshare_sina(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
+    plan = _shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -2885,7 +2914,7 @@ def test_production_composition_routes_tushare_gap_to_akshare_sina(
     assert [provider for provider, _ in calls] == ["tushare", "akshare_sina"]
     assert calls[1][1].missing_annual_period_ends == ()
     assert calls[1][1].missing_reporting_period_ends == (target,)
-    terminal = result["financial_dispatch_ledger"][
+    terminal = result["financial_dispatch_shadow_ledger"][
         "qualified_statement_selections"
     ][0]["terminal"]
     manifest = terminal["routing_result"]["manifest"]
@@ -2900,7 +2929,7 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
+    plan = _shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -2972,7 +3001,7 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
     )
 
     assert calls == ["tushare", "akshare_sina", "yfinance"]
-    terminal = result["financial_dispatch_ledger"][
+    terminal = result["financial_dispatch_shadow_ledger"][
         "qualified_statement_selections"
     ][0]["terminal"]
     manifest = terminal["routing_result"]["manifest"]
@@ -2989,7 +3018,7 @@ def test_production_composition_keeps_baostock_status_authoritative(
     tmp_path,
     tradeability: str,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
+    plan = _shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -3054,8 +3083,8 @@ def test_trading_graph_rejects_mismatched_qualified_composition_before_models(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _qualified_plan(monkeypatch)
-    mismatched_plan = _qualified_plan(
+    plan = _shadow_plan(monkeypatch)
+    mismatched_plan = _shadow_plan(
         monkeypatch,
         account_scope_label="personal-research-secondary",
     )
@@ -3073,7 +3102,7 @@ def test_trading_graph_rejects_mismatched_qualified_composition_before_models(
     runtime_config = copy.deepcopy(DEFAULT_CONFIG)
     runtime_config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "data_cache_dir": str(tmp_path / "cache"),
             "results_dir": str(tmp_path / "results"),
         }

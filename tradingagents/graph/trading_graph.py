@@ -242,6 +242,15 @@ class TradingAgentsGraph:
             raise MainlandCapabilityRoutingPreflightError(
                 routing_preflight.failure
             )
+        if (
+            capability_routing_plan is not None
+            and capability_routing_plan.mode.value == "qualified_v1"
+        ):
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
+                )
+            )
         requested_analysts = tuple(selected_analysts)
         effective_analysts = self._analysts_for_instrument_kind(
             requested_analysts,

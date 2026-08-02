@@ -1926,7 +1926,7 @@ def test_graph_persists_v2_manifest_and_evidence_without_repeating_io(
         vendor_methods,
         "legacy-placeholder",
     )
-    runtime_config["mainland_capability_routing_mode"] = "qualified_v1"
+    runtime_config["mainland_capability_routing_mode"] = "qualified_v1_shadow"
     node = FinancialDispatchToolNode(
         config=runtime_config,
         vendor_methods=vendor_methods,

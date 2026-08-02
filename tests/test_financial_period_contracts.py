@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -41,6 +42,15 @@ from tradingagents.dataflows.financial_contracts import (
     mark_financial_period_conflicted,
     resolve_financial_company_type,
 )
+from tradingagents.dataflows.financial_eligibility_policy import (
+    MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
+    MainlandFinancialEligibilityPolicyError,
+    MainlandFinancialEligibilityPolicyFailureReason,
+    MainlandFinancialPublicationState,
+    build_mainland_financial_eligibility_policy_v2,
+    mainland_financial_eligibility_policy_signature,
+    restore_mainland_financial_eligibility_policy,
+)
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     IdentityProvenance,
@@ -49,6 +59,212 @@ from tradingagents.evidence import (
 )
 
 _OBSERVED_AT = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+
+
+def test_v2_eligibility_policy_contract_is_exact_deterministic_and_round_trippable() -> None:
+    first = build_mainland_financial_eligibility_policy_v2()
+    second = build_mainland_financial_eligibility_policy_v2()
+    restored = restore_mainland_financial_eligibility_policy(
+        json.loads(first.model_dump_json())
+    )
+
+    assert first == second == restored
+    assert first.eligibility_policy_version == (
+        "mainland-financial-period-eligibility-v2"
+    )
+    assert first.reporting_calendar.annual_period_ends == ("12-31",)
+    assert first.reporting_calendar.reporting_period_ends == (
+        "03-31",
+        "06-30",
+        "09-30",
+        "12-31",
+    )
+    assert tuple(
+        (
+            rule.period_end,
+            rule.deadline,
+            rule.deadline_year_offset,
+        )
+        for rule in first.reporting_calendar.publication_deadlines
+    ) == (
+        ("03-31", "04-30", 0),
+        ("06-30", "08-31", 0),
+        ("09-30", "10-31", 0),
+        ("12-31", "04-30", 1),
+    )
+    assert first.publication_states == tuple(MainlandFinancialPublicationState)
+    assert first.reporting_calendar.announcement_cutoff_inclusive is True
+    assert first.reporting_calendar.missing_filing_deadline_day_is_not_overdue is True
+    assert first.policy_signature == (
+        "mainland-financial-eligibility-policy:v2:"
+        "da848efd908db60c5b6145ed17ae1734657ea109b476c6acc42025c9fb6e0868"
+    )
+    assert first.model_dump_json() == restored.model_dump_json()
+
+
+def test_v2_eligibility_policy_identity_ignores_input_order() -> None:
+    policy = build_mainland_financial_eligibility_policy_v2()
+    shuffled = policy.model_dump(mode="json")
+    shuffled["publication_states"] = list(
+        reversed(shuffled["publication_states"])
+    )
+    shuffled["reporting_calendar"]["annual_period_ends"] = list(
+        reversed(shuffled["reporting_calendar"]["annual_period_ends"])
+    )
+    shuffled["reporting_calendar"]["reporting_period_ends"] = list(
+        reversed(shuffled["reporting_calendar"]["reporting_period_ends"])
+    )
+    shuffled["reporting_calendar"]["publication_deadlines"] = list(
+        reversed(shuffled["reporting_calendar"]["publication_deadlines"])
+    )
+    shuffled = dict(reversed(tuple(shuffled.items())))
+
+    restored = restore_mainland_financial_eligibility_policy(shuffled)
+
+    assert restored == policy
+    assert restored.policy_signature == policy.policy_signature
+    assert restored.model_dump_json() == policy.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("eligibility_policy_version",), "mainland-financial-period-eligibility-v3"),
+        (("reporting_calendar", "calendar_version"), "mainland-reporting-calendar-v3"),
+        (
+            ("reporting_calendar", "publication_deadlines", 1, "deadline"),
+            "09-01",
+        ),
+        (("completeness_policy_version",), "mainland-financial-completeness-v3"),
+        (("candidate_selection_contract_version",), "financial-candidate-selection-v3"),
+        (("manifest_projection_version",), "financial-manifest-v3"),
+        (("checkpoint_projection_version",), "financial-checkpoint-projection-v3"),
+        (("audit_projection_version",), "financial-audit-projection-v3"),
+        (("report_projection_version",), "financial-report-projection-v3"),
+        (("authority_disposition",), "qualified_authoritative"),
+    ),
+)
+def test_every_material_v2_policy_change_changes_its_signature(
+    path: tuple[object, ...],
+    replacement: object,
+) -> None:
+    baseline = build_mainland_financial_eligibility_policy_v2()
+    payload = baseline.signature_payload()
+    target: object = payload
+    for key in path[:-1]:
+        target = target[key]  # type: ignore[index]
+    target[path[-1]] = replacement  # type: ignore[index]
+
+    assert mainland_financial_eligibility_policy_signature(payload) != (
+        baseline.policy_signature
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected_reason"),
+    (
+        (None, MainlandFinancialEligibilityPolicyFailureReason.MISSING_POLICY_IDENTITY),
+        (
+            "mainland-financial-period-eligibility-v3",
+            MainlandFinancialEligibilityPolicyFailureReason.UNKNOWN_POLICY_IDENTITY,
+        ),
+    ),
+)
+def test_missing_or_unknown_v2_policy_identity_fails_typed(
+    identity: str | None,
+    expected_reason: MainlandFinancialEligibilityPolicyFailureReason,
+) -> None:
+    payload = build_mainland_financial_eligibility_policy_v2().model_dump(
+        mode="json"
+    )
+    if identity is None:
+        payload.pop("eligibility_policy_version")
+    else:
+        payload["eligibility_policy_version"] = identity
+
+    with pytest.raises(MainlandFinancialEligibilityPolicyError) as caught:
+        restore_mainland_financial_eligibility_policy(payload)
+
+    assert caught.value.reason is expected_reason
+    assert caught.value.diagnostic_code == expected_reason.value
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("publication_states", ["published_eligible", "future_state"]),
+        (
+            "publication_deadlines",
+            [
+                {
+                    "period_end": "06-30",
+                    "deadline": "09-01",
+                    "deadline_year_offset": 0,
+                }
+            ],
+        ),
+    ),
+)
+def test_unknown_publication_state_or_deadline_fails_typed(
+    field: str,
+    replacement: object,
+) -> None:
+    policy = build_mainland_financial_eligibility_policy_v2()
+    payload = policy.model_dump(mode="json")
+    if field == "publication_states":
+        payload[field] = replacement
+    else:
+        payload["reporting_calendar"][field] = replacement
+    payload["policy_signature"] = mainland_financial_eligibility_policy_signature(
+        payload
+    )
+
+    with pytest.raises(MainlandFinancialEligibilityPolicyError) as caught:
+        restore_mainland_financial_eligibility_policy(payload)
+
+    assert caught.value.reason is (
+        MainlandFinancialEligibilityPolicyFailureReason.INVALID_POLICY_CONTRACT
+    )
+
+
+def test_policy_identity_excludes_unrelated_runtime_and_model_fields() -> None:
+    policy = build_mainland_financial_eligibility_policy_v2()
+    noisy_payload = {
+        **policy.signature_payload(),
+        "process_id": 9182,
+        "runtime_call_order": 14,
+        "unrelated_timestamp": "2099-01-01T00:00:00Z",
+        "model_prose": "not policy material",
+    }
+
+    assert mainland_financial_eligibility_policy_signature(noisy_payload) == (
+        policy.policy_signature
+    )
+
+
+def test_v2_policy_projection_is_closed_and_secret_free() -> None:
+    policy = build_mainland_financial_eligibility_policy_v2()
+    serialized = policy.model_dump_json().casefold()
+
+    assert policy.eligibility_policy_version == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
+    for forbidden in (
+        "token",
+        "token_digest",
+        "raw_error",
+        "payload_body",
+        "https://provider.invalid?",
+    ):
+        assert forbidden not in serialized
+    with pytest.raises(MainlandFinancialEligibilityPolicyError) as caught:
+        restore_mainland_financial_eligibility_policy(
+            {
+                **policy.model_dump(mode="json"),
+                "raw_error": "ProviderError: token=fixture-secret",
+            }
+        )
+    assert caught.value.reason is (
+        MainlandFinancialEligibilityPolicyFailureReason.UNSAFE_POLICY_PROJECTION
+    )
 
 
 def _instrument(*, symbol: str = "601328.SS") -> InstrumentIdentityEvidence:

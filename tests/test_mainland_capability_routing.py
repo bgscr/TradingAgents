@@ -55,7 +55,7 @@ def _qualified_config(*, enabled: object) -> dict[str, object]:
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": enabled,
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_account_scope_label": "personal-research-primary",
@@ -122,14 +122,14 @@ def test_mainland_plan_requires_an_authoritative_mainland_equity_identity() -> N
     )
 
 
-def test_qualified_v1_resolves_closed_versioned_routes_and_signature(
+def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": [
                 "name_events",
                 "adjustment_factors",
@@ -154,7 +154,7 @@ def test_qualified_v1_resolves_closed_versioned_routes_and_signature(
     plan = result.plan
     assert plan.plan_version == "1.0"
     assert plan.policy_version == "mainland-capability-routing-policy-v1"
-    assert plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1
+    assert plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
     assert plan.qualification_profile == "cn-a-2000-20260729-v1"
     assert plan.enabled_tushare_capabilities == (
         TushareCapability.STATEMENTS,
@@ -204,7 +204,7 @@ def test_qualified_v1_resolves_closed_versioned_routes_and_signature(
     assert plan.completeness_policy_version == "mainland-financial-completeness-v2"
     assert plan.account_scope_label == "personal-research-primary"
     assert plan.artifact_contract_version == "source-artifact-v1"
-    assert plan.manifest_contract_version == "financial-manifest-v1"
+    assert plan.manifest_contract_version == "financial-manifest-v2"
     assert plan.selection_contract_version == (
         "financial-period-selection-statement-v2"
     )
@@ -334,7 +334,7 @@ def test_invalid_tushare_configuration_returns_a_typed_secret_safe_preflight(
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": ["statements"],
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_account_scope_label": "personal-research-primary",

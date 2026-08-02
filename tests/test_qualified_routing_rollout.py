@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 from datetime import date
+from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,8 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingDisposition,
     MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingMode,
+    MainlandCapabilityRoutingPlan,
+    MainlandCapabilityRoutingPreflight,
     MainlandCapabilityRoutingPreflightError,
     MainlandCapabilityRoutingRunProjection,
     TushareCapability,
@@ -107,10 +110,37 @@ def _preflight(
     enabled: object = ("statements",),
 ):
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
-    return preflight_mainland_capability_routing(
+    resolved_mode = "qualified_v1_shadow" if mode == "qualified_v1" else mode
+    result = preflight_mainland_capability_routing(
         _asset(),
-        config=_rollout_config(mode, enabled=enabled),
+        config=_rollout_config(resolved_mode, enabled=enabled),
         environment={"TUSHARE_TOKEN": "deterministic-fixture-secret"},
+    )
+    if mode != "qualified_v1" or result.plan is None:
+        return result
+    historical_payload = result.plan.model_dump(mode="json")
+    historical_payload["mode"] = "qualified_v1"
+    historical_payload["manifest_contract_version"] = "financial-manifest-v1"
+    historical_payload.pop("eligibility_policy_version")
+    historical_payload.pop("financial_eligibility_policy")
+    _resign_plan_payload(historical_payload)
+    return MainlandCapabilityRoutingPreflight(
+        passed=True,
+        plan=MainlandCapabilityRoutingPlan.model_validate(historical_payload),
+    )
+
+
+def _resign_plan_payload(payload: dict[str, object]) -> None:
+    signature_payload = dict(payload)
+    signature_payload.pop("plan_signature", None)
+    encoded = json.dumps(
+        signature_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["plan_signature"] = (
+        "mainland-routing-plan:v1:" + sha256(encoded).hexdigest()
     )
 
 
@@ -177,9 +207,209 @@ def test_shadow_plan_is_explicit_qualified_routing_but_non_authoritative(
         TushareCapability.STATEMENTS,
         TushareCapability.FINANCIAL_INDICATORS,
     )
+    assert result.plan.eligibility_policy_version == (
+        "mainland-financial-period-eligibility-v2"
+    )
+    assert result.plan.financial_eligibility_policy is not None
+    assert projection.eligibility_policy_version == (
+        result.plan.eligibility_policy_version
+    )
+    assert projection.financial_eligibility_policy == (
+        result.plan.financial_eligibility_policy
+    )
+    assert projection.financial_eligibility_policy.authority_disposition == (
+        "shadow_non_authoritative"
+    )
 
 
-@pytest.mark.parametrize("mode", ["qualified_v1", "qualified_v1_shadow"])
+def test_shadow_plan_signature_binds_every_v2_policy_and_projection_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _preflight(monkeypatch, "qualified_v1_shadow", enabled=()).plan
+    assert plan is not None
+    assert plan.financial_eligibility_policy is not None
+    policy = plan.financial_eligibility_policy
+
+    assert policy.eligibility_policy_version == plan.eligibility_policy_version
+    assert policy.reporting_calendar.calendar_version == (
+        "mainland-financial-reporting-calendar-v2"
+    )
+    assert policy.completeness_policy_version == (
+        "mainland-financial-completeness-v2"
+    )
+    assert policy.candidate_selection_contract_version == (
+        "mainland-financial-candidate-selection-v2"
+    )
+    assert policy.manifest_projection_version == "financial-manifest-v2"
+    assert plan.manifest_contract_version == policy.manifest_projection_version
+    assert policy.checkpoint_projection_version == (
+        "mainland-financial-checkpoint-projection-v2"
+    )
+    assert policy.audit_projection_version == (
+        "mainland-financial-audit-projection-v2"
+    )
+    assert policy.report_projection_version == (
+        "mainland-financial-report-projection-v2"
+    )
+    assert policy.authority_disposition == "shadow_non_authoritative"
+    assert policy.qualified_v1_authority_enabled is False
+    assert plan.financial_eligibility_policy.model_dump(mode="json") == (
+        plan.signature_payload()["financial_eligibility_policy"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("eligibility_policy_version", "mainland-financial-period-eligibility-v3"),
+        ("reporting_calendar", {"calendar_version": "changed"}),
+        ("completeness_policy_version", "mainland-financial-completeness-v3"),
+        ("candidate_selection_contract_version", "financial-candidate-selection-v3"),
+        ("manifest_projection_version", "financial-manifest-v3"),
+        ("checkpoint_projection_version", "financial-checkpoint-projection-v3"),
+        ("audit_projection_version", "financial-audit-projection-v3"),
+        ("report_projection_version", "financial-report-projection-v3"),
+        ("authority_disposition", "qualified_authoritative"),
+    ),
+)
+def test_each_v2_policy_binding_is_material_to_the_plan_signature(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: object,
+) -> None:
+    plan = _preflight(monkeypatch, "qualified_v1_shadow", enabled=()).plan
+    assert plan is not None
+    payload = plan.model_dump(mode="json")
+    payload["financial_eligibility_policy"][field] = replacement
+
+    _resign_plan_payload(payload)
+
+    assert payload["plan_signature"] != plan.plan_signature
+
+
+def test_authoritative_qualified_v1_preflight_remains_disabled_without_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+    provider_calls = 0
+    model_calls = 0
+
+    result = preflight_mainland_capability_routing(
+        _asset(),
+        config=_rollout_config("qualified_v1", enabled=()),
+        environment={},
+    )
+
+    assert result.plan is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
+    )
+    assert provider_calls == 0
+    assert model_calls == 0
+
+
+def test_programmatic_qualified_v1_graph_injection_is_disabled_before_model_work(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    historical = _preflight(monkeypatch, "qualified_v1", enabled=()).plan
+    assert historical is not None
+    model_calls = 0
+
+    def model_factory(**_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("model construction must remain unreachable")
+
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.create_llm_client",
+        model_factory,
+    )
+
+    with pytest.raises(MainlandCapabilityRoutingPreflightError) as caught:
+        TradingAgentsGraph(
+            selected_analysts=("fundamentals",),
+            config=_graph_config(tmp_path, historical),
+            asset_configuration=_asset(),
+            capability_routing_plan=historical,
+            qualified_financial_routing=_composition(historical),
+        )
+
+    assert caught.value.failure.reason is (
+        MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
+    )
+    assert model_calls == 0
+
+
+def test_pre_v2_qualified_checkpoint_cannot_resume_as_v2_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = _preflight(monkeypatch, "qualified_v1_shadow", enabled=()).plan
+    assert active is not None
+    historical_payload = active.model_dump(mode="json")
+    historical_payload["mode"] = "qualified_v1"
+    historical_payload["manifest_contract_version"] = "financial-manifest-v1"
+    historical_payload.pop("eligibility_policy_version")
+    historical_payload.pop("financial_eligibility_policy")
+    _resign_plan_payload(historical_payload)
+    historical = MainlandCapabilityRoutingPlan.model_validate(historical_payload)
+
+    with pytest.raises(MainlandCapabilityRoutingCheckpointError) as caught:
+        validate_mainland_capability_routing_checkpoint(
+            active_plan=active,
+            checkpoint_plan=historical.model_dump(mode="json"),
+        )
+
+    assert caught.value.reason is (
+        MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+    )
+    assert caught.value.diagnostic_code == "financial_eligibility_policy_mismatch"
+
+
+@pytest.mark.parametrize("contradiction", ["plan", "policy"])
+def test_contradictory_plan_and_policy_identities_fail_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    contradiction: str,
+) -> None:
+    active = _preflight(monkeypatch, "qualified_v1_shadow", enabled=()).plan
+    assert active is not None
+    checkpoint = active.model_dump(mode="json")
+    if contradiction == "plan":
+        checkpoint["eligibility_policy_version"] = (
+            "mainland-financial-period-eligibility-v3"
+        )
+    else:
+        checkpoint["financial_eligibility_policy"]["eligibility_policy_version"] = (
+            "mainland-financial-period-eligibility-v3"
+        )
+
+    with pytest.raises(MainlandCapabilityRoutingCheckpointError) as caught:
+        validate_mainland_capability_routing_checkpoint(
+            active_plan=active,
+            checkpoint_plan=checkpoint,
+        )
+
+    assert caught.value.reason is (
+        MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+    )
+
+
+def test_legacy_plan_projection_remains_without_synthetic_v2_fields() -> None:
+    result = preflight_mainland_capability_routing(
+        _asset(),
+        config=copy.deepcopy(DEFAULT_CONFIG),
+        environment={},
+    )
+    assert result.plan is not None
+    serialized = result.plan.model_dump(mode="json")
+
+    assert result.plan.plan_signature == _LEGACY_PLAN_SIGNATURE
+    assert "eligibility_policy_version" not in serialized
+    assert "financial_eligibility_policy" not in serialized
+
+
+@pytest.mark.parametrize("mode", ["qualified_v1_shadow"])
 def test_empty_enablement_activates_no_tushare_provider_route(
     mode: str,
 ) -> None:
@@ -420,7 +650,7 @@ def test_shadow_cli_configuration_failure_stops_before_graph_or_provider_work(
     )
 
 
-def test_qualified_graph_requires_explicit_composition_before_model_work(
+def test_qualified_graph_is_disabled_before_model_work(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -447,9 +677,7 @@ def test_qualified_graph_requires_explicit_composition_before_model_work(
         )
 
     assert model_calls == 0
-    assert caught.value.failure.reason.value == (
-        "qualified_routing_composition_missing"
-    )
+    assert caught.value.failure.reason.value == "qualified_v1_authority_disabled"
 
 
 def test_contradictory_composition_fails_typed_before_model_work(
@@ -458,12 +686,12 @@ def test_contradictory_composition_fails_typed_before_model_work(
 ) -> None:
     active_plan = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("statements",),
     ).plan
     contradictory_plan = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("financial_indicators",),
     ).plan
     assert active_plan is not None
@@ -495,13 +723,13 @@ def test_contradictory_composition_fails_typed_before_model_work(
     )
 
 
-def test_cli_passes_explicit_qualified_composition_to_graph(
+def test_cli_passes_explicit_shadow_composition_to_graph(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
-    config = _rollout_config("qualified_v1")
+    config = _rollout_config("qualified_v1_shadow")
     config["results_dir"] = str(tmp_path)
     plan = preflight_mainland_capability_routing(
         _asset(),
@@ -546,13 +774,13 @@ def test_cli_passes_explicit_qualified_composition_to_graph(
     assert received is composition
 
 
-def test_cli_resolves_qualified_composition_before_graph_work(
+def test_cli_resolves_shadow_composition_before_graph_work(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
-    config = _rollout_config("qualified_v1")
+    config = _rollout_config("qualified_v1_shadow")
     config["results_dir"] = str(tmp_path)
     selections = {
         "ticker": "601328.SS",
@@ -582,7 +810,7 @@ def test_cli_resolves_qualified_composition_before_graph_work(
         assert config["mainland_capability_routing_plan_signature"] == (
             plan.plan_signature
         )
-        assert validation_workload is False
+        assert validation_workload is True
         resolved = _composition(plan, asset_configuration)
         return resolved
 
@@ -602,7 +830,7 @@ def test_cli_resolves_qualified_composition_before_graph_work(
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", graph_constructor)
 
     with pytest.raises(GraphReached):
-        cli_main.run_analysis()
+        cli_main.run_analysis(qualified_routing_validation=True)
 
     assert resolved is not None
     assert received is resolved
@@ -687,7 +915,7 @@ def test_capability_only_composition_needs_no_financial_request_factory(
 ) -> None:
     plan = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("adjustment_factors",),
     ).plan
     assert plan is not None
@@ -732,10 +960,10 @@ def test_resolved_shadow_plan_ignores_later_environment_mutation(
     assert plan.route_for(MainlandCapability.BALANCE_SHEET)[0] == "tushare"
 
 
-def test_rollback_changes_new_runs_immediately_and_reenable_revalidates(
+def test_shadow_rollback_changes_new_runs_immediately_and_authority_stays_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    qualified = _preflight(monkeypatch, "qualified_v1").plan
+    qualified = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert qualified is not None
     retained_projection = MainlandCapabilityRoutingRunProjection.from_plan(qualified)
 
@@ -750,7 +978,7 @@ def test_rollback_changes_new_runs_immediately_and_reenable_revalidates(
     assert rolled_back.plan.plan_signature == _LEGACY_PLAN_SIGNATURE
     assert retained_projection.plan_signature == qualified.plan_signature
     assert retained_projection.disposition is (
-        MainlandCapabilityRoutingDisposition.QUALIFIED_AUTHORITATIVE
+        MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
     )
 
     reenable = preflight_mainland_capability_routing(
@@ -761,7 +989,7 @@ def test_rollback_changes_new_runs_immediately_and_reenable_revalidates(
     assert reenable.plan is None
     assert reenable.failure is not None
     assert reenable.failure.reason is (
-        MainlandCapabilityRoutingFailureReason.TUSHARE_TOKEN_MISSING
+        MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
     )
 
 
@@ -769,7 +997,7 @@ def test_rollback_preserves_qualified_historical_state_byte_for_byte(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    qualified = _preflight(monkeypatch, "qualified_v1").plan
+    qualified = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert qualified is not None
     retained_files = {
         "provider-artifacts/candidate.json": b'{"artifact":"qualified"}\n',
@@ -810,7 +1038,7 @@ def test_rollback_preserves_qualified_historical_state_byte_for_byte(
 def test_qualified_checkpoint_exact_plan_resumes_without_provider_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan = _preflight(monkeypatch, "qualified_v1").plan
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
     provider_calls = 0
 
@@ -1206,7 +1434,7 @@ def test_graph_starts_new_for_legacy_checkpoint_without_rewrite(
         config=copy.deepcopy(DEFAULT_CONFIG),
         environment={},
     ).plan
-    qualified = _preflight(monkeypatch, "qualified_v1").plan
+    qualified = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert legacy is not None
     assert qualified is not None
     ticker = asset.instrument_identity.symbol
@@ -1258,7 +1486,7 @@ def test_graph_rollback_starts_legacy_without_opening_qualified_checkpoint(
         lambda **_kwargs: SimpleNamespace(get_llm=lambda: object()),
     )
     asset = _asset()
-    qualified = _preflight(monkeypatch, "qualified_v1").plan
+    qualified = _preflight(monkeypatch, "qualified_v1_shadow").plan
     legacy = preflight_mainland_capability_routing(
         asset,
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -1309,7 +1537,7 @@ def test_start_new_cleanup_targets_new_thread_and_preserves_old_checkpoint(
         lambda **_kwargs: SimpleNamespace(get_llm=lambda: object()),
     )
     asset = _asset()
-    plan = _preflight(monkeypatch, "qualified_v1").plan
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
     ticker = asset.instrument_identity.symbol
     trade_date = "2026-07-30"
@@ -1383,19 +1611,9 @@ def test_start_new_cleanup_targets_new_thread_and_preserves_old_checkpoint(
     ("active_mode", "checkpoint_mode", "reason"),
     [
         (
-            "qualified_v1",
-            "qualified_v1",
+            "qualified_v1_shadow",
+            "qualified_v1_shadow",
             MainlandCapabilityRoutingCheckpointFailureReason.PLAN_MISMATCH,
-        ),
-        (
-            "qualified_v1",
-            "qualified_v1_shadow",
-            MainlandCapabilityRoutingCheckpointFailureReason.ROLLOUT_MODE_MISMATCH,
-        ),
-        (
-            "qualified_v1_shadow",
-            "qualified_v1",
-            MainlandCapabilityRoutingCheckpointFailureReason.ROLLOUT_MODE_MISMATCH,
         ),
     ],
 )
@@ -1475,12 +1693,12 @@ def test_mixed_checkpoint_history_never_masks_qualified_plan_mismatch(
     asset = _asset()
     active = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("statements",),
     ).plan
     mismatch = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("financial_indicators",),
     ).plan
     legacy = preflight_mainland_capability_routing(
@@ -1554,12 +1772,12 @@ def test_checkpoint_scan_ignores_different_routing_neutral_graph_identity(
     asset = _asset()
     active = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("statements",),
     ).plan
     mismatch = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("financial_indicators",),
     ).plan
     assert active is not None
@@ -1604,12 +1822,12 @@ def test_checkpoint_scan_ignores_untagged_qualified_checkpoint_from_other_graph(
     asset = _asset()
     active = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("statements",),
     ).plan
     mismatch = _preflight(
         monkeypatch,
-        "qualified_v1",
+        "qualified_v1_shadow",
         enabled=("financial_indicators",),
     ).plan
     assert active is not None
@@ -1717,7 +1935,7 @@ def test_mismatched_qualified_checkpoint_fails_typed(
         ("qualified_v1_shadow", "qualified_v1"),
     ],
 )
-def test_shadow_and_authoritative_checkpoint_states_cannot_be_confused(
+def test_v2_shadow_and_pre_v2_qualified_checkpoint_states_cannot_be_confused(
     monkeypatch: pytest.MonkeyPatch,
     active_mode: str,
     checkpoint_mode: str,
@@ -1734,7 +1952,7 @@ def test_shadow_and_authoritative_checkpoint_states_cannot_be_confused(
         )
 
     assert caught.value.reason is (
-        MainlandCapabilityRoutingCheckpointFailureReason.ROLLOUT_MODE_MISMATCH
+        MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
     )
 
 

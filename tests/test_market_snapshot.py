@@ -161,7 +161,7 @@ def test_qualified_financial_routing_does_not_change_daily_mainland_order(
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     set_config(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": ("statements",),
             "market_data_vendors": {
                 "cn_a": {

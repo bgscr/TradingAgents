@@ -86,7 +86,7 @@ def _qualified_plan(monkeypatch: pytest.MonkeyPatch):
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": ["statements"],
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_account_scope_label": "personal-research-primary",

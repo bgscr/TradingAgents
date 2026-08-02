@@ -84,7 +84,7 @@ def _qualified_plan(
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": list(enabled),
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_account_scope_label": "personal-research-primary",
@@ -1047,7 +1047,7 @@ def test_invalid_status_enablement_and_missing_secret_fail_before_provider_work(
     invalid_status_config = copy.deepcopy(DEFAULT_CONFIG)
     invalid_status_config.update(
         {
-            "mainland_capability_routing_mode": "qualified_v1",
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
             "tushare_enabled_capabilities": ["suspension_status"],
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_calls_per_minute": 40,
