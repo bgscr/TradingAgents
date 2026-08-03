@@ -1,8 +1,7 @@
-"""Phase-one contract for production qualified-routing composition.
+"""Immutable blueprint and run-owned sources for qualified routing composition.
 
-This module validates and freezes construction material only.  Provider adapters,
-stores, graphs, models, checkpoints, and lifecycle ownership are deliberately not
-constructed here.
+Provider adapters are bound without opening sessions or stores. Graph integration,
+checkpoint restoration, and runtime lifecycle ownership remain later factory phases.
 """
 
 from __future__ import annotations
@@ -10,9 +9,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from calendar import monthrange
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -32,11 +36,53 @@ from tradingagents.capability_routing import (
     TushareEndpointPacingIdentity,
     mainland_capability_routing_failure,
 )
+from tradingagents.dataflows.akshare_sina_statements import (
+    AkshareSinaStatementAdapter,
+)
+from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
+from tradingagents.dataflows.baostock_ratios import (
+    BaoStockRatioFamilyAdapter,
+    assess_baostock_ratio_family_results,
+)
+from tradingagents.dataflows.financial_capability_routing import (
+    FinancialCapabilityProviderResponse,
+    FinancialCapabilityRoutingRequest,
+    FinancialCapabilitySource,
+    FinancialIndicatorProviderGapRequest,
+    FinancialIndicatorSource,
+    FinancialPeriodSource,
+    FinancialProviderGapRequest,
+    FinancialProviderPeriodResponse,
+    MainlandFinancialCapabilityRouter,
+    financial_period_response_from_indicator_adapter,
+    financial_period_response_from_statement_adapter,
+)
+from tradingagents.dataflows.financial_contracts import (
+    FinancialRatioFamily,
+    FinancialStatementType,
+)
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
 )
-from tradingagents.evidence import InstrumentKind
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestArtifactStore,
+    ProviderSubrequestCache,
+    ProviderSubrequestKey,
+    ProviderSubrequestResult,
+)
+from tradingagents.dataflows.tushare_factors_names import (
+    TushareAdjustmentFactorAdapter,
+    TushareNameEventAdapter,
+)
+from tradingagents.dataflows.tushare_indicators import TushareFinancialIndicatorAdapter
+from tradingagents.dataflows.tushare_statements import TushareStatementAdapter
+from tradingagents.evidence import AcquisitionUnavailableReason, InstrumentKind
 from tradingagents.market_history.config import DataUsageMode
+from tradingagents.market_history.coordinator import (
+    ProviderRequestCoordinator,
+    RequestPriority,
+    upstream_service_identity_for_provider,
+)
 
 PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION = (
     "production-qualified-routing-composition-factory-v1"
@@ -47,7 +93,18 @@ PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION = (
 
 _BLUEPRINT_IDENTITY_PREFIX = "production-qualified-routing-blueprint:v1:"
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
-_SAFE_IDENTITY_PATTERN = r"^[a-z][a-z0-9._:-]*$"
+_SAFE_IDENTITY_PATTERN = r"^[a-z][a-z0-9._:=-]*$"
+_SOURCE_SECRET_MARKERS = (
+    "api-key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 _REQUIRED_DEPENDENCY_IDS = ("akshare", "baostock", "tushare", "yfinance")
 _CONFIG_FIELDS = (
     "mainland_capability_routing_mode",
@@ -284,6 +341,372 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def interrupt(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+class ProductionQualifiedSourceKind(str, Enum):
+    """Public router seam implemented by one plan-named source."""
+
+    STATEMENT = "statement"
+    INDICATOR = "indicator"
+    CAPABILITY = "capability"
+
+
+_STATEMENT_CAPABILITIES = (
+    MainlandCapability.BALANCE_SHEET,
+    MainlandCapability.INCOME_STATEMENT,
+    MainlandCapability.CASH_FLOW,
+)
+_ROUTABLE_CAPABILITIES = (
+    MainlandCapability.ADJUSTMENT_FACTORS,
+    MainlandCapability.SUSPENSION_STATUS,
+    MainlandCapability.NAME_EVENTS,
+    MainlandCapability.ISSUER_LIFECYCLE,
+)
+
+
+def _safe_source_token(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(_SAFE_IDENTITY_PATTERN, value) is not None
+        and not any(marker in value.casefold() for marker in _SOURCE_SECRET_MARKERS)
+        and "?" not in value
+        and "://" not in value
+        and not Path(value).is_absolute()
+    )
+
+
+def _source_kind_accepts(
+    source_kind: ProductionQualifiedSourceKind,
+    capability: MainlandCapability,
+) -> bool:
+    if source_kind is ProductionQualifiedSourceKind.STATEMENT:
+        return capability in _STATEMENT_CAPABILITIES
+    if source_kind is ProductionQualifiedSourceKind.INDICATOR:
+        return capability is MainlandCapability.FINANCIAL_INDICATORS
+    return capability in _ROUTABLE_CAPABILITIES
+
+
+def _physical_provider_is_compatible(
+    *,
+    route_provider_id: str,
+    physical_provider_id: str,
+) -> bool:
+    expected_physical_provider_id = (
+        "yfinance"
+        if route_provider_id == "yfinance_derived"
+        else "akshare_sina"
+        if route_provider_id == "akshare"
+        else route_provider_id
+    )
+    return physical_provider_id == expected_physical_provider_id
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedSourceRegistration:
+    """Lazy, safe registration for an already-qualified run-owned source."""
+
+    provider_id: str
+    endpoint_id: str
+    source_kind: ProductionQualifiedSourceKind
+    capabilities: tuple[MainlandCapability, ...]
+    source_factory: Callable[
+        [ProductionQualifiedRoutingRunDependencies],
+        ProductionQualifiedBoundSource,
+    ] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        canonical = tuple(
+            capability
+            for capability in MainlandCapability
+            if capability in self.capabilities
+        )
+        if (
+            not _safe_source_token(self.provider_id)
+            or not _safe_source_token(self.endpoint_id)
+            or not isinstance(self.source_kind, ProductionQualifiedSourceKind)
+            or not self.capabilities
+            or self.capabilities != canonical
+            or len(self.capabilities) != len(set(self.capabilities))
+            or self.source_kind is ProductionQualifiedSourceKind.CAPABILITY
+            and len(self.capabilities) != 1
+            or any(
+                not _source_kind_accepts(self.source_kind, capability)
+                for capability in self.capabilities
+            )
+            or not callable(self.source_factory)
+        ):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+            )
+
+    @property
+    def registration_id(self) -> str:
+        return f"{self.source_kind.value}:{self.provider_id}:{self.endpoint_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedRoutingRunDependencies:
+    """Safe run-owned references shared by every assembled adapter and source."""
+
+    coordinator: ProviderRequestCoordinator = field(repr=False, compare=False)
+    subrequest_cache: ProviderSubrequestCache = field(repr=False, compare=False)
+    artifact_store: ProviderSubrequestArtifactStore = field(repr=False, compare=False)
+    provider_clients: Mapping[str, object] = field(repr=False, compare=False)
+    now: Callable[[], datetime] = field(repr=False, compare=False)
+    sleep: Callable[[float], None] = field(repr=False, compare=False)
+    owner_id: str
+    lease_duration: timedelta = field(repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            clients = MappingProxyType(
+                dict(sorted(dict(self.provider_clients).items()))
+            )
+        except Exception:
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
+            )
+        if (
+            not isinstance(self.coordinator, ProviderRequestCoordinator)
+            or not isinstance(self.subrequest_cache, ProviderSubrequestCache)
+            or not isinstance(self.artifact_store, ProviderSubrequestArtifactStore)
+            or not callable(self.now)
+            or not callable(self.sleep)
+            or not _safe_source_token(self.owner_id)
+            or not isinstance(self.lease_duration, timedelta)
+            or self.lease_duration <= timedelta(0)
+            or any(
+                not _safe_source_token(provider_id) or client is None
+                for provider_id, client in clients.items()
+            )
+        ):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
+            )
+        object.__setattr__(self, "provider_clients", clients)
+
+    def __repr__(self) -> str:
+        provider_ids = tuple(self.provider_clients)
+        return (
+            "ProductionQualifiedRoutingRunDependencies("
+            f"owner_id={self.owner_id!r}, provider_ids={provider_ids!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedBoundSource:
+    """One external physical operation bound to the run cache and coordinator."""
+
+    physical_provider_id: str
+    physical_request: Callable[[object], bytes] = field(repr=False, compare=False)
+    response_decoder: Callable[[object, bytes], object] = field(
+        repr=False,
+        compare=False,
+    )
+    normalizer_version: str
+    max_physical_attempts: int
+    coordinator: ProviderRequestCoordinator = field(repr=False, compare=False)
+    subrequest_cache: ProviderSubrequestCache = field(repr=False, compare=False)
+    artifact_store: ProviderSubrequestArtifactStore = field(repr=False, compare=False)
+    adapter: object = field(repr=False, compare=False)
+    now: Callable[[], datetime] = field(repr=False, compare=False)
+    sleep: Callable[[float], None] = field(repr=False, compare=False)
+    owner_id: str = field(repr=False)
+    lease_duration: timedelta = field(repr=False)
+
+    @classmethod
+    def bind(
+        cls,
+        *,
+        dependencies: ProductionQualifiedRoutingRunDependencies,
+        physical_provider_id: str,
+        physical_request: Callable[[object], bytes],
+        response_decoder: Callable[[object, bytes], object],
+        adapter: object,
+        normalizer_version: str,
+        max_physical_attempts: int = 1,
+    ) -> ProductionQualifiedBoundSource:
+        return cls(
+            physical_provider_id=physical_provider_id,
+            physical_request=physical_request,
+            response_decoder=response_decoder,
+            normalizer_version=normalizer_version,
+            max_physical_attempts=max_physical_attempts,
+            coordinator=dependencies.coordinator,
+            subrequest_cache=dependencies.subrequest_cache,
+            artifact_store=dependencies.artifact_store,
+            adapter=adapter,
+            now=dependencies.now,
+            sleep=dependencies.sleep,
+            owner_id=dependencies.owner_id,
+            lease_duration=dependencies.lease_duration,
+        )
+
+    def __post_init__(self) -> None:
+        if (
+            not _safe_source_token(self.physical_provider_id)
+            or not callable(self.physical_request)
+            or not callable(self.response_decoder)
+            or not _safe_source_token(self.normalizer_version)
+            or not isinstance(self.max_physical_attempts, int)
+            or isinstance(self.max_physical_attempts, bool)
+            or not 1 <= self.max_physical_attempts <= 10
+            or self.adapter is None
+            or not isinstance(self.coordinator, ProviderRequestCoordinator)
+            or not isinstance(self.subrequest_cache, ProviderSubrequestCache)
+            or not isinstance(self.artifact_store, ProviderSubrequestArtifactStore)
+            or not callable(self.now)
+            or not callable(self.sleep)
+            or not _safe_source_token(self.owner_id)
+            or not isinstance(self.lease_duration, timedelta)
+            or self.lease_duration <= timedelta(0)
+            or not self.subrequest_cache.is_bound_to(
+                coordinator=self.coordinator,
+                artifact_store=self.artifact_store,
+            )
+        ):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+
+    def is_bound_to(
+        self,
+        dependencies: ProductionQualifiedRoutingRunDependencies,
+    ) -> bool:
+        return (
+            self.coordinator is dependencies.coordinator
+            and self.subrequest_cache is dependencies.subrequest_cache
+            and self.artifact_store is dependencies.artifact_store
+            and self.now is dependencies.now
+            and self.sleep is dependencies.sleep
+            and self.owner_id == dependencies.owner_id
+            and self.lease_duration == dependencies.lease_duration
+            and (
+                self.physical_provider_id in dependencies.provider_clients
+                or self.physical_provider_id == "akshare_sina"
+                and "akshare" in dependencies.provider_clients
+            )
+        )
+
+    def __repr__(self) -> str:
+        return (
+            "ProductionQualifiedBoundSource("
+            f"physical_provider_id={self.physical_provider_id!r}, "
+            "run_authority_bound=True)"
+        )
+
+
+class ProductionQualifiedSourceUnavailableError(RuntimeError):
+    """Carry one already-sanitized typed source outcome across an adapter seam."""
+
+    def __init__(
+        self,
+        response: FinancialProviderPeriodResponse
+        | FinancialCapabilityProviderResponse,
+    ) -> None:
+        if (
+            not isinstance(
+                response,
+                (FinancialProviderPeriodResponse, FinancialCapabilityProviderResponse),
+            )
+            or response.kind.value != "unavailable"
+            or any(
+                not _safe_source_token(identity)
+                for identity in (
+                    *response.subrequest_keys,
+                    *response.physical_attempt_ids,
+                )
+            )
+        ):
+            raise ValueError(
+                "qualified provider source failure response is invalid"
+            ) from None
+        self.response = response
+        super().__init__("qualified_provider_source_unavailable")
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedSourceBinding:
+    """Immutable safe identity plus one hidden executable source function."""
+
+    provider_id: str
+    endpoint_id: str
+    source_kind: ProductionQualifiedSourceKind
+    capabilities: tuple[MainlandCapability, ...]
+    source: Callable[[object], object] = field(repr=False, compare=False)
+    coordinator: ProviderRequestCoordinator = field(repr=False, compare=False)
+    subrequest_cache: ProviderSubrequestCache = field(repr=False, compare=False)
+    artifact_store: ProviderSubrequestArtifactStore = field(repr=False, compare=False)
+    adapter: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        canonical = tuple(
+            capability
+            for capability in MainlandCapability
+            if capability in self.capabilities
+        )
+        if (
+            not _safe_source_token(self.provider_id)
+            or not _safe_source_token(self.endpoint_id)
+            or not isinstance(self.source_kind, ProductionQualifiedSourceKind)
+            or not self.capabilities
+            or self.capabilities != canonical
+            or len(self.capabilities) != len(set(self.capabilities))
+            or any(
+                not _source_kind_accepts(self.source_kind, capability)
+                for capability in self.capabilities
+            )
+            or not callable(self.source)
+            or self.adapter is None
+            or not self.subrequest_cache.is_bound_to(
+                coordinator=self.coordinator,
+                artifact_store=self.artifact_store,
+            )
+        ):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+
+    @property
+    def binding_id(self) -> str:
+        capability_id = ".".join(capability.value for capability in self.capabilities)
+        return (
+            f"{self.source_kind.value}:{capability_id}:"
+            f"{self.provider_id}:{self.endpoint_id}"
+        )
+
+    def __repr__(self) -> str:
+        return f"ProductionQualifiedSourceBinding(binding_id={self.binding_id!r})"
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedProviderSourceComposition:
+    """Immutable plan-bound topology for the existing qualified router."""
+
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint = field(
+        repr=False,
+        compare=False,
+    )
+    dependencies: ProductionQualifiedRoutingRunDependencies = field(
+        repr=False,
+        compare=False,
+    )
+    bindings: tuple[ProductionQualifiedSourceBinding, ...]
+    router: MainlandFinancialCapabilityRouter = field(repr=False, compare=False)
+    statement_source_ids: tuple[str, ...]
+    indicator_source_ids: tuple[str, ...]
+    capability_source_ids: tuple[tuple[MainlandCapability, tuple[str, ...]], ...]
+
+    @property
+    def source_binding_ids(self) -> tuple[str, ...]:
+        return tuple(binding.binding_id for binding in self.bindings)
+
+    def __repr__(self) -> str:
+        return (
+            "ProductionQualifiedProviderSourceComposition("
+            f"blueprint_identity={self.blueprint.blueprint_identity!r}, "
+            f"source_binding_ids={self.source_binding_ids!r})"
+        )
 
 
 def _canonical_digest(payload: Mapping[str, Any]) -> str:
@@ -807,12 +1230,999 @@ def build_production_qualified_routing_composition_blueprint(
     return blueprint
 
 
+def _internal_source_endpoint(
+    capability: MainlandCapability,
+    provider_id: str,
+) -> tuple[ProductionQualifiedSourceKind, str] | None:
+    if capability in _STATEMENT_CAPABILITIES:
+        if provider_id == "tushare":
+            endpoint_id = {
+                MainlandCapability.BALANCE_SHEET: "balancesheet",
+                MainlandCapability.INCOME_STATEMENT: "income",
+                MainlandCapability.CASH_FLOW: "cashflow",
+            }[capability]
+            return ProductionQualifiedSourceKind.STATEMENT, endpoint_id
+        if provider_id == "akshare_sina":
+            return ProductionQualifiedSourceKind.STATEMENT, "stock_financial_report_sina"
+    if capability is MainlandCapability.FINANCIAL_INDICATORS:
+        if provider_id == "tushare":
+            return ProductionQualifiedSourceKind.INDICATOR, "fina_indicator"
+        if provider_id == "baostock_qualified_families":
+            return ProductionQualifiedSourceKind.INDICATOR, "qualified_ratio_families"
+    if capability is MainlandCapability.ADJUSTMENT_FACTORS:
+        if provider_id == "baostock":
+            return ProductionQualifiedSourceKind.CAPABILITY, "provider_history_bundle"
+        if provider_id == "tushare":
+            return ProductionQualifiedSourceKind.CAPABILITY, "adj_factor"
+    if capability is MainlandCapability.SUSPENSION_STATUS and provider_id == "baostock":
+        return ProductionQualifiedSourceKind.CAPABILITY, "session_status"
+    if capability is MainlandCapability.NAME_EVENTS and provider_id == "tushare":
+        return ProductionQualifiedSourceKind.CAPABILITY, "namechange"
+    if capability is MainlandCapability.ISSUER_LIFECYCLE and provider_id == "baostock":
+        return ProductionQualifiedSourceKind.CAPABILITY, "issuer_lifecycle"
+    return None
+
+
+def _statement_capability(statement_type: FinancialStatementType) -> MainlandCapability:
+    return {
+        FinancialStatementType.BALANCE_SHEET: MainlandCapability.BALANCE_SHEET,
+        FinancialStatementType.INCOME_STATEMENT: MainlandCapability.INCOME_STATEMENT,
+        FinancialStatementType.CASH_FLOW: MainlandCapability.CASH_FLOW,
+    }[statement_type]
+
+
+def _statement_adapter_source(
+    *,
+    provider_id: Literal["tushare", "akshare_sina"],
+    adapter: TushareStatementAdapter | AkshareSinaStatementAdapter,
+) -> FinancialPeriodSource:
+    def source(request: FinancialProviderGapRequest):
+        if request.provider_id != provider_id:
+            raise ValueError("statement source request provider mismatch")
+        period_ends = (
+            *request.missing_annual_period_ends,
+            *request.missing_reporting_period_ends,
+            *request.conflicted_annual_period_ends,
+            *request.conflicted_reporting_period_ends,
+        )
+        if not period_ends:
+            raise ValueError("statement source requires an unresolved period")
+        if request.statement_type is FinancialStatementType.BALANCE_SHEET:
+            result = adapter.acquire_balance_sheet(
+                instrument_identity=request.instrument_identity,
+                range_start=min(period_ends),
+                as_of_date=request.as_of_date,
+            )
+        elif request.statement_type is FinancialStatementType.INCOME_STATEMENT:
+            result = adapter.acquire_income_statement(
+                instrument_identity=request.instrument_identity,
+                range_start=min(period_ends),
+                as_of_date=request.as_of_date,
+            )
+        else:
+            result = adapter.acquire_cash_flow(
+                instrument_identity=request.instrument_identity,
+                range_start=min(period_ends),
+                as_of_date=request.as_of_date,
+            )
+        return financial_period_response_from_statement_adapter(
+            provider_id=provider_id,
+            result=result,
+        )
+
+    return source
+
+
+def _tushare_indicator_source(
+    adapter: TushareFinancialIndicatorAdapter,
+) -> FinancialIndicatorSource:
+    def source(request: FinancialIndicatorProviderGapRequest):
+        if request.provider_id != "tushare":
+            raise ValueError("indicator source request provider mismatch")
+        period_ends = tuple(
+            period
+            for _family, periods in request.missing_periods_by_family
+            for period in periods
+        )
+        if not period_ends:
+            raise ValueError("indicator source requires an unresolved period")
+        if request.company_type_resolution is None:
+            return FinancialProviderPeriodResponse.unavailable(
+                provider_id="tushare",
+                reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+            )
+        result = adapter.acquire_financial_indicators(
+            instrument_identity=request.instrument_identity,
+            company_type_resolution=request.company_type_resolution,
+            range_start=min(period_ends),
+            as_of_date=request.as_of_date,
+            eligible_reporting_period_ends=tuple(
+                sorted(set(period_ends), reverse=True)
+            ),
+        )
+        return financial_period_response_from_indicator_adapter(
+            provider_id="tushare",
+            result=result,
+        )
+
+    return source
+
+
+def _quarter(period_end: date) -> int:
+    quarter_by_month = {3: 1, 6: 2, 9: 3, 12: 4}
+    quarter = quarter_by_month.get(period_end.month)
+    if (
+        quarter is None
+        or period_end.day != monthrange(period_end.year, period_end.month)[1]
+    ):
+        raise ValueError("BaoStock ratio target is not a reporting quarter end")
+    return quarter
+
+
+def _baostock_ratio_source(
+    adapter: BaoStockRatioFamilyAdapter,
+) -> FinancialIndicatorSource:
+    def source(request: FinancialIndicatorProviderGapRequest):
+        if request.provider_id != "baostock_qualified_families":
+            raise ValueError("indicator source request provider mismatch")
+        methods = {
+            FinancialRatioFamily.PROFIT: adapter.acquire_profit,
+            FinancialRatioFamily.OPERATION: adapter.acquire_operation,
+            FinancialRatioFamily.GROWTH: adapter.acquire_growth,
+            FinancialRatioFamily.BALANCE: adapter.acquire_balance_ratios,
+            FinancialRatioFamily.CASH_FLOW: adapter.acquire_cash_flow_ratios,
+            FinancialRatioFamily.DUPONT: adapter.acquire_dupont,
+        }
+        company_type_resolution = request.company_type_resolution
+        if company_type_resolution is None:
+            return FinancialProviderPeriodResponse.unavailable(
+                provider_id="baostock_qualified_families",
+                reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+            )
+        results = tuple(
+            methods[family](
+                instrument_identity=request.instrument_identity,
+                company_type_resolution=company_type_resolution,
+                year=period_end.year,
+                quarter=_quarter(period_end),
+                as_of_date=request.as_of_date,
+            )
+            for family, period_ends in request.missing_periods_by_family
+            for period_end in period_ends
+        )
+        eligible_periods = tuple(
+            sorted(
+                {
+                    period_end
+                    for _family, period_ends in request.missing_periods_by_family
+                    for period_end in period_ends
+                },
+                reverse=True,
+            )
+        )
+        aggregate = assess_baostock_ratio_family_results(
+            instrument_identity=request.instrument_identity,
+            company_type=request.company_type,
+            consolidation_scope=request.consolidation_scope,
+            currency=request.currency,
+            results=results,
+            eligible_reporting_period_ends=eligible_periods,
+        )
+        return financial_period_response_from_indicator_adapter(
+            provider_id="baostock_qualified_families",
+            result=aggregate,
+        )
+
+    return source
+
+
+def _adapter_unavailable_reason(outcome: object) -> AcquisitionUnavailableReason:
+    value = str(getattr(getattr(outcome, "kind", None), "value", "provider_error"))
+    return {
+        "permission_denied": AcquisitionUnavailableReason.PERMISSION_DENIED,
+        "rate_limited": AcquisitionUnavailableReason.RATE_LIMITED,
+        "authentication": AcquisitionUnavailableReason.AUTHENTICATION,
+        "empty": AcquisitionUnavailableReason.EMPTY_FRAME,
+        "malformed": AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+        "timeout": AcquisitionUnavailableReason.TIMEOUT,
+        "disconnect": AcquisitionUnavailableReason.DISCONNECT,
+        "upstream_busy": AcquisitionUnavailableReason.UPSTREAM_BUSY,
+    }.get(value, AcquisitionUnavailableReason.PROVIDER_ERROR)
+
+
+def _attempt_ids(results: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(event.attempt_event_id)
+            for result in results
+            if result is not None
+            for event in getattr(result, "attempt_events", ())
+        )
+    )
+
+
+def _artifact_ids(results: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(artifact.artifact_identity)
+            for result in results
+            if result is not None
+            for artifact in (getattr(result, "artifact", None),)
+            if artifact is not None
+        )
+    )
+
+
+def _subrequest_keys(results: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(key)
+            for result in results
+            if result is not None
+            for key in (getattr(result, "subrequest_key", None),)
+            if key is not None
+        )
+    )
+
+
+def _capability_adapter_response(
+    *,
+    provider_id: str,
+    capability: MainlandCapability,
+    result: object,
+    current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown",
+) -> FinancialCapabilityProviderResponse:
+    results = (result,)
+    artifact_ids = _artifact_ids(results)
+    candidates = tuple(getattr(result, "candidates", ()))
+    common = {
+        "provider_id": provider_id,
+        "capability": capability,
+        "subrequest_keys": _subrequest_keys(results),
+        "physical_attempt_ids": _attempt_ids(results),
+    }
+    if artifact_ids and (candidates or current_tradeability != "unknown"):
+        return FinancialCapabilityProviderResponse.available(
+            **common,
+            retained_artifact_identities=artifact_ids,
+            candidate_count=len(candidates),
+            current_tradeability=current_tradeability,
+        )
+    if artifact_ids:
+        return FinancialCapabilityProviderResponse.rejected(
+            **common,
+            retained_artifact_identities=artifact_ids,
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
+    return FinancialCapabilityProviderResponse.unavailable(
+        **common,
+        reason=_adapter_unavailable_reason(getattr(result, "outcome", None)),
+    )
+
+
+def _baostock_factor_source(
+    adapter: BaoStockCapabilityAdapter,
+) -> FinancialCapabilitySource:
+    def source(request):
+        bundle = adapter.acquire_provider_history_bundle(
+            instrument_identity=request.instrument_identity,
+            range_start=request.range_start,
+            as_of_date=request.as_of_date,
+        )
+        results = tuple(
+            result
+            for result in (bundle.raw, bundle.factors, bundle.statuses)
+            if result is not None
+        )
+        artifact_ids = _artifact_ids(results)
+        common = {
+            "provider_id": "baostock",
+            "capability": MainlandCapability.ADJUSTMENT_FACTORS,
+            "subrequest_keys": _subrequest_keys(results),
+            "physical_attempt_ids": _attempt_ids(results),
+        }
+        if bundle.provider_history_bundle_identity is not None:
+            assert len(artifact_ids) == 3
+            assert bundle.factors is not None
+            return FinancialCapabilityProviderResponse.available(
+                **common,
+                retained_artifact_identities=artifact_ids,
+                candidate_count=len(bundle.factors.candidates),
+                provider_history_bundle_identity=(
+                    bundle.provider_history_bundle_identity
+                ),
+                strict_bundle_component_artifact_identities=artifact_ids,
+            )
+        if artifact_ids:
+            return FinancialCapabilityProviderResponse.rejected(
+                **common,
+                retained_artifact_identities=artifact_ids,
+                reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
+            )
+        first = results[0] if results else None
+        return FinancialCapabilityProviderResponse.unavailable(
+            **common,
+            reason=_adapter_unavailable_reason(getattr(first, "outcome", None)),
+        )
+
+    return source
+
+
+def _baostock_status_source(
+    adapter: BaoStockCapabilityAdapter,
+) -> FinancialCapabilitySource:
+    def source(request):
+        result = adapter.acquire_session_status(
+            instrument_identity=request.instrument_identity,
+            range_start=request.range_start,
+            as_of_date=request.as_of_date,
+        )
+        return _capability_adapter_response(
+            provider_id="baostock",
+            capability=MainlandCapability.SUSPENSION_STATUS,
+            result=result,
+            current_tradeability=result.current_tradeability.value,
+        )
+
+    return source
+
+
+def _baostock_lifecycle_source(
+    adapter: BaoStockCapabilityAdapter,
+) -> FinancialCapabilitySource:
+    def source(request):
+        result = adapter.acquire_lifecycle(
+            instrument_identity=request.instrument_identity,
+            as_of_date=request.as_of_date,
+        )
+        return _capability_adapter_response(
+            provider_id="baostock",
+            capability=MainlandCapability.ISSUER_LIFECYCLE,
+            result=result,
+        )
+
+    return source
+
+
+def _tushare_factor_source(
+    adapter: TushareAdjustmentFactorAdapter,
+) -> FinancialCapabilitySource:
+    def source(request):
+        result = adapter.acquire_adjustment_factors(
+            instrument_identity=request.instrument_identity,
+            range_start=request.range_start,
+            as_of_date=request.as_of_date,
+        )
+        return _capability_adapter_response(
+            provider_id="tushare",
+            capability=MainlandCapability.ADJUSTMENT_FACTORS,
+            result=result,
+        )
+
+    return source
+
+
+def _tushare_name_source(
+    adapter: TushareNameEventAdapter,
+) -> FinancialCapabilitySource:
+    def source(request):
+        result = adapter.acquire_name_events(
+            instrument_identity=request.instrument_identity,
+            range_start=request.range_start,
+            as_of_date=request.as_of_date,
+        )
+        return _capability_adapter_response(
+            provider_id="tushare",
+            capability=MainlandCapability.NAME_EVENTS,
+            result=result,
+        )
+
+    return source
+
+
+def _build_internal_adapter(
+    *,
+    capability: MainlandCapability,
+    provider_id: str,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    dependencies: ProductionQualifiedRoutingRunDependencies,
+    adapter_cache: dict[str, object],
+) -> tuple[object, Callable[[object], object]]:
+    common = {
+        "routing_plan": blueprint.routing_plan,
+        "subrequest_cache": dependencies.subrequest_cache,
+        "owner_id": dependencies.owner_id,
+        "now": dependencies.now,
+        "sleep": dependencies.sleep,
+        "lease_duration": dependencies.lease_duration,
+    }
+    if capability in _STATEMENT_CAPABILITIES and provider_id == "tushare":
+        adapter = adapter_cache.get("tushare_statements")
+        if adapter is None:
+            adapter = TushareStatementAdapter(
+                **common,
+                sdk_client=dependencies.provider_clients["tushare"],
+            )
+            adapter_cache["tushare_statements"] = adapter
+        return adapter, _statement_adapter_source(
+            provider_id="tushare",
+            adapter=adapter,  # type: ignore[arg-type]
+        )
+    if capability in _STATEMENT_CAPABILITIES and provider_id == "akshare_sina":
+        adapter = adapter_cache.get("akshare_sina_statements")
+        if adapter is None:
+            adapter = AkshareSinaStatementAdapter(
+                **common,
+                sdk_client=dependencies.provider_clients["akshare"],
+            )
+            adapter_cache["akshare_sina_statements"] = adapter
+        return adapter, _statement_adapter_source(
+            provider_id="akshare_sina",
+            adapter=adapter,  # type: ignore[arg-type]
+        )
+    if capability is MainlandCapability.FINANCIAL_INDICATORS and provider_id == "tushare":
+        adapter = adapter_cache.get("tushare_indicators")
+        if adapter is None:
+            adapter = TushareFinancialIndicatorAdapter(
+                **common,
+                sdk_client=dependencies.provider_clients["tushare"],
+            )
+            adapter_cache["tushare_indicators"] = adapter
+        return adapter, _tushare_indicator_source(adapter)  # type: ignore[arg-type]
+    if (
+        capability is MainlandCapability.FINANCIAL_INDICATORS
+        and provider_id == "baostock_qualified_families"
+    ):
+        adapter = adapter_cache.get("baostock_ratios")
+        if adapter is None:
+            adapter = BaoStockRatioFamilyAdapter(
+                **common,
+                transport=dependencies.provider_clients["baostock"],
+                data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+            )
+            adapter_cache["baostock_ratios"] = adapter
+        return adapter, _baostock_ratio_source(adapter)  # type: ignore[arg-type]
+    if provider_id == "baostock":
+        adapter = adapter_cache.get("baostock_capabilities")
+        if adapter is None:
+            adapter = BaoStockCapabilityAdapter(
+                **common,
+                transport=dependencies.provider_clients["baostock"],
+            )
+            adapter_cache["baostock_capabilities"] = adapter
+        if capability is MainlandCapability.ADJUSTMENT_FACTORS:
+            source = _baostock_factor_source(adapter)  # type: ignore[arg-type]
+        elif capability is MainlandCapability.SUSPENSION_STATUS:
+            source = _baostock_status_source(adapter)  # type: ignore[arg-type]
+        else:
+            source = _baostock_lifecycle_source(adapter)  # type: ignore[arg-type]
+        return adapter, source
+    if capability is MainlandCapability.ADJUSTMENT_FACTORS and provider_id == "tushare":
+        adapter = adapter_cache.get("tushare_factors")
+        if adapter is None:
+            adapter = TushareAdjustmentFactorAdapter(
+                **common,
+                sdk_client=dependencies.provider_clients["tushare"],
+            )
+            adapter_cache["tushare_factors"] = adapter
+        return adapter, _tushare_factor_source(adapter)  # type: ignore[arg-type]
+    if capability is MainlandCapability.NAME_EVENTS and provider_id == "tushare":
+        adapter = adapter_cache.get("tushare_names")
+        if adapter is None:
+            adapter = TushareNameEventAdapter(
+                **common,
+                sdk_client=dependencies.provider_clients["tushare"],
+            )
+            adapter_cache["tushare_names"] = adapter
+        return adapter, _tushare_name_source(adapter)  # type: ignore[arg-type]
+    _fail(
+        MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+    )
+
+
+def _validate_run_dependencies(
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    dependencies: ProductionQualifiedRoutingRunDependencies,
+) -> None:
+    if (
+        not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint)
+        or not isinstance(dependencies, ProductionQualifiedRoutingRunDependencies)
+        or tuple(dependencies.provider_clients)
+        != blueprint.factory_contract.dependency_ids
+        or not dependencies.subrequest_cache.is_bound_to(
+            coordinator=dependencies.coordinator,
+            artifact_store=dependencies.artifact_store,
+        )
+    ):
+        _fail(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
+        )
+
+
+def _external_request_material(
+    registration: ProductionQualifiedSourceRegistration,
+    request: object,
+) -> tuple[object, date, date, tuple[str, ...]]:
+    if registration.source_kind is ProductionQualifiedSourceKind.STATEMENT:
+        if not isinstance(request, FinancialProviderGapRequest):
+            raise ValueError("qualified statement source request is invalid")
+        capability = _statement_capability(request.statement_type)
+        periods = tuple(
+            sorted(
+                {
+                    *request.missing_annual_period_ends,
+                    *request.missing_reporting_period_ends,
+                    *request.conflicted_annual_period_ends,
+                    *request.conflicted_reporting_period_ends,
+                }
+            )
+        )
+        if not periods:
+            raise ValueError("qualified statement source requires an unresolved period")
+        fields = (
+            f"capability:{capability.value}",
+            f"statement:{request.statement_type.value}",
+            *(f"period:{period.isoformat()}" for period in periods),
+        )
+        return request.instrument_identity, periods[0], request.as_of_date, fields
+    if registration.source_kind is ProductionQualifiedSourceKind.INDICATOR:
+        if not isinstance(request, FinancialIndicatorProviderGapRequest):
+            raise ValueError("qualified indicator source request is invalid")
+        targets = tuple(
+            (family, period)
+            for family, periods in request.missing_periods_by_family
+            for period in periods
+        )
+        if not targets:
+            raise ValueError("qualified indicator source requires an unresolved period")
+        periods = tuple(period for _family, period in targets)
+        fields = (
+            f"capability:{MainlandCapability.FINANCIAL_INDICATORS.value}",
+            *(f"target:{family.value}:{period.isoformat()}" for family, period in targets),
+        )
+        return request.instrument_identity, min(periods), request.as_of_date, fields
+    if not isinstance(request, FinancialCapabilityRoutingRequest):
+        raise ValueError("qualified capability source request is invalid")
+    fields = (f"capability:{request.capability.value}",)
+    return request.instrument_identity, request.range_start, request.as_of_date, fields
+
+
+def _external_subrequest_key(
+    *,
+    registration: ProductionQualifiedSourceRegistration,
+    bound_source: ProductionQualifiedBoundSource,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    request: object,
+) -> ProviderSubrequestKey:
+    instrument_identity, range_start, range_end, requested_fields = (
+        _external_request_material(registration, request)
+    )
+    upstream_service_id, _service_name = upstream_service_identity_for_provider(
+        bound_source.physical_provider_id
+    )
+    return ProviderSubrequestKey.create(
+        provider_id=bound_source.physical_provider_id,
+        upstream_service_id=upstream_service_id,
+        account_scope="public",
+        capacity_scope=registration.endpoint_id,
+        instrument_identity=instrument_identity,
+        requested_range_start=range_start.isoformat(),
+        requested_range_end=range_end.isoformat(),
+        requested_fields=requested_fields,
+        as_of_date=range_end,
+        qualification_profile=blueprint.routing_plan.qualification_profile,
+        normalizer_version=bound_source.normalizer_version,
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+
+
+def _external_unavailable_response(
+    registration: ProductionQualifiedSourceRegistration,
+    request: object,
+    *,
+    reason: AcquisitionUnavailableReason,
+    subrequest_keys: tuple[str, ...] = (),
+    physical_attempt_ids: tuple[str, ...] = (),
+    physical_attempt_events: tuple[object, ...] = (),
+):
+    if registration.source_kind in {
+        ProductionQualifiedSourceKind.STATEMENT,
+        ProductionQualifiedSourceKind.INDICATOR,
+    }:
+        return FinancialProviderPeriodResponse.unavailable(
+            provider_id=registration.provider_id,
+            reason=reason,
+            subrequest_keys=subrequest_keys,
+            physical_attempt_ids=physical_attempt_ids,
+            physical_attempt_events=physical_attempt_events,
+        )
+    capability = getattr(request, "capability", None)
+    if capability not in registration.capabilities:
+        capability = registration.capabilities[0]
+    return FinancialCapabilityProviderResponse.unavailable(
+        provider_id=registration.provider_id,
+        capability=capability,
+        reason=reason,
+        subrequest_keys=subrequest_keys,
+        physical_attempt_ids=physical_attempt_ids,
+    )
+
+
+def _external_response_with_attempts(
+    *,
+    registration: ProductionQualifiedSourceRegistration,
+    request: object,
+    response: object,
+    result: ProviderSubrequestResult,
+):
+    subrequest_keys = (result.key.subrequest_key,)
+    attempt_ids = tuple(event.attempt_event_id for event in result.attempt_events)
+    if not isinstance(
+        response,
+        (FinancialProviderPeriodResponse, FinancialCapabilityProviderResponse),
+    ):
+        return _external_unavailable_response(
+            registration,
+            request,
+            reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE,
+            subrequest_keys=subrequest_keys,
+            physical_attempt_ids=attempt_ids,
+            physical_attempt_events=result.attempt_events,
+        )
+    payload = response.model_dump(mode="python")
+    payload["subrequest_keys"] = subrequest_keys
+    payload["physical_attempt_ids"] = attempt_ids
+    if isinstance(response, FinancialProviderPeriodResponse):
+        payload["physical_attempt_events"] = result.attempt_events
+        payload["subrequest_outcomes"] = ()
+        return FinancialProviderPeriodResponse.model_validate(payload)
+    return FinancialCapabilityProviderResponse.model_validate(payload)
+
+
+def _execute_external_source(
+    *,
+    registration: ProductionQualifiedSourceRegistration,
+    bound_source: ProductionQualifiedBoundSource,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    request: object,
+):
+    key = _external_subrequest_key(
+        registration=registration,
+        bound_source=bound_source,
+        blueprint=blueprint,
+        request=request,
+    )
+    result = bound_source.subrequest_cache.execute(
+        key,
+        owner_id=bound_source.owner_id,
+        priority=RequestPriority.INTERACTIVE_MAINLAND,
+        now=bound_source.now,
+        sleep=bound_source.sleep,
+        lease_duration=bound_source.lease_duration,
+        max_physical_attempts=bound_source.max_physical_attempts,
+        operation=f"qualified_{registration.endpoint_id}",
+        media_type="application/json",
+        physical_request=lambda: bound_source.physical_request(request),
+    )
+    if result.value is None:
+        return _external_unavailable_response(
+            registration,
+            request,
+            reason=_adapter_unavailable_reason(result.outcome),
+            subrequest_keys=(result.key.subrequest_key,),
+            physical_attempt_ids=tuple(
+                event.attempt_event_id for event in result.attempt_events
+            ),
+            physical_attempt_events=result.attempt_events,
+        )
+    try:
+        response = bound_source.response_decoder(request, result.value)
+    except ProductionQualifiedSourceUnavailableError as failure:
+        response = failure.response
+    except Exception:
+        response = None
+    return _external_response_with_attempts(
+        registration=registration,
+        request=request,
+        response=response,
+        result=result,
+    )
+
+
+def _safe_external_source(
+    registration: ProductionQualifiedSourceRegistration,
+    bound_source: ProductionQualifiedBoundSource,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+) -> Callable[[object], object]:
+    def unavailable(request: object, response: object | None = None):
+        subrequest_keys = tuple(getattr(response, "subrequest_keys", ()))
+        physical_attempt_ids = tuple(getattr(response, "physical_attempt_ids", ()))
+        physical_attempt_events = tuple(
+            getattr(response, "physical_attempt_events", ())
+        )
+        return _external_unavailable_response(
+            registration,
+            request,
+            reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+            subrequest_keys=subrequest_keys,
+            physical_attempt_ids=physical_attempt_ids,
+            physical_attempt_events=physical_attempt_events,
+        )
+
+    def safe_source(request: object):
+        request_provider = getattr(request, "provider_id", registration.provider_id)
+        if registration.source_kind is ProductionQualifiedSourceKind.STATEMENT:
+            statement_type = getattr(request, "statement_type", None)
+            try:
+                request_capability = _statement_capability(statement_type)
+            except (KeyError, TypeError):
+                return unavailable(request)
+        elif registration.source_kind is ProductionQualifiedSourceKind.INDICATOR:
+            request_capability = MainlandCapability.FINANCIAL_INDICATORS
+        else:
+            request_capability = getattr(request, "capability", None)
+        if (
+            request_provider != registration.provider_id
+            or request_capability not in registration.capabilities
+        ):
+            return unavailable(request)
+        try:
+            response = _execute_external_source(
+                registration=registration,
+                bound_source=bound_source,
+                blueprint=blueprint,
+                request=request,
+            )
+        except Exception:
+            return unavailable(request)
+        if registration.source_kind in {
+            ProductionQualifiedSourceKind.STATEMENT,
+            ProductionQualifiedSourceKind.INDICATOR,
+        }:
+            if (
+                not isinstance(response, FinancialProviderPeriodResponse)
+                or response.provider_id != registration.provider_id
+            ):
+                return unavailable(request, response)
+            if (
+                registration.source_kind is ProductionQualifiedSourceKind.INDICATOR
+                and registration.provider_id == "yfinance"
+                and response.kind.value == "available"
+                and (
+                    not response.degraded_current_profile
+                    or bool(response.candidates)
+                )
+            ):
+                return unavailable(request, response)
+            return response
+        if (
+            not isinstance(response, FinancialCapabilityProviderResponse)
+            or response.provider_id != registration.provider_id
+            or response.capability is not request_capability
+        ):
+            return unavailable(request, response)
+        if (
+            registration.provider_id == "yfinance_derived"
+            and response.kind.value == "available"
+            and (not response.derived or not response.degraded)
+        ):
+            return unavailable(request, response)
+        return response
+
+    return safe_source
+
+
+def assemble_production_qualified_provider_sources(
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    dependencies: ProductionQualifiedRoutingRunDependencies,
+    source_registrations: tuple[ProductionQualifiedSourceRegistration, ...],
+) -> ProductionQualifiedProviderSourceComposition:
+    """Bind the plan's exact non-market routes without physical provider work."""
+
+    _validate_run_dependencies(blueprint, dependencies)
+    plan_pairs = tuple(
+        (route.capability, provider_id)
+        for route in blueprint.routing_plan.routes
+        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        for provider_id in route.providers
+    )
+    external_pairs = {
+        pair
+        for pair in plan_pairs
+        if _internal_source_endpoint(*pair) is None
+    }
+    registration_by_pair: dict[
+        tuple[MainlandCapability, str],
+        ProductionQualifiedSourceRegistration,
+    ] = {}
+    registration_ids: set[str] = set()
+    try:
+        registrations = tuple(source_registrations)
+    except Exception:
+        _fail(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+        )
+    for registration in registrations:
+        if not isinstance(registration, ProductionQualifiedSourceRegistration):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+            )
+        if registration.registration_id in registration_ids:
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+            )
+        registration_ids.add(registration.registration_id)
+        for capability in registration.capabilities:
+            pair = (capability, registration.provider_id)
+            if pair not in external_pairs or pair in registration_by_pair:
+                _fail(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+                )
+            registration_by_pair[pair] = registration
+    if set(registration_by_pair) != external_pairs:
+        _fail(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+        )
+
+    built_registration_sources: dict[
+        int,
+        tuple[Callable[[object], object], ProductionQualifiedBoundSource],
+    ] = {}
+    pair_sources: dict[tuple[MainlandCapability, str], Callable[[object], object]] = {}
+    bindings: list[ProductionQualifiedSourceBinding] = []
+    adapter_cache: dict[str, object] = {}
+    internal_binding_keys: set[tuple[MainlandCapability, str]] = set()
+    external_binding_ids: set[int] = set()
+    for capability, provider_id in plan_pairs:
+        internal = _internal_source_endpoint(capability, provider_id)
+        if internal is not None:
+            source_kind, endpoint_id = internal
+            adapter, source = _build_internal_adapter(
+                capability=capability,
+                provider_id=provider_id,
+                blueprint=blueprint,
+                dependencies=dependencies,
+                adapter_cache=adapter_cache,
+            )
+            pair_sources[(capability, provider_id)] = source
+            binding_key = (capability, provider_id)
+            if binding_key not in internal_binding_keys:
+                internal_binding_keys.add(binding_key)
+                bindings.append(
+                    ProductionQualifiedSourceBinding(
+                        provider_id=provider_id,
+                        endpoint_id=endpoint_id,
+                        source_kind=source_kind,
+                        capabilities=(capability,),
+                        source=source,
+                        coordinator=dependencies.coordinator,
+                        subrequest_cache=dependencies.subrequest_cache,
+                        artifact_store=dependencies.artifact_store,
+                        adapter=adapter,
+                    )
+                )
+            continue
+
+        registration = registration_by_pair[(capability, provider_id)]
+        registration_key = id(registration)
+        if registration_key not in built_registration_sources:
+            try:
+                bound_source = registration.source_factory(dependencies)
+            except Exception:
+                _fail(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+                )
+            if (
+                not isinstance(bound_source, ProductionQualifiedBoundSource)
+                or not bound_source.is_bound_to(dependencies)
+                or not _physical_provider_is_compatible(
+                    route_provider_id=registration.provider_id,
+                    physical_provider_id=bound_source.physical_provider_id,
+                )
+            ):
+                _fail(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+                )
+            built_registration_sources[registration_key] = (
+                _safe_external_source(registration, bound_source, blueprint),
+                bound_source,
+            )
+        source, bound_source = built_registration_sources[registration_key]
+        pair_sources[(capability, provider_id)] = source
+        if registration_key not in external_binding_ids:
+            external_binding_ids.add(registration_key)
+            bindings.append(
+                ProductionQualifiedSourceBinding(
+                    provider_id=registration.provider_id,
+                    endpoint_id=registration.endpoint_id,
+                    source_kind=registration.source_kind,
+                    capabilities=registration.capabilities,
+                    source=source,
+                    coordinator=dependencies.coordinator,
+                    subrequest_cache=dependencies.subrequest_cache,
+                    artifact_store=dependencies.artifact_store,
+                    adapter=bound_source.adapter,
+                )
+            )
+
+    statement_source_ids = blueprint.routing_plan.route_for(
+        MainlandCapability.BALANCE_SHEET
+    )
+
+    def statement_source(provider_id: str) -> FinancialPeriodSource:
+        def dispatch(request: FinancialProviderGapRequest):
+            capability = _statement_capability(request.statement_type)
+            return pair_sources[(capability, provider_id)](request)
+
+        return dispatch
+
+    statement_sources = MappingProxyType(
+        {
+            provider_id: statement_source(provider_id)
+            for provider_id in statement_source_ids
+        }
+    )
+    indicator_source_ids = blueprint.routing_plan.route_for(
+        MainlandCapability.FINANCIAL_INDICATORS
+    )
+    indicator_sources: Mapping[str, FinancialIndicatorSource] = MappingProxyType(
+        {
+            provider_id: pair_sources[
+                (MainlandCapability.FINANCIAL_INDICATORS, provider_id)
+            ]
+            for provider_id in indicator_source_ids
+        }
+    )
+    capability_source_ids = tuple(
+        (capability, blueprint.routing_plan.route_for(capability))
+        for capability in _ROUTABLE_CAPABILITIES
+    )
+    capability_sources: Mapping[
+        MainlandCapability,
+        Mapping[str, FinancialCapabilitySource],
+    ] = MappingProxyType(
+        {
+            capability: MappingProxyType(
+                {
+                    provider_id: pair_sources[(capability, provider_id)]
+                    for provider_id in provider_ids
+                }
+            )
+            for capability, provider_ids in capability_source_ids
+        }
+    )
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=blueprint.routing_plan,
+        statement_sources=statement_sources,
+        indicator_sources=indicator_sources,
+        capability_sources=capability_sources,
+    )
+    return ProductionQualifiedProviderSourceComposition(
+        blueprint=blueprint,
+        dependencies=dependencies,
+        bindings=tuple(bindings),
+        router=router,
+        statement_source_ids=statement_source_ids,
+        indicator_source_ids=indicator_source_ids,
+        capability_source_ids=capability_source_ids,
+    )
+
+
 __all__ = [
     "ManagedQualifiedRoutingComposition",
     "PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION",
     "PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION",
+    "ProductionQualifiedBoundSource",
     "ProductionQualifiedRoutingCompositionBlueprint",
     "ProductionQualifiedRoutingFactoryContract",
+    "ProductionQualifiedRoutingRunDependencies",
+    "ProductionQualifiedProviderSourceComposition",
+    "ProductionQualifiedSourceBinding",
+    "ProductionQualifiedSourceKind",
+    "ProductionQualifiedSourceRegistration",
+    "ProductionQualifiedSourceUnavailableError",
     "ProductionRuntimeRootIdentity",
+    "assemble_production_qualified_provider_sources",
     "build_production_qualified_routing_composition_blueprint",
 ]

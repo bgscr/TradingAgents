@@ -30,6 +30,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialAvailabilityScope,
     FinancialCapability,
     FinancialCompanyType,
+    FinancialCompanyTypeResolution,
     FinancialConsolidationScope,
     FinancialCriticalValueConflict,
     FinancialEvidenceDisposition,
@@ -526,6 +527,7 @@ class FinancialIndicatorProviderGapRequest(BaseModel):
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date
     company_type: FinancialCompanyType
+    company_type_resolution: FinancialCompanyTypeResolution | None = None
     consolidation_scope: FinancialConsolidationScope
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     missing_periods_by_family: tuple[
@@ -535,6 +537,11 @@ class FinancialIndicatorProviderGapRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_gaps(self) -> FinancialIndicatorProviderGapRequest:
+        if (
+            self.company_type_resolution is not None
+            and self.company_type_resolution.company_type is not self.company_type
+        ):
+            raise ValueError("indicator gap company-type resolution is inconsistent")
         family_order = tuple(FinancialRatioFamily)
         actual = tuple(family for family, _ in self.missing_periods_by_family)
         if actual != tuple(family for family in family_order if family in actual):
@@ -614,6 +621,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         "financial-indicator-routing-request-v2",
         "financial-indicator-routing-request-v3",
         "financial-indicator-routing-request-v4",
+        "financial-indicator-routing-request-v5",
     ] = (
         "financial-indicator-routing-request-v1"
     )
@@ -630,6 +638,10 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date
     company_type: FinancialCompanyType
+    company_type_resolution: FinancialCompanyTypeResolution | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     consolidation_scope: FinancialConsolidationScope
     currency: str = Field(pattern=r"^[A-Z]{3}$")
     ratio_families: tuple[FinancialRatioFamily, ...]
@@ -650,7 +662,13 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         canonical = tuple(
             family for family in FinancialRatioFamily if family in self.ratio_families
         )
-        family_bound = self.contract_version == "financial-indicator-routing-request-v4"
+        family_bound = self.contract_version in {
+            "financial-indicator-routing-request-v4",
+            "financial-indicator-routing-request-v5",
+        }
+        provenance_bound = (
+            self.contract_version == "financial-indicator-routing-request-v5"
+        )
         if not canonical or len(self.ratio_families) != len(canonical):
             raise ValueError("indicator families must be non-empty, unique, and canonical")
         if self.ratio_families != canonical:
@@ -661,12 +679,20 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             object.__setattr__(self, "ratio_families", canonical)
         if self.company_type is FinancialCompanyType.UNKNOWN:
             raise ValueError("indicator routing requires a resolved company type")
+        if provenance_bound != (self.company_type_resolution is not None):
+            raise ValueError("indicator company-type provenance is inconsistent")
+        if (
+            self.company_type_resolution is not None
+            and self.company_type_resolution.company_type is not self.company_type
+        ):
+            raise ValueError("indicator company-type resolution is inconsistent")
         if (self.listing_date is None) != (self.listing_provenance is None):
             raise ValueError("listing exception requires authoritative date and provenance")
         policy_bound = self.contract_version in {
             "financial-indicator-routing-request-v2",
             "financial-indicator-routing-request-v3",
             "financial-indicator-routing-request-v4",
+            "financial-indicator-routing-request-v5",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -684,6 +710,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             in {
                 "financial-indicator-routing-request-v3",
                 "financial-indicator-routing-request-v4",
+                "financial-indicator-routing-request-v5",
             }
         )
         if availability_bound and self.requested_analysis_scope is None:
@@ -2080,6 +2107,7 @@ class MainlandFinancialCapabilityRouter:
                 instrument_identity=request.instrument_identity,
                 as_of_date=request.as_of_date,
                 company_type=request.company_type,
+                company_type_resolution=request.company_type_resolution,
                 consolidation_scope=request.consolidation_scope,
                 currency=request.currency,
                 missing_periods_by_family=missing_by_family,
@@ -2509,7 +2537,10 @@ class MainlandFinancialCapabilityRouter:
 
         family_assessments: tuple[FinancialIndicatorFamilyAssessment, ...] = ()
         aggregate_family_assessment = None
-        if request.contract_version == "financial-indicator-routing-request-v4":
+        if request.contract_version in {
+            "financial-indicator-routing-request-v4",
+            "financial-indicator-routing-request-v5",
+        }:
             (
                 family_assessments,
                 aggregate_family_assessment,
@@ -2998,7 +3029,11 @@ def assess_financial_indicator_family_outcomes(
 
     requirements = request.family_evidence_requirements
     if (
-        request.contract_version != "financial-indicator-routing-request-v4"
+        request.contract_version
+        not in {
+            "financial-indicator-routing-request-v4",
+            "financial-indicator-routing-request-v5",
+        }
         or requirements is None
         or request.requested_analysis_scope is None
     ):

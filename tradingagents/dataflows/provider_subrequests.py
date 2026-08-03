@@ -526,6 +526,19 @@ class ProviderSubrequestCache:
         if checkpoint is not None:
             self._restore_checkpoint(checkpoint)
 
+    def is_bound_to(
+        self,
+        *,
+        coordinator: ProviderRequestCoordinator,
+        artifact_store: ProviderSubrequestArtifactStore,
+    ) -> bool:
+        """Report exact run-authority sharing without exposing local paths."""
+
+        return (
+            self._coordinator is coordinator
+            and self._artifact_store is artifact_store
+        )
+
     def checkpoint(self) -> dict[str, object]:
         entries: list[ProviderSubrequestCheckpointEntry] = []
         with self._lock:
@@ -606,10 +619,19 @@ class ProviderSubrequestCache:
         now: Callable[[], datetime],
         sleep: Callable[[float], None],
         lease_duration: timedelta,
+        max_physical_attempts: int = 1,
         operation: str,
         media_type: str,
         physical_request: Callable[[], bytes],
     ) -> ProviderSubrequestResult:
+        if (
+            not isinstance(max_physical_attempts, int)
+            or isinstance(max_physical_attempts, bool)
+            or max_physical_attempts < 1
+        ):
+            raise ProviderSubrequestCacheError(
+                ProviderSubrequestCacheFailureReason.EXECUTION_INVALID
+            )
         with self._lock:
             shared = self._results.get(key.subrequest_key)
             is_leader = shared is None
@@ -621,7 +643,16 @@ class ProviderSubrequestCache:
 
         try:
             def typed_physical_request() -> dict[str, object]:
-                value = physical_request()
+                try:
+                    value = physical_request()
+                except PhysicalAttemptFailure:
+                    raise
+                except Exception as exc:
+                    raise PhysicalAttemptFailure(
+                        outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+                        retryable=False,
+                        error_code="provider_error",
+                    ) from exc
                 if not isinstance(value, bytes):
                     raise PhysicalAttemptFailure(
                         outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
@@ -640,7 +671,7 @@ class ProviderSubrequestCache:
                 )
                 return artifact.model_dump(mode="json")
 
-            coordinated = self._coordinator.execute_direct_physical_request(
+            coordinated = self._coordinator.execute_retry_sequence(
                 request_key=key.subrequest_key,
                 upstream_service_id=key.upstream_service_id,
                 owner_id=owner_id,
@@ -648,9 +679,11 @@ class ProviderSubrequestCache:
                 now=now,
                 sleep=sleep,
                 lease_duration=lease_duration,
+                max_physical_attempts=max_physical_attempts,
                 operation=operation,
-                physical_request=typed_physical_request,
+                physical_attempt=lambda _attempt_index: typed_physical_request(),
                 cooldown_scope=key.capacity_scope,
+                _wait_for_initial_pacing=True,
             )
             artifact = ProviderSubrequestArtifactRef.model_validate(
                 coordinated.value
