@@ -5,7 +5,9 @@ import os
 import re
 import time
 from collections import deque
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext, suppress
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any
@@ -55,9 +57,12 @@ from tradingagents.asset_configuration import (
     resolve_run_asset_configuration,
 )
 from tradingagents.capability_routing import (
+    MainlandCapabilityRoutingDisposition,
     MainlandCapabilityRoutingFailure,
     MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingPlan,
+    MainlandCapabilityRoutingPreflightError,
+    TushareCapability,
     is_mainland_equity_configuration,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
@@ -83,6 +88,14 @@ from tradingagents.graph.evidence_gate import create_preflight_gate_node
 from tradingagents.graph.financial_tools import QualifiedFinancialRoutingComposition
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import CheckpointSession, TradingAgentsGraph
+from tradingagents.qualified_routing_composition import (
+    PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION,
+    RegisteredProductionQualifiedRoutingComposition,
+    build_production_qualified_routing_composition_blueprint,
+    build_registered_production_qualified_routing_composition,
+    production_qualified_routing_dependency_availability,
+    production_qualified_routing_provider_source_coverage,
+)
 from tradingagents.recorded_replay import (
     DEFAULT_RECORDED_FIXTURE_MANIFEST,
     load_recorded_run_fixtures,
@@ -148,6 +161,186 @@ _QUALIFIED_ROUTING_FACTORY_RE = re.compile(
 _QUALIFIED_ROUTING_FACTORY_CONFIG_KEY = (
     "_qualified_routing_composition_factory"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class QualifiedRoutingCompositionFactoryRegistration:
+    """One immutable host-owned built-in composition factory registration."""
+
+    identity: str
+    factory: Callable[..., object]
+
+
+BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY = (
+    QualifiedRoutingCompositionFactoryRegistration(
+        identity=PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION,
+        factory=build_registered_production_qualified_routing_composition,
+    )
+)
+
+_UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE = object()
+_UNSAFE_QUALIFIED_ROUTING_CONFIG_KEY_MARKERS = (
+    "credential",
+    "password",
+    "passwd",
+    "payload",
+    "raw_error",
+    "raw_provider_error",
+    "raw_exception",
+    "authorization",
+    "cookie",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+)
+
+
+def _unsafe_qualified_routing_config_key(key: object) -> bool:
+    try:
+        normalized_key = str(key).strip().casefold().replace("-", "_")
+    except Exception:
+        return True
+    return any(
+        marker in normalized_key
+        for marker in _UNSAFE_QUALIFIED_ROUTING_CONFIG_KEY_MARKERS
+    )
+
+
+def _safe_qualified_routing_config_value(
+    value: object,
+    *,
+    seen: frozenset[int] = frozenset(),
+) -> object:
+    if isinstance(value, BaseException | bytes | bytearray | memoryview):
+        return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+    if isinstance(value, str):
+        if (
+            ("?" in value and "://" in value)
+            or _ERROR_BEARER_TOKEN_RE.search(value) is not None
+        ):
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+        return value
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+        nested_seen = seen | {identity}
+        try:
+            items = tuple(value.items())
+        except Exception:
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+        projected: dict[object, object] = {}
+        for key, nested_value in items:
+            if _unsafe_qualified_routing_config_key(key):
+                continue
+            safe_value = _safe_qualified_routing_config_value(
+                nested_value,
+                seen=nested_seen,
+            )
+            if safe_value is not _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE:
+                projected[key] = safe_value
+        if items and not projected:
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+        return projected
+    if isinstance(value, (list, tuple, set, frozenset)):
+        identity = id(value)
+        if identity in seen:
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+        nested_seen = seen | {identity}
+        try:
+            projected_items = tuple(
+                safe_value
+                for item in value
+                for safe_value in (
+                    _safe_qualified_routing_config_value(item, seen=nested_seen),
+                )
+                if safe_value is not _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+            )
+            if isinstance(value, list):
+                return list(projected_items)
+            if isinstance(value, set):
+                return set(projected_items)
+            if isinstance(value, frozenset):
+                return frozenset(projected_items)
+            return projected_items
+        except Exception:
+            return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+    if value is None or isinstance(value, (bool, int, float, Path)):
+        return value
+    return _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE
+
+
+def _safe_qualified_routing_operator_config(
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Project operator configuration without references or unsafe material."""
+
+    safe_config: dict[str, Any] = {}
+    for key, value in config.items():
+        if (
+            key == _QUALIFIED_ROUTING_FACTORY_CONFIG_KEY
+            or _unsafe_qualified_routing_config_key(key)
+        ):
+            continue
+        safe_value = _safe_qualified_routing_config_value(value)
+        if safe_value is not _UNSAFE_QUALIFIED_ROUTING_CONFIG_VALUE:
+            safe_config[key] = safe_value
+    return safe_config
+
+
+def _qualified_routing_factory_failure(
+    reason: MainlandCapabilityRoutingFailureReason,
+) -> None:
+    raise MainlandCapabilityRoutingPreflightError(
+        mainland_capability_routing_failure(reason)
+    ) from None
+
+
+def _validate_qualified_routing_composition_output(
+    composition: object,
+    *,
+    plan: MainlandCapabilityRoutingPlan,
+    expected_blueprint: object | None = None,
+) -> object:
+    try:
+        if isinstance(
+            composition,
+            RegisteredProductionQualifiedRoutingComposition,
+        ):
+            valid = (
+                composition.blueprint.routing_plan.plan_signature
+                == plan.plan_signature
+                and composition.blueprint.enabled_capabilities
+                == plan.enabled_tushare_capabilities
+                and (
+                    expected_blueprint is None
+                    or composition.blueprint is expected_blueprint
+                )
+            )
+        elif isinstance(composition, QualifiedFinancialRoutingComposition):
+            enabled = set(plan.enabled_tushare_capabilities)
+            valid = (
+                composition.router.routing_plan.plan_signature
+                == plan.plan_signature
+                and (
+                    TushareCapability.STATEMENTS not in enabled
+                    or composition.statement_request_factory is not None
+                )
+                and (
+                    TushareCapability.FINANCIAL_INDICATORS not in enabled
+                    or composition.indicator_request_factory is not None
+                )
+            )
+        else:
+            valid = False
+    except Exception:
+        valid = False
+    if not valid:
+        _qualified_routing_factory_failure(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+        )
+    return composition
 _ERROR_SECRET_FIELD_RE = re.compile(
     r"(?<![\w-])"
     r"(?P<prefix>(?P<key_quote>[\"']?)(?:"
@@ -1751,7 +1944,12 @@ def build_qualified_financial_routing_composition(
     asset_configuration: Any,
     config: dict[str, Any],
     validation_workload: bool,
-) -> QualifiedFinancialRoutingComposition | None:
+    qualified_financial_routing: Any | None = None,
+) -> (
+    QualifiedFinancialRoutingComposition
+    | RegisteredProductionQualifiedRoutingComposition
+    | None
+):
     """Host integration seam for a plan-bound deterministic routing composition.
 
     Ticket 12 owns activation and authority boundaries. Provider transports remain
@@ -1759,25 +1957,90 @@ def build_qualified_financial_routing_composition(
     shadow traffic and tests never need live providers.
     """
 
+    if qualified_financial_routing is not None:
+        return _validate_qualified_routing_composition_output(
+            qualified_financial_routing,
+            plan=plan,
+        )
+
     factory_ref = config.get(_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY)
     if factory_ref is None:
-        return None
+        if plan.mode.value == "qualified_v1":
+            _qualified_routing_factory_failure(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
+            )
+        if (
+            plan.mode.value != "qualified_v1_shadow"
+            or validation_workload is not True
+            or not plan.enabled_tushare_capabilities
+        ):
+            return None
+        blueprint = build_production_qualified_routing_composition_blueprint(
+            plan=plan,
+            asset_configuration=asset_configuration,
+            financial_eligibility_binding=plan.financial_eligibility_binding,
+            config=config,
+            validation_workload=validation_workload,
+            disposition=(
+                MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
+            ),
+            environment=os.environ,
+            dependency_availability=(
+                production_qualified_routing_dependency_availability()
+            ),
+            provider_source_coverage=(
+                production_qualified_routing_provider_source_coverage(plan)
+            ),
+            factory_contract_version=(
+                BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.identity
+            ),
+        )
+        try:
+            composition = BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.factory(
+                blueprint=blueprint,
+            )
+        except MainlandCapabilityRoutingPreflightError:
+            raise
+        except Exception:
+            _qualified_routing_factory_failure(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+        return _validate_qualified_routing_composition_output(
+            composition,
+            plan=plan,
+            expected_blueprint=blueprint,
+        )
     if (
         not isinstance(factory_ref, str)
         or _QUALIFIED_ROUTING_FACTORY_RE.fullmatch(factory_ref) is None
     ):
         raise ValueError("qualified routing composition factory is invalid")
     module_name, attribute_name = factory_ref.split(":", 1)
-    factory = getattr(importlib.import_module(module_name), attribute_name, None)
+    try:
+        factory = getattr(importlib.import_module(module_name), attribute_name, None)
+    except Exception:
+        raise ValueError(
+            "qualified routing composition factory is unavailable"
+        ) from None
     if not callable(factory):
         raise ValueError("qualified routing composition factory is unavailable")
-    safe_config = dict(config)
-    safe_config.pop(_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY, None)
-    return factory(
+    safe_config = _safe_qualified_routing_operator_config(config)
+    try:
+        composition = factory(
+            plan=plan,
+            asset_configuration=asset_configuration,
+            config=safe_config,
+            validation_workload=validation_workload,
+        )
+    except MainlandCapabilityRoutingPreflightError:
+        raise
+    except Exception:
+        _qualified_routing_factory_failure(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+        )
+    return _validate_qualified_routing_composition_output(
+        composition,
         plan=plan,
-        asset_configuration=asset_configuration,
-        config=safe_config,
-        validation_workload=validation_workload,
     )
 
 
@@ -1862,24 +2125,35 @@ def run_analysis(
             mode == "qualified_v1"
             or (mode == "qualified_v1_shadow" and qualified_routing_validation)
         )
-        if needs_composition and qualified_financial_routing is None:
+        if needs_composition:
             composition_config = dict(config)
             if qualified_routing_composition_factory is not None:
                 composition_config[_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY] = (
                     qualified_routing_composition_factory
                 )
             try:
-                qualified_financial_routing = (
-                    build_qualified_financial_routing_composition(
-                        plan=capability_routing_plan,
-                        asset_configuration=asset_configuration,
-                        config=composition_config,
-                        validation_workload=qualified_routing_validation,
+                builder_inputs: dict[str, Any] = {
+                    "plan": capability_routing_plan,
+                    "asset_configuration": asset_configuration,
+                    "config": composition_config,
+                    "validation_workload": qualified_routing_validation,
+                }
+                if qualified_financial_routing is not None:
+                    builder_inputs["qualified_financial_routing"] = (
+                        qualified_financial_routing
                     )
+                qualified_financial_routing = (
+                    build_qualified_financial_routing_composition(**builder_inputs)
                 )
+            except MainlandCapabilityRoutingPreflightError as exc:
+                capability_routing_failure = exc.failure
+                qualified_financial_routing = None
             except Exception:  # noqa: BLE001 - typed, secret-free preflight boundary
                 qualified_financial_routing = None
-            if qualified_financial_routing is None:
+            if (
+                qualified_financial_routing is None
+                and capability_routing_failure is None
+            ):
                 capability_routing_failure = mainland_capability_routing_failure(
                     MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
                 )
@@ -1888,19 +2162,30 @@ def run_analysis(
             item.value
             for item in capability_routing_plan.enabled_tushare_capabilities
         }
-        try:
+        if isinstance(
+            qualified_financial_routing,
+            RegisteredProductionQualifiedRoutingComposition,
+        ):
             composition_incomplete = (
-                qualified_financial_routing.router.routing_plan.plan_signature
+                qualified_financial_routing.blueprint.routing_plan.plan_signature
                 != capability_routing_plan.plan_signature
-            ) or (
-                "statements" in enabled_values
-                and qualified_financial_routing.statement_request_factory is None
-            ) or (
-                "financial_indicators" in enabled_values
-                and qualified_financial_routing.indicator_request_factory is None
+                or qualified_financial_routing.blueprint.enabled_capabilities
+                != capability_routing_plan.enabled_tushare_capabilities
             )
-        except (AttributeError, TypeError, ValueError):
-            composition_incomplete = True
+        else:
+            try:
+                composition_incomplete = (
+                    qualified_financial_routing.router.routing_plan.plan_signature
+                    != capability_routing_plan.plan_signature
+                ) or (
+                    "statements" in enabled_values
+                    and qualified_financial_routing.statement_request_factory is None
+                ) or (
+                    "financial_indicators" in enabled_values
+                    and qualified_financial_routing.indicator_request_factory is None
+                )
+            except (AttributeError, TypeError, ValueError):
+                composition_incomplete = True
         if composition_incomplete:
             capability_routing_failure = mainland_capability_routing_failure(
                 MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING

@@ -6,6 +6,7 @@ checkpoint restoration, and runtime lifecycle ownership remain later factory pha
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -106,6 +107,17 @@ _SOURCE_SECRET_MARKERS = (
     "token",
 )
 _REQUIRED_DEPENDENCY_IDS = ("akshare", "baostock", "tushare", "yfinance")
+_PRODUCTION_PROVIDER_SOURCE_IDS = frozenset(
+    {
+        "akshare",
+        "akshare_sina",
+        "baostock",
+        "baostock_qualified_families",
+        "tushare",
+        "yfinance",
+        "yfinance_derived",
+    }
+)
 _CONFIG_FIELDS = (
     "mainland_capability_routing_mode",
     "mainland_capability_routing_plan_signature",
@@ -341,6 +353,87 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def interrupt(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredProductionQualifiedRoutingComposition:
+    """Resource-free result selected by the statically registered host factory."""
+
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.blueprint,
+            ProductionQualifiedRoutingCompositionBlueprint,
+        ):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+
+    @property
+    def factory_identity(self) -> str:
+        return self.blueprint.factory_contract_version
+
+    def bind_run(
+        self,
+        run_binding: ProductionQualifiedRoutingAssemblyBinding,
+    ) -> object:
+        """Delegate immutable source assembly without claiming resource ownership."""
+
+        if not isinstance(run_binding, ProductionQualifiedRoutingAssemblyBinding):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+        source_composition = assemble_production_qualified_provider_sources(
+            blueprint=self.blueprint,
+            dependencies=run_binding.dependencies,
+            source_registrations=run_binding.source_registrations,
+        )
+        from tradingagents.graph.financial_tools import (
+            QualifiedFinancialRoutingComposition,
+        )
+
+        try:
+            return QualifiedFinancialRoutingComposition(
+                router=source_composition.router,
+                statement_request_factory=run_binding.statement_request_factory,
+                indicator_request_factory=run_binding.indicator_request_factory,
+            )
+        except (AttributeError, TypeError, ValueError):
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedRoutingAssemblyBinding:
+    """Run-owned inputs consumed by Ticket 02 assembly at the binding seam."""
+
+    dependencies: object = field(repr=False, compare=False)
+    source_registrations: tuple[ProductionQualifiedSourceRegistration, ...]
+    statement_request_factory: Callable[[object], object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    indicator_request_factory: Callable[[object], object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+def build_registered_production_qualified_routing_composition(
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+) -> RegisteredProductionQualifiedRoutingComposition:
+    """Consume one validated blueprint without opening run-owned resources."""
+
+    if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
+        _fail(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+        )
+    return RegisteredProductionQualifiedRoutingComposition(blueprint=blueprint)
 
 
 class ProductionQualifiedSourceKind(str, Enum):
@@ -846,6 +939,26 @@ def _required_provider_source_ids(
         for provider in route.providers
     }
     return tuple(sorted(sources))
+
+
+def production_qualified_routing_dependency_availability() -> dict[str, bool]:
+    """Resolve the static production dependency inventory without importing it."""
+
+    return {
+        dependency: importlib.util.find_spec(dependency) is not None
+        for dependency in _REQUIRED_DEPENDENCY_IDS
+    }
+
+
+def production_qualified_routing_provider_source_coverage(
+    plan: MainlandCapabilityRoutingPlan,
+) -> dict[str, bool]:
+    """Project whether Ticket 02 covers every source named by the immutable plan."""
+
+    return {
+        source_id: source_id in _PRODUCTION_PROVIDER_SOURCE_IDS
+        for source_id in _required_provider_source_ids(plan)
+    }
 
 
 def _validated_root_paths(config: Mapping[str, Any]) -> tuple[Path, ...] | None:
@@ -2216,6 +2329,8 @@ __all__ = [
     "ProductionQualifiedBoundSource",
     "ProductionQualifiedRoutingCompositionBlueprint",
     "ProductionQualifiedRoutingFactoryContract",
+    "ProductionQualifiedRoutingAssemblyBinding",
+    "RegisteredProductionQualifiedRoutingComposition",
     "ProductionQualifiedRoutingRunDependencies",
     "ProductionQualifiedProviderSourceComposition",
     "ProductionQualifiedSourceBinding",
@@ -2225,4 +2340,7 @@ __all__ = [
     "ProductionRuntimeRootIdentity",
     "assemble_production_qualified_provider_sources",
     "build_production_qualified_routing_composition_blueprint",
+    "build_registered_production_qualified_routing_composition",
+    "production_qualified_routing_dependency_availability",
+    "production_qualified_routing_provider_source_coverage",
 ]

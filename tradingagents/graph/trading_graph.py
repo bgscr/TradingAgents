@@ -78,6 +78,9 @@ from tradingagents.evidence import (
 )
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.qualified_routing_composition import (
+    RegisteredProductionQualifiedRoutingComposition,
+)
 from tradingagents.reporting import write_report_tree
 from tradingagents.run_telemetry import RunTelemetryCallbackHandler
 from tradingagents.strategy_registry import (
@@ -164,7 +167,11 @@ class TradingAgentsGraph:
         asset_type: str | None = None,
         asset_configuration: RunAssetConfiguration | None = None,
         capability_routing_plan: MainlandCapabilityRoutingPlan | None = None,
-        qualified_financial_routing: QualifiedFinancialRoutingComposition | None = None,
+        qualified_financial_routing: (
+            QualifiedFinancialRoutingComposition
+            | RegisteredProductionQualifiedRoutingComposition
+            | None
+        ) = None,
         instrument_symbol: str | None = None,
     ):
         """Initialize the trading agents graph and components.
@@ -277,10 +284,18 @@ class TradingAgentsGraph:
                     "qualified financial routing requires a qualified mainland "
                     "Capability Routing Plan"
                 )
-            if (
-                qualified_financial_routing.router.routing_plan.plan_signature
-                != capability_routing_plan.plan_signature
+            if isinstance(
+                qualified_financial_routing,
+                RegisteredProductionQualifiedRoutingComposition,
             ):
+                composition_plan_signature = (
+                    qualified_financial_routing.blueprint.plan_signature
+                )
+            else:
+                composition_plan_signature = (
+                    qualified_financial_routing.router.routing_plan.plan_signature
+                )
+            if composition_plan_signature != capability_routing_plan.plan_signature:
                 raise MainlandCapabilityRoutingPreflightError(
                     mainland_capability_routing_failure(
                         MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
@@ -301,7 +316,13 @@ class TradingAgentsGraph:
                     MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
                 )
             )
-        if qualified_financial_routing is not None and capability_routing_plan is not None:
+        if (
+            isinstance(
+                qualified_financial_routing,
+                QualifiedFinancialRoutingComposition,
+            )
+            and capability_routing_plan is not None
+        ):
             enabled_capabilities = set(
                 capability_routing_plan.enabled_tushare_capabilities
             )
@@ -609,7 +630,10 @@ class TradingAgentsGraph:
         )
         qualified_financial_tool_routing = (
             qualified_financial_routing
-            if qualified_financial_routing is not None
+            if isinstance(
+                qualified_financial_routing,
+                QualifiedFinancialRoutingComposition,
+            )
             and (
                 qualified_financial_routing.statement_request_factory is not None
                 or qualified_financial_routing.indicator_request_factory is not None
@@ -675,6 +699,15 @@ class TradingAgentsGraph:
         composition = self.qualified_financial_routing
         if composition is None:
             raise ValueError("qualified mainland financial routing is not configured")
+        if isinstance(
+            composition,
+            RegisteredProductionQualifiedRoutingComposition,
+        ):
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                )
+            )
         asset_configuration = self.asset_configuration
         if (
             asset_configuration is None
