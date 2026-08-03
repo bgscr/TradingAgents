@@ -119,6 +119,37 @@ class MainlandCapabilityRoutingFailureReason(str, Enum):
     QUALIFIED_ROUTING_COMPOSITION_MISSING = (
         "qualified_routing_composition_missing"
     )
+    QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID = (
+        "qualified_routing_factory_contract_invalid"
+    )
+    QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID = (
+        "qualified_routing_factory_output_invalid"
+    )
+    QUALIFIED_VALIDATION_WORKLOAD_REQUIRED = (
+        "qualified_validation_workload_required"
+    )
+    QUALIFIED_ROUTING_PLAN_NOT_APPLICABLE = (
+        "qualified_routing_plan_not_applicable"
+    )
+    QUALIFIED_ROUTING_PLAN_INVALID = "qualified_routing_plan_invalid"
+    QUALIFIED_ROUTING_DISPOSITION_INVALID = (
+        "qualified_routing_disposition_invalid"
+    )
+    QUALIFIED_ROUTING_ASSET_BINDING_INVALID = (
+        "qualified_routing_asset_binding_invalid"
+    )
+    QUALIFIED_ROUTING_ELIGIBILITY_BINDING_INVALID = (
+        "qualified_routing_eligibility_binding_invalid"
+    )
+    QUALIFIED_ROUTING_DEPENDENCY_MISSING = (
+        "qualified_routing_dependency_missing"
+    )
+    QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE = (
+        "qualified_routing_source_coverage_incomplete"
+    )
+    QUALIFIED_ROUTING_RUNTIME_ROOT_INVALID = (
+        "qualified_routing_runtime_root_invalid"
+    )
     QUALIFIED_V1_AUTHORITY_DISABLED = "qualified_v1_authority_disabled"
 
 
