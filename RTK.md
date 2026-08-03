@@ -6,7 +6,10 @@ Token-optimized CLI proxy for shell commands.
 ALWAYS prefix shell commands with `rtk`.
 
 **Examples:**
-`rtk git status` | `rtk cargo test` | `rtk npm run build` | `rtk pytest -q`
+`rtk git status` | `rtk cargo test` | `rtk npm run build` | `rtk pytest -q` | `rtk pwsh -c "Get-Process"`
+
+## Shell Environment
+* Use `pwsh` instead of `powershell` for PowerShell commands.
 
 ## Meta Commands
 * `rtk gain` — Token savings analytics
