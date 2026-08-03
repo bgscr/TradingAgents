@@ -110,6 +110,8 @@ def _candidate(
     f_ann_date: date | None = None,
     value: str = "1",
     declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+    observed_at: datetime = _OBSERVED_AT,
+    retrieved_at: datetime = _OBSERVED_AT,
 ) -> FinancialPeriodCandidate:
     identity = _identity(symbol)
     declaration = financial_ratio_field_declaration(
@@ -135,8 +137,8 @@ def _candidate(
             "ratio_family": family.value,
         },
         provider_metadata={"ann_date": "20260701", "comp_type": "2" if company_type is FinancialCompanyType.BANK else "1"},
-        retrieved_at=_OBSERVED_AT,
-        observed_at=_OBSERVED_AT,
+        retrieved_at=retrieved_at,
+        observed_at=observed_at,
         payload={
             "family": family.value,
             "period": period.isoformat(),
@@ -181,8 +183,8 @@ def _candidate(
             report_type="1",
             comp_type="2" if company_type is FinancialCompanyType.BANK else "1",
             update_flag="0",
-            retrieved_at=_OBSERVED_AT,
-            observed_at=_OBSERVED_AT,
+            retrieved_at=retrieved_at,
+            observed_at=observed_at,
             local_provider_revision_identity=artifact.artifact_identity,
         ),
         company_type_resolution=resolution,
