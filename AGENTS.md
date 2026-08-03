@@ -6,12 +6,12 @@
 - **Local Triage & Specs**: Follow `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
 
 ## Exploration & Editing Rules
+- @RTK.md
 - **Code Graph First**: When `.codegraph/` exists, use CodeGraph first for symbols, callers, dependencies, and call paths.
 - **Direct Search Fallback**: Use direct file reads/grep for docs, configs, exact text, unindexed files, or when CodeGraph misses/is unavailable.
 - **Direct Investigation**: Primary agent inspects affected behavior directly before edit. No separate investigator subagent is needed if context can be built directly.
 - **Minimal Scope**: Make the smallest coherent edit. Preserve unrelated worktree changes.
 - **Ignored State**: Treat `.venv/`, `build/`, `dist/`, `reports/`, `.pytest_cache/`, `.ruff_cache/`, and `.worktrees/` as local generated state unless explicitly targeted.
-- **@RTK.md**
 
 ## Delegation & Subagent Rules
 ### Hard Constraints
