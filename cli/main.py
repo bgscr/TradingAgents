@@ -2044,6 +2044,46 @@ def build_qualified_financial_routing_composition(
     )
 
 
+def _interrupt_qualified_routing_owner(composition: object | None) -> None:
+    interrupt = getattr(composition, "interrupt", None)
+    if callable(interrupt):
+        with suppress(BaseException):
+            interrupt()
+
+
+def _close_qualified_routing_owner(composition: object | None) -> None:
+    close = getattr(composition, "close", None)
+    if callable(close):
+        with suppress(BaseException):
+            close()
+
+
+def _interrupt_qualified_routing_host(graph: object, composition: object | None) -> None:
+    graph_interrupter = getattr(
+        graph,
+        "interrupt_qualified_routing_runtime",
+        None,
+    )
+    if callable(graph_interrupter):
+        with suppress(BaseException):
+            graph_interrupter()
+    else:
+        _interrupt_qualified_routing_owner(composition)
+
+
+def _close_qualified_routing_host(graph: object, composition: object | None) -> None:
+    graph_closer = getattr(
+        graph,
+        "close_qualified_routing_runtime",
+        None,
+    )
+    if callable(graph_closer):
+        with suppress(BaseException):
+            graph_closer()
+    else:
+        _close_qualified_routing_owner(composition)
+
+
 def run_analysis(
     checkpoint: bool | None = None,
     *,
@@ -2252,6 +2292,8 @@ def run_analysis(
         # Initialize message buffer with selected analysts
         message_buffer.init_for_analysis(selected_analyst_keys)
     except BaseException as exc:
+        _interrupt_qualified_routing_owner(qualified_financial_routing)
+        _close_qualified_routing_owner(qualified_financial_routing)
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         with suppress(Exception):
             runtime_writer.close()
@@ -2322,6 +2364,8 @@ def run_analysis(
             start_time,
         )
     except BaseException as exc:
+        _interrupt_qualified_routing_owner(qualified_financial_routing)
+        _close_qualified_routing_owner(qualified_financial_routing)
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         with suppress(Exception):
             runtime_writer.close()
@@ -2348,6 +2392,7 @@ def run_analysis(
 
     spinner_text = f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
     snapshot_scope = ExitStack()
+    primary_failure: BaseException | None = None
     try:
         run_asset = getattr(graph, "asset_configuration", None)
         snapshot_context = (
@@ -2421,6 +2466,12 @@ def run_analysis(
             init_agent_state[
                 "capability_routing_checkpoint_compatibility"
             ] = checkpoint_session.routing_compatibility.model_dump(mode="json")
+        runtime_binder = getattr(graph, "bind_qualified_routing_runtime", None)
+        if callable(runtime_binder):
+            runtime_binder(
+                run_id=init_agent_state["run_id"],
+                checkpoint_compatibility_known=True,
+            )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
         args = graph.propagator.get_graph_args(
@@ -2621,16 +2672,45 @@ def run_analysis(
         _mark_run_completed(final_state, artifacts)
 
     except BaseException as exc:
+        primary_failure = exc
+        _interrupt_qualified_routing_host(graph, qualified_financial_routing)
         _mark_run_failed(artifacts, exc, current_phase=current_phase)
         raise
     finally:
-        snapshot_scope.close()
-        display.close()
+        terminal_cleanup_failure: BaseException | None = None
+        try:
+            snapshot_scope.close()
+        except BaseException as exc:
+            terminal_cleanup_failure = exc
+        try:
+            display.close()
+        except BaseException as exc:
+            if terminal_cleanup_failure is None:
+                terminal_cleanup_failure = exc
         message_buffer.add_message = base_add_message
         message_buffer.add_tool_call = base_add_tool_call
         message_buffer.update_report_section = base_update_report_section
-        with suppress(Exception):
+        try:
             runtime_writer.close()
+        except Exception:
+            pass
+        except BaseException as exc:
+            if terminal_cleanup_failure is None:
+                terminal_cleanup_failure = exc
+        if terminal_cleanup_failure is not None:
+            _interrupt_qualified_routing_host(graph, qualified_financial_routing)
+            if primary_failure is None:
+                with suppress(BaseException):
+                    _mark_run_failed(
+                        artifacts,
+                        terminal_cleanup_failure,
+                        current_phase=current_phase,
+                    )
+        try:
+            _close_qualified_routing_host(graph, qualified_financial_routing)
+        finally:
+            if terminal_cleanup_failure is not None and primary_failure is None:
+                raise terminal_cleanup_failure
 
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")

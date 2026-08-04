@@ -10,10 +10,12 @@ import importlib.util
 import json
 import os
 import re
+import threading
+import time
 from calendar import monthrange
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
@@ -50,10 +52,12 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
     FinancialCapabilitySource,
     FinancialIndicatorProviderGapRequest,
+    FinancialIndicatorRoutingRequest,
     FinancialIndicatorSource,
     FinancialPeriodSource,
     FinancialProviderGapRequest,
     FinancialProviderPeriodResponse,
+    FinancialStatementRoutingRequest,
     MainlandFinancialCapabilityRouter,
     financial_period_response_from_indicator_adapter,
     financial_period_response_from_statement_adapter,
@@ -78,11 +82,29 @@ from tradingagents.dataflows.tushare_factors_names import (
 from tradingagents.dataflows.tushare_indicators import TushareFinancialIndicatorAdapter
 from tradingagents.dataflows.tushare_statements import TushareStatementAdapter
 from tradingagents.evidence import AcquisitionUnavailableReason, InstrumentKind
-from tradingagents.market_history.config import DataUsageMode
+from tradingagents.market_history.config import (
+    DataUsageMode,
+    MarketHistoryConfig,
+    MarketHistoryMode,
+)
 from tradingagents.market_history.coordinator import (
+    PhysicalAttemptNotMade,
     ProviderRequestCoordinator,
     RequestPriority,
     upstream_service_identity_for_provider,
+)
+from tradingagents.market_history.store import MarketHistoryStore
+from tradingagents.qualified_routing_lifecycle import (
+    ProductionQualifiedRoutingLifecycleDiagnostic,
+    ProductionQualifiedRoutingLifecycleError,
+    ProductionQualifiedRoutingLifecycleFailureReason,
+    ProductionQualifiedRuntimeOwner,
+)
+from tradingagents.qualified_routing_provider_clients import (
+    ProductionBaoStockRunTransport,
+    production_baostock_process_transport,
+    production_module_run_facade,
+    production_tushare_run_client,
 )
 
 PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION = (
@@ -344,7 +366,7 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
 
 
 class ManagedQualifiedRoutingComposition(Protocol):
-    """Single owner-capable boundary implemented by later lifecycle tickets."""
+    """Single owner-capable boundary for one qualified analysis lifetime."""
 
     blueprint: ProductionQualifiedRoutingCompositionBlueprint
 
@@ -355,11 +377,337 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def close(self) -> None: ...
 
 
+class ProductionQualifiedRoutingRunBinding(BaseModel):
+    """Canonical post-checkpoint inputs required before run resources may open."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    run_id: str = Field(pattern=r"^run:[0-9a-f]{64}$")
+    asset_configuration: RunAssetConfiguration = Field(repr=False)
+    routing_plan: MainlandCapabilityRoutingPlan = Field(repr=False)
+    checkpoint_compatibility_known: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_authoritative_bindings(self) -> ProductionQualifiedRoutingRunBinding:
+        if (
+            self.asset_configuration.asset_configuration_signature
+            == ""
+            or self.routing_plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+        ):
+            raise ValueError("qualified runtime binding is invalid")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedRoutingRuntimeAssembly:
+    """Ticket-02 graph wiring plus the run-owned objects it created."""
+
+    financial_routing: object = field(repr=False, compare=False)
+    owned_resources: tuple[tuple[str, object], ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+    source_composition: object | None = field(default=None, repr=False, compare=False)
+    dependencies: object | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if any(
+            not _safe_source_token(resource_kind) or resource is None
+            for resource_kind, resource in self.owned_resources
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+
+
+def _noop_runtime_phase_hook(_phase: str, _value: object) -> None:
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedRoutingRuntimeFactories:
+    """Composition-local acquisition seams for deterministic run binding."""
+
+    open_coordinator_store: Callable[[object], object] = field(repr=False)
+    build_coordinator: Callable[[object, threading.Event], object] = field(repr=False)
+    build_artifact_store: Callable[[object], object] = field(repr=False)
+    build_subrequest_cache: Callable[
+        [object, object, str, threading.Event], object
+    ] = field(repr=False)
+    build_tushare_client: Callable[[object, threading.Event], object] = field(
+        repr=False
+    )
+    build_akshare_facade: Callable[[object, threading.Event], object] = field(
+        repr=False
+    )
+    build_yahoo_transport: Callable[[object, threading.Event], object] = field(
+        repr=False
+    )
+    build_baostock_transport: Callable[[object, threading.Event], object] = field(
+        repr=False
+    )
+    assemble_runtime: Callable[..., ProductionQualifiedRoutingRuntimeAssembly] = field(
+        repr=False
+    )
+    phase_hook: Callable[[str, object], None] = field(
+        default=_noop_runtime_phase_hook,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        callbacks = (
+            self.open_coordinator_store,
+            self.build_coordinator,
+            self.build_artifact_store,
+            self.build_subrequest_cache,
+            self.build_tushare_client,
+            self.build_akshare_facade,
+            self.build_yahoo_transport,
+            self.build_baostock_transport,
+            self.assemble_runtime,
+            self.phase_hook,
+        )
+        if any(not callable(callback) for callback in callbacks):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+
+
+def production_qualified_routing_runtime_factories(
+) -> ProductionQualifiedRoutingRuntimeFactories:
+    """Return lazy production acquisitions without opening any run resource."""
+
+    def runtime_blueprint(value: object) -> ProductionQualifiedRoutingCompositionBlueprint:
+        if not isinstance(value, ProductionQualifiedRoutingCompositionBlueprint):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        return value
+
+    def open_store(value: object) -> MarketHistoryStore:
+        blueprint = runtime_blueprint(value)
+        config = MarketHistoryConfig(
+            mode=MarketHistoryMode.SHADOW,
+            database_path=blueprint.database_path,
+            payload_root=blueprint.provider_artifact_root_path,
+            backup_root=blueprint.backup_root_path,
+            data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+        )
+        try:
+            return MarketHistoryStore.open_provider_request_authority(config)
+        except ProductionQualifiedRoutingLifecycleError:
+            raise
+        except Exception:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            ) from None
+
+    def build_coordinator(
+        store: object,
+        stop_signal: threading.Event,
+    ) -> ProviderRequestCoordinator:
+        if not isinstance(store, MarketHistoryStore):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        try:
+            coordinator = ProviderRequestCoordinator(store, stop_signal=stop_signal)
+            contract = runtime_blueprint_value.factory_contract
+            services = (
+                ("akshare_sina", ""),
+                ("baostock", ""),
+                ("tushare", contract.account_scope_label),
+                ("yfinance", ""),
+            )
+            for provider_id, account_scope in services:
+                service_id, service_name = upstream_service_identity_for_provider(
+                    provider_id,
+                    account_scope=account_scope,
+                )
+                coordinator.register_upstream_service(
+                    service_id,
+                    service_name,
+                    account_scope=account_scope,
+                )
+            tushare_service_id, _ = upstream_service_identity_for_provider(
+                "tushare",
+                account_scope=contract.account_scope_label,
+            )
+            coordinator.configure_operator_ceiling(
+                upstream_service_id=tushare_service_id,
+                minimum_interval=timedelta(
+                    seconds=60.0
+                    / min(
+                        identity.operator_calls_per_minute
+                        for identity in contract.endpoint_pacing_identities
+                    )
+                ),
+                allow_prewarming=False,
+                configured_at=datetime.now(timezone.utc),
+            )
+            return coordinator
+        except ProductionQualifiedRoutingLifecycleError:
+            raise
+        except Exception:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            ) from None
+
+    def build_artifact_store(value: object) -> ProviderSubrequestArtifactStore:
+        blueprint = runtime_blueprint(value)
+        try:
+            return ProviderSubrequestArtifactStore(
+                blueprint.provider_artifact_root_path
+                / "qualified-provider-subrequests"
+            )
+        except Exception:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            ) from None
+
+    def build_cache(
+        coordinator: object,
+        artifact_store: object,
+        run_id: str,
+        stop_signal: threading.Event,
+    ) -> ProviderSubrequestCache:
+        if not isinstance(coordinator, ProviderRequestCoordinator) or not isinstance(
+            artifact_store,
+            ProviderSubrequestArtifactStore,
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        try:
+            return ProviderSubrequestCache(
+                coordinator=coordinator,
+                artifact_store=artifact_store,
+                run_scope_id=run_id,
+                stop_signal=stop_signal,
+            )
+        except Exception:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            ) from None
+
+    runtime_blueprint_value: ProductionQualifiedRoutingCompositionBlueprint
+
+    def remember_blueprint(value: object) -> MarketHistoryStore:
+        nonlocal runtime_blueprint_value
+        runtime_blueprint_value = runtime_blueprint(value)
+        return open_store(runtime_blueprint_value)
+
+    def build_tushare(
+        value: object,
+        stop_signal: threading.Event,
+    ) -> object:
+        runtime_blueprint(value)
+        return production_tushare_run_client(stop_signal)
+
+    def build_module_facade(
+        provider_id: str,
+        module_name: str,
+        value: object,
+        stop_signal: threading.Event,
+    ) -> object:
+        runtime_blueprint(value)
+        return production_module_run_facade(
+            provider_id=provider_id,
+            module_name=module_name,
+            stop_signal=stop_signal,
+        )
+
+    def build_baostock(
+        value: object,
+        stop_signal: threading.Event,
+    ) -> object:
+        runtime_blueprint(value)
+        return production_baostock_process_transport(stop_signal)
+
+    return ProductionQualifiedRoutingRuntimeFactories(
+        open_coordinator_store=remember_blueprint,
+        build_coordinator=build_coordinator,
+        build_artifact_store=build_artifact_store,
+        build_subrequest_cache=build_cache,
+        build_tushare_client=build_tushare,
+        build_akshare_facade=lambda value, stop_signal: build_module_facade(
+            "akshare",
+            "akshare",
+            value,
+            stop_signal,
+        ),
+        build_yahoo_transport=lambda value, stop_signal: build_module_facade(
+            "yfinance",
+            "yfinance",
+            value,
+            stop_signal,
+        ),
+        build_baostock_transport=build_baostock,
+        assemble_runtime=_assemble_production_qualified_runtime,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionQualifiedRoutingRuntime:
+    """Safe public handle for one completely bound run-owned composition."""
+
+    run_id: str
+    financial_routing: object = field(repr=False, compare=False)
+    stop_signal: threading.Event = field(repr=False, compare=False)
+    resource_kinds: tuple[str, ...]
+    source_composition: object | None = field(default=None, repr=False, compare=False)
+    dependencies: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def router(self) -> object:
+        return self.financial_routing.router
+
+    @property
+    def statement_request_factory(self) -> object:
+        return self.financial_routing.statement_request_factory
+
+    @property
+    def indicator_request_factory(self) -> object:
+        return self.financial_routing.indicator_request_factory
+
+    def __repr__(self) -> str:
+        return (
+            "ProductionQualifiedRoutingRuntime("
+            f"run_id={self.run_id!r}, resource_kinds={self.resource_kinds!r})"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RegisteredProductionQualifiedRoutingComposition:
-    """Resource-free result selected by the statically registered host factory."""
+    """Resource-free blueprint that becomes the sole owner when a run binds."""
 
     blueprint: ProductionQualifiedRoutingCompositionBlueprint
+    runtime_factories: ProductionQualifiedRoutingRuntimeFactories | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _state_lock: threading.RLock = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default_factory=threading.RLock,
+    )
+    _runtime: ProductionQualifiedRoutingRuntime | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _owner: ProductionQualifiedRuntimeOwner | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _closed: bool = field(init=False, repr=False, compare=False, default=False)
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -369,6 +717,14 @@ class RegisteredProductionQualifiedRoutingComposition:
             _fail(
                 MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
             )
+        factories = self.runtime_factories
+        if factories is None:
+            factories = production_qualified_routing_runtime_factories()
+            object.__setattr__(self, "runtime_factories", factories)
+        if not isinstance(factories, ProductionQualifiedRoutingRuntimeFactories):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
 
     @property
     def factory_identity(self) -> str:
@@ -376,14 +732,49 @@ class RegisteredProductionQualifiedRoutingComposition:
 
     def bind_run(
         self,
-        run_binding: ProductionQualifiedRoutingAssemblyBinding,
+        run_binding: ProductionQualifiedRoutingAssemblyBinding
+        | ProductionQualifiedRoutingRunBinding,
     ) -> object:
-        """Delegate immutable source assembly without claiming resource ownership."""
+        """Bind injected Ticket-02 wiring or one managed canonical run runtime."""
 
-        if not isinstance(run_binding, ProductionQualifiedRoutingAssemblyBinding):
+        if isinstance(run_binding, ProductionQualifiedRoutingAssemblyBinding):
+            return self._bind_injected_assembly(run_binding)
+        if not isinstance(run_binding, ProductionQualifiedRoutingRunBinding):
             _fail(
                 MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
             )
+        self._validate_run_binding(run_binding)
+        with self._state_lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            if self._owner is not None and self._owner.interrupted:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.INTERRUPTED
+                )
+            if self._runtime is not None:
+                if self._runtime.run_id == run_binding.run_id:
+                    return self._runtime
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.DIFFERENT_RUN_ACTIVE
+                )
+            owner = ProductionQualifiedRuntimeOwner()
+            object.__setattr__(self, "_owner", owner)
+            try:
+                runtime = self._construct_runtime(run_binding, owner)
+            except BaseException:
+                owner.interrupt()
+                owner.close()
+                object.__setattr__(self, "_closed", True)
+                raise
+            object.__setattr__(self, "_runtime", runtime)
+            return runtime
+
+    def _bind_injected_assembly(
+        self,
+        run_binding: ProductionQualifiedRoutingAssemblyBinding,
+    ) -> object:
         source_composition = assemble_production_qualified_provider_sources(
             blueprint=self.blueprint,
             dependencies=run_binding.dependencies,
@@ -403,6 +794,143 @@ class RegisteredProductionQualifiedRoutingComposition:
             _fail(
                 MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
             )
+
+    def _validate_run_binding(
+        self,
+        run_binding: ProductionQualifiedRoutingRunBinding,
+    ) -> None:
+        if (
+            run_binding.routing_plan != self.blueprint.routing_plan
+            or run_binding.routing_plan.plan_signature != self.blueprint.plan_signature
+            or run_binding.asset_configuration.asset_configuration_signature
+            != self.blueprint.asset_configuration_signature
+            or run_binding.routing_plan.financial_eligibility_binding
+            != self.blueprint.factory_contract.financial_eligibility_binding
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+
+    def _construct_runtime(
+        self,
+        run_binding: ProductionQualifiedRoutingRunBinding,
+        owner: ProductionQualifiedRuntimeOwner,
+    ) -> ProductionQualifiedRoutingRuntime:
+        factories = self.runtime_factories
+        assert factories is not None
+
+        def acquire(resource_kind: str, value: object) -> object:
+            owner.own(resource_kind, value)
+            factories.phase_hook(resource_kind, value)
+            return value
+
+        coordinator_store = acquire(
+            "coordinator_store",
+            factories.open_coordinator_store(self.blueprint),
+        )
+        coordinator = acquire(
+            "coordinator",
+            factories.build_coordinator(coordinator_store, owner.stop_signal),
+        )
+        artifact_store = acquire(
+            "artifact_store",
+            factories.build_artifact_store(self.blueprint),
+        )
+        subrequest_cache = acquire(
+            "subrequest_cache",
+            factories.build_subrequest_cache(
+                coordinator,
+                artifact_store,
+                run_binding.run_id,
+                owner.stop_signal,
+            ),
+        )
+        tushare_client = acquire(
+            "tushare_client",
+            factories.build_tushare_client(self.blueprint, owner.stop_signal),
+        )
+        akshare_facade = acquire(
+            "akshare_facade",
+            factories.build_akshare_facade(self.blueprint, owner.stop_signal),
+        )
+        yahoo_transport = acquire(
+            "yahoo_transport",
+            factories.build_yahoo_transport(self.blueprint, owner.stop_signal),
+        )
+        baostock_transport = acquire(
+            "baostock_transport",
+            factories.build_baostock_transport(self.blueprint, owner.stop_signal),
+        )
+        assembly = factories.assemble_runtime(
+            blueprint=self.blueprint,
+            run_binding=run_binding,
+            coordinator=coordinator,
+            coordinator_store=coordinator_store,
+            artifact_store=artifact_store,
+            subrequest_cache=subrequest_cache,
+            provider_clients=MappingProxyType(
+                {
+                    "akshare": akshare_facade,
+                    "baostock": baostock_transport,
+                    "tushare": tushare_client,
+                    "yfinance": yahoo_transport,
+                }
+            ),
+            stop_signal=owner.stop_signal,
+            acquire_owned_resource=acquire,
+        )
+        if not isinstance(assembly, ProductionQualifiedRoutingRuntimeAssembly):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        from tradingagents.graph.financial_tools import (
+            QualifiedFinancialRoutingComposition,
+        )
+
+        if not isinstance(
+            assembly.financial_routing,
+            QualifiedFinancialRoutingComposition,
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        for resource_kind, resource in assembly.owned_resources:
+            acquire(resource_kind, resource)
+        return ProductionQualifiedRoutingRuntime(
+            run_id=run_binding.run_id,
+            financial_routing=assembly.financial_routing,
+            stop_signal=owner.stop_signal,
+            resource_kinds=owner.resource_kinds,
+            source_composition=assembly.source_composition,
+            dependencies=assembly.dependencies,
+        )
+
+    @property
+    def runtime(self) -> ProductionQualifiedRoutingRuntime | None:
+        with self._state_lock:
+            return self._runtime
+
+    @property
+    def cleanup_diagnostics(
+        self,
+    ) -> tuple[ProductionQualifiedRoutingLifecycleDiagnostic, ...]:
+        with self._state_lock:
+            return self._owner.diagnostics if self._owner is not None else ()
+
+    def interrupt(self) -> None:
+        with self._state_lock:
+            owner = self._owner
+        if owner is not None:
+            owner.interrupt()
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            object.__setattr__(self, "_closed", True)
+            owner = self._owner
+        if owner is not None:
+            owner.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +954,7 @@ class ProductionQualifiedRoutingAssemblyBinding:
 def build_registered_production_qualified_routing_composition(
     *,
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    runtime_factories: ProductionQualifiedRoutingRuntimeFactories | None = None,
 ) -> RegisteredProductionQualifiedRoutingComposition:
     """Consume one validated blueprint without opening run-owned resources."""
 
@@ -433,7 +962,10 @@ def build_registered_production_qualified_routing_composition(
         _fail(
             MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
         )
-    return RegisteredProductionQualifiedRoutingComposition(blueprint=blueprint)
+    return RegisteredProductionQualifiedRoutingComposition(
+        blueprint=blueprint,
+        runtime_factories=runtime_factories,
+    )
 
 
 class ProductionQualifiedSourceKind(str, Enum):
@@ -588,10 +1120,12 @@ class ProductionQualifiedRoutingRunDependencies:
 
 @dataclass(frozen=True, slots=True)
 class ProductionQualifiedBoundSource:
-    """One external physical operation bound to the run cache and coordinator."""
+    """One external source operation bound to the run cache and coordinator."""
 
     physical_provider_id: str
-    physical_request: Callable[[object], bytes] = field(repr=False, compare=False)
+    physical_request: Callable[
+        [object], bytes | PhysicalAttemptNotMade[bytes]
+    ] = field(repr=False, compare=False)
     response_decoder: Callable[[object, bytes], object] = field(
         repr=False,
         compare=False,
@@ -613,7 +1147,9 @@ class ProductionQualifiedBoundSource:
         *,
         dependencies: ProductionQualifiedRoutingRunDependencies,
         physical_provider_id: str,
-        physical_request: Callable[[object], bytes],
+        physical_request: Callable[
+            [object], bytes | PhysicalAttemptNotMade[bytes]
+        ],
         response_decoder: Callable[[object, bytes], object],
         adapter: object,
         normalizer_version: str,
@@ -2125,6 +2661,295 @@ def _safe_external_source(
     return safe_source
 
 
+class _ProductionQualifiedRequestFactories:
+    """Run-owned placeholder that never treats tool arguments as eligibility."""
+
+    def __init__(self, run_binding: ProductionQualifiedRoutingRunBinding) -> None:
+        self._asset_configuration = run_binding.asset_configuration
+        self._routing_plan = run_binding.routing_plan
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _require_open(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+
+    def statement(self, request: object) -> FinancialStatementRoutingRequest:
+        self._require_open()
+        del request
+        raise ProductionQualifiedRoutingLifecycleError(
+            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+        )
+
+    def indicator(self, request: object) -> FinancialIndicatorRoutingRequest:
+        self._require_open()
+        del request
+        raise ProductionQualifiedRoutingLifecycleError(
+            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+        )
+
+    def interrupt(self) -> None:
+        return None
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def __repr__(self) -> str:
+        return "ProductionQualifiedRequestFactories(run_owned=True)"
+
+
+class _ProductionQualifiedAdapterSet:
+    """Explicit ownership marker for the immutable set of bound adapters."""
+
+    def __init__(self, adapters: tuple[object, ...]) -> None:
+        self._adapters = adapters
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def interrupt(self) -> None:
+        for adapter in reversed(self._adapters):
+            interrupt = getattr(adapter, "interrupt", None)
+            if callable(interrupt):
+                interrupt()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+    def __repr__(self) -> str:
+        return "ProductionQualifiedAdapterSet(run_owned=True)"
+
+
+def _production_terminal_source_registrations(
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+) -> tuple[ProductionQualifiedSourceRegistration, ...]:
+    """Bind plan-named external seams without inventing provider SDK methods."""
+
+    plan_pairs = {
+        (route.capability, provider_id)
+        for route in blueprint.routing_plan.routes
+        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        for provider_id in route.providers
+        if _internal_source_endpoint(route.capability, provider_id) is None
+    }
+    statements = tuple(
+        capability
+        for capability in _STATEMENT_CAPABILITIES
+        if (capability, "yfinance") in plan_pairs
+    )
+    specifications: list[
+        tuple[
+            str,
+            str,
+            ProductionQualifiedSourceKind,
+            tuple[MainlandCapability, ...],
+        ]
+    ] = []
+    if statements:
+        specifications.append(
+            (
+                "yfinance",
+                "financial_statements",
+                ProductionQualifiedSourceKind.STATEMENT,
+                statements,
+            )
+        )
+    candidates = (
+        (
+            "akshare",
+            "financial_indicators",
+            ProductionQualifiedSourceKind.INDICATOR,
+            (MainlandCapability.FINANCIAL_INDICATORS,),
+        ),
+        (
+            "yfinance",
+            "current_financial_profile",
+            ProductionQualifiedSourceKind.INDICATOR,
+            (MainlandCapability.FINANCIAL_INDICATORS,),
+        ),
+        (
+            "akshare",
+            "adjustment_factors",
+            ProductionQualifiedSourceKind.CAPABILITY,
+            (MainlandCapability.ADJUSTMENT_FACTORS,),
+        ),
+        (
+            "yfinance_derived",
+            "derived_adjustment_factors",
+            ProductionQualifiedSourceKind.CAPABILITY,
+            (MainlandCapability.ADJUSTMENT_FACTORS,),
+        ),
+        (
+            "akshare",
+            "issuer_name_events",
+            ProductionQualifiedSourceKind.CAPABILITY,
+            (MainlandCapability.NAME_EVENTS,),
+        ),
+    )
+    specifications.extend(
+        specification
+        for specification in candidates
+        if all(
+            (capability, specification[0]) in plan_pairs
+            for capability in specification[3]
+        )
+    )
+
+    registrations: list[ProductionQualifiedSourceRegistration] = []
+    for provider_id, endpoint_id, source_kind, capabilities in specifications:
+        physical_provider_id = (
+            "yfinance"
+            if provider_id == "yfinance_derived"
+            else "akshare_sina"
+            if provider_id == "akshare"
+            else provider_id
+        )
+        client_id = "akshare" if provider_id == "akshare" else physical_provider_id
+        response_type = (
+            FinancialCapabilityProviderResponse
+            if source_kind is ProductionQualifiedSourceKind.CAPABILITY
+            else FinancialProviderPeriodResponse
+        )
+
+        def source_factory(
+            dependencies: ProductionQualifiedRoutingRunDependencies,
+            *,
+            _provider_id=provider_id,
+            _physical_provider_id=physical_provider_id,
+            _client_id=client_id,
+            _endpoint_id=endpoint_id,
+            _source_kind=source_kind,
+            _capabilities=capabilities,
+            _response_type=response_type,
+        ) -> ProductionQualifiedBoundSource:
+            client = dependencies.provider_clients[_client_id]
+
+            def terminal_response(request: object) -> PhysicalAttemptNotMade[bytes]:
+                if _source_kind in {
+                    ProductionQualifiedSourceKind.STATEMENT,
+                    ProductionQualifiedSourceKind.INDICATOR,
+                }:
+                    response = FinancialProviderPeriodResponse.unavailable(
+                        provider_id=_provider_id,
+                        reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
+                    )
+                else:
+                    capability = getattr(request, "capability", _capabilities[0])
+                    if capability not in _capabilities:
+                        capability = _capabilities[0]
+                    response = FinancialCapabilityProviderResponse.unavailable(
+                        provider_id=_provider_id,
+                        capability=capability,
+                        reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
+                    )
+                return PhysicalAttemptNotMade(
+                    response.model_dump_json().encode("utf-8")
+                )
+
+            return ProductionQualifiedBoundSource.bind(
+                dependencies=dependencies,
+                physical_provider_id=_physical_provider_id,
+                physical_request=terminal_response,
+                response_decoder=lambda _request, payload: _response_type.model_validate_json(
+                    payload
+                ),
+                adapter=client,
+                normalizer_version=f"{_endpoint_id}-terminal-v1",
+            )
+
+        registrations.append(
+            ProductionQualifiedSourceRegistration(
+                provider_id=provider_id,
+                endpoint_id=endpoint_id,
+                source_kind=source_kind,
+                capabilities=capabilities,
+                source_factory=source_factory,
+            )
+        )
+    return tuple(registrations)
+
+
+def _assemble_production_qualified_runtime(
+    *,
+    blueprint: object,
+    run_binding: object,
+    coordinator: object,
+    coordinator_store: object,
+    artifact_store: object,
+    subrequest_cache: object,
+    provider_clients: Mapping[str, object],
+    stop_signal: threading.Event,
+    acquire_owned_resource: Callable[[str, object], object],
+) -> ProductionQualifiedRoutingRuntimeAssembly:
+    if (
+        not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint)
+        or not isinstance(run_binding, ProductionQualifiedRoutingRunBinding)
+        or not isinstance(coordinator, ProviderRequestCoordinator)
+        or not isinstance(coordinator_store, MarketHistoryStore)
+        or not isinstance(artifact_store, ProviderSubrequestArtifactStore)
+        or not isinstance(subrequest_cache, ProviderSubrequestCache)
+        or not callable(acquire_owned_resource)
+    ):
+        raise ProductionQualifiedRoutingLifecycleError(
+            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+        )
+    dependencies = ProductionQualifiedRoutingRunDependencies(
+        coordinator=coordinator,
+        subrequest_cache=subrequest_cache,
+        artifact_store=artifact_store,
+        provider_clients=provider_clients,
+        now=lambda: datetime.now(timezone.utc),
+        sleep=time.sleep,
+        owner_id=run_binding.run_id,
+        lease_duration=timedelta(seconds=30),
+    )
+    source_composition = assemble_production_qualified_provider_sources(
+        blueprint=blueprint,
+        dependencies=dependencies,
+        source_registrations=_production_terminal_source_registrations(blueprint),
+    )
+    unique_adapters: list[object] = []
+    client_ids = {id(client) for client in provider_clients.values()}
+    for binding in source_composition.bindings:
+        if id(binding.adapter) not in client_ids and all(
+            binding.adapter is not adapter for adapter in unique_adapters
+        ):
+            unique_adapters.append(binding.adapter)
+    adapter_set = _ProductionQualifiedAdapterSet(tuple(unique_adapters))
+    acquire_owned_resource("provider_adapters", adapter_set)
+    request_factories = _ProductionQualifiedRequestFactories(run_binding)
+    acquire_owned_resource("request_factories", request_factories)
+    from tradingagents.graph.financial_tools import (
+        QualifiedFinancialRoutingComposition,
+    )
+
+    enabled = set(blueprint.enabled_capabilities)
+    financial_routing = QualifiedFinancialRoutingComposition(
+        router=source_composition.router,
+        statement_request_factory=(
+            request_factories.statement
+            if TushareCapability.STATEMENTS in enabled
+            else None
+        ),
+        indicator_request_factory=(
+            request_factories.indicator
+            if TushareCapability.FINANCIAL_INDICATORS in enabled
+            else None
+        ),
+    )
+    return ProductionQualifiedRoutingRuntimeAssembly(
+        financial_routing=financial_routing,
+        source_composition=source_composition,
+        dependencies=dependencies,
+    )
+
+
 def assemble_production_qualified_provider_sources(
     *,
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
@@ -2327,9 +3152,17 @@ __all__ = [
     "PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION",
     "PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION",
     "ProductionQualifiedBoundSource",
+    "ProductionBaoStockRunTransport",
     "ProductionQualifiedRoutingCompositionBlueprint",
     "ProductionQualifiedRoutingFactoryContract",
+    "ProductionQualifiedRoutingLifecycleDiagnostic",
+    "ProductionQualifiedRoutingLifecycleError",
+    "ProductionQualifiedRoutingLifecycleFailureReason",
     "ProductionQualifiedRoutingAssemblyBinding",
+    "ProductionQualifiedRoutingRuntime",
+    "ProductionQualifiedRoutingRuntimeAssembly",
+    "ProductionQualifiedRoutingRuntimeFactories",
+    "ProductionQualifiedRoutingRunBinding",
     "RegisteredProductionQualifiedRoutingComposition",
     "ProductionQualifiedRoutingRunDependencies",
     "ProductionQualifiedProviderSourceComposition",

@@ -22,6 +22,7 @@ from tradingagents.market_history.config import DataUsageMode
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptBudgetExhausted,
     PhysicalAttemptFailure,
+    PhysicalAttemptNotMade,
     PhysicalAttemptOutcome,
     ProviderPhysicalAttemptEvent,
     ProviderRequestCoordinator,
@@ -509,6 +510,7 @@ class ProviderSubrequestCache:
         artifact_store: ProviderSubrequestArtifactStore,
         run_scope_id: str,
         checkpoint: Mapping[str, object] | ProviderSubrequestCacheCheckpoint | None = None,
+        stop_signal: threading.Event | None = None,
     ) -> None:
         if (
             not isinstance(run_scope_id, str)
@@ -521,8 +523,12 @@ class ProviderSubrequestCache:
         self._coordinator = coordinator
         self._artifact_store = artifact_store
         self._run_scope_id = run_scope_id
+        self._stop_signal = stop_signal or threading.Event()
         self._lock = threading.Lock()
         self._results: dict[str, Future[ProviderSubrequestResult]] = {}
+        self._keys: dict[str, ProviderSubrequestKey] = {}
+        self._interrupted = False
+        self._closed = False
         if checkpoint is not None:
             self._restore_checkpoint(checkpoint)
 
@@ -609,6 +615,46 @@ class ProviderSubrequestCache:
             shared: Future[ProviderSubrequestResult] = Future()
             shared.set_result(result)
             self._results[subrequest_key] = shared
+            self._keys[subrequest_key] = entry.key
+
+    def _abandoned_result(self, key: ProviderSubrequestKey) -> ProviderSubrequestResult:
+        digest = sha256(
+            f"provider-subrequest-abandoned:{self._run_scope_id}:{key.subrequest_key}".encode()
+        ).hexdigest()
+        return ProviderSubrequestResult(
+            key=key,
+            value=None,
+            artifact=None,
+            outcome=ProviderSubrequestOutcome(
+                kind=ProviderSubrequestOutcomeKind.ABANDONED,
+                retryable=False,
+            ),
+            sequence_id=f"provider-request-sequence=sha256:{digest}",
+            attempt_events=(),
+        )
+
+    def interrupt(self) -> None:
+        """Stop accepting work and terminalize every pending cache future once."""
+
+        self._stop_signal.set()
+        with self._lock:
+            if self._interrupted:
+                return
+            self._interrupted = True
+            for subrequest_key, shared in self._results.items():
+                if not shared.done():
+                    shared.set_result(
+                        self._abandoned_result(self._keys[subrequest_key])
+                    )
+
+    def close(self) -> None:
+        """Close this run cache idempotently without changing completed entries."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.interrupt()
 
     def execute(
         self,
@@ -622,7 +668,7 @@ class ProviderSubrequestCache:
         max_physical_attempts: int = 1,
         operation: str,
         media_type: str,
-        physical_request: Callable[[], bytes],
+        physical_request: Callable[[], bytes | PhysicalAttemptNotMade[bytes]],
     ) -> ProviderSubrequestResult:
         if (
             not isinstance(max_physical_attempts, int)
@@ -633,18 +679,29 @@ class ProviderSubrequestCache:
                 ProviderSubrequestCacheFailureReason.EXECUTION_INVALID
             )
         with self._lock:
+            if self._closed or self._interrupted or self._stop_signal.is_set():
+                return self._abandoned_result(key)
             shared = self._results.get(key.subrequest_key)
             is_leader = shared is None
             if shared is None:
                 shared = Future()
                 self._results[key.subrequest_key] = shared
+                self._keys[key.subrequest_key] = key
         if not is_leader:
             return shared.result()
 
         try:
-            def typed_physical_request() -> dict[str, object]:
+            def typed_physical_request() -> (
+                dict[str, object] | PhysicalAttemptNotMade[dict[str, object]]
+            ):
+                if self._stop_signal.is_set():
+                    raise PhysicalAttemptFailure(
+                        outcome=PhysicalAttemptOutcome.ABANDONED,
+                        retryable=False,
+                        error_code="run_interrupted",
+                    )
                 try:
-                    value = physical_request()
+                    physical_value = physical_request()
                 except PhysicalAttemptFailure:
                     raise
                 except Exception as exc:
@@ -653,6 +710,8 @@ class ProviderSubrequestCache:
                         retryable=False,
                         error_code="provider_error",
                     ) from exc
+                no_io = isinstance(physical_value, PhysicalAttemptNotMade)
+                value = physical_value.value if no_io else physical_value
                 if not isinstance(value, bytes):
                     raise PhysicalAttemptFailure(
                         outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
@@ -665,11 +724,20 @@ class ProviderSubrequestCache:
                         retryable=False,
                         error_code="empty_transport_result",
                     )
+                if self._stop_signal.is_set():
+                    raise PhysicalAttemptFailure(
+                        outcome=PhysicalAttemptOutcome.ABANDONED,
+                        retryable=False,
+                        error_code="run_interrupted",
+                    )
                 artifact = self._artifact_store.install(
                     value,
                     media_type=media_type,
                 )
-                return artifact.model_dump(mode="json")
+                artifact_payload = artifact.model_dump(mode="json")
+                if no_io:
+                    return PhysicalAttemptNotMade(artifact_payload)
+                return artifact_payload
 
             coordinated = self._coordinator.execute_retry_sequence(
                 request_key=key.subrequest_key,
@@ -724,10 +792,18 @@ class ProviderSubrequestCache:
             safe_error = ProviderSubrequestCacheError(
                 ProviderSubrequestCacheFailureReason.EXECUTION_INVALID
             )
-            shared.set_exception(safe_error)
+            with self._lock:
+                if shared.done():
+                    return shared.result()
+                shared.set_exception(safe_error)
             raise safe_error from exc
-        shared.set_result(result)
-        return result
+        with self._lock:
+            if shared.done():
+                return shared.result()
+            if self._stop_signal.is_set():
+                result = self._abandoned_result(key)
+            shared.set_result(result)
+            return result
 
 
 __all__ = [

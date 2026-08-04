@@ -79,6 +79,8 @@ from tradingagents.evidence import (
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.qualified_routing_composition import (
+    ProductionQualifiedRoutingRunBinding,
+    ProductionQualifiedRoutingRuntime,
     RegisteredProductionQualifiedRoutingComposition,
 )
 from tradingagents.reporting import write_report_tree
@@ -379,6 +381,14 @@ class TradingAgentsGraph:
         self.asset_configuration = asset_configuration
         self.capability_routing_plan = capability_routing_plan
         self.qualified_financial_routing = qualified_financial_routing
+        self._managed_qualified_routing_composition = (
+            qualified_financial_routing
+            if isinstance(
+                qualified_financial_routing,
+                RegisteredProductionQualifiedRoutingComposition,
+            )
+            else None
+        )
         self.decision_policy = (
             decision_policy
             if decision_policy is not None
@@ -482,6 +492,7 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+        self._active_checkpointer = None
 
     @staticmethod
     def _instrument_kind_for_asset_type(
@@ -689,6 +700,70 @@ class TradingAgentsGraph:
                 ),
             ),
         }
+
+    def bind_qualified_routing_runtime(
+        self,
+        *,
+        run_id: str,
+        checkpoint_compatibility_known: bool,
+    ) -> ProductionQualifiedRoutingRuntime | None:
+        """Bind and install the one managed run after checkpoint compatibility."""
+
+        composition = getattr(
+            self,
+            "_managed_qualified_routing_composition",
+            None,
+        )
+        if composition is None:
+            return None
+        if checkpoint_compatibility_known is not True:
+            raise ValueError("qualified runtime requires known checkpoint compatibility")
+        asset_configuration = self.asset_configuration
+        routing_plan = self.capability_routing_plan
+        if asset_configuration is None or routing_plan is None:
+            raise ValueError("qualified runtime requires authoritative run bindings")
+        try:
+            runtime = composition.bind_run(
+                ProductionQualifiedRoutingRunBinding(
+                    run_id=run_id,
+                    asset_configuration=asset_configuration,
+                    routing_plan=routing_plan,
+                    checkpoint_compatibility_known=True,
+                )
+            )
+            if not isinstance(runtime, ProductionQualifiedRoutingRuntime):
+                raise ValueError("qualified runtime binding returned an invalid handle")
+            if self.qualified_financial_routing is not runtime.financial_routing:
+                self.qualified_financial_routing = runtime.financial_routing
+                self.tool_nodes = self._create_tool_nodes()
+                self.graph_setup.tool_nodes = self.tool_nodes
+                self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
+                self.graph = self.workflow.compile(
+                    checkpointer=getattr(self, "_active_checkpointer", None)
+                )
+            return runtime
+        except BaseException:
+            composition.interrupt()
+            composition.close()
+            raise
+
+    def interrupt_qualified_routing_runtime(self) -> None:
+        composition = getattr(
+            self,
+            "_managed_qualified_routing_composition",
+            None,
+        )
+        if composition is not None:
+            composition.interrupt()
+
+    def close_qualified_routing_runtime(self) -> None:
+        composition = getattr(
+            self,
+            "_managed_qualified_routing_composition",
+            None,
+        )
+        if composition is not None:
+            composition.close()
 
     def route_mainland_financial_capability(
         self,
@@ -1022,6 +1097,7 @@ class TradingAgentsGraph:
 
         signature = self._run_signature(asset_type)
         with get_checkpointer(self.config["data_cache_dir"], company_name) as saver:
+            self._active_checkpointer = saver
             self.graph = self.workflow.compile(checkpointer=saver)
             try:
                 def graph_config_for(run_signature: str) -> dict[str, Any]:
@@ -1235,6 +1311,7 @@ class TradingAgentsGraph:
                     run_signature=selected_signature,
                 )
             finally:
+                self._active_checkpointer = None
                 self.graph = self.workflow.compile()
 
     def clear_run_checkpoint(
@@ -1286,26 +1363,32 @@ class TradingAgentsGraph:
                 source_ref=asset_configuration.registry_source_ref,
             )
         self.ticker = company_name
-        with (
-            TradingAgentsGraph.checkpoint_scope(
-                self,
-                company_name,
-                str(trade_date),
-                effective_asset_type,
-            ) as checkpoint_session,
-            authoritative_snapshot_run(asset_configuration=asset_configuration),
-        ):
-            return self._run_graph(
-                company_name,
-                trade_date,
-                asset_type=effective_asset_type,
-                resume_from_checkpoint=checkpoint_session.resume_from_checkpoint,
-                checkpoint_graph_config=checkpoint_session.graph_config,
-                routing_checkpoint_compatibility=(
-                    checkpoint_session.routing_compatibility
-                ),
-                checkpoint_run_signature=checkpoint_session.run_signature,
-            )
+        try:
+            with (
+                TradingAgentsGraph.checkpoint_scope(
+                    self,
+                    company_name,
+                    str(trade_date),
+                    effective_asset_type,
+                ) as checkpoint_session,
+                authoritative_snapshot_run(asset_configuration=asset_configuration),
+            ):
+                return self._run_graph(
+                    company_name,
+                    trade_date,
+                    asset_type=effective_asset_type,
+                    resume_from_checkpoint=checkpoint_session.resume_from_checkpoint,
+                    checkpoint_graph_config=checkpoint_session.graph_config,
+                    routing_checkpoint_compatibility=(
+                        checkpoint_session.routing_compatibility
+                    ),
+                    checkpoint_run_signature=checkpoint_session.run_signature,
+                )
+        except BaseException:
+            self.interrupt_qualified_routing_runtime()
+            raise
+        finally:
+            self.close_qualified_routing_runtime()
 
     def save_reports(self, final_state, ticker, save_path=None) -> Path:
         """Write the markdown report tree for a completed run, like the CLI does.
@@ -1374,6 +1457,10 @@ class TradingAgentsGraph:
                 )
             initial_merge_state = init_agent_state
             run_id = init_agent_state["run_id"]
+        self.bind_qualified_routing_runtime(
+            run_id=run_id,
+            checkpoint_compatibility_known=True,
+        )
         telemetry_ledger = get_active_run_telemetry()
         telemetry_callbacks = (
             [RunTelemetryCallbackHandler(telemetry_ledger)]

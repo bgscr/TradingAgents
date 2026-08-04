@@ -83,6 +83,66 @@ def test_tushare_attempt_persists_account_identity_and_endpoint_capacity_scope(
 
 
 @pytest.mark.unit
+def test_coordinator_single_flight_futures_are_instance_owned(tmp_path) -> None:
+    config = _config(tmp_path)
+    with (
+        MarketHistoryStore.open(config) as first_store,
+        MarketHistoryStore.open(config) as second_store,
+    ):
+        first = ProviderRequestCoordinator(first_store)
+        second = ProviderRequestCoordinator(second_store)
+
+        assert first._single_flights is not second._single_flights
+
+
+@pytest.mark.unit
+def test_interrupt_terminalizes_owned_single_flight_future(tmp_path) -> None:
+    config = _config(tmp_path)
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    request_started = Event()
+    release_request = Event()
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service("upstream:yahoo", "Yahoo Finance")
+
+        def physical_request() -> str:
+            request_started.set()
+            assert release_request.wait(timeout=5)
+            return "late-result"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            leader = executor.submit(
+                coordinator.execute_direct_physical_request,
+                request_key="provider-subrequest:v1:interrupt-owned-future",
+                upstream_service_id="upstream:yahoo",
+                owner_id="ticket-04-test",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="qualified-yahoo",
+                physical_request=physical_request,
+            )
+            assert request_started.wait(timeout=5)
+            with coordinator._single_flight_lock:
+                owned_future = next(iter(coordinator._single_flights.values()))
+
+            coordinator.interrupt()
+
+            assert owned_future.done()
+            with pytest.raises(PhysicalAttemptBudgetExhausted) as terminal:
+                owned_future.result()
+            assert terminal.value.failure.outcome is PhysicalAttemptOutcome.ABANDONED
+            release_request.set()
+            with pytest.raises(PhysicalAttemptBudgetExhausted) as stopped:
+                leader.result(timeout=5)
+            assert stopped.value.failure.outcome is PhysicalAttemptOutcome.ABANDONED
+        coordinator.close()
+
+        assert coordinator._single_flights == {}
+
+
+@pytest.mark.unit
 def test_tushare_global_and_endpoint_cooldowns_have_distinct_scope(tmp_path) -> None:
     now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
     config = _config(tmp_path)
@@ -1402,6 +1462,146 @@ def test_direct_physical_attempt_persists_initial_pacing_wait(tmp_path) -> None:
     assert paced.physical_attempt_count == 1
     assert paced.attempt_events[0].pacing_event == "paced_then_permit_acquired"
     assert paced.attempt_events[0].pacing_wait_seconds == 9
+
+
+@pytest.mark.unit
+def test_managed_coordinator_pacing_wait_observes_stop_and_closes_peer_connection(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    started_at = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    stop_signal = Event()
+    pacing_wait_started = Event()
+    transport_calls = 0
+
+    def stop_wait(_seconds: float) -> bool:
+        pacing_wait_started.set()
+        return stop_signal.wait(timeout=5)
+
+    def physical_request() -> str:
+        nonlocal transport_calls
+        transport_calls += 1
+        return "available-frame"
+
+    with MarketHistoryStore.open(config) as store:
+        coordinator = ProviderRequestCoordinator(
+            store,
+            stop_signal=stop_signal,
+            stop_wait=stop_wait,
+        )
+        coordinator.register_upstream_service(
+            "upstream:eastmoney",
+            "Eastmoney push2his",
+        )
+        coordinator.configure_operator_ceiling(
+            upstream_service_id="upstream:eastmoney",
+            minimum_interval=timedelta(seconds=60),
+            allow_prewarming=False,
+            configured_at=started_at,
+        )
+        coordinator.execute_direct_physical_request(
+            request_key="history:600519.SS:first-managed",
+            upstream_service_id="upstream:eastmoney",
+            owner_id="process-a",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: started_at,
+            sleep=lambda _seconds: pytest.fail("managed wait must use the stop signal"),
+            lease_duration=timedelta(seconds=30),
+            operation="current-market-frame",
+            physical_request=physical_request,
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                coordinator.execute_direct_physical_request,
+                request_key="history:000001.SZ:interrupted-managed",
+                upstream_service_id="upstream:eastmoney",
+                owner_id="process-b",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: started_at + timedelta(seconds=1),
+                sleep=lambda _seconds: pytest.fail(
+                    "managed wait must use the stop signal"
+                ),
+                lease_duration=timedelta(seconds=30),
+                operation="current-market-frame",
+                physical_request=physical_request,
+            )
+            assert pacing_wait_started.wait(timeout=5)
+            stop_signal.set()
+            coordinator.interrupt()
+            with pytest.raises(PhysicalAttemptBudgetExhausted) as captured:
+                future.result(timeout=5)
+
+        summary = coordinator.operational_summary(
+            now=started_at + timedelta(seconds=1)
+        )
+        peer_count_before_close = coordinator.active_peer_connection_count
+        coordinator.close()
+        coordinator.close()
+
+    assert captured.value.failure.outcome is PhysicalAttemptOutcome.ABANDONED
+    assert transport_calls == 1
+    assert summary.active_leases == 0
+    assert summary.queued_requests == 0
+    assert peer_count_before_close == 1
+    assert coordinator.active_peer_connection_count == 0
+
+
+@pytest.mark.unit
+def test_managed_singleflight_follower_observes_stop_before_leader_returns(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    stop_signal = Event()
+    physical_started = Event()
+    allow_physical_return = Event()
+    follower_entered = Event()
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store, stop_signal=stop_signal)
+        coordinator.register_upstream_service("upstream:yahoo", "Yahoo Finance")
+
+        def invoke(owner_id: str):
+            if owner_id == "follower":
+                follower_entered.set()
+
+            def physical_attempt(_attempt_index: int) -> str:
+                physical_started.set()
+                assert allow_physical_return.wait(timeout=5)
+                return "late-result"
+
+            return coordinator.execute_retry_sequence(
+                request_key="history:BTC-USD:managed-stop",
+                upstream_service_id="upstream:yahoo",
+                owner_id=owner_id,
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                max_physical_attempts=1,
+                operation="market-snapshot",
+                physical_attempt=physical_attempt,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(invoke, "leader")
+            assert physical_started.wait(timeout=5)
+            follower = executor.submit(invoke, "follower")
+            assert follower_entered.wait(timeout=5)
+            coordinator.interrupt()
+            with pytest.raises(PhysicalAttemptBudgetExhausted) as follower_failure:
+                follower.result(timeout=5)
+            assert not allow_physical_return.is_set()
+            allow_physical_return.set()
+            with pytest.raises(PhysicalAttemptBudgetExhausted) as leader_failure:
+                leader.result(timeout=5)
+
+        summary = coordinator.operational_summary(now=now)
+        coordinator.close()
+
+    assert follower_failure.value.failure.outcome is PhysicalAttemptOutcome.ABANDONED
+    assert leader_failure.value.failure.outcome is PhysicalAttemptOutcome.ABANDONED
+    assert summary.active_leases == 0
 
 
 @pytest.mark.unit

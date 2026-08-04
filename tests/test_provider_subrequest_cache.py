@@ -41,6 +41,7 @@ from tradingagents.market_history import (
     MarketHistoryMode,
     MarketHistoryStore,
     PhysicalAttemptFailure,
+    PhysicalAttemptNotMade,
     PhysicalAttemptOutcome,
     ProviderRequestCoordinator,
     RequestPriority,
@@ -241,6 +242,48 @@ def test_identical_subrequests_share_one_inflight_and_terminal_physical_attempt(
     assert persisted_handoff is not None
     assert b'"type":"bytes"' not in persisted_handoff[0]
     assert b"provider-subrequest-artifact=sha256:" in persisted_handoff[0]
+
+
+@pytest.mark.unit
+def test_no_io_terminal_payload_is_cached_without_physical_attempt(tmp_path) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(
+                tmp_path / "subrequest-artifacts"
+            ),
+            run_scope_id="ticket-04-no-io-terminal",
+        )
+
+        result = cache.execute(
+            key,
+            owner_id="ticket-04-test",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="qualified-source-not-configured",
+            media_type="application/json",
+            physical_request=lambda: PhysicalAttemptNotMade(
+                b'{"kind":"unavailable"}'
+            ),
+        )
+        attempts = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+    assert result.outcome.kind is ProviderSubrequestOutcomeKind.AVAILABLE
+    assert result.value == b'{"kind":"unavailable"}'
+    assert result.attempt_events == ()
+    assert attempts == (0,)
 
 
 @pytest.mark.unit
@@ -1030,3 +1073,115 @@ def test_raw_provider_exception_text_never_crosses_cache_boundary(tmp_path) -> N
 
     assert result.outcome.kind is ProviderSubrequestOutcomeKind.PROVIDER_ERROR
     assert unsafe_text not in checkpoint_text
+
+
+@pytest.mark.unit
+def test_interrupted_cache_rejects_new_work_without_a_physical_attempt(tmp_path) -> None:
+    now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    stop_signal = Event()
+    physical_calls = 0
+
+    def physical_request() -> bytes:
+        nonlocal physical_calls
+        physical_calls += 1
+        return b'{"must":"not-run"}'
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store, stop_signal=stop_signal)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(
+                tmp_path / "subrequest-artifacts"
+            ),
+            run_scope_id="ticket-04-stopped-cache",
+            stop_signal=stop_signal,
+        )
+
+        cache.interrupt()
+        cache.interrupt()
+        result = cache.execute(
+            key,
+            owner_id="stopped-cache",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            media_type="application/json",
+            physical_request=physical_request,
+        )
+        cache.close()
+        cache.close()
+
+    assert stop_signal.is_set()
+    assert physical_calls == 0
+    assert result.outcome.kind is ProviderSubrequestOutcomeKind.ABANDONED
+    assert result.value is None
+    assert result.artifact is None
+
+
+@pytest.mark.unit
+def test_inflight_result_cannot_publish_available_after_interruption(tmp_path) -> None:
+    now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    stop_signal = Event()
+    physical_started = Event()
+    allow_physical_return = Event()
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store, stop_signal=stop_signal)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        artifact_store = ProviderSubrequestArtifactStore(
+            tmp_path / "subrequest-artifacts"
+        )
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-04-inflight-stop",
+            stop_signal=stop_signal,
+        )
+
+        def physical_request() -> bytes:
+            physical_started.set()
+            assert allow_physical_return.wait(timeout=5)
+            return b'{"late":"result"}'
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                cache.execute,
+                key,
+                owner_id="inflight-stop",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now,
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="financial-statement:income",
+                media_type="application/json",
+                physical_request=physical_request,
+            )
+            assert physical_started.wait(timeout=5)
+            cache.interrupt()
+            allow_physical_return.set()
+            result = future.result(timeout=5)
+
+        checkpoint = cache.checkpoint()
+        active_leases = coordinator.operational_summary(now=now).active_leases
+        cache.close()
+        coordinator.close()
+
+    assert result.outcome.kind is ProviderSubrequestOutcomeKind.ABANDONED
+    assert result.value is None
+    assert result.artifact is None
+    assert checkpoint["entries"][0]["outcome"]["kind"] == "abandoned"
+    assert active_leases == 0
+    assert not tuple((tmp_path / "subrequest-artifacts").rglob("*.bin"))

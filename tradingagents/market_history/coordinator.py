@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -318,13 +318,110 @@ class ProviderRequestOperationalSummary:
 class ProviderRequestCoordinator:
     """Cross-process SQLite lease and cooldown authority for provider requests."""
 
-    def __init__(self, store: MarketHistoryStore) -> None:
+    def __init__(
+        self,
+        store: MarketHistoryStore,
+        *,
+        stop_signal: threading.Event | None = None,
+        stop_wait: Callable[[float], bool] | None = None,
+    ) -> None:
         self._store = store
         self._store_thread_id = threading.get_ident()
         self._thread_state = threading.local()
+        self._stop_signal = stop_signal or threading.Event()
+        self._stop_wait = (
+            stop_wait
+            if stop_wait is not None
+            else (self._stop_signal.wait if stop_signal is not None else None)
+        )
+        self._single_flight_lock = threading.Lock()
+        self._single_flights: dict[tuple[str, str, str], Future[object]] = {}
+        self._lifecycle_lock = threading.RLock()
+        self._peer_connections: set[sqlite3.Connection] = set()
+        self._interrupted = False
+        self._closed = False
+
+    @property
+    def active_peer_connection_count(self) -> int:
+        with self._lifecycle_lock:
+            return len(self._peer_connections)
+
+    def _abandoned_failure(self) -> PhysicalAttemptFailure:
+        return PhysicalAttemptFailure(
+            outcome=PhysicalAttemptOutcome.ABANDONED,
+            retryable=False,
+            error_code="run_interrupted",
+        )
+
+    def _abandoned_budget_error(self) -> PhysicalAttemptBudgetExhausted:
+        return PhysicalAttemptBudgetExhausted(
+            sequence_id="",
+            failure=self._abandoned_failure(),
+            attempt_events=(),
+        )
+
+    def _terminalize_single_flights(self) -> None:
+        with self._single_flight_lock:
+            futures = tuple(self._single_flights.values())
+            self._single_flights.clear()
+            for shared in futures:
+                if not shared.done():
+                    shared.set_exception(self._abandoned_budget_error())
+
+    def _raise_if_stopped(
+        self,
+        *,
+        sequence_id: str = "",
+        attempt_events: tuple[ProviderPhysicalAttemptEvent, ...] = (),
+    ) -> None:
+        with self._lifecycle_lock:
+            stopped = self._closed or self._interrupted
+        if stopped or self._stop_signal.is_set():
+            raise PhysicalAttemptBudgetExhausted(
+                sequence_id=sequence_id,
+                failure=self._abandoned_failure(),
+                attempt_events=attempt_events,
+            )
+
+    def _wait_or_raise_if_stopped(
+        self,
+        wait_seconds: float,
+        *,
+        sleep: Callable[[float], None],
+        sequence_id: str = "",
+    ) -> None:
+        self._raise_if_stopped(sequence_id=sequence_id)
+        if self._stop_wait is None:
+            sleep(wait_seconds)
+        elif self._stop_wait(wait_seconds):
+            self._raise_if_stopped(sequence_id=sequence_id)
+        self._raise_if_stopped(sequence_id=sequence_id)
+
+    def interrupt(self) -> None:
+        self._stop_signal.set()
+        with self._lifecycle_lock:
+            if self._interrupted:
+                return
+            self._interrupted = True
+        self._terminalize_single_flights()
+
+    def close(self) -> None:
+        self._stop_signal.set()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            connections = tuple(self._peer_connections)
+            self._peer_connections.clear()
+        self._terminalize_single_flights()
+        for connection in connections:
+            connection.close()
 
     def _database_connection(self) -> sqlite3.Connection:
         """Use the store connection on its owner thread and a local peer elsewhere."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("provider_request_coordinator_closed")
         if threading.get_ident() == self._store_thread_id:
             return self._store._connection
         connection = getattr(self._thread_state, "connection", None)
@@ -333,12 +430,18 @@ class ProviderRequestCoordinator:
                 self._store.config.database_path,
                 isolation_level=None,
                 timeout=30.0,
+                check_same_thread=False,
             )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("PRAGMA busy_timeout = 30000")
             self._thread_state.connection = connection
+            with self._lifecycle_lock:
+                if self._closed:
+                    connection.close()
+                    raise RuntimeError("provider_request_coordinator_closed")
+                self._peer_connections.add(connection)
         return connection
 
     def register_upstream_service(
@@ -849,6 +952,7 @@ class ProviderRequestCoordinator:
             raise ValueError("physical-attempt budget must be positive")
         if not operation.strip():
             raise ValueError("physical-attempt operation must not be blank")
+        self._raise_if_stopped()
         flight_key = (
             str(self._store.config.database_path),
             upstream_service_id,
@@ -863,7 +967,12 @@ class ProviderRequestCoordinator:
             else:
                 leader = False
         if not leader:
-            return shared.result()  # type: ignore[return-value]
+            while True:
+                self._raise_if_stopped()
+                try:
+                    return shared.result(timeout=0.05)  # type: ignore[return-value]
+                except FutureTimeoutError:
+                    continue
 
         try:
             result = self._execute_retry_sequence_as_leader(
@@ -882,10 +991,24 @@ class ProviderRequestCoordinator:
                 wait_for_initial_pacing=_wait_for_initial_pacing,
             )
         except BaseException as exc:
-            shared.set_exception(exc)
+            with self._single_flight_lock:
+                if shared.done():
+                    terminal_error = shared.exception()
+                else:
+                    shared.set_exception(exc)
+                    terminal_error = None
+            if terminal_error is not None:
+                raise terminal_error from None
             raise
         else:
-            shared.set_result(result)
+            with self._single_flight_lock:
+                if shared.done():
+                    terminal_error = shared.exception()
+                else:
+                    shared.set_result(result)
+                    terminal_error = None
+            if terminal_error is not None:
+                raise terminal_error from None
             return result
         finally:
             with self._single_flight_lock:
@@ -943,6 +1066,7 @@ class ProviderRequestCoordinator:
         started_at = _as_utc(now(), label="coordinator time")
         initial_pacing_wait_seconds = 0.0
         while True:
+            self._raise_if_stopped()
             decision = self.acquire(
                 request_key=request_key,
                 upstream_service_id=upstream_service_id,
@@ -961,7 +1085,14 @@ class ProviderRequestCoordinator:
                     0.0,
                     (decision.cooldown_until - started_at).total_seconds(),
                 )
-                sleep(wait_seconds)
+                try:
+                    self._wait_or_raise_if_stopped(wait_seconds, sleep=sleep)
+                except PhysicalAttemptBudgetExhausted:
+                    self.cancel_queued_request(
+                        request_key=request_key,
+                        upstream_service_id=upstream_service_id,
+                    )
+                    raise
                 initial_pacing_wait_seconds += wait_seconds
                 started_at = max(
                     _as_utc(now(), label="coordinator time"),
@@ -1004,6 +1135,10 @@ class ProviderRequestCoordinator:
         self._create_retry_sequence(sequence_id, lease)
         try:
             for attempt_index in range(1, max_physical_attempts + 1):
+                self._raise_if_stopped(
+                    sequence_id=sequence_id,
+                    attempt_events=self.physical_attempt_events(sequence_id),
+                )
                 requested_at = _as_utc(now(), label="physical-attempt time")
                 earliest_at = self.earliest_physical_attempt_at(
                     lease,
@@ -1043,7 +1178,11 @@ class ProviderRequestCoordinator:
                         lease_duration.total_seconds() / 2,
                         (earliest_at - attempted_at).total_seconds(),
                     )
-                    sleep(wait_seconds)
+                    self._wait_or_raise_if_stopped(
+                        wait_seconds,
+                        sleep=sleep,
+                        sequence_id=sequence_id,
+                    )
                     attempted_at = max(
                         _as_utc(now(), label="physical-attempt time"),
                         attempted_at + timedelta(seconds=wait_seconds),
@@ -1083,6 +1222,8 @@ class ProviderRequestCoordinator:
                     _pacing_wait_seconds=pacing_wait_seconds,
                 ) -> None:
                     nonlocal attempt_recorded, attempted_at, diagnostic_id
+                    if self._stop_signal.is_set():
+                        raise self._abandoned_failure()
                     if attempt_recorded:
                         raise RuntimeError(
                             "one coordinator permit cannot record multiple physical attempts"
@@ -1115,6 +1256,10 @@ class ProviderRequestCoordinator:
                     attempted_at = io_at
                     attempt_recorded = True
 
+                self._raise_if_stopped(
+                    sequence_id=sequence_id,
+                    attempt_events=self.physical_attempt_events(sequence_id),
+                )
                 if not record_at_physical_io:
                     record_attempt_at_io_boundary()
                 recorder_token = _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER.set(
@@ -1122,7 +1267,11 @@ class ProviderRequestCoordinator:
                 )
                 try:
                     try:
+                        if self._stop_signal.is_set():
+                            raise self._abandoned_failure()
                         value = physical_attempt(attempt_index)
+                        if self._stop_signal.is_set():
+                            raise self._abandoned_failure()
                     finally:
                         _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER.reset(recorder_token)
                 except PhysicalAttemptFailure as failure:
@@ -1503,7 +1652,7 @@ class ProviderRequestCoordinator:
                     failure=failure,
                     attempt_events=(),
                 )
-            sleep(0.05)
+            self._wait_or_raise_if_stopped(0.05, sleep=sleep)
 
     def _load_persisted_sequence(self, row: tuple[object, ...]) -> CoordinatedRequestResult[T]:
         sequence_id = str(row[0])
@@ -1890,5 +2039,3 @@ class ProviderRequestCoordinator:
         )
         if cursor.rowcount not in (0, 1):
             raise RuntimeError("queued request cancellation affected multiple rows")
-    _single_flight_lock = threading.Lock()
-    _single_flights: dict[tuple[str, str, str], Future[object]] = {}
