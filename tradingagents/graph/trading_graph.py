@@ -698,6 +698,16 @@ class TradingAgentsGraph:
                     if qualified_financial_tool_routing is not None
                     else None
                 ),
+                qualified_provider_subrequest_cache=(
+                    qualified_financial_tool_routing.provider_subrequest_cache
+                    if qualified_financial_tool_routing is not None
+                    else None
+                ),
+                restored_shadow_dispatcher=(
+                    qualified_financial_tool_routing.restored_shadow_dispatcher
+                    if qualified_financial_tool_routing is not None
+                    else None
+                ),
             ),
         }
 
@@ -706,6 +716,9 @@ class TradingAgentsGraph:
         *,
         run_id: str,
         checkpoint_compatibility_known: bool,
+        resume_from_checkpoint: bool = False,
+        checkpoint_thread_id: str | None = None,
+        checkpoint_state: Mapping[str, Any] | None = None,
     ) -> ProductionQualifiedRoutingRuntime | None:
         """Bind and install the one managed run after checkpoint compatibility."""
 
@@ -722,6 +735,13 @@ class TradingAgentsGraph:
         routing_plan = self.capability_routing_plan
         if asset_configuration is None or routing_plan is None:
             raise ValueError("qualified runtime requires authoritative run bindings")
+        financial_tool_node = getattr(self, "tool_nodes", {}).get("fundamentals")
+        restore_financial_dispatcher = (
+            financial_tool_node.restore_shadow_dispatcher
+            if resume_from_checkpoint
+            and isinstance(financial_tool_node, FinancialDispatchToolNode)
+            else None
+        )
         try:
             runtime = composition.bind_run(
                 ProductionQualifiedRoutingRunBinding(
@@ -729,6 +749,10 @@ class TradingAgentsGraph:
                     asset_configuration=asset_configuration,
                     routing_plan=routing_plan,
                     checkpoint_compatibility_known=True,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    checkpoint_thread_id=checkpoint_thread_id,
+                    checkpoint_state=checkpoint_state,
+                    restore_financial_dispatcher=restore_financial_dispatcher,
                 )
             )
             if not isinstance(runtime, ProductionQualifiedRoutingRuntime):
@@ -1460,6 +1484,11 @@ class TradingAgentsGraph:
         self.bind_qualified_routing_runtime(
             run_id=run_id,
             checkpoint_compatibility_known=True,
+            resume_from_checkpoint=resume_from_checkpoint,
+            checkpoint_thread_id=checkpoint_thread_id,
+            checkpoint_state=(
+                initial_merge_state if resume_from_checkpoint else None
+            ),
         )
         telemetry_ledger = get_active_run_telemetry()
         telemetry_callbacks = (

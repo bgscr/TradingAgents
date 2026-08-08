@@ -276,6 +276,28 @@ def test_no_io_terminal_payload_is_cached_without_physical_attempt(tmp_path) -> 
                 b'{"kind":"unavailable"}'
             ),
         )
+        checkpoint = cache.checkpoint()
+        restored_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(
+                tmp_path / "subrequest-artifacts"
+            ),
+            run_scope_id="ticket-04-no-io-terminal",
+            checkpoint=checkpoint,
+        )
+        restored = restored_cache.execute(
+            key,
+            owner_id="ticket-05-resumed",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now + timedelta(seconds=1),
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="qualified-source-not-configured",
+            media_type="application/json",
+            physical_request=lambda: pytest.fail(
+                "restored no-I/O terminal must not execute provider work"
+            ),
+        )
         attempts = store._connection.execute(
             "SELECT COUNT(*) FROM provider_request_attempts"
         ).fetchone()
@@ -283,6 +305,132 @@ def test_no_io_terminal_payload_is_cached_without_physical_attempt(tmp_path) -> 
     assert result.outcome.kind is ProviderSubrequestOutcomeKind.AVAILABLE
     assert result.value == b'{"kind":"unavailable"}'
     assert result.attempt_events == ()
+    assert result.sequence_id.startswith("provider-request-sequence=sha256:")
+    assert restored == result
+    assert attempts == (0,)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("blocked_by", "expected_kind"),
+    (
+        ("cooldown", ProviderSubrequestOutcomeKind.RATE_LIMITED),
+        ("operator_policy", ProviderSubrequestOutcomeKind.UPSTREAM_BUSY),
+    ),
+)
+def test_zero_attempt_coordinator_skip_restores_terminal_unavailable_without_io(
+    tmp_path,
+    blocked_by: str,
+    expected_kind: ProviderSubrequestOutcomeKind,
+) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    physical_calls = 0
+    artifact_store = ProviderSubrequestArtifactStore(
+        tmp_path / "subrequest-artifacts"
+    )
+
+    def physical_request() -> bytes:
+        nonlocal physical_calls
+        physical_calls += 1
+        return b'{"must_not":"run"}'
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        priority = RequestPriority.INTERACTIVE_MAINLAND
+        if blocked_by == "cooldown":
+            coordinator.record_rate_limit(
+                upstream_service_id=key.upstream_service_id,
+                cooldown_scope=key.capacity_scope,
+                observed_at=now,
+                retry_after=timedelta(seconds=60),
+                provider_code="TUSHARE_HTTP_429",
+            )
+        else:
+            priority = RequestPriority.CONFIGURED_PREWARMING
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id=f"ticket-05-zero-attempt-{blocked_by}",
+        )
+
+        original = cache.execute(
+            key,
+            owner_id="original",
+            priority=priority,
+            now=lambda: now + timedelta(seconds=1),
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            media_type="application/json",
+            physical_request=physical_request,
+        )
+        checkpoint = cache.checkpoint()
+        restored_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            checkpoint=checkpoint,
+            run_scope_id=f"ticket-05-zero-attempt-{blocked_by}",
+        )
+        restored = restored_cache.execute(
+            key,
+            owner_id="resumed",
+            priority=priority,
+            now=lambda: now + timedelta(seconds=2),
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            media_type="application/json",
+            physical_request=lambda: pytest.fail(
+                "restored terminal cooldown must perform zero provider I/O"
+            ),
+        )
+        attempts = store._connection.execute(
+            "SELECT COUNT(*) FROM provider_request_attempts"
+        ).fetchone()
+
+        if blocked_by == "cooldown":
+            corruptions = (
+                {"outcome": {"kind": "provider_error", "retryable": False}},
+                {"outcome": {"retryable": False}},
+                {"outcome": {"status_code": 429}},
+                {
+                    "sequence_id": (
+                        "provider-request-sequence=sha256:" + "f" * 64
+                    )
+                },
+            )
+            for changes in corruptions:
+                invalid_checkpoint = copy.deepcopy(checkpoint)
+                entry = invalid_checkpoint["entries"][0]
+                if "outcome" in changes:
+                    entry["outcome"].update(changes["outcome"])
+                if "sequence_id" in changes:
+                    entry["sequence_id"] = changes["sequence_id"]
+                with pytest.raises(ProviderSubrequestCacheError) as exc_info:
+                    ProviderSubrequestCache(
+                        coordinator=coordinator,
+                        artifact_store=artifact_store,
+                        checkpoint=invalid_checkpoint,
+                        run_scope_id="ticket-05-zero-attempt-cooldown",
+                    )
+                assert exc_info.value.reason is (
+                    ProviderSubrequestCacheFailureReason.MALFORMED_CHECKPOINT
+                )
+
+    assert physical_calls == 0
+    assert original.sequence_id == ""
+    assert original.attempt_events == ()
+    assert original.artifact is None
+    assert original.outcome.kind is expected_kind
+    assert original.outcome.retryable is True
+    assert checkpoint["entries"][0]["sequence_id"] == ""
+    assert restored == original
     assert attempts == (0,)
 
 
@@ -400,6 +548,170 @@ def test_checkpoint_resume_reuses_terminal_artifact_and_outcome_without_io(
     assert mismatch_info.value.reason is (
         ProviderSubrequestCacheFailureReason.RUN_SCOPE_MISMATCH
     )
+
+
+@pytest.mark.unit
+def test_restore_blocks_exact_requests_until_terminal_cache_is_published(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    artifact_store = ProviderSubrequestArtifactStore(
+        tmp_path / "subrequest-artifacts"
+    )
+    artifact_read_started = Event()
+    allow_artifact_read = Event()
+    execute_started = Event()
+    coordinator_called = Event()
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        original_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-05-atomic-restore",
+        )
+        original = original_cache.execute(
+            key,
+            owner_id="original",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            media_type="application/json",
+            physical_request=lambda: b'{"safe_fixture":"atomic-restore"}',
+        )
+        checkpoint = original_cache.checkpoint()
+        restored_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-05-atomic-restore",
+        )
+        read_artifact = artifact_store.read
+
+        def blocked_artifact_read(artifact):
+            artifact_read_started.set()
+            assert allow_artifact_read.wait(timeout=5)
+            return read_artifact(artifact)
+
+        monkeypatch.setattr(artifact_store, "read", blocked_artifact_read)
+        execute_retry_sequence = coordinator.execute_retry_sequence
+
+        def counted_execute_retry_sequence(**kwargs):
+            coordinator_called.set()
+            return execute_retry_sequence(**kwargs)
+
+        monkeypatch.setattr(
+            coordinator,
+            "execute_retry_sequence",
+            counted_execute_retry_sequence,
+        )
+
+        def exact_request():
+            execute_started.set()
+            return restored_cache.execute(
+                key,
+                owner_id="resumed",
+                priority=RequestPriority.INTERACTIVE_MAINLAND,
+                now=lambda: now + timedelta(minutes=1),
+                sleep=lambda _seconds: None,
+                lease_duration=timedelta(seconds=30),
+                operation="financial-statement:income",
+                media_type="application/json",
+                physical_request=lambda: pytest.fail(
+                    "request racing restoration must not perform provider I/O"
+                ),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            restore = executor.submit(restored_cache.restore_checkpoint, checkpoint)
+            assert artifact_read_started.wait(timeout=5)
+            request = executor.submit(exact_request)
+            assert execute_started.wait(timeout=5)
+            assert not coordinator_called.wait(timeout=0.25)
+            allow_artifact_read.set()
+            restore.result(timeout=5)
+            restored = request.result(timeout=5)
+
+    assert restored == original
+    assert not coordinator_called.is_set()
+
+
+@pytest.mark.unit
+def test_interrupt_during_restore_cannot_publish_available_entry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    key = _key()
+    artifact_store = ProviderSubrequestArtifactStore(
+        tmp_path / "subrequest-artifacts"
+    )
+    artifact_read_started = Event()
+    allow_artifact_read = Event()
+    stop_signal = Event()
+
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        coordinator.register_upstream_service(
+            key.upstream_service_id,
+            "Tushare Pro account",
+            account_scope=key.account_scope,
+        )
+        original_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-05-interrupted-restore",
+        )
+        original_cache.execute(
+            key,
+            owner_id="original",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=lambda: now,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+            operation="financial-statement:income",
+            media_type="application/json",
+            physical_request=lambda: b'{"safe_fixture":"interrupted-restore"}',
+        )
+        checkpoint = original_cache.checkpoint()
+        restored_cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-05-interrupted-restore",
+            stop_signal=stop_signal,
+        )
+        read_artifact = artifact_store.read
+
+        def blocked_artifact_read(artifact):
+            artifact_read_started.set()
+            assert allow_artifact_read.wait(timeout=5)
+            return read_artifact(artifact)
+
+        monkeypatch.setattr(artifact_store, "read", blocked_artifact_read)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            restore = executor.submit(restored_cache.restore_checkpoint, checkpoint)
+            assert artifact_read_started.wait(timeout=5)
+            interrupt = executor.submit(restored_cache.interrupt)
+            assert stop_signal.wait(timeout=5)
+            allow_artifact_read.set()
+            with pytest.raises(ProviderSubrequestCacheError) as exc_info:
+                restore.result(timeout=5)
+            interrupt.result(timeout=5)
+
+        restored_checkpoint = restored_cache.checkpoint()
+
+    assert exc_info.value.reason is (
+        ProviderSubrequestCacheFailureReason.UNSAFE_CHECKPOINT_BOUNDARY
+    )
+    assert restored_checkpoint["entries"] == []
 
 
 @pytest.mark.unit

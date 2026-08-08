@@ -30,14 +30,17 @@ from tradingagents.dataflows.financial_capability_routing import (
     MainlandFinancialCapabilityRouter,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
+    FinancialDispatchCheckpointLedger,
     FinancialReportingFrequency,
     FinancialStatementType,
     FinancialToolDispatcher,
     FinancialToolRequest,
     project_financial_selection_evidence,
 )
+from tradingagents.dataflows.provider_subrequests import ProviderSubrequestCache
 from tradingagents.evidence import EvidenceState
 
 _FINANCIAL_TOOL_CONTRACTS = {
@@ -71,6 +74,8 @@ class QualifiedFinancialRoutingComposition:
     indicator_request_factory: (
         Callable[[FinancialToolRequest], FinancialIndicatorRoutingRequest] | None
     ) = None
+    provider_subrequest_cache: ProviderSubrequestCache | None = None
+    restored_shadow_dispatcher: FinancialToolDispatcher | None = None
 
     def __post_init__(self) -> None:
         financial_capabilities = {
@@ -94,6 +99,16 @@ class QualifiedFinancialRoutingComposition:
             raise ValueError(
                 "qualified financial routing requires a qualified_v1 plan"
             )
+        if self.restored_shadow_dispatcher is not None and (
+            self.provider_subrequest_cache is None
+            or not isinstance(
+                self.restored_shadow_dispatcher,
+                FinancialToolDispatcher,
+            )
+        ):
+            raise ValueError(
+                "restored shadow dispatcher requires its run-owned cache"
+            )
 
 
 class FinancialDispatchToolNode:
@@ -116,6 +131,8 @@ class FinancialDispatchToolNode:
             Callable[[FinancialToolRequest], FinancialIndicatorRoutingRequest]
             | None
         ) = None,
+        qualified_provider_subrequest_cache: ProviderSubrequestCache | None = None,
+        restored_shadow_dispatcher: FinancialToolDispatcher | None = None,
     ) -> None:
         has_factory = (
             qualified_statement_request_factory is not None
@@ -155,6 +172,17 @@ class FinancialDispatchToolNode:
         self._qualified_indicator_request_factory = (
             qualified_indicator_request_factory
         )
+        self._qualified_provider_subrequest_cache = (
+            qualified_provider_subrequest_cache
+        )
+        self._restored_shadow_dispatcher = restored_shadow_dispatcher
+        if restored_shadow_dispatcher is not None and (
+            qualified_statement_router is None
+            or qualified_provider_subrequest_cache is None
+        ):
+            raise ValueError(
+                "restored shadow dispatcher requires qualified run wiring"
+            )
 
     def __call__(self, state: Mapping[str, Any]) -> dict[str, Any]:
         messages = state.get("messages") or ()
@@ -210,14 +238,26 @@ class FinancialDispatchToolNode:
                             is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                             and self._qualified_indicator_request_factory is not None
                         ):
+                            selection_request = (
+                                shadow_dispatcher.restored_indicator_selection_request(
+                                    request
+                                )
+                                or self._qualified_indicator_request_factory(request)
+                            )
                             shadow_dispatcher.dispatch_indicator_selection(
                                 request,
-                                self._qualified_indicator_request_factory(request),
+                                selection_request,
                             )
                         elif self._qualified_statement_request_factory is not None:
+                            selection_request = (
+                                shadow_dispatcher.restored_statement_selection_request(
+                                    request
+                                )
+                                or self._qualified_statement_request_factory(request)
+                            )
                             shadow_dispatcher.dispatch_statement_selection(
                                 request,
-                                self._qualified_statement_request_factory(request),
+                                selection_request,
                             )
                     except Exception:  # noqa: BLE001 - shadow cannot affect authority
                         shadow_failure_count += 1
@@ -394,7 +434,30 @@ class FinancialDispatchToolNode:
             if authoritative_ledger is not None:
                 self._dispatcher_from_state(state)
             if shadow_ledger is not None:
-                self._dispatcher_from_state(state, shadow=True)
+                if self._qualified_statement_router is None:
+                    ledger = FinancialDispatchCheckpointLedger.model_validate(
+                        shadow_ledger
+                    )
+                    expected_binding = (
+                        expected_capability_routing_plan.financial_eligibility_binding
+                        if expected_capability_routing_plan is not None
+                        else None
+                    )
+                    if (
+                        expected_capability_routing_plan is None
+                        or ledger.contract_version
+                        != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                        or ledger.capability_routing_plan_signature
+                        != expected_capability_routing_plan.plan_signature
+                        or ledger.financial_eligibility_binding != expected_binding
+                        or ledger.run_scope_id != state.get("run_id")
+                        or ledger.provider_subrequest_cache is None
+                    ):
+                        raise FinancialDispatchCheckpointError(
+                            FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+                        )
+                else:
+                    self._dispatcher_from_state(state, shadow=True)
         except FinancialDispatchCheckpointError:
             raise
         except (TypeError, ValueError) as exc:
@@ -408,6 +471,8 @@ class FinancialDispatchToolNode:
         state: Mapping[str, Any],
         *,
         shadow: bool = False,
+        qualified_router_override: MainlandFinancialCapabilityRouter | None = None,
+        provider_subrequest_cache_override: ProviderSubrequestCache | None = None,
     ) -> tuple[FinancialToolDispatcher, EvidenceState]:
         evidence = EvidenceState.model_validate(state.get("evidence_state") or {})
         identity = evidence.instrument_identity
@@ -423,8 +488,14 @@ class FinancialDispatchToolNode:
 
             effective_config = get_config()
         effective_config = dict(effective_config)
-        rollout_mode = self._routing_mode()
-        qualified_router = self._qualified_statement_router
+        rollout_mode = (
+            qualified_router_override.routing_plan.mode.value
+            if qualified_router_override is not None
+            else self._routing_mode()
+        )
+        qualified_router = (
+            qualified_router_override or self._qualified_statement_router
+        )
         checkpoint_key = "financial_dispatch_ledger"
         if rollout_mode == "qualified_v1_shadow":
             if shadow:
@@ -463,6 +534,13 @@ class FinancialDispatchToolNode:
             configured_retry_policy = effective_config.get("financial_dispatch_retry_policy")
             if configured_retry_policy is not None:
                 retry_policy = RetryPolicy.model_validate(configured_retry_policy)
+        restored_dispatcher = self._restored_shadow_dispatcher
+        if shadow and restored_dispatcher is not None and qualified_router_override is None:
+            if restored_dispatcher.checkpoint_ledger() != state.get(checkpoint_key):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+                )
+            return restored_dispatcher, evidence
         dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=identity,
             run_asset_configuration=asset_configuration,
@@ -472,6 +550,10 @@ class FinancialDispatchToolNode:
             clock=self._clock,
             sleeper=self._sleeper,
             checkpoint_ledger=state.get(checkpoint_key),
+            provider_subrequest_cache=(
+                provider_subrequest_cache_override
+                or self._qualified_provider_subrequest_cache
+            ),
             qualified_statement_router=qualified_router,
             run_scope_id=(
                 str(state["run_id"])
@@ -480,6 +562,28 @@ class FinancialDispatchToolNode:
             ),
         )
         return dispatcher, evidence
+
+    def restore_shadow_dispatcher(
+        self,
+        state: Mapping[str, Any],
+        *,
+        provider_subrequest_cache: ProviderSubrequestCache,
+        routing_plan: MainlandCapabilityRoutingPlan,
+    ) -> FinancialToolDispatcher:
+        """Restore the qualified ledger against a non-callable validation router."""
+
+        validation_router = MainlandFinancialCapabilityRouter(
+            routing_plan=routing_plan,
+            statement_sources={},
+            indicator_sources={},
+            capability_sources={},
+        )
+        return self._dispatcher_from_state(
+            state,
+            shadow=True,
+            qualified_router_override=validation_router,
+            provider_subrequest_cache_override=provider_subrequest_cache,
+        )[0]
 
 
 def _financial_request_from_tool_call(

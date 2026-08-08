@@ -35,6 +35,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingMode,
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingPreflightError,
+    MainlandCapabilityRoutingRunProjection,
     TushareCapability,
     TushareEndpointPacingIdentity,
     mainland_capability_routing_failure,
@@ -42,8 +43,12 @@ from tradingagents.capability_routing import (
 from tradingagents.dataflows.akshare_sina_statements import (
     AkshareSinaStatementAdapter,
 )
-from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
+from tradingagents.dataflows.baostock_capabilities import (
+    BAOSTOCK_CAPABILITY_NORMALIZER_VERSION,
+    BaoStockCapabilityAdapter,
+)
 from tradingagents.dataflows.baostock_ratios import (
+    BAOSTOCK_RATIO_NORMALIZER_VERSION,
     BaoStockRatioFamilyAdapter,
     assess_baostock_ratio_family_results,
 )
@@ -63,8 +68,16 @@ from tradingagents.dataflows.financial_capability_routing import (
     financial_period_response_from_statement_adapter,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_MANIFEST_V2,
     FinancialRatioFamily,
     FinancialStatementType,
+)
+from tradingagents.dataflows.financial_dispatch import (
+    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_LEDGER_VERSION,
+    FinancialDispatchCheckpointError,
+    FinancialDispatchCheckpointFailureReason,
+    FinancialDispatchCheckpointLedger,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
@@ -72,6 +85,8 @@ from tradingagents.dataflows.financial_eligibility_policy import (
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
     ProviderSubrequestCache,
+    ProviderSubrequestCacheCheckpoint,
+    ProviderSubrequestInstrumentIdentity,
     ProviderSubrequestKey,
     ProviderSubrequestResult,
 )
@@ -81,7 +96,11 @@ from tradingagents.dataflows.tushare_factors_names import (
 )
 from tradingagents.dataflows.tushare_indicators import TushareFinancialIndicatorAdapter
 from tradingagents.dataflows.tushare_statements import TushareStatementAdapter
-from tradingagents.evidence import AcquisitionUnavailableReason, InstrumentKind
+from tradingagents.evidence import (
+    AcquisitionUnavailableReason,
+    EvidenceState,
+    InstrumentKind,
+)
 from tradingagents.market_history.config import (
     DataUsageMode,
     MarketHistoryConfig,
@@ -380,12 +399,31 @@ class ManagedQualifiedRoutingComposition(Protocol):
 class ProductionQualifiedRoutingRunBinding(BaseModel):
     """Canonical post-checkpoint inputs required before run resources may open."""
 
-    model_config = _CLOSED_MODEL_CONFIG
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+    )
 
     run_id: str = Field(pattern=r"^run:[0-9a-f]{64}$")
     asset_configuration: RunAssetConfiguration = Field(repr=False)
     routing_plan: MainlandCapabilityRoutingPlan = Field(repr=False)
     checkpoint_compatibility_known: Literal[True]
+    resume_from_checkpoint: bool = False
+    checkpoint_thread_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{16}$",
+    )
+    checkpoint_state: Mapping[str, Any] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    restore_financial_dispatcher: Callable[..., object] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
 
     @model_validator(mode="after")
     def _validate_authoritative_bindings(self) -> ProductionQualifiedRoutingRunBinding:
@@ -395,6 +433,21 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
             or self.routing_plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
         ):
             raise ValueError("qualified runtime binding is invalid")
+        if self.checkpoint_thread_id is not None and not self.resume_from_checkpoint:
+            expected_run_id = "run:" + sha256(
+                f"checkpoint:{self.checkpoint_thread_id}".encode()
+            ).hexdigest()
+            if self.run_id != expected_run_id:
+                raise ValueError("qualified checkpoint run identity is invalid")
+        if self.resume_from_checkpoint:
+            if (
+                self.checkpoint_thread_id is None
+                or not isinstance(self.checkpoint_state, Mapping)
+                or not callable(self.restore_financial_dispatcher)
+            ):
+                raise ValueError("qualified checkpoint restoration binding is invalid")
+        elif self.checkpoint_state is not None:
+            raise ValueError("fresh qualified binding cannot carry checkpoint state")
         return self
 
 
@@ -680,6 +733,284 @@ class ProductionQualifiedRoutingRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class _QualifiedCheckpointRestoration:
+    shadow_ledger: FinancialDispatchCheckpointLedger
+    cache_checkpoint: ProviderSubrequestCacheCheckpoint
+
+
+def _physical_provider_id(route_provider_id: str) -> str:
+    return {
+        "akshare": "akshare_sina",
+        "baostock_qualified_families": "baostock",
+        "yfinance_derived": "yfinance",
+    }.get(route_provider_id, route_provider_id)
+
+
+def _cache_normalizer_is_compatible(
+    key: ProviderSubrequestKey,
+    plan: MainlandCapabilityRoutingPlan,
+) -> bool:
+    if key.provider_id == "tushare":
+        return key.normalizer_version == plan.normalizer_version
+    if key.provider_id == "baostock":
+        return key.normalizer_version in {
+            BAOSTOCK_CAPABILITY_NORMALIZER_VERSION,
+            BAOSTOCK_RATIO_NORMALIZER_VERSION,
+        }
+    if key.provider_id == "akshare_sina":
+        return key.normalizer_version in {
+            plan.normalizer_version,
+            f"{key.capacity_scope}-terminal-v1",
+        }
+    if key.provider_id == "yfinance":
+        return key.normalizer_version == f"{key.capacity_scope}-terminal-v1"
+    return False
+
+
+def _validate_cache_provider_calls(
+    ledger: FinancialDispatchCheckpointLedger,
+    cache_checkpoint: ProviderSubrequestCacheCheckpoint,
+    plan: MainlandCapabilityRoutingPlan,
+) -> None:
+    cache_entries = {
+        entry.key.subrequest_key: entry for entry in cache_checkpoint.entries
+    }
+    allowed_logical_providers = {
+        provider_id
+        for route in plan.routes
+        for provider_id in route.providers
+    }
+    selections = (
+        *ledger.qualified_statement_selections,
+        *ledger.qualified_indicator_selections,
+    )
+    for selection in selections:
+        for call in selection.terminal.routing_result.provider_calls:
+            if (
+                call.provider_id not in allowed_logical_providers
+                or len(call.subrequest_keys) != len(set(call.subrequest_keys))
+                or len(call.physical_attempt_ids)
+                != len(set(call.physical_attempt_ids))
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
+                )
+            try:
+                entries = tuple(
+                    cache_entries[subrequest_key]
+                    for subrequest_key in call.subrequest_keys
+                )
+            except KeyError as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                ) from exc
+            expected_physical_provider = _physical_provider_id(call.provider_id)
+            expected_events = {
+                event.attempt_event_id: event
+                for entry in entries
+                for event in entry.attempt_events
+            }
+            actual_events = {
+                event.attempt_event_id: event
+                for event in call.physical_attempt_events
+            }
+            if (
+                any(
+                    entry.key.provider_id != expected_physical_provider
+                    for entry in entries
+                )
+                or set(call.physical_attempt_ids) != set(expected_events)
+                or actual_events != expected_events
+                or any(
+                    outcome.provider_id != call.provider_id
+                    or outcome.subrequest_key not in call.subrequest_keys
+                    for outcome in call.subrequest_outcomes
+                )
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                )
+
+
+def _validated_checkpoint_restoration(
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    run_binding: ProductionQualifiedRoutingRunBinding,
+) -> _QualifiedCheckpointRestoration | None:
+    """Authenticate the complete qualified projection before resources open."""
+
+    if not run_binding.resume_from_checkpoint:
+        return None
+    state = run_binding.checkpoint_state
+    if not isinstance(state, Mapping):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.MALFORMED
+        )
+    checkpoint_thread_id = run_binding.checkpoint_thread_id
+    expected_run_id = (
+        "run:"
+        + sha256(f"checkpoint:{checkpoint_thread_id}".encode()).hexdigest()
+        if checkpoint_thread_id is not None
+        else None
+    )
+    if expected_run_id != run_binding.run_id:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+        )
+    try:
+        expected_asset = RunAssetConfigurationProjection.model_validate(
+            run_binding.asset_configuration.model_dump(mode="json")
+        )
+        restored_asset = RunAssetConfigurationProjection.model_validate(
+            state.get("asset_configuration")
+        )
+        restored_plan = MainlandCapabilityRoutingPlan.model_validate(
+            state.get("capability_routing_plan")
+        )
+        restored_rollout = MainlandCapabilityRoutingRunProjection.model_validate(
+            state.get("capability_routing_rollout")
+        )
+        restored_binding = (
+            MainlandFinancialEligibilityProjectionBinding.model_validate(
+                state.get("financial_eligibility_binding")
+            )
+        )
+        evidence = EvidenceState.model_validate(state.get("evidence_state"))
+        authoritative_ledger = FinancialDispatchCheckpointLedger.model_validate(
+            state.get("financial_dispatch_ledger")
+        )
+        shadow_ledger = FinancialDispatchCheckpointLedger.model_validate(
+            state.get("financial_dispatch_shadow_ledger")
+        )
+    except FinancialDispatchCheckpointError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.MALFORMED
+        ) from exc
+
+    plan = run_binding.routing_plan
+    expected_binding = plan.financial_eligibility_binding
+    expected_rollout = MainlandCapabilityRoutingRunProjection.from_plan(plan)
+    if restored_asset != expected_asset:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+        )
+    if (
+        evidence.instrument_identity
+        != run_binding.asset_configuration.instrument_identity
+        or evidence.instrument_identity is None
+        or ProviderSubrequestInstrumentIdentity.from_authoritative(
+            evidence.instrument_identity
+        )
+        != ProviderSubrequestInstrumentIdentity.from_authoritative(
+            run_binding.asset_configuration.instrument_identity
+        )
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
+        )
+    if (
+        restored_plan != plan
+        or restored_plan != blueprint.routing_plan
+        or restored_rollout != expected_rollout
+        or restored_rollout.disposition
+        is not MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+        )
+    if (
+        expected_binding is None
+        or restored_binding != expected_binding
+        or evidence.financial_eligibility_binding != expected_binding
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+        )
+    if state.get("run_id") != run_binding.run_id:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+        )
+    if (
+        authoritative_ledger.contract_version != FINANCIAL_DISPATCH_LEDGER_VERSION
+        or authoritative_ledger.run_asset_configuration_version
+        != expected_asset.asset_configuration_version
+        or authoritative_ledger.run_asset_configuration_signature
+        != expected_asset.asset_configuration_signature
+        or authoritative_ledger.provider_subrequest_cache is not None
+        or authoritative_ledger.qualified_statement_selections
+        or authoritative_ledger.qualified_indicator_selections
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
+        )
+    cache_checkpoint = shadow_ledger.provider_subrequest_cache
+    if (
+        shadow_ledger.contract_version
+        != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+        or shadow_ledger.run_asset_configuration_version
+        != expected_asset.asset_configuration_version
+        or shadow_ledger.run_asset_configuration_signature
+        != expected_asset.asset_configuration_signature
+        or shadow_ledger.capability_routing_plan_signature != plan.plan_signature
+        or shadow_ledger.financial_manifest_version != FINANCIAL_MANIFEST_V2
+        or shadow_ledger.financial_eligibility_binding != expected_binding
+        or shadow_ledger.run_scope_id != run_binding.run_id
+        or cache_checkpoint is None
+        or cache_checkpoint.run_scope_id != run_binding.run_id
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+        )
+
+    expected_identity = ProviderSubrequestInstrumentIdentity.from_authoritative(
+        run_binding.asset_configuration.instrument_identity
+    )
+    allowed_physical_providers = {
+        _physical_provider_id(provider_id)
+        for route in plan.routes
+        for provider_id in route.providers
+    }
+    for entry in cache_checkpoint.entries:
+        key = entry.key
+        expected_account_scope = (
+            plan.account_scope_label
+            if key.provider_id == "tushare"
+            else "not-applicable"
+            if key.provider_id == "baostock"
+            else "public"
+        )
+        expected_upstream_id, _ = upstream_service_identity_for_provider(
+            key.provider_id,
+            account_scope=(
+                expected_account_scope if key.provider_id == "tushare" else ""
+            ),
+        )
+        if (
+            key.provider_id not in allowed_physical_providers
+            or key.instrument_identity != expected_identity
+            or key.canonical_symbol != expected_identity.canonical_symbol
+            or key.account_scope != expected_account_scope
+            or key.upstream_service_id != expected_upstream_id
+            or key.qualification_profile != plan.qualification_profile
+            or key.data_usage_mode is not blueprint.factory_contract.data_usage_mode
+            or not _cache_normalizer_is_compatible(key, plan)
+            or (
+                entry.artifact is not None
+                and entry.artifact.media_type != "application/json"
+            )
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+            )
+    _validate_cache_provider_calls(shadow_ledger, cache_checkpoint, plan)
+    return _QualifiedCheckpointRestoration(
+        shadow_ledger=shadow_ledger,
+        cache_checkpoint=cache_checkpoint,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RegisteredProductionQualifiedRoutingComposition:
     """Resource-free blueprint that becomes the sole owner when a run binds."""
 
@@ -818,6 +1149,7 @@ class RegisteredProductionQualifiedRoutingComposition:
     ) -> ProductionQualifiedRoutingRuntime:
         factories = self.runtime_factories
         assert factories is not None
+        restoration = _validated_checkpoint_restoration(self.blueprint, run_binding)
 
         def acquire(resource_kind: str, value: object) -> object:
             owner.own(resource_kind, value)
@@ -845,6 +1177,34 @@ class RegisteredProductionQualifiedRoutingComposition:
                 owner.stop_signal,
             ),
         )
+        restored_shadow_dispatcher = None
+        if restoration is not None:
+            checkpoint_state = run_binding.checkpoint_state
+            restore_dispatcher = run_binding.restore_financial_dispatcher
+            assert checkpoint_state is not None
+            assert restore_dispatcher is not None
+            if not isinstance(subrequest_cache, ProviderSubrequestCache):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            subrequest_cache.restore_checkpoint(restoration.cache_checkpoint)
+            restored_shadow_dispatcher = restore_dispatcher(
+                checkpoint_state,
+                provider_subrequest_cache=subrequest_cache,
+                routing_plan=run_binding.routing_plan,
+            )
+            from tradingagents.dataflows.financial_dispatch import (
+                FinancialToolDispatcher,
+            )
+
+            if not isinstance(restored_shadow_dispatcher, FinancialToolDispatcher):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            factories.phase_hook(
+                "checkpoint_restore",
+                restored_shadow_dispatcher,
+            )
         tushare_client = acquire(
             "tushare_client",
             factories.build_tushare_client(self.blueprint, owner.stop_signal),
@@ -894,11 +1254,23 @@ class RegisteredProductionQualifiedRoutingComposition:
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
+        financial_routing = assembly.financial_routing
+        if restored_shadow_dispatcher is not None:
+            restored_shadow_dispatcher.bind_qualified_statement_router(
+                financial_routing.router
+            )
+        financial_routing = QualifiedFinancialRoutingComposition(
+            router=financial_routing.router,
+            statement_request_factory=financial_routing.statement_request_factory,
+            indicator_request_factory=financial_routing.indicator_request_factory,
+            provider_subrequest_cache=subrequest_cache,
+            restored_shadow_dispatcher=restored_shadow_dispatcher,
+        )
         for resource_kind, resource in assembly.owned_resources:
             acquire(resource_kind, resource)
         return ProductionQualifiedRoutingRuntime(
             run_id=run_binding.run_id,
-            financial_routing=assembly.financial_routing,
+            financial_routing=financial_routing,
             stop_signal=owner.stop_signal,
             resource_kinds=owner.resource_kinds,
             source_composition=assembly.source_composition,

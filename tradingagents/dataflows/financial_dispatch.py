@@ -1619,6 +1619,13 @@ class FinancialToolDispatcher:
         self._dispatch_results: dict[str, Future[FinancialDispatchResult]] = {}
         self._reuse_counts: dict[str, int] = {}
         self._qualified_statement_router = qualified_statement_router
+        self._qualified_router_rebind_pending = bool(
+            checkpoint_ledger is not None
+            and qualified_statement_router is not None
+            and not getattr(qualified_statement_router, "_statement_sources", None)
+            and not getattr(qualified_statement_router, "_indicator_sources", None)
+            and not getattr(qualified_statement_router, "_capability_sources", None)
+        )
         self._statement_selection_results: dict[
             str,
             Future[FinancialStatementSelectionDispatchResult],
@@ -1632,6 +1639,85 @@ class FinancialToolDispatcher:
         self._provider_subrequest_cache = provider_subrequest_cache
         if checkpoint_ledger is not None:
             self._restore_checkpoint_ledger(checkpoint_ledger)
+
+    def bind_qualified_statement_router(
+        self,
+        router: MainlandFinancialCapabilityRouter,
+    ) -> None:
+        """Replace a validation-only router without losing restored run state."""
+
+        if not isinstance(router, MainlandFinancialCapabilityRouter):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+            )
+        with self._dispatch_lock:
+            if not self._qualified_router_rebind_pending:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                )
+            current = self._qualified_statement_router
+            if (
+                current is None
+                or current.routing_plan != router.routing_plan
+                or self._capability_routing_plan_signature
+                != router.routing_plan.plan_signature
+                or self._financial_eligibility_binding
+                != router.routing_plan.financial_eligibility_binding
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+                )
+            futures = (
+                *self._dispatch_results.values(),
+                *self._statement_selection_results.values(),
+                *self._indicator_selection_results.values(),
+            )
+            if any(not future.done() for future in futures):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
+                )
+            self._qualified_statement_router = router
+            self._qualified_router_rebind_pending = False
+
+    def restored_statement_selection_request(
+        self,
+        request: FinancialToolRequest,
+    ) -> FinancialStatementRoutingRequest | None:
+        """Return the exact retained request for a completed statement selection."""
+
+        canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            shared = self._statement_selection_results.get(
+                canonical_key.request_key
+            )
+        if shared is None:
+            return None
+        try:
+            return shared.result().selection_request
+        except BaseException as exc:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+            ) from exc
+
+    def restored_indicator_selection_request(
+        self,
+        request: FinancialToolRequest,
+    ) -> FinancialIndicatorRoutingRequest | None:
+        """Return the exact retained request for a completed indicator selection."""
+
+        canonical_key = self.canonical_request_key(request)
+        with self._dispatch_lock:
+            shared = self._indicator_selection_results.get(
+                canonical_key.request_key
+            )
+        if shared is None:
+            return None
+        try:
+            return shared.result().selection_request
+        except BaseException as exc:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+            ) from exc
 
     @classmethod
     def from_configured_vendors(

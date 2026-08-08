@@ -440,7 +440,11 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
     key: ProviderSubrequestKey
     artifact: ProviderSubrequestArtifactRef | None
     outcome: ProviderSubrequestOutcome
-    sequence_id: str
+    sequence_id: str = Field(
+        pattern=(
+            r"^(?:|provider-request-sequence=sha256:[0-9a-f]{64})$"
+        )
+    )
     attempt_events: tuple[ProviderSubrequestAttemptEvent, ...]
 
     @model_validator(mode="after")
@@ -448,18 +452,87 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
         available = self.outcome.kind is ProviderSubrequestOutcomeKind.AVAILABLE
         if available != (self.artifact is not None):
             raise ValueError("provider subrequest terminal artifact contradicts outcome")
-        if available and not self.attempt_events:
-            raise ValueError("available provider subrequest requires an attempt event")
-        for event in self.attempt_events:
+        if not self.attempt_events:
+            no_attempt_kinds = {
+                ProviderSubrequestOutcomeKind.AVAILABLE,
+                ProviderSubrequestOutcomeKind.RATE_LIMITED,
+                ProviderSubrequestOutcomeKind.UPSTREAM_BUSY,
+                ProviderSubrequestOutcomeKind.ABANDONED,
+            }
+            if self.outcome.kind not in no_attempt_kinds:
+                raise ValueError("provider subrequest terminal progress is incomplete")
+            if self.sequence_id == "" and available:
+                raise ValueError("provider subrequest sequence progress is incomplete")
             if (
-                event.sequence_id != self.sequence_id
+                self.outcome.kind is ProviderSubrequestOutcomeKind.RATE_LIMITED
+                and self.sequence_id != ""
+            ):
+                raise ValueError("provider subrequest sequence progress is invalid")
+            expected_retryable = self.outcome.kind in {
+                ProviderSubrequestOutcomeKind.RATE_LIMITED,
+                ProviderSubrequestOutcomeKind.UPSTREAM_BUSY,
+            }
+            if (
+                self.outcome.retryable is not expected_retryable
+                or self.outcome.status_code is not None
+                or (
+                    self.outcome.kind
+                    in {
+                        ProviderSubrequestOutcomeKind.AVAILABLE,
+                        ProviderSubrequestOutcomeKind.ABANDONED,
+                    }
+                    and self.outcome.retry_after_seconds is not None
+                )
+            ):
+                raise ValueError("provider subrequest no-attempt outcome is invalid")
+        attempt_ids = tuple(event.attempt_event_id for event in self.attempt_events)
+        attempt_indices = tuple(event.attempt_index for event in self.attempt_events)
+        attempted_at = tuple(event.attempted_at for event in self.attempt_events)
+        if (
+            len(attempt_ids) != len(set(attempt_ids))
+            or attempt_indices != tuple(range(1, len(self.attempt_events) + 1))
+            or attempted_at != tuple(sorted(attempted_at))
+        ):
+            raise ValueError("provider subrequest attempt progress is invalid")
+        for event in self.attempt_events:
+            digest = sha256()
+            for component in (
+                "provider-physical-attempt",
+                self.sequence_id,
+                str(event.attempt_index),
+            ):
+                encoded = component.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+            expected_attempt_id = (
+                f"provider-physical-attempt=sha256:{digest.hexdigest()}"
+            )
+            if (
+                event.attempt_event_id != expected_attempt_id
+                or event.sequence_id != self.sequence_id
                 or event.request_key != self.key.subrequest_key
                 or event.upstream_service_id != self.key.upstream_service_id
                 or event.capacity_scope != self.key.capacity_scope
+                or event.final_physical_attempt_count != len(self.attempt_events)
             ):
                 raise ValueError("provider subrequest attempt contradicts cache key")
-        if self.attempt_events and self.attempt_events[-1].outcome is not self.outcome.kind:
-            raise ValueError("provider subrequest attempt contradicts terminal outcome")
+        if any(
+            event.outcome is ProviderSubrequestOutcomeKind.AVAILABLE
+            or not event.retryable
+            for event in self.attempt_events[:-1]
+        ):
+            raise ValueError("provider subrequest retry progress is invalid")
+        if self.attempt_events:
+            terminal = self.attempt_events[-1]
+            if (
+                terminal.outcome is not self.outcome.kind
+                or terminal.retryable is not self.outcome.retryable
+                or terminal.status_code != self.outcome.status_code
+                or terminal.retry_after_seconds != self.outcome.retry_after_seconds
+            ):
+                raise ValueError(
+                    "provider subrequest attempt contradicts terminal outcome"
+                )
         return self
 
 
@@ -530,7 +603,7 @@ class ProviderSubrequestCache:
         self._interrupted = False
         self._closed = False
         if checkpoint is not None:
-            self._restore_checkpoint(checkpoint)
+            self.restore_checkpoint(checkpoint)
 
     def is_bound_to(
         self,
@@ -577,45 +650,76 @@ class ProviderSubrequestCache:
             entries=tuple(entries),
         ).model_dump(mode="json")
 
-    def _restore_checkpoint(
+    def restore_checkpoint(
         self,
         checkpoint: Mapping[str, object] | ProviderSubrequestCacheCheckpoint,
     ) -> None:
-        try:
-            restored = ProviderSubrequestCacheCheckpoint.model_validate(checkpoint)
-        except (TypeError, ValueError) as exc:
-            raise ProviderSubrequestCacheError(
-                ProviderSubrequestCacheFailureReason.MALFORMED_CHECKPOINT
-            ) from exc
-        if restored.run_scope_id != self._run_scope_id:
-            raise ProviderSubrequestCacheError(
-                ProviderSubrequestCacheFailureReason.RUN_SCOPE_MISMATCH
-            )
-        keys: set[str] = set()
-        for entry in restored.entries:
-            subrequest_key = entry.key.subrequest_key
-            if subrequest_key in keys:
+        """Restore one complete terminal projection before the cache is callable."""
+
+        with self._lock:
+            if (
+                self._closed
+                or self._interrupted
+                or self._stop_signal.is_set()
+                or self._results
+                or self._keys
+            ):
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.UNSAFE_CHECKPOINT_BOUNDARY
+                )
+            try:
+                restored = ProviderSubrequestCacheCheckpoint.model_validate(checkpoint)
+            except (TypeError, ValueError) as exc:
                 raise ProviderSubrequestCacheError(
                     ProviderSubrequestCacheFailureReason.MALFORMED_CHECKPOINT
+                ) from exc
+            if restored.run_scope_id != self._run_scope_id:
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.RUN_SCOPE_MISMATCH
                 )
-            keys.add(subrequest_key)
-            value = (
-                self._artifact_store.read(entry.artifact)
-                if entry.artifact is not None
-                else None
-            )
-            result = ProviderSubrequestResult(
-                key=entry.key,
-                value=value,
-                artifact=entry.artifact,
-                outcome=entry.outcome,
-                sequence_id=entry.sequence_id,
-                attempt_events=entry.attempt_events,
-            )
-            shared: Future[ProviderSubrequestResult] = Future()
-            shared.set_result(result)
-            self._results[subrequest_key] = shared
-            self._keys[subrequest_key] = entry.key
+            keys: set[str] = set()
+            restored_results: dict[str, Future[ProviderSubrequestResult]] = {}
+            restored_keys: dict[str, ProviderSubrequestKey] = {}
+            for entry in restored.entries:
+                subrequest_key = entry.key.subrequest_key
+                if subrequest_key in keys:
+                    raise ProviderSubrequestCacheError(
+                        ProviderSubrequestCacheFailureReason.MALFORMED_CHECKPOINT
+                    )
+                keys.add(subrequest_key)
+                value = (
+                    self._artifact_store.read(entry.artifact)
+                    if entry.artifact is not None
+                    else None
+                )
+                if (
+                    entry.artifact is not None
+                    and entry.artifact.media_type == "application/json"
+                ):
+                    try:
+                        json.loads(value)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise ProviderSubrequestCacheError(
+                            ProviderSubrequestCacheFailureReason.ARTIFACT_CORRUPT
+                        ) from exc
+                result = ProviderSubrequestResult(
+                    key=entry.key,
+                    value=value,
+                    artifact=entry.artifact,
+                    outcome=entry.outcome,
+                    sequence_id=entry.sequence_id,
+                    attempt_events=entry.attempt_events,
+                )
+                shared: Future[ProviderSubrequestResult] = Future()
+                shared.set_result(result)
+                restored_results[subrequest_key] = shared
+                restored_keys[subrequest_key] = entry.key
+            if self._stop_signal.is_set():
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.UNSAFE_CHECKPOINT_BOUNDARY
+                )
+            self._results.update(restored_results)
+            self._keys.update(restored_keys)
 
     def _abandoned_result(self, key: ProviderSubrequestKey) -> ProviderSubrequestResult:
         digest = sha256(
