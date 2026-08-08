@@ -24,6 +24,7 @@ from tradingagents.capability_routing import (
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
+    FinancialCompanyTypeEvidenceProviderResponse,
     FinancialIndicatorProviderGapRequest,
     FinancialIndicatorRoutingRequest,
     FinancialProviderGapRequest,
@@ -189,7 +190,9 @@ def _registrations(
                 ),
             )
             response_type = (
-                FinancialCapabilityProviderResponse
+                FinancialCompanyTypeEvidenceProviderResponse
+                if kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE
+                else FinancialCapabilityProviderResponse
                 if kind is ProductionQualifiedSourceKind.CAPABILITY
                 else FinancialProviderPeriodResponse
             )
@@ -210,7 +213,7 @@ def _registrations(
                 physical_request=physical_request,
                 response_decoder=response_decoders.get(
                     endpoint_id,
-                    lambda _request, payload: response_type.model_validate_json(payload),
+                    lambda _request, payload, _result: response_type.model_validate_json(payload),
                 ),
                 adapter=source,
                 normalizer_version=f"{endpoint_id}-v1",
@@ -248,6 +251,12 @@ def _registrations(
             "current_financial_profile",
             ProductionQualifiedSourceKind.INDICATOR,
             (MainlandCapability.FINANCIAL_INDICATORS,),
+        ),
+        registration(
+            "yfinance",
+            "current_profile_company_type_evidence",
+            ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE,
+            (MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,),
         ),
         registration(
             "akshare",
@@ -557,11 +566,7 @@ def test_source_composition_is_plan_ordered_run_owned_and_zero_io(
     plan_source_pairs = {
         (route.capability, provider_id)
         for route in plan.routes
-        if route.capability
-        not in {
-            MainlandCapability.DAILY_MARKET_SNAPSHOT,
-            MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,
-        }
+        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
         for provider_id in route.providers
     }
     bound_source_pairs = {
@@ -570,10 +575,8 @@ def test_source_composition_is_plan_ordered_run_owned_and_zero_io(
         for capability in binding.capabilities
     }
     assert bound_source_pairs == plan_source_pairs
-    assert not any(
-        capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
-        for binding in composition.bindings
-        for capability in binding.capabilities
+    assert composition.company_type_evidence_source_ids == plan.route_for(
+        MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
     )
     assert all(
         binding.coordinator is coordinator
@@ -602,6 +605,7 @@ def test_source_composition_is_plan_ordered_run_owned_and_zero_io(
         "adjustment_factors",
         "derived_adjustment_factors",
         "issuer_name_events",
+        "current_profile_company_type_evidence",
     ]
     assert coordinator_calls == 0
     assert sum(client.calls for client in clients.values()) == 0
@@ -759,11 +763,16 @@ def test_every_external_binding_shares_retry_singleflight_cache_and_cooldown(
             changed = binding.source(
                 _external_binding_request(binding, variant=1)
             )
-            assert attempts[binding.endpoint_id] == 4
-            assert changed.subrequest_keys != first.subrequest_keys
-            assert set(changed.physical_attempt_ids).isdisjoint(
-                first.physical_attempt_ids
-            )
+            profile_cache_key = binding.endpoint_id == "current_financial_profile"
+            assert attempts[binding.endpoint_id] == (2 if profile_cache_key else 4)
+            if profile_cache_key:
+                assert changed.subrequest_keys == first.subrequest_keys
+                assert changed.physical_attempt_ids == first.physical_attempt_ids
+            else:
+                assert changed.subrequest_keys != first.subrequest_keys
+                assert set(changed.physical_attempt_ids).isdisjoint(
+                    first.physical_attempt_ids
+                )
 
             composition.dependencies.coordinator.record_rate_limit(
                 upstream_service_id=expected_upstream_id,
@@ -775,10 +784,14 @@ def test_every_external_binding_shares_retry_singleflight_cache_and_cooldown(
             cooled = binding.source(
                 _external_binding_request(binding, variant=2)
             )
-            assert cooled.reason is AcquisitionUnavailableReason.RATE_LIMITED
-            assert len(cooled.subrequest_keys) == 1
-            assert cooled.physical_attempt_ids == ()
-            assert attempts[binding.endpoint_id] == 4
+            if profile_cache_key:
+                assert cooled == first
+                assert attempts[binding.endpoint_id] == 2
+            else:
+                assert cooled.reason is AcquisitionUnavailableReason.RATE_LIMITED
+                assert len(cooled.subrequest_keys) == 1
+                assert cooled.physical_attempt_ids == ()
+                assert attempts[binding.endpoint_id] == 4
 
             all_subrequest_keys.update(
                 (*first.subrequest_keys, *changed.subrequest_keys, *cooled.subrequest_keys)
@@ -787,8 +800,8 @@ def test_every_external_binding_shares_retry_singleflight_cache_and_cooldown(
                 (*first.physical_attempt_ids, *changed.physical_attempt_ids)
             )
 
-    assert len(all_subrequest_keys) == 18
-    assert len(all_attempt_ids) == 24
+    assert len(all_subrequest_keys) == 16
+    assert len(all_attempt_ids) == 22
 
 
 def test_disabled_tushare_capabilities_construct_only_the_enabled_adapter(
@@ -2045,7 +2058,7 @@ def test_route_provider_rejects_an_incompatible_physical_provider_before_io(
             dependencies=dependencies,
             physical_provider_id="yfinance",
             physical_request=physical_request,
-            response_decoder=lambda _request, _payload: None,
+            response_decoder=lambda _request, _payload, _result: None,
             adapter=physical_request,
             normalizer_version="financial-indicators-v1",
         )

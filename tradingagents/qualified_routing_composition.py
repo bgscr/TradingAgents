@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
+from inspect import signature as inspect_signature
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -56,6 +57,10 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
     FinancialCapabilitySource,
+    FinancialCompanyTypeEvidenceProviderResponse,
+    FinancialCompanyTypeEvidenceRoutingRequest,
+    FinancialCompanyTypeEvidenceSource,
+    FinancialCompanyTypeEvidenceSourceProjectionKind,
     FinancialIndicatorProviderGapRequest,
     FinancialIndicatorRoutingRequest,
     FinancialIndicatorSource,
@@ -81,6 +86,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolRequest,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialEligibilityAcquisitionContext,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
@@ -97,6 +103,27 @@ from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestInstrumentIdentity,
     ProviderSubrequestKey,
     ProviderSubrequestResult,
+)
+from tradingagents.dataflows.qualified_production_sources import (
+    AKSHARE_FACTOR_NORMALIZER_VERSION,
+    AKSHARE_INDICATOR_NORMALIZER_VERSION,
+    AKSHARE_NAME_NORMALIZER_VERSION,
+    YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION,
+    YFINANCE_PROFILE_NORMALIZER_VERSION,
+    YFINANCE_STATEMENT_NORMALIZER_VERSION,
+    acquire_akshare_factor_payload,
+    acquire_akshare_indicator_payload,
+    acquire_akshare_name_payload,
+    acquire_yahoo_derived_factor_payload,
+    acquire_yahoo_profile_payload,
+    acquire_yahoo_statement_payload,
+    decode_akshare_factor_response,
+    decode_akshare_indicator_response,
+    decode_akshare_name_response,
+    decode_yahoo_company_type_evidence_response,
+    decode_yahoo_derived_factor_response,
+    decode_yahoo_profile_response,
+    decode_yahoo_statement_response,
 )
 from tradingagents.dataflows.tushare_factors_names import (
     TushareAdjustmentFactorAdapter,
@@ -115,7 +142,9 @@ from tradingagents.market_history.config import (
     MarketHistoryMode,
 )
 from tradingagents.market_history.coordinator import (
+    PhysicalAttemptFailure,
     PhysicalAttemptNotMade,
+    PhysicalAttemptOutcome,
     ProviderRequestCoordinator,
     RequestPriority,
     upstream_service_identity_for_provider,
@@ -766,12 +795,28 @@ def _cache_normalizer_is_compatible(
             BAOSTOCK_RATIO_NORMALIZER_VERSION,
         }
     if key.provider_id == "akshare_sina":
+        external_normalizer = {
+            "adjustment_factors": AKSHARE_FACTOR_NORMALIZER_VERSION,
+            "financial_indicators": AKSHARE_INDICATOR_NORMALIZER_VERSION,
+            "issuer_name_events": AKSHARE_NAME_NORMALIZER_VERSION,
+        }.get(key.capacity_scope)
         return key.normalizer_version in {
             plan.normalizer_version,
+            external_normalizer,
             f"{key.capacity_scope}-terminal-v1",
         }
     if key.provider_id == "yfinance":
-        return key.normalizer_version == f"{key.capacity_scope}-terminal-v1"
+        external_normalizer = {
+            "current_financial_profile": YFINANCE_PROFILE_NORMALIZER_VERSION,
+            "derived_adjustment_factors": (
+                YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION
+            ),
+            "financial_statements": YFINANCE_STATEMENT_NORMALIZER_VERSION,
+        }.get(key.capacity_scope)
+        return key.normalizer_version in {
+            external_normalizer,
+            f"{key.capacity_scope}-terminal-v1",
+        }
     return False
 
 
@@ -1358,6 +1403,7 @@ class ProductionQualifiedSourceKind(str, Enum):
     STATEMENT = "statement"
     INDICATOR = "indicator"
     CAPABILITY = "capability"
+    COMPANY_TYPE_EVIDENCE = "company_type_evidence"
 
 
 _STATEMENT_CAPABILITIES = (
@@ -1392,6 +1438,8 @@ def _source_kind_accepts(
         return capability in _STATEMENT_CAPABILITIES
     if source_kind is ProductionQualifiedSourceKind.INDICATOR:
         return capability is MainlandCapability.FINANCIAL_INDICATORS
+    if source_kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE:
+        return capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
     return capability in _ROUTABLE_CAPABILITIES
 
 
@@ -1407,6 +1455,8 @@ def _ordinary_plan_pairs(
         and (
             route.capability in _STATEMENT_CAPABILITIES
             or route.capability is MainlandCapability.FINANCIAL_INDICATORS
+            or route.capability
+            is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
             or route.capability in _ROUTABLE_CAPABILITIES
         )
         for provider_id in route.providers
@@ -1528,10 +1578,10 @@ class ProductionQualifiedBoundSource:
     physical_request: Callable[
         [object], bytes | PhysicalAttemptNotMade[bytes]
     ] = field(repr=False, compare=False)
-    response_decoder: Callable[[object, bytes], object] = field(
-        repr=False,
-        compare=False,
-    )
+    response_decoder: (
+        Callable[[object, bytes], object]
+        | Callable[[object, bytes, ProviderSubrequestResult], object]
+    ) = field(repr=False, compare=False)
     normalizer_version: str
     max_physical_attempts: int
     coordinator: ProviderRequestCoordinator = field(repr=False, compare=False)
@@ -1552,7 +1602,10 @@ class ProductionQualifiedBoundSource:
         physical_request: Callable[
             [object], bytes | PhysicalAttemptNotMade[bytes]
         ],
-        response_decoder: Callable[[object, bytes], object],
+        response_decoder: (
+            Callable[[object, bytes], object]
+            | Callable[[object, bytes, ProviderSubrequestResult], object]
+        ),
         adapter: object,
         normalizer_version: str,
         max_physical_attempts: int = 1,
@@ -1632,13 +1685,20 @@ class ProductionQualifiedSourceUnavailableError(RuntimeError):
 
     def __init__(
         self,
-        response: FinancialProviderPeriodResponse
-        | FinancialCapabilityProviderResponse,
+        response: (
+            FinancialProviderPeriodResponse
+            | FinancialCapabilityProviderResponse
+            | FinancialCompanyTypeEvidenceProviderResponse
+        ),
     ) -> None:
         if (
             not isinstance(
                 response,
-                (FinancialProviderPeriodResponse, FinancialCapabilityProviderResponse),
+                (
+                    FinancialProviderPeriodResponse,
+                    FinancialCapabilityProviderResponse,
+                    FinancialCompanyTypeEvidenceProviderResponse,
+                ),
             )
             or response.kind.value != "unavailable"
             or any(
@@ -1726,6 +1786,7 @@ class ProductionQualifiedProviderSourceComposition:
     router: MainlandFinancialCapabilityRouter = field(repr=False, compare=False)
     statement_source_ids: tuple[str, ...]
     indicator_source_ids: tuple[str, ...]
+    company_type_evidence_source_ids: tuple[str, ...]
     capability_source_ids: tuple[tuple[MainlandCapability, tuple[str, ...]], ...]
 
     @property
@@ -2285,6 +2346,17 @@ def _internal_source_endpoint(
     capability: MainlandCapability,
     provider_id: str,
 ) -> tuple[ProductionQualifiedSourceKind, str] | None:
+    if capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE:
+        if provider_id == "tushare":
+            return (
+                ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE,
+                "balancesheet_company_type_evidence",
+            )
+        if provider_id == "akshare_sina":
+            return (
+                ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE,
+                "stock_financial_report_sina_company_type_evidence",
+            )
     if capability in _STATEMENT_CAPABILITIES:
         if provider_id == "tushare":
             endpoint_id = {
@@ -2359,6 +2431,100 @@ def _statement_adapter_source(
         return financial_period_response_from_statement_adapter(
             provider_id=provider_id,
             result=result,
+        )
+
+    return source
+
+
+def _statement_company_type_evidence_source(
+    *,
+    provider_id: Literal["tushare", "akshare_sina"],
+    adapter: TushareStatementAdapter | AkshareSinaStatementAdapter,
+) -> FinancialCompanyTypeEvidenceSource:
+    """Project safe company-type inputs from the existing statement adapter."""
+
+    projection_kind = {
+        "tushare": FinancialCompanyTypeEvidenceSourceProjectionKind.TUSHARE_STATEMENT,
+        "akshare_sina": (
+            FinancialCompanyTypeEvidenceSourceProjectionKind.AKSHARE_SINA_STATEMENT
+        ),
+    }[provider_id]
+
+    def source(
+        request: FinancialCompanyTypeEvidenceRoutingRequest,
+    ) -> FinancialCompanyTypeEvidenceProviderResponse:
+        as_of_date = request.metadata_binding.as_of_date
+        target_period = date(as_of_date.year - 1, 12, 31)
+        period_response = _statement_adapter_source(
+            provider_id=provider_id,
+            adapter=adapter,
+        )(
+            FinancialProviderGapRequest(
+                provider_id=provider_id,
+                instrument_identity=request.metadata_binding.instrument_identity,
+                statement_type=FinancialStatementType.BALANCE_SHEET,
+                as_of_date=as_of_date,
+                missing_annual_period_ends=(target_period,),
+                missing_reporting_period_ends=(),
+            )
+        )
+        if period_response.kind.value != "available" or not period_response.candidates:
+            return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+                provider_id=provider_id,
+                metadata_binding=request.metadata_binding,
+                reason=(
+                    period_response.reason
+                    or AcquisitionUnavailableReason.NO_DATA
+                ),
+                subrequest_keys=period_response.subrequest_keys,
+                physical_attempt_ids=period_response.physical_attempt_ids,
+            )
+        candidate = max(
+            period_response.candidates,
+            key=lambda item: (
+                item.period_identity.period_end,
+                item.candidate_identity,
+            ),
+        )
+        resolution = candidate.company_type_resolution
+        evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+            instrument_identity=request.metadata_binding.instrument_identity,
+            as_of_date=as_of_date,
+            provider_id=provider_id,
+            artifact_identity=candidate.artifact.artifact_identity,
+            source_ref=candidate.artifact.artifact_identity,
+            observed_at=candidate.filing_metadata.observed_at,
+            retrieved_at=candidate.filing_metadata.retrieved_at,
+            provider_declared_type=resolution.provider_declared_type,
+            provider_declaration_qualified=(
+                resolution.provider_declaration_qualified
+            ),
+            normalized_resolver_inputs=resolution.classifier_inputs,
+        )
+        return FinancialCompanyTypeEvidenceProviderResponse.available(
+            provider_id=provider_id,
+            metadata_binding=request.metadata_binding,
+            source_projection_kind=projection_kind,
+            evidence=evidence,
+            subrequest_keys=period_response.subrequest_keys,
+            physical_attempt_ids=period_response.physical_attempt_ids,
+        )
+
+    return source
+
+
+def _disabled_company_type_evidence_source(
+    provider_id: str,
+) -> FinancialCompanyTypeEvidenceSource:
+    """Keep disabled optional Tushare statement capability typed and callable."""
+
+    def source(
+        request: FinancialCompanyTypeEvidenceRoutingRequest,
+    ) -> FinancialCompanyTypeEvidenceProviderResponse:
+        return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+            provider_id=provider_id,
+            metadata_binding=request.metadata_binding,
+            reason=AcquisitionUnavailableReason.USAGE_NOT_ENTITLED,
         )
 
     return source
@@ -2688,6 +2854,37 @@ def _build_internal_adapter(
         "sleep": dependencies.sleep,
         "lease_duration": dependencies.lease_duration,
     }
+    if capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE:
+        if provider_id == "tushare":
+            if (
+                TushareCapability.STATEMENTS
+                not in blueprint.routing_plan.enabled_tushare_capabilities
+            ):
+                client = dependencies.provider_clients["tushare"]
+                return client, _disabled_company_type_evidence_source("tushare")
+            adapter = adapter_cache.get("tushare_statements")
+            if adapter is None:
+                adapter = TushareStatementAdapter(
+                    **common,
+                    sdk_client=dependencies.provider_clients["tushare"],
+                )
+                adapter_cache["tushare_statements"] = adapter
+        elif provider_id == "akshare_sina":
+            adapter = adapter_cache.get("akshare_sina_statements")
+            if adapter is None:
+                adapter = AkshareSinaStatementAdapter(
+                    **common,
+                    sdk_client=dependencies.provider_clients["akshare"],
+                )
+                adapter_cache["akshare_sina_statements"] = adapter
+        else:
+            _fail(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
+            )
+        return adapter, _statement_company_type_evidence_source(
+            provider_id=provider_id,  # type: ignore[arg-type]
+            adapter=adapter,  # type: ignore[arg-type]
+        )
     if capability in _STATEMENT_CAPABILITIES and provider_id == "tushare":
         adapter = adapter_cache.get("tushare_statements")
         if adapter is None:
@@ -2795,6 +2992,24 @@ def _external_request_material(
     registration: ProductionQualifiedSourceRegistration,
     request: object,
 ) -> tuple[object, date, date, tuple[str, ...]]:
+    if registration.endpoint_id in {
+        "current_financial_profile",
+        "current_profile_company_type_evidence",
+    }:
+        if isinstance(request, FinancialIndicatorProviderGapRequest):
+            identity = request.instrument_identity
+            as_of_date = request.as_of_date
+        elif isinstance(request, FinancialCompanyTypeEvidenceRoutingRequest):
+            identity = request.metadata_binding.instrument_identity
+            as_of_date = request.metadata_binding.as_of_date
+        else:
+            raise ValueError("qualified Yahoo profile request is invalid")
+        return (
+            identity,
+            as_of_date,
+            as_of_date,
+            ("profile:company_type_classifier",),
+        )
     if registration.source_kind is ProductionQualifiedSourceKind.STATEMENT:
         if not isinstance(request, FinancialProviderGapRequest):
             raise ValueError("qualified statement source request is invalid")
@@ -2833,6 +3048,20 @@ def _external_request_material(
             *(f"target:{family.value}:{period.isoformat()}" for family, period in targets),
         )
         return request.instrument_identity, min(periods), request.as_of_date, fields
+    if registration.source_kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE:
+        if not isinstance(request, FinancialCompanyTypeEvidenceRoutingRequest):
+            raise ValueError("qualified company-type evidence request is invalid")
+        binding = request.metadata_binding
+        fields = (
+            f"capability:{MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE.value}",
+            f"purpose:{binding.acquisition_purpose}",
+        )
+        return (
+            binding.instrument_identity,
+            binding.as_of_date,
+            binding.as_of_date,
+            fields,
+        )
     if not isinstance(request, FinancialCapabilityRoutingRequest):
         raise ValueError("qualified capability source request is invalid")
     fields = (f"capability:{request.capability.value}",)
@@ -2856,7 +3085,12 @@ def _external_subrequest_key(
         provider_id=bound_source.physical_provider_id,
         upstream_service_id=upstream_service_id,
         account_scope="public",
-        capacity_scope=registration.endpoint_id,
+        capacity_scope=(
+            "current_financial_profile"
+            if registration.endpoint_id
+            == "current_profile_company_type_evidence"
+            else registration.endpoint_id
+        ),
         instrument_identity=instrument_identity,
         requested_range_start=range_start.isoformat(),
         requested_range_end=range_end.isoformat(),
@@ -2888,6 +3122,16 @@ def _external_unavailable_response(
             physical_attempt_ids=physical_attempt_ids,
             physical_attempt_events=physical_attempt_events,
         )
+    if registration.source_kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE:
+        if not isinstance(request, FinancialCompanyTypeEvidenceRoutingRequest):
+            raise ValueError("qualified company-type evidence request is invalid")
+        return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+            provider_id=registration.provider_id,
+            metadata_binding=request.metadata_binding,
+            reason=reason,
+            subrequest_keys=subrequest_keys,
+            physical_attempt_ids=physical_attempt_ids,
+        )
     capability = getattr(request, "capability", None)
     if capability not in registration.capabilities:
         capability = registration.capabilities[0]
@@ -2911,7 +3155,11 @@ def _external_response_with_attempts(
     attempt_ids = tuple(event.attempt_event_id for event in result.attempt_events)
     if not isinstance(
         response,
-        (FinancialProviderPeriodResponse, FinancialCapabilityProviderResponse),
+        (
+            FinancialProviderPeriodResponse,
+            FinancialCapabilityProviderResponse,
+            FinancialCompanyTypeEvidenceProviderResponse,
+        ),
     ):
         return _external_unavailable_response(
             registration,
@@ -2928,6 +3176,8 @@ def _external_response_with_attempts(
         payload["physical_attempt_events"] = result.attempt_events
         payload["subrequest_outcomes"] = ()
         return FinancialProviderPeriodResponse.model_validate(payload)
+    if isinstance(response, FinancialCompanyTypeEvidenceProviderResponse):
+        return FinancialCompanyTypeEvidenceProviderResponse.model_validate(payload)
     return FinancialCapabilityProviderResponse.model_validate(payload)
 
 
@@ -2968,7 +3218,28 @@ def _execute_external_source(
             physical_attempt_events=result.attempt_events,
         )
     try:
-        response = bound_source.response_decoder(request, result.value)
+        decoder = bound_source.response_decoder
+        try:
+            decoder_signature = inspect_signature(decoder)
+        except (TypeError, ValueError):
+            response = decoder(request, result.value)  # type: ignore[call-arg]
+        else:
+            try:
+                decoder_signature.bind(request, result.value, result)
+            except TypeError:
+                try:
+                    decoder_signature.bind(request, result.value)
+                except TypeError:
+                    raise ValueError(
+                        "qualified response decoder signature is incompatible"
+                    ) from None
+                response = decoder(request, result.value)  # type: ignore[call-arg]
+            else:
+                response = decoder(  # type: ignore[call-arg]
+                    request,
+                    result.value,
+                    result,
+                )
     except ProductionQualifiedSourceUnavailableError as failure:
         response = failure.response
     except Exception:
@@ -3011,6 +3282,11 @@ def _safe_external_source(
                 return unavailable(request)
         elif registration.source_kind is ProductionQualifiedSourceKind.INDICATOR:
             request_capability = MainlandCapability.FINANCIAL_INDICATORS
+        elif (
+            registration.source_kind
+            is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE
+        ):
+            request_capability = MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
         else:
             request_capability = getattr(request, "capability", None)
         if (
@@ -3044,6 +3320,18 @@ def _safe_external_source(
                     not response.degraded_current_profile
                     or bool(response.candidates)
                 )
+            ):
+                return unavailable(request, response)
+            return response
+        if (
+            registration.source_kind
+            is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE
+        ):
+            if (
+                not isinstance(response, FinancialCompanyTypeEvidenceProviderResponse)
+                or response.provider_id != registration.provider_id
+                or not isinstance(request, FinancialCompanyTypeEvidenceRoutingRequest)
+                or response.metadata_binding != request.metadata_binding
             ):
                 return unavailable(request, response)
             return response
@@ -3145,10 +3433,10 @@ class _ProductionQualifiedAdapterSet:
         return "ProductionQualifiedAdapterSet(run_owned=True)"
 
 
-def _production_terminal_source_registrations(
+def _production_executable_source_registrations(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
 ) -> tuple[ProductionQualifiedSourceRegistration, ...]:
-    """Bind plan-named external seams without inventing provider SDK methods."""
+    """Replace six terminal seams and add Yahoo's required evidence projection."""
 
     plan_pairs = {
         pair
@@ -3191,6 +3479,12 @@ def _production_terminal_source_registrations(
             (MainlandCapability.FINANCIAL_INDICATORS,),
         ),
         (
+            "yfinance",
+            "current_profile_company_type_evidence",
+            ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE,
+            (MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,),
+        ),
+        (
             "akshare",
             "adjustment_factors",
             ProductionQualifiedSourceKind.CAPABILITY,
@@ -3228,57 +3522,265 @@ def _production_terminal_source_registrations(
             else provider_id
         )
         client_id = "akshare" if provider_id == "akshare" else physical_provider_id
-        response_type = (
-            FinancialCapabilityProviderResponse
-            if source_kind is ProductionQualifiedSourceKind.CAPABILITY
-            else FinancialProviderPeriodResponse
-        )
-
         def source_factory(
             dependencies: ProductionQualifiedRoutingRunDependencies,
             *,
-            _provider_id=provider_id,
             _physical_provider_id=physical_provider_id,
             _client_id=client_id,
             _endpoint_id=endpoint_id,
-            _source_kind=source_kind,
-            _capabilities=capabilities,
-            _response_type=response_type,
         ) -> ProductionQualifiedBoundSource:
             client = dependencies.provider_clients[_client_id]
 
-            def terminal_response(request: object) -> PhysicalAttemptNotMade[bytes]:
-                if _source_kind in {
-                    ProductionQualifiedSourceKind.STATEMENT,
-                    ProductionQualifiedSourceKind.INDICATOR,
-                }:
-                    response = FinancialProviderPeriodResponse.unavailable(
-                        provider_id=_provider_id,
-                        reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
+            if _endpoint_id == "financial_statements":
+                def yahoo_statement_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialProviderGapRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="yfinance_statement_request_incompatible",
+                        )
+                    return acquire_yahoo_statement_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
                     )
-                else:
-                    capability = getattr(request, "capability", _capabilities[0])
-                    if capability not in _capabilities:
-                        capability = _capabilities[0]
-                    response = FinancialCapabilityProviderResponse.unavailable(
-                        provider_id=_provider_id,
-                        capability=capability,
-                        reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
-                    )
-                return PhysicalAttemptNotMade(
-                    response.model_dump_json().encode("utf-8")
-                )
 
-            return ProductionQualifiedBoundSource.bind(
-                dependencies=dependencies,
-                physical_provider_id=_physical_provider_id,
-                physical_request=terminal_response,
-                response_decoder=lambda _request, payload: _response_type.model_validate_json(
-                    payload
-                ),
-                adapter=client,
-                normalizer_version=f"{_endpoint_id}-terminal-v1",
-            )
+                def yahoo_statement_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialProviderPeriodResponse:
+                    if not isinstance(request, FinancialProviderGapRequest):
+                        raise ValueError("Yahoo statement request is incompatible")
+                    return decode_yahoo_statement_response(request, payload, result)
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=yahoo_statement_request,
+                    response_decoder=yahoo_statement_decoder,
+                    adapter=client,
+                    normalizer_version=YFINANCE_STATEMENT_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "financial_indicators":
+                def akshare_indicator_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialIndicatorProviderGapRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="akshare_indicator_request_incompatible",
+                        )
+                    return acquire_akshare_indicator_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def akshare_indicator_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialProviderPeriodResponse:
+                    if not isinstance(request, FinancialIndicatorProviderGapRequest):
+                        raise ValueError("AKShare indicator request is incompatible")
+                    return decode_akshare_indicator_response(request, payload, result)
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=akshare_indicator_request,
+                    response_decoder=akshare_indicator_decoder,
+                    adapter=client,
+                    normalizer_version=AKSHARE_INDICATOR_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "current_financial_profile":
+                def yahoo_profile_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialIndicatorProviderGapRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="yfinance_profile_request_incompatible",
+                        )
+                    return acquire_yahoo_profile_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def yahoo_profile_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialProviderPeriodResponse:
+                    if not isinstance(request, FinancialIndicatorProviderGapRequest):
+                        raise ValueError("Yahoo profile request is incompatible")
+                    return decode_yahoo_profile_response(request, payload, result)
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=yahoo_profile_request,
+                    response_decoder=yahoo_profile_decoder,
+                    adapter=client,
+                    normalizer_version=YFINANCE_PROFILE_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "current_profile_company_type_evidence":
+                def yahoo_company_type_request(request: object) -> bytes:
+                    if not isinstance(
+                        request,
+                        FinancialCompanyTypeEvidenceRoutingRequest,
+                    ):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="yfinance_company_type_request_incompatible",
+                        )
+                    return acquire_yahoo_profile_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def yahoo_company_type_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialCompanyTypeEvidenceProviderResponse:
+                    if not isinstance(
+                        request,
+                        FinancialCompanyTypeEvidenceRoutingRequest,
+                    ):
+                        raise ValueError("Yahoo company-type request is incompatible")
+                    return decode_yahoo_company_type_evidence_response(
+                        request,
+                        payload,
+                        result,
+                    )
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=yahoo_company_type_request,
+                    response_decoder=yahoo_company_type_decoder,
+                    adapter=client,
+                    normalizer_version=YFINANCE_PROFILE_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "adjustment_factors":
+                def akshare_factor_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="akshare_factor_request_incompatible",
+                        )
+                    return acquire_akshare_factor_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def akshare_factor_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialCapabilityProviderResponse:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise ValueError("AKShare factor request is incompatible")
+                    return decode_akshare_factor_response(
+                        request,
+                        payload,
+                        result,
+                        qualification_profile=blueprint.routing_plan.qualification_profile,
+                    )
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=akshare_factor_request,
+                    response_decoder=akshare_factor_decoder,
+                    adapter=client,
+                    normalizer_version=AKSHARE_FACTOR_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "derived_adjustment_factors":
+                def yahoo_factor_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="yfinance_factor_request_incompatible",
+                        )
+                    return acquire_yahoo_derived_factor_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def yahoo_factor_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialCapabilityProviderResponse:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise ValueError("Yahoo factor request is incompatible")
+                    return decode_yahoo_derived_factor_response(
+                        request,
+                        payload,
+                        result,
+                        qualification_profile=blueprint.routing_plan.qualification_profile,
+                    )
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=yahoo_factor_request,
+                    response_decoder=yahoo_factor_decoder,
+                    adapter=client,
+                    normalizer_version=YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            if _endpoint_id == "issuer_name_events":
+                def akshare_name_request(request: object) -> bytes:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise PhysicalAttemptFailure(
+                            outcome=PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                            retryable=False,
+                            error_code="akshare_name_request_incompatible",
+                        )
+                    return acquire_akshare_name_payload(
+                        facade=client,
+                        request=request,
+                        now=dependencies.now,
+                    )
+
+                def akshare_name_decoder(
+                    request: object,
+                    payload: bytes,
+                    result: ProviderSubrequestResult,
+                ) -> FinancialCapabilityProviderResponse:
+                    if not isinstance(request, FinancialCapabilityRoutingRequest):
+                        raise ValueError("AKShare name request is incompatible")
+                    return decode_akshare_name_response(
+                        request,
+                        payload,
+                        result,
+                        qualification_profile=blueprint.routing_plan.qualification_profile,
+                    )
+
+                return ProductionQualifiedBoundSource.bind(
+                    dependencies=dependencies,
+                    physical_provider_id=_physical_provider_id,
+                    physical_request=akshare_name_request,
+                    response_decoder=akshare_name_decoder,
+                    adapter=client,
+                    normalizer_version=AKSHARE_NAME_NORMALIZER_VERSION,
+                    max_physical_attempts=1,
+                )
+            raise ValueError("unknown qualified production source endpoint")
 
         registrations.append(
             ProductionQualifiedSourceRegistration(
@@ -3329,7 +3831,7 @@ def _assemble_production_qualified_runtime(
     source_composition = assemble_production_qualified_provider_sources(
         blueprint=blueprint,
         dependencies=dependencies,
-        source_registrations=_production_terminal_source_registrations(blueprint),
+        source_registrations=_production_executable_source_registrations(blueprint),
     )
     unique_adapters: list[object] = []
     client_ids = {id(client) for client in provider_clients.values()}
@@ -3542,11 +4044,29 @@ def assemble_production_qualified_provider_sources(
             for capability, provider_ids in capability_source_ids
         }
     )
+    company_type_evidence_source_ids = blueprint.routing_plan.route_for(
+        MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+    )
+    company_type_evidence_sources: Mapping[
+        str,
+        FinancialCompanyTypeEvidenceSource,
+    ] = MappingProxyType(
+        {
+            provider_id: pair_sources[
+                (
+                    MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,
+                    provider_id,
+                )
+            ]
+            for provider_id in company_type_evidence_source_ids
+        }
+    )
     router = MainlandFinancialCapabilityRouter(
         routing_plan=blueprint.routing_plan,
         statement_sources=statement_sources,
         indicator_sources=indicator_sources,
         capability_sources=capability_sources,
+        company_type_evidence_sources=company_type_evidence_sources,
     )
     return ProductionQualifiedProviderSourceComposition(
         blueprint=blueprint,
@@ -3555,6 +4075,7 @@ def assemble_production_qualified_provider_sources(
         router=router,
         statement_source_ids=statement_source_ids,
         indicator_source_ids=indicator_source_ids,
+        company_type_evidence_source_ids=company_type_evidence_source_ids,
         capability_source_ids=capability_source_ids,
     )
 

@@ -660,8 +660,12 @@ def test_composition_factory_contains_no_duplicate_company_type_route_table() ->
         encoding="utf-8"
     )
 
-    assert "FINANCIAL_COMPANY_TYPE_EVIDENCE" not in composition_source
-    assert "financial_company_type_evidence" not in composition_source
+    assert "_COMPANY_TYPE_EVIDENCE_ROUTE" not in composition_source
+    assert '("tushare", "akshare_sina", "yfinance")' not in composition_source
+    assert (
+        "company_type_evidence_source_ids = blueprint.routing_plan.route_for"
+        in composition_source
+    )
 
 
 def test_legacy_plan_and_authoritative_mode_controls_remain_unchanged(
