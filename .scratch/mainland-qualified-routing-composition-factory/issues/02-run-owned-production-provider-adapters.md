@@ -14,7 +14,7 @@ immutable Capability Routing Plan.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
@@ -134,4 +134,3 @@ integration tests, load live qualification caches, or read real credentials.
   behavior pass without fixture or expectation changes.
 - [ ] Focused tests, Ruff, whitespace, secret/payload, and scope checks pass with
   zero live-provider or paid-model activity.
-

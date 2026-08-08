@@ -13,7 +13,7 @@ graph, model, provider, store, artifact, report, or checkpoint work.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
@@ -133,4 +133,3 @@ requests or construct paid-model clients.
 - [ ] Self-review confirms the slice adds only construction contract/blueprint
   behavior and preserves every authority and compatibility invariant in the
   parent specification.
-

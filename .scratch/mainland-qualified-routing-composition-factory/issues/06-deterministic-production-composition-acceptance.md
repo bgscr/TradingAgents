@@ -11,12 +11,14 @@ record for QCF1–QCF18, rerun PE1–PE15 and parent AC1–AC13 unchanged, run t
 suite twice, and complete Spec Compliance review before Code Quality review.
 Any failure blocks Ticket 07.
 
-**Blocked by:** 02 — Assemble run-owned production provider adapters; 03 — Add
-static registration and caller precedence; 04 — Implement managed runtime
-lifecycle and cleanup; 05 — Restore checkpoint and cache state through the
-factory.
+**Blocked by:** 03 — Add static registration and caller precedence; 02D — Add
+executable production-source wiring; 04A — Integrate managed eligibility-context
+acquisition; 05A — Bind and restore eligibility context through checkpoints.
 
-**Status:** ready-for-agent
+**Status:** blocked
+
+**Acceptance state:** FAIL/BLOCKED and not complete. Ticket 06 cannot resume
+until 02A, 02B, 02C, 02D, 04A, and 05A are complete.
 
 ## Observable behavior
 
@@ -24,6 +26,9 @@ factory.
   retained immutable artifacts, and fake models exercise the shipped built-in
   selection and real compiled-graph/dispatcher seams without a test factory or
   dynamic-import fixture.
+- QCF4–QCF12 each begin from a new built-in run with no manually seeded
+  eligibility context, callable runtime, or checkpoint. The run must originate
+  and bind its own immutable context before ordinary factory/dispatcher use.
 - The matrix covers complete and partial Tushare, AKShare-Sina salvage, Yahoo
   degraded/current-only terminal fallback, BaoStock tradeable/suspended and
   strict-bundle authority, factor/name separation, ratio families, exact
@@ -37,6 +42,10 @@ factory.
   byte-for-byte untouched and readable.
 
 ## Acceptance criteria
+
+QCF1–QCF18 remain unchanged. QCF4–QCF12 must originate from a fresh built-in
+run. A manually seeded Financial Eligibility Acquisition Context, callable
+runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
 
 - [ ] **QCF1 — Built-in reachability:** CLI and programmatic explicit validation
   select the statically registered built-in without injection/factory path;
@@ -107,10 +116,10 @@ factory.
 
 ## Deterministic regressions
 
-- Run every focused test added by Tickets 01–05 plus existing adapter,
-  coordinator/cache, rollout, checkpoint, graph-dispatch, report, audit,
-  Evidence Admission, Decision Gate, Current Tradeability, strict-history, and
-  daily-market tests.
+- Run every focused test added by Tickets 01–05, 02A, 02B, 02C, 02D, 04A, and
+  05A plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
+  dispatch, report, audit, Evidence Admission, Decision Gate, Current
+  Tradeability, strict-history, and daily-market tests.
 - Cover exact attempt cardinality for success, retry, capacity cooldown, skip,
   terminal failure, sequential fallback, cache hit, restored hit, single-flight,
   and bulk reuse for every assembled provider.
@@ -157,6 +166,8 @@ Run production-composition and provider focused suites:
 
 \`\`\`powershell
 pytest -q tests/test_qualified_routing_composition_contract.py tests/test_production_qualified_provider_composition.py tests/test_qualified_routing_static_registration.py tests/test_qualified_routing_managed_lifecycle.py tests/test_qualified_routing_factory_checkpoint_restore.py
+pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_financial_eligibility_metadata_acquisition.py tests/test_financial_request_factory_context_binding.py
+pytest -q tests/test_qualified_production_source_bindings.py tests/test_qualified_routing_eligibility_context_lifecycle.py tests/test_qualified_routing_checkpoint_context_restore.py
 pytest -q tests/test_tushare_statement_adapters.py tests/test_tushare_indicator_adapter.py tests/test_tushare_factor_name_adapters.py tests/test_akshare_sina_statement_adapters.py tests/test_baostock_capability_adapters.py tests/test_baostock_ratio_adapters.py
 pytest -q tests/test_provider_subrequest_cache.py tests/test_provider_request_coordinator.py tests/test_mainland_physical_attempt_coordination.py tests/test_yahoo_retry_coordination.py
 \`\`\`
@@ -201,4 +212,3 @@ instead of running it.
   unrelated changes. All Critical and Important findings are resolved.
 - [ ] Authoritative \`qualified_v1\` remains disabled, no live traffic occurred,
   and Ticket 07 is unblocked only by a complete passing evidence package.
-

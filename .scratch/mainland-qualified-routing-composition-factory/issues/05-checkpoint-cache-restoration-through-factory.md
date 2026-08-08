@@ -13,7 +13,7 @@ I/O; incompatible or corrupt state must fail typed without live repair.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
@@ -127,4 +127,3 @@ every restoration scenario.
 - [ ] Legacy and pre-v2 compatibility behavior passes without schema or fixture
   changes.
 - [ ] Focused tests, Ruff, whitespace, secret/payload, and scope checks pass.
-

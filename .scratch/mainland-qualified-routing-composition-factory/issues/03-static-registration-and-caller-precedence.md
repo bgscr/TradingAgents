@@ -12,7 +12,7 @@ prove all ordinary paths allocate zero qualified resources.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
@@ -121,4 +121,3 @@ The tests must not construct real provider or model clients.
 - [ ] Existing direct and operator override behavior passes unchanged.
 - [ ] Focused tests, Ruff, whitespace, and scope checks pass; authoritative
   \`qualified_v1\` remains disabled.
-

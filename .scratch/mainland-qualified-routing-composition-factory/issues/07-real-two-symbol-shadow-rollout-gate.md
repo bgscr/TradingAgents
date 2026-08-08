@@ -13,7 +13,10 @@ output, and still-disabled \`qualified_v1\`.
 
 **Blocked by:** 06 — Run deterministic production-composition acceptance.
 
-**Status:** ready-for-agent
+**Status:** blocked
+
+**Gate state:** Blocked by Ticket 06. This remains the only live-provider gate,
+and authoritative `qualified_v1` remains disabled.
 
 ## Observable behavior
 
@@ -28,6 +31,9 @@ output, and still-disabled \`qualified_v1\`.
   artifacts are used for each attempt. No historical report, checkpoint,
   attempt, artifact, audit, snapshot, pin, provider row, or ID is cleared or
   reused to manufacture a clean result.
+- Each run originates and binds one immutable Financial Eligibility Acquisition
+  Context without a manually seeded context, runtime, or checkpoint, and retains
+  its safe version, identity, and projection before ordinary financial dispatch.
 - Run \`601328.SS\` first as the bank Equity and \`600895.SS\` second as the
   non-bank Equity, sequentially, for the same latest completed mainland session.
 - Each run retains its safe preflight result, Capability Routing Plan signature,
@@ -55,6 +61,10 @@ output, and still-disabled \`qualified_v1\`.
 - [ ] \`600895.SS\` starts only after the bank run terminates and completes
   through the same seam and policy inputs in its own new run/checkpoint
   namespace; its report and decision audit are complete and retained.
+- [ ] Each symbol's fresh built-in run acquires company type and authoritative
+  BaoStock listing provenance, binds exactly one immutable eligibility context
+  before factory/dispatcher exposure, and retains its safe context identity and
+  projection with no manual seed.
 - [ ] For both runs, every transport call has exactly one existing-schema
   physical-attempt event; retries/fallback match configured budgets and plan
   order; cache hits, reuse, skips, selections, and derived facts add zero
@@ -124,6 +134,8 @@ Before seeking live authorization:
 
 \`\`\`powershell
 pytest -q tests/test_qualified_routing_composition_contract.py tests/test_production_qualified_provider_composition.py tests/test_qualified_routing_static_registration.py tests/test_qualified_routing_managed_lifecycle.py tests/test_qualified_routing_factory_checkpoint_restore.py
+pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_financial_eligibility_metadata_acquisition.py tests/test_financial_request_factory_context_binding.py
+pytest -q tests/test_qualified_production_source_bindings.py tests/test_qualified_routing_eligibility_context_lifecycle.py tests/test_qualified_routing_checkpoint_context_restore.py
 pytest -q tests/test_qualified_routing_rollout.py tests/test_corrected_shadow_joint_acceptance.py
 pytest -q -m "not integration"
 ruff check .

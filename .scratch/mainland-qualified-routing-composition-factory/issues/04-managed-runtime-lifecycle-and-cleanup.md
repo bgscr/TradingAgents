@@ -13,7 +13,7 @@ owned resource on success or any \`BaseException\`.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
@@ -128,4 +128,3 @@ must not open live provider sessions or instantiate paid-model clients.
 - [ ] Leak/race tests prove no dangling session, connection, lease, store, or
   worker after success or failure.
 - [ ] Focused tests, Ruff, whitespace, secret-safety, and scope checks pass.
-
