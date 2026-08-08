@@ -78,9 +78,17 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
+    FinancialToolRequest,
+)
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialEligibilityAcquisitionContext,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
+)
+from tradingagents.dataflows.financial_request_factory import (
+    build_financial_indicator_routing_request,
+    build_financial_statement_routing_request,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -3057,7 +3065,7 @@ def _safe_external_source(
 
 
 class _ProductionQualifiedRequestFactories:
-    """Run-owned placeholder that never treats tool arguments as eligibility."""
+    """Lifecycle wrapper around the pure Ticket 02C two-input projections."""
 
     def __init__(self, run_binding: ProductionQualifiedRoutingRunBinding) -> None:
         self._asset_configuration = run_binding.asset_configuration
@@ -3072,19 +3080,35 @@ class _ProductionQualifiedRequestFactories:
                     ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
                 )
 
-    def statement(self, request: object) -> FinancialStatementRoutingRequest:
+    def statement(
+        self,
+        request: object,
+        context: object | None = None,
+    ) -> FinancialStatementRoutingRequest:
         self._require_open()
-        del request
-        raise ProductionQualifiedRoutingLifecycleError(
-            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
-        )
+        if not isinstance(request, FinancialToolRequest) or not isinstance(
+            context,
+            FinancialEligibilityAcquisitionContext,
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        return build_financial_statement_routing_request(request, context)
 
-    def indicator(self, request: object) -> FinancialIndicatorRoutingRequest:
+    def indicator(
+        self,
+        request: object,
+        context: object | None = None,
+    ) -> FinancialIndicatorRoutingRequest:
         self._require_open()
-        del request
-        raise ProductionQualifiedRoutingLifecycleError(
-            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
-        )
+        if not isinstance(request, FinancialToolRequest) or not isinstance(
+            context,
+            FinancialEligibilityAcquisitionContext,
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        return build_financial_indicator_routing_request(request, context)
 
     def interrupt(self) -> None:
         return None

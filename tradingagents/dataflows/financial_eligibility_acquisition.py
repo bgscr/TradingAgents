@@ -60,6 +60,9 @@ FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION = (
 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION = (
     "financial-eligibility-acquisition-result-v1"
 )
+FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION = (
+    "financial-eligibility-request-binding-v1"
+)
 
 _CLOSED_MODEL_CONFIG = ConfigDict(
     extra="forbid",
@@ -111,6 +114,12 @@ def _assert_safe_projection(value: object) -> None:
         or _is_machine_local_absolute_path(projected)
     ):
         raise ValueError("financial eligibility projection contains an unsafe locator")
+
+
+def assert_safe_financial_eligibility_projection(value: object) -> None:
+    """Validate checkpoint-safe financial eligibility or request material."""
+
+    _assert_safe_projection(value)
 
 
 def _canonical_value(value: object) -> object:
@@ -594,6 +603,92 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         return self
 
 
+class FinancialEligibilityRequestBinding(BaseModel):
+    """Complete safe context binding carried by a fresh routing request."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-eligibility-request-binding-v1"] = (
+        FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION
+    )
+    context_contract_version: Literal[
+        "financial-eligibility-acquisition-context-v1"
+    ]
+    context_identity: str = Field(
+        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$"
+    )
+    canonical_run_id: str = Field(pattern=_RUN_ID_PATTERN)
+    asset_configuration_signature: str = Field(pattern=_ASSET_SIGNATURE_PATTERN)
+    instrument_identity: InstrumentIdentityEvidence
+    canonical_symbol: str = Field(min_length=1, max_length=64)
+    as_of_date: date
+    availability_scope: FinancialAvailabilityScope
+    acquisition_purpose: Literal["foreground_current_analysis"]
+    financial_eligibility_binding: MainlandFinancialEligibilityProjectionBinding
+    routing_plan_signature: str = Field(pattern=_PLAN_SIGNATURE_PATTERN)
+    company_type_resolution: FinancialCompanyTypeResolution
+    company_type_evidence: FinancialCompanyTypeContextEvidence
+    listing_date: date
+    listing_provenance: FinancialListingProvenance
+    currency: Literal["CNY"]
+    consolidation_scope: FinancialConsolidationScope
+    acquisition_annual_period_ends: tuple[date, ...]
+    acquisition_reporting_period_ends: tuple[date, ...]
+
+    @model_validator(mode="after")
+    def _validate_binding(self) -> Self:
+        if self.canonical_symbol != self.instrument_identity.symbol.strip().upper():
+            raise ValueError("request binding symbol contradicts Instrument Identity")
+        if self.currency != self.instrument_identity.currency:
+            raise ValueError("request binding currency contradicts Instrument Identity")
+        if self.company_type_resolution.company_type is FinancialCompanyType.UNKNOWN:
+            raise ValueError("request binding requires resolved company type")
+        if (
+            self.company_type_evidence.normalized_resolver_inputs
+            != self.company_type_resolution.classifier_inputs
+            or self.company_type_evidence.provider_declared_type
+            is not self.company_type_resolution.provider_declared_type
+            or self.company_type_evidence.provider_declaration_qualified
+            != self.company_type_resolution.provider_declaration_qualified
+        ):
+            raise ValueError("request binding company-type evidence is inconsistent")
+        if self.listing_date > self.as_of_date:
+            raise ValueError("request binding listing date is after its as-of date")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+    @classmethod
+    def from_context(
+        cls,
+        context: FinancialEligibilityAcquisitionContext,
+    ) -> Self:
+        """Project the complete immutable context without recomputing policy."""
+
+        return cls(
+            context_contract_version=context.contract_version,
+            context_identity=context.context_identity,
+            canonical_run_id=context.run_id,
+            asset_configuration_signature=context.asset_configuration_signature,
+            instrument_identity=context.instrument_identity,
+            canonical_symbol=context.instrument_identity.symbol.strip().upper(),
+            as_of_date=context.as_of_date,
+            availability_scope=context.availability_scope,
+            acquisition_purpose=context.acquisition_purpose,
+            financial_eligibility_binding=context.financial_eligibility_binding,
+            routing_plan_signature=context.routing_plan_signature,
+            company_type_resolution=context.company_type_resolution,
+            company_type_evidence=context.company_type_evidence,
+            listing_date=context.listing_date,
+            listing_provenance=context.listing_provenance,
+            currency=context.currency,
+            consolidation_scope=context.consolidation_scope,
+            acquisition_annual_period_ends=context.acquisition_annual_period_ends,
+            acquisition_reporting_period_ends=(
+                context.acquisition_reporting_period_ends
+            ),
+        )
+
+
 class FinancialEligibilityAcquisitionFailureReason(str, Enum):
     COMPANY_TYPE_EVIDENCE_UNAVAILABLE = "company_type_evidence_unavailable"
     COMPANY_TYPE_UNRESOLVED = "company_type_unresolved"
@@ -902,6 +997,7 @@ __all__ = [
     "FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION",
+    "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION",
     "FinancialCompanyTypeAcquisitionEvidenceBinding",
     "FinancialCompanyTypeContextEvidence",
     "FinancialCompanyTypeEvidenceBinding",
@@ -910,10 +1006,12 @@ __all__ = [
     "FinancialEligibilityAcquisitionFailure",
     "FinancialEligibilityAcquisitionFailureReason",
     "FinancialEligibilityMetadataBinding",
+    "FinancialEligibilityRequestBinding",
     "FinancialEligibilityAcquisitionResult",
     "FinancialListingMetadata",
     "FinancialListingMetadataProjection",
     "build_financial_eligibility_acquisition_context",
     "derive_mainland_financial_acquisition_period_supersets",
     "financial_eligibility_acquisition_context_identity",
+    "assert_safe_financial_eligibility_projection",
 ]

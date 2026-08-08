@@ -70,6 +70,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialEvidenceDisposition,
     FinancialHistoryCompletenessAssessment,
     FinancialIndicatorAggregateAssessment,
+    FinancialIndicatorEvidenceRequirements,
     FinancialIndicatorFamilyAssessment,
     FinancialPeriodCandidate,
     FinancialPeriodCompletenessAssessment,
@@ -88,6 +89,9 @@ from tradingagents.dataflows.financial_contracts import (
     assess_financial_history_coverage,
     assess_financial_period_candidate,
     assess_financial_ratio_history_coverage,
+)
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialEligibilityRequestBinding,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityPolicyError,
@@ -146,6 +150,7 @@ _RESERVED_MATERIAL_ARGUMENTS = frozenset(
         "dispatched_at",
         "frequency",
         "graph_message_id",
+        "indicator_request_arguments",
         "period",
         "process_id",
         "provider",
@@ -211,6 +216,29 @@ _FINANCIAL_TOOL_SPECS = {
 }
 
 
+class FinancialIndicatorRequestArguments(BaseModel):
+    """Caller-owned indicator families and their existing evidence requirements."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    requested_families: tuple[FinancialRatioFamily, ...] = Field(min_length=1)
+    family_evidence_requirements: FinancialIndicatorEvidenceRequirements
+    remaining_evidence_decision_ready: bool = False
+
+    @model_validator(mode="after")
+    def _validate_arguments(self) -> FinancialIndicatorRequestArguments:
+        canonical = tuple(
+            family for family in FinancialRatioFamily if family in self.requested_families
+        )
+        if (
+            self.requested_families != canonical
+            or self.family_evidence_requirements.requested_families != canonical
+            or self.remaining_evidence_decision_ready
+        ):
+            raise ValueError("indicator request arguments are inconsistent")
+        return self
+
+
 class FinancialToolRequest(BaseModel):
     """One logical request; runtime correlation fields are deliberately separate."""
 
@@ -225,6 +253,23 @@ class FinancialToolRequest(BaseModel):
     graph_message_id: str | None = Field(default=None, min_length=1, pattern=r".*\S.*")
     process_id: int | None = None
     dispatched_at: datetime | None = None
+    financial_eligibility_context_binding: (
+        FinancialEligibilityRequestBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_request_arguments: FinancialIndicatorRequestArguments | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    def canonical_material_arguments(self) -> dict[str, Any]:
+        """Include typed qualified arguments in existing material identity."""
+
+        material = dict(self.material_arguments)
+        if self.indicator_request_arguments is not None:
+            material["indicator_request_arguments"] = (
+                self.indicator_request_arguments.model_dump(mode="json")
+            )
+        return material
 
     @model_validator(mode="after")
     def _validate_logical_tool_contract(self) -> FinancialToolRequest:
@@ -238,6 +283,12 @@ class FinancialToolRequest(BaseModel):
             raise ValueError("financial statement type contradicts the tool name")
         if self.frequency not in allowed_frequencies:
             raise ValueError("financial reporting frequency contradicts the tool name")
+        if (
+            self.indicator_request_arguments is not None
+            and self.statement_type
+            is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+        ):
+            raise ValueError("statement tool cannot carry indicator request arguments")
         reserved = tuple(
             sorted(
                 key
@@ -1833,7 +1884,7 @@ class FinancialToolDispatcher:
             self._instrument_identity
         )
         material_arguments_json = _canonical_json(
-            request.material_arguments,
+            request.canonical_material_arguments(),
             label="material arguments",
         )
         provider_chain_identity = _provider_chain_identity(

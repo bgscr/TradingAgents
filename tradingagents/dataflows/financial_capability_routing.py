@@ -72,8 +72,11 @@ from tradingagents.dataflows.financial_contracts import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialCompanyTypeAcquisitionEvidenceBinding,
+    FinancialCompanyTypeContextEvidence,
     FinancialEligibilityMetadataBinding,
+    FinancialEligibilityRequestBinding,
     FinancialListingMetadata,
+    assert_safe_financial_eligibility_projection,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
@@ -109,6 +112,11 @@ _ROUTABLE_DATASET_CAPABILITIES = frozenset(
 )
 _ROUTE_PROVIDER_ARTIFACT_PROVIDER = {
     "baostock_qualified_families": "baostock",
+}
+_STATEMENT_TOOL_NAME = {
+    FinancialStatementType.BALANCE_SHEET: "get_balance_sheet",
+    FinancialStatementType.INCOME_STATEMENT: "get_income_statement",
+    FinancialStatementType.CASH_FLOW: "get_cashflow",
 }
 _QUALIFIED_PUBLICATION_PROVIDERS = {
     FinancialCapability.STATEMENT: frozenset({"akshare_sina", "tushare"}),
@@ -571,6 +579,7 @@ class FinancialStatementRoutingRequest(BaseModel):
     contract_version: Literal[
         "financial-statement-routing-request-v1",
         "financial-statement-routing-request-v2",
+        "financial-statement-routing-request-v3",
     ] = (
         "financial-statement-routing-request-v1"
     )
@@ -590,6 +599,54 @@ class FinancialStatementRoutingRequest(BaseModel):
     eligible_reporting_period_ends: tuple[date, ...]
     listing_date: date | None = None
     listing_provenance: FinancialListingProvenance | None = None
+    requested_capability: MainlandCapability | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_analysis_scope: FinancialAvailabilityScope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    acquisition_purpose: Literal["foreground_current_analysis"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    company_type_resolution: FinancialCompanyTypeResolution | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    company_type_evidence: FinancialCompanyTypeContextEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    tool_name: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        exclude_if=lambda value: value is None,
+    )
+    frequency: FinancialReportingFrequency | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    material_arguments_json: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    financial_eligibility_context_binding: (
+        FinancialEligibilityRequestBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    request_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-statement-routing-request:v3:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+
+    def safe_projection(self) -> dict[str, Any]:
+        """Return the deterministic payload later checkpoint tickets may bind."""
+
+        projection = self.model_dump(mode="json")
+        assert_safe_financial_eligibility_projection(projection)
+        return projection
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialStatementRoutingRequest:
@@ -599,18 +656,99 @@ class FinancialStatementRoutingRequest(BaseModel):
             raise ValueError("statement routing requires a resolved company type")
         if (self.listing_date is None) != (self.listing_provenance is None):
             raise ValueError("listing exception requires authoritative date and provenance")
-        v2 = self.contract_version == "financial-statement-routing-request-v2"
-        if v2 != (
+        policy_bound = self.contract_version in {
+            "financial-statement-routing-request-v2",
+            "financial-statement-routing-request-v3",
+        }
+        if policy_bound != (
             self.eligibility_policy_version
             == MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2
         ):
             raise ValueError("statement routing request policy identity is inconsistent")
         if self.financial_eligibility_binding is not None and (
-            not v2
+            not policy_bound
             or self.financial_eligibility_binding.eligibility_policy_version
             != self.eligibility_policy_version
         ):
             raise ValueError("statement routing eligibility binding is inconsistent")
+        context_bound = self.contract_version == "financial-statement-routing-request-v3"
+        new_fields = (
+            self.requested_capability,
+            self.requested_analysis_scope,
+            self.acquisition_purpose,
+            self.company_type_resolution,
+            self.company_type_evidence,
+            self.tool_name,
+            self.frequency,
+            self.material_arguments_json,
+            self.financial_eligibility_context_binding,
+            self.request_identity,
+        )
+        if context_bound != all(value is not None for value in new_fields):
+            raise ValueError("statement routing context binding is inconsistent")
+        if not context_bound and any(value is not None for value in new_fields):
+            raise ValueError("legacy statement routing carries a fresh context binding")
+        if context_bound:
+            binding = self.financial_eligibility_context_binding
+            assert binding is not None
+            expected_capability = _STATEMENT_CAPABILITY[self.statement_type]
+            if (
+                self.requested_capability is not expected_capability
+                or self.tool_name != _STATEMENT_TOOL_NAME[self.statement_type]
+                or self.frequency
+                not in {
+                    FinancialReportingFrequency.ANNUAL,
+                    FinancialReportingFrequency.QUARTERLY,
+                }
+                or self.requested_analysis_scope is not binding.availability_scope
+                or self.acquisition_purpose != binding.acquisition_purpose
+                or self.instrument_identity != binding.instrument_identity
+                or self.as_of_date != binding.as_of_date
+                or self.company_type_resolution != binding.company_type_resolution
+                or self.company_type_evidence != binding.company_type_evidence
+                or self.company_type is not binding.company_type_resolution.company_type
+                or self.consolidation_scope is not binding.consolidation_scope
+                or self.currency != binding.currency
+                or self.eligible_annual_period_ends
+                != binding.acquisition_annual_period_ends
+                or self.eligible_reporting_period_ends
+                != binding.acquisition_reporting_period_ends
+                or self.listing_date != binding.listing_date
+                or self.listing_provenance != binding.listing_provenance
+                or self.financial_eligibility_binding
+                != binding.financial_eligibility_binding
+            ):
+                raise ValueError("statement routing request contradicts its context")
+            assert self.material_arguments_json is not None
+            try:
+                material_arguments = json.loads(self.material_arguments_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("statement routing material arguments are invalid") from exc
+            assert_safe_financial_eligibility_projection(material_arguments)
+            if self.material_arguments_json != json.dumps(
+                material_arguments,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ):
+                raise ValueError("statement routing material arguments are not canonical")
+            payload = self.model_dump(mode="json", exclude={"request_identity"})
+            expected_identity = (
+                "financial-statement-routing-request:v3:"
+                + sha256(
+                    json.dumps(
+                        payload,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            if self.request_identity != expected_identity:
+                raise ValueError("statement routing request identity mismatch")
+            assert_safe_financial_eligibility_projection(payload)
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -627,6 +765,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         "financial-indicator-routing-request-v3",
         "financial-indicator-routing-request-v4",
         "financial-indicator-routing-request-v5",
+        "financial-indicator-routing-request-v6",
     ] = (
         "financial-indicator-routing-request-v1"
     )
@@ -661,6 +800,50 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    eligible_annual_period_ends: tuple[date, ...] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_capability: MainlandCapability | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    acquisition_purpose: Literal["foreground_current_analysis"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    company_type_evidence: FinancialCompanyTypeContextEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    tool_name: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        exclude_if=lambda value: value is None,
+    )
+    frequency: FinancialReportingFrequency | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    material_arguments_json: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    financial_eligibility_context_binding: (
+        FinancialEligibilityRequestBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    request_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-indicator-routing-request:v6:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+
+    def safe_projection(self) -> dict[str, Any]:
+        """Return the deterministic payload later checkpoint tickets may bind."""
+
+        projection = self.model_dump(mode="json")
+        assert_safe_financial_eligibility_projection(projection)
+        return projection
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialIndicatorRoutingRequest:
@@ -670,9 +853,14 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         family_bound = self.contract_version in {
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
+            "financial-indicator-routing-request-v6",
         }
         provenance_bound = (
-            self.contract_version == "financial-indicator-routing-request-v5"
+            self.contract_version
+            in {
+                "financial-indicator-routing-request-v5",
+                "financial-indicator-routing-request-v6",
+            }
         )
         if not canonical or len(self.ratio_families) != len(canonical):
             raise ValueError("indicator families must be non-empty, unique, and canonical")
@@ -698,6 +886,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v3",
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
+            "financial-indicator-routing-request-v6",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -716,6 +905,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 "financial-indicator-routing-request-v3",
                 "financial-indicator-routing-request-v4",
                 "financial-indicator-routing-request-v5",
+                "financial-indicator-routing-request-v6",
             }
         )
         if availability_bound and self.requested_analysis_scope is None:
@@ -736,6 +926,78 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 or self.remaining_evidence_decision_ready
             ):
                 raise ValueError("indicator family requirement binding is inconsistent")
+        context_bound = self.contract_version == "financial-indicator-routing-request-v6"
+        new_fields = (
+            self.eligible_annual_period_ends,
+            self.requested_capability,
+            self.acquisition_purpose,
+            self.company_type_evidence,
+            self.tool_name,
+            self.frequency,
+            self.material_arguments_json,
+            self.financial_eligibility_context_binding,
+            self.request_identity,
+        )
+        if context_bound != all(value is not None for value in new_fields):
+            raise ValueError("indicator routing context binding is inconsistent")
+        if not context_bound and any(value is not None for value in new_fields):
+            raise ValueError("legacy indicator routing carries a fresh context binding")
+        if context_bound:
+            binding = self.financial_eligibility_context_binding
+            assert binding is not None
+            if (
+                self.requested_capability is not MainlandCapability.FINANCIAL_INDICATORS
+                or self.tool_name != "get_fundamentals"
+                or self.frequency is not FinancialReportingFrequency.NOT_APPLICABLE
+                or self.requested_analysis_scope is not binding.availability_scope
+                or self.acquisition_purpose != binding.acquisition_purpose
+                or self.instrument_identity != binding.instrument_identity
+                or self.as_of_date != binding.as_of_date
+                or self.company_type_resolution != binding.company_type_resolution
+                or self.company_type_evidence != binding.company_type_evidence
+                or self.company_type is not binding.company_type_resolution.company_type
+                or self.consolidation_scope is not binding.consolidation_scope
+                or self.currency != binding.currency
+                or self.eligible_annual_period_ends
+                != binding.acquisition_annual_period_ends
+                or self.eligible_reporting_period_ends
+                != binding.acquisition_reporting_period_ends
+                or self.listing_date != binding.listing_date
+                or self.listing_provenance != binding.listing_provenance
+                or self.financial_eligibility_binding
+                != binding.financial_eligibility_binding
+            ):
+                raise ValueError("indicator routing request contradicts its context")
+            assert self.material_arguments_json is not None
+            try:
+                material_arguments = json.loads(self.material_arguments_json)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("indicator routing material arguments are invalid") from exc
+            assert_safe_financial_eligibility_projection(material_arguments)
+            if self.material_arguments_json != json.dumps(
+                material_arguments,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ):
+                raise ValueError("indicator routing material arguments are not canonical")
+            payload = self.model_dump(mode="json", exclude={"request_identity"})
+            expected_identity = (
+                "financial-indicator-routing-request:v6:"
+                + sha256(
+                    json.dumps(
+                        payload,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+            if self.request_identity != expected_identity:
+                raise ValueError("indicator routing request identity mismatch")
+            assert_safe_financial_eligibility_projection(payload)
         _validate_mainland_financial_identity(
             self.instrument_identity,
             currency=self.currency,
@@ -2842,6 +3104,7 @@ class MainlandFinancialCapabilityRouter:
         if request.contract_version in {
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
+            "financial-indicator-routing-request-v6",
         }:
             (
                 family_assessments,
@@ -3335,6 +3598,7 @@ def assess_financial_indicator_family_outcomes(
         not in {
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
+            "financial-indicator-routing-request-v6",
         }
         or requirements is None
         or request.requested_analysis_scope is None
