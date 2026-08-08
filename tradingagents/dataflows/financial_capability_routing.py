@@ -70,6 +70,11 @@ from tradingagents.dataflows.financial_contracts import (
     reject_financial_period_for_incompatible_selection_key,
     reject_financial_period_for_strict_pit,
 )
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialCompanyTypeAcquisitionEvidenceBinding,
+    FinancialEligibilityMetadataBinding,
+    FinancialListingMetadata,
+)
 from tradingagents.dataflows.financial_eligibility_policy import (
     MAINLAND_FINANCIAL_ELIGIBILITY_POLICY_V2,
     MainlandFinancialEligibilityProjectionBinding,
@@ -764,6 +769,200 @@ class FinancialCapabilityRoutingRequest(BaseModel):
         return self
 
 
+class FinancialCompanyTypeEvidenceRoutingRequest(BaseModel):
+    """Pre-company-type request bound to the active eligibility acquisition."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-company-type-evidence-routing-request-v1"] = (
+        "financial-company-type-evidence-routing-request-v1"
+    )
+    metadata_binding: FinancialEligibilityMetadataBinding
+
+
+class FinancialCompanyTypeEvidenceProviderResponseKind(str, Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class FinancialCompanyTypeEvidenceSourceProjectionKind(str, Enum):
+    """Qualified provider-neutral source projection accepted at the boundary."""
+
+    TUSHARE_STATEMENT = "tushare_statement"
+    AKSHARE_SINA_STATEMENT = "akshare_sina_statement"
+    YFINANCE_CURRENT_PROFILE = "yfinance_current_profile"
+
+
+class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
+    """Safe provider-neutral company-type projection from one plan source."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "financial-company-type-evidence-provider-response-v1"
+    ] = "financial-company-type-evidence-provider-response-v1"
+    provider_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    metadata_binding: FinancialEligibilityMetadataBinding
+    kind: FinancialCompanyTypeEvidenceProviderResponseKind
+    source_projection_kind: FinancialCompanyTypeEvidenceSourceProjectionKind | None = (
+        None
+    )
+    reason: AcquisitionUnavailableReason | None = None
+    evidence: FinancialCompanyTypeAcquisitionEvidenceBinding | None = None
+    subrequest_keys: tuple[str, ...] = ()
+    physical_attempt_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def available(
+        cls,
+        *,
+        provider_id: str,
+        metadata_binding: FinancialEligibilityMetadataBinding,
+        source_projection_kind: FinancialCompanyTypeEvidenceSourceProjectionKind | str,
+        evidence: FinancialCompanyTypeAcquisitionEvidenceBinding,
+        subrequest_keys: Sequence[str] = (),
+        physical_attempt_ids: Sequence[str] = (),
+    ) -> FinancialCompanyTypeEvidenceProviderResponse:
+        return cls(
+            provider_id=provider_id,
+            metadata_binding=metadata_binding,
+            kind=FinancialCompanyTypeEvidenceProviderResponseKind.AVAILABLE,
+            source_projection_kind=FinancialCompanyTypeEvidenceSourceProjectionKind(
+                source_projection_kind
+            ),
+            evidence=evidence,
+            subrequest_keys=tuple(subrequest_keys),
+            physical_attempt_ids=tuple(physical_attempt_ids),
+        )
+
+    @classmethod
+    def unavailable(
+        cls,
+        *,
+        provider_id: str,
+        metadata_binding: FinancialEligibilityMetadataBinding,
+        reason: AcquisitionUnavailableReason | str,
+        subrequest_keys: Sequence[str] = (),
+        physical_attempt_ids: Sequence[str] = (),
+    ) -> FinancialCompanyTypeEvidenceProviderResponse:
+        return cls(
+            provider_id=provider_id,
+            metadata_binding=metadata_binding,
+            kind=FinancialCompanyTypeEvidenceProviderResponseKind.UNAVAILABLE,
+            reason=AcquisitionUnavailableReason(reason),
+            subrequest_keys=tuple(subrequest_keys),
+            physical_attempt_ids=tuple(physical_attempt_ids),
+        )
+
+    @model_validator(mode="after")
+    def _validate_response(self) -> FinancialCompanyTypeEvidenceProviderResponse:
+        for values in (self.subrequest_keys, self.physical_attempt_ids):
+            if len(values) != len(set(values)) or any(
+                not value.strip() for value in values
+            ):
+                raise ValueError("company-type source identities are invalid")
+        if self.kind is FinancialCompanyTypeEvidenceProviderResponseKind.AVAILABLE:
+            expected_projection_kind = {
+                "tushare": FinancialCompanyTypeEvidenceSourceProjectionKind.TUSHARE_STATEMENT,
+                "akshare_sina": FinancialCompanyTypeEvidenceSourceProjectionKind.AKSHARE_SINA_STATEMENT,
+                "yfinance": FinancialCompanyTypeEvidenceSourceProjectionKind.YFINANCE_CURRENT_PROFILE,
+            }.get(self.provider_id)
+            if (
+                self.reason is not None
+                or self.evidence is None
+                or self.evidence.provider_id != self.provider_id
+                or self.source_projection_kind is not expected_projection_kind
+            ):
+                raise ValueError("available company-type response is inconsistent")
+            if (
+                self.evidence.instrument_identity
+                != self.metadata_binding.instrument_identity
+                or self.evidence.as_of_date != self.metadata_binding.as_of_date
+            ):
+                raise ValueError("company-type evidence acquisition binding mismatch")
+            if self.provider_id == "yfinance" and (
+                self.evidence.provider_declared_type is not None
+                or self.evidence.provider_declaration_qualified
+            ):
+                raise ValueError("Yahoo company-type evidence is classifier-only")
+        elif (
+            self.reason is None
+            or self.evidence is not None
+            or self.source_projection_kind is not None
+        ):
+            raise ValueError("unavailable company-type response carries evidence")
+        return self
+
+
+FinancialCompanyTypeEvidenceSource = Callable[
+    [FinancialCompanyTypeEvidenceRoutingRequest],
+    FinancialCompanyTypeEvidenceProviderResponse,
+]
+
+
+class FinancialCompanyTypeEvidenceRoutingResult(BaseModel):
+    """Terminal sequential traversal of the plan prerequisite route."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-company-type-evidence-routing-result-v1"] = (
+        "financial-company-type-evidence-routing-result-v1"
+    )
+    route: tuple[str, ...]
+    provider_calls: tuple[FinancialCompanyTypeEvidenceProviderResponse, ...]
+    selected_provider: str | None = None
+    selected_evidence: FinancialCompanyTypeAcquisitionEvidenceBinding | None = None
+    subrequest_keys: tuple[str, ...] = ()
+    physical_attempt_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_result(self) -> FinancialCompanyTypeEvidenceRoutingResult:
+        called = tuple(item.provider_id for item in self.provider_calls)
+        if called != self.route[: len(called)]:
+            raise ValueError("company-type route calls do not follow the plan")
+        expected_subrequest_keys = tuple(
+            identity
+            for item in self.provider_calls
+            for identity in item.subrequest_keys
+        )
+        expected_physical_attempt_ids = tuple(
+            identity
+            for item in self.provider_calls
+            for identity in item.physical_attempt_ids
+        )
+        if (
+            len(expected_subrequest_keys) != len(set(expected_subrequest_keys))
+            or len(expected_physical_attempt_ids)
+            != len(set(expected_physical_attempt_ids))
+        ):
+            raise ValueError("company-type route contains duplicate lineage")
+        if (
+            self.subrequest_keys != expected_subrequest_keys
+            or self.physical_attempt_ids != expected_physical_attempt_ids
+        ):
+            raise ValueError("company-type route lineage does not match provider calls")
+        selected = next(
+            (
+                item
+                for item in self.provider_calls
+                if item.kind
+                is FinancialCompanyTypeEvidenceProviderResponseKind.AVAILABLE
+            ),
+            None,
+        )
+        if (selected is None) != (self.selected_provider is None) or (
+            selected is None
+        ) != (self.selected_evidence is None):
+            raise ValueError("company-type route selection is incomplete")
+        if selected is not None and (
+            selected.provider_id != self.selected_provider
+            or selected.evidence != self.selected_evidence
+            or selected is not self.provider_calls[-1]
+        ):
+            raise ValueError("company-type route selection contradicts its source")
+        return self
+
+
 class FinancialCapabilityProviderResponse(BaseModel):
     """Payload-free result from one factor/status/name/lifecycle adapter."""
 
@@ -786,6 +985,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
     )
     strict_bundle_component_artifact_identities: tuple[str, ...] = ()
     current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
+    listing_metadata: FinancialListingMetadata | None = None
     derived: bool = False
     degraded: bool = False
 
@@ -806,6 +1006,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
             "tradeable",
             "suspended",
         ] = "unknown",
+        listing_metadata: FinancialListingMetadata | None = None,
         derived: bool = False,
         degraded: bool = False,
     ) -> FinancialCapabilityProviderResponse:
@@ -822,6 +1023,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
                 strict_bundle_component_artifact_identities
             ),
             current_tradeability=current_tradeability,
+            listing_metadata=listing_metadata,
             derived=derived,
             degraded=degraded,
         )
@@ -903,6 +1105,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
                 or self.current_tradeability != "unknown"
                 or self.derived
                 or self.degraded
+                or self.listing_metadata is not None
             ):
                 raise ValueError(
                     "rejected capability response must retain only unusable artifacts"
@@ -914,6 +1117,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
             or self.current_tradeability != "unknown"
             or self.derived
             or self.degraded
+            or self.listing_metadata is not None
         ):
             raise ValueError("unavailable capability response carries usable data")
         bundle_binding_present = (
@@ -938,6 +1142,14 @@ class FinancialCapabilityProviderResponse(BaseModel):
             or self.provider_id != "baostock"
         ):
             raise ValueError("only BaoStock status can establish Current Tradeability")
+        if self.listing_metadata is not None and (
+            self.kind is not FinancialCapabilityProviderResponseKind.AVAILABLE
+            or self.capability is not MainlandCapability.ISSUER_LIFECYCLE
+            or self.provider_id != "baostock"
+            or self.listing_metadata.listing_provenance.source_ref
+            not in self.retained_artifact_identities
+        ):
+            raise ValueError("listing metadata is not BaoStock lifecycle-bound")
         if self.derived and (
             self.capability is not MainlandCapability.ADJUSTMENT_FACTORS
             or self.provider_id != "yfinance_derived"
@@ -1295,6 +1507,7 @@ class FinancialCapabilityRoutingResult(BaseModel):
     )
     strict_bundle_component_artifact_identities: tuple[str, ...] = ()
     current_tradeability: Literal["unknown", "tradeable", "suspended"] = "unknown"
+    listing_metadata: FinancialListingMetadata | None = None
     retained_artifact_identities: tuple[str, ...] = ()
     physical_attempt_ids: tuple[str, ...] = ()
     derived: bool = False
@@ -1338,6 +1551,24 @@ class FinancialCapabilityRoutingResult(BaseModel):
             or self.authoritative_provider != "baostock"
         ):
             raise ValueError("Current Tradeability result is not BaoStock-bound")
+        selected = next(
+            (
+                item
+                for item in self.provider_calls
+                if item.kind is FinancialCapabilityProviderResponseKind.AVAILABLE
+            ),
+            None,
+        )
+        if self.listing_metadata is not None and (
+            self.capability is not MainlandCapability.ISSUER_LIFECYCLE
+            or self.selected_provider != "baostock"
+            or self.authoritative_provider != "baostock"
+            or selected is None
+            or selected.listing_metadata != self.listing_metadata
+        ):
+            raise ValueError("listing result is not BaoStock lifecycle-bound")
+        if selected is None and self.listing_metadata is not None:
+            raise ValueError("unselected lifecycle route carries listing metadata")
         if self.derived and (
             self.selected_provider != "yfinance_derived" or not self.degraded
         ):
@@ -1361,6 +1592,9 @@ class MainlandFinancialCapabilityRouter:
             ]
             | None
         ) = None,
+        company_type_evidence_sources: (
+            Mapping[str, FinancialCompanyTypeEvidenceSource] | None
+        ) = None,
     ) -> None:
         if routing_plan.mode not in {
             MainlandCapabilityRoutingMode.QUALIFIED_V1,
@@ -1374,6 +1608,9 @@ class MainlandFinancialCapabilityRouter:
             capability: dict(sources)
             for capability, sources in (capability_sources or {}).items()
         }
+        self._company_type_evidence_sources = dict(
+            company_type_evidence_sources or {}
+        )
         if any(
             capability not in _ROUTABLE_DATASET_CAPABILITIES
             for capability in self._capability_sources
@@ -1383,6 +1620,59 @@ class MainlandFinancialCapabilityRouter:
     @property
     def routing_plan(self) -> MainlandCapabilityRoutingPlan:
         return self._routing_plan
+
+    def route_company_type_evidence(
+        self,
+        request: FinancialCompanyTypeEvidenceRoutingRequest,
+        *,
+        interrupted: Callable[[], bool] | None = None,
+    ) -> FinancialCompanyTypeEvidenceRoutingResult:
+        """Traverse only the prerequisite route declared by the immutable plan."""
+
+        route = self._routing_plan.route_for(
+            MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+        )
+        provider_calls: list[FinancialCompanyTypeEvidenceProviderResponse] = []
+        subrequest_keys: list[str] = []
+        physical_attempt_ids: list[str] = []
+        selected: FinancialCompanyTypeEvidenceProviderResponse | None = None
+        for provider_id in route:
+            if interrupted is not None and interrupted():
+                break
+            source = self._company_type_evidence_sources.get(provider_id)
+            response = (
+                FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+                    provider_id=provider_id,
+                    metadata_binding=request.metadata_binding,
+                    reason=AcquisitionUnavailableReason.NOT_CONFIGURED,
+                )
+                if source is None
+                else source(request)
+            )
+            response = FinancialCompanyTypeEvidenceProviderResponse.model_validate(
+                response.model_dump(mode="json")
+            )
+            if response.provider_id != provider_id:
+                raise ValueError("company-type source returned another route step")
+            if response.metadata_binding != request.metadata_binding:
+                raise ValueError("company-type source request binding mismatch")
+            provider_calls.append(response)
+            subrequest_keys.extend(response.subrequest_keys)
+            physical_attempt_ids.extend(response.physical_attempt_ids)
+            if (
+                response.kind
+                is FinancialCompanyTypeEvidenceProviderResponseKind.AVAILABLE
+            ):
+                selected = response
+                break
+        return FinancialCompanyTypeEvidenceRoutingResult(
+            route=route,
+            provider_calls=tuple(provider_calls),
+            selected_provider=selected.provider_id if selected is not None else None,
+            selected_evidence=selected.evidence if selected is not None else None,
+            subrequest_keys=tuple(subrequest_keys),
+            physical_attempt_ids=tuple(physical_attempt_ids),
+        )
 
     def capability_policy(
         self,
@@ -1448,6 +1738,15 @@ class MainlandFinancialCapabilityRouter:
                 if source is None
                 else source(request)
             )
+            response = FinancialCapabilityProviderResponse.model_validate(
+                response.model_dump(mode="json")
+            )
+            if response.listing_metadata is not None and (
+                response.listing_metadata.instrument_identity
+                != request.instrument_identity
+                or response.listing_metadata.as_of_date != request.as_of_date
+            ):
+                raise ValueError("lifecycle source request binding mismatch")
             if (
                 response.provider_id != provider_id
                 or response.capability is not request.capability
@@ -1490,6 +1789,9 @@ class MainlandFinancialCapabilityRouter:
             ),
             current_tradeability=(
                 selected.current_tradeability if selected is not None else "unknown"
+            ),
+            listing_metadata=(
+                selected.listing_metadata if selected is not None else None
             ),
             retained_artifact_identities=tuple(retained_artifacts),
             physical_attempt_ids=tuple(physical_attempt_ids),
@@ -3762,6 +4064,12 @@ def render_indicator_routing_result(
 
 __all__ = [
     "FinancialAdapterRowRejection",
+    "FinancialCompanyTypeEvidenceProviderResponse",
+    "FinancialCompanyTypeEvidenceProviderResponseKind",
+    "FinancialCompanyTypeEvidenceRoutingRequest",
+    "FinancialCompanyTypeEvidenceRoutingResult",
+    "FinancialCompanyTypeEvidenceSource",
+    "FinancialCompanyTypeEvidenceSourceProjectionKind",
     "FinancialCapabilityProviderResponseKind",
     "FinancialCapabilityProviderResponse",
     "FinancialCapabilityRoutingRequest",

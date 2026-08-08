@@ -29,6 +29,9 @@ from tradingagents.dataflows.factor_name_contracts import (
     ProviderRowArtifactIdentity,
 )
 from tradingagents.dataflows.financial_contracts import FinancialListingProvenance
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialListingMetadata,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactRef,
     ProviderSubrequestAttemptEvent,
@@ -412,6 +415,31 @@ class BaoStockLifecycleAdapterResult(_BaoStockAdapterResultBase):
     endpoint_scope: Literal["issuer_lifecycle"] = _LIFECYCLE_SCOPE
     candidates: tuple[BaoStockLifecycleCandidate, ...] = ()
     row_rejections: tuple[BaoStockRowRejection, ...] = ()
+    listing_metadata: FinancialListingMetadata | None = None
+
+    @model_validator(mode="after")
+    def _validate_listing_metadata(self):
+        if self.listing_metadata is None:
+            return self
+        if (
+            self.outcome.kind is not ProviderSubrequestOutcomeKind.AVAILABLE
+            or self.capability_outcome.kind is not BaoStockCapabilityOutcomeKind.AVAILABLE
+            or len(self.candidates) != 1
+        ):
+            raise ValueError("BaoStock listing metadata has no unique lifecycle candidate")
+        candidate = self.candidates[0]
+        if (
+            ProviderSubrequestInstrumentIdentity.from_authoritative(
+                self.listing_metadata.instrument_identity
+            )
+            != self.request.instrument_identity
+            or self.listing_metadata.as_of_date != self.request.as_of_date
+            or candidate.listing_date != self.listing_metadata.listing_date
+            or candidate.financial_listing_provenance()
+            != self.listing_metadata.listing_provenance
+        ):
+            raise ValueError("BaoStock listing metadata contradicts lifecycle provenance")
+        return self
 
 
 @dataclass(frozen=True)
@@ -965,6 +993,14 @@ class BaoStockCapabilityAdapter:
             provider_code=symbol,
             as_of_date=as_of_date,
         )
+        listing_metadata = None
+        if len(candidates) == 1 and candidates[0].listing_date is not None:
+            listing_metadata = FinancialListingMetadata(
+                instrument_identity=instrument_identity,
+                as_of_date=as_of_date,
+                listing_date=candidates[0].listing_date,
+                listing_provenance=candidates[0].financial_listing_provenance(),
+            )
         return BaoStockLifecycleAdapterResult(
             request=key,
             subrequest_key=key.subrequest_key,
@@ -977,6 +1013,7 @@ class BaoStockCapabilityAdapter:
             attempt_events=result.attempt_events,
             candidates=candidates,
             row_rejections=rejections,
+            listing_metadata=listing_metadata,
         )
 
     def acquire_provider_history_bundle(

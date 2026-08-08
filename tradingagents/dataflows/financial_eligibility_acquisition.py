@@ -10,6 +10,7 @@ from enum import Enum
 from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     BaseModel,
@@ -50,6 +51,9 @@ from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
 FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION = (
     "financial-company-type-evidence-binding-v1"
 )
+FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION = (
+    "financial-company-type-evidence-binding-v2"
+)
 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION = (
     "financial-eligibility-acquisition-context-v1"
 )
@@ -72,6 +76,7 @@ _ASSET_SIGNATURE_PATTERN = r"^asset-config:v1:[0-9a-f]{64}$"
 _PLAN_SIGNATURE_PATTERN = r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
 _CONTEXT_IDENTITY_PREFIX = "financial-eligibility-acquisition-context:v1:"
 _EVIDENCE_IDENTITY_PREFIX = "financial-company-type-evidence:v1:"
+_MAINLAND_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _URL_QUERY = re.compile(r"https?://\S*\?", re.IGNORECASE)
 
 
@@ -261,6 +266,209 @@ class FinancialCompanyTypeEvidenceBinding(BaseModel):
         )
 
 
+class FinancialCompanyTypeAcquisitionEvidenceBinding(
+    FinancialCompanyTypeEvidenceBinding
+):
+    """Additive source-bound evidence required by fresh metadata acquisition."""
+
+    contract_version: Literal[
+        "financial-company-type-evidence-binding-v2"
+    ] = FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION
+    instrument_identity: InstrumentIdentityEvidence
+    as_of_date: date
+
+    @model_validator(mode="after")
+    def _validate_acquisition_binding(self) -> Self:
+        identity = InstrumentIdentityEvidence.model_validate(
+            self.instrument_identity.model_dump(mode="json")
+        )
+        if (
+            not identity.is_authoritative
+            or identity.instrument_kind is not InstrumentKind.EQUITY
+            or identity.venue not in {"XSHG", "XSHE"}
+            or identity.currency != "CNY"
+            or self.retrieved_at.astimezone(_MAINLAND_TIMEZONE).date()
+            != self.as_of_date
+        ):
+            raise ValueError("company-type evidence acquisition binding is invalid")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        instrument_identity: InstrumentIdentityEvidence,
+        as_of_date: date,
+        provider_id: str,
+        artifact_identity: str,
+        source_ref: str,
+        observed_at: datetime,
+        retrieved_at: datetime,
+        provider_declared_type: FinancialCompanyType | None,
+        provider_declaration_qualified: bool,
+        normalized_resolver_inputs: Sequence[
+            FinancialCompanyTypeClassifierInput | Mapping[str, object]
+        ],
+    ) -> Self:
+        parsed_inputs = tuple(
+            sorted(
+                (
+                    item
+                    if isinstance(item, FinancialCompanyTypeClassifierInput)
+                    else FinancialCompanyTypeClassifierInput.model_validate(item)
+                    for item in normalized_resolver_inputs
+                ),
+                key=lambda item: (item.key, item.value),
+            )
+        )
+        payload: dict[str, object] = {
+            "contract_version": (
+                FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION
+            ),
+            "instrument_identity": instrument_identity,
+            "as_of_date": as_of_date,
+            "provider_id": provider_id,
+            "artifact_identity": artifact_identity,
+            "source_ref": source_ref,
+            "observed_at": _utc_datetime(observed_at),
+            "retrieved_at": _utc_datetime(retrieved_at),
+            "provider_declared_type": provider_declared_type,
+            "provider_declaration_qualified": provider_declaration_qualified,
+            "normalized_resolver_inputs": parsed_inputs,
+            "qualified_provenance": True,
+        }
+        return cls(
+            **payload,
+            resolution_input_identity=_evidence_identity(payload),
+        )
+
+
+FinancialCompanyTypeContextEvidence = (
+    FinancialCompanyTypeAcquisitionEvidenceBinding
+    | FinancialCompanyTypeEvidenceBinding
+)
+
+
+class FinancialEligibilityMetadataBinding(BaseModel):
+    """Exact safe binding shared by freshly acquired and retained metadata."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-eligibility-metadata-binding-v1"] = (
+        "financial-eligibility-metadata-binding-v1"
+    )
+    instrument_identity: InstrumentIdentityEvidence
+    as_of_date: date
+    availability_scope: FinancialAvailabilityScope
+    acquisition_purpose: Literal["foreground_current_analysis"] = (
+        "foreground_current_analysis"
+    )
+    financial_eligibility_binding: MainlandFinancialEligibilityProjectionBinding
+    routing_plan_signature: str = Field(pattern=_PLAN_SIGNATURE_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_metadata_binding(self) -> Self:
+        identity = InstrumentIdentityEvidence.model_validate(
+            self.instrument_identity.model_dump(mode="json")
+        )
+        if (
+            not identity.is_authoritative
+            or identity.instrument_kind is not InstrumentKind.EQUITY
+            or identity.venue not in {"XSHG", "XSHE"}
+            or identity.currency != "CNY"
+        ):
+            raise ValueError("eligibility metadata requires a CNY XSHG/XSHE Equity")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialCompanyTypeEvidenceProjection(BaseModel):
+    """Exact retained-safe company-type evidence and acquisition binding."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-company-type-evidence-projection-v1"] = (
+        "financial-company-type-evidence-projection-v1"
+    )
+    metadata_binding: FinancialEligibilityMetadataBinding
+    evidence: FinancialCompanyTypeAcquisitionEvidenceBinding
+
+    @model_validator(mode="after")
+    def _validate_projection(self) -> Self:
+        if (
+            self.evidence.instrument_identity
+            != self.metadata_binding.instrument_identity
+            or self.evidence.as_of_date != self.metadata_binding.as_of_date
+        ):
+            raise ValueError("company-type evidence acquisition binding mismatch")
+        if self.evidence.provider_id == "yfinance" and (
+            self.evidence.provider_declared_type is not None
+            or self.evidence.provider_declaration_qualified
+        ):
+            raise ValueError("Yahoo company-type evidence is classifier-only")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialListingMetadata(BaseModel):
+    """Provider-neutral authoritative listing metadata projected by lifecycle."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-listing-metadata-v1"] = (
+        "financial-listing-metadata-v1"
+    )
+    instrument_identity: InstrumentIdentityEvidence
+    as_of_date: date
+    listing_date: date
+    listing_provenance: FinancialListingProvenance
+
+    @model_validator(mode="after")
+    def _validate_listing_metadata(self) -> Self:
+        provenance = FinancialListingProvenance.model_validate(
+            self.listing_provenance.model_dump(mode="json")
+        )
+        identity = InstrumentIdentityEvidence.model_validate(
+            self.instrument_identity.model_dump(mode="json")
+        )
+        if (
+            not identity.is_authoritative
+            or identity.instrument_kind is not InstrumentKind.EQUITY
+            or identity.venue not in {"XSHG", "XSHE"}
+            or identity.currency != "CNY"
+            or self.listing_date > self.as_of_date
+            or not provenance.authoritative
+            or provenance.provider_id != "baostock"
+            or re.fullmatch(_LISTING_ARTIFACT_ID_PATTERN, provenance.source_ref) is None
+        ):
+            raise ValueError("listing metadata is not BaoStock authoritative")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialListingMetadataProjection(BaseModel):
+    """Exact retained-safe listing metadata and acquisition binding."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-listing-metadata-projection-v1"] = (
+        "financial-listing-metadata-projection-v1"
+    )
+    metadata_binding: FinancialEligibilityMetadataBinding
+    metadata: FinancialListingMetadata
+
+    @model_validator(mode="after")
+    def _validate_projection(self) -> Self:
+        if (
+            self.metadata.instrument_identity
+            != self.metadata_binding.instrument_identity
+            or self.metadata.as_of_date != self.metadata_binding.as_of_date
+        ):
+            raise ValueError("listing metadata acquisition binding mismatch")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+
 class FinancialEligibilityAcquisitionContext(BaseModel):
     """Immutable provider-neutral authoritative metadata for one qualified run."""
 
@@ -283,7 +491,7 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
     financial_eligibility_binding: MainlandFinancialEligibilityProjectionBinding
     routing_plan_signature: str = Field(pattern=_PLAN_SIGNATURE_PATTERN)
     company_type_resolution: FinancialCompanyTypeResolution
-    company_type_evidence: FinancialCompanyTypeEvidenceBinding
+    company_type_evidence: FinancialCompanyTypeContextEvidence
     listing_date: date
     listing_provenance: FinancialListingProvenance
     currency: Literal["CNY"] = "CNY"
@@ -328,9 +536,7 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         resolution = FinancialCompanyTypeResolution.model_validate(
             self.company_type_resolution.model_dump(mode="json")
         )
-        evidence = FinancialCompanyTypeEvidenceBinding.model_validate(
-            self.company_type_evidence.model_dump(mode="json")
-        )
+        evidence = self.company_type_evidence
         if (
             resolution.company_type is FinancialCompanyType.UNKNOWN
             or resolution.method is FinancialCompanyTypeResolutionMethod.UNRESOLVED
@@ -345,6 +551,13 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             != resolution.provider_declaration_qualified
         ):
             raise ValueError("company-type resolution and evidence binding mismatch")
+        if isinstance(
+            evidence, FinancialCompanyTypeAcquisitionEvidenceBinding
+        ) and (
+            evidence.instrument_identity != identity
+            or evidence.as_of_date != self.as_of_date
+        ):
+            raise ValueError("company-type acquisition evidence context mismatch")
         listing = FinancialListingProvenance.model_validate(
             self.listing_provenance.model_dump(mode="json")
         )
@@ -526,7 +739,7 @@ def build_financial_eligibility_acquisition_context(
     routing_plan_signature: str,
     company_type_resolution: FinancialCompanyTypeResolution,
     company_type_evidence: (
-        FinancialCompanyTypeEvidenceBinding | Mapping[str, Any] | None
+        FinancialCompanyTypeContextEvidence | Mapping[str, Any] | None
     ),
     listing_date: date,
     listing_provenance: FinancialListingProvenance | Mapping[str, Any] | None,
@@ -567,9 +780,14 @@ def build_financial_eligibility_acquisition_context(
             FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE
         )
     try:
-        evidence = FinancialCompanyTypeEvidenceBinding.model_validate(
-            _model_payload(company_type_evidence)
+        evidence_payload = _model_payload(company_type_evidence)
+        evidence_type = (
+            FinancialCompanyTypeAcquisitionEvidenceBinding
+            if evidence_payload.get("contract_version")
+            == FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION
+            else FinancialCompanyTypeEvidenceBinding
         )
+        evidence = evidence_type.model_validate(evidence_payload)
     except (TypeError, ValidationError, ValueError):
         return _failure(
             FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE
@@ -680,14 +898,21 @@ def build_financial_eligibility_acquisition_context(
 
 
 __all__ = [
+    "FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION",
     "FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION",
+    "FinancialCompanyTypeAcquisitionEvidenceBinding",
+    "FinancialCompanyTypeContextEvidence",
     "FinancialCompanyTypeEvidenceBinding",
+    "FinancialCompanyTypeEvidenceProjection",
     "FinancialEligibilityAcquisitionContext",
     "FinancialEligibilityAcquisitionFailure",
     "FinancialEligibilityAcquisitionFailureReason",
+    "FinancialEligibilityMetadataBinding",
     "FinancialEligibilityAcquisitionResult",
+    "FinancialListingMetadata",
+    "FinancialListingMetadataProjection",
     "build_financial_eligibility_acquisition_context",
     "derive_mainland_financial_acquisition_period_supersets",
     "financial_eligibility_acquisition_context_identity",

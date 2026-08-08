@@ -493,6 +493,11 @@ def test_lifecycle_preserves_exact_ipo_listing_out_and_delisting_provenance(
     assert provenance.authoritative is True
     assert provenance.provider_id == "baostock"
     assert provenance.observed_at == _OBSERVED_AT
+    assert result.listing_metadata is not None
+    assert result.listing_metadata.listing_date == date(1996, 4, 22)
+    assert result.listing_metadata.listing_provenance == provenance
+    assert "original_ipo_date" not in result.listing_metadata.model_dump(mode="json")
+    assert "observed_name" not in result.listing_metadata.model_dump(mode="json")
 
 
 @pytest.mark.unit

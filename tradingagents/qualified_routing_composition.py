@@ -2530,6 +2530,7 @@ def _capability_adapter_response(
             retained_artifact_identities=artifact_ids,
             candidate_count=len(candidates),
             current_tradeability=current_tradeability,
+            listing_metadata=getattr(result, "listing_metadata", None),
         )
     if artifact_ids:
         return FinancialCapabilityProviderResponse.rejected(
