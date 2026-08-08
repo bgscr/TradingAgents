@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -42,6 +41,10 @@ from tradingagents.dataflows.financial_dispatch import (
 )
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestCache
 from tradingagents.evidence import EvidenceState
+from tradingagents.qualified_routing_eligibility_lifecycle import (
+    FinancialEligibilityAcquisitionContextOwner,
+    QualifiedFinancialRoutingComposition,
+)
 
 _FINANCIAL_TOOL_CONTRACTS = {
     "get_fundamentals": (
@@ -61,55 +64,6 @@ _FINANCIAL_TOOL_CONTRACTS = {
         FinancialReportingFrequency.QUARTERLY,
     ),
 }
-
-
-@dataclass(frozen=True)
-class QualifiedFinancialRoutingComposition:
-    """Immutable graph-owned wiring for qualified mainland financial routing."""
-
-    router: MainlandFinancialCapabilityRouter
-    statement_request_factory: (
-        Callable[[FinancialToolRequest], FinancialStatementRoutingRequest] | None
-    ) = None
-    indicator_request_factory: (
-        Callable[[FinancialToolRequest], FinancialIndicatorRoutingRequest] | None
-    ) = None
-    provider_subrequest_cache: ProviderSubrequestCache | None = None
-    restored_shadow_dispatcher: FinancialToolDispatcher | None = None
-
-    def __post_init__(self) -> None:
-        financial_capabilities = {
-            TushareCapability.STATEMENTS,
-            TushareCapability.FINANCIAL_INDICATORS,
-        }
-        if (
-            self.statement_request_factory is None
-            and self.indicator_request_factory is None
-            and financial_capabilities.intersection(
-                self.router.routing_plan.enabled_tushare_capabilities
-            )
-        ):
-            raise ValueError(
-                "qualified financial routing requires at least one request factory"
-            )
-        if self.router.routing_plan.mode.value not in {
-            "qualified_v1",
-            "qualified_v1_shadow",
-        }:
-            raise ValueError(
-                "qualified financial routing requires a qualified_v1 plan"
-            )
-        if self.restored_shadow_dispatcher is not None and (
-            self.provider_subrequest_cache is None
-            or not isinstance(
-                self.restored_shadow_dispatcher,
-                FinancialToolDispatcher,
-            )
-        ):
-            raise ValueError(
-                "restored shadow dispatcher requires its run-owned cache"
-            )
-
 
 class FinancialDispatchToolNode:
     """Execute one fundamentals tool turn through a checkpoint-aware dispatcher."""
@@ -133,7 +87,20 @@ class FinancialDispatchToolNode:
         ) = None,
         qualified_provider_subrequest_cache: ProviderSubrequestCache | None = None,
         restored_shadow_dispatcher: FinancialToolDispatcher | None = None,
+        qualified_context_owner: (
+            FinancialEligibilityAcquisitionContextOwner | None
+        ) = None,
     ) -> None:
+        if qualified_context_owner is not None and (
+            qualified_statement_router is not None
+            or qualified_statement_request_factory is not None
+            or qualified_indicator_request_factory is not None
+            or qualified_provider_subrequest_cache is not None
+            or restored_shadow_dispatcher is not None
+        ):
+            raise ValueError(
+                "context-owned qualified routing cannot expose unbound runtime wiring"
+            )
         has_factory = (
             qualified_statement_request_factory is not None
             or qualified_indicator_request_factory is not None
@@ -160,6 +127,24 @@ class FinancialDispatchToolNode:
                 raise ValueError(
                     "financial tool node Capability Routing Plan is immutable"
                 )
+        if qualified_context_owner is not None and config is not None:
+            if str(
+                config.get("mainland_capability_routing_mode", "legacy")
+            ).strip().casefold() != "qualified_v1_shadow":
+                raise ValueError(
+                    "eligibility context owner requires qualified_v1_shadow mode"
+                )
+            configured_signature = config.get(
+                "mainland_capability_routing_plan_signature"
+            )
+            if (
+                configured_signature is not None
+                and str(configured_signature)
+                != qualified_context_owner.routing_plan.plan_signature
+            ):
+                raise ValueError(
+                    "financial tool node Capability Routing Plan is immutable"
+                )
         self._config = dict(config) if config is not None else None
         self._vendor_methods = vendor_methods
         self._retry_policy = retry_policy
@@ -176,6 +161,7 @@ class FinancialDispatchToolNode:
             qualified_provider_subrequest_cache
         )
         self._restored_shadow_dispatcher = restored_shadow_dispatcher
+        self._qualified_context_owner = qualified_context_owner
         if restored_shadow_dispatcher is not None and (
             qualified_statement_router is None
             or qualified_provider_subrequest_cache is None
@@ -205,12 +191,6 @@ class FinancialDispatchToolNode:
                 FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
             )
         dispatcher, evidence = self._dispatcher_from_state(state)
-        shadow_dispatcher = (
-            self._dispatcher_from_state(state, shadow=True)[0]
-            if rollout_mode == "qualified_v1_shadow"
-            else None
-        )
-        shadow_checkpoint_dispatcher = shadow_dispatcher
         graph_message_id = getattr(model_message, "id", None)
         requests = [
             _financial_request_from_tool_call(
@@ -223,37 +203,81 @@ class FinancialDispatchToolNode:
             )
             for tool_call in tool_calls
         ]
+        qualified_routing: QualifiedFinancialRoutingComposition | None = None
+        shadow_dispatcher = None
+        shadow_checkpoint_dispatcher = None
         tool_messages = []
         shadow_executed = False
         shadow_failure_count = 0
+        if rollout_mode == "qualified_v1_shadow":
+            context_owner = self._qualified_context_owner
+            qualified_request = next(
+                (request for request in requests if self._qualified_route_enabled(request)),
+                None,
+            )
+            if context_owner is not None and qualified_request is not None:
+                try:
+                    acquisition = context_owner.acquire_context(
+                        as_of_date=qualified_request.as_of_date
+                    )
+                    if acquisition.context is None:
+                        shadow_failure_count += 1
+                    else:
+                        qualified_routing = context_owner.financial_routing
+                        shadow_dispatcher = self._dispatcher_from_state(
+                            state,
+                            shadow=True,
+                            qualified_router_override=qualified_routing.router,
+                            provider_subrequest_cache_override=(
+                                qualified_routing.provider_subrequest_cache
+                            ),
+                        )[0]
+                        shadow_checkpoint_dispatcher = shadow_dispatcher
+                except Exception:  # noqa: BLE001 - shadow cannot affect authority
+                    shadow_failure_count += 1
+            elif context_owner is None:
+                shadow_dispatcher = self._dispatcher_from_state(
+                    state,
+                    shadow=True,
+                )[0]
+                shadow_checkpoint_dispatcher = shadow_dispatcher
+        active_statement_factory = (
+            qualified_routing.statement_request_factory
+            if qualified_routing is not None
+            else self._qualified_statement_request_factory
+        )
+        active_indicator_factory = (
+            qualified_routing.indicator_request_factory
+            if qualified_routing is not None
+            else self._qualified_indicator_request_factory
+        )
         for request in requests:
             if rollout_mode == "qualified_v1_shadow":
                 tool_messages.append(dispatcher.dispatch_tool_message(request))
-                if self._qualified_route_enabled(request):
+                if self._qualified_route_enabled(request) and shadow_dispatcher is not None:
                     shadow_executed = True
                     try:
-                        assert shadow_dispatcher is not None
                         if (
                             request.statement_type
                             is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
-                            and self._qualified_indicator_request_factory is not None
+                            and active_indicator_factory is not None
                         ):
                             selection_request = (
                                 shadow_dispatcher.restored_indicator_selection_request(
                                     request
                                 )
-                                or self._qualified_indicator_request_factory(request)
+                                or active_indicator_factory(request)
                             )
                             shadow_dispatcher.dispatch_indicator_selection(
                                 request,
                                 selection_request,
                             )
-                        elif self._qualified_statement_request_factory is not None:
+                        elif active_statement_factory is not None:
                             selection_request = (
                                 shadow_dispatcher.restored_statement_selection_request(
                                     request
                                 )
-                                or self._qualified_statement_request_factory(request)
+                                or active_statement_factory(request)
                             )
                             shadow_dispatcher.dispatch_statement_selection(
                                 request,
@@ -325,7 +349,8 @@ class FinancialDispatchToolNode:
 
     def _qualified_route_enabled(self, request: FinancialToolRequest) -> bool:
         router = self._qualified_statement_router
-        if router is None:
+        context_owner = self._qualified_context_owner
+        if router is None and context_owner is None:
             return False
         required = (
             TushareCapability.FINANCIAL_INDICATORS
@@ -333,12 +358,16 @@ class FinancialDispatchToolNode:
             is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
             else TushareCapability.STATEMENTS
         )
-        return required in router.routing_plan.enabled_tushare_capabilities
+        plan = router.routing_plan if router is not None else context_owner.routing_plan
+        return required in plan.enabled_tushare_capabilities
 
     def _routing_mode(self) -> str:
         router = self._qualified_statement_router
         if router is not None:
             return router.routing_plan.mode.value
+        context_owner = self._qualified_context_owner
+        if context_owner is not None:
+            return context_owner.routing_plan.mode.value
         config = self._config or {}
         configured_mode = str(
             config.get("mainland_capability_routing_mode", "legacy")
@@ -663,6 +692,7 @@ def _financial_request_from_tool_call(
 
 
 __all__ = [
+    "FinancialEligibilityAcquisitionContextOwner",
     "FinancialDispatchToolNode",
     "QualifiedFinancialRoutingComposition",
 ]

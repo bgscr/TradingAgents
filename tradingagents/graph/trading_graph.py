@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -55,6 +55,10 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
     FinancialCapabilityRoutingResult,
 )
+from tradingagents.dataflows.financial_contracts import (
+    FinancialAvailabilityScope,
+    FinancialConsolidationScope,
+)
 from tradingagents.dataflows.instrument_identity import RegistryFailureReason
 from tradingagents.dataflows.market_snapshot import (
     authoritative_snapshot_run,
@@ -79,9 +83,18 @@ from tradingagents.evidence import (
 from tradingagents.evidence_artifacts import AuditEvidenceProjection
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.qualified_routing_composition import (
+    ProductionFinancialEligibilityRuntimeInputs,
     ProductionQualifiedRoutingRunBinding,
     ProductionQualifiedRoutingRuntime,
     RegisteredProductionQualifiedRoutingComposition,
+)
+from tradingagents.qualified_routing_eligibility_lifecycle import (
+    FinancialEligibilityAcquisitionContextOwner,
+    QualifiedFinancialRoutingComposition,
+)
+from tradingagents.qualified_routing_lifecycle import (
+    ProductionQualifiedRoutingLifecycleError,
+    ProductionQualifiedRoutingLifecycleFailureReason,
 )
 from tradingagents.reporting import write_report_tree
 from tradingagents.run_telemetry import RunTelemetryCallbackHandler
@@ -101,7 +114,6 @@ from .checkpointer import clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
 from .financial_tools import (
     FinancialDispatchToolNode,
-    QualifiedFinancialRoutingComposition,
 )
 from .propagation import Propagator
 from .reflection import Reflector
@@ -389,6 +401,9 @@ class TradingAgentsGraph:
             )
             else None
         )
+        self._financial_eligibility_context_owner: (
+            FinancialEligibilityAcquisitionContextOwner | None
+        ) = None
         self.decision_policy = (
             decision_policy
             if decision_policy is not None
@@ -651,6 +666,11 @@ class TradingAgentsGraph:
             )
             else None
         )
+        qualified_context_owner = getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
         return {
             "market": ToolNode(
                 [
@@ -708,6 +728,11 @@ class TradingAgentsGraph:
                     if qualified_financial_tool_routing is not None
                     else None
                 ),
+                qualified_context_owner=(
+                    qualified_context_owner
+                    if qualified_financial_tool_routing is None
+                    else None
+                ),
             ),
         }
 
@@ -719,6 +744,7 @@ class TradingAgentsGraph:
         resume_from_checkpoint: bool = False,
         checkpoint_thread_id: str | None = None,
         checkpoint_state: Mapping[str, Any] | None = None,
+        analysis_as_of_date: date | str | None = None,
     ) -> ProductionQualifiedRoutingRuntime | None:
         """Bind and install the one managed run after checkpoint compatibility."""
 
@@ -742,6 +768,69 @@ class TradingAgentsGraph:
             and isinstance(financial_tool_node, FinancialDispatchToolNode)
             else None
         )
+        expected_as_of = (
+            date.fromisoformat(analysis_as_of_date)
+            if isinstance(analysis_as_of_date, str)
+            else analysis_as_of_date
+        )
+        context_owner = getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
+        if context_owner is not None:
+            if resume_from_checkpoint:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_BINDING_INVALID
+                )
+            context_owner.validate_host_binding(
+                run_id=run_id,
+                asset_configuration=asset_configuration,
+                routing_plan=routing_plan,
+                expected_as_of_date=expected_as_of,
+                availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+            )
+        install_runtime_wiring = False
+
+        def install_financial_eligibility_runtime(
+            inputs: object,
+        ) -> FinancialEligibilityAcquisitionContextOwner:
+            nonlocal context_owner, install_runtime_wiring
+            if (
+                context_owner is not None
+                or not isinstance(
+                    inputs,
+                    ProductionFinancialEligibilityRuntimeInputs,
+                )
+                or not isinstance(
+                    inputs.financial_routing,
+                    QualifiedFinancialRoutingComposition,
+                )
+            ):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_BINDING_INVALID
+                )
+            context_owner = FinancialEligibilityAcquisitionContextOwner(
+                run_id=run_id,
+                asset_configuration=asset_configuration,
+                routing_plan=routing_plan,
+                metadata_acquirer=inputs.metadata_acquirer,
+                unbound_financial_routing=inputs.financial_routing,
+                expected_as_of_date=expected_as_of,
+                availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                retained_company_type_evidence=(
+                    inputs.retained_company_type_evidence
+                ),
+                retained_listing_metadata=inputs.retained_listing_metadata,
+                interrupt_runtime=composition.interrupt,
+                close_runtime=composition.close,
+            )
+            self._financial_eligibility_context_owner = context_owner
+            install_runtime_wiring = True
+            return context_owner
+
         try:
             runtime = composition.bind_run(
                 ProductionQualifiedRoutingRunBinding(
@@ -753,12 +842,34 @@ class TradingAgentsGraph:
                     checkpoint_thread_id=checkpoint_thread_id,
                     checkpoint_state=checkpoint_state,
                     restore_financial_dispatcher=restore_financial_dispatcher,
+                    install_financial_eligibility_runtime=(
+                        install_financial_eligibility_runtime
+                        if not resume_from_checkpoint and context_owner is None
+                        else None
+                    ),
                 )
             )
             if not isinstance(runtime, ProductionQualifiedRoutingRuntime):
                 raise ValueError("qualified runtime binding returned an invalid handle")
-            if self.qualified_financial_routing is not runtime.financial_routing:
+            if context_owner is not None and not resume_from_checkpoint and (
+                runtime.financial_routing is not None
+                or runtime.source_composition is not None
+                or runtime.dependencies is not None
+            ):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_BINDING_INVALID
+                )
+            if context_owner is None and runtime.financial_routing is None:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_BINDING_INVALID
+                )
+            if (
+                runtime.financial_routing is not None
+                and self.qualified_financial_routing is not runtime.financial_routing
+            ):
                 self.qualified_financial_routing = runtime.financial_routing
+                install_runtime_wiring = True
+            if install_runtime_wiring:
                 self.tool_nodes = self._create_tool_nodes()
                 self.graph_setup.tool_nodes = self.tool_nodes
                 self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
@@ -767,11 +878,23 @@ class TradingAgentsGraph:
                 )
             return runtime
         except BaseException:
-            composition.interrupt()
-            composition.close()
+            if context_owner is not None:
+                context_owner.interrupt()
+                context_owner.close()
+            else:
+                composition.interrupt()
+                composition.close()
             raise
 
     def interrupt_qualified_routing_runtime(self) -> None:
+        context_owner = getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
+        if context_owner is not None:
+            context_owner.interrupt()
+            return
         composition = getattr(
             self,
             "_managed_qualified_routing_composition",
@@ -781,6 +904,14 @@ class TradingAgentsGraph:
             composition.interrupt()
 
     def close_qualified_routing_runtime(self) -> None:
+        context_owner = getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
+        if context_owner is not None:
+            context_owner.close()
+            return
         composition = getattr(
             self,
             "_managed_qualified_routing_composition",
@@ -788,6 +919,29 @@ class TradingAgentsGraph:
         )
         if composition is not None:
             composition.close()
+
+    @property
+    def financial_eligibility_acquisition_context(self):
+        """Return the exact run-owned context after its atomic first-use bind."""
+
+        owner = getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
+        return owner.context if owner is not None else None
+
+    @property
+    def financial_eligibility_context_owner(
+        self,
+    ) -> FinancialEligibilityAcquisitionContextOwner | None:
+        """Expose the run-host slot without exposing unbound routing callables."""
+
+        return getattr(
+            self,
+            "_financial_eligibility_context_owner",
+            None,
+        )
 
     def route_mainland_financial_capability(
         self,
@@ -1488,6 +1642,9 @@ class TradingAgentsGraph:
             checkpoint_thread_id=checkpoint_thread_id,
             checkpoint_state=(
                 initial_merge_state if resume_from_checkpoint else None
+            ),
+            analysis_as_of_date=str(
+                initial_merge_state.get("trade_date") or trade_date
             ),
         )
         telemetry_ledger = get_active_run_telemetry()

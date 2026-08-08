@@ -22,6 +22,10 @@ class ProductionQualifiedRoutingLifecycleFailureReason(str, Enum):
     CLOSED = "qualified_routing_runtime_closed"
     DIFFERENT_RUN_ACTIVE = "qualified_routing_runtime_different_run_active"
     INTERRUPTED = "qualified_routing_runtime_interrupted"
+    ELIGIBILITY_CONTEXT_UNBOUND = "qualified_routing_eligibility_context_unbound"
+    ELIGIBILITY_CONTEXT_BINDING_INVALID = (
+        "qualified_routing_eligibility_context_binding_invalid"
+    )
 
 
 class ProductionQualifiedRoutingLifecycleError(RuntimeError):

@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from calendar import monthrange
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -87,7 +87,12 @@ from tradingagents.dataflows.financial_dispatch import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialCompanyTypeAcquisitionEvidenceBinding,
+    FinancialCompanyTypeEvidenceProjection,
     FinancialEligibilityAcquisitionContext,
+    FinancialListingMetadataProjection,
+)
+from tradingagents.dataflows.financial_eligibility_metadata import (
+    FinancialEligibilityMetadataAcquirer,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
@@ -433,6 +438,66 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def close(self) -> None: ...
 
 
+def _validated_retained_financial_metadata(
+    company_type_evidence: Sequence[object],
+    listing_metadata: Sequence[object],
+) -> tuple[
+    tuple[FinancialCompanyTypeEvidenceProjection, ...],
+    tuple[FinancialListingMetadataProjection, ...],
+]:
+    try:
+        return (
+            tuple(
+                FinancialCompanyTypeEvidenceProjection.model_validate(value)
+                for value in company_type_evidence
+            ),
+            tuple(
+                FinancialListingMetadataProjection.model_validate(value)
+                for value in listing_metadata
+            ),
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ProductionQualifiedRoutingLifecycleError(
+            ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+        ) from None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionFinancialEligibilityRuntimeInputs:
+    """Validated one-way handoff from managed composition to the run host."""
+
+    financial_routing: object = field(repr=False, compare=False)
+    metadata_acquirer: object = field(repr=False, compare=False)
+    retained_company_type_evidence: tuple[
+        FinancialCompanyTypeEvidenceProjection, ...
+    ] = field(default=(), repr=False, compare=False)
+    retained_listing_metadata: tuple[FinancialListingMetadataProjection, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.financial_routing is None or not callable(
+            getattr(self.metadata_acquirer, "acquire", None)
+        ):
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        company_type_evidence, listing_metadata = (
+            _validated_retained_financial_metadata(
+                self.retained_company_type_evidence,
+                self.retained_listing_metadata,
+            )
+        )
+        object.__setattr__(
+            self,
+            "retained_company_type_evidence",
+            company_type_evidence,
+        )
+        object.__setattr__(self, "retained_listing_metadata", listing_metadata)
+
+
 class ProductionQualifiedRoutingRunBinding(BaseModel):
     """Canonical post-checkpoint inputs required before run resources may open."""
 
@@ -461,6 +526,11 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
         exclude=True,
         repr=False,
     )
+    install_financial_eligibility_runtime: Callable[[object], object] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
 
     @model_validator(mode="after")
     def _validate_authoritative_bindings(self) -> ProductionQualifiedRoutingRunBinding:
@@ -481,6 +551,7 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
                 self.checkpoint_thread_id is None
                 or not isinstance(self.checkpoint_state, Mapping)
                 or not callable(self.restore_financial_dispatcher)
+                or self.install_financial_eligibility_runtime is not None
             ):
                 raise ValueError("qualified checkpoint restoration binding is invalid")
         elif self.checkpoint_state is not None:
@@ -500,8 +571,29 @@ class ProductionQualifiedRoutingRuntimeAssembly:
     )
     source_composition: object | None = field(default=None, repr=False, compare=False)
     dependencies: object | None = field(default=None, repr=False, compare=False)
+    eligibility_metadata_acquirer: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    retained_company_type_evidence: tuple[FinancialCompanyTypeEvidenceProjection, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+    retained_listing_metadata: tuple[FinancialListingMetadataProjection, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
+        company_type_evidence, listing_metadata = (
+            _validated_retained_financial_metadata(
+                self.retained_company_type_evidence,
+                self.retained_listing_metadata,
+            )
+        )
         if any(
             not _safe_source_token(resource_kind) or resource is None
             for resource_kind, resource in self.owned_resources
@@ -509,6 +601,12 @@ class ProductionQualifiedRoutingRuntimeAssembly:
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
+        object.__setattr__(
+            self,
+            "retained_company_type_evidence",
+            company_type_evidence,
+        )
+        object.__setattr__(self, "retained_listing_metadata", listing_metadata)
 
 
 def _noop_runtime_phase_hook(_phase: str, _value: object) -> None:
@@ -744,23 +842,29 @@ class ProductionQualifiedRoutingRuntime:
     """Safe public handle for one completely bound run-owned composition."""
 
     run_id: str
-    financial_routing: object = field(repr=False, compare=False)
+    financial_routing: object | None = field(repr=False, compare=False)
     stop_signal: threading.Event = field(repr=False, compare=False)
     resource_kinds: tuple[str, ...]
     source_composition: object | None = field(default=None, repr=False, compare=False)
     dependencies: object | None = field(default=None, repr=False, compare=False)
+    def _require_financial_routing(self) -> object:
+        if self.financial_routing is None:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_UNBOUND
+            )
+        return self.financial_routing
 
     @property
     def router(self) -> object:
-        return self.financial_routing.router
+        return self._require_financial_routing().router
 
     @property
     def statement_request_factory(self) -> object:
-        return self.financial_routing.statement_request_factory
+        return self._require_financial_routing().statement_request_factory
 
     @property
     def indicator_request_factory(self) -> object:
-        return self.financial_routing.indicator_request_factory
+        return self._require_financial_routing().indicator_request_factory
 
     def __repr__(self) -> str:
         return (
@@ -1325,13 +1429,46 @@ class RegisteredProductionQualifiedRoutingComposition:
         )
         for resource_kind, resource in assembly.owned_resources:
             acquire(resource_kind, resource)
+        install_eligibility_runtime = (
+            run_binding.install_financial_eligibility_runtime
+        )
+        eligibility_runtime_installed = False
+        if (
+            install_eligibility_runtime is not None
+            and assembly.eligibility_metadata_acquirer is not None
+        ):
+            eligibility_inputs = ProductionFinancialEligibilityRuntimeInputs(
+                financial_routing=financial_routing,
+                metadata_acquirer=assembly.eligibility_metadata_acquirer,
+                retained_company_type_evidence=(
+                    assembly.retained_company_type_evidence
+                ),
+                retained_listing_metadata=assembly.retained_listing_metadata,
+            )
+            installed_owner = install_eligibility_runtime(eligibility_inputs)
+            if installed_owner is None:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            eligibility_runtime_installed = True
         return ProductionQualifiedRoutingRuntime(
             run_id=run_binding.run_id,
-            financial_routing=financial_routing,
+            financial_routing=(
+                financial_routing
+                if run_binding.resume_from_checkpoint
+                or assembly.eligibility_metadata_acquirer is None
+                else None
+            ),
             stop_signal=owner.stop_signal,
             resource_kinds=owner.resource_kinds,
-            source_composition=assembly.source_composition,
-            dependencies=assembly.dependencies,
+            source_composition=(
+                None
+                if eligibility_runtime_installed
+                else assembly.source_composition
+            ),
+            dependencies=(
+                None if eligibility_runtime_installed else assembly.dependencies
+            ),
         )
 
     @property
@@ -3862,10 +3999,16 @@ def _assemble_production_qualified_runtime(
             else None
         ),
     )
+    eligibility_metadata_acquirer = FinancialEligibilityMetadataAcquirer(
+        routing_plan=blueprint.routing_plan,
+        router=source_composition.router,
+        stop_signal=stop_signal,
+    )
     return ProductionQualifiedRoutingRuntimeAssembly(
         financial_routing=financial_routing,
         source_composition=source_composition,
         dependencies=dependencies,
+        eligibility_metadata_acquirer=eligibility_metadata_acquirer,
     )
 
 
@@ -4084,6 +4227,7 @@ __all__ = [
     "ManagedQualifiedRoutingComposition",
     "PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION",
     "PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION",
+    "ProductionFinancialEligibilityRuntimeInputs",
     "ProductionQualifiedBoundSource",
     "ProductionBaoStockRunTransport",
     "ProductionQualifiedRoutingCompositionBlueprint",

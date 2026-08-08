@@ -2481,6 +2481,7 @@ def run_analysis(
             runtime_binder(
                 run_id=init_agent_state["run_id"],
                 checkpoint_compatibility_known=True,
+                analysis_as_of_date=str(init_agent_state["trade_date"]),
             )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
