@@ -1725,7 +1725,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
         )
     )
     detail_digest: str | None = None
-    with suppress(Exception):
+    with suppress(BaseException):
         detail_digest = persist_runtime_artifact(
             artifacts["artifact_root"],
             {
@@ -1748,13 +1748,13 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
         "phase": current_phase,
         "detail_artifact": detail_artifact,
     }
-    with suppress(Exception):
+    with suppress(BaseException):
         telemetry_ledger = artifacts.get("run_telemetry_ledger")
         if telemetry_ledger is not None:
             artifacts["terminal_run_telemetry"] = telemetry_ledger.finalize(
                 terminal_route="operational_failure",
             ).model_dump(mode="json")
-    with suppress(Exception):
+    with suppress(BaseException):
         _update_run_status(
             artifacts,
             status="failed",
@@ -1765,7 +1765,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             error_summary=summary,
             error_diagnostics=diagnostics,
         )
-    with suppress(Exception):
+    with suppress(BaseException):
         runtime_writer = artifacts.get("runtime_writer")
         if runtime_writer is not None:
             runtime_writer.record_critical(
@@ -2231,6 +2231,14 @@ def run_analysis(
                 MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
             )
 
+    if qualified_routing_validation:
+        if asset_configuration_error is not None:
+            raise asset_configuration_error
+        if capability_routing_failure is not None:
+            raise MainlandCapabilityRoutingPreflightError(
+                capability_routing_failure
+            )
+
     artifacts = None
     current_phase = "setup"
 
@@ -2294,8 +2302,9 @@ def run_analysis(
     except BaseException as exc:
         _interrupt_qualified_routing_owner(qualified_financial_routing)
         _close_qualified_routing_owner(qualified_financial_routing)
-        _mark_run_failed(artifacts, exc, current_phase=current_phase)
-        with suppress(Exception):
+        with suppress(BaseException):
+            _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        with suppress(BaseException):
             runtime_writer.close()
         raise
 
@@ -2366,8 +2375,9 @@ def run_analysis(
     except BaseException as exc:
         _interrupt_qualified_routing_owner(qualified_financial_routing)
         _close_qualified_routing_owner(qualified_financial_routing)
-        _mark_run_failed(artifacts, exc, current_phase=current_phase)
-        with suppress(Exception):
+        with suppress(BaseException):
+            _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        with suppress(BaseException):
             runtime_writer.close()
         raise
 
@@ -2674,7 +2684,8 @@ def run_analysis(
     except BaseException as exc:
         primary_failure = exc
         _interrupt_qualified_routing_host(graph, qualified_financial_routing)
-        _mark_run_failed(artifacts, exc, current_phase=current_phase)
+        with suppress(BaseException):
+            _mark_run_failed(artifacts, exc, current_phase=current_phase)
         raise
     finally:
         terminal_cleanup_failure: BaseException | None = None

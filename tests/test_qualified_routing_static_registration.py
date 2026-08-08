@@ -18,6 +18,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingFailureReason,
     MainlandCapabilityRoutingMode,
     MainlandCapabilityRoutingPreflightError,
+    mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
 )
 from tradingagents.dataflows.financial_capability_routing import (
@@ -929,3 +930,50 @@ def test_authoritative_qualified_plan_is_rejected_before_builtin_invocation(
     assert raised.value.failure.reason is (
         MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
     )
+
+
+@pytest.mark.parametrize(
+    "failure_origin",
+    ["routing_preflight", "composition_builder"],
+)
+def test_explicit_validation_preflight_failure_stops_before_run_artifacts(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_origin: str,
+) -> None:
+    _plan, _asset, config = _valid_shadow_inputs(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_main, "get_user_selections", _cli_selections)
+    monkeypatch.setattr(cli_main, "DEFAULT_CONFIG", config)
+    expected_reason = MainlandCapabilityRoutingFailureReason.TUSHARE_TOKEN_MISSING
+    if failure_origin == "routing_preflight":
+        monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    else:
+        expected_reason = (
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+        )
+
+        def fail_composition_builder(**_kwargs):
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(expected_reason)
+            )
+
+        monkeypatch.setattr(
+            cli_main,
+            "build_qualified_financial_routing_composition",
+            fail_composition_builder,
+        )
+
+    artifact_calls: list[str] = []
+
+    def unexpected_run_artifacts(*_args, **_kwargs):
+        artifact_calls.append("prepare")
+        raise AssertionError("pre-open validation must not create run artifacts")
+
+    monkeypatch.setattr(cli_main, "_prepare_run_artifacts", unexpected_run_artifacts)
+
+    with pytest.raises(MainlandCapabilityRoutingPreflightError) as raised:
+        cli_main.run_analysis(qualified_routing_validation=True)
+
+    assert raised.value.failure.reason is expected_reason
+    assert artifact_calls == []
+    assert not any(tmp_path.rglob("*"))

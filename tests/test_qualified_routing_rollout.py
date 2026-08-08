@@ -2305,6 +2305,15 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
         "scripted",
     )
     vendor_methods = _financial_vendor_methods(legacy_balance_sheet)
+
+    class QualifiedCache:
+        def checkpoint(self) -> dict[str, object]:
+            return {
+                "contract_version": "1.0",
+                "run_scope_id": "run:" + "b" * 64,
+                "entries": [],
+            }
+
     node = FinancialDispatchToolNode(
         config=config,
         vendor_methods=vendor_methods,
@@ -2315,12 +2324,21 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
         qualified_statement_request_factory=lambda _request: _statement_request(
             asset
         ),
+        qualified_provider_subrequest_cache=QualifiedCache(),
     )
 
     result = node(_financial_tool_state(asset, plan))
 
     assert "LegacyTotal,100" in result["messages"][0].content
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
+    assert "provider_subrequest_cache" not in result["financial_dispatch_ledger"]
+    assert result["financial_dispatch_shadow_ledger"][
+        "provider_subrequest_cache"
+    ] == {
+        "contract_version": "1.0",
+        "run_scope_id": "run:" + "b" * 64,
+        "entries": [],
+    }
     assert result["financial_dispatch_shadow_failure"] == {
         "contract_version": "1.0",
         "diagnostic_code": "shadow_dispatch_failed",
@@ -2330,6 +2348,18 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
         result,
         default=str,
     )
+
+    historical_state = _financial_tool_state(asset, plan)
+    historical_ledger = copy.deepcopy(result["financial_dispatch_ledger"])
+    historical_ledger["provider_subrequest_cache"] = QualifiedCache().checkpoint()
+    historical_state["financial_dispatch_ledger"] = historical_ledger
+
+    restored = node(historical_state)
+
+    assert "LegacyTotal,100" in restored["messages"][0].content
+    assert "provider_subrequest_cache" not in restored[
+        "financial_dispatch_ledger"
+    ]
 
 
 def test_shadow_request_factory_failure_cannot_change_legacy_output(

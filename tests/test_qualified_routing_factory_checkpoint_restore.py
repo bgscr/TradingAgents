@@ -462,6 +462,10 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
 
     binding = plan.financial_eligibility_binding
     assert binding is not None
+    historical_authoritative_ledger = copy.deepcopy(authoritative_ledger)
+    historical_authoritative_ledger["provider_subrequest_cache"] = copy.deepcopy(
+        shadow_ledger["provider_subrequest_cache"]
+    )
     checkpoint_state = {
         "run_id": run_id,
         "asset_configuration": asset.model_dump(mode="json"),
@@ -474,7 +478,7 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             instrument_identity=asset.instrument_identity,
             financial_eligibility_binding=binding,
         ).model_dump(mode="json"),
-        "financial_dispatch_ledger": authoritative_ledger,
+        "financial_dispatch_ledger": historical_authoritative_ledger,
         "financial_dispatch_shadow_ledger": shadow_ledger,
     }
     checkpoint_bytes = json.dumps(
@@ -1003,6 +1007,18 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     for case_name, corrupt in corruptions:
         invalid_state = copy.deepcopy(checkpoint_state)
         corrupt(invalid_state)
+        invalid_shadow_ledger = invalid_state.get(
+            "financial_dispatch_shadow_ledger"
+        )
+        if (
+            isinstance(invalid_shadow_ledger, dict)
+            and "provider_subrequest_cache" in invalid_shadow_ledger
+        ):
+            invalid_state["financial_dispatch_ledger"][
+                "provider_subrequest_cache"
+            ] = copy.deepcopy(
+                invalid_shadow_ledger["provider_subrequest_cache"]
+            )
         invalid_checkpoint_bytes = json.dumps(
             invalid_state,
             separators=(",", ":"),

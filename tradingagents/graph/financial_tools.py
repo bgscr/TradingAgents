@@ -541,6 +541,33 @@ class FinancialDispatchToolNode:
                     FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
                 )
             return restored_dispatcher, evidence
+        checkpoint_ledger = state.get(checkpoint_key)
+        if (
+            rollout_mode == "qualified_v1_shadow"
+            and not shadow
+            and isinstance(checkpoint_ledger, Mapping)
+            and checkpoint_ledger.get("provider_subrequest_cache") is not None
+        ):
+            authoritative_cache = checkpoint_ledger.get(
+                "provider_subrequest_cache"
+            )
+            shadow_ledger = state.get("financial_dispatch_shadow_ledger")
+            mirrored_shadow_cache = (
+                isinstance(shadow_ledger, Mapping)
+                and shadow_ledger.get("provider_subrequest_cache")
+                == authoritative_cache
+            )
+            empty_historical_cache = (
+                isinstance(authoritative_cache, Mapping)
+                and set(authoritative_cache)
+                == {"contract_version", "run_scope_id", "entries"}
+                and authoritative_cache.get("contract_version") == "1.0"
+                and authoritative_cache.get("run_scope_id") == state.get("run_id")
+                and authoritative_cache.get("entries") in ([], ())
+            )
+            if mirrored_shadow_cache or empty_historical_cache:
+                checkpoint_ledger = dict(checkpoint_ledger)
+                checkpoint_ledger.pop("provider_subrequest_cache", None)
         dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=identity,
             run_asset_configuration=asset_configuration,
@@ -549,10 +576,14 @@ class FinancialDispatchToolNode:
             retry_policy=retry_policy,
             clock=self._clock,
             sleeper=self._sleeper,
-            checkpoint_ledger=state.get(checkpoint_key),
+            checkpoint_ledger=checkpoint_ledger,
             provider_subrequest_cache=(
-                provider_subrequest_cache_override
-                or self._qualified_provider_subrequest_cache
+                (
+                    provider_subrequest_cache_override
+                    or self._qualified_provider_subrequest_cache
+                )
+                if qualified_router is not None
+                else None
             ),
             qualified_statement_router=qualified_router,
             run_scope_id=(

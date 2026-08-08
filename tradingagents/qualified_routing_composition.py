@@ -937,7 +937,11 @@ def _validated_checkpoint_restoration(
         != expected_asset.asset_configuration_version
         or authoritative_ledger.run_asset_configuration_signature
         != expected_asset.asset_configuration_signature
-        or authoritative_ledger.provider_subrequest_cache is not None
+        or (
+            authoritative_ledger.provider_subrequest_cache is not None
+            and authoritative_ledger.provider_subrequest_cache
+            != shadow_ledger.provider_subrequest_cache
+        )
         or authoritative_ledger.qualified_statement_selections
         or authoritative_ledger.qualified_indicator_selections
     ):

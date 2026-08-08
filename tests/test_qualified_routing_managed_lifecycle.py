@@ -142,6 +142,7 @@ def _runtime_factories(
     events: list[tuple[object, ...]],
     fail_after: str | None = None,
     fail_close: str | None = None,
+    construction_failure: BaseException | None = None,
 ) -> ProductionQualifiedRoutingRuntimeFactories:
     def resource(name: str, stop_signal=None):
         return _Resource(
@@ -154,7 +155,9 @@ def _runtime_factories(
     def phase_hook(phase: str, _value: object) -> None:
         events.append(("created", phase))
         if phase == fail_after:
-            raise KeyboardInterrupt("original construction interruption")
+            raise construction_failure or KeyboardInterrupt(
+                "original construction interruption"
+            )
 
     def assemble(**_kwargs) -> ProductionQualifiedRoutingRuntimeAssembly:
         routing = QualifiedFinancialRoutingComposition(
@@ -357,25 +360,30 @@ def test_parallel_compositions_keep_run_resources_and_stop_state_isolated(
         "request_factories",
     ],
 )
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
 def test_partial_construction_failure_closes_only_created_resources_in_reverse(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     fail_after: str,
+    failure_type: type[BaseException],
 ) -> None:
     blueprint, binding = _blueprint_and_binding(tmp_path, monkeypatch)
     events: list[tuple[object, ...]] = []
+    original = failure_type("original construction interruption")
     composition = build_registered_production_qualified_routing_composition(
         blueprint=blueprint,
         runtime_factories=_runtime_factories(
             plan=binding.routing_plan,
             events=events,
             fail_after=fail_after,
+            construction_failure=original,
         ),
     )
 
-    with pytest.raises(KeyboardInterrupt, match="original construction interruption"):
+    with pytest.raises(failure_type) as captured:
         composition.bind_run(binding)
 
+    assert captured.value is original
     created = [event[1] for event in events if event[0] == "created"]
     closed = [event[1] for event in events if event[0] == "close"]
     assert closed == list(reversed(created))
@@ -850,9 +858,11 @@ def _graph_host(
     return host
 
 
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
 def test_graph_initialization_failure_interrupts_and_closes_bound_runtime(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
 ) -> None:
     blueprint, binding = _blueprint_and_binding(tmp_path, monkeypatch)
     events: list[tuple[object, ...]] = []
@@ -863,14 +873,14 @@ def test_graph_initialization_failure_interrupts_and_closes_bound_runtime(
             events=events,
         ),
     )
-    original = SystemExit("graph initialization stopped")
+    original = failure_type("graph initialization stopped")
     host = _graph_host(
         composition=composition,
         binding=binding,
         compile_failure=original,
     )
 
-    with pytest.raises(SystemExit) as captured:
+    with pytest.raises(failure_type) as captured:
         TradingAgentsGraph.bind_qualified_routing_runtime(
             host,
             run_id=binding.run_id,
@@ -983,6 +993,7 @@ def _run_cli_lifecycle_phase(
     phase: str,
     failure: BaseException,
     checkpoint_cleanup_failure: BaseException | None = None,
+    failure_publication_failure: BaseException | None = None,
 ) -> None:
     telemetry_ledger = RunTelemetryLedger()
 
@@ -1004,6 +1015,8 @@ def _run_cli_lifecycle_phase(
 
     class FakeTradingAgentsGraph:
         def __init__(self, *_args, **_kwargs) -> None:
+            if phase == "graph_initialization":
+                raise failure
             self.asset_configuration = None
             self.propagator = FakePropagator()
             self.graph = FakeStream()
@@ -1100,13 +1113,19 @@ def _run_cli_lifecycle_phase(
     )
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeTradingAgentsGraph)
     monkeypatch.setattr(cli_main, "authoritative_snapshot_run", snapshot_scope)
-    monkeypatch.setattr(
-        cli_main,
-        "create_run_display",
-        lambda *_args, **_kwargs: NoOpDisplay(),
-    )
+    def create_display(*_args, **_kwargs):
+        if phase == "display_initialization":
+            raise failure
+        return NoOpDisplay()
+
+    monkeypatch.setattr(cli_main, "create_run_display", create_display)
     monkeypatch.setattr(cli_main, "_write_run_reports", write_reports)
     monkeypatch.setattr(cli_main, "_mark_run_completed", mark_completed)
+    if failure_publication_failure is not None:
+        def fail_publication(*_args, **_kwargs) -> None:
+            raise failure_publication_failure
+
+        monkeypatch.setattr(cli_main, "_mark_run_failed", fail_publication)
 
     cli_main.run_analysis(qualified_financial_routing=owner)
 
@@ -1114,6 +1133,8 @@ def _run_cli_lifecycle_phase(
 @pytest.mark.parametrize(
     "phase",
     [
+        "display_initialization",
+        "graph_initialization",
         "provider_dispatch",
         "checkpoint_publication",
         "report_publication",
@@ -1141,6 +1162,32 @@ def test_cli_phase_baseexception_interrupts_then_closes_managed_owner(
 
     assert captured.value is original
     assert owner.stop_signal.is_set()
+    assert owner.events == ["interrupt", "close"]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["display_initialization", "graph_initialization"],
+)
+def test_failure_publication_baseexception_does_not_mask_primary_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    owner = _RecordingQualifiedLifecycleOwner()
+    original = RuntimeError(f"{phase} failed")
+
+    with pytest.raises(RuntimeError) as captured:
+        _run_cli_lifecycle_phase(
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+            owner=owner,
+            phase=phase,
+            failure=original,
+            failure_publication_failure=SystemExit("failure publication exited"),
+        )
+
+    assert captured.value is original
     assert owner.events == ["interrupt", "close"]
 
 
