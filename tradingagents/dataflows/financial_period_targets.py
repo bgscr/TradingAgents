@@ -29,6 +29,8 @@ from tradingagents.dataflows.financial_eligibility_policy import (
 from tradingagents.evidence import InstrumentIdentityEvidence
 
 _STANDARD_PERIOD_MONTH_DAYS = ((3, 31), (6, 30), (9, 30), (12, 31))
+MAINLAND_FINANCIAL_ANNUAL_TARGET_COUNT = 5
+MAINLAND_FINANCIAL_REPORTING_TARGET_COUNT = 8
 
 
 def _identity_payload(identity: InstrumentIdentityEvidence) -> tuple[object, ...]:
@@ -90,6 +92,63 @@ def _reporting_periods_since(
         periods.append(cursor)
         cursor = _previous_reporting_end(cursor)
     return tuple(periods)
+
+
+def _calendar_period(year: int, period_end: str) -> date:
+    month, day = (int(item) for item in period_end.split("-"))
+    return date(year, month, day)
+
+
+def derive_mainland_financial_acquisition_period_supersets(
+    *,
+    run_as_of_date: date,
+    listing_date: date,
+    policy: MainlandFinancialEligibilityPolicy | None = None,
+) -> tuple[tuple[date, ...], tuple[date, ...]]:
+    """Derive the bounded v2 acquisition horizons before publication filtering."""
+
+    effective_policy = policy or build_mainland_financial_eligibility_policy_v2()
+    if listing_date > run_as_of_date:
+        raise ValueError("financial listing date follows the run as-of date")
+    annual_period_ends = effective_policy.reporting_calendar.annual_period_ends
+    annual_candidates = tuple(
+        _calendar_period(run_as_of_date.year, period_end)
+        for period_end in annual_period_ends
+    )
+    annual_frontier = max(
+        (item for item in annual_candidates if item <= run_as_of_date),
+        default=max(
+            _calendar_period(run_as_of_date.year - 1, period_end)
+            for period_end in annual_period_ends
+        ),
+    )
+    annual = tuple(
+        period
+        for offset in range(MAINLAND_FINANCIAL_ANNUAL_TARGET_COUNT)
+        for period in (date(annual_frontier.year - offset, 12, 31),)
+        if period >= listing_date
+    )
+    reporting_period_ends = effective_policy.reporting_calendar.reporting_period_ends
+    reporting_candidates = tuple(
+        _calendar_period(run_as_of_date.year, period_end)
+        for period_end in reporting_period_ends
+    )
+    reporting_frontier = max(
+        (item for item in reporting_candidates if item <= run_as_of_date),
+        default=max(
+            _calendar_period(run_as_of_date.year - 1, period_end)
+            for period_end in reporting_period_ends
+        ),
+    )
+    reporting_periods: list[date] = []
+    cursor = reporting_frontier
+    while (
+        len(reporting_periods) < MAINLAND_FINANCIAL_REPORTING_TARGET_COUNT
+        and cursor >= listing_date
+    ):
+        reporting_periods.append(cursor)
+        cursor = _previous_reporting_end(cursor)
+    return annual, tuple(reporting_periods)
 
 
 def _deadline_for(
@@ -370,12 +429,18 @@ def construct_mainland_financial_period_targets(
         default=None,
     )
     annual_targets = (
-        tuple(date(annual_frontier.year - offset, 12, 31) for offset in range(5))
+        tuple(
+            date(annual_frontier.year - offset, 12, 31)
+            for offset in range(MAINLAND_FINANCIAL_ANNUAL_TARGET_COUNT)
+        )
         if annual_frontier is not None
         else ()
     )
     reporting_targets = (
-        _reporting_window(reporting_frontier, 8)
+        _reporting_window(
+            reporting_frontier,
+            MAINLAND_FINANCIAL_REPORTING_TARGET_COUNT,
+        )
         if reporting_frontier is not None
         else ()
     )
@@ -406,8 +471,12 @@ def construct_mainland_financial_period_targets(
             listing_date=listing_date,
             frontier=reporting_frontier,
         )
-        annual_age_short = len(post_listing_annual) < 5
-        reporting_age_short = len(post_listing_reporting) < 8
+        annual_age_short = (
+            len(post_listing_annual) < MAINLAND_FINANCIAL_ANNUAL_TARGET_COUNT
+        )
+        reporting_age_short = (
+            len(post_listing_reporting) < MAINLAND_FINANCIAL_REPORTING_TARGET_COUNT
+        )
         if annual_age_short or reporting_age_short:
             annual_targets = (
                 post_listing_annual if annual_age_short else annual_targets
@@ -462,8 +531,9 @@ def construct_mainland_financial_period_targets(
             annual_frontier is not None
             and reporting_frontier is not None
             and (
-                post_listing_annual_count < 5
-                or post_listing_reporting_count < 8
+                post_listing_annual_count < MAINLAND_FINANCIAL_ANNUAL_TARGET_COUNT
+                or post_listing_reporting_count
+                < MAINLAND_FINANCIAL_REPORTING_TARGET_COUNT
             )
         )
         if exception_applicable:
@@ -582,5 +652,6 @@ def construct_mainland_financial_period_targets(
 
 __all__ = [
     "construct_mainland_financial_period_targets",
+    "derive_mainland_financial_acquisition_period_supersets",
     "filter_mainland_financial_acquisition_periods",
 ]

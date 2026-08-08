@@ -417,7 +417,7 @@ def test_legacy_plan_projection_remains_without_synthetic_v2_fields() -> None:
 
 
 @pytest.mark.parametrize("mode", ["qualified_v1_shadow"])
-def test_empty_enablement_activates_no_tushare_provider_route(
+def test_empty_enablement_activates_no_ordinary_tushare_provider_route(
     mode: str,
 ) -> None:
     config = _rollout_config(mode, enabled=())
@@ -431,8 +431,12 @@ def test_empty_enablement_activates_no_tushare_provider_route(
     assert "tushare" not in {
         provider
         for capability in MainlandCapability
+        if capability is not MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
         for provider in result.plan.route_for(capability)
     }
+    assert result.plan.route_for(
+        MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+    ) == ("tushare", "akshare_sina", "yfinance")
 
 
 def test_checkpoint_state_identifies_rollout_mode_and_disposition(

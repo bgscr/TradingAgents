@@ -1387,6 +1387,24 @@ def _source_kind_accepts(
     return capability in _ROUTABLE_CAPABILITIES
 
 
+def _ordinary_plan_pairs(
+    plan: MainlandCapabilityRoutingPlan,
+) -> tuple[tuple[MainlandCapability, str], ...]:
+    """Project only source kinds implemented by the ordinary financial router."""
+
+    return tuple(
+        (route.capability, provider_id)
+        for route in plan.routes
+        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        and (
+            route.capability in _STATEMENT_CAPABILITIES
+            or route.capability is MainlandCapability.FINANCIAL_INDICATORS
+            or route.capability in _ROUTABLE_CAPABILITIES
+        )
+        for provider_id in route.providers
+    )
+
+
 def _physical_provider_is_compatible(
     *,
     route_provider_id: str,
@@ -3108,11 +3126,9 @@ def _production_terminal_source_registrations(
     """Bind plan-named external seams without inventing provider SDK methods."""
 
     plan_pairs = {
-        (route.capability, provider_id)
-        for route in blueprint.routing_plan.routes
-        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
-        for provider_id in route.providers
-        if _internal_source_endpoint(route.capability, provider_id) is None
+        pair
+        for pair in _ordinary_plan_pairs(blueprint.routing_plan)
+        if _internal_source_endpoint(*pair) is None
     }
     statements = tuple(
         capability
@@ -3335,12 +3351,7 @@ def assemble_production_qualified_provider_sources(
     """Bind the plan's exact non-market routes without physical provider work."""
 
     _validate_run_dependencies(blueprint, dependencies)
-    plan_pairs = tuple(
-        (route.capability, provider_id)
-        for route in blueprint.routing_plan.routes
-        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
-        for provider_id in route.providers
-    )
+    plan_pairs = _ordinary_plan_pairs(blueprint.routing_plan)
     external_pairs = {
         pair
         for pair in plan_pairs

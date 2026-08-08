@@ -557,7 +557,11 @@ def test_source_composition_is_plan_ordered_run_owned_and_zero_io(
     plan_source_pairs = {
         (route.capability, provider_id)
         for route in plan.routes
-        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        if route.capability
+        not in {
+            MainlandCapability.DAILY_MARKET_SNAPSHOT,
+            MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,
+        }
         for provider_id in route.providers
     }
     bound_source_pairs = {
@@ -566,6 +570,11 @@ def test_source_composition_is_plan_ordered_run_owned_and_zero_io(
         for capability in binding.capabilities
     }
     assert bound_source_pairs == plan_source_pairs
+    assert not any(
+        capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+        for binding in composition.bindings
+        for capability in binding.capabilities
+    )
     assert all(
         binding.coordinator is coordinator
         and binding.subrequest_cache is cache

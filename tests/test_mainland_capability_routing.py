@@ -152,7 +152,7 @@ def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
     assert result.passed is True
     assert result.plan is not None
     plan = result.plan
-    assert plan.plan_version == "1.0"
+    assert plan.plan_version == "1.1"
     assert plan.policy_version == "mainland-capability-routing-policy-v1"
     assert plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
     assert plan.qualification_profile == "cn-a-2000-20260729-v1"
@@ -200,6 +200,13 @@ def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
         "akshare",
     )
     assert plan.route_for(MainlandCapability.ISSUER_LIFECYCLE) == ("baostock",)
+    assert plan.route_for(
+        MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+    ) == (
+        "tushare",
+        "akshare_sina",
+        "yfinance",
+    )
     assert plan.normalizer_version == "mainland-financial-normalizer-v2"
     assert plan.completeness_policy_version == "mainland-financial-completeness-v2"
     assert plan.account_scope_label == "personal-research-primary"

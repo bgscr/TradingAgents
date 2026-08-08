@@ -28,7 +28,8 @@ from tradingagents.evidence import (
     InstrumentKind,
 )
 
-CAPABILITY_ROUTING_PLAN_VERSION = "1.0"
+CAPABILITY_ROUTING_PLAN_VERSION_V1 = "1.0"
+CAPABILITY_ROUTING_PLAN_VERSION = "1.1"
 CAPABILITY_ROUTING_POLICY_VERSION = "mainland-capability-routing-policy-v1"
 QUALIFICATION_PROFILE = "cn-a-2000-20260729-v1"
 NORMALIZER_VERSION_V1 = "mainland-financial-normalizer-v1"
@@ -83,6 +84,30 @@ class MainlandCapability(str, Enum):
     SUSPENSION_STATUS = "suspension_status"
     NAME_EVENTS = "name_events"
     ISSUER_LIFECYCLE = "issuer_lifecycle"
+    FINANCIAL_COMPANY_TYPE_EVIDENCE = "financial_company_type_evidence"
+
+
+_PLAN_V1_CAPABILITIES = (
+    MainlandCapability.DAILY_MARKET_SNAPSHOT,
+    MainlandCapability.BALANCE_SHEET,
+    MainlandCapability.INCOME_STATEMENT,
+    MainlandCapability.CASH_FLOW,
+    MainlandCapability.FINANCIAL_INDICATORS,
+    MainlandCapability.ADJUSTMENT_FACTORS,
+    MainlandCapability.SUSPENSION_STATUS,
+    MainlandCapability.NAME_EVENTS,
+    MainlandCapability.ISSUER_LIFECYCLE,
+)
+
+
+def _capabilities_for_plan_version(
+    plan_version: str,
+) -> tuple[MainlandCapability, ...]:
+    if plan_version == CAPABILITY_ROUTING_PLAN_VERSION_V1:
+        return _PLAN_V1_CAPABILITIES
+    if plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+        return tuple(MainlandCapability)
+    raise ValueError("Capability Routing Plan version is unsupported")
 
 
 class TushareCapability(str, Enum):
@@ -199,7 +224,7 @@ class MainlandCapabilityRoutingPlan(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    plan_version: Literal["1.0"] = CAPABILITY_ROUTING_PLAN_VERSION
+    plan_version: Literal["1.0", "1.1"] = CAPABILITY_ROUTING_PLAN_VERSION
     policy_version: Literal[
         "mainland-capability-routing-policy-v1"
     ] = CAPABILITY_ROUTING_POLICY_VERSION
@@ -248,6 +273,11 @@ class MainlandCapabilityRoutingPlan(BaseModel):
 
     @model_validator(mode="after")
     def _validate_closed_plan(self) -> MainlandCapabilityRoutingPlan:
+        if (
+            self.mode is MainlandCapabilityRoutingMode.LEGACY
+            and self.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_V1
+        ):
+            raise ValueError("legacy routing requires the historical plan version")
         expected_profile = (
             "legacy"
             if self.mode is MainlandCapabilityRoutingMode.LEGACY
@@ -302,8 +332,9 @@ class MainlandCapabilityRoutingPlan(BaseModel):
             and self.enabled_tushare_capabilities
         ):
             raise ValueError("legacy routing cannot enable Tushare capabilities")
+        plan_capabilities = _capabilities_for_plan_version(self.plan_version)
         route_capabilities = tuple(route.capability for route in self.routes)
-        if route_capabilities != tuple(MainlandCapability):
+        if route_capabilities != plan_capabilities:
             raise ValueError("capability routes must be complete and canonical")
         if self.enabled_tushare_capabilities != tuple(
             sorted(
@@ -312,7 +343,11 @@ class MainlandCapabilityRoutingPlan(BaseModel):
             )
         ):
             raise ValueError("enabled Tushare capabilities must be canonical")
-        if self.routes != _routes(self.mode, self.enabled_tushare_capabilities):
+        if self.routes != _routes(
+            self.mode,
+            self.enabled_tushare_capabilities,
+            plan_version=self.plan_version,
+        ):
             raise ValueError("capability policy routes do not match their identity")
         endpoint_ids = tuple(
             identity.endpoint_id for identity in self.endpoint_pacing_identities
@@ -329,7 +364,7 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         budget_capabilities = tuple(
             identity.capability for identity in self.request_budget_identities
         )
-        if budget_capabilities != tuple(MainlandCapability):
+        if budget_capabilities != plan_capabilities:
             raise ValueError("request-budget identities must be complete and canonical")
         if any(
             identity.budget_identity
@@ -368,7 +403,7 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
 
     contract_version: Literal["1.0"] = "1.0"
     mode: MainlandCapabilityRoutingMode
-    plan_version: Literal["1.0"]
+    plan_version: Literal["1.0", "1.1"]
     policy_version: Literal["mainland-capability-routing-policy-v1"]
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
     enabled_tushare_capabilities: tuple[TushareCapability, ...]
@@ -439,6 +474,11 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
 
     @model_validator(mode="after")
     def _validate_plan_disposition(self) -> MainlandCapabilityRoutingRunProjection:
+        if (
+            self.mode is MainlandCapabilityRoutingMode.LEGACY
+            and self.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_V1
+        ):
+            raise ValueError("legacy rollout requires the historical plan version")
         expected_profile = (
             "legacy"
             if self.mode is MainlandCapabilityRoutingMode.LEGACY
@@ -903,6 +943,8 @@ def mainland_capability_routing_failure(
 def _routes(
     mode: MainlandCapabilityRoutingMode,
     enabled: tuple[TushareCapability, ...],
+    *,
+    plan_version: str,
 ) -> tuple[MainlandCapabilityRoute, ...]:
     if mode is MainlandCapabilityRoutingMode.LEGACY:
         providers = {
@@ -977,9 +1019,16 @@ def _routes(
             ),
             MainlandCapability.ISSUER_LIFECYCLE: ("baostock",),
         }
+        if plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+            providers[MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE] = (
+                "tushare",
+                "akshare_sina",
+                "yfinance",
+            )
+    capabilities = _capabilities_for_plan_version(plan_version)
     return tuple(
         MainlandCapabilityRoute(capability=capability, providers=providers[capability])
-        for capability in MainlandCapability
+        for capability in capabilities
     )
 
 
@@ -1006,16 +1055,30 @@ def _build_plan(
     account_scope_label: str,
     calls_per_minute: int,
     operator_calls_per_minute: int,
+    plan_version: str | None = None,
 ) -> MainlandCapabilityRoutingPlan:
+    effective_plan_version = plan_version or (
+        CAPABILITY_ROUTING_PLAN_VERSION_V1
+        if mode is MainlandCapabilityRoutingMode.LEGACY
+        else CAPABILITY_ROUTING_PLAN_VERSION
+    )
+    plan_capabilities = _capabilities_for_plan_version(effective_plan_version)
     normalizer_version, completeness_policy_version, selection_contract_version = (
         _contract_versions_for_mode(mode)
     )
     payload: dict[str, Any] = {
-        "plan_version": CAPABILITY_ROUTING_PLAN_VERSION,
+        "plan_version": effective_plan_version,
         "policy_version": CAPABILITY_ROUTING_POLICY_VERSION,
         "mode": mode.value,
         "qualification_profile": qualification_profile,
-        "routes": [route.model_dump(mode="json") for route in _routes(mode, enabled)],
+        "routes": [
+            route.model_dump(mode="json")
+            for route in _routes(
+                mode,
+                enabled,
+                plan_version=effective_plan_version,
+            )
+        ],
         "enabled_tushare_capabilities": [item.value for item in enabled],
         "normalizer_version": normalizer_version,
         "completeness_policy_version": completeness_policy_version,
@@ -1033,7 +1096,7 @@ def _build_plan(
                 capability=capability,
                 budget_identity=f"foreground-{capability.value}-budget-v1",
             ).model_dump(mode="json")
-            for capability in MainlandCapability
+            for capability in plan_capabilities
         ],
         "artifact_contract_version": "source-artifact-v1",
         "manifest_contract_version": (
@@ -1072,6 +1135,7 @@ def _legacy_plan_signature() -> str:
         account_scope_label="not-applicable",
         calls_per_minute=40,
         operator_calls_per_minute=40,
+        plan_version=CAPABILITY_ROUTING_PLAN_VERSION_V1,
     ).plan_signature
 
 
