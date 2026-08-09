@@ -7,7 +7,7 @@
 
 ## Exploration & Editing Rules
 - @RTK.md
-- **Code Graph First**: When `.codegraph/` exists, use CodeGraph first for symbols, callers, dependencies, and call paths.
+- **Code Graph First**: When `.codegraph/` exists, use CodeGraph tools first for symbols, callers, dependencies, and call paths.
 - **Direct Search Fallback**: Use direct file reads/grep for docs, configs, exact text, unindexed files, or when CodeGraph misses/is unavailable.
 - **Direct Investigation**: Primary agent inspects affected behavior directly before edit. No separate investigator subagent is needed if context can be built directly.
 - **Minimal Scope**: Make the smallest coherent edit. Preserve unrelated worktree changes.
@@ -20,6 +20,7 @@
 3. **Strict File Ownership**: Never assign overlapping write scopes or files to multiple writers.
 4. **Primary Responsibilities**: Primary agent retains synthesis, conflict resolution, implementation coordination, and final user communication.
 5. **Profile Standard**: `.codex/agents/*.toml` is the source of truth for agent role names, model settings, reasoning effort, and sandbox modes.
+6. **Reporting Contract**: Subagents must return a structured summary containing: (1) Files modified/analyzed, (2) Key changes/insights, (3) Verification status.
 
 ### Specialist Routing
 Select the **single most-specific role** matching the task's primary risk:
@@ -42,9 +43,9 @@ Select the **single most-specific role** matching the task's primary risk:
 *Note: Read-only specialists investigate/review; implementation is performed by the primary agent or one writing specialist. Run read-only specialists sequentially unless scopes are strictly independent.*
 
 ## Verification & Review Process
-- **Scaled Verification**: Run targeted tests first. For broad or cross-module changes, run repository CI checks:
-  - `pytest -q`
-  - `ruff check .`
+- **Scaled Verification**: Run targeted tests first. For broad or cross-module changes, run repository CI checks via RTK:
+  - `rtk pytest -q`
+  - `rtk ruff check .`
 - **Review Strategy**: Small localized edits may be self-reviewed by the primary agent. High-risk/cross-module changes require the `reviewer` role.
 - **Two-Stage Review Framework**:
   1. **Spec Compliance**: Verify requested behavior, explicit interfaces, data contracts, terminology (`CONTEXT.md`), and ADR adherence.
