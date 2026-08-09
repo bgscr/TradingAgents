@@ -91,7 +91,9 @@ from tradingagents.dataflows.financial_contracts import (
     assess_financial_ratio_history_coverage,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
+    validate_financial_eligibility_acquisition_context_binding,
 )
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityPolicyError,
@@ -134,6 +136,7 @@ FINANCIAL_DISPATCH_LEDGER_VERSION = "1.0"
 FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION = "1.1"
 FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION = "1.2"
 FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION = "1.3"
+FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION = "1.4"
 FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
 FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION = "2.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
@@ -743,6 +746,23 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
     )
     RUN_SCOPE_MISMATCH = "financial_dispatch_checkpoint_run_scope_mismatch"
     ELIGIBILITY_POLICY_MISMATCH = "financial_eligibility_policy_mismatch"
+    ELIGIBILITY_CONTEXT_MISSING = "financial_eligibility_context_missing"
+    ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED = (
+        "financial_eligibility_context_version_unsupported"
+    )
+    ELIGIBILITY_CONTEXT_IDENTITY_MISMATCH = (
+        "financial_eligibility_context_identity_mismatch"
+    )
+    ELIGIBILITY_CONTEXT_INVALID = "financial_eligibility_context_invalid"
+    ELIGIBILITY_CONTEXT_BINDING_MISMATCH = (
+        "financial_eligibility_context_binding_mismatch"
+    )
+    ELIGIBILITY_CONTEXT_CACHE_MISMATCH = (
+        "financial_eligibility_context_cache_mismatch"
+    )
+    ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH = (
+        "financial_eligibility_context_dispatcher_mismatch"
+    )
 
 
 class FinancialDispatchCheckpointError(ValueError):
@@ -872,7 +892,7 @@ class FinancialDispatchCheckpointLedger(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1", "1.2", "1.3"] = (
+    contract_version: Literal["1.0", "1.1", "1.2", "1.3", "1.4"] = (
         FINANCIAL_DISPATCH_LEDGER_VERSION
     )
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
@@ -897,6 +917,14 @@ class FinancialDispatchCheckpointLedger(BaseModel):
     run_scope_id: str | None = Field(
         default=None,
         pattern=ACQUISITION_TOKEN_PATTERN,
+    )
+    checkpoint_thread_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{16}$",
+        exclude_if=lambda value: value is None,
+    )
+    financial_eligibility_context: FinancialEligibilityAcquisitionContext | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
     )
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
     qualified_statement_selections: tuple[
@@ -941,7 +969,18 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             else None
             for manifest in manifests
         }
-        if not manifests:
+        has_context_projection = (
+            self.checkpoint_thread_id is not None
+            or self.financial_eligibility_context is not None
+        )
+        if has_context_projection and (
+            self.checkpoint_thread_id is None
+            or self.financial_eligibility_context is None
+        ):
+            raise ValueError("financial checkpoint context projection is incomplete")
+        if has_context_projection:
+            expected_version = FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
+        elif not manifests:
             expected_version = FINANCIAL_DISPATCH_LEDGER_VERSION
         elif manifest_versions == {"financial-manifest-v1"}:
             expected_version = FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
@@ -966,10 +1005,12 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             or self.financial_manifest_version is not None
             or self.financial_eligibility_binding is not None
             or self.run_scope_id is not None
+            or has_context_projection
         )
         if expected_version in {
             FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
         }:
             signatures = {
                 manifest.capability_routing_plan_signature
@@ -981,7 +1022,10 @@ class FinancialDispatchCheckpointLedger(BaseModel):
                 or signatures != {self.capability_routing_plan_signature}
             ):
                 raise ValueError("financial checkpoint v2 identity binding is incomplete")
-            if expected_version == FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION:
+            if expected_version in {
+                FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
+            }:
                 if self.financial_eligibility_binding is None or any(
                     manifest.financial_eligibility_binding
                     != self.financial_eligibility_binding
@@ -999,7 +1043,62 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         if expected_version in {
             FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
         }:
+            if expected_version == FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION:
+                context = self.financial_eligibility_context
+                cache = self.provider_subrequest_cache
+                assert context is not None
+                assert self.checkpoint_thread_id is not None
+                expected_run_scope_id = "run:" + sha256(
+                    f"checkpoint:{self.checkpoint_thread_id}".encode()
+                ).hexdigest()
+                expected_request_binding = FinancialEligibilityRequestBinding.from_context(
+                    context
+                )
+                selection_bindings = tuple(
+                    entry.terminal.selection_request.financial_eligibility_context_binding
+                    for entry in (
+                        *self.qualified_statement_selections,
+                        *self.qualified_indicator_selections,
+                    )
+                )
+                try:
+                    validate_financial_eligibility_acquisition_context_binding(
+                        context,
+                        canonical_run_id=self.run_scope_id,
+                        asset_configuration_signature=(
+                            self.run_asset_configuration_signature
+                        ),
+                        financial_eligibility_binding=(
+                            self.financial_eligibility_binding
+                        ),
+                        routing_plan_signature=(
+                            self.capability_routing_plan_signature
+                        ),
+                    )
+                except ValueError:
+                    raise ValueError(
+                        "financial checkpoint context cross-binding is invalid"
+                    ) from None
+                if (
+                    self.run_scope_id != expected_run_scope_id
+                    or not selection_bindings
+                    or any(
+                        binding != expected_request_binding
+                        for binding in selection_bindings
+                    )
+                    or cache is None
+                    or cache.contract_version != "1.1"
+                    or cache.run_scope_id != context.run_id
+                    or cache.financial_eligibility_context_contract_version
+                    != context.contract_version
+                    or cache.financial_eligibility_context_identity
+                    != context.context_identity
+                ):
+                    raise ValueError(
+                        "financial checkpoint context cross-binding is invalid"
+                    )
             assert_safe_financial_contract_payload(self.model_dump(mode="json"))
         return self
 
@@ -1603,6 +1702,10 @@ class FinancialToolDispatcher:
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
         qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
         run_scope_id: str | None = None,
+        financial_eligibility_context: (
+            FinancialEligibilityAcquisitionContext | None
+        ) = None,
+        checkpoint_thread_id: str | None = None,
     ) -> None:
         if not instrument_identity.is_authoritative:
             raise ValueError("financial dispatcher requires authoritative Instrument Identity")
@@ -1626,6 +1729,13 @@ class FinancialToolDispatcher:
             raise ValueError("Capability Routing Plan signature is malformed")
         if run_scope_id is not None and _ACQUISITION_TOKEN.fullmatch(run_scope_id) is None:
             raise ValueError("financial run scope identity is malformed")
+        if (
+            checkpoint_thread_id is not None
+            and re.fullmatch(r"[0-9a-f]{16}", checkpoint_thread_id) is None
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+            )
         copied_chains = {
             str(tool_name): tuple(providers)
             for tool_name, providers in provider_chains.items()
@@ -1662,6 +1772,49 @@ class FinancialToolDispatcher:
             else None
         )
         self._run_scope_id = run_scope_id
+        self._checkpoint_thread_id = checkpoint_thread_id
+        self._financial_eligibility_context = financial_eligibility_context
+        if financial_eligibility_context is not None:
+            try:
+                expected_run_scope_id = (
+                    "run:"
+                    + sha256(
+                        f"checkpoint:{checkpoint_thread_id}".encode()
+                    ).hexdigest()
+                    if checkpoint_thread_id is not None
+                    else None
+                )
+                if (
+                    run_scope_id is None
+                    or checkpoint_thread_id is None
+                    or expected_run_scope_id != run_scope_id
+                    or run_asset_configuration is None
+                    or provider_subrequest_cache is None
+                ):
+                    raise ValueError("financial dispatcher context binding is invalid")
+                context = validate_financial_eligibility_acquisition_context_binding(
+                    financial_eligibility_context,
+                    canonical_run_id=run_scope_id,
+                    asset_configuration_signature=(
+                        run_asset_configuration.asset_configuration_signature
+                    ),
+                    instrument_identity=instrument_identity,
+                    financial_eligibility_binding=self._financial_eligibility_binding,
+                    routing_plan_signature=self._capability_routing_plan_signature,
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
+                ) from exc
+            try:
+                provider_subrequest_cache.bind_financial_eligibility_context(
+                    context_contract_version=context.contract_version,
+                    context_identity=context.context_identity,
+                )
+            except ProviderSubrequestCacheError as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+                ) from exc
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleeper = sleeper or time.sleep
         self._retry_policy = retry_policy or RetryPolicy()
@@ -1730,6 +1883,17 @@ class FinancialToolDispatcher:
             self._qualified_statement_router = router
             self._qualified_router_rebind_pending = False
 
+    @property
+    def financial_eligibility_context(
+        self,
+    ) -> FinancialEligibilityAcquisitionContext | None:
+        return self._financial_eligibility_context
+
+    @property
+    def financial_eligibility_context_identity(self) -> str | None:
+        context = self._financial_eligibility_context
+        return context.context_identity if context is not None else None
+
     def restored_statement_selection_request(
         self,
         request: FinancialToolRequest,
@@ -1790,6 +1954,10 @@ class FinancialToolDispatcher:
         provider_subrequest_cache: ProviderSubrequestCache | None = None,
         qualified_statement_router: MainlandFinancialCapabilityRouter | None = None,
         run_scope_id: str | None = None,
+        financial_eligibility_context: (
+            FinancialEligibilityAcquisitionContext | None
+        ) = None,
+        checkpoint_thread_id: str | None = None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -1869,6 +2037,8 @@ class FinancialToolDispatcher:
             provider_subrequest_cache=provider_subrequest_cache,
             qualified_statement_router=qualified_statement_router,
             run_scope_id=run_scope_id,
+            financial_eligibility_context=financial_eligibility_context,
+            checkpoint_thread_id=checkpoint_thread_id,
         )
 
     def canonical_request_key(
@@ -2385,21 +2555,48 @@ class FinancialToolDispatcher:
             and manifest.financial_eligibility_binding is not None
             for manifest in qualified_manifests
         )
+        context = self._financial_eligibility_context
+        expected_context_binding = (
+            FinancialEligibilityRequestBinding.from_context(context)
+            if context is not None
+            else None
+        )
+        selection_context_bindings = tuple(
+            entry.terminal.selection_request.financial_eligibility_context_binding
+            for entry in (*qualified_entries, *qualified_indicator_entries)
+        )
+        has_context_binding = (
+            has_eligibility_binding
+            and context is not None
+            and bool(selection_context_bindings)
+            and all(
+                binding == expected_context_binding
+                for binding in selection_context_bindings
+            )
+        )
+        if context is not None and not has_context_binding:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
+            )
         if has_manifest_v2 and self._run_scope_id is None:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
             )
         ledger = FinancialDispatchCheckpointLedger(
             contract_version=(
-                FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
-                if has_eligibility_binding
+                FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
+                if has_context_binding
                 else (
-                    FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
-                    if has_manifest_v2
+                    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                    if has_eligibility_binding
                     else (
-                        FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
-                        if qualified_entries or qualified_indicator_entries
-                        else FINANCIAL_DISPATCH_LEDGER_VERSION
+                        FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION
+                        if has_manifest_v2
+                        else (
+                            FINANCIAL_DISPATCH_QUALIFIED_LEDGER_VERSION
+                            if qualified_entries or qualified_indicator_entries
+                            else FINANCIAL_DISPATCH_LEDGER_VERSION
+                        )
                     )
                 )
             ),
@@ -2437,6 +2634,12 @@ class FinancialToolDispatcher:
                 else None
             ),
             run_scope_id=self._run_scope_id if has_manifest_v2 else None,
+            checkpoint_thread_id=(
+                self._checkpoint_thread_id if has_context_binding else None
+            ),
+            financial_eligibility_context=(
+                context if has_context_binding else None
+            ),
             entries=tuple(entries),
             qualified_statement_selections=tuple(qualified_entries),
             qualified_indicator_selections=tuple(qualified_indicator_entries),
@@ -2452,6 +2655,10 @@ class FinancialToolDispatcher:
             payload.pop("financial_eligibility_binding", None)
         if ledger.run_scope_id is None:
             payload.pop("run_scope_id", None)
+        if ledger.checkpoint_thread_id is None:
+            payload.pop("checkpoint_thread_id", None)
+        if ledger.financial_eligibility_context is None:
+            payload.pop("financial_eligibility_context", None)
         if not ledger.qualified_statement_selections:
             payload.pop("qualified_statement_selections", None)
         if not ledger.qualified_indicator_selections:
@@ -2495,7 +2702,11 @@ class FinancialToolDispatcher:
                     FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
                 ) from exc
             if (
-                raw_version != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                raw_version
+                not in {
+                    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                    FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
+                }
                 or restored_binding != self._financial_eligibility_binding
             ):
                 raise FinancialDispatchCheckpointError(
@@ -2511,12 +2722,13 @@ class FinancialToolDispatcher:
             )
             raise FinancialDispatchCheckpointError(
 
-                    FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
-                    if raw_version in {
-                        FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
-                        FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
-                    }
-                    else FinancialDispatchCheckpointFailureReason.MALFORMED
+                FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
+                if raw_version in {
+                    FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
+                    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                    FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
+                }
+                else FinancialDispatchCheckpointFailureReason.MALFORMED
 
             ) from exc
         asset_configuration = self._run_asset_configuration
@@ -2537,9 +2749,49 @@ class FinancialToolDispatcher:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.POLICY_MISMATCH
             )
+        if ledger.contract_version == FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION:
+            restored_context = ledger.financial_eligibility_context
+            if restored_context is None or ledger.checkpoint_thread_id is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+                )
+            if (
+                self._financial_eligibility_context is not None
+                and self._financial_eligibility_context != restored_context
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
+                )
+            if (
+                self._checkpoint_thread_id is not None
+                and self._checkpoint_thread_id != ledger.checkpoint_thread_id
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
+                )
+            self._financial_eligibility_context = restored_context
+            self._checkpoint_thread_id = ledger.checkpoint_thread_id
+            if self._provider_subrequest_cache is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
+                )
+            try:
+                self._provider_subrequest_cache.bind_financial_eligibility_context(
+                    context_contract_version=restored_context.contract_version,
+                    context_identity=restored_context.context_identity,
+                )
+            except ProviderSubrequestCacheError as exc:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
+                ) from exc
+        elif self._financial_eligibility_context is not None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+            )
         if ledger.contract_version in {
             FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
         }:
             if ledger.run_scope_id != self._run_scope_id:
                 raise FinancialDispatchCheckpointError(
@@ -2662,6 +2914,7 @@ class FinancialToolDispatcher:
                         in {
                             FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                         }
                     ),
                 )
@@ -2728,6 +2981,7 @@ class FinancialToolDispatcher:
                         in {
                             FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                         }
                     ),
                 )

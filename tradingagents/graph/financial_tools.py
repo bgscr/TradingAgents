@@ -29,7 +29,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     MainlandFinancialCapabilityRouter,
 )
 from tradingagents.dataflows.financial_dispatch import (
-    FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
@@ -44,6 +44,9 @@ from tradingagents.evidence import EvidenceState
 from tradingagents.qualified_routing_eligibility_lifecycle import (
     FinancialEligibilityAcquisitionContextOwner,
     QualifiedFinancialRoutingComposition,
+)
+from tradingagents.qualified_routing_lifecycle import (
+    ProductionQualifiedRoutingLifecycleError,
 )
 
 _FINANCIAL_TOOL_CONTRACTS = {
@@ -91,21 +94,46 @@ class FinancialDispatchToolNode:
             FinancialEligibilityAcquisitionContextOwner | None
         ) = None,
     ) -> None:
-        if qualified_context_owner is not None and (
-            qualified_statement_router is not None
-            or qualified_statement_request_factory is not None
-            or qualified_indicator_request_factory is not None
-            or qualified_provider_subrequest_cache is not None
-            or restored_shadow_dispatcher is not None
-        ):
-            raise ValueError(
-                "context-owned qualified routing cannot expose unbound runtime wiring"
+        if qualified_context_owner is not None:
+            if (
+                qualified_statement_request_factory is not None
+                or qualified_indicator_request_factory is not None
+            ):
+                raise ValueError(
+                    "context-owned qualified routing cannot expose direct factories"
+                )
+            has_owner_wiring = any(
+                value is not None
+                for value in (
+                    qualified_statement_router,
+                    qualified_provider_subrequest_cache,
+                    restored_shadow_dispatcher,
+                )
             )
+            if has_owner_wiring:
+                try:
+                    owner_routing = qualified_context_owner.financial_routing
+                except ProductionQualifiedRoutingLifecycleError as exc:
+                    raise ValueError(
+                        "context-owned qualified routing is not completely restored"
+                    ) from exc
+                if (
+                    qualified_statement_router is not owner_routing.router
+                    or qualified_provider_subrequest_cache
+                    is not owner_routing.provider_subrequest_cache
+                    or restored_shadow_dispatcher
+                    is not owner_routing.restored_shadow_dispatcher
+                ):
+                    raise ValueError(
+                        "context-owned qualified routing wiring is not owner-owned"
+                    )
         has_factory = (
             qualified_statement_request_factory is not None
             or qualified_indicator_request_factory is not None
         )
-        if (qualified_statement_router is None) == has_factory:
+        if qualified_context_owner is None and (
+            (qualified_statement_router is None) == has_factory
+        ):
             raise ValueError(
                 "qualified router requires at least one matching request factory"
             )
@@ -475,7 +503,7 @@ class FinancialDispatchToolNode:
                     if (
                         expected_capability_routing_plan is None
                         or ledger.contract_version
-                        != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+                        != FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
                         or ledger.capability_routing_plan_signature
                         != expected_capability_routing_plan.plan_signature
                         or ledger.financial_eligibility_binding != expected_binding
@@ -564,7 +592,7 @@ class FinancialDispatchToolNode:
             if configured_retry_policy is not None:
                 retry_policy = RetryPolicy.model_validate(configured_retry_policy)
         restored_dispatcher = self._restored_shadow_dispatcher
-        if shadow and restored_dispatcher is not None and qualified_router_override is None:
+        if shadow and restored_dispatcher is not None:
             if restored_dispatcher.checkpoint_ledger() != state.get(checkpoint_key):
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
@@ -597,6 +625,20 @@ class FinancialDispatchToolNode:
             if mirrored_shadow_cache or empty_historical_cache:
                 checkpoint_ledger = dict(checkpoint_ledger)
                 checkpoint_ledger.pop("provider_subrequest_cache", None)
+        qualified_cache = (
+            provider_subrequest_cache_override
+            or self._qualified_provider_subrequest_cache
+        )
+        context_owner = self._qualified_context_owner
+        dispatcher_context = (
+            context_owner.context
+            if (
+                context_owner is not None
+                and context_owner.checkpoint_thread_id is not None
+                and qualified_cache is not None
+            )
+            else None
+        )
         dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=identity,
             run_asset_configuration=asset_configuration,
@@ -607,10 +649,7 @@ class FinancialDispatchToolNode:
             sleeper=self._sleeper,
             checkpoint_ledger=checkpoint_ledger,
             provider_subrequest_cache=(
-                (
-                    provider_subrequest_cache_override
-                    or self._qualified_provider_subrequest_cache
-                )
+                qualified_cache
                 if qualified_router is not None
                 else None
             ),
@@ -618,6 +657,14 @@ class FinancialDispatchToolNode:
             run_scope_id=(
                 str(state["run_id"])
                 if state.get("run_id") is not None
+                else None
+            ),
+            financial_eligibility_context=(
+                dispatcher_context if qualified_router is not None else None
+            ),
+            checkpoint_thread_id=(
+                context_owner.checkpoint_thread_id
+                if qualified_router is not None and dispatcher_context is not None
                 else None
             ),
         )

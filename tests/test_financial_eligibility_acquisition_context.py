@@ -33,6 +33,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     build_financial_eligibility_acquisition_context,
     derive_mainland_financial_acquisition_period_supersets,
     financial_eligibility_acquisition_context_identity,
+    validate_financial_eligibility_acquisition_context_binding,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
@@ -230,6 +231,44 @@ def test_valid_contexts_construct_deterministically(
     assert FinancialEligibilityAcquisitionContext.model_validate(
         json.loads(json.dumps(first.safe_projection()))
     ) == first
+
+
+def test_context_cross_binding_validation_is_centralized_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _context_inputs(monkeypatch)
+    context = _success_context(inputs)
+    expected = {
+        "canonical_run_id": inputs["canonical_run_id"],
+        "asset_configuration_signature": inputs["asset_configuration_signature"],
+        "instrument_identity": inputs["instrument_identity"],
+        "as_of_date": inputs["as_of_date"],
+        "availability_scope": inputs["availability_scope"],
+        "acquisition_purpose": inputs["acquisition_purpose"],
+        "financial_eligibility_binding": inputs["financial_eligibility_binding"],
+        "routing_plan_signature": inputs["routing_plan_signature"],
+        "consolidation_scope": inputs["consolidation_scope"],
+    }
+
+    assert (
+        validate_financial_eligibility_acquisition_context_binding(
+            context,
+            **expected,
+        )
+        is context
+    )
+
+    for field, mismatch in (
+        ("canonical_run_id", _run_id("other")),
+        ("asset_configuration_signature", "asset-config:v1:" + "1" * 64),
+        ("routing_plan_signature", "mainland-routing-plan:v1:" + "2" * 64),
+        ("as_of_date", date(2026, 8, 7)),
+    ):
+        with pytest.raises(ValueError, match="context binding is invalid"):
+            validate_financial_eligibility_acquisition_context_binding(
+                context,
+                **dict(expected, **{field: mismatch}),
+            )
 
 
 def test_resolver_input_order_does_not_change_evidence_or_context_identity(

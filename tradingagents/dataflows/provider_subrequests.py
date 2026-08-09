@@ -31,6 +31,10 @@ from tradingagents.market_history.coordinator import (
 )
 
 PROVIDER_SUBREQUEST_KEY_VERSION = "1.0"
+PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION = "1.1"
+FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION = (
+    "financial-eligibility-acquisition-context-v1"
+)
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:=/-]{0,255}$"
@@ -56,6 +60,7 @@ class ProviderSubrequestCacheFailureReason(str, Enum):
     UNSAFE_CACHE_IDENTITY = "provider_subrequest_cache_identity_unsafe"
     UPSTREAM_IDENTITY_MISMATCH = "provider_subrequest_upstream_identity_mismatch"
     RUN_SCOPE_MISMATCH = "provider_subrequest_run_scope_mismatch"
+    CONTEXT_MISMATCH = "provider_subrequest_context_mismatch"
 
 
 class ProviderSubrequestCacheError(ValueError):
@@ -324,10 +329,12 @@ class ProviderSubrequestArtifactStore:
     def read(self, artifact: ProviderSubrequestArtifactRef) -> bytes:
         try:
             payload = self._artifact_path(artifact.artifact_sha256).read_bytes()
-        except OSError as exc:
+        except OSError:
+            payload = None
+        if payload is None:
             raise ProviderSubrequestCacheError(
                 ProviderSubrequestCacheFailureReason.ARTIFACT_CORRUPT
-            ) from exc
+            )
         if (
             len(payload) != artifact.byte_length
             or sha256(payload).hexdigest() != artifact.artifact_sha256
@@ -539,14 +546,30 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
 class ProviderSubrequestCacheCheckpoint(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = "1.0"
+    contract_version: Literal["1.0", "1.1"] = "1.0"
     run_scope_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    financial_eligibility_context_contract_version: Literal[
+        "financial-eligibility-acquisition-context-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    financial_eligibility_context_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     entries: tuple[ProviderSubrequestCheckpointEntry, ...] = ()
 
     @model_validator(mode="after")
     def _validate_run_scope(self) -> ProviderSubrequestCacheCheckpoint:
         if _contains_reserved_secret_text((self.run_scope_id,)):
             raise ValueError("provider subrequest run scope is unsafe")
+        has_context_binding = (
+            self.financial_eligibility_context_contract_version is not None
+            and self.financial_eligibility_context_identity is not None
+        )
+        if (
+            self.contract_version == PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
+        ) != has_context_binding:
+            raise ValueError("provider subrequest context binding is incomplete")
         return self
 
 
@@ -600,6 +623,8 @@ class ProviderSubrequestCache:
         self._lock = threading.Lock()
         self._results: dict[str, Future[ProviderSubrequestResult]] = {}
         self._keys: dict[str, ProviderSubrequestKey] = {}
+        self._financial_eligibility_context_contract_version: str | None = None
+        self._financial_eligibility_context_identity: str | None = None
         self._interrupted = False
         self._closed = False
         if checkpoint is not None:
@@ -617,6 +642,48 @@ class ProviderSubrequestCache:
             self._coordinator is coordinator
             and self._artifact_store is artifact_store
         )
+
+    def bind_financial_eligibility_context(
+        self,
+        *,
+        context_contract_version: str,
+        context_identity: str,
+    ) -> None:
+        """Single-assign the safe context identity governing this run cache."""
+
+        if (
+            context_contract_version
+            != FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION
+            or re.fullmatch(
+                r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}",
+                context_identity,
+            )
+            is None
+            or _contains_reserved_secret_text(
+                (context_contract_version, context_identity)
+            )
+        ):
+            raise ProviderSubrequestCacheError(
+                ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
+            )
+        with self._lock:
+            if self._closed or self._interrupted or self._stop_signal.is_set():
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.UNSAFE_CHECKPOINT_BOUNDARY
+                )
+            existing = (
+                self._financial_eligibility_context_contract_version,
+                self._financial_eligibility_context_identity,
+            )
+            requested = (context_contract_version, context_identity)
+            if existing != (None, None) and existing != requested:
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
+                )
+            (
+                self._financial_eligibility_context_contract_version,
+                self._financial_eligibility_context_identity,
+            ) = requested
 
     def checkpoint(self) -> dict[str, object]:
         entries: list[ProviderSubrequestCheckpointEntry] = []
@@ -645,8 +712,21 @@ class ProviderSubrequestCache:
                         attempt_events=result.attempt_events,
                     )
                 )
+            context_contract_version = (
+                self._financial_eligibility_context_contract_version
+            )
+            context_identity = self._financial_eligibility_context_identity
         return ProviderSubrequestCacheCheckpoint(
+            contract_version=(
+                PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
+                if context_identity is not None
+                else "1.0"
+            ),
             run_scope_id=self._run_scope_id,
+            financial_eligibility_context_contract_version=(
+                context_contract_version
+            ),
+            financial_eligibility_context_identity=context_identity,
             entries=tuple(entries),
         ).model_dump(mode="json")
 
@@ -676,6 +756,18 @@ class ProviderSubrequestCache:
             if restored.run_scope_id != self._run_scope_id:
                 raise ProviderSubrequestCacheError(
                     ProviderSubrequestCacheFailureReason.RUN_SCOPE_MISMATCH
+                )
+            expected_context = (
+                self._financial_eligibility_context_contract_version,
+                self._financial_eligibility_context_identity,
+            )
+            restored_context = (
+                restored.financial_eligibility_context_contract_version,
+                restored.financial_eligibility_context_identity,
+            )
+            if expected_context != restored_context:
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
                 )
             keys: set[str] = set()
             restored_results: dict[str, Future[ProviderSubrequestResult]] = {}

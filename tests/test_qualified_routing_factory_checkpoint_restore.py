@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -25,16 +26,17 @@ from tradingagents.dataflows.acquisition import (
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialProviderGapRequest,
     FinancialProviderPeriodResponse,
-    FinancialStatementRoutingRequest,
     MainlandFinancialCapabilityRouter,
 )
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_STATEMENT_DECLARATION_TUSHARE_V2,
+    FinancialAvailabilityScope,
     FinancialCapability,
     FinancialCompanyType,
     FinancialConsolidationScope,
     FinancialFieldValue,
     FinancialFilingMetadata,
+    FinancialListingProvenance,
     FinancialPeriodCandidate,
     FinancialPeriodIdentity,
     FinancialProviderArtifactIdentity,
@@ -49,6 +51,16 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchCheckpointFailureReason,
     FinancialToolDispatcher,
     FinancialToolRequest,
+)
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialCompanyTypeEvidenceBinding,
+    FinancialEligibilityRequestBinding,
+    build_financial_eligibility_acquisition_context,
+    derive_mainland_financial_acquisition_period_supersets,
+    financial_eligibility_acquisition_context_identity,
+)
+from tradingagents.dataflows.financial_request_factory import (
+    build_financial_statement_routing_request,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -290,6 +302,67 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     legacy_config = copy.deepcopy(qualified_config)
     legacy_config["mainland_capability_routing_mode"] = "legacy"
     legacy_config.pop("mainland_capability_routing_plan_signature")
+    company_type_resolution = resolve_financial_company_type(
+        provider_declared_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+        provider_declaration_qualified=True,
+        classifier_metadata={"industry": "industrial"},
+        present_fields=("accounts_receivable", "inventory"),
+    )
+    company_type_evidence = FinancialCompanyTypeEvidenceBinding.create(
+        provider_id="tushare",
+        artifact_identity=(
+            "provider-artifact:v1:"
+            + sha256(b"factory-restore-company-type").hexdigest()
+        ),
+        source_ref="acq.v1:financial.company-type:factory-restore",
+        observed_at=_NOW,
+        retrieved_at=_NOW,
+        provider_declared_type=company_type_resolution.provider_declared_type,
+        provider_declaration_qualified=(
+            company_type_resolution.provider_declaration_qualified
+        ),
+        normalized_resolver_inputs=company_type_resolution.classifier_inputs,
+    )
+    listing_date = date(2007, 5, 15)
+    annual_periods, reporting_periods = (
+        derive_mainland_financial_acquisition_period_supersets(
+            run_as_of_date=date(2026, 7, 30),
+            listing_date=listing_date,
+            policy=plan.financial_eligibility_policy,
+        )
+    )
+    context_result = build_financial_eligibility_acquisition_context(
+        canonical_run_id=run_id,
+        run_id=run_id,
+        asset_configuration=asset,
+        asset_configuration_signature=asset.asset_configuration_signature,
+        instrument_identity=asset.instrument_identity,
+        authoritative_as_of_date=date(2026, 7, 30),
+        as_of_date=date(2026, 7, 30),
+        authoritative_availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        acquisition_purpose="foreground_current_analysis",
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan=plan,
+        routing_plan_signature=plan.plan_signature,
+        company_type_resolution=company_type_resolution,
+        company_type_evidence=company_type_evidence,
+        listing_date=listing_date,
+        listing_provenance=FinancialListingProvenance(
+            provider_id="baostock",
+            source_ref=(
+                "provider-artifact:v1:"
+                + sha256(b"factory-restore-listing").hexdigest()
+            ),
+            observed_at=_NOW,
+        ),
+        currency="CNY",
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        acquisition_annual_period_ends=annual_periods,
+        acquisition_reporting_period_ends=reporting_periods,
+    )
+    assert context_result.context is not None
+    context = context_result.context
     upstream_id, upstream_name = upstream_service_identity_for_provider(
         "tushare",
         account_scope=plan.account_scope_label,
@@ -322,6 +395,10 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             coordinator=coordinator,
             artifact_store=artifact_store,
             run_scope_id=run_id,
+        )
+        original_cache.bind_financial_eligibility_context(
+            context_contract_version=context.contract_version,
+            context_identity=context.context_identity,
         )
         original_result = original_cache.execute(
             key,
@@ -402,25 +479,19 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
                 statement_source,
             ),
         )
-        selection_request = FinancialStatementRoutingRequest(
-            contract_version="financial-statement-routing-request-v2",
-            eligibility_policy_version=("mainland-financial-period-eligibility-v2"),
-            financial_eligibility_binding=plan.financial_eligibility_binding,
-            instrument_identity=asset.instrument_identity,
-            statement_type=FinancialStatementType.BALANCE_SHEET,
-            as_of_date=date(2026, 7, 30),
-            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
-            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
-            currency="CNY",
-            eligible_annual_period_ends=(date(2025, 12, 31),),
-            eligible_reporting_period_ends=(date(2026, 6, 30),),
-        )
         original_request = FinancialToolRequest(
             tool_name="get_balance_sheet",
             statement_type=FinancialStatementType.BALANCE_SHEET,
             frequency=FinancialReportingFrequency.QUARTERLY,
             as_of_date=date(2026, 7, 30),
             tool_call_id="original-tool-call",
+            financial_eligibility_context_binding=(
+                FinancialEligibilityRequestBinding.from_context(context)
+            ),
+        )
+        selection_request = build_financial_statement_routing_request(
+            original_request,
+            context,
         )
         original_dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=asset.instrument_identity,
@@ -431,6 +502,8 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             provider_subrequest_cache=original_cache,
             qualified_statement_router=original_router,
             run_scope_id=run_id,
+            financial_eligibility_context=context,
+            checkpoint_thread_id=_CHECKPOINT_THREAD_ID,
         )
         original_selection = original_dispatcher.dispatch_statement_selection(
             original_request,
@@ -468,6 +541,7 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     )
     checkpoint_state = {
         "run_id": run_id,
+        "trade_date": "2026-07-30",
         "asset_configuration": asset.model_dump(mode="json"),
         "capability_routing_plan": plan.model_dump(mode="json"),
         "capability_routing_rollout": (
@@ -583,20 +657,43 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             provider_subrequest_cache=provider_subrequest_cache,
             qualified_statement_router=validation_router,
             run_scope_id=run_id,
+            financial_eligibility_context=context,
+            checkpoint_thread_id=_CHECKPOINT_THREAD_ID,
         )
+
+    class RestoredContextProbe:
+        def __init__(self, restored_context) -> None:
+            self.context = restored_context
+            self.routing = None
+
+        def install_restored_financial_routing(self, routing):
+            self.routing = routing
+            return routing
+
+    def restore_financial_eligibility_context(restored_context):
+        return RestoredContextProbe(restored_context)
 
     composition = build_registered_production_qualified_routing_composition(
         blueprint=blueprint,
         runtime_factories=runtime_factories,
     )
 
-    def financial_node(routing=None) -> FinancialDispatchToolNode:
+    def financial_node(
+        routing=None,
+        context_owner=None,
+    ) -> FinancialDispatchToolNode:
         qualified = routing if isinstance(routing, QualifiedFinancialRoutingComposition) else None
+        owner_routing = (
+            context_owner.financial_routing
+            if context_owner is not None
+            else None
+        )
+        effective = qualified or owner_routing
         return FinancialDispatchToolNode(
             config=qualified_config,
             vendor_methods=vendor_methods,
             retry_policy=RetryPolicy(),
-            qualified_statement_router=(qualified.router if qualified else None),
+            qualified_statement_router=(effective.router if effective else None),
             qualified_statement_request_factory=(
                 qualified.statement_request_factory if qualified else None
             ),
@@ -604,11 +701,12 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
                 qualified.indicator_request_factory if qualified else None
             ),
             qualified_provider_subrequest_cache=(
-                qualified.provider_subrequest_cache if qualified else None
+                effective.provider_subrequest_cache if effective else None
             ),
             restored_shadow_dispatcher=(
-                qualified.restored_shadow_dispatcher if qualified else None
+                effective.restored_shadow_dispatcher if effective else None
             ),
+            qualified_context_owner=context_owner,
         )
 
     class Workflow:
@@ -635,7 +733,10 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
         _active_checkpointer=None,
     )
     host._create_tool_nodes = lambda: {
-        "fundamentals": financial_node(host.qualified_financial_routing)
+        "fundamentals": financial_node(
+            host.qualified_financial_routing,
+            getattr(host, "_financial_eligibility_context_owner", None),
+        )
     }
     runtime = TradingAgentsGraph.bind_qualified_routing_runtime(
         host,
@@ -647,7 +748,12 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     )
     assert runtime is not None
 
-    restored_dispatcher = runtime.financial_routing.restored_shadow_dispatcher
+    assert runtime.financial_routing is None
+    assert runtime.dependencies is None
+    restored_owner = host._financial_eligibility_context_owner
+    assert restored_owner.context == context
+    restored_routing = restored_owner.financial_routing
+    restored_dispatcher = restored_routing.restored_shadow_dispatcher
     assert restored_dispatcher is not None
     assert restored_dispatcher.checkpoint_ledger() == shadow_ledger
     legacy_calls_before_resume = legacy_provider_calls
@@ -700,7 +806,9 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
         original_request.model_copy(update={"tool_call_id": "resumed-tool-call"}),
         selection_request,
     )
-    restored_cache_result = runtime.dependencies.subrequest_cache.execute(
+    restored_cache = restored_routing.provider_subrequest_cache
+    assert restored_cache is not None
+    restored_cache_result = restored_cache.execute(
         key,
         owner_id=run_id,
         priority=RequestPriority.INTERACTIVE_MAINLAND,
@@ -711,7 +819,7 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
         media_type="application/json",
         physical_request=lambda: pytest.fail("resume must perform zero provider I/O"),
     )
-    restored_unavailable = runtime.dependencies.subrequest_cache.execute(
+    restored_unavailable = restored_cache.execute(
         unavailable_key,
         owner_id=run_id,
         priority=RequestPriority.INTERACTIVE_MAINLAND,
@@ -755,13 +863,22 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     )
     assert resumed_shadow_ledger["qualified_statement_selections"][0]["reuse_count"] == 10
     assert (
-        runtime.dependencies.subrequest_cache.checkpoint()
+        restored_cache.checkpoint()
         == shadow_ledger["provider_subrequest_cache"]
     )
     assert qualified_source_calls == qualified_calls_before_resume
     assert coordinator_sequences == 0
+    assert events.index("phase:eligibility_context_restore") < events.index(
+        "phase:subrequest_cache"
+    )
+    assert events.index("phase:subrequest_cache_restore") < events.index(
+        "phase:checkpoint_restore"
+    )
     assert events.index("phase:checkpoint_restore") < events.index("client:tushare")
     assert events.index("phase:checkpoint_restore") < events.index("phase:provider_adapters")
+    assert events.index("phase:checkpoint_restore") < events.index(
+        "phase:eligibility_runtime_exposed"
+    )
     assert artifact_bytes() == original_artifact_bytes
     assert (
         json.dumps(
@@ -773,7 +890,7 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     )
     with pytest.raises(FinancialDispatchCheckpointError) as rebind_error:
         restored_dispatcher.bind_qualified_statement_router(
-            runtime.financial_routing.router
+            restored_routing.router
         )
     assert rebind_error.value.reason is (
         FinancialDispatchCheckpointFailureReason.UNSAFE_BOUNDARY
@@ -784,6 +901,54 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
     assert tuple(events) == closed_events
     for client_name in ("tushare", "akshare", "yfinance", "baostock"):
         assert events.count(f"close:{client_name}") == 1
+
+    pre_context_state = copy.deepcopy(checkpoint_state)
+    pre_context_shadow = pre_context_state["financial_dispatch_shadow_ledger"]
+    pre_context_shadow["contract_version"] = "1.3"
+    pre_context_shadow.pop("checkpoint_thread_id")
+    pre_context_shadow.pop("financial_eligibility_context")
+    pre_context_bytes = json.dumps(
+        pre_context_state,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    events.clear()
+    pre_context_composition = (
+        build_registered_production_qualified_routing_composition(
+            blueprint=blueprint,
+            runtime_factories=runtime_factories,
+        )
+    )
+    with pytest.raises(FinancialDispatchCheckpointError) as pre_context_error:
+        pre_context_composition.bind_run(
+            ProductionQualifiedRoutingRunBinding(
+                run_id=run_id,
+                asset_configuration=asset,
+                routing_plan=plan,
+                checkpoint_compatibility_known=True,
+                resume_from_checkpoint=True,
+                checkpoint_thread_id=_CHECKPOINT_THREAD_ID,
+                checkpoint_state=MappingProxyType(pre_context_state),
+                restore_financial_dispatcher=restore_financial_dispatcher,
+                restore_financial_eligibility_context=(
+                    restore_financial_eligibility_context
+                ),
+            )
+        )
+    assert pre_context_error.value.reason is (
+        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+    )
+    assert events == []
+    assert (
+        json.dumps(
+            pre_context_state,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        == pre_context_bytes
+    )
+    assert artifact_bytes() == original_artifact_bytes
+    pre_context_composition.close()
 
     def available_entry(state):
         return next(
@@ -803,8 +968,127 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             if entry["artifact"] is None
         )
 
+    def context_projection(state):
+        return state["financial_dispatch_shadow_ledger"][
+            "financial_eligibility_context"
+        ]
+
+    def reidentify_context(state) -> None:
+        projection = context_projection(state)
+        identity_material = copy.deepcopy(projection)
+        identity_material.pop("context_identity")
+        projection["context_identity"] = financial_eligibility_acquisition_context_identity(
+            identity_material
+        )
+
     def corrupt_missing_ledger(state) -> None:
         state.pop("financial_dispatch_shadow_ledger")
+
+    def corrupt_missing_context(state) -> None:
+        state["financial_dispatch_shadow_ledger"].pop(
+            "financial_eligibility_context"
+        )
+
+    def corrupt_context_version(state) -> None:
+        context_projection(state)["contract_version"] = (
+            "financial-eligibility-acquisition-context-v9"
+        )
+
+    def corrupt_context_identity(state) -> None:
+        context_projection(state)["context_identity"] = (
+            "financial-eligibility-acquisition-context:v1:" + "0" * 64
+        )
+
+    def corrupt_context_thread(state) -> None:
+        state["financial_dispatch_shadow_ledger"]["checkpoint_thread_id"] = (
+            "fedcba9876543210"
+        )
+
+    def corrupt_context_run(state) -> None:
+        context_projection(state)["run_id"] = "run:" + "0" * 64
+        reidentify_context(state)
+
+    def corrupt_context_asset(state) -> None:
+        context_projection(state)["asset_configuration_signature"] = (
+            "asset-config:v1:" + "0" * 64
+        )
+        reidentify_context(state)
+
+    def corrupt_context_instrument(state) -> None:
+        context_projection(state)["instrument_identity"]["symbol"] = "600000.SS"
+        reidentify_context(state)
+
+    def corrupt_context_as_of(state) -> None:
+        context_projection(state)["as_of_date"] = "2026-07-29"
+        reidentify_context(state)
+
+    def corrupt_context_scope(state) -> None:
+        context_projection(state)["availability_scope"] = "strict_pit_eligible"
+        reidentify_context(state)
+
+    def corrupt_context_purpose(state) -> None:
+        context_projection(state)["acquisition_purpose"] = "resume_reconstruction"
+        reidentify_context(state)
+
+    def corrupt_context_plan(state) -> None:
+        context_projection(state)["routing_plan_signature"] = (
+            "mainland-routing-plan:v1:" + "0" * 64
+        )
+        reidentify_context(state)
+
+    def corrupt_context_eligibility(state) -> None:
+        context_projection(state)["financial_eligibility_binding"]["policy_signature"] = (
+            "mainland-financial-eligibility-policy:v2:" + "0" * 64
+        )
+        reidentify_context(state)
+
+    def corrupt_context_unknown_company_type(state) -> None:
+        resolution = context_projection(state)["company_type_resolution"]
+        resolution["company_type"] = "unknown"
+        resolution["method"] = "unresolved"
+        reidentify_context(state)
+
+    def corrupt_context_ambiguous_company_type(state) -> None:
+        context_projection(state)["company_type_resolution"]["ambiguous"] = True
+        reidentify_context(state)
+
+    def corrupt_context_contradictory_company_type(state) -> None:
+        context_projection(state)["company_type_resolution"]["contradictory"] = True
+        reidentify_context(state)
+
+    def corrupt_context_company_evidence(state) -> None:
+        context_projection(state)["company_type_evidence"][
+            "normalized_resolver_inputs"
+        ] = []
+        reidentify_context(state)
+
+    def corrupt_context_listing_authority(state) -> None:
+        context_projection(state)["listing_provenance"]["authoritative"] = False
+        reidentify_context(state)
+
+    def corrupt_context_listing_provider(state) -> None:
+        context_projection(state)["listing_provenance"]["provider_id"] = "yfinance"
+        reidentify_context(state)
+
+    def corrupt_context_listing_date(state) -> None:
+        context_projection(state)["listing_date"] = "2027-01-01"
+        reidentify_context(state)
+
+    def corrupt_context_periods(state) -> None:
+        context_projection(state)["acquisition_reporting_period_ends"].pop()
+        reidentify_context(state)
+
+    def corrupt_context_cache_binding(state) -> None:
+        state["financial_dispatch_shadow_ledger"]["provider_subrequest_cache"][
+            "financial_eligibility_context_identity"
+        ] = "financial-eligibility-acquisition-context:v1:" + "0" * 64
+
+    def corrupt_context_request_binding(state) -> None:
+        state["financial_dispatch_shadow_ledger"]["qualified_statement_selections"][0]["terminal"][
+            "selection_request"
+        ]["financial_eligibility_context_binding"]["context_identity"] = (
+            "financial-eligibility-acquisition-context:v1:" + "0" * 64
+        )
 
     def corrupt_truncated_ledger(state) -> None:
         state["financial_dispatch_shadow_ledger"] = {"contract_version": "1.3"}
@@ -975,6 +1259,31 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
 
     corruptions = (
         ("missing_ledger", corrupt_missing_ledger),
+        ("missing_context", corrupt_missing_context),
+        ("context_version", corrupt_context_version),
+        ("context_identity", corrupt_context_identity),
+        ("context_thread", corrupt_context_thread),
+        ("context_run", corrupt_context_run),
+        ("context_asset", corrupt_context_asset),
+        ("context_instrument", corrupt_context_instrument),
+        ("context_as_of", corrupt_context_as_of),
+        ("context_scope", corrupt_context_scope),
+        ("context_purpose", corrupt_context_purpose),
+        ("context_plan", corrupt_context_plan),
+        ("context_eligibility", corrupt_context_eligibility),
+        ("context_unknown_company_type", corrupt_context_unknown_company_type),
+        ("context_ambiguous_company_type", corrupt_context_ambiguous_company_type),
+        (
+            "context_contradictory_company_type",
+            corrupt_context_contradictory_company_type,
+        ),
+        ("context_company_evidence", corrupt_context_company_evidence),
+        ("context_listing_authority", corrupt_context_listing_authority),
+        ("context_listing_provider", corrupt_context_listing_provider),
+        ("context_listing_date", corrupt_context_listing_date),
+        ("context_periods", corrupt_context_periods),
+        ("context_cache_binding", corrupt_context_cache_binding),
+        ("context_request_binding", corrupt_context_request_binding),
         ("truncated_ledger", corrupt_truncated_ledger),
         ("cross_run", corrupt_cross_run),
         ("missing_artifact", corrupt_missing_artifact),
@@ -1041,6 +1350,9 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
                     checkpoint_thread_id=_CHECKPOINT_THREAD_ID,
                     checkpoint_state=MappingProxyType(invalid_state),
                     restore_financial_dispatcher=restore_financial_dispatcher,
+                    restore_financial_eligibility_context=(
+                        restore_financial_eligibility_context
+                    ),
                 )
             )
         assert not any(event.startswith("client:") for event in events), case_name
@@ -1074,6 +1386,12 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
         assert unsafe_restore_text not in diagnostic, case_name
         assert "example.invalid" not in diagnostic, case_name
         assert "raw-provider-exception-canary" not in diagnostic, case_name
+        rendered_traceback = "".join(
+            traceback.format_exception(error.value)
+        )
+        assert str(tmp_path) not in rendered_traceback, case_name
+        assert "deterministic-fixture-only" not in rendered_traceback, case_name
+        assert unsafe_restore_text not in rendered_traceback, case_name
         invalid_composition.close()
         invalid_composition.close()
 
@@ -1095,6 +1413,9 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
                 checkpoint_thread_id="fedcba9876543210",
                 checkpoint_state=MappingProxyType(checkpoint_state),
                 restore_financial_dispatcher=restore_financial_dispatcher,
+                restore_financial_eligibility_context=(
+                    restore_financial_eligibility_context
+                ),
             )
         )
     assert wrong_thread_error.value.reason is (

@@ -603,6 +603,57 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         return self
 
 
+def validate_financial_eligibility_acquisition_context_binding(
+    context: FinancialEligibilityAcquisitionContext,
+    *,
+    canonical_run_id: str,
+    asset_configuration_signature: str,
+    financial_eligibility_binding: MainlandFinancialEligibilityProjectionBinding,
+    routing_plan_signature: str,
+    instrument_identity: InstrumentIdentityEvidence | None = None,
+    as_of_date: date | None = None,
+    availability_scope: FinancialAvailabilityScope | None = None,
+    acquisition_purpose: Literal["foreground_current_analysis"] | None = None,
+    consolidation_scope: FinancialConsolidationScope | None = None,
+) -> FinancialEligibilityAcquisitionContext:
+    """Validate one immutable context against its authoritative host bindings."""
+
+    if not isinstance(context, FinancialEligibilityAcquisitionContext):
+        raise ValueError("financial eligibility context binding is invalid")
+    try:
+        validated_context = FinancialEligibilityAcquisitionContext.model_validate(
+            context.model_dump(mode="json")
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("financial eligibility context binding is invalid") from None
+    if (
+        validated_context != context
+        or context.run_id != canonical_run_id
+        or context.asset_configuration_signature != asset_configuration_signature
+        or context.financial_eligibility_binding != financial_eligibility_binding
+        or context.routing_plan_signature != routing_plan_signature
+        or (
+            instrument_identity is not None
+            and context.instrument_identity != instrument_identity
+        )
+        or (as_of_date is not None and context.as_of_date != as_of_date)
+        or (
+            availability_scope is not None
+            and context.availability_scope is not availability_scope
+        )
+        or (
+            acquisition_purpose is not None
+            and context.acquisition_purpose != acquisition_purpose
+        )
+        or (
+            consolidation_scope is not None
+            and context.consolidation_scope is not consolidation_scope
+        )
+    ):
+        raise ValueError("financial eligibility context binding is invalid")
+    return context
+
+
 class FinancialEligibilityRequestBinding(BaseModel):
     """Complete safe context binding carried by a fresh routing request."""
 

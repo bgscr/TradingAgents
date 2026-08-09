@@ -74,10 +74,13 @@ from tradingagents.dataflows.financial_capability_routing import (
 )
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_MANIFEST_V2,
+    FinancialAvailabilityScope,
+    FinancialConsolidationScope,
     FinancialRatioFamily,
     FinancialStatementType,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
@@ -86,10 +89,14 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolRequest,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
     FinancialEligibilityAcquisitionContext,
+    FinancialEligibilityRequestBinding,
     FinancialListingMetadataProjection,
+    financial_eligibility_acquisition_context_identity,
+    validate_financial_eligibility_acquisition_context_binding,
 )
 from tradingagents.dataflows.financial_eligibility_metadata import (
     FinancialEligibilityMetadataAcquirer,
@@ -105,6 +112,8 @@ from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
     ProviderSubrequestCache,
     ProviderSubrequestCacheCheckpoint,
+    ProviderSubrequestCacheError,
+    ProviderSubrequestCacheFailureReason,
     ProviderSubrequestInstrumentIdentity,
     ProviderSubrequestKey,
     ProviderSubrequestResult,
@@ -531,6 +540,9 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
         exclude=True,
         repr=False,
     )
+    restore_financial_eligibility_context: (
+        Callable[[object], object] | None
+    ) = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="after")
     def _validate_authoritative_bindings(self) -> ProductionQualifiedRoutingRunBinding:
@@ -552,9 +564,13 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
                 or not isinstance(self.checkpoint_state, Mapping)
                 or not callable(self.restore_financial_dispatcher)
                 or self.install_financial_eligibility_runtime is not None
+                or not callable(self.restore_financial_eligibility_context)
             ):
                 raise ValueError("qualified checkpoint restoration binding is invalid")
-        elif self.checkpoint_state is not None:
+        elif (
+            self.checkpoint_state is not None
+            or self.restore_financial_eligibility_context is not None
+        ):
             raise ValueError("fresh qualified binding cannot carry checkpoint state")
         return self
 
@@ -875,6 +891,7 @@ class ProductionQualifiedRoutingRuntime:
 
 @dataclass(frozen=True, slots=True)
 class _QualifiedCheckpointRestoration:
+    context: FinancialEligibilityAcquisitionContext
     shadow_ledger: FinancialDispatchCheckpointLedger
     cache_checkpoint: ProviderSubrequestCacheCheckpoint
 
@@ -989,6 +1006,92 @@ def _validate_cache_provider_calls(
                 )
 
 
+def _restore_checkpoint_eligibility_context(
+    state: Mapping[str, Any],
+    run_binding: ProductionQualifiedRoutingRunBinding,
+) -> FinancialEligibilityAcquisitionContext:
+    raw_shadow_ledger = state.get("financial_dispatch_shadow_ledger")
+    if not isinstance(raw_shadow_ledger, Mapping):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+        )
+    raw_ledger_version = raw_shadow_ledger.get("contract_version")
+    if raw_ledger_version != FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+            if raw_ledger_version == FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+            else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
+        )
+    raw_context = raw_shadow_ledger.get("financial_eligibility_context")
+    if raw_context is None:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+        )
+    if not isinstance(raw_context, Mapping):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
+        )
+    if raw_context.get("contract_version") != (
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
+        )
+    raw_identity = raw_context.get("context_identity")
+    try:
+        identity_material = dict(raw_context)
+        identity_material.pop("context_identity", None)
+        expected_identity = financial_eligibility_acquisition_context_identity(
+            identity_material
+        )
+    except (TypeError, ValueError) as exc:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
+        ) from exc
+    if raw_identity != expected_identity:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_IDENTITY_MISMATCH
+        )
+    try:
+        context = FinancialEligibilityAcquisitionContext.model_validate(raw_context)
+    except (TypeError, ValueError) as exc:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
+        ) from exc
+    checkpoint_thread_id = run_binding.checkpoint_thread_id
+    trade_date = state.get("trade_date")
+    if (
+        checkpoint_thread_id is None
+        or raw_shadow_ledger.get("checkpoint_thread_id") != checkpoint_thread_id
+        or trade_date != context.as_of_date.isoformat()
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_BINDING_MISMATCH
+        )
+    try:
+        validate_financial_eligibility_acquisition_context_binding(
+            context,
+            canonical_run_id=run_binding.run_id,
+            asset_configuration_signature=(
+                run_binding.asset_configuration.asset_configuration_signature
+            ),
+            instrument_identity=run_binding.asset_configuration.instrument_identity,
+            as_of_date=context.as_of_date,
+            availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+            acquisition_purpose="foreground_current_analysis",
+            financial_eligibility_binding=(
+                run_binding.routing_plan.financial_eligibility_binding
+            ),
+            routing_plan_signature=run_binding.routing_plan.plan_signature,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        )
+    except ValueError as exc:
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_BINDING_MISMATCH
+        ) from exc
+    return context
+
+
 def _validated_checkpoint_restoration(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     run_binding: ProductionQualifiedRoutingRunBinding,
@@ -1013,6 +1116,7 @@ def _validated_checkpoint_restoration(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
         )
+    context = _restore_checkpoint_eligibility_context(state, run_binding)
     try:
         expected_asset = RunAssetConfigurationProjection.model_validate(
             run_binding.asset_configuration.model_dump(mode="json")
@@ -1106,9 +1210,19 @@ def _validated_checkpoint_restoration(
             FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
         )
     cache_checkpoint = shadow_ledger.provider_subrequest_cache
+    expected_context_binding = FinancialEligibilityRequestBinding.from_context(
+        context
+    )
+    selection_context_bindings = tuple(
+        selection.terminal.selection_request.financial_eligibility_context_binding
+        for selection in (
+            *shadow_ledger.qualified_statement_selections,
+            *shadow_ledger.qualified_indicator_selections,
+        )
+    )
     if (
         shadow_ledger.contract_version
-        != FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
+        != FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
         or shadow_ledger.run_asset_configuration_version
         != expected_asset.asset_configuration_version
         or shadow_ledger.run_asset_configuration_signature
@@ -1119,9 +1233,26 @@ def _validated_checkpoint_restoration(
         or shadow_ledger.run_scope_id != run_binding.run_id
         or cache_checkpoint is None
         or cache_checkpoint.run_scope_id != run_binding.run_id
+        or shadow_ledger.checkpoint_thread_id != checkpoint_thread_id
+        or shadow_ledger.financial_eligibility_context != context
+        or not selection_context_bindings
+        or any(
+            binding != expected_context_binding
+            for binding in selection_context_bindings
+        )
     ):
         raise FinancialDispatchCheckpointError(
-            FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
+        )
+    if (
+        cache_checkpoint.contract_version != "1.1"
+        or cache_checkpoint.financial_eligibility_context_contract_version
+        != context.contract_version
+        or cache_checkpoint.financial_eligibility_context_identity
+        != context.context_identity
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
         )
 
     expected_identity = ProviderSubrequestInstrumentIdentity.from_authoritative(
@@ -1166,6 +1297,7 @@ def _validated_checkpoint_restoration(
             )
     _validate_cache_provider_calls(shadow_ledger, cache_checkpoint, plan)
     return _QualifiedCheckpointRestoration(
+        context=context,
         shadow_ledger=shadow_ledger,
         cache_checkpoint=cache_checkpoint,
     )
@@ -1311,6 +1443,19 @@ class RegisteredProductionQualifiedRoutingComposition:
         factories = self.runtime_factories
         assert factories is not None
         restoration = _validated_checkpoint_restoration(self.blueprint, run_binding)
+        restored_context_owner = None
+        if restoration is not None:
+            restore_context = run_binding.restore_financial_eligibility_context
+            assert restore_context is not None
+            restored_context_owner = restore_context(restoration.context)
+            if restored_context_owner is None:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            factories.phase_hook(
+                "eligibility_context_restore",
+                restoration.context,
+            )
 
         def acquire(resource_kind: str, value: object) -> object:
             owner.own(resource_kind, value)
@@ -1348,7 +1493,21 @@ class RegisteredProductionQualifiedRoutingComposition:
                 raise ProductionQualifiedRoutingLifecycleError(
                     ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
                 )
-            subrequest_cache.restore_checkpoint(restoration.cache_checkpoint)
+            try:
+                subrequest_cache.bind_financial_eligibility_context(
+                    context_contract_version=restoration.context.contract_version,
+                    context_identity=restoration.context.context_identity,
+                )
+                subrequest_cache.restore_checkpoint(restoration.cache_checkpoint)
+            except ProviderSubrequestCacheError as exc:
+                if exc.reason is (
+                    ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
+                ):
+                    raise FinancialDispatchCheckpointError(
+                        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
+                    ) from exc
+                raise
+            factories.phase_hook("subrequest_cache_restore", subrequest_cache)
             restored_shadow_dispatcher = restore_dispatcher(
                 checkpoint_state,
                 provider_subrequest_cache=subrequest_cache,
@@ -1361,6 +1520,13 @@ class RegisteredProductionQualifiedRoutingComposition:
             if not isinstance(restored_shadow_dispatcher, FinancialToolDispatcher):
                 raise ProductionQualifiedRoutingLifecycleError(
                     ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            if (
+                restored_shadow_dispatcher.financial_eligibility_context
+                != restoration.context
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
                 )
             factories.phase_hook(
                 "checkpoint_restore",
@@ -1429,6 +1595,21 @@ class RegisteredProductionQualifiedRoutingComposition:
         )
         for resource_kind, resource in assembly.owned_resources:
             acquire(resource_kind, resource)
+        if restored_context_owner is not None:
+            install_restored_routing = getattr(
+                restored_context_owner,
+                "install_restored_financial_routing",
+                None,
+            )
+            if not callable(install_restored_routing):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            install_restored_routing(financial_routing)
+            factories.phase_hook(
+                "eligibility_runtime_exposed",
+                restored_context_owner,
+            )
         install_eligibility_runtime = (
             run_binding.install_financial_eligibility_runtime
         )
@@ -1454,20 +1635,24 @@ class RegisteredProductionQualifiedRoutingComposition:
         return ProductionQualifiedRoutingRuntime(
             run_id=run_binding.run_id,
             financial_routing=(
-                financial_routing
-                if run_binding.resume_from_checkpoint
-                or assembly.eligibility_metadata_acquirer is None
-                else None
+                None
+                if restored_context_owner is not None
+                or eligibility_runtime_installed
+                else financial_routing
             ),
             stop_signal=owner.stop_signal,
             resource_kinds=owner.resource_kinds,
             source_composition=(
                 None
                 if eligibility_runtime_installed
+                or restored_context_owner is not None
                 else assembly.source_composition
             ),
             dependencies=(
-                None if eligibility_runtime_installed else assembly.dependencies
+                None
+                if eligibility_runtime_installed
+                or restored_context_owner is not None
+                else assembly.dependencies
             ),
         )
 

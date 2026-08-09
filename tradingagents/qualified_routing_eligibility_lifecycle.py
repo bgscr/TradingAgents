@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime
+from hashlib import sha256
 
 from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.capability_routing import MainlandCapabilityRoutingPlan, TushareCapability
@@ -28,6 +29,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialEligibilityAcquisitionFailureReason,
     FinancialEligibilityAcquisitionResult,
     FinancialEligibilityRequestBinding,
+    validate_financial_eligibility_acquisition_context_binding,
 )
 from tradingagents.dataflows.financial_eligibility_metadata import (
     FinancialEligibilityMetadataAcquisitionRequest,
@@ -103,6 +105,7 @@ class FinancialEligibilityAcquisitionContextOwner:
         consolidation_scope: FinancialConsolidationScope,
         retained_company_type_evidence: Sequence[object] = (),
         retained_listing_metadata: Sequence[object] = (),
+        checkpoint_thread_id: str | None = None,
         interrupt_runtime: Callable[[], object],
         close_runtime: Callable[[], object],
     ) -> None:
@@ -129,6 +132,21 @@ class FinancialEligibilityAcquisitionContextOwner:
             or not isinstance(consolidation_scope, FinancialConsolidationScope)
             or not callable(interrupt_runtime)
             or not callable(close_runtime)
+            or (
+                checkpoint_thread_id is not None
+                and (
+                    len(checkpoint_thread_id) != 16
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in checkpoint_thread_id
+                    )
+                    or run_id
+                    != "run:"
+                    + sha256(
+                        f"checkpoint:{checkpoint_thread_id}".encode()
+                    ).hexdigest()
+                )
+            )
         ):
             self._fail_binding()
         self._run_id = run_id
@@ -143,6 +161,7 @@ class FinancialEligibilityAcquisitionContextOwner:
             retained_company_type_evidence
         )
         self._retained_listing_metadata = tuple(retained_listing_metadata)
+        self._checkpoint_thread_id = checkpoint_thread_id
         self._interrupt_runtime = interrupt_runtime
         self._close_runtime = close_runtime
         self._lock = threading.RLock()
@@ -153,6 +172,71 @@ class FinancialEligibilityAcquisitionContextOwner:
         self._acquiring = False
         self._cleanup_started = False
         self._interruption_requested = False
+
+    @classmethod
+    def from_restored_context(
+        cls,
+        *,
+        run_id: str,
+        checkpoint_thread_id: str,
+        asset_configuration: RunAssetConfiguration,
+        routing_plan: MainlandCapabilityRoutingPlan,
+        context: FinancialEligibilityAcquisitionContext,
+        expected_as_of_date: date | None,
+        availability_scope: FinancialAvailabilityScope,
+        consolidation_scope: FinancialConsolidationScope,
+        interrupt_runtime: Callable[[], object],
+        close_runtime: Callable[[], object],
+    ) -> FinancialEligibilityAcquisitionContextOwner:
+        """Create a restoration-only owner without a metadata acquisition seam."""
+
+        if (
+            not isinstance(run_id, str)
+            or len(checkpoint_thread_id) != 16
+            or any(
+                character not in "0123456789abcdef"
+                for character in checkpoint_thread_id
+            )
+            or run_id
+            != "run:"
+            + sha256(f"checkpoint:{checkpoint_thread_id}".encode()).hexdigest()
+            or not isinstance(asset_configuration, RunAssetConfiguration)
+            or not isinstance(routing_plan, MainlandCapabilityRoutingPlan)
+            or routing_plan.financial_eligibility_binding is None
+            or not isinstance(availability_scope, FinancialAvailabilityScope)
+            or not isinstance(consolidation_scope, FinancialConsolidationScope)
+            or not callable(interrupt_runtime)
+            or not callable(close_runtime)
+        ):
+            cls._fail_binding()
+        owner = cls.__new__(cls)
+        owner._run_id = run_id
+        owner._asset_configuration = asset_configuration
+        owner._routing_plan = routing_plan
+        owner._metadata_acquirer = None
+        owner._unbound_financial_routing = None
+        owner._expected_as_of_date = expected_as_of_date
+        owner._availability_scope = availability_scope
+        owner._consolidation_scope = consolidation_scope
+        owner._retained_company_type_evidence = ()
+        owner._retained_listing_metadata = ()
+        owner._checkpoint_thread_id = checkpoint_thread_id
+        owner._interrupt_runtime = interrupt_runtime
+        owner._close_runtime = close_runtime
+        owner._lock = threading.RLock()
+        owner._condition = threading.Condition(owner._lock)
+        owner._context = None
+        owner._bound_financial_routing = None
+        owner._acquisition_result = None
+        owner._acquiring = False
+        owner._cleanup_started = False
+        owner._interruption_requested = False
+        owner._validate_context(context)
+        owner._context = context
+        owner._acquisition_result = FinancialEligibilityAcquisitionResult.succeeded(
+            context
+        )
+        return owner
 
     @staticmethod
     def _fail_binding() -> None:
@@ -177,6 +261,10 @@ class FinancialEligibilityAcquisitionContextOwner:
     @property
     def run_id(self) -> str:
         return self._run_id
+
+    @property
+    def checkpoint_thread_id(self) -> str | None:
+        return self._checkpoint_thread_id
 
     def validate_host_binding(
         self,
@@ -254,32 +342,23 @@ class FinancialEligibilityAcquisitionContextOwner:
         self,
         context: FinancialEligibilityAcquisitionContext,
     ) -> None:
-        if not isinstance(context, FinancialEligibilityAcquisitionContext):
-            self._fail_binding()
         try:
-            validated_context = FinancialEligibilityAcquisitionContext.model_validate(
-                context.model_dump(mode="python")
+            validate_financial_eligibility_acquisition_context_binding(
+                context,
+                canonical_run_id=self._run_id,
+                asset_configuration_signature=(
+                    self._asset_configuration.asset_configuration_signature
+                ),
+                instrument_identity=self._asset_configuration.instrument_identity,
+                as_of_date=self._expected_as_of_date,
+                availability_scope=self._availability_scope,
+                financial_eligibility_binding=(
+                    self._routing_plan.financial_eligibility_binding
+                ),
+                routing_plan_signature=self._routing_plan.plan_signature,
+                consolidation_scope=self._consolidation_scope,
             )
-        except (AttributeError, TypeError, ValueError):
-            self._fail_binding()
-        expected_binding = self._routing_plan.financial_eligibility_binding
-        if (
-            validated_context != context
-            or context.run_id != self._run_id
-            or context.asset_configuration_signature
-            != self._asset_configuration.asset_configuration_signature
-            or context.instrument_identity
-            != self._asset_configuration.instrument_identity
-            or (
-                self._expected_as_of_date is not None
-                and context.as_of_date != self._expected_as_of_date
-            )
-            or context.availability_scope is not self._availability_scope
-            or context.financial_eligibility_binding != expected_binding
-            or context.routing_plan_signature != self._routing_plan.plan_signature
-            or context.currency != self._asset_configuration.instrument_identity.currency
-            or context.consolidation_scope is not self._consolidation_scope
-        ):
+        except (TypeError, ValueError):
             self._fail_binding()
 
     def _bound_factory(
@@ -363,7 +442,15 @@ class FinancialEligibilityAcquisitionContextOwner:
             if self._expected_as_of_date is None:
                 self._expected_as_of_date = context.as_of_date
             raw = self._unbound_financial_routing
+            if raw is None:
+                self._fail_binding()
             try:
+                cache = raw.provider_subrequest_cache
+                if cache is not None:
+                    cache.bind_financial_eligibility_context(
+                        context_contract_version=context.contract_version,
+                        context_identity=context.context_identity,
+                    )
                 bound = QualifiedFinancialRoutingComposition(
                     router=raw.router,
                     statement_request_factory=self._bound_factory(
@@ -384,6 +471,54 @@ class FinancialEligibilityAcquisitionContextOwner:
             self._bound_financial_routing = bound
             self._context = context
             return context
+
+    def install_restored_financial_routing(
+        self,
+        routing: QualifiedFinancialRoutingComposition,
+    ) -> QualifiedFinancialRoutingComposition:
+        """Expose restored routing only after cache and dispatcher restoration."""
+
+        if not isinstance(routing, QualifiedFinancialRoutingComposition):
+            self._fail_binding()
+        with self._lock:
+            if self._interruption_requested or self._context is None:
+                self._fail_binding()
+            if self._bound_financial_routing is not None:
+                if self._bound_financial_routing == routing:
+                    return self._bound_financial_routing
+                self._fail_binding()
+            context = self._context
+            if routing.router.routing_plan != self._routing_plan:
+                self._fail_binding()
+            cache = routing.provider_subrequest_cache
+            if cache is not None:
+                try:
+                    cache.bind_financial_eligibility_context(
+                        context_contract_version=context.contract_version,
+                        context_identity=context.context_identity,
+                    )
+                except Exception:
+                    self._fail_binding()
+            try:
+                bound = QualifiedFinancialRoutingComposition(
+                    router=routing.router,
+                    statement_request_factory=self._bound_factory(
+                        routing.statement_request_factory,
+                        context,
+                    ),
+                    indicator_request_factory=self._bound_factory(
+                        routing.indicator_request_factory,
+                        context,
+                    ),
+                    provider_subrequest_cache=cache,
+                    restored_shadow_dispatcher=routing.restored_shadow_dispatcher,
+                )
+            except ProductionQualifiedRoutingLifecycleError:
+                raise
+            except (AttributeError, TypeError, ValueError):
+                self._fail_binding()
+            self._bound_financial_routing = bound
+            return bound
 
     def acquire_context(
         self,
