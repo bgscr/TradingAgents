@@ -31,6 +31,19 @@ production adapter seams. A complete design must originate authoritative
 eligibility metadata in a fresh run and make every declared source executable
 without moving policy into factories or adding another router.
 
+The completed QCF4 metadata-compatibility prototype exposed a third Critical
+gap: QCF4 currently equates complete normalized Tushare indicator values with
+compatible filing metadata and therefore requires those candidates to be
+selected. That implication is false. Instrument Identity currency, normalized
+value unit, financial value currency applicability, and filing-consolidation
+scope are separate semantic dimensions. A dimensionless ratio can be complete
+and correctly associated with a CNY Instrument Identity while value currency is
+semantically `NOT_APPLICABLE`; the same candidate can still be incompatible
+because its material filing-consolidation scope is `UNPROVEN`. `UNKNOWN` is
+neither proof nor semantic irrelevance. Ticket 06 therefore remains
+FAIL/BLOCKED until the provider-neutral metadata contract and corrected QCF4
+path are implemented.
+
 ## Solution
 
 Ship and statically register one built-in qualified routing composition factory.
@@ -97,6 +110,15 @@ Existing override behavior is preserved with this precedence:
 The word “production” here means shipped, non-test construction code. It does
 not change the configured Data Usage Mode or grant provider usage rights.
 
+For financial indicators, use Design A's provider-neutral semantic metadata
+model with Design C's existing fallback behavior. Every retained normalized
+field is classified by versioned policy before compatibility is assessed. A
+metadata-incompatible candidate remains retained but cannot satisfy selection;
+only the unresolved family continues sequentially through the immutable
+Capability Routing Plan. No provider-specific router exception, requested-
+metadata backfill, companion-filing inference, completeness-threshold change,
+or Evidence Admission rewrite is introduced.
+
 ## User Stories
 
 1. As a shadow-run operator, I want a shipped factory to be selected without test injection, so that real qualified shadow preflight can proceed.
@@ -142,6 +164,22 @@ not change the configured Data Usage Mode or grant provider usage rights.
 41. As a failure-path operator, I want partial context acquisition to fail typed before callable routing escapes, so that incomplete metadata cannot create a partially usable runtime.
 42. As a provider-integration maintainer, I want the six terminal `NOT_CONFIGURED` registrations replaced at the existing source-binding seam, so that every plan-declared production source is executable without a second registry.
 43. As an acceptance owner, I want QCF4–QCF12 to originate context from a fresh built-in run, so that seeded runtime/checkpoint state cannot conceal a broken acquisition path.
+44. As an evidence consumer, I want Instrument Identity currency separated from financial value currency and normalized unit, so that issuer identity is not mistaken for provider value evidence.
+45. As a compatibility-policy owner, I want `PROVEN`, `UNPROVEN`, and `NOT_APPLICABLE` to be closed assessment states, so that missing proof cannot be confused with semantic irrelevance.
+46. As an audit reader, I want a provider's raw `UNKNOWN` or `XXX` marker retained separately from semantic assessment state, so that unknown metadata never becomes compatible proof.
+47. As an indicator maintainer, I want every normalized family-field pair classified by versioned policy data, so that applicability never depends on whichever values happen to be populated in one response.
+48. As a ratio user, I want value currency declared `NOT_APPLICABLE` for dimensionless ratios and rates, so that `XXX` does not falsely conflict with the CNY Instrument Identity.
+49. As a monetary or per-share user, I want currency and unit proof to remain mandatory, so that missing or request-derived currency fails closed or degrades under the existing contract.
+50. As a filing-scope user, I want every current statement-derived indicator family to require proven consolidation scope, so that `UNKNOWN` cannot be converted to `CONSOLIDATED`.
+51. As a routing owner, I want complete-but-metadata-incompatible Tushare candidates retained and rejected while only unresolved families fall through, so that Design C behavior remains plan-owned and deterministic.
+52. As a fallback provider maintainer, I want AKShare, BaoStock, and Yahoo judged only by their own truthful metadata contracts, so that one provider's weakness neither disqualifies nor qualifies another.
+53. As a lineage owner, I want companion-filing metadata rejected without an exact stable cross-artifact filing identity, so that statement scope or currency is never inferred onto an indicator artifact.
+54. As an Evidence Admission owner, I want already-normalized applicability delivered at the existing trust boundary, so that material `UNPROVEN` metadata is rejected and explicit `NOT_APPLICABLE` dimensions alone are ignored.
+55. As a strict-replay user, I want missing `f_ann_date` to remain current-only at most, so that metadata applicability cannot bypass first-publication or observation requirements.
+56. As a checkpoint user, I want new semantic-policy and compatibility identities restored exactly, so that resume does not reinterpret old candidates under a new policy.
+57. As a historical-artifact reader, I want recorded old versions replayed under their pinned contracts and never rewritten, so that the amendment is forward-versioned rather than migratory.
+58. As a QCF4 owner, I want complete Tushare statements to stop statement fallback while incompatible indicator families continue, so that acceptance proves metadata truth rather than provider preference.
+59. As a regression owner, I want the separately completed deterministic live-test isolation fix retained, so that deterministic acceptance remains isolated from live providers independently of this metadata change.
 
 ## Implementation Decisions
 
@@ -156,9 +194,11 @@ not change the configured Data Usage Mode or grant provider usage rights.
   already-declared `(capability, provider ID)` pair. Registration order has no
   routing meaning. The factory maps provider IDs to executable sources; the
   immutable Capability Routing Plan alone determines traversal and fallback.
-- Existing financial eligibility, completeness, revision selection, Evidence
-  Admission, Decision Gate, Strategy Rules, and reporting behavior are
-  unchanged.
+- Existing financial-period eligibility v2, completeness thresholds/math,
+  revision selection, Evidence Admission trust boundary, Decision Gate,
+  Strategy Rules, and decision authority are unchanged. Indicator metadata
+  compatibility is an additional provider-neutral pre-selection hard gate and
+  receives the exact forward versions defined below.
 - Request factories, the composition factory, the context acquirer, and provider
   adapters must not implement fallback, provider ordering, duplicated
   completeness rules, duplicated company-type policy, another capability
@@ -271,7 +311,7 @@ existing canonical identity rules.
 | Routing-plan signature | The exact immutable Capability Routing Plan signature that governed prerequisite metadata acquisition and will govern ordinary financial routing. |
 | Resolved Financial Company Type | The existing `FinancialCompanyTypeResolution`, including resolved type, resolution method, resolver/classifier version, canonical resolution inputs, candidate types, ambiguity/contradiction flags, and safe provenance binding to qualified evidence. A successful context cannot contain `UNKNOWN`, an ambiguous result, or an unacceptable contradiction. |
 | Authoritative listing data | The authoritative listing date and existing `FinancialListingProvenance`, projected from the BaoStock issuer-lifecycle capability. Provider ID, source reference, observation time, and authority marker remain bound. |
-| Canonical acquisition metadata | Only the immutable provider-neutral values needed to construct fresh requests: currency, requested consolidation scope, and canonical annual/reporting acquisition-period supersets produced by the active eligibility policy from as-of and listing data. |
+| Canonical acquisition metadata | Only the immutable provider-neutral values needed to construct fresh requests: requested currency, requested consolidation scope, and canonical annual/reporting acquisition-period supersets produced by the active eligibility policy from as-of and listing data. Currency and scope are request intent; currency also binds authoritative Instrument Identity. Neither is provider evidence. |
 
 The context must not contain provider fallback policy, provider ordering,
 provider-specific request functions, routers or clients, mutable provider/cache
@@ -400,7 +440,8 @@ resource-free blueprint
 
 Statement and indicator request factories have the pure conceptual interface
 `(FinancialToolRequest, Financial Eligibility Acquisition Context) -> typed
-routing request`. They validate binding equality and project context values;
+routing request`. They validate binding equality and project context values as
+request intent only;
 they receive no provider clients, source catalog, router, coordinator, mutable
 state, fallback policy, or completeness policy. They may not resolve company
 type, acquire metadata, choose a provider, perform fallback, retry, alter the
@@ -421,6 +462,196 @@ secret-free. The context slot stays unbound; no request factory, dispatcher, or
 partial callable router escapes; lifecycle cleanup remains reverse-order and
 idempotent; and the original acquisition failure remains primary over any
 cleanup failure.
+
+### Financial-indicator semantic metadata contract
+
+The QCF4 metadata-compatibility prototype is authoritative design evidence for
+this amendment. Adopt Design A's provider-neutral semantic model together with
+Design C's fallback behavior. The compatibility model is applied to each
+retained normalized field under a versioned declaration; it is never inferred
+from provider identity or from the union/subset of fields populated in a
+particular response.
+
+Keep the following dimensions separate throughout normalization, compatibility,
+selection, manifest, checkpoint, report, and audit projection:
+
+| Dimension | Normative meaning |
+| --- | --- |
+| `instrument_currency` | Currency in authoritative Instrument Identity. It binds issuer/instrument context and remains `CNY` for the mainland Equities in scope, including when a normalized value is dimensionless. It is not provider value-currency evidence. |
+| `value_unit` | The provider-origin unit/basis and canonical normalized unit. Percentage/rate input may normalize deterministically from `PERCENT` to `RATIO`; currency/share, monetary scale, shares, days, and turns/reporting-period remain explicit when applicable. |
+| `value_currency` applicability | Whether a currency is semantically part of the normalized value. It applies to monetary and per-share values and does not apply to dimensionless ratios, percentages/rates, share counts, or days/turnover-time values. |
+| `filing_consolidation_scope` | The scope of financial inputs represented by an indicator. It is compared with requested scope only when the registered retained field declares scope material. |
+
+Use the following closed semantic assessment states for each materiality-aware
+dimension:
+
+| State | Normative meaning and compatibility behavior |
+| --- | --- |
+| `PROVEN` | Qualified provider-origin evidence proves the material dimension and its value matches the requested capability contract. |
+| `UNPROVEN` | The dimension is material, but the retained provider artifact does not prove it. It is incompatible and cannot satisfy selection/admission. |
+| `NOT_APPLICABLE` | The versioned field-semantics registry declares that the dimension cannot change the normalized value's semantic meaning. Only this explicit policy declaration allows the dimension to be ignored. |
+
+`UNKNOWN` remains a raw provider marker or enum value indicating that the
+provider did not identify a value. It is retained independently from the
+assessment state. It is never proof, is never automatically compatible, and is
+never converted to `PROVEN`, `NOT_APPLICABLE`, `CNY`, or `CONSOLIDATED`.
+`UNPROVEN` is an assessment about missing material proof; `NOT_APPLICABLE` is a
+semantic policy result; neither is an alias for raw `UNKNOWN`.
+
+The Financial Eligibility Acquisition Context continues carrying requested
+currency and consolidation scope solely as immutable run intent. Its CNY value
+also agrees with authoritative Instrument Identity. Request factories may copy
+these values only into typed provider requests as request intent. They must
+never relabel them as provider metadata, populate provider artifacts/candidates
+from them, or use them to repair absent provider evidence.
+
+### Versioned indicator field classification policy
+
+Add closed policy data named `financial-indicator-field-semantics-v1`, keyed by
+normalized field plus the financial ratio declaration version. It records the
+field class, canonical unit/basis, value-currency applicability,
+filing-consolidation-scope materiality, provider evidence requirements,
+current-only eligibility, and strict-PIT eligibility. No runtime branch may
+derive these properties from populated response fields.
+
+| Class | Value currency | Expected normalized unit/basis | Filing scope | Required provider evidence | Current-only eligibility | Strict-PIT eligibility |
+| --- | --- | --- | --- | --- | --- | --- |
+| Dimensionless ratio | `NOT_APPLICABLE` | `RATIO` | Material for every currently declared field in this class | Numeric value, provider field, original unit/basis, deterministic normalized `RATIO`, announcement metadata, and proven scope | Eligible only when material metadata and unchanged completeness/current gates pass; absent first-publication proof limits the result to current-only at most | Same hard gates plus qualified first-publication and observed-revision proof at/before cutoff |
+| Percentage/rate | `NOT_APPLICABLE` | `RATIO`, with provider `PERCENT`/rate basis retained | Material | Numeric value, percent/rate basis, deterministic normalization to `RATIO`, announcement metadata, and proven scope | Same as dimensionless ratio | Same plus strict-PIT lineage |
+| Per-share | Required | `CURRENCY_PER_SHARE` with share basis | Material | Numeric value, provider-proven value currency/share unit, share basis, announcement metadata, and proven scope | Eligible only when currency, unit/basis, scope, completeness, and current gates pass | Same plus strict-PIT lineage |
+| Monetary | Required | `CURRENCY_BASE_UNIT` plus explicit provider monetary scale | Material | Numeric value, provider-proven value currency, monetary unit/scale, announcement metadata, and proven scope | Eligible only when currency, unit/scale, scope, completeness, and current gates pass | Same plus strict-PIT lineage |
+| Share-count | `NOT_APPLICABLE` | `SHARES` plus issued/diluted/weighted-average basis | `NOT_APPLICABLE` only for issuer share-count facts | Numeric value, shares unit, share-count basis, effective date, and publication/observation lineage | Eligible when basis, lineage, completeness, and current gates pass | Same plus strict-PIT lineage |
+| Days/turnover-time | `NOT_APPLICABLE` | `DAYS` or `TURNS_PER_REPORTING_PERIOD`, as declared | Material for every currently declared field in this class | Numeric value, provider time/turnover basis, announcement metadata, and proven scope | Eligible only when unit/basis, scope, completeness, and current gates pass | Same plus strict-PIT lineage |
+| Other | Field-specific; fail closed | Explicit registry value | Field-specific; fail closed | An explicit registry entry and all evidence named by it | Ineligible until classified | Ineligible until classified and strict-PIT lineage passes |
+
+The complete v1 registry for every currently declared normalized family-field
+pair is:
+
+| Family | Class | Normalized fields | Filing scope materiality |
+| --- | --- | --- | --- |
+| Profit | Per-share | `earnings_per_share` | Material; must be `PROVEN` |
+| Profit | Percentage/rate | `ebitda_margin`, `gross_margin`, `net_margin`, `operating_margin`, `pre_tax_margin`, `profit_to_cost`, `return_on_assets`, `return_on_equity`, `return_on_invested_capital` | Material; must be `PROVEN` |
+| Operation | Days/turnover-time | `accounts_payable_turnover`, `asset_turnover`, `cash_conversion_cycle`, `current_asset_turnover`, `fixed_asset_turnover`, `inventory_days`, `inventory_turnover`, `operating_cycle`, `receivable_days`, `receivables_turnover` | Material; must be `PROVEN` |
+| Growth | Percentage/rate | `asset_growth`, `basic_earnings_per_share_growth`, `cash_flow_growth`, `equity_growth`, `gross_profit_growth`, `liability_growth`, `net_income_growth`, `operating_profit_growth`, `parent_net_income_growth`, `revenue_growth`, `return_on_equity_growth`, `total_profit_growth`, `working_capital_growth` | Material; must be `PROVEN` |
+| Balance | Dimensionless ratio | `cash_ratio`, `current_ratio`, `debt_to_assets`, `debt_to_equity`, `equity_multiplier`, `interest_coverage`, `long_term_debt_ratio`, `quick_ratio`, `tangible_asset_ratio`, `working_capital_ratio` | Material; must be `PROVEN` |
+| Cash flow | Dimensionless ratio | `cash_flow_adequacy`, `cash_flow_to_debt`, `cash_flow_to_gross_revenue`, `cash_flow_to_liabilities`, `cash_flow_to_revenue`, `current_assets_to_assets`, `interest_coverage`, `non_current_assets_to_assets`, `operating_cash_flow_ratio`, `quality_of_income`, `reinvestment_ratio`, `self_financing_ratio`, `tangible_asset_ratio` | Material; must be `PROVEN` |
+| Cash flow | Percentage/rate | `cash_return_on_assets`, `free_cash_flow_margin` | Material; must be `PROVEN` |
+| DuPont | Days/turnover-time | `asset_turnover_component` | Material; must be `PROVEN` |
+| DuPont | Dimensionless ratio | `debt_burden`, `equity_multiplier_component`, `financial_leverage`, `interest_burden`, `parent_net_income_share`, `tax_burden` | Material; must be `PROVEN` |
+| DuPont | Percentage/rate | `ebit_margin_component`, `net_profit_margin_component`, `operating_margin_component`, `return_on_assets_component`, `return_on_equity_component` | Material; must be `PROVEN` |
+
+This is 70 family-field pairs / 68 unique normalized fields across legacy v1,
+qualified Tushare v2, and BaoStock v1 declarations. No currently normalized
+field is monetary, share-count, or `other`. BaoStock raw-only `netProfit`,
+`MBRevenue`, `totalShare`, `liqaShare`, `NRTurnDays`, and `INVTurnDays` remain
+provider artifact data and are not promoted by this amendment.
+
+### Currency, consolidation scope, and companion-filing rules
+
+- For dimensionless ratios and percentage/rate fields, authoritative Instrument
+  Identity remains CNY while value currency is `NOT_APPLICABLE`. A provider
+  `XXX` marker is retained but cannot conflict with CNY monetary evidence because
+  no monetary value-currency dimension exists for that normalized value.
+- For per-share and monetary fields, value currency remains material. The
+  provider must prove currency and applicable unit/scale; missing, `UNKNOWN`,
+  `XXX`, request-derived, or otherwise unproven currency remains fail-closed or
+  degraded according to the existing evidence contract.
+- Filing consolidation scope is material for every currently normalized
+  statement-derived indicator field in the registry because parent and
+  consolidated inputs can differ. Compatibility requires provider-origin proof
+  of the requested scope. An absent or raw `UNKNOWN` scope assesses as
+  `UNPROVEN`, never as `CONSOLIDATED`.
+- `NOT_APPLICABLE` filing scope is reserved for fields whose versioned semantics
+  make scope irrelevant, such as a future issuer share-count fact. It cannot be
+  assigned merely because a value is a ratio, complete, or currency-free.
+- Design B is rejected for this version. Statement metadata may not be bound
+  onto an indicator artifact unless a future qualified provider contract
+  supplies an exact stable filing/report identity shared across both artifacts,
+  including filing revision. Matching provider, Instrument Identity, company
+  type, reporting period, or observation time is insufficient. Tushare
+  `update_flag` is not restatement lineage. No inferred cross-artifact lineage
+  is permitted.
+
+For the diagnosed Tushare `fina_indicator` artifacts, normalized value
+completeness can be 100%. Value currency is `NOT_APPLICABLE` for their retained
+dimensionless ratio, percentage/rate, and turnover fields. Filing consolidation
+scope remains `UNPROVEN` because the endpoint does not prove it. Every requested
+family in the v1 registry requires proven scope, so those candidates are
+retained and remain unadmitted/unselected. Missing `f_ann_date` independently
+limits the artifacts to current-only at most and forbids a strict no-lookahead
+claim, strict historical Source Fact, and strict replay eligibility.
+
+### Compatibility assessment, selection, and fallback
+
+Add `financial-indicator-metadata-compatibility-v1` as a closed provider-neutral
+assessment bound to the candidate, provider artifact, period, family, retained
+field set, Instrument Identity, requested capability metadata, declaration
+version, and `financial-indicator-field-semantics-v1`. For each applicable
+dimension it retains the raw provider marker/value, assessment state, safe
+evidence origin, expected semantic value when material, and a canonical typed
+reason. The assessment identity commits to all of those bindings.
+
+Compatibility is a separate hard gate from the unchanged 100% critical and
+at-least-90% declared-core completeness gates. A complete family with any
+material `UNPROVEN` or mismatched dimension is not selected. Its artifact,
+candidate, completeness assessment, metadata assessment, and typed rejection
+remain in the manifest. `NOT_APPLICABLE` is ignored only when the pinned field-
+semantics contract explicitly declares the dimension irrelevant for every
+retained selected field.
+
+Preserve Design C fallback behavior without adding router logic. The existing
+Capability Routing Plan remains the sole route and work authority. After
+Tushare evaluation, only unresolved indicator families continue sequentially to
+AKShare, BaoStock, and Yahoo. Each lower provider can satisfy a family only
+through its own truthful artifact-bound metadata contract. The router contains
+no Tushare/AKShare/BaoStock/Yahoo compatibility exception, expected-currency
+table, request-metadata substitution, provider fan-out, or changed stop rule.
+
+Evidence Admission receives only selected evidence whose applicability has
+already been normalized under the pinned compatibility contract. No broad
+Evidence Admission rewrite or evidence-contract version is required. Its strict
+trust boundary remains unchanged: material `UNPROVEN` metadata is rejected,
+`NOT_APPLICABLE` is ignored only under the explicit pinned capability contract,
+and `UNKNOWN` is never compatible proof. Only selected candidates can project a
+Source Fact or Decision-Ready evidence. Metadata applicability never bypasses
+publication, observation, availability-scope, or strict-PIT requirements.
+
+### Exact contract versions and migration behavior
+
+The following labels are exact new-write requirements. “Unchanged” means no new
+version is created; it does not permit reinterpretation under the new policy.
+
+| Contract | Required new-write version and binding |
+| --- | --- |
+| Financial Period Candidate / Financial Period Identity | Keep raw observation contracts and identity namespaces at contract `1.0`, `financial-period-candidate:v1`, and `financial-period:v1`. They continue retaining provider-origin `currency`/scope markers exactly as observed. Do not add applicability state to, or reinterpret, these immutable raw identities. |
+| Tushare indicator normalization/artifact | Keep `tushare-financial-indicator-adapter-v1` normalized artifacts and existing candidate identities. Split/version only the adapter result/assessment projection as `tushare-financial-indicator-result-v2` so it can carry `financial-indicator-metadata-compatibility-v1`; do not relabel stored v1 artifacts. |
+| AKShare indicator normalization | Write `akshare-financial-indicators-v2`; absent provider value currency becomes raw `XXX`, absent scope remains raw `UNKNOWN`, and request/Instrument Identity values are not provider proof. |
+| BaoStock ratio normalization | Write `baostock-ratio-family-normalizer-v2`; apply the same no-request-backfill rule while retaining BaoStock artifact evidence truthfully. Keep the adapter transport/result envelope `baostock-ratio-family-adapter-v1`; compatibility is assessed at the shared selection seam, so stored v1 artifacts/results are not relabeled. |
+| Indicator field-semantics policy | Add `financial-indicator-field-semantics-v1` with the complete registry above. |
+| Metadata compatibility | Add `financial-indicator-metadata-compatibility-v1` and identity namespace `financial-indicator-metadata-compatibility:v1`. |
+| Indicator period compatibility/completeness selection | Add `financial-period-selection-v3`. It preserves completeness math and financial-period eligibility v2 while binding the metadata-assessment identity and typed incompatibility reasons. Statement selection contracts remain unchanged. |
+| Indicator Financial Provider Candidate and period selection/rejection | Add `financial-provider-candidate-v2` and `financial-period-selection:v3` bindings. Indicator candidate wrappers, accepted/current-only selections, and typed rejections bind the compatibility assessment identity; raw candidate identities remain v1. Statement wrappers/selections remain unchanged. |
+| Indicator financial manifest | Add `financial-manifest-v3` and `financial-manifest:v3`; it retains field-semantics/compatibility versions, assessment identities/states, raw-marker-safe diagnostics, and typed incompatibility reasons. Statement manifests remain `financial-manifest-v2`. |
+| Indicator routing result | Add `financial-indicator-routing-result-v3`; selected and unresolved families must agree exactly with manifest-v3 compatibility outcomes. Statement routing behavior remains on its existing contracts. |
+| Indicator dispatch/checkpoint entry | Add `financial-indicator-selection-dispatch-v2` and `financial-indicator-selection-checkpoint-v2`; both bind routing-result v3 and manifest-v3 identities. |
+| Dispatch checkpoint ledger | Add exact ledger version `1.5`, carrying statement manifest v2, indicator manifest v3, field-semantics and metadata-compatibility versions, all assessment identities/states, and the existing context/cache/plan bindings. |
+| Indicator report/audit operational projections | Add `financial-completeness-row-v4`, `financial-aggregate-completeness-v3`, `financial-manifest-audit-v3`, `financial-manifest-request-audit-v3`, and Financial Dispatch Audit Projection `3.0`. They bind indicator manifest v3, selection v3, the pinned semantics/compatibility versions, assessment identities/states, and safe typed reasons without normalized provider values or raw payloads. Statement projections remain on their existing versions. |
+| Indicator tool manifest projection/envelope | Add `financial-tool-manifest-v3` and `financial-tool-message-envelope-v3` with the same safe bindings. Statement tool projections remain v2. Canonical Evidence, Source Fact, Decision Report, and Decision Audit contracts do not change. |
+| Capability Routing Plan | Add plan payload version `1.2` with new indicator-specific bindings for `financial-indicator-field-semantics-v1`, `financial-indicator-metadata-compatibility-v1`, `financial-manifest-v3`, and `financial-period-selection-v3`. Existing statement manifest/selection bindings remain v2. Provider routes, policy version, financial-period eligibility v2, completeness policy/thresholds, and the `mainland-routing-plan:v1:<sha256>` signature namespace remain unchanged; the digest changes because the new indicator contract bindings are material. |
+
+Historical artifacts, candidates, manifests, routing results, tool projections,
+audits, reports, and checkpoints remain readable under their recorded versions
+and are never rewritten. Historical replay uses the semantic/compatibility
+contract pinned in the recorded plan/checkpoint; a reader must not apply the new
+registry retroactively. New qualified runs write only plan 1.2 and the new-write
+contracts above.
+
+An attempted restore of a new run from a qualified checkpoint that carries the
+old metadata-compatibility contract—or carries no pinned compatibility contract—
+must fail with a typed compatibility error or require the explicit existing
+`START_NEW` choice. `START_NEW` allocates a new run identity and performs the
+fresh path. Restore performs zero provider/model I/O, does not consult the
+current registry to repair old state, and never upgrades a checkpoint in place.
 
 ### Adapter and route composition
 
@@ -482,9 +713,10 @@ AKShare -> BaoStock -> Yahoo route remains owned by the existing market-history
 composition.
 
 Adapter result conversion uses the existing provider-response, manifest,
-selection, completeness, and capability-response contracts. No raw frame or SDK
-object crosses the adapter boundary. Factor and name calls share the run cache
-but retain distinct endpoint scopes, subrequest keys, artifacts, outcomes, and
+selection, completeness, and capability-response seams with the exact
+forward-version changes defined in this amendment. No raw frame or SDK object
+crosses the adapter boundary. Factor and name calls share the run cache but
+retain distinct endpoint scopes, subrequest keys, artifacts, outcomes, and
 authority.
 
 BaoStock transport ownership is per run. Login/session creation is lazy and
@@ -532,9 +764,10 @@ singleton.
   restored Provider Subrequest Cache only after all bindings validate.
 - The existing shadow financial dispatch ledger remains the owner of qualified
   selection progress and Provider Subrequest Cache checkpoint. Its existing
-  qualified checkpoint projection is versioned to carry the safe Financial
-  Eligibility Acquisition Context projection; no second checkpoint file,
-  sidecar, or competing checkpoint owner is introduced.
+  qualified checkpoint projection advances to ledger `1.5` and carries the safe
+  Financial Eligibility Acquisition Context projection plus pinned indicator
+  field-semantics and metadata-compatibility versions/assessment identities; no
+  second checkpoint file, sidecar, or competing checkpoint owner is introduced.
 - The checkpoint binds the context contract version, deterministic context
   identity, complete safe context fields, run/asset signatures, authoritative
   Instrument Identity, run as-of date, requested availability scope, financial
@@ -544,14 +777,16 @@ singleton.
   dispatcher selection state, or historical request identities it governed.
 - On exact compatible resume, validate every context binding together with run
   scope, provider-chain topology, immutable artifacts, attempt identities,
-  Provider Subrequest Cache, and dispatcher state before any adapter, request
-  factory, or dispatcher becomes callable. Restore and single-assign the
-  immutable context, restore terminal cache entries from existing immutable
-  artifact references, then restore dispatcher results. The exact repeated
-  request returns identical context, cache, attempts, candidates, selections,
-  artifacts, and IDs with zero provider/network I/O, zero coordinator permits,
-  zero new attempt events, and zero model I/O. Local checkpoint/artifact reads
-  are the restoration boundary.
+  Provider Subrequest Cache, field-semantics policy, metadata-compatibility
+  assessment identities/states, manifests, and dispatcher state before any
+  adapter, request factory, or dispatcher becomes callable. Restore and single-
+  assign the immutable context, restore terminal cache entries from existing
+  immutable artifact references, then restore dispatcher results. The exact
+  repeated request returns identical context, cache, attempts, candidates,
+  metadata assessments, typed rejections, selections, artifacts, and IDs with
+  zero provider/network I/O, zero coordinator permits, zero new attempt events,
+  and zero model I/O. Local checkpoint/artifact reads are the restoration
+  boundary.
 - A missing context projection, unknown/ambiguous/contradictory company-type
   result, non-authoritative or mismatched listing provenance, context identity or
   version mismatch, malformed context, plan/asset/as-of/availability/eligibility
@@ -562,21 +797,24 @@ singleton.
 - Interrupted in-flight entries are never serialized as available. Checkpointing
   occurs only at the existing safe terminal boundary; otherwise the existing
   unsafe-checkpoint failure is preserved.
-- Legacy checkpoints remain readable by the legacy path. Pre-v2 or mismatched
-  qualified checkpoints follow the existing explicit start-new/fail-typed
-  compatibility rules. Choosing start-new requires a new run identity and the
-  fresh acquisition path; it is never an implicit repair of a restoration. No
-  historical checkpoint receives an in-place upgrade.
+- Legacy and historical qualified checkpoints remain readable under their
+  recorded paths and pinned contracts. A new plan-1.2 qualified restore from a
+  checkpoint carrying the old or absent metadata-compatibility contract follows
+  the existing explicit typed-failure/`START_NEW` compatibility rule. Choosing
+  `START_NEW` requires a new run identity and the fresh acquisition path; it is
+  never an implicit repair of a restoration. No historical checkpoint receives
+  an in-place upgrade or semantic reinterpretation.
 
 ### Historical and shadow compatibility
 
 - Do not rewrite, relabel, migrate in place, delete, or renumber historical
   reports, checkpoints, artifacts, provider rows, physical attempts, snapshots,
   pins, manifests, audits, run IDs, request IDs, sequence IDs, or artifact IDs.
-- New runs use existing schemas and ID constructors. The static factory identity
-  may be reported as safe operational metadata, but it is not part of evidence,
-  route policy, or an existing content identity unless an already versioned
-  contract explicitly requires it.
+- New runs use the exact forward schemas and identity constructors listed in the
+  version table while preserving every unchanged historical namespace. The
+  static factory identity may be reported as safe operational metadata, but it
+  is not part of evidence, route policy, or an existing content identity unless
+  an explicitly versioned contract requires it.
 - Qualified shadow manifests, reports, checkpoints, and decision audits continue
   to say `shadow_non_authoritative`. They cannot replace legacy-selected tool
   output, admitted Source Facts, Validated Decision Context, or the final Trading
@@ -611,15 +849,28 @@ singleton.
   contradictory outcomes, pure request-factory projection, and rejection of
   forbidden provider-specific or mutable fields. Lifecycle tests inject failure
   at every metadata-acquisition and context-bind boundary.
+- Indicator contract tests enumerate the entire pinned field registry and test
+  compatibility at the highest existing candidate-selection seam. They prove
+  that response sparsity cannot change classification; `UNKNOWN`, `UNPROVEN`,
+  and `NOT_APPLICABLE` remain distinct; CNY Instrument Identity does not become
+  value-currency proof; request currency/scope never enters provider evidence;
+  and material unproven scope retains/rejects a complete candidate while the
+  plan advances only its unresolved family.
+- Migration tests open each historical candidate/manifest/routing/checkpoint
+  version under its recorded contract, then prove that a new plan-1.2 run writes
+  only the exact new versions. A plan-1.2 restore from old/absent compatibility
+  state must fail typed or require explicit `START_NEW`, with no repair, provider
+  or model I/O, historical rewrite, or current-registry reinterpretation.
 - The real two-symbol gate is deliberately separate from deterministic
   acceptance. It runs only after all non-live criteria pass and only with
   explicit operator authorization.
 
 ### Deterministic acceptance criteria
 
-QCF1–QCF18 retain their existing IDs, scenarios, authority, and pass/fail
-meaning. The following fresh-origin condition strengthens, but does not waive or
-replace, QCF4–QCF12:
+QCF1–QCF18 retain their existing IDs and authority. QCF1–QCF3 and QCF5–QCF18
+retain their scenarios and pass/fail meaning; QCF4 alone receives the explicit
+metadata-compatibility correction below. The following fresh-origin condition
+strengthens, but does not waive or replace, QCF4–QCF12:
 
 - Every QCF4–QCF11 execution starts from the statically registered built-in,
   resource-free blueprint, and zero-I/O managed composition with no manually
@@ -637,13 +888,17 @@ replace, QCF4–QCF12:
   attempts under their plan capabilities. The original ordinary-route attempt
   assertions still apply after context binding; context acquisition cannot be
   hidden inside an ordinary provider attempt or omitted from ADR-0031 counts.
+- QCF4 is the corrected metadata-compatibility prerequisite for QCF5–QCF12.
+  Those criteria remain blocked and are not considered runnable/passing until
+  QCF4 proves the new contract at the fresh built-in seam. This dependency does
+  not renumber, waive, or weaken any QCF.
 
 | ID | Scenario | Required result |
 | --- | --- | --- |
 | QCF1 | Start CLI and programmatic `qualified_v1_shadow` validation with qualified capabilities enabled, no injected composition, and no explicit factory path. | The statically registered built-in factory is selected, the plan-bound managed composition reaches the graph, and `qualified_routing_composition_missing` is absent. No test module or dynamic-import fixture participates. |
 | QCF2 | Supply a direct composition, then separately an explicit operator factory. | Direct composition wins without invoking either factory; explicit operator factory wins over the built-in; the existing safe-config and plan-signature validations remain exact. |
 | QCF3 | Run legacy mode, ordinary non-validation shadow mode, an empty/non-applicable qualified plan, and attempted `qualified_v1`. | Legacy/non-validation paths construct no qualified resource and perform zero qualified I/O; `qualified_v1` fails with the existing authority-disabled preflight before the built-in factory is called. |
-| QCF4 | From the required fresh origin, return complete fixed Tushare company-type, statement, and indicator fixtures plus authoritative BaoStock lifecycle metadata for all eligible targets. | The run originates and binds its context before ordinary dispatch. Tushare is selected where the plan names it first; all expected annual/reporting periods and indicator families are retained and selected; no lower ordinary financial provider is called; physical attempts equal the exact prerequisite metadata calls plus Tushare endpoint calls. |
+| QCF4 | From the required fresh origin, return complete fixed Tushare company-type, statement, and indicator fixtures plus authoritative BaoStock lifecycle metadata for all eligible targets; configure deterministic lower-provider indicator fixtures for unresolved families. | The run originates and binds fresh company-type/listing context before ordinary dispatch. Complete Tushare statement artifacts whose own metadata qualifies are retained and selected and stop lower statement fallback. Complete Tushare indicator artifacts/candidates and 100% value-completeness assessments are retained, but their ratio/rate/turnover value currency is `NOT_APPLICABLE`, filing consolidation scope is material and `UNPROVEN`, and missing `f_ann_date` remains current-only at most; no affected Tushare indicator family is selected. Only those unresolved indicator families continue deterministically through the immutable Capability Routing Plan, and a lower provider may satisfy them only through its own truthful metadata contract. Requested `CNY`/`CONSOLIDATED` is absent from provider evidence. Exact prerequisite and every ordinary physical-attempt cardinality—including lower-provider attempts for actual unresolved work—are proven, with no hidden calls, duplicate bulk work, provider-specific router branch, or fan-out. |
 | QCF5 | From the required fresh origin, make one Tushare endpoint unavailable and another return usable rows plus partial eligible-period/family gaps. | One context is originated without a seed; successful Tushare artifacts and periods survive; only unresolved statement periods or indicator families continue; typed gaps and all prerequisite/ordinary attempts are exact; no successful bulk request is repeated per target. |
 | QCF6 | From the required fresh origin, leave statement gaps after Tushare and make AKShare-Sina return usable periods, including partial salvage across its statement types. | Context acquisition resolves company type once before factory use; AKShare-Sina is called sequentially only for unresolved ordinary work, its usable artifacts/periods are retained, and Yahoo is not called for resolved targets. |
 | QCF7 | From the required fresh origin, leave eligible statement or indicator gaps after higher providers and provide only Yahoo fallback data. | The context is self-originated first; Yahoo is last, coordinated, and selected only under existing degraded/current-only contracts; candidate-free current profile and Yahoo-derived factor behavior remain exact; no Yahoo evidence becomes strict PIT or native factor authority. |
@@ -651,12 +906,12 @@ replace, QCF4–QCF12:
 | QCF9 | From the required fresh origin, exercise Adjustment Factors and Name Events together, with Tushare factor success, Tushare name success, BaoStock factor success/failure, and Yahoo-derived terminal fallback. | The context is acquired once without seeded state; factor and name requests use distinct plan routes, endpoint scopes, keys, artifacts, and attempts while sharing one cache; name output remains descriptive; Yahoo factor output is `derived` and `degraded`; provider bundles are never blended. |
 | QCF10 | From the required fresh origin, run complete, retryable-failure, terminal-failure, cooldown-skip, partial-fallback, and fresh-produced restored-cache matrices for every assembled provider. | Context and provider work share the one plan/router/coordinator. Every actual transport call has one and only one attempt event; retries and fallback match exact configured cardinality; cache hits, skips, normalization, selection, and restore add zero attempts; no hidden adapter retry or fan-out exists. |
 | QCF11 | From the required fresh origin, concurrently issue identical first requests and request multiple periods/families/graph calls covered by one bulk artifact. | Concurrent first use performs one company-type resolution, one compatible listing acquisition, and one context bind; one leader performs each physical sequence, followers receive the same terminal result, bulk payloads are acquired once, reuse counts are deterministic, and differing material keys do not collide. |
-| QCF12 | Produce a checkpoint from a fresh built-in context acquisition and terminal qualified shadow request, close all resources, reconstruct through the built-in factory, and repeat the exact request. | Context version/identity and all context fields, plan, eligibility binding, dispatcher state, cache entries, artifacts, candidates, selections, attempts, and IDs restore exactly; the repeat causes zero provider/network/model I/O, zero coordinator permits, and zero new attempts. Missing, contradictory, corrupt, or mismatched context/cache controls fail typed before work and do not call live providers or rewrite history. |
+| QCF12 | Produce a checkpoint from a fresh built-in context acquisition and terminal qualified shadow request under plan 1.2, close all resources, reconstruct through the built-in factory, and repeat the exact request. | Context version/identity and all context fields, plan, eligibility binding, field-semantics/metadata-compatibility versions, compatibility assessment identities/states, dispatcher state, cache entries, artifacts, candidates, typed rejections, selections, attempts, and IDs restore exactly; the repeat causes zero provider/network/model I/O, zero coordinator permits, and zero new attempts. Missing, old/absent, contradictory, corrupt, or mismatched semantic/context/cache controls fail typed or require explicit `START_NEW` before work and do not call live providers, consult the current registry for repair, or rewrite history. |
 | QCF13 | Supply missing token/dependency, invalid mode, invalid plan/asset/context signature, invalid pacing/Safety Ceiling/account scope/Data Usage Mode/runtime root, incomplete source coverage including any of the six required executable bindings, and unsafe factory output. | Each pre-construction failure is secret-free and occurs before graph/model/provider work, store/artifact/report creation, or physical attempts. Typed context-acquisition failures occur only after allowed prerequisite work, leave the context slot unbound, and expose no partial callable composition. |
 | QCF14 | Inject failure after each construction step, at every eligibility-metadata acquisition and context-binding step, during graph initialization, during provider dispatch, during graph execution, during checkpoint publication, and interrupt with `KeyboardInterrupt`. | The original failure remains primary; no partial context or callable dispatcher escapes; interrupt/close occur exactly once; new work stops; all sessions, BaoStock login, coordinator connections/store, leases, and workers are released or terminally abandoned; repeated close is harmless; no process-global mutable provider or eligibility state remains. |
 | QCF15 | Put tokens, credential-like text, URLs with credentials, and raw provider exception text in fake environment values and transport failures. | Tokens and raw errors are absent from config, plan, repr, IDs, events, exceptions, logs, reports, checkpoints, artifacts, manifests, audits, and terminal output; only existing typed safe diagnostics cross boundaries. |
 | QCF16 | Compare legacy output, qualified shadow output, daily market acquisition, Evidence Admission, Decision Gate, report, checkpoint, and decision audit before and after built-in registration. | Legacy-selected output and daily AKShare -> BaoStock -> Yahoo routing are unchanged; qualified output remains `shadow_non_authoritative`; no factory result changes admitted evidence or decision authority. |
-| QCF17 | Open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs, then create a new built-in-factory run. | Historical material is byte-for-byte untouched and remains readable; new material uses existing schemas/identities; no migration, rewrite, deletion, or ID renumbering occurs. |
+| QCF17 | Open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs, then create a new built-in-factory run. | Historical material is byte-for-byte untouched, remains readable, and is interpreted only under its recorded contracts; new qualified material uses the exact forward versions in this amendment while unchanged raw artifact/candidate namespaces remain stable; no in-place migration, reinterpretation, rewrite, deletion, or ID renumbering occurs. |
 | QCF18 | Run PE1–PE15 and parent AC1–AC13 with their existing fixtures and expected results, followed by the full supported suite, Ruff, and whitespace/diff checks. | Every criterion passes unchanged and without waiver. Parent joint acceptance is run twice as already required; any failure blocks the real rollout gate. |
 
 ### Final real two-symbol shadow rollout gate
@@ -684,8 +939,10 @@ QCF1–QCF18 pass.
    `qualified_routing_composition_missing`, complete through the registered
    production composition, originate and bind one eligibility context without
    seeded state, route all physical calls through the coordinator, establish
-   BaoStock Current Tradeability authority, show exact/non-duplicated attempts,
-   and publish report plus decision audit as
+   BaoStock Current Tradeability authority, retain and truthfully assess
+   Tushare indicator artifacts, continue only metadata-unresolved indicator
+   families through the plan, show exact/non-duplicated attempts, and publish
+   report plus decision audit as
    `shadow_non_authoritative` while legacy-selected output remains authoritative.
 6. A typed provider/configuration failure, missing status authority, unexplained
    attempt, secret/raw-error exposure, authority drift, historical-state
@@ -710,6 +967,10 @@ design evidence only and is not copied into production.
 | **02D — Executable provider-source wiring for the six terminal registrations** | Replace exactly the Yahoo statements, AKShare indicators, Yahoo current profile, AKShare factors, Yahoo-derived factors, and AKShare name-event `NOT_CONFIGURED` registrations with the typed bindings in the exact matrix above; add safe company-type evidence projections; preserve shared physical-provider/coordinator/cache identities. | 02A and existing **02**. | 04A and Ticket 06. |
 | **04A — Managed lifecycle integration for context acquisition and binding** | Give the graph/run host the single-assignment slot and single-flight; bind acquired context before exposing factories/dispatcher; integrate interruption, partial-failure cleanup, idempotence, and original-failure precedence through the existing managed composition. | 02A, 02B, 02C, 02D, and existing **04**. | 05A and Ticket 06. |
 | **05A — Checkpoint context binding and restoration compatibility** | Version the existing qualified checkpoint projection with context identity/version and safe fields; validate and bind context before cache/dispatcher exposure; prove exact zero-I/O restore; fail typed without live repair or historical rewrite. | 02A, 02B, 02C, 04A, and existing **05**. | Ticket 06. |
+| **02E — Financial-indicator semantic metadata contracts** | Add `financial-indicator-field-semantics-v1`, the complete closed classification registry, applicability/proof states, `financial-indicator-metadata-compatibility-v1`, assessment identity/typed reasons, plan 1.2 bindings, and the unchanged completeness/current/PIT boundaries. Keep raw candidate/period identities at v1 and reject inferred companion-filing lineage. No provider implementation or live I/O. | Existing **01** and the accepted QCF4 metadata-compatibility prototype report. | 02F, 05B, 06A, and Ticket 06. |
+| **02F — Truthful provider indicator normalization and compatibility evaluation** | Consume 02E. Write AKShare indicator normalizer v2 and BaoStock ratio normalizer v2 without request metadata backfill; add versioned Tushare/BaoStock result projections only where needed to carry assessments; evaluate Tushare, AKShare, BaoStock, and Yahoo through one provider-neutral compatibility seam; retain incompatible candidates and return only unresolved families to the existing router. No route or Evidence Admission changes. | 02E. | 05B, 06A, and Ticket 06. |
+| **05B — Persist and restore indicator metadata compatibility** | Add indicator manifest v3, indicator routing-result v3, provider-candidate/selection v2/v3 bindings, indicator dispatch/checkpoint v2, dispatch ledger 1.5, indicator completeness/aggregate audit rows v4/v3, indicator manifest/request audit v3, Financial Dispatch Audit Projection 3.0, tool-manifest v3, and tool-message envelope v3 while statement projections remain v2. Preserve historical readers, exact pinned-contract replay, typed/`START_NEW` rejection of old compatibility checkpoints under plan 1.2, and zero-I/O/no-repair restore. | 02E, 02F, and 05A. | 06A and Ticket 06. |
+| **06A — Correct QCF4 deterministic acceptance** | Replace only the over-specified QCF4 expectation with the fresh-origin statement-success plus retained/rejected-indicator plus plan-owned lower-provider fallback behavior above. Trace both fixed symbols; prove no request metadata is provider evidence and prove exact prerequisite/ordinary attempt cardinality. Retain the separately completed deterministic live-test isolation fix and rerun QCF1–QCF18, PE1–PE15, and AC1–AC13 unchanged outside corrected QCF4. | 02F, 05B, and all existing Ticket 06 prerequisites. | Ticket 06; QCF5–QCF12 cannot proceed until corrected QCF4 passes. |
 
 The exact dependency graph is:
 
@@ -720,7 +981,11 @@ The exact dependency graph is:
 02A + 02 -> 02D
 02A + 02B + 02C + 02D + 04 -> 04A
 02A + 02B + 02C + 04A + 05 -> 05A
-03 + 02D + 04A + 05A -> 06
+01 + QCF4 prototype report -> 02E
+02E -> 02F
+02E + 02F + 05A -> 05B
+03 + 02D + 04A + 02F + 05B -> 06A
+03 + 02D + 04A + 05B + 06A -> 06
 06 -> 07
 ```
 
@@ -728,10 +993,11 @@ Existing Ticket 03 remains the static-selection/caller-precedence slice and may
 proceed after Ticket 01; it does not own context construction. Existing Ticket
 04 remains the resource-lifecycle prerequisite to 04A. Existing Ticket 05
 remains the cache/dispatcher restoration prerequisite to 05A. Ticket 06 remains
-blocked even if its original Tickets 02–05 are marked complete: it cannot resume
-until 02A, 02B, 02C, 02D, 04A, and 05A are complete and their deterministic
-tests pass. Ticket 07 remains blocked by Ticket 06 and fresh explicit operator
-authorization for live-provider work.
+**FAIL/BLOCKED** even if its original Tickets 02–05 are marked complete: it
+cannot resume until 02A–02F, 04A, 05A, 05B, and 06A are complete and their
+deterministic tests pass. Within Ticket 06, QCF5–QCF12 remain blocked behind the
+corrected QCF4 path. Ticket 07 remains blocked by Ticket 06 and fresh explicit
+operator authorization for live-provider work.
 
 ## Out of Scope
 
@@ -741,27 +1007,32 @@ authorization for live-provider work.
   completeness threshold, financial eligibility rule, revision-selection rule,
   or qualification profile. The new versioned prerequisite company-type-
   evidence capability is the sole additive route defined by this amendment.
-- Changing Evidence Admission, Decision Gate, Strategy Rules, Validated Decision
-  Context, or the authority of legacy-selected output.
+- Broadly rewriting or weakening Evidence Admission, or changing Decision Gate,
+  Strategy Rules, Validated Decision Context, canonical Evidence/Source Fact
+  versions, or the authority of legacy-selected output. The new provider-neutral
+  compatibility assessment is completed before selection at the existing trust
+  boundary.
 - Changing BaoStock status, lifecycle, or strict-history authority.
 - Changing the daily mainland AKShare -> BaoStock -> Yahoo market route or adding
   Tushare to daily market acquisition.
 - Adding speculative prewarming, parallel provider fan-out, provider probing,
   account rotation, hidden retries, or future-replay work to foreground analysis.
-- Introducing a new provider cache, artifact schema, checkpoint sidecar, report
-  format, ID namespace, process-global provider registry, or process-global
-  eligibility context.
+- Introducing a new provider cache, checkpoint sidecar, competing report/audit
+  authority, process-global provider registry, or process-global eligibility
+  context. Only the exact forward contract/identity versions listed above are
+  permitted.
 - Rewriting, deleting, migrating in place, or relabeling any historical report,
   checkpoint, artifact, attempt, manifest, audit, snapshot, pin, provider row, or
   ID.
 - Moving credentials into config, files, command arguments, prompts, logs, or
   persisted state.
-- Running live providers during implementation or deterministic acceptance; the
-  separately authorized two-symbol gate is the only live step.
-- Copying the fresh-run prototype into production, importing it at runtime, or
-  treating its code/tests as implementation completion. Its report is
-  authoritative design evidence only; production work uses existing contracts
-  and seams named in this specification.
+- Running live providers or paid models while amending or implementing this
+  deterministic contract. The separately authorized future two-symbol gate is
+  outside this amendment and remains blocked by Ticket 06.
+- Copying either the fresh-run or QCF4 metadata-compatibility prototype into
+  production, importing prototype code at runtime, or treating prototype
+  code/tests as implementation completion. Their reports are design evidence;
+  production work uses the existing contracts and seams named here.
 
 ## Further Notes
 
@@ -769,6 +1040,9 @@ authorization for live-provider work.
   Coordinator, with sequential fallback, shared cooldowns, exact attempt
   accounting, and no fan-out. This specification is additive and consistent
   with that decision.
+- The separately completed deterministic live-test isolation fix is retained as
+  prior state. This amendment neither reopens nor replaces it, and implementation
+  must not weaken its provider/model isolation guarantees.
 - ADR-0032 continues to govern the operator’s Data Usage Mode. A shipped factory
   does not imply commercial provider entitlement.
 - ADR-0033 and ADR-0034 preserve complete BaoStock Provider History Bundle and
@@ -781,12 +1055,13 @@ authorization for live-provider work.
   financial tool/dispatcher boundary for request binding/restoration. The
   factory may add lifecycle capabilities to the managed composition contract,
   but it must not add another routing, eligibility, or persistence authority.
-- `Status: ready-for-agent` is justified because fresh-run ownership, context
-  fields and identity, provider-neutral company-type and BaoStock listing
-  acquisition, pure request factories, the exact provider-source wiring matrix,
-  partial-failure lifecycle behavior, checkpoint context restoration, ticket
-  dependencies, and shadow/legacy authority are fully resolved above. Ticket 06
-  is nevertheless implementation-blocked until 02A–02D, 04A, and 05A are
-  complete. Any implementation that cannot satisfy one of these decisions must
-  return the specification to `needs-info` rather than inventing a second owner
-  or weakening the boundary.
+- `Status: ready-for-agent` is justified because fresh-run ownership, metadata
+  applicability semantics, the complete field classification, exact forward
+  versions/migrations, the unchanged Evidence Admission boundary, corrected
+  QCF4 expectation, plan-owned fallback, checkpoint compatibility, provider
+  source wiring, lifecycle behavior, and exact work dependencies are fully
+  resolved above. Ticket 06 nevertheless remains **FAIL/BLOCKED** until
+  02A–02F, 04A, 05A, 05B, and 06A are implemented and corrected QCF4 passes;
+  QCF5–QCF12 remain behind that path. Any implementation that cannot satisfy
+  one of these decisions must return the specification to `needs-info` rather
+  than inventing a second owner or weakening a trust boundary.
