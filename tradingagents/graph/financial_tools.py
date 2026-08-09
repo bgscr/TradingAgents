@@ -33,6 +33,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
+    FinancialIndicatorRequestArguments,
     FinancialReportingFrequency,
     FinancialStatementType,
     FinancialToolDispatcher,
@@ -709,6 +710,10 @@ def _financial_request_from_tool_call(
     if not isinstance(raw_arguments, Mapping):
         raise ValueError("financial tool arguments must be a mapping")
     material_arguments = dict(raw_arguments)
+    raw_indicator_arguments = material_arguments.pop(
+        "indicator_request_arguments",
+        None,
+    )
     requested_symbol = str(
         material_arguments.pop("ticker", material_arguments.pop("symbol", ""))
     ).strip()
@@ -723,6 +728,16 @@ def _financial_request_from_tool_call(
         if statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
         else FinancialReportingFrequency(str(raw_frequency).strip().casefold())
     )
+    if raw_indicator_arguments is not None and (
+        statement_type is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+        or not isinstance(raw_indicator_arguments, Mapping)
+    ):
+        raise ValueError("financial indicator request arguments are incompatible")
+    indicator_request_arguments = (
+        FinancialIndicatorRequestArguments.model_validate(raw_indicator_arguments)
+        if raw_indicator_arguments is not None
+        else None
+    )
     raw_as_of_date = material_arguments.pop(
         "curr_date",
         material_arguments.pop("as_of_date", trade_date),
@@ -735,6 +750,7 @@ def _financial_request_from_tool_call(
         material_arguments=material_arguments,
         tool_call_id=str(tool_call.get("id") or ""),
         graph_message_id=graph_message_id,
+        indicator_request_arguments=indicator_request_arguments,
     )
 
 

@@ -1506,7 +1506,7 @@ class FinancialIndicatorMetadataIncompatibility(BaseModel):
 
 
 class FinancialIndicatorMetadataIncompatibleRejection(BaseModel):
-    """Complete candidate retained but excluded from selection by metadata."""
+    """Retained candidate excluded from selection by incompatible metadata."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -3229,17 +3229,6 @@ class MainlandFinancialCapabilityRouter:
                         assessment=assessment,
                     )
                 )
-                if assessment.disposition in {
-                    FinancialPeriodDisposition.REJECTED,
-                    FinancialPeriodDisposition.CONFLICTED,
-                }:
-                    rejected_periods[candidate.candidate_identity] = (
-                        FinancialRejectedPeriod.create(
-                            candidate=candidate,
-                            assessment=assessment,
-                        )
-                    )
-                    continue
                 if compatibility is not None and not compatibility.compatible:
                     typed_reasons = tuple(
                         FinancialIndicatorMetadataIncompatibility(
@@ -3263,6 +3252,18 @@ class MainlandFinancialCapabilityRouter:
                         compatibility_assessment=compatibility,
                         typed_reasons=typed_reasons,
                     )
+                if assessment.disposition in {
+                    FinancialPeriodDisposition.REJECTED,
+                    FinancialPeriodDisposition.CONFLICTED,
+                }:
+                    rejected_periods[candidate.candidate_identity] = (
+                        FinancialRejectedPeriod.create(
+                            candidate=candidate,
+                            assessment=assessment,
+                        )
+                    )
+                    continue
+                if compatibility is not None and not compatibility.compatible:
                     continue
                 key = (ratio_family, identity.period_end)
                 if identity.period_end not in target_periods:
