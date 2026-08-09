@@ -18,6 +18,7 @@ from tradingagents.capability_routing import (
 from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchAuditProjection,
     FinancialDispatchAuditProjectionV2,
+    FinancialDispatchAuditProjectionV3,
 )
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import TradingDecisionContract
@@ -313,6 +314,24 @@ def _render_financial_dispatch_operations(
             ),
             "",
         ]
+        if isinstance(financial_dispatch, FinancialDispatchAuditProjectionV3):
+            lines[4:4] = [
+                (
+                    "- **Financial indicator manifest version:** "
+                    f"{financial_dispatch.financial_indicator_manifest_version}"
+                ),
+                "- **Financial completeness row version:** financial-completeness-row-v4",
+                "- **Financial aggregate completeness version:** financial-aggregate-completeness-v3",
+                "- **Financial manifest audit version:** financial-manifest-audit-v3",
+                (
+                    "- **Indicator field-semantics version:** "
+                    f"`{financial_dispatch.indicator_field_semantics_version}`"
+                ),
+                (
+                    "- **Indicator metadata-compatibility version:** "
+                    f"`{financial_dispatch.indicator_metadata_compatibility_version}`"
+                ),
+            ]
         binding = financial_dispatch.financial_eligibility_binding
         if binding is not None:
             lines[2:2] = [
@@ -565,6 +584,45 @@ def _render_financial_dispatch_operations(
                         ),
                     ]
                 )
+                if manifest.contract_version == "financial-manifest-audit-v3":
+                    lines.extend(
+                        [
+                            "  - Audit contract: `financial-manifest-audit-v3`",
+                            "  - Indicator field semantics: "
+                            f"`{manifest.indicator_field_semantics_version}`",
+                            "  - Indicator metadata compatibility: "
+                            f"`{manifest.indicator_metadata_compatibility_version}`",
+                            "  - Family disposition: "
+                            + (
+                                "selected"
+                                if manifest.selected_families
+                                else "unresolved"
+                                if manifest.unresolved_families
+                                else "unselected"
+                            ),
+                        ]
+                    )
+                    for assessment in manifest.metadata_compatibility_assessments:
+                        lines.append(
+                            "  - Metadata assessment: "
+                            f"`{assessment.assessment_identity}` / "
+                            f"`{assessment.family.value}` / "
+                            f"`{assessment.provider_id}` / "
+                            f"`{assessment.compatibility_state}` / "
+                            "current-only="
+                            f"{_format_scalar(assessment.current_only_metadata_eligible)} / "
+                            "strict-PIT="
+                            f"{_format_scalar(assessment.strict_pit_metadata_eligible)}"
+                        )
+                    for rejection in manifest.metadata_incompatible_rejections:
+                        lines.append(
+                            "  - Metadata rejection: "
+                            f"`{rejection.assessment_identity}` / "
+                            + ", ".join(
+                                f"`{reason.reason}`"
+                                for reason in rejection.typed_reasons
+                            )
+                        )
                 if manifest.requested_analysis_scope is not None:
                     lines.extend(
                         [
@@ -760,11 +818,13 @@ def _render_financial_dispatch_operations(
                     "Missing core fields | Critical actual / threshold | Core actual / threshold | "
                     "Disposition | Typed reason | PIT eligible | Artifact identity | "
                     "Provider attempts | Since-listing exception | Listing date | "
-                    "Listing provider | Listing source |"
+                    "Listing provider | Listing source | Projection contract | "
+                    "Compatibility state | Field-semantics version | Compatibility version | "
+                    "Assessment identity | Metadata typed reason |"
                 ),
                 (
                     "|---|---|---|---|---|---|---:|---|---|---|---|---|---|---|"
-                    "---|---|---|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---:|---|---|---|---|"
+                    "---|---|---|---|---|---|---|---|---|---|---|---:|---:|---|---|---|---|---:|---|---|---|---|---|---|---|---|---|---|"
                 ),
             ]
         )
@@ -875,6 +935,18 @@ def _render_financial_dispatch_operations(
                         ),
                         row.listing_provider or "none",
                         row.listing_source_ref or "none",
+                        row.contract_version,
+                        row.compatibility_state or "not_applicable",
+                        row.indicator_field_semantics_version or "not_applicable",
+                        (
+                            row.indicator_metadata_compatibility_version
+                            or "not_applicable"
+                        ),
+                        (
+                            row.metadata_compatibility_assessment_identity
+                            or "none"
+                        ),
+                        ", ".join(row.metadata_typed_reasons) or "none",
                     )
                 )
                 + " |"

@@ -38,7 +38,11 @@ NORMALIZER_VERSION = "mainland-financial-normalizer-v2"
 COMPLETENESS_POLICY_VERSION_V1 = "mainland-financial-completeness-v1"
 COMPLETENESS_POLICY_VERSION = "mainland-financial-completeness-v2"
 
-_CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
+_CLOSED_MODEL_CONFIG = ConfigDict(
+    extra="forbid",
+    frozen=True,
+    hide_input_in_errors=True,
+)
 _PLAN_SIGNATURE_PREFIX = "mainland-routing-plan:v1:"
 _PROVIDER_ID_PATTERN = r"^[a-z][a-z0-9_]*$"
 _IDENTITY_PATTERN = r"^[a-z][a-z0-9._:-]*$"
@@ -667,6 +671,9 @@ class MainlandCapabilityRoutingCheckpointFailureReason(str, Enum):
     FINANCIAL_ELIGIBILITY_POLICY_MISMATCH = (
         "financial_eligibility_policy_mismatch"
     )
+    INDICATOR_METADATA_COMPATIBILITY_MISMATCH = (
+        "indicator_metadata_compatibility_mismatch"
+    )
 
 
 class MainlandCapabilityRoutingCheckpointError(ValueError):
@@ -732,9 +739,8 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
             ):
                 raise ValueError("legacy new-run state requires a qualified active plan")
-        elif (
-            self.reason
-            is MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
+        elif self.reason is (
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
         ):
             if (
                 self.checkpoint is None
@@ -745,13 +751,32 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 or self.previous_run_id == self.new_run_id
             ):
                 raise ValueError(
-                    "policy-mismatch new-run state requires distinct run identities"
+                    "qualified-mismatch new-run state requires distinct run identities"
+                )
+        elif self.reason is (
+            MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
+        ):
+            if (
+                self.checkpoint is None
+                or self.checkpoint.mode is MainlandCapabilityRoutingMode.LEGACY
+                or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
+                or self.active.plan_version != CAPABILITY_ROUTING_PLAN_VERSION
+                or self.checkpoint.plan_version == CAPABILITY_ROUTING_PLAN_VERSION
+                or self.active.indicator_field_semantics_version is None
+                or self.active.indicator_metadata_compatibility_version is None
+                or self.previous_run_id is None
+                or self.new_run_id is None
+                or self.previous_run_id == self.new_run_id
+            ):
+                raise ValueError(
+                    "indicator-mismatch new-run state requires distinct run identities"
                 )
         else:
             raise ValueError("new-run routing decision requires a legacy mismatch")
-        if self.reason is not (
-            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
-        ) and (
+        if self.reason not in {
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH,
+            MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+        } and (
             self.previous_run_id is not None or self.new_run_id is not None
         ):
             raise ValueError("legacy new-run compatibility cannot relabel run identity")
@@ -817,6 +842,15 @@ def validate_mainland_capability_routing_checkpoint(
         raise MainlandCapabilityRoutingCheckpointError(
             MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
         )
+    if (
+        active_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION
+        and restored.plan_version != CAPABILITY_ROUTING_PLAN_VERSION
+        and restored.mode is not MainlandCapabilityRoutingMode.LEGACY
+        and active_plan.mode is not MainlandCapabilityRoutingMode.LEGACY
+    ):
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
+        )
     if restored == active_plan:
         return MainlandCapabilityRoutingCheckpointCompatibility(
             action=MainlandCapabilityRoutingCheckpointAction.RESUME,
@@ -858,18 +892,21 @@ def start_new_mainland_capability_routing_run(
     previous_run_id: str,
     new_run_id: str,
 ) -> MainlandCapabilityRoutingCheckpointCompatibility:
-    """Explicitly classify a distinct v2 run after a typed policy mismatch."""
+    """Explicitly classify a distinct run after a typed qualified mismatch."""
 
+    mismatch_reason: MainlandCapabilityRoutingCheckpointFailureReason
     try:
         validate_mainland_capability_routing_checkpoint(
             active_plan=active_plan,
             checkpoint_plan=checkpoint_plan,
         )
     except MainlandCapabilityRoutingCheckpointError as exc:
-        if exc.reason is not (
-            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
-        ):
+        if exc.reason not in {
+            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH,
+            MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+        }:
             raise
+        mismatch_reason = exc.reason
     else:
         raise ValueError("START_NEW requires a financial eligibility-policy mismatch")
     try:
@@ -880,9 +917,7 @@ def start_new_mainland_capability_routing_run(
         ) from exc
     return MainlandCapabilityRoutingCheckpointCompatibility(
         action=MainlandCapabilityRoutingCheckpointAction.START_NEW,
-        reason=(
-            MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
-        ),
+        reason=mismatch_reason,
         active=MainlandCapabilityRoutingRunProjection.from_plan(active_plan),
         checkpoint=MainlandCapabilityRoutingRunProjection.from_plan(restored),
         previous_run_id=previous_run_id,

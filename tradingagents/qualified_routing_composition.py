@@ -84,6 +84,7 @@ from tradingagents.dataflows.financial_contracts import (
 from tradingagents.dataflows.financial_dispatch import (
     FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
@@ -191,7 +192,11 @@ PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION = (
 )
 
 _BLUEPRINT_IDENTITY_PREFIX = "production-qualified-routing-blueprint:v1:"
-_CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
+_CLOSED_MODEL_CONFIG = ConfigDict(
+    extra="forbid",
+    frozen=True,
+    hide_input_in_errors=True,
+)
 _SAFE_IDENTITY_PATTERN = r"^[a-z][a-z0-9._:=-]*$"
 _SOURCE_SECRET_MARKERS = (
     "api-key",
@@ -1026,7 +1031,19 @@ def _restore_checkpoint_eligibility_context(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
         )
     raw_ledger_version = raw_shadow_ledger.get("contract_version")
-    if raw_ledger_version != FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION:
+    expected_ledger_version = (
+        FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.2"
+        else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
+    )
+    if raw_ledger_version != expected_ledger_version:
+        if run_binding.routing_plan.plan_version == "1.2" and raw_ledger_version in {
+            FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
+        }:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
+            )
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
             if raw_ledger_version == FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION
@@ -1230,9 +1247,14 @@ def _validated_checkpoint_restoration(
             *shadow_ledger.qualified_indicator_selections,
         )
     )
+    expected_shadow_version = (
+        FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+        if plan.plan_version == "1.2"
+        else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
+    )
     if (
         shadow_ledger.contract_version
-        != FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
+        != expected_shadow_version
         or shadow_ledger.run_asset_configuration_version
         != expected_asset.asset_configuration_version
         or shadow_ledger.run_asset_configuration_signature
@@ -1253,6 +1275,20 @@ def _validated_checkpoint_restoration(
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
+        )
+    if plan.plan_version == "1.2" and (
+        shadow_ledger.capability_routing_plan_version != "1.2"
+        or shadow_ledger.financial_indicator_manifest_version
+        != plan.indicator_manifest_contract_version
+        or shadow_ledger.indicator_field_semantics_version
+        != plan.indicator_field_semantics_version
+        or shadow_ledger.indicator_metadata_compatibility_version
+        != plan.indicator_metadata_compatibility_version
+        or shadow_ledger.indicator_provider_topology
+        != plan.route_for(MainlandCapability.FINANCIAL_INDICATORS)
+    ):
+        raise FinancialDispatchCheckpointError(
+            FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
         )
     if (
         cache_checkpoint.contract_version != "1.1"

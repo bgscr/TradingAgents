@@ -14,7 +14,7 @@ from enum import Enum
 from hashlib import sha256
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from tradingagents.capability_routing import (
     MainlandCapability,
@@ -40,6 +40,9 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialIndicatorAggregateAssessment,
     FinancialIndicatorEvidenceRequirements,
     FinancialIndicatorFamilyAssessment,
+    FinancialIndicatorMetadataAssessmentBinding,
+    FinancialIndicatorMetadataDimensionBinding,
+    FinancialIndicatorMetadataRejectionBinding,
     FinancialListingProvenance,
     FinancialMaterialPremiseFamilyBinding,
     FinancialPeriodCandidate,
@@ -102,7 +105,11 @@ from tradingagents.evidence import (
     InstrumentKind,
 )
 
-_CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
+_CLOSED_MODEL_CONFIG = ConfigDict(
+    extra="forbid",
+    frozen=True,
+    hide_input_in_errors=True,
+)
 _STATEMENT_CAPABILITY = {
     FinancialStatementType.BALANCE_SHEET: MainlandCapability.BALANCE_SHEET,
     FinancialStatementType.INCOME_STATEMENT: MainlandCapability.INCOME_STATEMENT,
@@ -1538,6 +1545,71 @@ class FinancialIndicatorMetadataIncompatibleRejection(BaseModel):
         return self
 
 
+def _metadata_dimension_bindings(
+    assessment: FinancialIndicatorMetadataCompatibilityAssessment,
+) -> tuple[FinancialIndicatorMetadataDimensionBinding, ...]:
+    return tuple(
+        sorted(
+            (
+                FinancialIndicatorMetadataDimensionBinding(
+                    normalized_field=field.normalized_field,
+                    dimension=dimension.dimension.value,
+                    state=dimension.state.value,
+                    raw_provider_marker=(
+                        dimension.raw_provider_marker.upper()
+                        if dimension.raw_provider_marker is not None
+                        and dimension.raw_provider_marker.upper() in {"UNKNOWN", "XXX"}
+                        else None
+                    ),
+                    reason=dimension.reason.value,
+                )
+                for field in assessment.field_assessments
+                for dimension in field.dimensions
+            ),
+            key=lambda item: (item.normalized_field, item.dimension),
+        )
+    )
+
+
+def _metadata_assessment_binding(
+    assessment: FinancialIndicatorMetadataCompatibilityAssessment,
+) -> FinancialIndicatorMetadataAssessmentBinding:
+    return FinancialIndicatorMetadataAssessmentBinding(
+        field_semantics_version=assessment.field_semantics_version,
+        metadata_compatibility_version=assessment.contract_version,
+        assessment_identity=assessment.assessment_identity,
+        provider_id=assessment.provider_id,
+        artifact_identity=assessment.provider_artifact_identity,
+        candidate_identity=assessment.candidate_identity,
+        period_identity=assessment.period_identity,
+        family=assessment.family,
+        compatibility_state=(
+            "compatible" if assessment.compatible else "incompatible"
+        ),
+        current_only_metadata_eligible=(
+            assessment.current_only_metadata_eligible
+        ),
+        strict_pit_metadata_eligible=assessment.strict_pit_metadata_eligible,
+        dimensions=_metadata_dimension_bindings(assessment),
+    )
+
+
+def _metadata_rejection_binding(
+    rejection: FinancialIndicatorMetadataIncompatibleRejection,
+) -> FinancialIndicatorMetadataRejectionBinding:
+    binding = _metadata_assessment_binding(rejection.compatibility_assessment)
+    return FinancialIndicatorMetadataRejectionBinding(
+        assessment_identity=binding.assessment_identity,
+        candidate_identity=rejection.candidate_identity,
+        artifact_identity=rejection.artifact_identity,
+        period_identity=rejection.period_identity,
+        family=rejection.family,
+        typed_reasons=tuple(
+            item for item in binding.dimensions if item.state == "unproven"
+        ),
+    )
+
+
 def _validate_indicator_metadata_compatibility_binding(
     *,
     candidate: FinancialPeriodCandidate,
@@ -1685,6 +1757,7 @@ class FinancialIndicatorRoutingResult(BaseModel):
     contract_version: Literal[
         "financial-indicator-routing-result-v1",
         "financial-indicator-routing-result-v2",
+        "financial-indicator-routing-result-v3",
     ] = (
         "financial-indicator-routing-result-v1"
     )
@@ -1695,7 +1768,6 @@ class FinancialIndicatorRoutingResult(BaseModel):
     complete_families: tuple[FinancialRatioFamily, ...]
     unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
         default=(),
-        exclude=True,
     )
     missing_periods_by_family: tuple[
         tuple[FinancialRatioFamily, tuple[date, ...]],
@@ -1730,18 +1802,45 @@ class FinancialIndicatorRoutingResult(BaseModel):
     metadata_compatibility_assessments: tuple[
         FinancialIndicatorMetadataCompatibilityAssessment,
         ...,
-    ] = Field(default=(), exclude=True)
+    ] = ()
     metadata_incompatible_rejections: tuple[
         FinancialIndicatorMetadataIncompatibleRejection,
         ...,
-    ] = Field(default=(), exclude=True)
+    ] = ()
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_serializer(mode="wrap")
+    def _serialize_versioned(self, handler):
+        payload = handler(self)
+        if self.contract_version != "financial-indicator-routing-result-v3":
+            payload.pop("unresolved_families", None)
+            payload.pop("metadata_compatibility_assessments", None)
+            payload.pop("metadata_incompatible_rejections", None)
+            payload.pop("indicator_field_semantics_version", None)
+            payload.pop("indicator_metadata_compatibility_version", None)
+        return payload
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
-        family_bound = self.contract_version == "financial-indicator-routing-result-v2"
-        if family_bound != (
+        family_bound = bool(self.family_assessments) and (
+            self.aggregate_family_assessment is not None
+        )
+        if (
             bool(self.family_assessments)
-            and self.aggregate_family_assessment is not None
+            != (self.aggregate_family_assessment is not None)
+            or (
+                self.contract_version == "financial-indicator-routing-result-v1"
+                and family_bound
+            )
+            or (
+                self.contract_version == "financial-indicator-routing-result-v2"
+                and not family_bound
+            )
         ):
             raise ValueError("indicator family assessment binding is incomplete")
         if family_bound:
@@ -1820,7 +1919,8 @@ class FinancialIndicatorRoutingResult(BaseModel):
         manifest_target_constructions = {
             manifest.publication_target_construction
             for manifest in self.family_manifests
-            if manifest.contract_version == "financial-manifest-v2"
+            if manifest.contract_version
+            in {"financial-manifest-v2", "financial-manifest-v3"}
         }
         if any(
             manifest.contract_version == "financial-manifest-v1"
@@ -1900,17 +2000,86 @@ class FinancialIndicatorRoutingResult(BaseModel):
             raise ValueError(
                 "indicator metadata compatibility disposition is inconsistent"
             )
-        v2_manifests = tuple(
+        metadata_bound = self.contract_version == "financial-indicator-routing-result-v3"
+        if metadata_bound:
+            if (
+                self.indicator_field_semantics_version
+                != "financial-indicator-field-semantics-v1"
+                or self.indicator_metadata_compatibility_version
+                != "financial-indicator-metadata-compatibility-v1"
+                or any(
+                    manifest.contract_version != "financial-manifest-v3"
+                    for manifest in self.family_manifests
+                )
+            ):
+                raise ValueError("indicator routing metadata binding is incomplete")
+            assessment_by_candidate = {
+                item.candidate_identity: item
+                for item in self.metadata_compatibility_assessments
+            }
+            if len(assessment_by_candidate) != len(
+                self.metadata_compatibility_assessments
+            ):
+                raise ValueError("indicator routing assessments are duplicated")
+            manifest_bindings = {
+                item.candidate_identity: item
+                for manifest in self.family_manifests
+                for item in manifest.metadata_compatibility_assessments
+            }
+            if set(manifest_bindings) != set(assessment_by_candidate):
+                raise ValueError("indicator manifest/routing assessments mismatch")
+            for candidate_id, assessment in assessment_by_candidate.items():
+                binding = _metadata_assessment_binding(assessment)
+                if manifest_bindings[candidate_id] != binding:
+                    raise ValueError("indicator assessment identity/state mismatch")
+            manifest_rejections = {
+                item.candidate_identity: item
+                for manifest in self.family_manifests
+                for item in manifest.metadata_incompatible_rejections
+            }
+            result_rejections = {
+                item.candidate_identity: _metadata_rejection_binding(item)
+                for item in self.metadata_incompatible_rejections
+            }
+            if manifest_rejections != result_rejections:
+                raise ValueError("indicator manifest/routing rejection mismatch")
+            if any(
+                not assessment_by_candidate[candidate_id].compatible
+                for candidate_id in selected_ids
+            ):
+                raise ValueError("selected indicator candidate is metadata incompatible")
+            manifest_selected = tuple(
+                family
+                for manifest in self.family_manifests
+                for family in manifest.selected_families
+            )
+            manifest_unresolved = tuple(
+                family
+                for manifest in self.family_manifests
+                for family in manifest.unresolved_families
+            )
+            if (
+                manifest_selected != self.complete_families
+                or manifest_unresolved != self.unresolved_families
+            ):
+                raise ValueError("indicator manifest/routing family disposition mismatch")
+        elif (
+            self.indicator_field_semantics_version is not None
+            or self.indicator_metadata_compatibility_version is not None
+        ):
+            raise ValueError("historical indicator result carries metadata binding")
+        forward_manifests = tuple(
             manifest
             for manifest in self.family_manifests
-            if manifest.contract_version == "financial-manifest-v2"
+            if manifest.contract_version
+            in {"financial-manifest-v2", "financial-manifest-v3"}
         )
-        if v2_manifests and {
+        if forward_manifests and {
             (
                 manifest.requested_analysis_scope,
                 manifest.eligibility_policy_version,
             )
-            for manifest in v2_manifests
+            for manifest in forward_manifests
         } != {
             (
                 self.requested_analysis_scope,
@@ -1918,24 +2087,30 @@ class FinancialIndicatorRoutingResult(BaseModel):
             )
         }:
             raise ValueError("indicator manifest analysis scope binding is invalid")
-        if v2_manifests and any(
+        if forward_manifests and any(
             manifest.financial_eligibility_binding
             != self.financial_eligibility_binding
-            for manifest in v2_manifests
+            for manifest in forward_manifests
         ):
             raise ValueError("indicator manifest eligibility binding is invalid")
-        if v2_manifests and (
-            len(v2_manifests) != len(self.family_manifests)
+        if forward_manifests and (
+            len(forward_manifests) != len(self.family_manifests)
             or any(
                 manifest.final_rendered_artifact is None
                 or manifest.final_rendered_artifact.content_sha256
                 != _rendered_sha256(render_indicator_routing_result(self))
-                or {
-                    event.attempt_event_id
-                    for event in manifest.physical_attempt_events
-                }
-                != set(self.physical_attempt_ids)
-                for manifest in v2_manifests
+                or (
+                    (
+                        manifest.physical_attempt_events
+                        or manifest.financial_eligibility_binding is not None
+                    )
+                    and {
+                        event.attempt_event_id
+                        for event in manifest.physical_attempt_events
+                    }
+                    != set(self.physical_attempt_ids)
+                )
+                for manifest in forward_manifests
             )
         ):
             raise ValueError("indicator manifest operational binding is invalid")
@@ -3269,6 +3444,14 @@ class MainlandFinancialCapabilityRouter:
             FinancialRatioFamily,
             FinancialRatioHistoryCompletenessAssessment,
         ] = {}
+        family_metadata_assessment_bindings: dict[
+            FinancialRatioFamily,
+            tuple[FinancialIndicatorMetadataAssessmentBinding, ...],
+        ] = {}
+        family_metadata_rejection_bindings: dict[
+            FinancialRatioFamily,
+            tuple[FinancialIndicatorMetadataRejectionBinding, ...],
+        ] = {}
         family_manifests: list[FinancialAcquisitionManifest] = []
         candidate_artifact_ids = {
             item.candidate.artifact.artifact_identity
@@ -3303,11 +3486,94 @@ class MainlandFinancialCapabilityRouter:
                 eligible_reporting_period_ends=target_periods,
             )
             family_completeness_assessments[family] = completeness
-            family_candidates = tuple(
+            raw_family_candidates = tuple(
                 item
                 for item in provider_candidates.values()
                 if item.candidate.period_identity.ratio_family is family
             )
+            selected_candidate_identity_set = {
+                candidate.candidate_identity
+                for (candidate_family, _), candidate in selected_candidates.items()
+                if candidate_family is family
+            }
+            if compatibility_required:
+                family_assessment_bindings = tuple(
+                    sorted(
+                        (
+                            _metadata_assessment_binding(
+                                metadata_compatibility_assessments[
+                                    item.candidate.candidate_identity
+                                ]
+                            )
+                            for item in raw_family_candidates
+                        ),
+                        key=lambda item: item.candidate_identity,
+                    )
+                )
+                family_rejection_bindings = tuple(
+                    sorted(
+                        (
+                            _metadata_rejection_binding(rejection)
+                            for rejection in metadata_incompatible_rejections.values()
+                            if rejection.family is family
+                        ),
+                        key=lambda item: item.candidate_identity,
+                    )
+                )
+                binding_by_candidate = {
+                    item.candidate_identity: item
+                    for item in family_assessment_bindings
+                }
+                family_candidates = tuple(
+                    FinancialProviderCandidate(
+                        contract_version="financial-provider-candidate-v2",
+                        candidate=item.candidate,
+                        assessment=item.assessment,
+                        indicator_field_semantics_version=field_semantics_version,
+                        indicator_metadata_compatibility_version=(
+                            metadata_compatibility_version
+                        ),
+                        metadata_compatibility_assessment_identity=(
+                            binding_by_candidate[
+                                item.candidate.candidate_identity
+                            ].assessment_identity
+                        ),
+                        metadata_compatibility_state=(
+                            binding_by_candidate[
+                                item.candidate.candidate_identity
+                            ].compatibility_state
+                        ),
+                        metadata_selection_disposition=(
+                            "selected"
+                            if item.candidate.candidate_identity
+                            in selected_candidate_identity_set
+                            else "unselected"
+                            if binding_by_candidate[
+                                item.candidate.candidate_identity
+                            ].compatibility_state
+                            == "incompatible"
+                            else "unresolved"
+                            if not completeness.complete
+                            else "unselected"
+                        ),
+                        metadata_incompatibility_reasons=tuple(
+                            reason
+                            for reason in binding_by_candidate[
+                                item.candidate.candidate_identity
+                            ].dimensions
+                            if reason.state == "unproven"
+                        ),
+                    )
+                    for item in raw_family_candidates
+                )
+                family_metadata_assessment_bindings[family] = (
+                    family_assessment_bindings
+                )
+                family_metadata_rejection_bindings[family] = (
+                    family_rejection_bindings
+                )
+            else:
+                family_candidates = raw_family_candidates
             family_candidate_ids = {
                 item.candidate.candidate_identity for item in family_candidates
             }
@@ -3321,6 +3587,21 @@ class MainlandFinancialCapabilityRouter:
                     assessment=selected_assessments[(family, period)],
                     requested_analysis_scope=request.requested_analysis_scope,
                     eligibility_policy_version=availability_policy_version,
+                    indicator_field_semantics_version=(
+                        field_semantics_version if compatibility_required else None
+                    ),
+                    indicator_metadata_compatibility_version=(
+                        metadata_compatibility_version
+                        if compatibility_required
+                        else None
+                    ),
+                    metadata_compatibility_assessment_identity=(
+                        metadata_compatibility_assessments[
+                            candidate.candidate_identity
+                        ].assessment_identity
+                        if compatibility_required
+                        else None
+                    ),
                 )
                 for (candidate_family, period), candidate in selected_candidates.items()
                 if candidate_family is family
@@ -3336,7 +3617,16 @@ class MainlandFinancialCapabilityRouter:
                 tuple(
                     item
                     for item in _v2_revision_selections(
-                        provider_candidates=provider_candidates,
+                        provider_candidates=(
+                            {
+                                candidate_id: item
+                                for candidate_id, item in provider_candidates.items()
+                                if candidate_id
+                                not in metadata_incompatible_rejections
+                            }
+                            if compatibility_required
+                            else provider_candidates
+                        ),
                         selected_candidates=tuple(selected_candidates.values()),
                         conflicted_candidate_identities=(
                             conflicted_candidate_identities
@@ -3485,6 +3775,7 @@ class MainlandFinancialCapabilityRouter:
         if (
             not physical_attempt_events
             and request.financial_eligibility_binding is None
+            and not compatibility_required
         ):
             return result
         rendered_value = render_indicator_routing_result(result)
@@ -3501,10 +3792,64 @@ class MainlandFinancialCapabilityRouter:
                 requested_analysis_scope=request.requested_analysis_scope,
                 eligibility_policy_version=availability_policy_version,
                 financial_eligibility_binding=eligibility_binding,
+                indicator_field_semantics_version=(
+                    field_semantics_version if compatibility_required else None
+                ),
+                indicator_metadata_compatibility_version=(
+                    metadata_compatibility_version
+                    if compatibility_required
+                    else None
+                ),
+                metadata_compatibility_assessments=(
+                    family_metadata_assessment_bindings[
+                        manifest.requested_ratio_family
+                    ]
+                    if compatibility_required
+                    else ()
+                ),
+                metadata_incompatible_rejections=(
+                    family_metadata_rejection_bindings[
+                        manifest.requested_ratio_family
+                    ]
+                    if compatibility_required
+                    else ()
+                ),
+                selected_families=(
+                    (manifest.requested_ratio_family,)
+                    if compatibility_required
+                    and manifest.aggregate_completeness.complete
+                    else ()
+                ),
+                unresolved_families=(
+                    (manifest.requested_ratio_family,)
+                    if compatibility_required
+                    and not manifest.aggregate_completeness.complete
+                    else ()
+                ),
             )
             for manifest in result.family_manifests
         )
-        return result.model_copy(update={"family_manifests": finalized_manifests})
+        finalized_result = result.model_copy(
+            update={
+                "contract_version": (
+                    "financial-indicator-routing-result-v3"
+                    if compatibility_required
+                    else result.contract_version
+                ),
+                "family_manifests": finalized_manifests,
+                "indicator_field_semantics_version": (
+                    field_semantics_version if compatibility_required else None
+                ),
+                "indicator_metadata_compatibility_version": (
+                    metadata_compatibility_version
+                    if compatibility_required
+                    else None
+                ),
+            }
+        )
+        return FinancialIndicatorRoutingResult.model_validate(
+            finalized_result.model_dump(mode="python")
+        )
 
 
 def _statement_gap_request(
@@ -4012,6 +4357,8 @@ def assess_financial_indicator_family_outcomes(
                     if rejection.candidate_identity not in conflict_candidate_ids
                     and candidate_periods.get(rejection.candidate_identity)
                     in target_periods
+                    and candidate_periods[rejection.candidate_identity]
+                    not in selected_periods
                 },
                 reverse=True,
             )
@@ -4348,7 +4695,7 @@ def finalize_indicator_routing_result(
     """Upgrade all families in one qualified indicator result to v2."""
 
     if all(
-        manifest.contract_version == "financial-manifest-v2"
+        manifest.contract_version in {"financial-manifest-v2", "financial-manifest-v3"}
         for manifest in result.family_manifests
     ):
         return result
@@ -4574,7 +4921,10 @@ def render_indicator_routing_result(
                 if field.normalized_value is not None
             },
         }
-        if selection.contract_version == "financial-period-selection-v2":
+        if (
+            selection.contract_version == "financial-period-selection-v2"
+            or selection.eligibility_policy_version is not None
+        ):
             assert selection.availability_scope is not None
             assert selection.availability_basis is not None
             assert selection.ann_date is not None

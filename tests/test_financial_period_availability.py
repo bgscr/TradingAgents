@@ -8,6 +8,7 @@ import pytest
 
 from tests.test_financial_capability_routing_selection import (
     _REPORTING_PERIODS,
+    _historical_shadow_plan,
     _identity,
     _ratio_candidate,
     _shadow_plan,
@@ -56,14 +57,17 @@ _AS_OF = date(2026, 8, 1)
 _ELIGIBILITY_POLICY_VERSION = "mainland-financial-period-eligibility-v2"
 
 
-def _rehash_v2_selection(payload: dict[str, object]) -> dict[str, object]:
+def _rehash_selection(payload: dict[str, object]) -> dict[str, object]:
     identity_payload = {
         key: value
         for key, value in payload.items()
         if key != "selection_identity"
     }
+    contract_version = str(payload["contract_version"])
+    identity_version = contract_version.rsplit("v", 1)[1]
     payload["selection_identity"] = (
-        "financial-period-selection:v2:" + _canonical_digest(identity_payload)
+        f"financial-period-selection:v{identity_version}:"
+        + _canonical_digest(identity_payload)
     )
     return payload
 
@@ -199,7 +203,7 @@ def test_complete_announced_indicators_are_explicitly_current_only_and_degraded(
 
     selections = manifest.selections
     assert len(selections) == 8
-    assert all(selection.contract_version == "financial-period-selection-v2" for selection in selections)
+    assert all(selection.contract_version == "financial-period-selection-v3" for selection in selections)
     assert all(selection.requested_analysis_scope.value == "current_only" for selection in selections)
     assert all(selection.availability_scope.value == "current_only" for selection in selections)
     assert all(
@@ -243,7 +247,7 @@ def test_v2_selection_deserialization_rejects_naive_availability_timestamps(
     payload["observed_at"] = "2026-08-01T12:00:00"
 
     with pytest.raises(ValueError, match="availability time must be concrete"):
-        FinancialPeriodSelection.model_validate(_rehash_v2_selection(payload))
+        FinancialPeriodSelection.model_validate(_rehash_selection(payload))
 
 
 def test_v2_selection_deserialization_rejects_contradictory_current_only_reason(
@@ -254,7 +258,7 @@ def test_v2_selection_deserialization_rejects_contradictory_current_only_reason(
     payload["availability_reason"] = "pit_cutoff_not_satisfied"
 
     with pytest.raises(ValueError, match="current-only financial availability"):
-        FinancialPeriodSelection.model_validate(_rehash_v2_selection(payload))
+        FinancialPeriodSelection.model_validate(_rehash_selection(payload))
 
 
 @pytest.mark.parametrize(
@@ -408,12 +412,14 @@ def test_strict_pit_rejects_revision_first_observed_after_cutoff(
 def test_current_only_source_facts_are_explicit_and_cannot_be_consumed_as_strict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    selection_request, response, plan = _indicator_fixture(
+    selection_request, response, _plan = _indicator_fixture(
         monkeypatch,
         requested_analysis_scope="current_only",
         f_ann_date=None,
         as_of_date=_AS_OF,
     )
+    # This Ticket 03 Evidence fixture records the manifest-v2 admission contract.
+    plan = _historical_shadow_plan(monkeypatch)
     router = MainlandFinancialCapabilityRouter(
         routing_plan=plan,
         statement_sources={},
@@ -497,6 +503,7 @@ def test_strict_checkpoint_replay_performs_zero_io_and_rejects_missing_lineage(
         as_of_date=_AS_OF,
         instrument_identity=asset.instrument_identity,
     )
+    plan = _historical_shadow_plan(monkeypatch)
     calls = 0
 
     def source(_request):
@@ -637,6 +644,7 @@ def test_checkpoint_audit_tool_and_report_agree_on_current_only_availability(
         as_of_date=_AS_OF,
         instrument_identity=asset.instrument_identity,
     )
+    plan = _historical_shadow_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -741,12 +749,14 @@ def test_checkpoint_audit_tool_and_report_agree_on_current_only_availability(
 def test_strict_source_facts_bind_exact_first_publication_and_revision_lineage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    selection_request, response, plan = _indicator_fixture(
+    selection_request, response, _plan = _indicator_fixture(
         monkeypatch,
         requested_analysis_scope="strict_pit_eligible",
         f_ann_date=date(2026, 7, 2),
         as_of_date=_AS_OF,
     )
+    # This Ticket 03 Evidence fixture records the manifest-v2 admission contract.
+    plan = _historical_shadow_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=_identity(),
         provider_chains={

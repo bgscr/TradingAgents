@@ -56,6 +56,10 @@ from tradingagents.dataflows.financial_request_factory import (
     build_financial_indicator_routing_request,
     build_financial_statement_routing_request,
 )
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestArtifactStore,
+    ProviderSubrequestCache,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
 from tradingagents.graph.financial_tools import (
@@ -217,7 +221,11 @@ class _BlockingTerminalAcquirer(_TerminalAcquirer):
         return super().acquire(request, **kwargs)
 
 
-def _raw_routing(plan) -> QualifiedFinancialRoutingComposition:
+def _raw_routing(
+    plan,
+    *,
+    provider_subrequest_cache: ProviderSubrequestCache | None = None,
+) -> QualifiedFinancialRoutingComposition:
     def unavailable(request):
         return FinancialProviderPeriodResponse.unavailable(
             provider_id=request.provider_id,
@@ -231,6 +239,7 @@ def _raw_routing(plan) -> QualifiedFinancialRoutingComposition:
         ),
         statement_request_factory=build_financial_statement_routing_request,
         indicator_request_factory=build_financial_indicator_routing_request,
+        provider_subrequest_cache=provider_subrequest_cache,
     )
 
 
@@ -1214,16 +1223,31 @@ def test_failed_single_flight_is_shared_without_follower_fallback_race(
 @pytest.mark.unit
 def test_financial_tool_node_creates_shadow_dispatcher_only_after_context_bind(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     asset, plan = _qualified_asset_and_plan(monkeypatch)
-    context = _context(asset, plan)
+    checkpoint_thread_id = "04a05b1c2d3e4f50"
+    context = _context(
+        asset,
+        plan,
+        run_label=f"checkpoint:{checkpoint_thread_id}",
+    )
+    cache = ProviderSubrequestCache(
+        coordinator=object(),
+        artifact_store=ProviderSubrequestArtifactStore(tmp_path / "05b-cache"),
+        run_scope_id=context.run_id,
+    )
     acquirer = _SuccessfulAcquirer(context)
     owner = FinancialEligibilityAcquisitionContextOwner(
         run_id=context.run_id,
         asset_configuration=asset,
         routing_plan=plan,
         metadata_acquirer=acquirer,
-        unbound_financial_routing=_raw_routing(plan),
+        unbound_financial_routing=_raw_routing(
+            plan,
+            provider_subrequest_cache=cache,
+        ),
+        checkpoint_thread_id=checkpoint_thread_id,
         expected_as_of_date=_AS_OF,
         availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
         consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,

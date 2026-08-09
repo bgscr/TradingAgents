@@ -56,7 +56,11 @@ FINANCIAL_FAMILY_REQUIREMENTS_V1 = "financial-family-requirements-v1"
 FINANCIAL_FAMILY_ASSESSMENT_V2 = "financial-family-assessment-v2"
 FINANCIAL_FAMILY_AGGREGATE_V2 = "financial-family-aggregate-v2"
 
-_CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
+_CLOSED_MODEL_CONFIG = ConfigDict(
+    extra="forbid",
+    frozen=True,
+    hide_input_in_errors=True,
+)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _UNORDERED_REQUEST_KEYS = frozenset({"fields", "field_set", "requested_fields"})
@@ -2236,6 +2240,7 @@ class FinancialPeriodCompletenessAssessment(BaseModel):
     contract_version: Literal[
         "financial-period-selection-v1",
         "financial-period-selection-v2",
+        "financial-period-selection-v3",
         "financial-period-selection-baostock-v1",
         "financial-period-selection-tushare-statement-v2",
     ] = FINANCIAL_PERIOD_SELECTION_V1
@@ -3325,12 +3330,134 @@ class FinancialAcquisitionOutcome(BaseModel):
         return self
 
 
+class FinancialIndicatorMetadataDimensionBinding(BaseModel):
+    """Bounded persisted state for one material compatibility dimension."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    normalized_field: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
+    dimension: str = Field(pattern=_SAFE_ID_PATTERN)
+    state: Literal["proven", "unproven", "not_applicable"]
+    raw_provider_marker: Literal["UNKNOWN", "XXX"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    reason: str = Field(pattern=_SAFE_ID_PATTERN)
+
+
+class FinancialIndicatorMetadataAssessmentBinding(BaseModel):
+    """Identity/state-only compatibility projection safe for manifests and audit."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] = "financial-indicator-field-semantics-v1"
+    metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] = "financial-indicator-metadata-compatibility-v1"
+    assessment_identity: str = Field(
+        pattern=r"^financial-indicator-metadata-compatibility:v1:[0-9a-f]{64}$"
+    )
+    provider_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    period_identity: str = Field(pattern=r"^financial-period:v1:[0-9a-f]{64}$")
+    family: FinancialRatioFamily
+    compatibility_state: Literal["compatible", "incompatible"]
+    current_only_metadata_eligible: bool
+    strict_pit_metadata_eligible: bool
+    dimensions: tuple[FinancialIndicatorMetadataDimensionBinding, ...]
+
+    @model_validator(mode="after")
+    def _validate_binding(self) -> FinancialIndicatorMetadataAssessmentBinding:
+        canonical = tuple(
+            sorted(
+                self.dimensions,
+                key=lambda item: (item.normalized_field, item.dimension),
+            )
+        )
+        if not canonical or self.dimensions != canonical or len(canonical) != len(
+            {(item.normalized_field, item.dimension) for item in canonical}
+        ):
+            raise ValueError("indicator metadata dimension bindings must be canonical")
+        compatible = not any(item.state == "unproven" for item in canonical)
+        if (self.compatibility_state == "compatible") != compatible:
+            raise ValueError("indicator metadata assessment state is inconsistent")
+        assert_safe_financial_projection(self.model_dump(mode="json"))
+        return self
+
+
+class FinancialIndicatorMetadataRejectionBinding(BaseModel):
+    """Typed incompatibility projection without provider payload values."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    assessment_identity: str = Field(
+        pattern=r"^financial-indicator-metadata-compatibility:v1:[0-9a-f]{64}$"
+    )
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    period_identity: str = Field(pattern=r"^financial-period:v1:[0-9a-f]{64}$")
+    family: FinancialRatioFamily
+    typed_reasons: tuple[FinancialIndicatorMetadataDimensionBinding, ...] = Field(
+        min_length=1
+    )
+
+    @model_validator(mode="after")
+    def _validate_reasons(self) -> FinancialIndicatorMetadataRejectionBinding:
+        if any(item.state != "unproven" for item in self.typed_reasons):
+            raise ValueError("indicator metadata rejection reason must be UNPROVEN")
+        if self.typed_reasons != tuple(
+            sorted(
+                self.typed_reasons,
+                key=lambda item: (item.normalized_field, item.dimension, item.reason),
+            )
+        ):
+            raise ValueError("indicator metadata rejection reasons must be canonical")
+        return self
+
+
 class FinancialProviderCandidate(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-manifest-v1"] = "financial-manifest-v1"
+    contract_version: Literal[
+        "financial-manifest-v1",
+        "financial-provider-candidate-v2",
+    ] = "financial-manifest-v1"
     candidate: FinancialPeriodCandidate
     assessment: FinancialPeriodCompletenessAssessment
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    metadata_compatibility_assessment_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-indicator-metadata-compatibility:v1:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    metadata_compatibility_state: Literal["compatible", "incompatible"] | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
+    metadata_selection_disposition: Literal[
+        "selected",
+        "unselected",
+        "unresolved",
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    metadata_incompatibility_reasons: tuple[
+        FinancialIndicatorMetadataDimensionBinding,
+        ...,
+    ] = Field(default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def _validate_binding(self) -> FinancialProviderCandidate:
@@ -3366,6 +3493,33 @@ class FinancialProviderCandidate(BaseModel):
             != (self.candidate.filing_metadata.ann_date is not None)
         ):
             raise ValueError("provider candidate filing assessment mismatch")
+        metadata_values = (
+            self.indicator_field_semantics_version,
+            self.indicator_metadata_compatibility_version,
+            self.metadata_compatibility_assessment_identity,
+            self.metadata_compatibility_state,
+            self.metadata_selection_disposition,
+        )
+        if self.contract_version == FINANCIAL_PROVIDER_CANDIDATE_V2:
+            if any(value is None for value in metadata_values):
+                raise ValueError("indicator provider candidate metadata binding is incomplete")
+            if (
+                self.metadata_compatibility_state == "compatible"
+                and self.metadata_incompatibility_reasons
+            ) or (
+                self.metadata_compatibility_state == "incompatible"
+                and not self.metadata_incompatibility_reasons
+            ):
+                raise ValueError("indicator provider candidate metadata state is inconsistent")
+            if (
+                self.metadata_selection_disposition == "selected"
+                and self.metadata_compatibility_state != "compatible"
+            ):
+                raise ValueError("incompatible indicator provider candidate is selected")
+        elif any(value is not None for value in metadata_values) or (
+            self.metadata_incompatibility_reasons
+        ):
+            raise ValueError("historical provider candidate carries indicator metadata")
         return self
 
 
@@ -3375,6 +3529,7 @@ class FinancialPeriodSelection(BaseModel):
     contract_version: Literal[
         "financial-period-selection-v1",
         "financial-period-selection-v2",
+        "financial-period-selection-v3",
     ] = (
         "financial-period-selection-v1"
     )
@@ -3437,8 +3592,31 @@ class FinancialPeriodSelection(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    metadata_compatibility_assessment_identity: str | None = Field(
+        default=None,
+        pattern=r"^financial-indicator-metadata-compatibility:v1:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    metadata_compatibility_state: Literal["compatible"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    metadata_selection_disposition: Literal["selected"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    metadata_incompatibility_reasons: tuple[
+        FinancialIndicatorMetadataDimensionBinding,
+        ...,
+    ] = Field(default=(), exclude_if=lambda value: not value)
     selection_identity: str = Field(
-        pattern=r"^financial-period-selection:v[12]:[0-9a-f]{64}$"
+        pattern=r"^financial-period-selection:v[123]:[0-9a-f]{64}$"
     )
 
     @field_validator("observed_at", "retrieved_at")
@@ -3463,6 +3641,13 @@ class FinancialPeriodSelection(BaseModel):
         eligibility_policy_version: Literal[
             "mainland-financial-period-eligibility-v2"
         ] | None = None,
+        indicator_field_semantics_version: Literal[
+            "financial-indicator-field-semantics-v1"
+        ] | None = None,
+        indicator_metadata_compatibility_version: Literal[
+            "financial-indicator-metadata-compatibility-v1"
+        ] | None = None,
+        metadata_compatibility_assessment_identity: str | None = None,
     ) -> FinancialPeriodSelection:
         if assessment.disposition not in {
             FinancialPeriodDisposition.ACCEPTED,
@@ -3475,13 +3660,23 @@ class FinancialPeriodSelection(BaseModel):
             or assessment.period_identity != candidate.period_identity.period_identity
         ):
             raise ValueError("financial selection candidate binding mismatch")
-        v2 = eligibility_policy_version is not None
-        if v2 != (requested_analysis_scope is not None):
+        availability_bound = eligibility_policy_version is not None
+        if availability_bound != (requested_analysis_scope is not None):
             raise ValueError("financial selection availability request is incomplete")
+        metadata_values = (
+            indicator_field_semantics_version,
+            indicator_metadata_compatibility_version,
+            metadata_compatibility_assessment_identity,
+        )
+        metadata_bound = all(value is not None for value in metadata_values)
+        if any(value is not None for value in metadata_values) and not metadata_bound:
+            raise ValueError("indicator selection metadata binding is incomplete")
         payload: dict[str, object] = {
             "contract_version": (
-                "financial-period-selection-v2"
-                if v2
+                "financial-period-selection-v3"
+                if metadata_bound
+                else "financial-period-selection-v2"
+                if availability_bound
                 else "financial-period-selection-v1"
             ),
             "candidate_identity": candidate.candidate_identity,
@@ -3491,7 +3686,7 @@ class FinancialPeriodSelection(BaseModel):
             "disposition": assessment.disposition.value,
             "strict_pit_eligible": assessment.strict_pit_eligible,
         }
-        if v2:
+        if availability_bound:
             filing = candidate.filing_metadata
             if filing.ann_date is None or candidate.period_identity.ratio_family is None:
                 raise ValueError("v2 financial availability requires indicator filing lineage")
@@ -3544,7 +3739,23 @@ class FinancialPeriodSelection(BaseModel):
                     ),
                 }
             )
-        prefix = "v2" if v2 else "v1"
+        if metadata_bound:
+            payload.update(
+                {
+                    "indicator_field_semantics_version": (
+                        indicator_field_semantics_version
+                    ),
+                    "indicator_metadata_compatibility_version": (
+                        indicator_metadata_compatibility_version
+                    ),
+                    "metadata_compatibility_assessment_identity": (
+                        metadata_compatibility_assessment_identity
+                    ),
+                    "metadata_compatibility_state": "compatible",
+                    "metadata_selection_disposition": "selected",
+                }
+            )
+        prefix = "v3" if metadata_bound else "v2" if availability_bound else "v1"
         identity_payload = {
             key: value for key, value in payload.items() if value is not None
         }
@@ -3559,7 +3770,11 @@ class FinancialPeriodSelection(BaseModel):
     @model_validator(mode="after")
     def _validate_identity(self) -> FinancialPeriodSelection:
         payload = self.model_dump(mode="json", exclude={"selection_identity"})
-        prefix = "v2" if self.contract_version == "financial-period-selection-v2" else "v1"
+        prefix = {
+            "financial-period-selection-v1": "v1",
+            "financial-period-selection-v2": "v2",
+            "financial-period-selection-v3": "v3",
+        }[self.contract_version]
         expected = f"financial-period-selection:{prefix}:" + _canonical_digest(payload)
         if self.selection_identity != expected:
             raise ValueError("financial period selection identity mismatch")
@@ -3578,11 +3793,39 @@ class FinancialPeriodSelection(BaseModel):
             self.period_end,
             self.eligibility_policy_version,
         )
+        metadata_values = (
+            self.indicator_field_semantics_version,
+            self.indicator_metadata_compatibility_version,
+            self.metadata_compatibility_assessment_identity,
+            self.metadata_compatibility_state,
+            self.metadata_selection_disposition,
+        )
         if self.contract_version == "financial-period-selection-v1":
             if any(value is not None for value in availability_values) or (
                 self.f_ann_date is not None or self.availability_reason is not None
+            ) or any(value is not None for value in metadata_values) or (
+                self.metadata_incompatibility_reasons
             ):
                 raise ValueError("legacy financial selection carries v2 availability")
+            return self
+        if self.contract_version == "financial-period-selection-v2" and (
+            any(value is not None for value in metadata_values)
+            or self.metadata_incompatibility_reasons
+        ):
+            raise ValueError("financial selection v2 carries indicator compatibility")
+        if self.contract_version == "financial-period-selection-v3" and (
+            any(value is None for value in metadata_values)
+            or self.metadata_incompatibility_reasons
+        ):
+            raise ValueError("indicator selection metadata compatibility is incomplete")
+        if (
+            self.contract_version == "financial-period-selection-v3"
+            and self.eligibility_policy_version is None
+        ):
+            if any(value is not None for value in availability_values) or (
+                self.f_ann_date is not None or self.availability_reason is not None
+            ):
+                raise ValueError("indicator selection availability is partial")
             return self
         if any(value is None for value in availability_values):
             raise ValueError("v2 financial selection availability is incomplete")
@@ -4589,7 +4832,11 @@ class FinancialRenderedArtifactIdentity(BaseModel):
 
 def _manifest_identity_payload(
     *,
-    contract_version: Literal["financial-manifest-v1", "financial-manifest-v2"],
+    contract_version: Literal[
+        "financial-manifest-v1",
+        "financial-manifest-v2",
+        "financial-manifest-v3",
+    ],
     capability_routing_plan_signature: str,
     instrument_identity: InstrumentIdentityEvidence,
     requested_capability: FinancialCapability,
@@ -4620,6 +4867,21 @@ def _manifest_identity_payload(
         MainlandFinancialEligibilityProjectionBinding | None
     ) = None,
     availability_reason: FinancialPeriodRejectionReason | None = None,
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = None,
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = None,
+    metadata_compatibility_assessments: Sequence[
+        FinancialIndicatorMetadataAssessmentBinding
+    ] = (),
+    metadata_incompatible_rejections: Sequence[
+        FinancialIndicatorMetadataRejectionBinding
+    ] = (),
+    selected_families: Sequence[FinancialRatioFamily] = (),
+    unselected_families: Sequence[FinancialRatioFamily] = (),
+    unresolved_families: Sequence[FinancialRatioFamily] = (),
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "contract_version": contract_version,
@@ -4655,7 +4917,7 @@ def _manifest_identity_payload(
         payload["revision_selections"] = [
             item.model_dump(mode="json") for item in revision_selections
         ]
-    if contract_version == FINANCIAL_MANIFEST_V2:
+    if contract_version in {FINANCIAL_MANIFEST_V2, FINANCIAL_MANIFEST_V3}:
         payload.update(
             {
                 "physical_attempt_events": [
@@ -4697,6 +4959,28 @@ def _manifest_identity_payload(
             payload["financial_eligibility_binding"] = (
                 financial_eligibility_binding.model_dump(mode="json")
             )
+    if contract_version == FINANCIAL_MANIFEST_V3:
+        payload.update(
+            {
+                "indicator_field_semantics_version": (
+                    indicator_field_semantics_version
+                ),
+                "indicator_metadata_compatibility_version": (
+                    indicator_metadata_compatibility_version
+                ),
+                "metadata_compatibility_assessments": [
+                    item.model_dump(mode="json")
+                    for item in metadata_compatibility_assessments
+                ],
+                "metadata_incompatible_rejections": [
+                    item.model_dump(mode="json")
+                    for item in metadata_incompatible_rejections
+                ],
+                "selected_families": [item.value for item in selected_families],
+                "unselected_families": [item.value for item in unselected_families],
+                "unresolved_families": [item.value for item in unresolved_families],
+            }
+        )
     if publication_target_construction is not None:
         payload["publication_target_construction"] = (
             publication_target_construction.model_dump(mode="json")
@@ -4712,6 +4996,7 @@ class FinancialAcquisitionManifest(BaseModel):
     contract_version: Literal[
         "financial-manifest-v1",
         "financial-manifest-v2",
+        "financial-manifest-v3",
     ] = FINANCIAL_MANIFEST_V1
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
@@ -4763,7 +5048,30 @@ class FinancialAcquisitionManifest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
-    manifest_identity: str = Field(pattern=r"^financial-manifest:v[12]:[0-9a-f]{64}$")
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    metadata_compatibility_assessments: tuple[
+        FinancialIndicatorMetadataAssessmentBinding,
+        ...,
+    ] = Field(default=(), exclude_if=lambda value: not value)
+    metadata_incompatible_rejections: tuple[
+        FinancialIndicatorMetadataRejectionBinding,
+        ...,
+    ] = Field(default=(), exclude_if=lambda value: not value)
+    selected_families: tuple[FinancialRatioFamily, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    unselected_families: tuple[FinancialRatioFamily, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    manifest_identity: str = Field(pattern=r"^financial-manifest:v[123]:[0-9a-f]{64}$")
 
     @classmethod
     def create(
@@ -4874,11 +5182,61 @@ class FinancialAcquisitionManifest(BaseModel):
         financial_eligibility_binding: (
             MainlandFinancialEligibilityProjectionBinding | None
         ) = None,
+        indicator_field_semantics_version: Literal[
+            "financial-indicator-field-semantics-v1"
+        ] | None = None,
+        indicator_metadata_compatibility_version: Literal[
+            "financial-indicator-metadata-compatibility-v1"
+        ] | None = None,
+        metadata_compatibility_assessments: Sequence[
+            FinancialIndicatorMetadataAssessmentBinding
+        ] = (),
+        metadata_incompatible_rejections: Sequence[
+            FinancialIndicatorMetadataRejectionBinding
+        ] = (),
+        selected_families: Sequence[FinancialRatioFamily] = (),
+        unselected_families: Sequence[FinancialRatioFamily] = (),
+        unresolved_families: Sequence[FinancialRatioFamily] = (),
     ) -> FinancialAcquisitionManifest:
         """Bind the v1 selection contract to Ticket 11 operational lineage."""
 
         if self.contract_version != FINANCIAL_MANIFEST_V1:
             raise ValueError("only a v1 financial manifest may be finalized")
+        metadata_values = (
+            indicator_field_semantics_version,
+            indicator_metadata_compatibility_version,
+        )
+        indicator_v3 = all(value is not None for value in metadata_values)
+        if any(value is not None for value in metadata_values) and not indicator_v3:
+            raise ValueError("indicator manifest metadata binding is incomplete")
+        if indicator_v3:
+            family_dispositions = (
+                *selected_families,
+                *unselected_families,
+                *unresolved_families,
+            )
+            if (
+                self.requested_capability is not FinancialCapability.RATIO_FAMILY
+                or self.requested_ratio_family is None
+                or family_dispositions != (self.requested_ratio_family,)
+                or any(
+                    item.contract_version != FINANCIAL_PROVIDER_CANDIDATE_V2
+                    for item in self.provider_candidates
+                )
+                or any(
+                    item.contract_version != FINANCIAL_PERIOD_SELECTION_V3
+                    for item in self.selections
+                )
+            ):
+                raise ValueError("indicator manifest v3 binding is incomplete")
+        elif (
+            metadata_compatibility_assessments
+            or metadata_incompatible_rejections
+            or selected_families
+            or unselected_families
+            or unresolved_families
+        ):
+            raise ValueError("historical manifest carries indicator metadata")
         canonical_attempts = tuple(
             sorted(
                 physical_attempt_events,
@@ -4888,28 +5246,30 @@ class FinancialAcquisitionManifest(BaseModel):
         final_rendered_artifact = FinancialRenderedArtifactIdentity.create(
             rendered_value
         )
-        v2_selections = tuple(
+        availability_selections = tuple(
             selection
             for selection in self.selections
-            if selection.contract_version == "financial-period-selection-v2"
+            if selection.contract_version
+            in {FINANCIAL_PERIOD_SELECTION_V2, FINANCIAL_PERIOD_SELECTION_V3}
+            and selection.eligibility_policy_version is not None
         )
         availability_scope = (
             FinancialAvailabilityScope.CURRENT_ONLY
             if any(
                 selection.availability_scope
                 is FinancialAvailabilityScope.CURRENT_ONLY
-                for selection in v2_selections
+                for selection in availability_selections
             )
             else (
                 FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
-                if v2_selections
+                if availability_selections
                 else None
             )
         )
         availability_basis = (
             FinancialAvailabilityBasis.ANN_DATE_WITHOUT_FIRST_PUBLICATION
             if availability_scope is FinancialAvailabilityScope.CURRENT_ONLY
-            and any(selection.f_ann_date is None for selection in v2_selections)
+            and any(selection.f_ann_date is None for selection in availability_selections)
             else (
                 FinancialAvailabilityBasis.ANN_DATE_FIRST_PUBLICATION_AND_OBSERVED_REVISION
                 if availability_scope is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
@@ -4923,7 +5283,7 @@ class FinancialAcquisitionManifest(BaseModel):
         availability_reason = next(
             (
                 selection.availability_reason
-                for selection in v2_selections
+                for selection in availability_selections
                 if selection.availability_reason is not None
             ),
             None,
@@ -4957,8 +5317,23 @@ class FinancialAcquisitionManifest(BaseModel):
                 availability_reason = (
                     FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
                 )
+        forward_contract_version = (
+            FINANCIAL_MANIFEST_V3 if indicator_v3 else FINANCIAL_MANIFEST_V2
+        )
+        canonical_metadata_assessments = tuple(
+            sorted(
+                metadata_compatibility_assessments,
+                key=lambda item: item.candidate_identity,
+            )
+        )
+        canonical_metadata_rejections = tuple(
+            sorted(
+                metadata_incompatible_rejections,
+                key=lambda item: item.candidate_identity,
+            )
+        )
         payload = _manifest_identity_payload(
-            contract_version=FINANCIAL_MANIFEST_V2,
+            contract_version=forward_contract_version,
             capability_routing_plan_signature=self.capability_routing_plan_signature,
             instrument_identity=self.instrument_identity,
             requested_capability=self.requested_capability,
@@ -4983,6 +5358,17 @@ class FinancialAcquisitionManifest(BaseModel):
             eligibility_policy_version=eligibility_policy_version,
             financial_eligibility_binding=financial_eligibility_binding,
             availability_reason=availability_reason,
+            indicator_field_semantics_version=indicator_field_semantics_version,
+            indicator_metadata_compatibility_version=(
+                indicator_metadata_compatibility_version
+            ),
+            metadata_compatibility_assessments=(
+                canonical_metadata_assessments
+            ),
+            metadata_incompatible_rejections=canonical_metadata_rejections,
+            selected_families=selected_families,
+            unselected_families=unselected_families,
+            unresolved_families=unresolved_families,
         )
         return FinancialAcquisitionManifest(
             **self.model_dump(
@@ -5000,9 +5386,16 @@ class FinancialAcquisitionManifest(BaseModel):
                     "eligibility_policy_version",
                     "financial_eligibility_binding",
                     "availability_reason",
+                    "indicator_field_semantics_version",
+                    "indicator_metadata_compatibility_version",
+                    "metadata_compatibility_assessments",
+                    "metadata_incompatible_rejections",
+                    "selected_families",
+                    "unselected_families",
+                    "unresolved_families",
                 },
             ),
-            contract_version=FINANCIAL_MANIFEST_V2,
+            contract_version=forward_contract_version,
             publication_target_construction=publication_target_construction,
             physical_attempt_events=canonical_attempts,
             disposition=disposition,
@@ -5013,7 +5406,21 @@ class FinancialAcquisitionManifest(BaseModel):
             eligibility_policy_version=eligibility_policy_version,
             financial_eligibility_binding=financial_eligibility_binding,
             availability_reason=availability_reason,
-            manifest_identity="financial-manifest:v2:" + _canonical_digest(payload),
+            indicator_field_semantics_version=indicator_field_semantics_version,
+            indicator_metadata_compatibility_version=(
+                indicator_metadata_compatibility_version
+            ),
+            metadata_compatibility_assessments=(
+                canonical_metadata_assessments
+            ),
+            metadata_incompatible_rejections=canonical_metadata_rejections,
+            selected_families=tuple(selected_families),
+            unselected_families=tuple(unselected_families),
+            unresolved_families=tuple(unresolved_families),
+            manifest_identity=(
+                f"financial-manifest:{'v3' if indicator_v3 else 'v2'}:"
+                + _canonical_digest(payload)
+            ),
         )
 
     @model_validator(mode="after")
@@ -5037,6 +5444,8 @@ class FinancialAcquisitionManifest(BaseModel):
                 is not self.requested_statement_type
             ):
                 raise ValueError("statement manifest completeness context is invalid")
+            if self.contract_version == FINANCIAL_MANIFEST_V3:
+                raise ValueError("statement manifest cannot use indicator v3")
         elif self.requested_statement_type is not None or self.requested_ratio_family is None:
             raise ValueError("ratio manifest request identity is invalid")
         elif (
@@ -5111,6 +5520,13 @@ class FinancialAcquisitionManifest(BaseModel):
                 or self.eligibility_policy_version is not None
                 or self.financial_eligibility_binding is not None
                 or self.availability_reason is not None
+                or self.indicator_field_semantics_version is not None
+                or self.indicator_metadata_compatibility_version is not None
+                or self.metadata_compatibility_assessments
+                or self.metadata_incompatible_rejections
+                or self.selected_families
+                or self.unselected_families
+                or self.unresolved_families
             ):
                 raise ValueError("legacy financial manifest carries v2 lineage")
         else:
@@ -5151,8 +5567,16 @@ class FinancialAcquisitionManifest(BaseModel):
             if self.financial_eligibility_binding is not None and (
                 self.eligibility_policy_version
                 != self.financial_eligibility_binding.eligibility_policy_version
-                or self.financial_eligibility_binding.financial_manifest_version
-                != self.contract_version
+                or (
+                    self.contract_version == FINANCIAL_MANIFEST_V2
+                    and self.financial_eligibility_binding.financial_manifest_version
+                    != self.contract_version
+                )
+                or (
+                    self.contract_version == FINANCIAL_MANIFEST_V3
+                    and self.financial_eligibility_binding.financial_manifest_version
+                    != FINANCIAL_MANIFEST_V2
+                )
             ):
                 raise ValueError(
                     "financial manifest eligibility binding is contradictory"
@@ -5162,6 +5586,24 @@ class FinancialAcquisitionManifest(BaseModel):
             )
             if len(attempt_ids) != len(set(attempt_ids)):
                 raise ValueError("financial manifest attempt identities must be unique")
+            metadata_values = (
+                self.indicator_field_semantics_version,
+                self.indicator_metadata_compatibility_version,
+            )
+            if self.contract_version == FINANCIAL_MANIFEST_V2:
+                if (
+                    any(value is not None for value in metadata_values)
+                    or self.metadata_compatibility_assessments
+                    or self.metadata_incompatible_rejections
+                    or self.selected_families
+                    or self.unselected_families
+                    or self.unresolved_families
+                ):
+                    raise ValueError("financial manifest v2 carries indicator compatibility")
+            elif (
+                any(value is None for value in metadata_values)
+            ):
+                raise ValueError("indicator manifest v3 metadata binding is incomplete")
         artifact_ids = tuple(item.artifact.artifact_identity for item in self.artifacts)
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("manifest artifact identities must be unique")
@@ -5171,6 +5613,99 @@ class FinancialAcquisitionManifest(BaseModel):
         }
         if len(candidate_by_id) != len(self.provider_candidates):
             raise ValueError("manifest candidate identities must be unique")
+        if self.contract_version == FINANCIAL_MANIFEST_V3:
+            assert self.requested_ratio_family is not None
+            family_order = tuple(FinancialRatioFamily)
+            family_dispositions = (
+                *self.selected_families,
+                *self.unselected_families,
+                *self.unresolved_families,
+            )
+            if (
+                family_dispositions != (self.requested_ratio_family,)
+                or any(
+                    families
+                    != tuple(family for family in family_order if family in families)
+                    for families in (
+                        self.selected_families,
+                        self.unselected_families,
+                        self.unresolved_families,
+                    )
+                )
+                or bool(self.selected_families)
+                != bool(self.aggregate_completeness.complete)
+                or bool(self.unresolved_families)
+                == bool(self.aggregate_completeness.complete)
+                or self.unselected_families
+            ):
+                raise ValueError("indicator manifest family disposition is inconsistent")
+            assessment_bindings = {
+                item.candidate_identity: item
+                for item in self.metadata_compatibility_assessments
+            }
+            if (
+                len(assessment_bindings)
+                != len(self.metadata_compatibility_assessments)
+                or set(assessment_bindings) != set(candidate_by_id)
+            ):
+                raise ValueError("indicator manifest assessment candidates mismatch")
+            rejection_bindings = {
+                item.candidate_identity: item
+                for item in self.metadata_incompatible_rejections
+            }
+            if len(rejection_bindings) != len(self.metadata_incompatible_rejections):
+                raise ValueError("indicator manifest metadata rejections are duplicated")
+            selected_candidate_ids = {
+                selection.candidate_identity for selection in self.selections
+            }
+            for candidate_id, wrapper in candidate_by_id.items():
+                binding = assessment_bindings[candidate_id]
+                reasons = tuple(
+                    item for item in binding.dimensions if item.state == "unproven"
+                )
+                expected_disposition = (
+                    "selected"
+                    if candidate_id in selected_candidate_ids
+                    else "unselected"
+                    if binding.compatibility_state == "incompatible"
+                    else "unresolved"
+                    if self.unresolved_families
+                    else "unselected"
+                )
+                if (
+                    wrapper.contract_version != FINANCIAL_PROVIDER_CANDIDATE_V2
+                    or wrapper.metadata_compatibility_assessment_identity
+                    != binding.assessment_identity
+                    or wrapper.metadata_compatibility_state
+                    != binding.compatibility_state
+                    or wrapper.metadata_selection_disposition
+                    != expected_disposition
+                    or wrapper.metadata_incompatibility_reasons != reasons
+                    or wrapper.candidate.artifact.artifact_identity
+                    != binding.artifact_identity
+                    or wrapper.candidate.period_identity.period_identity
+                    != binding.period_identity
+                ):
+                    raise ValueError("indicator manifest candidate assessment mismatch")
+                rejection = rejection_bindings.get(candidate_id)
+                if binding.compatibility_state == "incompatible":
+                    if (
+                        rejection is None
+                        or rejection.assessment_identity != binding.assessment_identity
+                        or rejection.typed_reasons != reasons
+                    ):
+                        raise ValueError("indicator manifest typed rejection mismatch")
+                elif rejection is not None:
+                    raise ValueError("compatible indicator carries metadata rejection")
+            for selection in self.selections:
+                binding = assessment_bindings[selection.candidate_identity]
+                if (
+                    selection.contract_version != FINANCIAL_PERIOD_SELECTION_V3
+                    or selection.metadata_compatibility_assessment_identity
+                    != binding.assessment_identity
+                    or binding.compatibility_state != "compatible"
+                ):
+                    raise ValueError("indicator manifest selection compatibility mismatch")
         if any(
             item.candidate.artifact.artifact_identity not in artifact_id_set
             for item in self.provider_candidates
@@ -5372,12 +5907,28 @@ class FinancialAcquisitionManifest(BaseModel):
             eligibility_policy_version=self.eligibility_policy_version,
             financial_eligibility_binding=self.financial_eligibility_binding,
             availability_reason=self.availability_reason,
+            indicator_field_semantics_version=(
+                self.indicator_field_semantics_version
+            ),
+            indicator_metadata_compatibility_version=(
+                self.indicator_metadata_compatibility_version
+            ),
+            metadata_compatibility_assessments=(
+                self.metadata_compatibility_assessments
+            ),
+            metadata_incompatible_rejections=(
+                self.metadata_incompatible_rejections
+            ),
+            selected_families=self.selected_families,
+            unselected_families=self.unselected_families,
+            unresolved_families=self.unresolved_families,
         )
-        expected = (
-            "financial-manifest:"
-            f"{'v2' if self.contract_version == FINANCIAL_MANIFEST_V2 else 'v1'}:"
-            + _canonical_digest(payload)
-        )
+        version = {
+            FINANCIAL_MANIFEST_V1: "v1",
+            FINANCIAL_MANIFEST_V2: "v2",
+            FINANCIAL_MANIFEST_V3: "v3",
+        }[self.contract_version]
+        expected = "financial-manifest:" + version + ":" + _canonical_digest(payload)
         if self.manifest_identity != expected:
             raise ValueError("financial acquisition manifest identity mismatch")
         return self

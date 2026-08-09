@@ -174,8 +174,8 @@ def _qualified_plan(
     return MainlandCapabilityRoutingPlan.model_validate(historical_payload)
 
 
-def _historical_shadow_plan(monkeypatch: pytest.MonkeyPatch):
-    historical_payload = _shadow_plan(monkeypatch).model_dump(mode="json")
+def _historical_plan(plan):
+    historical_payload = plan.model_dump(mode="json")
     historical_payload["plan_version"] = "1.1"
     for key in (
         "indicator_field_semantics_version",
@@ -196,6 +196,14 @@ def _historical_shadow_plan(monkeypatch: pytest.MonkeyPatch):
         "mainland-routing-plan:v1:" + sha256(encoded).hexdigest()
     )
     return MainlandCapabilityRoutingPlan.model_validate(historical_payload)
+
+
+def _historical_shadow_plan(monkeypatch: pytest.MonkeyPatch):
+    return _historical_plan(_shadow_plan(monkeypatch))
+
+
+def _historical_qualified_plan(monkeypatch: pytest.MonkeyPatch):
+    return _historical_plan(_qualified_plan(monkeypatch))
 
 
 def _candidate(
@@ -2638,7 +2646,7 @@ def test_dispatcher_singleflight_and_checkpoint_resume_reuse_selection_without_i
         calls += 1
         return _available_response("tushare", (candidate,))
 
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     original = FinancialToolDispatcher(
         instrument_identity=identity,
         run_asset_configuration=asset,
@@ -2736,7 +2744,7 @@ def test_compiled_tool_node_uses_only_final_selected_periods(
         )
     }
     qualified_router = MainlandFinancialCapabilityRouter(
-        routing_plan=_qualified_plan(monkeypatch),
+        routing_plan=_historical_qualified_plan(monkeypatch),
         statement_sources={"tushare": source},
     )
     with pytest.raises(
@@ -2861,7 +2869,7 @@ def test_compiled_tool_node_routes_fundamentals_through_indicator_families(
         config=runtime_config,
         vendor_methods=vendor_methods,
         qualified_statement_router=MainlandFinancialCapabilityRouter(
-            routing_plan=_qualified_plan(monkeypatch),
+            routing_plan=_historical_qualified_plan(monkeypatch),
             statement_sources={},
             indicator_sources={
                 "tushare": tushare,
@@ -3071,7 +3079,7 @@ def test_compiled_tool_node_keeps_fundamentals_legacy_without_indicator_factory(
         config=runtime_config,
         vendor_methods=vendor_methods,
         qualified_statement_router=MainlandFinancialCapabilityRouter(
-            routing_plan=_qualified_plan(monkeypatch),
+            routing_plan=_historical_qualified_plan(monkeypatch),
             statement_sources={},
         ),
         qualified_statement_request_factory=statement_only_factory,
@@ -3358,7 +3366,7 @@ def test_production_composition_routes_tushare_gap_to_akshare_sina(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _shadow_plan(monkeypatch)
+    plan = _historical_shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -3467,7 +3475,7 @@ def test_production_composition_uses_yahoo_only_as_degraded_current_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    plan = _shadow_plan(monkeypatch)
+    plan = _historical_shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),

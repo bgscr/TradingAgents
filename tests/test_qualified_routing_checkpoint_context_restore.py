@@ -456,7 +456,18 @@ def test_fresh_checkpoint_persists_complete_safe_context_projection(
     dispatcher.dispatch_statement_selection(request, selection_request)
     checkpoint = dispatcher.checkpoint_ledger()
 
-    assert checkpoint["contract_version"] == "1.4"
+    assert checkpoint["contract_version"] == "1.5"
+    assert checkpoint["financial_manifest_version"] == "financial-manifest-v2"
+    assert checkpoint["financial_indicator_manifest_version"] == (
+        "financial-manifest-v3"
+    )
+    assert checkpoint["capability_routing_plan_version"] == "1.2"
+    assert checkpoint["indicator_field_semantics_version"] == (
+        "financial-indicator-field-semantics-v1"
+    )
+    assert checkpoint["indicator_metadata_compatibility_version"] == (
+        "financial-indicator-metadata-compatibility-v1"
+    )
     assert owner.context is context
     assert context.run_id == owner.run_id
     assert source_calls == [

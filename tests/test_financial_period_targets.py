@@ -658,6 +658,31 @@ def _shadow_plan(monkeypatch: pytest.MonkeyPatch):
     return preflight.plan
 
 
+def _historical_shadow_plan(monkeypatch: pytest.MonkeyPatch):
+    plan = _shadow_plan(monkeypatch)
+    historical_payload = plan.model_dump(mode="json")
+    historical_payload["plan_version"] = "1.1"
+    for key in (
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_manifest_contract_version",
+        "indicator_selection_contract_version",
+    ):
+        historical_payload.pop(key)
+    signature_payload = dict(historical_payload)
+    signature_payload.pop("plan_signature")
+    encoded = json.dumps(
+        signature_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    historical_payload["plan_signature"] = (
+        "mainland-routing-plan:v1:" + sha256(encoded).hexdigest()
+    )
+    return type(plan).model_validate(historical_payload)
+
+
 def test_v2_router_persists_targets_without_additional_provider_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -814,7 +839,7 @@ def test_v2_indicator_denominators_use_publication_targets_without_extra_io(
         )
 
     router = MainlandFinancialCapabilityRouter(
-        routing_plan=_shadow_plan(monkeypatch),
+        routing_plan=_historical_shadow_plan(monkeypatch),
         statement_sources={},
         indicator_sources={"tushare": source},
     )
@@ -889,7 +914,7 @@ def test_indicator_publication_index_uses_retained_unrequested_families(
         )
 
     router = MainlandFinancialCapabilityRouter(
-        routing_plan=_shadow_plan(monkeypatch),
+        routing_plan=_historical_shadow_plan(monkeypatch),
         statement_sources={},
         indicator_sources={"tushare": source},
     )
@@ -1036,7 +1061,7 @@ def test_routed_unqualified_artifact_cannot_prove_publication(
 def test_dispatcher_checkpoint_and_audit_persist_target_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan = _shadow_plan(monkeypatch)
+    plan = _historical_shadow_plan(monkeypatch)
     asset = resolve_run_asset_configuration(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),

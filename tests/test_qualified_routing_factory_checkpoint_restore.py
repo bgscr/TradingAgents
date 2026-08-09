@@ -936,7 +936,7 @@ def test_factory_restores_terminal_cache_and_dispatcher_before_provider_clients(
             )
         )
     assert pre_context_error.value.reason is (
-        FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_MISSING
+        FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
     )
     assert events == []
     assert (

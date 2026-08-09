@@ -18,6 +18,7 @@ from tests.test_financial_capability_routing_selection import (
     _ANNUAL_PERIODS,
     _REPORTING_PERIODS,
     _candidate,
+    _historical_plan,
 )
 from tests.test_financial_graph_dispatch import (
     _analysis_outcome_state,
@@ -2421,6 +2422,7 @@ def test_later_shadow_failure_preserves_prior_manifest_and_legacy_authority(
     asset = _asset()
     plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
+    plan = _historical_plan(plan)
     legacy_calls = 0
     shadow_calls = 0
 
@@ -2566,6 +2568,7 @@ def test_earlier_shadow_failure_does_not_skip_later_independent_request(
     asset = _asset()
     plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
+    plan = _historical_plan(plan)
     shadow_calls = 0
     event = _attempt_event()
 
@@ -2692,6 +2695,7 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
     asset = _asset()
     plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
+    plan = _historical_plan(plan)
     legacy_calls = 0
     shadow_calls = 0
 

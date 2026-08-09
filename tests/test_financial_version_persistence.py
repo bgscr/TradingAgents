@@ -81,6 +81,33 @@ def _ticket06_dispatch(monkeypatch: pytest.MonkeyPatch):
         as_of_date=_AS_OF,
         instrument_identity=asset.instrument_identity,
     )
+    historical_plan = plan.model_dump(mode="json")
+    historical_plan["plan_version"] = "1.1"
+    for field in (
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_manifest_contract_version",
+        "indicator_selection_contract_version",
+    ):
+        historical_plan.pop(field, None)
+    signature_payload = {
+        key: value
+        for key, value in historical_plan.items()
+        if key != "plan_signature"
+    }
+    historical_plan["plan_signature"] = (
+        "mainland-routing-plan:v1:"
+        + sha256(
+            json.dumps(
+                signature_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
+    plan = MainlandCapabilityRoutingPlan.model_validate(historical_plan)
     provider_calls: list[str] = []
 
     def source(_request):

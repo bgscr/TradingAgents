@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -17,6 +18,7 @@ from tests.test_financial_capability_routing_selection import (
     _without_field,
 )
 from tradingagents.asset_configuration import resolve_run_asset_configuration
+from tradingagents.capability_routing import MainlandCapabilityRoutingPlan
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialIndicatorRoutingRequest,
     FinancialProviderPeriodResponse,
@@ -58,6 +60,42 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
 from tradingagents.graph.financial_tools import FinancialDispatchToolNode
 from tradingagents.reporting import _render_financial_dispatch_operations
+
+
+def _historical_qualified_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    **overrides: object,
+) -> MainlandCapabilityRoutingPlan:
+    """Pin Ticket 11 fixtures to the plan version they originally recorded."""
+
+    plan = _qualified_plan(monkeypatch, **overrides)
+    historical_plan = plan.model_dump(mode="json")
+    historical_plan["plan_version"] = "1.1"
+    for field in (
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_manifest_contract_version",
+        "indicator_selection_contract_version",
+    ):
+        historical_plan.pop(field, None)
+    signature_payload = {
+        key: value
+        for key, value in historical_plan.items()
+        if key != "plan_signature"
+    }
+    historical_plan["plan_signature"] = (
+        "mainland-routing-plan:v1:"
+        + sha256(
+            json.dumps(
+                signature_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
+    return MainlandCapabilityRoutingPlan.model_validate(historical_plan)
 
 
 def _attempt_event(
@@ -217,7 +255,7 @@ def test_v2_checkpoint_round_trip_restores_without_io_and_rejects_tampering(
         calls += 1
         return response
 
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     original = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -350,7 +388,7 @@ def test_v2_checkpoint_round_trip_restores_without_io_and_rejects_tampering(
         FinancialDispatchCheckpointFailureReason.RUN_SCOPE_MISMATCH
     )
 
-    contradictory_plan = _qualified_plan(
+    contradictory_plan = _historical_qualified_plan(
         monkeypatch,
         account_scope_label="contradictory-account-scope",
     )
@@ -419,7 +457,7 @@ def test_run_scoped_qualified_dispatch_finalizes_zero_attempts_and_rejects_gaps(
         config=copy.deepcopy(DEFAULT_CONFIG),
     )
     period = date(2026, 6, 30)
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     provider_chain = (
         FinancialProvider(
             name="legacy-placeholder",
@@ -546,7 +584,7 @@ def test_qualified_mode_rejects_legacy_checkpoint_without_plan_binding(
             checkpoint_ledger=legacy,
         )
     assert raised.value.reason is (
-        FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
+        FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
     )
 
 
@@ -647,7 +685,7 @@ def test_indicator_manifest_retains_fallback_lineage_and_yahoo_degradation(
 
     manifest = result.family_manifests[0]
     rendered = render_indicator_routing_result(result)
-    assert manifest.contract_version == "financial-manifest-v2"
+    assert manifest.contract_version == "financial-manifest-v3"
     assert manifest.disposition.value == "degraded"
     assert manifest.physical_attempt_events == tuple(
         sorted(
@@ -714,7 +752,7 @@ def test_v2_audit_and_report_expose_safe_deterministic_completeness(
         physical_attempt_ids=(event.attempt_event_id,),
         physical_attempt_events=(event,),
     )
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -948,7 +986,7 @@ def test_v2_tool_envelope_and_evidence_admit_only_selected_strict_pit_facts(
             physical_attempt_events=(current_event,),
         ),
     }
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -1082,7 +1120,7 @@ def test_fully_rejected_artifact_remains_operational_and_creates_no_fact(
         physical_attempt_ids=(event.attempt_event_id,),
         physical_attempt_events=(event,),
     )
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -1224,7 +1262,7 @@ def test_critical_conflict_is_period_local_in_audit_and_evidence(
             physical_attempt_events=(akshare_event,),
         ),
     }
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -1422,7 +1460,7 @@ def test_complete_statement_families_retain_uncited_lineage_through_report(
         )
         for _statement_type, tool_name in statement_tools
     }
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     dispatcher = FinancialToolDispatcher(
         instrument_identity=asset.instrument_identity,
         run_asset_configuration=asset,
@@ -1561,7 +1599,7 @@ def test_equivalent_overlap_is_unselected_without_duplicate_source_facts(
             physical_attempt_events=(fallback_event,),
         ),
     }
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     provider_chain = (
         FinancialProvider(
             name="legacy-placeholder",
@@ -1685,7 +1723,7 @@ def test_physical_attempt_totals_derive_from_all_coordinator_events(
         ),
         physical_attempt_events=attempt_events,
     )
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     provider_chain = (
         FinancialProvider(
             name="legacy-placeholder",
@@ -1791,7 +1829,7 @@ def test_checkpoint_replay_admits_only_observed_strict_pit_periods(
             physical_attempt_events=(current_event,),
         ),
     }
-    plan = _qualified_plan(monkeypatch)
+    plan = _historical_qualified_plan(monkeypatch)
     provider_chain = (
         FinancialProvider(
             name="legacy-placeholder",

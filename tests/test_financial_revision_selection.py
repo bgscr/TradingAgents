@@ -9,6 +9,7 @@ import pytest
 
 from tests.test_financial_capability_routing_selection import (
     _REPORTING_PERIODS,
+    _historical_shadow_plan,
     _identity,
     _shadow_plan,
 )
@@ -938,7 +939,7 @@ def test_conflict_state_round_trips_and_bars_only_affected_period_source_facts(
         physical_attempt_ids=(event.attempt_event_id,),
         physical_attempt_events=(event,),
     )
-    plan = _shadow_plan(monkeypatch)
+    plan = _historical_shadow_plan(monkeypatch)
     provider_chain = (
         FinancialProvider(
             name="unused",
