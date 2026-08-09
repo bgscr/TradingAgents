@@ -37,13 +37,18 @@ and authoritative `qualified_v1` remains disabled.
 - Run \`601328.SS\` first as the bank Equity and \`600895.SS\` second as the
   non-bank Equity, sequentially, for the same latest completed mainland session.
 - Each run retains its safe preflight result, Capability Routing Plan signature,
-  dispatcher/cache checkpoint projection, provider physical-attempt events,
-  manifest, complete report, and decision audit.
+  plan-1.2 indicator contract bindings, metadata-compatibility assessment
+  identities/states, dispatcher/cache checkpoint projection, provider physical-
+  attempt events, manifest, complete report, and decision audit.
 - Both runs avoid \`qualified_routing_composition_missing\`, complete through
   the registered composition, coordinate every physical call, establish
   BaoStock Current Tradeability authority, and publish qualified observations
   as \`shadow_non_authoritative\` while legacy-selected output remains
   authoritative.
+- Complete Tushare indicator artifacts remain retained even when material
+  metadata is incompatible; only unresolved families continue through the
+  Capability Routing Plan, and each lower provider is judged only by its own
+  truthful metadata.
 
 ## Acceptance criteria
 
@@ -74,6 +79,14 @@ and authoritative `qualified_v1` remains disabled.
   Tushare names and supplemental sources establish no suspension, ST,
   lifecycle, or tradeability authority; strict Provider History Bundles are not
   blended.
+- [ ] For both runs, plan 1.2 pins
+  `financial-indicator-field-semantics-v1` and
+  `financial-indicator-metadata-compatibility-v1`; complete-but-incompatible
+  indicator candidates remain retained, material `UNPROVEN` metadata prevents
+  selection, and `NOT_APPLICABLE` is ignored only under the pinned field policy.
+- [ ] Requested `CNY`/`CONSOLIDATED` never appears as provider-origin evidence;
+  only unresolved indicator families continue through plan-owned fallback and
+  lower providers are assessed solely from their own metadata.
 - [ ] Reports, manifests, checkpoints, decision audits, and terminal output say
   \`shadow_non_authoritative\`; qualified results do not replace legacy-selected
   tool output, admitted Source Facts, Validated Decision Context, or the final
@@ -102,9 +115,10 @@ and authoritative `qualified_v1` remains disabled.
 
 ## Compatibility and migration behavior
 
-- Each live run is additive and uses a fresh namespace with existing schemas,
-  ID constructors, coordinator, cache, artifact store, dispatcher, checkpoint,
-  graph, report, and audit seams.
+- Each live run is additive and uses a fresh namespace with the exact plan-1.2
+  indicator forward versions, unchanged raw artifact/candidate identities, and
+  existing coordinator, cache, artifact store, dispatcher, checkpoint, graph,
+  report, and audit seams.
 - Historical state remains immutable and readable. No cleanup, migration,
   relabeling, ID renumbering, checkpoint upgrade, or failed-run rewrite is
   permitted.

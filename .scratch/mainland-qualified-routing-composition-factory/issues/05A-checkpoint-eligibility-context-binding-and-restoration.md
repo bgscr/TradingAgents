@@ -17,7 +17,7 @@ Integrate pure financial request factories; 04A — Integrate managed eligibilit
 context acquisition; 05 — Restore checkpoint and cache state through the
 factory.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

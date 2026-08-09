@@ -13,7 +13,7 @@ failures. This slice is contract-only and performs no provider work.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

@@ -13,7 +13,7 @@ routing request`.
 **Blocked by:** 02A — Add provider-neutral eligibility acquisition context
 contracts.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

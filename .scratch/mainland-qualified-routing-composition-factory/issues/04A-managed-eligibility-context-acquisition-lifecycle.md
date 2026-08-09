@@ -15,7 +15,7 @@ contracts; 02B — Acquire fresh company type and listing provenance; 02C —
 Integrate pure financial request factories; 02D — Add executable production-
 source wiring; 04 — Implement managed runtime lifecycle and cleanup.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

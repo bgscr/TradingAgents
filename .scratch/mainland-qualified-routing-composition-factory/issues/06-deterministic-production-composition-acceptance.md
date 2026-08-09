@@ -13,12 +13,14 @@ Any failure blocks Ticket 07.
 
 **Blocked by:** 03 — Add static registration and caller precedence; 02D — Add
 executable production-source wiring; 04A — Integrate managed eligibility-context
-acquisition; 05A — Bind and restore eligibility context through checkpoints.
+acquisition; 05B — Persist and restore indicator metadata compatibility; 06A —
+Correct QCF4 deterministic acceptance.
 
-**Status:** blocked
+**Status:** FAIL/BLOCKED
 
 **Acceptance state:** FAIL/BLOCKED and not complete. Ticket 06 cannot resume
-until 02A, 02B, 02C, 02D, 04A, and 05A are complete.
+until 02E, 02F, 05B, and 06A are complete. QCF5–QCF12 remain blocked until 06A
+passes the corrected QCF4 path.
 
 ## Observable behavior
 
@@ -43,9 +45,12 @@ until 02A, 02B, 02C, 02D, 04A, and 05A are complete.
 
 ## Acceptance criteria
 
-QCF1–QCF18 remain unchanged. QCF4–QCF12 must originate from a fresh built-in
-run. A manually seeded Financial Eligibility Acquisition Context, callable
-runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
+QCF1–QCF18 retain their IDs and authority. QCF1–QCF3 and QCF5–QCF18 retain
+their scenarios and pass/fail meaning; QCF4 alone uses the corrected semantics
+below. QCF4–QCF12 must originate from a fresh built-in run. A manually seeded
+Financial Eligibility Acquisition Context, callable runtime, or checkpoint
+cannot satisfy fresh acceptance for any of QCF4–QCF12. QCF5–QCF12 are not
+runnable or passing until Ticket 06A passes corrected QCF4.
 
 - [ ] **QCF1 — Built-in reachability:** CLI and programmatic explicit validation
   select the statically registered built-in without injection/factory path;
@@ -58,9 +63,22 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
   shadow, empty/non-applicable plan, and \`qualified_v1\` controls construct no
   qualified resource or I/O; authority-disabled preflight precedes built-in
   construction.
-- [ ] **QCF4 — Complete Tushare:** complete statement/indicator fixtures retain
-  all eligible targets/families, call no lower provider, and record exactly the
-  Tushare endpoint calls.
+- [ ] **QCF4 — Truthful complete Tushare metadata:** from the required fresh
+  built-in origin, complete fixed Tushare company-type, statement, and indicator
+  fixtures plus authoritative BaoStock lifecycle metadata originate and bind
+  the context before ordinary dispatch. Compatible Tushare statements are
+  retained and selected and stop lower statement fallback. Tushare indicator
+  artifacts/candidates and 100% value-completeness assessments are retained;
+  ratio/rate/turnover value currency is `NOT_APPLICABLE` where declared by the
+  pinned field policy, filing consolidation scope is material and `UNPROVEN`,
+  and missing `f_ann_date` remains current-only at most, so affected Tushare
+  indicator families remain unselected. Only unresolved indicator families
+  continue sequentially through the immutable Capability Routing Plan, and
+  lower providers qualify only through their own truthful metadata. Requested
+  `CNY`/`CONSOLIDATED` is never copied into provider evidence. Exact prerequisite
+  and ordinary physical-attempt cardinality includes actual lower-provider work
+  with no hidden call, duplicate bulk work, provider-specific router branch,
+  or fan-out.
 - [ ] **QCF5 — Tushare gaps:** successful artifacts/periods survive unavailable
   endpoints and partial gaps; only unresolved work continues; no successful
   bulk acquisition repeats per target.
@@ -85,10 +103,14 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
   share one physical sequence and terminal result; one bulk artifact serves all
   covered targets/calls with deterministic reuse; materially different keys do
   not collide.
-- [ ] **QCF12 — Exact restoration:** reconstruction through the built-in restores
-  plan, eligibility, dispatcher/cache, artifacts, candidates, selections,
-  attempts, and IDs exactly; repeated work performs zero provider/network/model
-  I/O or coordinator permits; corrupt/mismatched controls fail typed.
+- [ ] **QCF12 — Exact restoration:** a plan-1.2 checkpoint produced by the fresh
+  path restores context, eligibility, field-semantics and metadata-compatibility
+  versions, assessment identities/states, dispatcher/cache, artifacts,
+  candidates, typed rejections, selections, attempts, and IDs exactly; repeated
+  work performs zero provider/network/model I/O or coordinator permits.
+  Missing, old/absent, corrupt, contradictory, or mismatched compatibility state
+  fails typed or requires explicit `START_NEW`, without current-registry repair
+  or historical rewrite.
 - [ ] **QCF13 — Pre-open validation:** every missing credential/dependency and
   invalid mode/plan/asset/pacing/Safety Ceiling/account scope/Data Usage
   Mode/runtime root/source coverage/output case fails secret-free before any
@@ -107,8 +129,10 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
   decision audit comparisons show unchanged legacy/daily authority and
   \`shadow_non_authoritative\` qualified output.
 - [ ] **QCF17 — Historical immutability:** representative historical material is
-  byte-for-byte unchanged/readable; new runs use existing schemas/identities
-  with no migration, rewrite, deletion, relabeling, or renumbering.
+  byte-for-byte unchanged/readable under its recorded contracts; plan-1.2 runs
+  use the exact forward indicator versions from the amended specification while
+  unchanged raw artifact/candidate namespaces remain stable, with no migration,
+  reinterpretation, rewrite, deletion, relabeling, or renumbering.
 - [ ] **QCF18 — Unchanged parent assurance:** PE1–PE15 and parent AC1–AC13 pass
   with their existing text, fixtures, expected results, and authority, followed
   by the full supported suite twice, Ruff, whitespace, and diff/scope checks,
@@ -116,8 +140,8 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
 
 ## Deterministic regressions
 
-- Run every focused test added by Tickets 01–05, 02A, 02B, 02C, 02D, 04A, and
-  05A plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
+- Run every focused test added by Tickets 01–05, 02A–02F, 04A, 05A, 05B, and
+  06A plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
   dispatch, report, audit, Evidence Admission, Decision Gate, Current
   Tradeability, strict-history, and daily-market tests.
 - Cover exact attempt cardinality for success, retry, capacity cooldown, skip,
@@ -138,10 +162,13 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
 - Acceptance uses disposable new run/checkpoint namespaces and existing
   content-addressed artifact behavior. It does not clear, recycle, repair, or
   overwrite historical state.
-- Legacy and pre-v2 checkpoints retain existing read/start-new/fail-typed
-  behavior. No schema, ID, provider record, snapshot, pin, report, or artifact is
-  upgraded in place.
-- Existing Capability Routing Plan, completeness, financial eligibility,
+- Historical checkpoints retain their recorded-version read behavior and are
+  never reinterpreted or upgraded in place. A plan-1.2 restore from an old or
+  absent metadata-compatibility checkpoint fails typed or requires explicit
+  `START_NEW`, with zero I/O and no repair.
+- Capability Routing Plan 1.2 remains the sole routing authority. The unchanged
+  completeness gates (100% critical and at least 90% declared-core), financial-
+  period eligibility v2, current-only/strict-PIT boundaries,
   Evidence Admission, Decision Gate, Strategy Rules, BaoStock status/lifecycle/
   strict-history authority, and daily market route are treated as immutable
   baselines.
@@ -155,10 +182,12 @@ runtime, or checkpoint cannot satisfy fresh acceptance for any of QCF4–QCF12.
 - Enabling/recommending \`qualified_v1\`, changing activation gates, provider
   routes/order, thresholds, eligibility, revision selection, evidence/decision
   authority, BaoStock authority, daily routing, or shadow disposition.
-- New router, cache, persistence authority, checkpoint sidecar, report schema,
-  provider registry, ID namespace, historical migration, provider fan-out,
-  hidden retry, account rotation, or speculative prewarming.
-- Waiving or editing QCF1–QCF18, PE1–PE15, or parent AC1–AC13 to obtain a pass.
+- New router, cache, persistence authority, checkpoint sidecar, provider
+  registry, ID namespace, historical migration, provider fan-out, hidden retry,
+  account rotation, speculative prewarming, or any schema/version beyond the
+  exact forward contracts in the amended specification.
+- Waiving or renumbering QCF1–QCF18, PE1–PE15, or parent AC1–AC13 to obtain a
+  pass; only QCF4's over-specified expectation is corrected by Ticket 06A.
 
 ## Verification commands
 
@@ -168,6 +197,7 @@ Run production-composition and provider focused suites:
 pytest -q tests/test_qualified_routing_composition_contract.py tests/test_production_qualified_provider_composition.py tests/test_qualified_routing_static_registration.py tests/test_qualified_routing_managed_lifecycle.py tests/test_qualified_routing_factory_checkpoint_restore.py
 pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_financial_eligibility_metadata_acquisition.py tests/test_financial_request_factory_context_binding.py
 pytest -q tests/test_qualified_production_source_bindings.py tests/test_qualified_routing_eligibility_context_lifecycle.py tests/test_qualified_routing_checkpoint_context_restore.py
+pytest -q tests/test_financial_indicator_field_semantics.py tests/test_financial_indicator_metadata_compatibility.py tests/test_financial_indicator_compatibility_persistence.py
 pytest -q tests/test_tushare_statement_adapters.py tests/test_tushare_indicator_adapter.py tests/test_tushare_factor_name_adapters.py tests/test_akshare_sina_statement_adapters.py tests/test_baostock_capability_adapters.py tests/test_baostock_ratio_adapters.py
 pytest -q tests/test_provider_subrequest_cache.py tests/test_provider_request_coordinator.py tests/test_mainland_physical_attempt_coordination.py tests/test_yahoo_retry_coordination.py
 \`\`\`

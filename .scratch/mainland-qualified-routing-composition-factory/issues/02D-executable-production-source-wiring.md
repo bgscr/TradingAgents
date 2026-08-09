@@ -13,7 +13,7 @@ order authority.
 **Blocked by:** 02A — Add provider-neutral eligibility acquisition context
 contracts; 02 — Assemble run-owned production provider adapters.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
