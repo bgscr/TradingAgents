@@ -626,7 +626,7 @@ def test_qualified_plan_adds_exact_company_type_evidence_route_only_once(
     asset = _asset("601328.SS")
     plan = _qualified_plan(monkeypatch, asset)
 
-    assert plan.plan_version == "1.1"
+    assert plan.plan_version == "1.2"
     assert plan.route_for(MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE) == (
         "tushare",
         "akshare_sina",
@@ -672,6 +672,13 @@ def test_historical_plan_v1_retains_routes_without_synthetic_prerequisite(
         for item in payload["request_budget_identities"]
         if item["capability"] != "financial_company_type_evidence"
     ]
+    for key in (
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_manifest_contract_version",
+        "indicator_selection_contract_version",
+    ):
+        payload.pop(key)
     signature_payload = dict(payload)
     signature_payload.pop("plan_signature")
     payload["plan_signature"] = (

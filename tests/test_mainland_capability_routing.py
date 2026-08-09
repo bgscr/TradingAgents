@@ -152,7 +152,7 @@ def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
     assert result.passed is True
     assert result.plan is not None
     plan = result.plan
-    assert plan.plan_version == "1.1"
+    assert plan.plan_version == "1.2"
     assert plan.policy_version == "mainland-capability-routing-policy-v1"
     assert plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
     assert plan.qualification_profile == "cn-a-2000-20260729-v1"
@@ -214,6 +214,16 @@ def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
     assert plan.manifest_contract_version == "financial-manifest-v2"
     assert plan.selection_contract_version == (
         "financial-period-selection-statement-v2"
+    )
+    assert plan.indicator_field_semantics_version == (
+        "financial-indicator-field-semantics-v1"
+    )
+    assert plan.indicator_metadata_compatibility_version == (
+        "financial-indicator-metadata-compatibility-v1"
+    )
+    assert plan.indicator_manifest_contract_version == "financial-manifest-v3"
+    assert plan.indicator_selection_contract_version == (
+        "financial-period-selection-v3"
     )
     assert plan.degradation_contract_version == "financial-degradation-v1"
     assert tuple(item.endpoint_id for item in plan.endpoint_pacing_identities) == (

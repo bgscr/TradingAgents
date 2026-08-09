@@ -29,7 +29,8 @@ from tradingagents.evidence import (
 )
 
 CAPABILITY_ROUTING_PLAN_VERSION_V1 = "1.0"
-CAPABILITY_ROUTING_PLAN_VERSION = "1.1"
+CAPABILITY_ROUTING_PLAN_VERSION_V2 = "1.1"
+CAPABILITY_ROUTING_PLAN_VERSION = "1.2"
 CAPABILITY_ROUTING_POLICY_VERSION = "mainland-capability-routing-policy-v1"
 QUALIFICATION_PROFILE = "cn-a-2000-20260729-v1"
 NORMALIZER_VERSION_V1 = "mainland-financial-normalizer-v1"
@@ -74,6 +75,22 @@ def _contract_versions_for_mode(
     )
 
 
+_CURRENT_INDICATOR_CONTRACT_BINDINGS = (
+    "financial-indicator-field-semantics-v1",
+    "financial-indicator-metadata-compatibility-v1",
+    "financial-manifest-v3",
+    "financial-period-selection-v3",
+)
+
+
+def _indicator_contract_bindings_for_plan_version(
+    plan_version: str,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+        return _CURRENT_INDICATOR_CONTRACT_BINDINGS
+    return (None, None, None, None)
+
+
 class MainlandCapability(str, Enum):
     DAILY_MARKET_SNAPSHOT = "daily_market_snapshot"
     BALANCE_SHEET = "balance_sheet"
@@ -105,7 +122,10 @@ def _capabilities_for_plan_version(
 ) -> tuple[MainlandCapability, ...]:
     if plan_version == CAPABILITY_ROUTING_PLAN_VERSION_V1:
         return _PLAN_V1_CAPABILITIES
-    if plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+    if plan_version in {
+        CAPABILITY_ROUTING_PLAN_VERSION_V2,
+        CAPABILITY_ROUTING_PLAN_VERSION,
+    }:
         return tuple(MainlandCapability)
     raise ValueError("Capability Routing Plan version is unsupported")
 
@@ -224,7 +244,7 @@ class MainlandCapabilityRoutingPlan(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    plan_version: Literal["1.0", "1.1"] = CAPABILITY_ROUTING_PLAN_VERSION
+    plan_version: Literal["1.0", "1.1", "1.2"] = CAPABILITY_ROUTING_PLAN_VERSION
     policy_version: Literal[
         "mainland-capability-routing-policy-v1"
     ] = CAPABILITY_ROUTING_POLICY_VERSION
@@ -256,6 +276,18 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         "financial-period-selection-v1",
         "financial-period-selection-statement-v2",
     ] = "financial-period-selection-statement-v2"
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_manifest_contract_version: Literal[
+        "financial-manifest-v3"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_selection_contract_version: Literal[
+        "financial-period-selection-v3"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
     degradation_contract_version: Literal[
         "financial-degradation-v1"
     ] = "financial-degradation-v1"
@@ -299,6 +331,17 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         )
         if self.manifest_contract_version != expected_manifest_version:
             raise ValueError("routing mode and manifest contract version contradict")
+        indicator_bindings = (
+            self.indicator_field_semantics_version,
+            self.indicator_metadata_compatibility_version,
+            self.indicator_manifest_contract_version,
+            self.indicator_selection_contract_version,
+        )
+        expected_indicator_bindings = (
+            _indicator_contract_bindings_for_plan_version(self.plan_version)
+        )
+        if indicator_bindings != expected_indicator_bindings:
+            raise ValueError("routing plan indicator contract bindings contradict version")
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
             historical_pre_v2 = (
                 self.eligibility_policy_version is None
@@ -403,7 +446,7 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
 
     contract_version: Literal["1.0"] = "1.0"
     mode: MainlandCapabilityRoutingMode
-    plan_version: Literal["1.0", "1.1"]
+    plan_version: Literal["1.0", "1.1", "1.2"]
     policy_version: Literal["mainland-capability-routing-policy-v1"]
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
     enabled_tushare_capabilities: tuple[TushareCapability, ...]
@@ -424,6 +467,18 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         "financial-period-selection-v1",
         "financial-period-selection-statement-v2",
     ]
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_manifest_contract_version: Literal[
+        "financial-manifest-v3"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    indicator_selection_contract_version: Literal[
+        "financial-period-selection-v3"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
     degradation_contract_version: Literal["financial-degradation-v1"]
     eligibility_policy_version: Literal[
         "mainland-financial-period-eligibility-v2"
@@ -465,6 +520,18 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
             completeness_policy_version=plan.completeness_policy_version,
             manifest_contract_version=plan.manifest_contract_version,
             selection_contract_version=plan.selection_contract_version,
+            indicator_field_semantics_version=(
+                plan.indicator_field_semantics_version
+            ),
+            indicator_metadata_compatibility_version=(
+                plan.indicator_metadata_compatibility_version
+            ),
+            indicator_manifest_contract_version=(
+                plan.indicator_manifest_contract_version
+            ),
+            indicator_selection_contract_version=(
+                plan.indicator_selection_contract_version
+            ),
             degradation_contract_version=plan.degradation_contract_version,
             eligibility_policy_version=plan.eligibility_policy_version,
             financial_eligibility_policy=plan.financial_eligibility_policy,
@@ -502,6 +569,17 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
             raise ValueError(
                 "routing rollout mode and manifest contract version contradict"
             )
+        indicator_bindings = (
+            self.indicator_field_semantics_version,
+            self.indicator_metadata_compatibility_version,
+            self.indicator_manifest_contract_version,
+            self.indicator_selection_contract_version,
+        )
+        expected_indicator_bindings = (
+            _indicator_contract_bindings_for_plan_version(self.plan_version)
+        )
+        if indicator_bindings != expected_indicator_bindings:
+            raise ValueError("routing rollout indicator bindings contradict version")
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
             historical_pre_v2 = (
                 self.eligibility_policy_version is None
@@ -1019,7 +1097,10 @@ def _routes(
             ),
             MainlandCapability.ISSUER_LIFECYCLE: ("baostock",),
         }
-        if plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+        if plan_version in {
+            CAPABILITY_ROUTING_PLAN_VERSION_V2,
+            CAPABILITY_ROUTING_PLAN_VERSION,
+        }:
             providers[MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE] = (
                 "tushare",
                 "akshare_sina",
@@ -1120,6 +1201,19 @@ def _build_plan(
             ),
             financial_eligibility_policy=eligibility_policy.model_dump(mode="json"),
             financial_eligibility_binding=eligibility_binding.model_dump(mode="json"),
+        )
+    if effective_plan_version == CAPABILITY_ROUTING_PLAN_VERSION:
+        (
+            field_semantics_version,
+            metadata_compatibility_version,
+            indicator_manifest_version,
+            indicator_selection_version,
+        ) = _indicator_contract_bindings_for_plan_version(effective_plan_version)
+        payload.update(
+            indicator_field_semantics_version=field_semantics_version,
+            indicator_metadata_compatibility_version=metadata_compatibility_version,
+            indicator_manifest_contract_version=indicator_manifest_version,
+            indicator_selection_contract_version=indicator_selection_version,
         )
     return MainlandCapabilityRoutingPlan(
         **payload,
@@ -1272,6 +1366,9 @@ def preflight_mainland_capability_routing(
 
 
 __all__ = [
+    "CAPABILITY_ROUTING_PLAN_VERSION",
+    "CAPABILITY_ROUTING_PLAN_VERSION_V1",
+    "CAPABILITY_ROUTING_PLAN_VERSION_V2",
     "MainlandCapability",
     "MainlandCapabilityRoutingCheckpointAction",
     "MainlandCapabilityRoutingCheckpointCompatibility",

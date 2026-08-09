@@ -539,11 +539,11 @@ def test_canonical_request_identity_snapshots_are_stable(
 
     assert statement.request_identity == (
         "financial-statement-routing-request:v3:"
-        "43b230feb64c35f447de58ad00fddba5b2479ba6098fab83f94e3a2c7b4e66cb"
+        "8c2d4a5b6851e10e04c292f62f3701f02e4a381da98897aa0fdd7b089097bb4e"
     )
     assert indicator.request_identity == (
         "financial-indicator-routing-request:v6:"
-        "9924c96fe031280e67eab0709f39a4929f23e76a31378723bd4fbb24e0ad1641"
+        "33a47c3a8254535a6e1d1f8b6142ab281913f224a3d09ac44adcc0ce46832feb"
     )
     assert sha256(
         json.dumps(
@@ -552,7 +552,7 @@ def test_canonical_request_identity_snapshots_are_stable(
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-    ).hexdigest() == "cf0ffd899595eedab20c9dba24d84c05915d83df52967e78b137898ae863cffd"
+    ).hexdigest() == "3b69d23edc8917458bc8b891ddc48821a661495061f737979e09ee9c82620276"
     assert sha256(
         json.dumps(
             indicator.safe_projection(),
@@ -560,7 +560,7 @@ def test_canonical_request_identity_snapshots_are_stable(
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-    ).hexdigest() == "ad800eb9ab6942d82e41ac7f274b8a90544181710665c209e9d2600d3be72414"
+    ).hexdigest() == "893fda03a3087e97c351b0dc33a10224cdd08ad4169c5af560f0ff6f69624449"
 
 
 def test_correlation_ids_are_nonmaterial_but_material_arguments_are_distinct(
