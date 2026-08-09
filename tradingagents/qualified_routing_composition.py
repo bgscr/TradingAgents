@@ -50,6 +50,7 @@ from tradingagents.dataflows.baostock_capabilities import (
 )
 from tradingagents.dataflows.baostock_ratios import (
     BAOSTOCK_RATIO_NORMALIZER_VERSION,
+    BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
     BaoStockRatioFamilyAdapter,
     assess_baostock_ratio_family_results,
 )
@@ -74,6 +75,7 @@ from tradingagents.dataflows.financial_capability_routing import (
 )
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_MANIFEST_V2,
+    FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
     FinancialAvailabilityScope,
     FinancialConsolidationScope,
     FinancialRatioFamily,
@@ -104,6 +106,9 @@ from tradingagents.dataflows.financial_eligibility_metadata import (
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
 )
+from tradingagents.dataflows.financial_indicator_metadata import (
+    evaluate_financial_indicator_candidates,
+)
 from tradingagents.dataflows.financial_request_factory import (
     build_financial_indicator_routing_request,
     build_financial_statement_routing_request,
@@ -121,6 +126,7 @@ from tradingagents.dataflows.provider_subrequests import (
 from tradingagents.dataflows.qualified_production_sources import (
     AKSHARE_FACTOR_NORMALIZER_VERSION,
     AKSHARE_INDICATOR_NORMALIZER_VERSION,
+    AKSHARE_INDICATOR_NORMALIZER_VERSION_V1,
     AKSHARE_NAME_NORMALIZER_VERSION,
     YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION,
     YFINANCE_PROFILE_NORMALIZER_VERSION,
@@ -914,6 +920,7 @@ def _cache_normalizer_is_compatible(
         return key.normalizer_version in {
             BAOSTOCK_CAPABILITY_NORMALIZER_VERSION,
             BAOSTOCK_RATIO_NORMALIZER_VERSION,
+            BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
         }
     if key.provider_id == "akshare_sina":
         external_normalizer = {
@@ -921,11 +928,14 @@ def _cache_normalizer_is_compatible(
             "financial_indicators": AKSHARE_INDICATOR_NORMALIZER_VERSION,
             "issuer_name_events": AKSHARE_NAME_NORMALIZER_VERSION,
         }.get(key.capacity_scope)
-        return key.normalizer_version in {
+        compatible_normalizers = {
             plan.normalizer_version,
             external_normalizer,
             f"{key.capacity_scope}-terminal-v1",
         }
+        if key.capacity_scope == "financial_indicators":
+            compatible_normalizers.add(AKSHARE_INDICATOR_NORMALIZER_VERSION_V1)
+        return key.normalizer_version in compatible_normalizers
     if key.provider_id == "yfinance":
         external_normalizer = {
             "current_financial_profile": YFINANCE_PROFILE_NORMALIZER_VERSION,
@@ -2873,6 +2883,8 @@ def _tushare_indicator_source(
         result = adapter.acquire_financial_indicators(
             instrument_identity=request.instrument_identity,
             company_type_resolution=request.company_type_resolution,
+            requested_value_currency=request.currency,
+            requested_consolidation_scope=request.consolidation_scope,
             range_start=min(period_ends),
             as_of_date=request.as_of_date,
             eligible_reporting_period_ends=tuple(
@@ -2947,10 +2959,24 @@ def _baostock_ratio_source(
             results=results,
             eligible_reporting_period_ends=eligible_periods,
         )
-        return financial_period_response_from_indicator_adapter(
+        response = financial_period_response_from_indicator_adapter(
             provider_id="baostock_qualified_families",
             result=aggregate,
         )
+        if response.kind.value != "available":
+            return response
+        compatibility = evaluate_financial_indicator_candidates(
+            candidates=response.candidates,
+            instrument_identity=request.instrument_identity,
+            requested_value_currency=request.currency,
+            requested_filing_consolidation_scope=request.consolidation_scope,
+            pit_as_of_date=request.as_of_date,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+            normalizer_contract_version=BAOSTOCK_RATIO_NORMALIZER_VERSION,
+        )
+        payload = response.model_dump(mode="python")
+        payload["indicator_metadata_compatibility"] = compatibility
+        return FinancialProviderPeriodResponse.model_validate(payload)
 
     return source
 
@@ -3497,6 +3523,9 @@ def _external_response_with_attempts(
     if isinstance(response, FinancialProviderPeriodResponse):
         payload["physical_attempt_events"] = result.attempt_events
         payload["subrequest_outcomes"] = ()
+        payload["indicator_metadata_compatibility"] = (
+            response.indicator_metadata_compatibility
+        )
         return FinancialProviderPeriodResponse.model_validate(payload)
     if isinstance(response, FinancialCompanyTypeEvidenceProviderResponse):
         return FinancialCompanyTypeEvidenceProviderResponse.model_validate(payload)

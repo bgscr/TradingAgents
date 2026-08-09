@@ -41,6 +41,7 @@ from tradingagents.dataflows.provider_subrequests import (
 from tradingagents.dataflows.qualified_production_sources import (
     AKSHARE_FACTOR_NORMALIZER_VERSION,
     AKSHARE_INDICATOR_NORMALIZER_VERSION,
+    AKSHARE_INDICATOR_NORMALIZER_VERSION_V1,
     AKSHARE_NAME_NORMALIZER_VERSION,
     YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION,
     YFINANCE_PROFILE_NORMALIZER_VERSION,
@@ -781,6 +782,11 @@ def test_remaining_five_production_bindings_are_executable_typed_and_cached(
     indicator = results["financial_indicators"]
     assert indicator.kind.value == "available"
     assert indicator.candidates
+    assert indicator.indicator_metadata_compatibility
+    assert all(
+        not assessment.compatible
+        for assessment in indicator.indicator_metadata_compatibility
+    )
     assert all(
         candidate.period_identity.capability.value == "financial_ratio_family"
         for candidate in indicator.candidates
@@ -797,6 +803,7 @@ def test_remaining_five_production_bindings_are_executable_typed_and_cached(
     assert profile.kind.value == "available"
     assert profile.degraded_current_profile is True
     assert profile.candidates == ()
+    assert profile.indicator_metadata_compatibility == ()
     native_factor = results["adjustment_factors"]
     assert native_factor.kind.value == "available"
     assert native_factor.derived is False
@@ -874,6 +881,19 @@ def test_all_six_production_sources_restore_as_zero_attempt_cache_hits(
                 blueprint.routing_plan,
             )
             for entry in checkpoint_model.entries
+        )
+        akshare_indicator_entry = next(
+            entry
+            for entry in checkpoint_model.entries
+            if entry.key.capacity_scope == "financial_indicators"
+        )
+        assert composition_module._cache_normalizer_is_compatible(
+            akshare_indicator_entry.key.model_copy(
+                update={
+                    "normalizer_version": AKSHARE_INDICATOR_NORMALIZER_VERSION_V1
+                }
+            ),
+            blueprint.routing_plan,
         )
         for provider_id in ("akshare_sina", "yfinance"):
             provider_entries = tuple(

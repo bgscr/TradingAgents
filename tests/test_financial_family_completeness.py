@@ -8,7 +8,9 @@ from hashlib import sha256
 
 import pytest
 
-from tests.test_financial_capability_routing_selection import _shadow_plan
+from tests.test_financial_capability_routing_selection import (
+    _historical_shadow_plan,
+)
 from tests.test_financial_manifest_evidence_reporting import _attempt_event
 from tests.test_financial_period_contracts import (
     _candidate as _statement_candidate,
@@ -266,7 +268,7 @@ def _route(
         eligible_reporting_period_ends=(date(2026, 6, 30), *_REPORTING_TARGETS),
         family_evidence_requirements=requirements or _requirements(families),
     )
-    plan = _shadow_plan(monkeypatch)
+    plan = _historical_shadow_plan(monkeypatch)
     result = MainlandFinancialCapabilityRouter(
         routing_plan=plan,
         statement_sources={},

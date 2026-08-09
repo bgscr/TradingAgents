@@ -499,7 +499,9 @@ def test_ticket06_checkpoint_round_trip_is_exact_and_performs_zero_io(
         selection_request,
     )
 
-    assert resumed.routing_result == first.routing_result
+    assert resumed.routing_result.model_dump(
+        mode="json"
+    ) == first.routing_result.model_dump(mode="json")
     assert resumed.selection_request == first.selection_request
     assert resumed.disposition == "duplicate_suppressed"
     assert json.dumps(checkpoint, sort_keys=True, separators=(",", ":")) == before

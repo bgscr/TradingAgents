@@ -1584,6 +1584,64 @@ def assess_financial_indicator_metadata_compatibility(
     )
 
 
+def evaluate_financial_indicator_candidates(
+    *,
+    candidates: Sequence[FinancialPeriodCandidate],
+    instrument_identity: InstrumentIdentityEvidence,
+    requested_value_currency: str,
+    requested_filing_consolidation_scope: FinancialConsolidationScope,
+    pit_as_of_date: date,
+    declaration_version: str,
+    normalizer_contract_version: str,
+) -> tuple[FinancialIndicatorMetadataCompatibilityAssessment, ...]:
+    """Evaluate truthful candidate-bound metadata through one provider-neutral seam."""
+
+    assessments: list[FinancialIndicatorMetadataCompatibilityAssessment] = []
+    for candidate in sorted(candidates, key=lambda item: item.candidate_identity):
+        if not candidate.fields:
+            continue
+        identity = candidate.period_identity
+        family = identity.ratio_family
+        if family is None:
+            raise ValueError("indicator metadata evaluation requires a ratio family")
+        raw_currency = identity.currency.upper()
+        raw_scope = identity.consolidation_scope
+        provider_metadata = tuple(
+            FinancialIndicatorProviderFieldMetadata(
+                provider_id=candidate.artifact.dataset.provider_id,
+                provider_artifact_identity=candidate.artifact.artifact_identity,
+                normalized_field=field.normalized_field,
+                unit_normalization_contract_version=normalizer_contract_version,
+                value_currency=(
+                    None if raw_currency in {"UNKNOWN", "XXX"} else raw_currency
+                ),
+                raw_value_currency_marker=raw_currency,
+                filing_consolidation_scope=(
+                    None
+                    if raw_scope is FinancialConsolidationScope.UNKNOWN
+                    else raw_scope
+                ),
+                raw_filing_consolidation_scope_marker=raw_scope.value.upper(),
+            )
+            for field in candidate.fields
+        )
+        assessments.append(
+            assess_financial_indicator_metadata_compatibility(
+                candidate=candidate,
+                family=family,
+                instrument_identity=instrument_identity,
+                requested_value_currency=requested_value_currency,
+                requested_filing_consolidation_scope=(
+                    requested_filing_consolidation_scope
+                ),
+                pit_as_of_date=pit_as_of_date,
+                declaration_version=declaration_version,
+                provider_field_metadata=provider_metadata,
+            )
+        )
+    return tuple(assessments)
+
+
 __all__ = [
     "FINANCIAL_INDICATOR_FIELD_SEMANTICS_IDENTITY_NAMESPACE",
     "FINANCIAL_INDICATOR_FIELD_SEMANTICS_REGISTRY",
@@ -1607,6 +1665,7 @@ __all__ = [
     "FinancialIndicatorSemanticApplicability",
     "FinancialIndicatorSemanticAssessmentState",
     "assess_financial_indicator_metadata_compatibility",
+    "evaluate_financial_indicator_candidates",
     "financial_indicator_class_rule",
     "financial_indicator_field_semantics",
     "financial_indicator_field_semantics_policy_v1",

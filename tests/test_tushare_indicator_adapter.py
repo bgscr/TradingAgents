@@ -42,10 +42,13 @@ from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestOutcomeKind,
 )
 from tradingagents.dataflows.tushare_indicators import (
+    TUSHARE_FINANCIAL_INDICATOR_ADAPTER_VERSION,
+    TUSHARE_FINANCIAL_INDICATOR_RESULT_VERSION,
     TushareFinancialIndicatorAdapter,
     TushareFinancialIndicatorAdapterConfigurationError,
     TushareFinancialIndicatorAdapterFailureReason,
     TushareFinancialIndicatorAdapterResult,
+    TushareFinancialIndicatorAdapterResultV2,
     TushareFinancialIndicatorSdkClient,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -315,6 +318,10 @@ def test_complete_non_bank_history_persists_raw_artifact_and_passes_eight_period
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=_PERIODS,
@@ -328,6 +335,21 @@ def test_complete_non_bank_history_persists_raw_artifact_and_passes_eight_period
         }
     ]
     assert result.outcome.kind is ProviderSubrequestOutcomeKind.AVAILABLE
+    assert isinstance(result, TushareFinancialIndicatorAdapterResultV2)
+    assert result.contract_version == TUSHARE_FINANCIAL_INDICATOR_RESULT_VERSION
+    historical_payload = result.model_dump(
+        mode="python",
+        exclude={"metadata_compatibility"},
+    )
+    historical_payload["contract_version"] = (
+        TUSHARE_FINANCIAL_INDICATOR_ADAPTER_VERSION
+    )
+    historical = TushareFinancialIndicatorAdapterResult.model_validate(
+        historical_payload
+    )
+    assert historical.contract_version == "tushare-financial-indicator-adapter-v1"
+    assert historical.candidates == result.candidates
+    assert historical.row_artifacts == result.row_artifacts
     assert len(result.attempt_events) == 1
     assert result.attempt_events[0].capacity_scope == "fina_indicator"
     assert result.provider_artifact is not None
@@ -378,6 +400,18 @@ def test_complete_non_bank_history_persists_raw_artifact_and_passes_eight_period
     assert gross_margin.normalized_value == "0.4"
     assert gross_margin.normalized_unit == "RATIO"
     assert first_profit.period_identity.currency == "XXX"
+    profit_compatibility = next(
+        item
+        for item in result.metadata_compatibility
+        if item.candidate_identity == first_profit.candidate_identity
+    )
+    value_currency = profit_compatibility.field_assessments[0].dimensions[2]
+    filing_scope = profit_compatibility.field_assessments[0].dimensions[3]
+    assert value_currency.raw_provider_marker == "XXX"
+    assert value_currency.state.value == "not_applicable"
+    assert filing_scope.raw_provider_marker == "UNKNOWN"
+    assert filing_scope.state.value == "unproven"
+    assert profit_compatibility.compatible is False
     assert first_profit.filing_metadata.retrieved_at == _OBSERVED_AT
     assert first_profit.filing_metadata.observed_at == _OBSERVED_AT
     profit_history = next(
@@ -436,6 +470,10 @@ def test_bank_history_uses_bank_qualified_indicator_fields(
             instrument_identity=bank_identity,
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -601,8 +639,9 @@ def test_sparse_family_period_is_rejected_without_discarding_usable_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rows = _complete_non_bank_rows()
+    rows["ts_code"] = "601328.SH"
     affected_period = _PERIODS[0]
-    rows.loc[0, ["ebitda_margin", "grossprofit_margin"]] = None
+    rows.loc[0, ["netprofit_margin"]] = None
     plan = _qualified_plan(monkeypatch)
     artifact_store = ProviderSubrequestArtifactStore(tmp_path / "artifacts")
 
@@ -614,9 +653,13 @@ def test_sparse_family_period_is_rejected_without_discarding_usable_family(
             artifact_store=artifact_store,
             run_scope_id="ticket-05-family-isolation",
         ).adapter.acquire_financial_indicators(
-            instrument_identity=_identity(),
+            instrument_identity=_identity("601328.SS"),
             company_type_resolution=_company_type_resolution(
-                FinancialCompanyType.INDUSTRIAL_NON_BANK
+                FinancialCompanyType.BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -638,7 +681,7 @@ def test_sparse_family_period_is_rejected_without_discarding_usable_family(
         FinancialPeriodDisposition.REJECTED
     )
     assert affected[FinancialRatioFamily.PROFIT].core_coverage == (
-        Decimal(7) / Decimal(8)
+        Decimal(4) / Decimal(5)
     )
     assert FinancialPeriodRejectionReason.INSUFFICIENT_COMPLETENESS in (
         affected[FinancialRatioFamily.PROFIT].rejection_reasons
@@ -678,6 +721,10 @@ def test_missing_required_reporting_period_fails_aggregate_gate(
             instrument_identity=_identity(),
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -719,6 +766,10 @@ def test_indicator_rows_remain_distinct_and_cannot_satisfy_statement_requests(
             instrument_identity=_identity(),
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -798,6 +849,10 @@ def test_unknown_company_type_and_incompatible_unit_currency_are_typed(
         ).adapter.acquire_financial_indicators(
             instrument_identity=_identity(),
             company_type_resolution=unknown_resolution,
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=(_PERIODS[0],),
@@ -812,6 +867,10 @@ def test_unknown_company_type_and_incompatible_unit_currency_are_typed(
             instrument_identity=_identity(),
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -862,6 +921,10 @@ def test_wrong_or_ambiguous_response_unit_is_rejected_before_conversion(
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=(_PERIODS[0],),
@@ -897,6 +960,10 @@ def test_result_enforces_bulk_row_lineage_and_every_row_disposition(
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=(_PERIODS[0],),
@@ -914,7 +981,7 @@ def test_result_enforces_bulk_row_lineage_and_every_row_disposition(
     rogue_payload = result.model_dump(mode="python")
     rogue_payload["artifact"] = rogue_bulk.model_dump(mode="python")
     with pytest.raises(ValueError, match="row artifact contradicts bulk artifact"):
-        TushareFinancialIndicatorAdapterResult.model_validate(rogue_payload)
+        TushareFinancialIndicatorAdapterResultV2.model_validate(rogue_payload)
 
     orphan_identity = result.row_artifacts[0].artifact_identity
     orphan_payload = result.model_dump(mode="python")
@@ -933,13 +1000,18 @@ def test_result_enforces_bulk_row_lineage_and_every_row_disposition(
         for assessment in orphan_payload["period_completeness"]
         if assessment["candidate_identity"] not in removed_candidates
     ]
+    orphan_payload["metadata_compatibility"] = [
+        assessment
+        for assessment in orphan_payload["metadata_compatibility"]
+        if assessment["candidate_identity"] not in removed_candidates
+    ]
     orphan_payload["row_rejections"] = [
         rejection
         for rejection in orphan_payload["row_rejections"]
         if rejection["artifact_identity"] != orphan_identity
     ]
     with pytest.raises(ValueError, match="row artifact has no disposition"):
-        TushareFinancialIndicatorAdapterResult.model_validate(orphan_payload)
+        TushareFinancialIndicatorAdapterResultV2.model_validate(orphan_payload)
 
 
 @pytest.mark.unit
@@ -960,6 +1032,10 @@ def test_rejection_identities_and_order_are_content_canonical(
             instrument_identity=_identity(),
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -1054,6 +1130,10 @@ def test_provider_failures_are_typed_single_attempt_and_secret_safe(
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=_PERIODS,
@@ -1115,6 +1195,10 @@ def test_concurrent_and_completed_duplicates_share_one_physical_event(
                 instrument_identity=_identity(),
                 company_type_resolution=_company_type_resolution(
                     FinancialCompanyType.INDUSTRIAL_NON_BANK
+                ),
+                requested_value_currency="CNY",
+                requested_consolidation_scope=(
+                    FinancialConsolidationScope.CONSOLIDATED
                 ),
                 range_start=date(2021, 1, 1),
                 as_of_date=date(2026, 7, 30),
@@ -1184,6 +1268,10 @@ def test_checkpoint_restore_reprojects_without_provider_io(
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=_PERIODS,
@@ -1204,6 +1292,10 @@ def test_checkpoint_restore_reprojects_without_provider_io(
             instrument_identity=_identity(),
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
             ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
@@ -1289,6 +1381,10 @@ def test_malformed_family_value_preserves_artifact_and_other_families(
             company_type_resolution=_company_type_resolution(
                 FinancialCompanyType.INDUSTRIAL_NON_BANK
             ),
+            requested_value_currency="CNY",
+            requested_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
             range_start=date(2021, 1, 1),
             as_of_date=date(2026, 7, 30),
             eligible_reporting_period_ends=_PERIODS,
@@ -1341,6 +1437,10 @@ def test_changed_response_creates_new_artifact_without_overwrite(
                 instrument_identity=_identity(),
                 company_type_resolution=_company_type_resolution(
                     FinancialCompanyType.INDUSTRIAL_NON_BANK
+                ),
+                requested_value_currency="CNY",
+                requested_consolidation_scope=(
+                    FinancialConsolidationScope.CONSOLIDATED
                 ),
                 range_start=date(2021, 1, 1),
                 as_of_date=date(2026, 7, 30),

@@ -83,6 +83,12 @@ from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
 )
+from tradingagents.dataflows.financial_indicator_metadata import (
+    FinancialIndicatorMetadataCompatibilityAssessment,
+    FinancialIndicatorMetadataDimension,
+    FinancialIndicatorMetadataReason,
+    FinancialIndicatorSemanticAssessmentState,
+)
 from tradingagents.dataflows.financial_period_targets import (
     construct_mainland_financial_period_targets,
     filter_mainland_financial_acquisition_periods,
@@ -383,6 +389,10 @@ class FinancialProviderPeriodResponse(BaseModel):
     degraded_current_profile: bool = False
     subrequest_outcomes: tuple[FinancialSubrequestAcquisitionOutcome, ...] = ()
     adapter_row_rejections: tuple[FinancialAdapterRowRejection, ...] = ()
+    indicator_metadata_compatibility: tuple[
+        FinancialIndicatorMetadataCompatibilityAssessment,
+        ...,
+    ] = Field(default=(), exclude=True)
 
     @classmethod
     def available(
@@ -398,6 +408,9 @@ class FinancialProviderPeriodResponse(BaseModel):
         degraded_current_profile: bool = False,
         subrequest_outcomes: Sequence[FinancialSubrequestAcquisitionOutcome] = (),
         adapter_row_rejections: Sequence[FinancialAdapterRowRejection] = (),
+        indicator_metadata_compatibility: Sequence[
+            FinancialIndicatorMetadataCompatibilityAssessment
+        ] = (),
     ) -> FinancialProviderPeriodResponse:
         return cls(
             provider_id=provider_id,
@@ -411,6 +424,9 @@ class FinancialProviderPeriodResponse(BaseModel):
             degraded_current_profile=degraded_current_profile,
             subrequest_outcomes=tuple(subrequest_outcomes),
             adapter_row_rejections=tuple(adapter_row_rejections),
+            indicator_metadata_compatibility=tuple(
+                indicator_metadata_compatibility
+            ),
         )
 
     @classmethod
@@ -498,6 +514,20 @@ class FinancialProviderPeriodResponse(BaseModel):
                 raise ValueError(
                     "degraded current profile must be a candidate-free Yahoo response"
                 )
+            assessed_candidate_ids = tuple(
+                item.candidate_identity
+                for item in self.indicator_metadata_compatibility
+            )
+            if len(assessed_candidate_ids) != len(set(assessed_candidate_ids)):
+                raise ValueError(
+                    "provider response indicator compatibility must be unique"
+                )
+            if not set(assessed_candidate_ids).issubset(
+                {candidate.candidate_identity for candidate in self.candidates}
+            ):
+                raise ValueError(
+                    "provider response indicator compatibility is not candidate-bound"
+                )
         elif (
             self.response_artifact is not None
             or self.retained_artifacts
@@ -505,6 +535,7 @@ class FinancialProviderPeriodResponse(BaseModel):
             or self.reason is None
             or self.degraded_current_profile
             or self.adapter_row_rejections
+            or self.indicator_metadata_compatibility
         ):
             raise ValueError("unavailable provider response cannot carry artifacts")
         return self
@@ -1457,6 +1488,137 @@ class FinancialIndicatorProviderRouteCall(BaseModel):
     adapter_row_rejections: tuple[FinancialAdapterRowRejection, ...] = ()
 
 
+class FinancialIndicatorMetadataIncompatibility(BaseModel):
+    """One typed material reason retained before Ticket 05B persistence."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    normalized_field: str
+    dimension: FinancialIndicatorMetadataDimension
+    reason: FinancialIndicatorMetadataReason
+
+
+class FinancialIndicatorMetadataIncompatibleRejection(BaseModel):
+    """Complete candidate retained but excluded from selection by metadata."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    period_identity: str = Field(pattern=r"^financial-period:v1:[0-9a-f]{64}$")
+    family: FinancialRatioFamily
+    completeness_assessment: FinancialPeriodCompletenessAssessment
+    compatibility_assessment: FinancialIndicatorMetadataCompatibilityAssessment
+    typed_reasons: tuple[FinancialIndicatorMetadataIncompatibility, ...]
+
+    @property
+    def compatibility_assessment_identity(self) -> str:
+        return self.compatibility_assessment.assessment_identity
+
+    @model_validator(mode="after")
+    def _validate_rejection(
+        self,
+    ) -> FinancialIndicatorMetadataIncompatibleRejection:
+        compatibility = self.compatibility_assessment
+        if (
+            compatibility.compatible
+            or not self.typed_reasons
+            or compatibility.candidate_identity != self.candidate_identity
+            or compatibility.provider_artifact_identity != self.artifact_identity
+            or compatibility.period_identity != self.period_identity
+            or compatibility.family is not self.family
+            or self.completeness_assessment.candidate_identity
+            != self.candidate_identity
+        ):
+            raise ValueError("indicator metadata rejection binding is inconsistent")
+        return self
+
+
+def _validate_indicator_metadata_compatibility_binding(
+    *,
+    candidate: FinancialPeriodCandidate,
+    compatibility: FinancialIndicatorMetadataCompatibilityAssessment,
+    request: FinancialIndicatorRoutingRequest,
+    field_semantics_version: str,
+    metadata_compatibility_version: str,
+) -> None:
+    identity = candidate.period_identity
+    retained_field_set = tuple(
+        sorted(field.normalized_field for field in candidate.fields)
+    )
+    if (
+        compatibility.contract_version != metadata_compatibility_version
+        or compatibility.field_semantics_version != field_semantics_version
+    ):
+        raise ValueError("indicator metadata compatibility plan binding mismatch")
+    if (
+        compatibility.instrument_identity != request.instrument_identity
+        or compatibility.requested_value_currency != request.currency
+        or compatibility.requested_filing_consolidation_scope
+        is not request.consolidation_scope
+        or compatibility.pit_as_of_date != request.as_of_date
+    ):
+        raise ValueError("indicator metadata compatibility request binding mismatch")
+    if (
+        compatibility.provider_id != candidate.artifact.dataset.provider_id
+        or compatibility.provider_artifact_identity
+        != candidate.artifact.artifact_identity
+        or compatibility.candidate_identity != candidate.candidate_identity
+        or compatibility.period_identity != identity.period_identity
+        or compatibility.family is not identity.ratio_family
+        or compatibility.period_end != identity.period_end
+        or compatibility.retained_field_set != retained_field_set
+        or compatibility.announcement_date != candidate.filing_metadata.ann_date
+        or compatibility.first_publication_date
+        != candidate.filing_metadata.f_ann_date
+        or compatibility.revision_observed_at != candidate.artifact.observed_at
+        or compatibility.filing_metadata_observed_at
+        != candidate.filing_metadata.observed_at
+    ):
+        raise ValueError("indicator metadata compatibility candidate binding mismatch")
+    assessments_by_field = {
+        field.normalized_field: field
+        for field in compatibility.field_assessments
+    }
+    raw_currency = identity.currency.upper()
+    provider_currency = (
+        None if raw_currency in {"UNKNOWN", "XXX"} else raw_currency
+    )
+    raw_scope = identity.consolidation_scope
+    provider_scope = (
+        None
+        if raw_scope is FinancialConsolidationScope.UNKNOWN
+        else raw_scope.value
+    )
+    for field in candidate.fields:
+        dimensions = {
+            item.dimension: item
+            for item in assessments_by_field[field.normalized_field].dimensions
+        }
+        unit = dimensions[FinancialIndicatorMetadataDimension.VALUE_UNIT]
+        value_currency = dimensions[
+            FinancialIndicatorMetadataDimension.VALUE_CURRENCY
+        ]
+        filing_scope = dimensions[
+            FinancialIndicatorMetadataDimension.FILING_CONSOLIDATION_SCOPE
+        ]
+        if (
+            unit.raw_provider_marker != field.original_unit
+            or unit.raw_provider_value != field.normalized_unit
+            or value_currency.raw_provider_marker != raw_currency
+            or value_currency.raw_provider_value != provider_currency
+            or filing_scope.raw_provider_marker != raw_scope.value.upper()
+            or filing_scope.raw_provider_value != provider_scope
+        ):
+            raise ValueError(
+                "indicator metadata compatibility raw provider binding mismatch"
+            )
+
+
 class FinancialStatementRoutingResult(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -1531,6 +1693,10 @@ class FinancialIndicatorRoutingResult(BaseModel):
     family_manifests: tuple[FinancialAcquisitionManifest, ...]
     selected_candidates: tuple[FinancialPeriodCandidate, ...]
     complete_families: tuple[FinancialRatioFamily, ...]
+    unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
+        default=(),
+        exclude=True,
+    )
     missing_periods_by_family: tuple[
         tuple[FinancialRatioFamily, tuple[date, ...]],
         ...,
@@ -1561,6 +1727,14 @@ class FinancialIndicatorRoutingResult(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    metadata_compatibility_assessments: tuple[
+        FinancialIndicatorMetadataCompatibilityAssessment,
+        ...,
+    ] = Field(default=(), exclude=True)
+    metadata_incompatible_rejections: tuple[
+        FinancialIndicatorMetadataIncompatibleRejection,
+        ...,
+    ] = Field(default=(), exclude=True)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorRoutingResult:
@@ -1663,6 +1837,21 @@ class FinancialIndicatorRoutingResult(BaseModel):
             family for family in family_order if family in self.complete_families
         ):
             raise ValueError("complete indicator families must be canonical")
+        if self.unresolved_families and (
+            self.unresolved_families
+            != tuple(
+                family
+                for family in family_order
+                if family in self.unresolved_families
+            )
+            or set(self.complete_families) & set(self.unresolved_families)
+            or set(self.complete_families) | set(self.unresolved_families)
+            != {
+                manifest.requested_ratio_family
+                for manifest in self.family_manifests
+            }
+        ):
+            raise ValueError("unresolved indicator families must be exact and canonical")
         missing_families = tuple(
             family for family, _ in self.missing_periods_by_family
         )
@@ -1692,6 +1881,25 @@ class FinancialIndicatorRoutingResult(BaseModel):
             candidate.candidate_identity for candidate in self.selected_candidates
         }:
             raise ValueError("indicator candidates contradict family manifests")
+        selected_ids = {
+            candidate.candidate_identity for candidate in self.selected_candidates
+        }
+        rejection_ids = {
+            rejection.candidate_identity
+            for rejection in self.metadata_incompatible_rejections
+        }
+        assessment_ids = {
+            assessment.candidate_identity
+            for assessment in self.metadata_compatibility_assessments
+        }
+        if (
+            selected_ids & rejection_ids
+            or len(rejection_ids) != len(self.metadata_incompatible_rejections)
+            or not rejection_ids <= assessment_ids
+        ):
+            raise ValueError(
+                "indicator metadata compatibility disposition is inconsistent"
+            )
         v2_manifests = tuple(
             manifest
             for manifest in self.family_manifests
@@ -2635,11 +2843,28 @@ class MainlandFinancialCapabilityRouter:
         provider_calls: list[FinancialIndicatorProviderRouteCall] = []
         physical_attempt_ids: list[str] = []
         physical_attempt_events: dict[str, ProviderSubrequestAttemptEvent] = {}
+        metadata_compatibility_assessments: dict[
+            str,
+            FinancialIndicatorMetadataCompatibilityAssessment,
+        ] = {}
+        metadata_incompatible_rejections: dict[
+            str,
+            FinancialIndicatorMetadataIncompatibleRejection,
+        ] = {}
         current_profile_provider: Literal["yfinance"] | None = None
         qualified_publication_providers = _qualified_publication_provider_ids(
             route,
             capability=FinancialCapability.RATIO_FAMILY,
         )
+        field_semantics_version = (
+            self._routing_plan.indicator_field_semantics_version
+        )
+        metadata_compatibility_version = (
+            self._routing_plan.indicator_metadata_compatibility_version
+        )
+        compatibility_required = metadata_compatibility_version is not None
+        if compatibility_required and field_semantics_version is None:
+            raise ValueError("indicator metadata plan binding is incomplete")
 
         def publication_gap_periods() -> tuple[date, ...]:
             if not publication_aware:
@@ -2736,6 +2961,21 @@ class MainlandFinancialCapabilityRouter:
                 if publication_aware
                 else frozenset()
             )
+            response_metadata_compatibility = {
+                assessment.candidate_identity: assessment
+                for assessment in response.indicator_metadata_compatibility
+            }
+            for candidate_identity, compatibility in (
+                response_metadata_compatibility.items()
+            ):
+                existing = metadata_compatibility_assessments.setdefault(
+                    candidate_identity,
+                    compatibility,
+                )
+                if existing != compatibility:
+                    raise ValueError(
+                        "indicator route received conflicting compatibility assessments"
+                    )
             for candidate in response_candidates:
                 publication_candidates.setdefault(
                     candidate.candidate_identity,
@@ -2745,12 +2985,39 @@ class MainlandFinancialCapabilityRouter:
                 ratio_family = identity.ratio_family
                 if ratio_family is None or ratio_family not in request.ratio_families:
                     continue
-                declaration_version, expected_currency = (
-                    _INDICATOR_PROVIDER_ASSESSMENT_CONTRACT.get(
-                        candidate.artifact.dataset.provider_id,
-                        (FINANCIAL_RATIO_DECLARATION_V1, request.currency),
-                    )
+                compatibility = response_metadata_compatibility.get(
+                    candidate.candidate_identity
                 )
+                if compatibility_required and candidate.fields:
+                    if compatibility is None:
+                        raise ValueError(
+                            "indicator candidate is missing plan-bound metadata compatibility"
+                        )
+                    assert field_semantics_version is not None
+                    assert metadata_compatibility_version is not None
+                    _validate_indicator_metadata_compatibility_binding(
+                        candidate=candidate,
+                        compatibility=compatibility,
+                        request=request,
+                        field_semantics_version=field_semantics_version,
+                        metadata_compatibility_version=(
+                            metadata_compatibility_version
+                        ),
+                    )
+                if not compatibility_required:
+                    compatibility = None
+                if compatibility is None:
+                    declaration_version, expected_currency = (
+                        _INDICATOR_PROVIDER_ASSESSMENT_CONTRACT.get(
+                            candidate.artifact.dataset.provider_id,
+                            (FINANCIAL_RATIO_DECLARATION_V1, request.currency),
+                        )
+                    )
+                    expected_scope = request.consolidation_scope
+                else:
+                    declaration_version = compatibility.declaration_version
+                    expected_currency = identity.currency
+                    expected_scope = identity.consolidation_scope
                 assessment = assess_financial_period_candidate(
                     candidate,
                     requested_capability=FinancialCapability.RATIO_FAMILY,
@@ -2759,7 +3026,7 @@ class MainlandFinancialCapabilityRouter:
                     expected_instrument_identity=request.instrument_identity,
                     expected_frequency=FinancialReportingFrequency.QUARTERLY,
                     expected_currency=expected_currency,
-                    expected_consolidation_scope=request.consolidation_scope,
+                    expected_consolidation_scope=expected_scope,
                     pit_as_of_date=request.as_of_date,
                     ratio_declaration_version=declaration_version,
                     eligibility_policy_version=availability_policy_version,
@@ -2796,6 +3063,30 @@ class MainlandFinancialCapabilityRouter:
                             candidate=candidate,
                             assessment=assessment,
                         )
+                    )
+                    continue
+                if compatibility is not None and not compatibility.compatible:
+                    typed_reasons = tuple(
+                        FinancialIndicatorMetadataIncompatibility(
+                            normalized_field=field.normalized_field,
+                            dimension=dimension.dimension,
+                            reason=dimension.reason,
+                        )
+                        for field in compatibility.field_assessments
+                        for dimension in field.dimensions
+                        if dimension.state
+                        is FinancialIndicatorSemanticAssessmentState.UNPROVEN
+                    )
+                    metadata_incompatible_rejections[
+                        candidate.candidate_identity
+                    ] = FinancialIndicatorMetadataIncompatibleRejection(
+                        candidate_identity=candidate.candidate_identity,
+                        artifact_identity=candidate.artifact.artifact_identity,
+                        period_identity=identity.period_identity,
+                        family=ratio_family,
+                        completeness_assessment=assessment,
+                        compatibility_assessment=compatibility,
+                        typed_reasons=typed_reasons,
                     )
                     continue
                 key = (ratio_family, identity.period_end)
@@ -3138,6 +3429,11 @@ class MainlandFinancialCapabilityRouter:
                 for family in request.ratio_families
                 if family_completeness_assessments[family].complete
             ),
+            unresolved_families=tuple(
+                family
+                for family in request.ratio_families
+                if not family_completeness_assessments[family].complete
+            ),
             missing_periods_by_family=tuple(
                 (
                     family,
@@ -3167,6 +3463,24 @@ class MainlandFinancialCapabilityRouter:
             financial_eligibility_binding=eligibility_binding,
             family_assessments=family_assessments,
             aggregate_family_assessment=aggregate_family_assessment,
+            metadata_compatibility_assessments=tuple(
+                sorted(
+                    (
+                        assessment
+                        for candidate_identity, assessment in (
+                            metadata_compatibility_assessments.items()
+                        )
+                        if candidate_identity in provider_candidates
+                    ),
+                    key=lambda item: item.candidate_identity,
+                )
+            ),
+            metadata_incompatible_rejections=tuple(
+                sorted(
+                    metadata_incompatible_rejections.values(),
+                    key=lambda item: item.candidate_identity,
+                )
+            ),
         )
         if (
             not physical_attempt_events
@@ -3384,6 +3698,10 @@ def financial_period_response_from_indicator_adapter(
     physical_attempt_events: list[ProviderSubrequestAttemptEvent] = []
     retained: dict[str, FinancialProviderArtifactIdentity] = {}
     candidates: list[FinancialPeriodCandidate] = []
+    metadata_compatibility: dict[
+        str,
+        FinancialIndicatorMetadataCompatibilityAssessment,
+    ] = {}
     available_results: list[Any] = []
     subrequest_outcomes: list[FinancialSubrequestAcquisitionOutcome] = []
     adapter_row_rejections: list[FinancialAdapterRowRejection] = []
@@ -3433,6 +3751,15 @@ def financial_period_response_from_indicator_adapter(
             if artifact is not None:
                 retained.setdefault(artifact.artifact_identity, artifact)
         candidates.extend(operational.candidates)
+        for assessment in getattr(operational, "metadata_compatibility", ()):
+            existing = metadata_compatibility.setdefault(
+                assessment.candidate_identity,
+                assessment,
+            )
+            if existing != assessment:
+                raise ValueError(
+                    "indicator adapter returned conflicting compatibility assessments"
+                )
         adapter_row_rejections.extend(
             _project_adapter_row_rejections(
                 provider_id=provider_id,
@@ -3461,6 +3788,10 @@ def financial_period_response_from_indicator_adapter(
         physical_attempt_events=physical_attempt_events,
         subrequest_outcomes=subrequest_outcomes,
         adapter_row_rejections=adapter_row_rejections,
+        indicator_metadata_compatibility=tuple(
+            metadata_compatibility[candidate_identity]
+            for candidate_identity in sorted(metadata_compatibility)
+        ),
     )
 
 
@@ -4211,6 +4542,7 @@ def render_indicator_routing_result(
             is FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
             and availability_reason is not None
         )
+        or (result.unresolved_families and not result.missing_periods_by_family)
     ):
         status = "insufficient_evidence"
     elif result.missing_periods_by_family and result.current_profile_degraded:

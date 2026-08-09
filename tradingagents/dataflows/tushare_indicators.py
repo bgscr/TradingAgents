@@ -35,6 +35,7 @@ from tradingagents.dataflows._tushare_statement_artifacts import (
     require_utc,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_V2,
     FinancialCapability,
     FinancialCompanyType,
     FinancialCompanyTypeResolution,
@@ -44,6 +45,10 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialProviderArtifactIdentity,
     FinancialRatioHistoryCompletenessAssessment,
     assess_financial_ratio_history_coverage,
+)
+from tradingagents.dataflows.financial_indicator_metadata import (
+    FinancialIndicatorMetadataCompatibilityAssessment,
+    evaluate_financial_indicator_candidates,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactRef,
@@ -74,6 +79,9 @@ _ARTIFACT_METADATA = {
         "stable_restatement_identity",
     ],
 }
+TUSHARE_FINANCIAL_INDICATOR_RESULT_VERSION = (
+    "tushare-financial-indicator-result-v2"
+)
 
 
 class TushareFinancialIndicatorSdkClient(Protocol):
@@ -199,6 +207,39 @@ class TushareFinancialIndicatorAdapterResult(BaseModel):
         return self
 
 
+class TushareFinancialIndicatorAdapterResultV2(
+    TushareFinancialIndicatorAdapterResult
+):
+    """Forward result projection carrying provider-neutral compatibility."""
+
+    contract_version: Literal["tushare-financial-indicator-result-v2"] = (
+        TUSHARE_FINANCIAL_INDICATOR_RESULT_VERSION
+    )
+    metadata_compatibility: tuple[
+        FinancialIndicatorMetadataCompatibilityAssessment,
+        ...,
+    ] = ()
+
+    @model_validator(mode="after")
+    def _validate_metadata_compatibility(
+        self,
+    ) -> TushareFinancialIndicatorAdapterResultV2:
+        expected = {
+            candidate.candidate_identity
+            for candidate in self.candidates
+            if candidate.fields
+        }
+        actual = {
+            assessment.candidate_identity
+            for assessment in self.metadata_compatibility
+        }
+        if expected != actual or len(actual) != len(self.metadata_compatibility):
+            raise ValueError(
+                "Tushare indicator compatibility is not candidate-aligned"
+            )
+        return self
+
+
 class TushareFinancialIndicatorAdapter:
     """Acquire and normalize one qualified Tushare indicator history."""
 
@@ -227,10 +268,12 @@ class TushareFinancialIndicatorAdapter:
         *,
         instrument_identity: InstrumentIdentityEvidence,
         company_type_resolution: FinancialCompanyTypeResolution,
+        requested_value_currency: str,
+        requested_consolidation_scope: FinancialConsolidationScope,
         range_start: date,
         as_of_date: date,
         eligible_reporting_period_ends: Sequence[date],
-    ) -> TushareFinancialIndicatorAdapterResult:
+    ) -> TushareFinancialIndicatorAdapterResultV2:
         _validate_instrument_identity(instrument_identity)
         if range_start > as_of_date:
             raise ValueError("Tushare indicator range must not end before it starts")
@@ -305,7 +348,7 @@ class TushareFinancialIndicatorAdapter:
             physical_request=physical_request,
         )
         if subrequest.outcome.kind is not ProviderSubrequestOutcomeKind.AVAILABLE:
-            return TushareFinancialIndicatorAdapterResult(
+            return TushareFinancialIndicatorAdapterResultV2(
                 subrequest_key=key.subrequest_key,
                 outcome=subrequest.outcome,
                 sequence_id=subrequest.sequence_id,
@@ -335,6 +378,19 @@ class TushareFinancialIndicatorAdapter:
                 pit_as_of_date=as_of_date,
             )
         )
+        metadata_compatibility = evaluate_financial_indicator_candidates(
+            candidates=candidates,
+            instrument_identity=instrument_identity,
+            requested_value_currency=requested_value_currency,
+            requested_filing_consolidation_scope=(
+                requested_consolidation_scope
+            ),
+            pit_as_of_date=as_of_date,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+            normalizer_contract_version=(
+                TUSHARE_FINANCIAL_INDICATOR_ADAPTER_VERSION
+            ),
+        )
         families = qualified_indicator_families(
             company_type_resolution.company_type
         )
@@ -351,7 +407,7 @@ class TushareFinancialIndicatorAdapter:
             for family in families
             if company_type_resolution.company_type is not FinancialCompanyType.UNKNOWN
         )
-        return TushareFinancialIndicatorAdapterResult(
+        return TushareFinancialIndicatorAdapterResultV2(
             subrequest_key=key.subrequest_key,
             provider_artifact=subrequest.artifact,
             artifact=artifact,
@@ -363,6 +419,7 @@ class TushareFinancialIndicatorAdapter:
             period_completeness=period_completeness,
             family_completeness=family_completeness,
             row_rejections=row_rejections,
+            metadata_compatibility=metadata_compatibility,
             current_analysis_capable=any(item.complete for item in family_completeness),
         )
 
@@ -463,10 +520,12 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 
 __all__ = [
     "TUSHARE_FINANCIAL_INDICATOR_ADAPTER_VERSION",
+    "TUSHARE_FINANCIAL_INDICATOR_RESULT_VERSION",
     "TushareFinancialIndicatorAdapter",
     "TushareFinancialIndicatorAdapterConfigurationError",
     "TushareFinancialIndicatorAdapterFailureReason",
     "TushareFinancialIndicatorAdapterResult",
+    "TushareFinancialIndicatorAdapterResultV2",
     "TushareFinancialIndicatorMetadataAvailability",
     "TushareFinancialIndicatorSdkClient",
     "TushareIndicatorRowRejection",

@@ -60,6 +60,10 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolDispatcher,
     FinancialToolRequest,
 )
+from tradingagents.dataflows.financial_indicator_metadata import (
+    FinancialIndicatorMetadataCompatibilityAssessment,
+    evaluate_financial_indicator_candidates,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
     ProviderSubrequestOutcomeKind,
@@ -156,6 +160,30 @@ def _qualified_plan(
     historical_payload.pop("eligibility_policy_version")
     historical_payload.pop("financial_eligibility_policy")
     historical_payload.pop("financial_eligibility_binding")
+    signature_payload = dict(historical_payload)
+    signature_payload.pop("plan_signature")
+    encoded = json.dumps(
+        signature_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    historical_payload["plan_signature"] = (
+        "mainland-routing-plan:v1:" + sha256(encoded).hexdigest()
+    )
+    return MainlandCapabilityRoutingPlan.model_validate(historical_payload)
+
+
+def _historical_shadow_plan(monkeypatch: pytest.MonkeyPatch):
+    historical_payload = _shadow_plan(monkeypatch).model_dump(mode="json")
+    historical_payload["plan_version"] = "1.1"
+    for key in (
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_manifest_contract_version",
+        "indicator_selection_contract_version",
+    ):
+        historical_payload.pop(key)
     signature_payload = dict(historical_payload)
     signature_payload.pop("plan_signature")
     encoded = json.dumps(
@@ -433,6 +461,36 @@ def _available_response(
     candidates: tuple[FinancialPeriodCandidate, ...],
 ) -> FinancialProviderPeriodResponse:
     artifacts = tuple(candidate.artifact for candidate in candidates)
+    indicator_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.period_identity.capability is FinancialCapability.RATIO_FAMILY
+    )
+    metadata_compatibility = ()
+    if indicator_candidates:
+        artifact_provider = (
+            indicator_candidates[0].artifact.dataset.provider_id
+        )
+        declaration_version = {
+            "tushare": FINANCIAL_RATIO_DECLARATION_V2,
+            "baostock": FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+        }.get(artifact_provider, FINANCIAL_RATIO_DECLARATION_V1)
+        metadata_compatibility = evaluate_financial_indicator_candidates(
+            candidates=indicator_candidates,
+            instrument_identity=(
+                indicator_candidates[0].period_identity.instrument_identity
+            ),
+            requested_value_currency=(
+                indicator_candidates[0]
+                .period_identity.instrument_identity.currency
+            ),
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=declaration_version,
+            normalizer_contract_version=f"{artifact_provider}-fixture-v2",
+        )
     return FinancialProviderPeriodResponse.available(
         provider_id=provider_id,
         response_artifact=artifacts[0],
@@ -440,6 +498,81 @@ def _available_response(
         candidates=candidates,
         subrequest_keys=(f"{provider_id}-bulk-statement",),
         physical_attempt_ids=(f"{provider_id}-attempt-1",),
+        indicator_metadata_compatibility=metadata_compatibility,
+    )
+
+
+def _indicator_response_with_compatibility(
+    provider_id: str,
+    candidates: tuple[FinancialPeriodCandidate, ...],
+    *,
+    declaration_version: str,
+) -> FinancialProviderPeriodResponse:
+    artifacts = tuple(candidate.artifact for candidate in candidates)
+    return FinancialProviderPeriodResponse.available(
+        provider_id=provider_id,
+        response_artifact=artifacts[0],
+        retained_artifacts=artifacts,
+        candidates=candidates,
+        subrequest_keys=(f"{provider_id}-indicator",),
+        physical_attempt_ids=(f"{provider_id}-attempt-1",),
+        indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=candidates,
+            instrument_identity=_identity(),
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=declaration_version,
+            normalizer_contract_version=f"{provider_id}-indicator-normalizer-v2",
+        ),
+    )
+
+
+def _with_raw_indicator_metadata(
+    candidate: FinancialPeriodCandidate,
+    *,
+    currency: str,
+    scope: FinancialConsolidationScope,
+) -> FinancialPeriodCandidate:
+    identity = candidate.period_identity
+    return FinancialPeriodCandidate.create(
+        artifact=candidate.artifact,
+        period_identity=FinancialPeriodIdentity.create(
+            instrument_identity=identity.instrument_identity,
+            capability=identity.capability,
+            statement_type=identity.statement_type,
+            ratio_family=identity.ratio_family,
+            period_end=identity.period_end,
+            frequency=identity.frequency,
+            company_type=identity.company_type,
+            consolidation_scope=scope,
+            currency=currency,
+            provider_revision_binding=identity.provider_revision_binding,
+        ),
+        filing_metadata=candidate.filing_metadata,
+        company_type_resolution=candidate.company_type_resolution,
+        fields=candidate.fields,
+    )
+
+
+def _without_field(
+    candidate: FinancialPeriodCandidate,
+    *,
+    normalized_field: str,
+) -> FinancialPeriodCandidate:
+    fields = tuple(
+        field
+        for field in candidate.fields
+        if field.normalized_field != normalized_field
+    )
+    return FinancialPeriodCandidate.create(
+        artifact=candidate.artifact,
+        period_identity=candidate.period_identity,
+        filing_metadata=candidate.filing_metadata,
+        company_type_resolution=candidate.company_type_resolution,
+        fields=fields,
     )
 
 
@@ -1062,6 +1195,336 @@ def test_ratio_artifact_cannot_satisfy_statement_request(
     )
 
 
+def test_metadata_incompatible_family_is_retained_while_only_it_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    period = date(2026, 3, 31)
+    tushare_growth = _qualified_ratio_candidate(
+        provider_id="tushare",
+        ratio_family=FinancialRatioFamily.GROWTH,
+        period_end=period,
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+        currency="XXX",
+    )
+    tushare_balance = _with_raw_indicator_metadata(
+        _qualified_ratio_candidate(
+            provider_id="tushare",
+            ratio_family=FinancialRatioFamily.BALANCE,
+            period_end=period,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+            currency="XXX",
+        ),
+        currency="XXX",
+        scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    akshare_growth = _with_raw_indicator_metadata(
+        _qualified_ratio_candidate(
+            provider_id="akshare",
+            ratio_family=FinancialRatioFamily.GROWTH,
+            period_end=period,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+            currency="XXX",
+        ),
+        currency="CNY",
+        scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    calls: list[tuple[str, FinancialIndicatorProviderGapRequest]] = []
+
+    def source(provider_id: str, response: FinancialProviderPeriodResponse):
+        def invoke(
+            request: FinancialIndicatorProviderGapRequest,
+        ) -> FinancialProviderPeriodResponse:
+            calls.append((provider_id, request))
+            return response
+
+        return invoke
+
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={
+            "tushare": source(
+                "tushare",
+                _indicator_response_with_compatibility(
+                    "tushare",
+                    (tushare_growth, tushare_balance),
+                    declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+                ),
+            ),
+            "akshare": source(
+                "akshare",
+                _indicator_response_with_compatibility(
+                    "akshare",
+                    (akshare_growth,),
+                    declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+                ),
+            ),
+            "baostock_qualified_families": source(
+                "baostock_qualified_families",
+                FinancialProviderPeriodResponse.unavailable(
+                    provider_id="baostock_qualified_families",
+                    reason="no_data",
+                ),
+            ),
+        },
+    )
+    result = router.route_indicators(
+        FinancialIndicatorRoutingRequest(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+            company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+            currency="CNY",
+            ratio_families=(
+                FinancialRatioFamily.GROWTH,
+                FinancialRatioFamily.BALANCE,
+            ),
+            eligible_reporting_period_ends=(period,),
+        )
+    )
+
+    assert tuple(provider_id for provider_id, _request in calls) == (
+        "tushare",
+        "akshare",
+    )
+    assert calls[1][1].missing_periods_by_family == (
+        (FinancialRatioFamily.GROWTH, (period,)),
+    )
+    assert {
+        (
+            candidate.artifact.dataset.provider_id,
+            candidate.period_identity.ratio_family,
+        )
+        for candidate in result.selected_candidates
+    } == {
+        ("tushare", FinancialRatioFamily.BALANCE),
+        ("akshare", FinancialRatioFamily.GROWTH),
+    }
+    rejection = next(
+        item
+        for item in result.metadata_incompatible_rejections
+        if item.candidate_identity == tushare_growth.candidate_identity
+    )
+    assert rejection.compatibility_assessment_identity.startswith(
+        "financial-indicator-metadata-compatibility:v1:"
+    )
+    assert rejection.completeness_assessment.usable_for_current_analysis is True
+    assert rejection.completeness_assessment.core_coverage == 1
+    assert rejection.typed_reasons
+    growth_manifest = next(
+        manifest
+        for manifest in result.family_manifests
+        if manifest.requested_ratio_family is FinancialRatioFamily.GROWTH
+    )
+    assert tushare_growth.candidate_identity in {
+        item.candidate.candidate_identity
+        for item in growth_manifest.provider_candidates
+    }
+    assert result.physical_attempt_ids == (
+        "tushare-attempt-1",
+        "akshare-attempt-1",
+    )
+
+
+def test_plan_1_2_rejects_field_bearing_candidate_without_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    period = date(2026, 3, 31)
+    candidate = _ratio_candidate(
+        provider_id="tushare",
+        ratio_family=FinancialRatioFamily.PROFIT,
+        period_end=period,
+    )
+    lower_calls: list[str] = []
+
+    def lower(_request: FinancialIndicatorProviderGapRequest):
+        lower_calls.append("akshare")
+        return FinancialProviderPeriodResponse.unavailable(
+            provider_id="akshare",
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
+
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={
+            "tushare": lambda _request: FinancialProviderPeriodResponse.available(
+                provider_id="tushare",
+                response_artifact=candidate.artifact,
+                retained_artifacts=(candidate.artifact,),
+                candidates=(candidate,),
+                subrequest_keys=("tushare-indicator",),
+                physical_attempt_ids=("tushare-attempt-1",),
+            ),
+            "akshare": lower,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="missing plan-bound metadata compatibility",
+    ):
+        router.route_indicators(
+            FinancialIndicatorRoutingRequest(
+                instrument_identity=_identity(),
+                as_of_date=date(2026, 7, 30),
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                currency="CNY",
+                ratio_families=(FinancialRatioFamily.PROFIT,),
+                eligible_reporting_period_ends=(period,),
+            )
+        )
+
+    assert lower_calls == []
+
+
+def test_plan_1_2_rejects_compatibility_bound_to_different_request_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    period = date(2026, 3, 31)
+    candidate = _with_raw_indicator_metadata(
+        _ratio_candidate(
+            provider_id="akshare",
+            ratio_family=FinancialRatioFamily.PROFIT,
+            period_end=period,
+        ),
+        currency="CNY",
+        scope=FinancialConsolidationScope.PARENT,
+    )
+    response = FinancialProviderPeriodResponse.available(
+        provider_id="akshare",
+        response_artifact=candidate.artifact,
+        retained_artifacts=(candidate.artifact,),
+        candidates=(candidate,),
+        subrequest_keys=("akshare-indicator",),
+        physical_attempt_ids=("akshare-attempt-1",),
+        indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=(candidate,),
+            instrument_identity=_identity(),
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.PARENT
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+            normalizer_contract_version="akshare-financial-indicators-v2",
+        ),
+    )
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={
+            "tushare": lambda _request: FinancialProviderPeriodResponse.unavailable(
+                provider_id="tushare",
+                reason=AcquisitionUnavailableReason.NO_DATA,
+            ),
+            "akshare": lambda _request: response,
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="metadata compatibility request binding mismatch",
+    ):
+        router.route_indicators(
+            FinancialIndicatorRoutingRequest(
+                instrument_identity=_identity(),
+                as_of_date=date(2026, 7, 30),
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                currency="CNY",
+                ratio_families=(FinancialRatioFamily.PROFIT,),
+                eligible_reporting_period_ends=(period,),
+            )
+        )
+
+
+def test_plan_1_2_rejects_compatibility_with_forged_raw_scope_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    period = date(2026, 3, 31)
+    candidate = _qualified_ratio_candidate(
+        provider_id="tushare",
+        ratio_family=FinancialRatioFamily.PROFIT,
+        period_end=period,
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+        currency="XXX",
+    )
+    proof_candidate = _with_raw_indicator_metadata(
+        candidate,
+        currency="XXX",
+        scope=FinancialConsolidationScope.CONSOLIDATED,
+    )
+    proof = evaluate_financial_indicator_candidates(
+        candidates=(proof_candidate,),
+        instrument_identity=_identity(),
+        requested_value_currency="CNY",
+        requested_filing_consolidation_scope=(
+            FinancialConsolidationScope.CONSOLIDATED
+        ),
+        pit_as_of_date=date(2026, 7, 30),
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+        normalizer_contract_version="tushare-financial-indicator-adapter-v1",
+    )[0]
+    forged_payload = proof.model_dump(
+        mode="json",
+        exclude={"assessment_identity"},
+    )
+    forged_payload.update(
+        candidate_identity=candidate.candidate_identity,
+        period_identity=candidate.period_identity.period_identity,
+    )
+    forged_digest = sha256(
+        json.dumps(
+            forged_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    forged = FinancialIndicatorMetadataCompatibilityAssessment.model_validate(
+        {
+            **forged_payload,
+            "assessment_identity": (
+                "financial-indicator-metadata-compatibility:v1:"
+                f"{forged_digest}"
+            ),
+        }
+    )
+    response = FinancialProviderPeriodResponse.available(
+        provider_id="tushare",
+        response_artifact=candidate.artifact,
+        retained_artifacts=(candidate.artifact,),
+        candidates=(candidate,),
+        subrequest_keys=("tushare-indicator",),
+        physical_attempt_ids=("tushare-attempt-1",),
+        indicator_metadata_compatibility=(forged,),
+    )
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=_qualified_plan(monkeypatch),
+        statement_sources={},
+        indicator_sources={"tushare": lambda _request: response},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="metadata compatibility raw provider binding mismatch",
+    ):
+        router.route_indicators(
+            FinancialIndicatorRoutingRequest(
+                instrument_identity=_identity(),
+                as_of_date=date(2026, 7, 30),
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                currency="CNY",
+                ratio_families=(FinancialRatioFamily.PROFIT,),
+                eligible_reporting_period_ends=(period,),
+            )
+        )
+
+
 def test_indicator_routing_calls_only_missing_families_and_exact_periods(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1173,23 +1636,20 @@ def test_indicator_router_preserves_provider_qualified_contract(
     currency: str,
 ) -> None:
     candidates = tuple(
-        _qualified_ratio_candidate(
-            provider_id=artifact_provider,
-            ratio_family=FinancialRatioFamily.PROFIT,
-            period_end=period,
-            declaration_version=declaration_version,
+        _with_raw_indicator_metadata(
+            _qualified_ratio_candidate(
+                provider_id=artifact_provider,
+                ratio_family=FinancialRatioFamily.PROFIT,
+                period_end=period,
+                declaration_version=declaration_version,
+                currency=currency,
+            ),
             currency=currency,
+            scope=FinancialConsolidationScope.CONSOLIDATED,
         )
         for period in _REPORTING_PERIODS
     )
-    response = FinancialProviderPeriodResponse.available(
-        provider_id=route_provider,
-        response_artifact=candidates[0].artifact,
-        retained_artifacts=tuple(candidate.artifact for candidate in candidates),
-        candidates=candidates,
-        subrequest_keys=(f"{route_provider}-qualified-profit",),
-        physical_attempt_ids=(f"{route_provider}-attempt-1",),
-    )
+    response = _available_response(route_provider, candidates)
 
     result = MainlandFinancialCapabilityRouter(
         routing_plan=_qualified_plan(monkeypatch),
@@ -1200,7 +1660,7 @@ def test_indicator_router_preserves_provider_qualified_contract(
             instrument_identity=_identity(),
             as_of_date=date(2026, 7, 30),
             company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
-            consolidation_scope=FinancialConsolidationScope.UNKNOWN,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
             currency="CNY",
             ratio_families=(FinancialRatioFamily.PROFIT,),
             eligible_reporting_period_ends=_REPORTING_PERIODS,
@@ -1309,6 +1769,17 @@ def test_sparse_baostock_family_preserves_sibling_and_yahoo_is_degraded_only(
             f"baostock-attempt-{index}"
             for index in range(1, len(_REPORTING_PERIODS) * 2 + 1)
         ),
+        indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=(*profit, *growth),
+            instrument_identity=_identity(),
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+            normalizer_contract_version="baostock-ratio-family-normalizer-v2",
+        ),
     )
     yahoo_artifact = _ratio_candidate(
         provider_id="yfinance",
@@ -1409,6 +1880,17 @@ def test_indicator_adapter_projection_retains_every_subrequest_and_row_rejection
         ratio_family=FinancialRatioFamily.PROFIT,
         period_end=period,
     )
+    compatibility = evaluate_financial_indicator_candidates(
+        candidates=(candidate,),
+        instrument_identity=_identity(),
+        requested_value_currency="CNY",
+        requested_filing_consolidation_scope=(
+            FinancialConsolidationScope.CONSOLIDATED
+        ),
+        pit_as_of_date=date(2026, 7, 30),
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+        normalizer_contract_version="tushare-financial-indicator-adapter-v1",
+    )
     available = SimpleNamespace(
         request=SimpleNamespace(subrequest_key="provider-subrequest:v1:" + "1" * 64),
         outcome=SimpleNamespace(kind=SimpleNamespace(value="available")),
@@ -1420,6 +1902,7 @@ def test_indicator_adapter_projection_retains_every_subrequest_and_row_rejection
         artifact=candidate.artifact,
         row_artifacts=(),
         candidates=(candidate,),
+        metadata_compatibility=compatibility,
         row_rejections=(
             SimpleNamespace(
                 row_identity="tushare-indicator-row:v1:" + "3" * 64,
@@ -1456,6 +1939,7 @@ def test_indicator_adapter_projection_retains_every_subrequest_and_row_rejection
         AcquisitionUnavailableReason.EMPTY_FRAME
     )
     assert len(response.adapter_row_rejections) == 1
+    assert response.indicator_metadata_compatibility == compatibility
     assert response.adapter_row_rejections[0].reasons == (
         FinancialPeriodRejectionReason.INCOMPATIBLE_METADATA,
     )
@@ -1511,6 +1995,17 @@ def test_baostock_indicator_projection_preserves_physical_provider_identity(
         row_artifacts=(),
         candidates=(candidate,),
         row_rejections=(),
+        metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=(candidate,),
+            instrument_identity=_identity(),
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+            normalizer_contract_version="baostock-ratio-family-normalizer-v2",
+        ),
     )
 
     response = financial_period_response_from_indicator_adapter(
@@ -1604,15 +2099,21 @@ def test_indicator_equivalent_overlap_is_retained_and_unselected(
         if period != final_gap
     )
     akshare_candidates = (
-        _ratio_candidate(
-            provider_id="akshare",
-            ratio_family=FinancialRatioFamily.PROFIT,
-            period_end=final_gap,
+        _without_field(
+            _ratio_candidate(
+                provider_id="akshare",
+                ratio_family=FinancialRatioFamily.PROFIT,
+                period_end=final_gap,
+            ),
+            normalized_field="earnings_per_share",
         ),
-        _ratio_candidate(
-            provider_id="akshare",
-            ratio_family=FinancialRatioFamily.PROFIT,
-            period_end=overlapping_period,
+        _without_field(
+            _ratio_candidate(
+                provider_id="akshare",
+                ratio_family=FinancialRatioFamily.PROFIT,
+                period_end=overlapping_period,
+            ),
+            normalized_field="earnings_per_share",
         ),
     )
     lower_calls: list[FinancialIndicatorProviderGapRequest] = []
@@ -1626,18 +2127,18 @@ def test_indicator_equivalent_overlap_is_retained_and_unselected(
             reason=AcquisitionUnavailableReason.NO_DATA,
         )
 
+    tushare_response = _available_response("tushare", tushare_candidates)
+    akshare_response = _available_response("akshare", akshare_candidates)
+    assert all(
+        assessment.compatible
+        for assessment in akshare_response.indicator_metadata_compatibility
+    )
     result = MainlandFinancialCapabilityRouter(
         routing_plan=_qualified_plan(monkeypatch),
         statement_sources={},
         indicator_sources={
-            "tushare": lambda _request: _available_response(
-                "tushare",
-                tushare_candidates,
-            ),
-            "akshare": lambda _request: _available_response(
-                "akshare",
-                akshare_candidates,
-            ),
+            "tushare": lambda _request: tushare_response,
+            "akshare": lambda _request: akshare_response,
             "baostock_qualified_families": unavailable,
             "yfinance": unavailable,
         },
@@ -2450,6 +2951,19 @@ def test_run_scoped_indicator_dispatch_preserves_provider_qualified_currency(
         subrequest_keys=(attempt_event.request_key,),
         physical_attempt_ids=(attempt_event_id,),
         physical_attempt_events=(attempt_event,),
+        indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=candidates,
+            instrument_identity=identity,
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+            normalizer_contract_version=(
+                "tushare-financial-indicator-adapter-v1"
+            ),
+        ),
     )
     plan = _qualified_plan(monkeypatch)
     router = MainlandFinancialCapabilityRouter(

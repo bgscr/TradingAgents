@@ -14,6 +14,7 @@ from tests.test_financial_capability_routing_selection import (
     _candidate,
     _qualified_plan,
     _ratio_candidate,
+    _without_field,
 )
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.dataflows.financial_capability_routing import (
@@ -25,6 +26,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     render_statement_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_V1,
     FinancialCompanyType,
     FinancialConsolidationScope,
     FinancialListingProvenance,
@@ -44,6 +46,9 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolRequest,
     project_financial_dispatch_ledger,
     project_financial_selection_evidence,
+)
+from tradingagents.dataflows.financial_indicator_metadata import (
+    evaluate_financial_indicator_candidates,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
@@ -552,12 +557,15 @@ def test_indicator_manifest_retains_fallback_lineage_and_yahoo_degradation(
         "600895.SS",
         config=copy.deepcopy(DEFAULT_CONFIG),
     )
-    selected = _ratio_candidate(
-        provider_id="akshare",
-        ratio_family=FinancialRatioFamily.PROFIT,
-        period_end=_REPORTING_PERIODS[-1],
-        f_ann_date=None,
-        instrument_identity=asset.instrument_identity,
+    selected = _without_field(
+        _ratio_candidate(
+            provider_id="akshare",
+            ratio_family=FinancialRatioFamily.PROFIT,
+            period_end=_REPORTING_PERIODS[-1],
+            f_ann_date=None,
+            instrument_identity=asset.instrument_identity,
+        ),
+        normalized_field="earnings_per_share",
     )
     yahoo_artifact = _ratio_candidate(
         provider_id="yfinance",
@@ -591,6 +599,17 @@ def test_indicator_manifest_retains_fallback_lineage_and_yahoo_degradation(
             subrequest_keys=(akshare_event.request_key,),
             physical_attempt_ids=(akshare_event.attempt_event_id,),
             physical_attempt_events=(akshare_event,),
+            indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+                candidates=(selected,),
+                instrument_identity=asset.instrument_identity,
+                requested_value_currency="CNY",
+                requested_filing_consolidation_scope=(
+                    FinancialConsolidationScope.CONSOLIDATED
+                ),
+                pit_as_of_date=date(2026, 7, 30),
+                declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+                normalizer_contract_version="akshare-financial-indicators-v2",
+            ),
         )
 
     def yahoo(_request):

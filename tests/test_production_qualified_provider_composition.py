@@ -30,6 +30,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialProviderGapRequest,
     FinancialProviderPeriodResponse,
     FinancialStatementRoutingRequest,
+    render_indicator_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
     FinancialCapability,
@@ -279,9 +280,9 @@ def _registrations(
     )
 
 
-def _identity() -> InstrumentIdentityEvidence:
+def _identity(symbol: str = "601328.SS") -> InstrumentIdentityEvidence:
     return InstrumentIdentityEvidence(
-        symbol="601328.SS",
+        symbol=symbol,
         venue="XSHG",
         instrument_kind=InstrumentKind.EQUITY,
         currency="CNY",
@@ -1321,11 +1322,14 @@ class _CompleteTushareIndicators(_ProviderClient):
         return pd.DataFrame(
             [
                 {
-                    "ts_code": "601328.SH",
+                    "ts_code": "600895.SH",
                     "ann_date": (period_end + timedelta(days=25)).strftime("%Y%m%d"),
                     "end_date": period_end.strftime("%Y%m%d"),
                     "netprofit_margin": 28 + index,
+                    "grossprofit_margin": 35 + index,
+                    "op_of_gr": 30 + index,
                     "profit_to_gr": 31 + index,
+                    "profit_to_op": 29 + index,
                     "roa": 1.1 + index / 100,
                     "roe": 12 + index,
                     "roic": 10 + index,
@@ -1335,27 +1339,39 @@ class _CompleteTushareIndicators(_ProviderClient):
         )
 
 
-def test_complete_tushare_indicator_bulk_stops_the_plan_after_one_attempt(
+def test_complete_tushare_indicator_is_retained_but_falls_back_on_unproven_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     blueprint = _blueprint(tmp_path, monkeypatch, enabled=["financial_indicators"])
     tushare = _CompleteTushareIndicators()
-    company_type_resolution = _company_type_resolution(FinancialCompanyType.BANK)
+    baostock = _EmptyBaoStockRatios()
+    company_type_resolution = _company_type_resolution(
+        FinancialCompanyType.INDUSTRIAL_NON_BANK
+    )
     clients = {
         "akshare": _ProviderClient(),
-        "baostock": _ProviderClient(),
+        "baostock": baostock,
         "tushare": tushare,
         "yfinance": _ProviderClient(),
     }
+
+    def unavailable(provider_id: str):
+        return lambda _request: FinancialProviderPeriodResponse.unavailable(
+            provider_id=provider_id,
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
 
     with _assembled_runtime(
         blueprint=blueprint,
         tmp_path=tmp_path,
         clients=clients,
-        sources={},
+        sources={
+            "financial_indicators": unavailable("akshare"),
+            "current_financial_profile": unavailable("yfinance"),
+        },
         run_scope_id="qualified-indicator-complete",
-        coordinated_providers=("tushare",),
+        coordinated_providers=("tushare", "baostock"),
     ) as composition:
         routed = composition.router.route_indicators(
             FinancialIndicatorRoutingRequest(
@@ -1364,11 +1380,11 @@ def test_complete_tushare_indicator_bulk_stops_the_plan_after_one_attempt(
                     "mainland-financial-period-eligibility-v2"
                 ),
                 requested_analysis_scope="current_only",
-                instrument_identity=_identity(),
+                instrument_identity=_identity("600895.SS"),
                 as_of_date=date(2026, 7, 30),
-                company_type=FinancialCompanyType.BANK,
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
                 company_type_resolution=company_type_resolution,
-                consolidation_scope=FinancialConsolidationScope.UNKNOWN,
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
                 currency="CNY",
                 ratio_families=(FinancialRatioFamily.PROFIT,),
                 family_evidence_requirements=_indicator_requirements(
@@ -1380,14 +1396,49 @@ def test_complete_tushare_indicator_bulk_stops_the_plan_after_one_attempt(
             )
         )
 
-    assert tuple(call.provider_id for call in routed.provider_calls) == ("tushare",)
-    assert routed.complete_families == (FinancialRatioFamily.PROFIT,)
+    assert tuple(call.provider_id for call in routed.provider_calls) == (
+        "tushare",
+        "akshare",
+        "baostock_qualified_families",
+        "yfinance",
+    )
+    assert routed.complete_families == ()
+    assert routed.unresolved_families == (FinancialRatioFamily.PROFIT,)
     assert routed.missing_periods_by_family == ()
-    assert len(routed.physical_attempt_ids) == 1
+    assert tuple(len(call.physical_attempt_ids) for call in routed.provider_calls) == (
+        1,
+        1,
+        8,
+        1,
+    )
+    assert len(routed.physical_attempt_ids) == 11
     assert tushare.calls == 1
+    assert len(baostock.endpoints) == 8
     assert all(
-        candidate.company_type_resolution == company_type_resolution
-        for candidate in routed.selected_candidates
+        binding.candidate.company_type_resolution == company_type_resolution
+        for binding in routed.family_manifests[0].provider_candidates
+    )
+    assert routed.selected_candidates == ()
+    legacy_projection = routed.model_copy(
+        update={
+            "contract_version": "financial-indicator-routing-result-v1",
+            "family_assessments": (),
+            "aggregate_family_assessment": None,
+            "publication_target_construction": None,
+        }
+    )
+    assert (
+        '"status":"insufficient_evidence"'
+        in render_indicator_routing_result(legacy_projection)
+    )
+    assert len(routed.metadata_incompatible_rejections) == 8
+    assert all(
+        rejection.completeness_assessment.core_coverage == 1
+        and any(
+            reason.dimension.value == "filing_consolidation_scope"
+            for reason in rejection.typed_reasons
+        )
+        for rejection in routed.metadata_incompatible_rejections
     )
 
 
@@ -1418,6 +1469,120 @@ class _EmptyBaoStockRatios(_ProviderClient):
 
     def query_dupont_data(self, **kwargs: object) -> pd.DataFrame:
         return self._empty("dupont", **kwargs)
+
+
+class _CompleteBaoStockProfit(_EmptyBaoStockRatios):
+    def query_profit_data(self, **kwargs: object) -> pd.DataFrame:
+        self.calls += 1
+        self.endpoints.append(("profit", int(kwargs["year"]), int(kwargs["quarter"])))
+        return pd.DataFrame(
+            [
+                {
+                    "code": "sh.600895",
+                    "pubDate": "2026-04-25",
+                    "statDate": "2026-03-31",
+                    "gpMargin": "0.4",
+                    "npMargin": "0.1",
+                    "roeAvg": "0.16",
+                    "netProfit": "123456789",
+                    "epsTTM": "0.75",
+                    "MBRevenue": "987654321",
+                    "totalShare": "1000000000",
+                    "liqaShare": "800000000",
+                }
+            ]
+        )
+
+
+def test_baostock_lower_provider_is_assessed_from_its_own_truthful_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blueprint = _blueprint(tmp_path, monkeypatch, enabled=["financial_indicators"])
+    tushare = _EmptyTushareIndicators()
+    baostock = _CompleteBaoStockProfit()
+
+    def unavailable(provider_id: str):
+        return lambda _request: FinancialProviderPeriodResponse.unavailable(
+            provider_id=provider_id,
+            reason=AcquisitionUnavailableReason.NO_DATA,
+        )
+
+    with _assembled_runtime(
+        blueprint=blueprint,
+        tmp_path=tmp_path,
+        clients={
+            "akshare": _ProviderClient(),
+            "baostock": baostock,
+            "tushare": tushare,
+            "yfinance": _ProviderClient(),
+        },
+        sources={
+            "financial_indicators": unavailable("akshare"),
+            "current_financial_profile": unavailable("yfinance"),
+        },
+        run_scope_id="qualified-baostock-metadata",
+        coordinated_providers=("tushare", "baostock"),
+    ) as composition:
+        routed = composition.router.route_indicators(
+            FinancialIndicatorRoutingRequest(
+                contract_version="financial-indicator-routing-request-v5",
+                eligibility_policy_version=(
+                    "mainland-financial-period-eligibility-v2"
+                ),
+                requested_analysis_scope="current_only",
+                instrument_identity=_identity("600895.SS"),
+                as_of_date=date(2026, 7, 30),
+                company_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
+                company_type_resolution=_company_type_resolution(
+                    FinancialCompanyType.INDUSTRIAL_NON_BANK
+                ),
+                consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+                currency="CNY",
+                ratio_families=(FinancialRatioFamily.PROFIT,),
+                family_evidence_requirements=_indicator_requirements(
+                    (FinancialRatioFamily.PROFIT,)
+                ),
+                eligible_reporting_period_ends=(date(2026, 3, 31),),
+            )
+        )
+
+    assert tuple(call.provider_id for call in routed.provider_calls) == (
+        "tushare",
+        "akshare",
+        "baostock_qualified_families",
+        "yfinance",
+    )
+    assert tuple(len(call.physical_attempt_ids) for call in routed.provider_calls) == (
+        1,
+        1,
+        1,
+        1,
+    )
+    assert baostock.endpoints == [("profit", 2026, 1)]
+    assert routed.selected_candidates == ()
+    assert routed.unresolved_families == (FinancialRatioFamily.PROFIT,)
+    baostock_assessment = next(
+        item
+        for item in routed.metadata_compatibility_assessments
+        if item.provider_id == "baostock"
+    )
+    assert baostock_assessment.compatible is False
+    assert all(
+        field.unit_normalization_contract_version
+        == "baostock-ratio-family-normalizer-v2"
+        for field in baostock_assessment.field_assessments
+    )
+    rejection = next(
+        item
+        for item in routed.metadata_incompatible_rejections
+        if item.compatibility_assessment.provider_id == "baostock"
+    )
+    assert rejection.completeness_assessment.core_coverage == 1
+    assert any(
+        reason.dimension.value == "filing_consolidation_scope"
+        for reason in rejection.typed_reasons
+    )
 
 
 def test_indicator_source_requests_only_exact_baostock_family_period_gaps(

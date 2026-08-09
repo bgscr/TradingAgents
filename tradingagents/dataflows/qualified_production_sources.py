@@ -35,6 +35,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialProviderPeriodResponse,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_V1,
     FinancialCapability,
     FinancialConsolidationScope,
     FinancialFieldValue,
@@ -51,6 +52,9 @@ from tradingagents.dataflows.financial_contracts import (
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialCompanyTypeAcquisitionEvidenceBinding,
 )
+from tradingagents.dataflows.financial_indicator_metadata import (
+    evaluate_financial_indicator_candidates,
+)
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestResult
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.market_history.coordinator import (
@@ -60,7 +64,8 @@ from tradingagents.market_history.coordinator import (
 )
 
 YFINANCE_STATEMENT_NORMALIZER_VERSION = "yfinance-financial-statements-v1"
-AKSHARE_INDICATOR_NORMALIZER_VERSION = "akshare-financial-indicators-v1"
+AKSHARE_INDICATOR_NORMALIZER_VERSION_V1 = "akshare-financial-indicators-v1"
+AKSHARE_INDICATOR_NORMALIZER_VERSION = "akshare-financial-indicators-v2"
 YFINANCE_PROFILE_NORMALIZER_VERSION = "yfinance-current-financial-profile-v1"
 AKSHARE_FACTOR_NORMALIZER_VERSION = "akshare-adjustment-factors-v1"
 YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION = "yfinance-derived-adjustment-factors-v1"
@@ -694,6 +699,13 @@ def decode_akshare_indicator_response(
             payload=records,
         )
         candidates: list[FinancialPeriodCandidate] = []
+        schema_identity = str(decoded["schema_identity"])
+        if schema_identity not in {
+            AKSHARE_INDICATOR_NORMALIZER_VERSION_V1,
+            AKSHARE_INDICATOR_NORMALIZER_VERSION,
+        }:
+            raise ValueError("AKShare indicator schema identity is unsupported")
+        truthful_metadata = schema_identity == AKSHARE_INDICATOR_NORMALIZER_VERSION
         for record in records:
             if not isinstance(record, dict) or not isinstance(record.get("fields"), list):
                 raise ValueError("AKShare indicator row is malformed")
@@ -718,8 +730,12 @@ def decode_akshare_indicator_response(
                     period_end=date.fromisoformat(str(record["period_end"])),
                     frequency=FinancialReportingFrequency.QUARTERLY,
                     company_type=request.company_type,
-                    consolidation_scope=request.consolidation_scope,
-                    currency=request.currency,
+                    consolidation_scope=(
+                        FinancialConsolidationScope.UNKNOWN
+                        if truthful_metadata
+                        else request.consolidation_scope
+                    ),
+                    currency="XXX" if truthful_metadata else request.currency,
                     provider_revision_binding=artifact.artifact_identity,
                 )
                 candidates.append(
@@ -742,6 +758,23 @@ def decode_akshare_indicator_response(
                 )
         if not candidates:
             raise ValueError("AKShare indicator response has no candidates")
+        metadata_compatibility = (
+            evaluate_financial_indicator_candidates(
+                candidates=candidates,
+                instrument_identity=request.instrument_identity,
+                requested_value_currency=request.currency,
+                requested_filing_consolidation_scope=(
+                    request.consolidation_scope
+                ),
+                pit_as_of_date=request.as_of_date,
+                declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+                normalizer_contract_version=(
+                    AKSHARE_INDICATOR_NORMALIZER_VERSION
+                ),
+            )
+            if truthful_metadata
+            else ()
+        )
         return FinancialProviderPeriodResponse.available(
             provider_id="akshare",
             response_artifact=artifact,
@@ -749,6 +782,7 @@ def decode_akshare_indicator_response(
             candidates=candidates,
             subrequest_keys=(),
             physical_attempt_ids=(),
+            indicator_metadata_compatibility=metadata_compatibility,
         )
     except (KeyError, TypeError, ValueError):
         raise _malformed("akshare_indicator_decode_malformed") from None
@@ -846,6 +880,15 @@ def decode_yahoo_profile_response(
             payload=payload,
             result=result,
         )
+        metadata_compatibility = evaluate_financial_indicator_candidates(
+            candidates=(),
+            instrument_identity=request.instrument_identity,
+            requested_value_currency=request.currency,
+            requested_filing_consolidation_scope=request.consolidation_scope,
+            pit_as_of_date=request.as_of_date,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+            normalizer_contract_version=YFINANCE_PROFILE_NORMALIZER_VERSION,
+        )
         return FinancialProviderPeriodResponse.available(
             provider_id="yfinance",
             response_artifact=artifact,
@@ -854,6 +897,7 @@ def decode_yahoo_profile_response(
             subrequest_keys=(),
             physical_attempt_ids=(),
             degraded_current_profile=True,
+            indicator_metadata_compatibility=metadata_compatibility,
         )
     except (KeyError, TypeError, ValueError):
         raise _malformed("yfinance_profile_decode_malformed") from None
@@ -1312,6 +1356,7 @@ def decode_akshare_name_response(
 __all__ = [
     "AKSHARE_FACTOR_NORMALIZER_VERSION",
     "AKSHARE_INDICATOR_NORMALIZER_VERSION",
+    "AKSHARE_INDICATOR_NORMALIZER_VERSION_V1",
     "AKSHARE_NAME_NORMALIZER_VERSION",
     "YFINANCE_STATEMENT_NORMALIZER_VERSION",
     "YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION",

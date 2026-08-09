@@ -22,6 +22,8 @@ from tradingagents.dataflows.baostock_capabilities import (
     assemble_baostock_history_bundle,
 )
 from tradingagents.dataflows.baostock_ratios import (
+    BAOSTOCK_RATIO_NORMALIZER_VERSION,
+    BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
     BaoStockRatioAdapterConfigurationError,
     BaoStockRatioAdapterFailureReason,
     BaoStockRatioFamilyAdapter,
@@ -31,6 +33,7 @@ from tradingagents.dataflows.baostock_ratios import (
     offer_baostock_ratio_to_statement,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
     FinancialCapability,
     FinancialCompanyType,
     FinancialCompanyTypeResolution,
@@ -40,6 +43,11 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialRatioFamily,
     FinancialStatementType,
     resolve_financial_company_type,
+)
+from tradingagents.dataflows.financial_indicator_metadata import (
+    FinancialIndicatorMetadataDimension,
+    FinancialIndicatorSemanticAssessmentState,
+    evaluate_financial_indicator_candidates,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -344,6 +352,7 @@ def test_complete_non_bank_profit_request_normalizes_one_exact_period(
     assert result.request.capacity_scope == "ratio_profit"
     assert result.request.requested_range_start == "2026-Q1"
     assert result.request.requested_range_end == "2026-Q1"
+    assert result.request.normalizer_version == "baostock-ratio-family-normalizer-v2"
     assert result.provider_artifact is not None
     assert result.artifact is not None
     assert result.artifact.dataset.endpoint_id == "query_profit_data"
@@ -360,6 +369,11 @@ def test_complete_non_bank_profit_request_normalizes_one_exact_period(
     assert candidate.period_identity.company_type is (
         FinancialCompanyType.INDUSTRIAL_NON_BANK
     )
+    assert candidate.period_identity.currency == "XXX"
+    assert candidate.period_identity.currency != _identity().currency
+    assert candidate.period_identity.consolidation_scope is (
+        FinancialConsolidationScope.UNKNOWN
+    )
     assert assessment.disposition is FinancialPeriodDisposition.CURRENT_ONLY
     assert assessment.core_coverage == Decimal("1")
 
@@ -373,6 +387,124 @@ def test_complete_non_bank_profit_request_normalizes_one_exact_period(
     assert gross_margin.original_unit == "RATIO"
     assert gross_margin.normalized_value == "0.4"
     assert gross_margin.normalized_unit == "RATIO"
+
+
+@pytest.mark.unit
+def test_baostock_v2_metadata_uses_raw_provider_truth_without_new_attempt(
+    tmp_path,
+) -> None:
+    transport = _FakeTransport(profit=_profit_row())
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=transport,
+            run_scope_id="ticket-02f-baostock-metadata",
+        )
+        result = harness.adapter.acquire_profit(
+            instrument_identity=_identity(),
+            company_type_resolution=_company_type_resolution(
+                FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            year=2026,
+            quarter=1,
+            as_of_date=date(2026, 7, 30),
+        )
+        attempts_before = harness.coordinator.physical_attempt_events(
+            result.sequence_id
+        )
+        compatibility = evaluate_financial_indicator_candidates(
+            candidates=result.candidates,
+            instrument_identity=_identity(),
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=date(2026, 7, 30),
+            declaration_version=FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
+            normalizer_contract_version=BAOSTOCK_RATIO_NORMALIZER_VERSION,
+        )
+        attempts_after = harness.coordinator.physical_attempt_events(
+            result.sequence_id
+        )
+
+    assert attempts_after == attempts_before
+    assessment = compatibility[0]
+    gross_margin = next(
+        item
+        for item in assessment.field_assessments
+        if item.normalized_field == "gross_margin"
+    )
+    dimensions = {item.dimension: item for item in gross_margin.dimensions}
+    assert dimensions[
+        FinancialIndicatorMetadataDimension.VALUE_CURRENCY
+    ].state is FinancialIndicatorSemanticAssessmentState.NOT_APPLICABLE
+    assert dimensions[
+        FinancialIndicatorMetadataDimension.VALUE_CURRENCY
+    ].raw_provider_marker == "XXX"
+    assert dimensions[
+        FinancialIndicatorMetadataDimension.FILING_CONSOLIDATION_SCOPE
+    ].state is FinancialIndicatorSemanticAssessmentState.UNPROVEN
+    assert dimensions[
+        FinancialIndicatorMetadataDimension.FILING_CONSOLIDATION_SCOPE
+    ].raw_provider_marker == "UNKNOWN"
+
+
+@pytest.mark.unit
+def test_baostock_v1_artifact_and_projection_remain_readable_without_relabeling(
+    tmp_path,
+) -> None:
+    transport = _FakeTransport(profit=_profit_row())
+    artifact_store = ProviderSubrequestArtifactStore(tmp_path / "artifacts")
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        result = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=transport,
+            run_scope_id="ticket-02f-baostock-v1",
+            artifact_store=artifact_store,
+            normalizer_version=BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
+        ).adapter.acquire_profit(
+            instrument_identity=_identity(),
+            company_type_resolution=_company_type_resolution(
+                FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            year=2026,
+            quarter=1,
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert result.request.normalizer_version == "baostock-ratio-family-normalizer-v1"
+    assert result.provider_artifact is not None
+    persisted = json.loads(artifact_store.read(result.provider_artifact))
+    assert persisted["normalizer_version"] == "baostock-ratio-family-normalizer-v1"
+    assert persisted["rows"][0] == _profit_row().iloc[0].to_dict()
+    assert result.candidates[0].period_identity.currency == "CNY"
+
+
+@pytest.mark.unit
+def test_baostock_v2_retains_explicit_provider_currency_without_request_backfill(
+    tmp_path,
+) -> None:
+    row = _profit_row().assign(currency="USD")
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        result = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=_FakeTransport(profit=row),
+            run_scope_id="ticket-02f-baostock-provider-currency",
+        ).adapter.acquire_profit(
+            instrument_identity=_identity(),
+            company_type_resolution=_company_type_resolution(
+                FinancialCompanyType.INDUSTRIAL_NON_BANK
+            ),
+            year=2026,
+            quarter=1,
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert result.candidates[0].period_identity.currency == "USD"
+    assert result.candidates[0].period_identity.currency != _identity().currency
 
 
 @pytest.mark.unit
@@ -846,7 +978,7 @@ def test_exact_request_artifact_is_immutable_and_checkpoint_resume_is_zero_io(
     assert persisted["observed_at"] == "2026-07-30T12:00:00Z"
     assert persisted["qualification_profile"] == "cn-a-2000-20260729-v1"
     assert persisted["normalizer_version"] == (
-        "baostock-ratio-family-normalizer-v1"
+        "baostock-ratio-family-normalizer-v2"
     )
     assert persisted["exact_request_identity"] == first.request.subrequest_key
     assert persisted["columns"] == list(_profit_row().columns)
@@ -1032,7 +1164,7 @@ def test_family_year_quarter_as_of_and_normalizer_have_distinct_cache_keys(
             artifact_store=ProviderSubrequestArtifactStore(tmp_path / "artifacts"),
             coordinator=harness.coordinator,
             checkpoint=harness.cache.checkpoint(),
-            normalizer_version="baostock-ratio-family-normalizer-v2",
+            normalizer_version=BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
         ).adapter.acquire_profit(
             **common,
             year=2026,
@@ -1283,21 +1415,24 @@ def test_incompatible_unit_currency_and_ambiguous_company_type_are_independent(
             incompatible_unit,
             _company_type_resolution(FinancialCompanyType.INDUSTRIAL_NON_BANK),
             BaoStockRatioOutcomeKind.INCOMPATIBLE_UNIT,
+            False,
         ),
         (
             incompatible_currency,
             _company_type_resolution(FinancialCompanyType.INDUSTRIAL_NON_BANK),
-            BaoStockRatioOutcomeKind.INCOMPATIBLE_CURRENCY,
+            BaoStockRatioOutcomeKind.AVAILABLE,
+            True,
         ),
         (
             _profit_row(),
             ambiguous_resolution,
             BaoStockRatioOutcomeKind.AMBIGUOUS_COMPANY_TYPE,
+            False,
         ),
     )
     with MarketHistoryStore.open(_history_config(tmp_path)) as store:
         results = []
-        for index, (frame, resolution, _expected) in enumerate(cases):
+        for index, (frame, resolution, _expected, _usable) in enumerate(cases):
             harness = _build_harness(
                 tmp_path=tmp_path,
                 store=store,
@@ -1314,14 +1449,18 @@ def test_incompatible_unit_currency_and_ambiguous_company_type_are_independent(
                 )
             )
 
-    for result, (_frame, _resolution, expected) in zip(results, cases, strict=True):
+    for result, (_frame, _resolution, expected, usable) in zip(
+        results,
+        cases,
+        strict=True,
+    ):
         assert result.capability_outcome.kind is expected
         assert result.provider_artifact is not None
         assert result.artifact is not None
-        assert not any(
+        assert any(
             assessment.usable_for_current_analysis
             for assessment in result.period_completeness
-        )
+        ) is usable
 
 
 @pytest.mark.unit

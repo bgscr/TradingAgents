@@ -30,6 +30,7 @@ from tradingagents.dataflows.financial_indicator_metadata import (
     FinancialIndicatorProviderFieldMetadata,
     FinancialIndicatorSemanticAssessmentState,
     assess_financial_indicator_metadata_compatibility,
+    evaluate_financial_indicator_candidates,
 )
 from tradingagents.evidence import (
     IdentityProvenance,
@@ -331,6 +332,49 @@ def test_complete_normalized_values_do_not_prove_material_scope() -> None:
     assert all(field.metadata_compatible is False for field in assessment.field_assessments)
     assert assessment.compatible is False
     assert assessment.current_only_metadata_eligible is False
+
+
+def test_provider_neutral_evaluation_derives_only_raw_candidate_metadata() -> None:
+    candidate = _candidate(
+        (
+            _field("gross_margin", original_unit="PERCENT", normalized_unit="RATIO"),
+            _field("net_margin", original_unit="PERCENT", normalized_unit="RATIO"),
+        )
+    )
+
+    assessments = evaluate_financial_indicator_candidates(
+        candidates=(candidate,),
+        instrument_identity=_instrument(),
+        requested_value_currency="CNY",
+        requested_filing_consolidation_scope=(
+            FinancialConsolidationScope.CONSOLIDATED
+        ),
+        pit_as_of_date=date(2026, 5, 1),
+        declaration_version=FINANCIAL_RATIO_DECLARATION_V1,
+        normalizer_contract_version="fixture-indicator-normalizer-v1",
+    )
+
+    assert len(assessments) == 1
+    assessment = assessments[0]
+    assert assessment.candidate_identity == candidate.candidate_identity
+    assert assessment.compatible is False
+    for field in assessment.field_assessments:
+        dimensions = {item.dimension: item for item in field.dimensions}
+        assert dimensions[
+            FinancialIndicatorMetadataDimension.INSTRUMENT_CURRENCY
+        ].evidence_value == "CNY"
+        assert dimensions[
+            FinancialIndicatorMetadataDimension.VALUE_CURRENCY
+        ].raw_provider_marker == "XXX"
+        assert dimensions[
+            FinancialIndicatorMetadataDimension.VALUE_CURRENCY
+        ].state is FinancialIndicatorSemanticAssessmentState.NOT_APPLICABLE
+        assert dimensions[
+            FinancialIndicatorMetadataDimension.FILING_CONSOLIDATION_SCOPE
+        ].raw_provider_marker == "UNKNOWN"
+        assert dimensions[
+            FinancialIndicatorMetadataDimension.FILING_CONSOLIDATION_SCOPE
+        ].state is FinancialIndicatorSemanticAssessmentState.UNPROVEN
 
 
 def test_compatibility_identity_is_stable_to_input_order_and_changes_with_proof() -> None:

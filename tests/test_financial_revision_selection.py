@@ -51,6 +51,10 @@ from tradingagents.dataflows.financial_dispatch import (
     project_financial_dispatch_ledger,
     project_financial_selection_evidence,
 )
+from tradingagents.dataflows.financial_indicator_metadata import (
+    FinancialIndicatorMetadataCompatibilityAssessment,
+    evaluate_financial_indicator_candidates,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState, InstrumentIdentityEvidence
 from tradingagents.reporting import _render_financial_dispatch_operations
@@ -239,6 +243,11 @@ def _indicator_revision(
             else FINANCIAL_RATIO_DECLARATION_V1
         ),
     )
+    selected_fields = tuple(
+        field
+        for field in declaration.normalized_fields
+        if provider_id == "tushare" or field != "earnings_per_share"
+    )
     dataset = FinancialProviderDatasetIdentity.create(
         provider_id=provider_id,
         endpoint_id="financial_indicators",
@@ -270,13 +279,13 @@ def _indicator_revision(
             normalized_value=value,
             normalized_unit=declaration.normalized_unit,
         )
-        for field in declaration.normalized_fields
+        for field in selected_fields
     )
     resolution = resolve_financial_company_type(
         provider_declared_type=FinancialCompanyType.INDUSTRIAL_NON_BANK,
         provider_declaration_qualified=True,
         classifier_metadata={},
-        present_fields=declaration.normalized_fields,
+        present_fields=selected_fields,
     )
     return FinancialPeriodCandidate.create(
         artifact=artifact,
@@ -311,6 +320,27 @@ def _indicator_revision(
         ),
         company_type_resolution=resolution,
         fields=fields,
+    )
+
+
+def _indicator_compatibility(
+    candidates: tuple[FinancialPeriodCandidate, ...],
+) -> tuple[FinancialIndicatorMetadataCompatibilityAssessment, ...]:
+    provider_id = candidates[0].artifact.dataset.provider_id
+    return evaluate_financial_indicator_candidates(
+        candidates=candidates,
+        instrument_identity=_identity(),
+        requested_value_currency="CNY",
+        requested_filing_consolidation_scope=(
+            FinancialConsolidationScope.CONSOLIDATED
+        ),
+        pit_as_of_date=_AS_OF,
+        declaration_version=(
+            FINANCIAL_RATIO_DECLARATION_V2
+            if provider_id == "tushare"
+            else FINANCIAL_RATIO_DECLARATION_V1
+        ),
+        normalizer_contract_version=f"{provider_id}-indicator-fixture-v2",
     )
 def test_same_provider_revisions_use_exact_operational_order_under_shuffled_input(
     monkeypatch: pytest.MonkeyPatch,
@@ -720,6 +750,7 @@ def test_strict_pit_excludes_later_observed_revision_from_qualified_sequence(
         candidates=candidates,
         subrequest_keys=("ticket-05-strict-replay",),
         physical_attempt_ids=("ticket-05-strict-replay-attempt",),
+        indicator_metadata_compatibility=_indicator_compatibility(candidates),
     )
     result = MainlandFinancialCapabilityRouter(
         routing_plan=_shadow_plan(monkeypatch),
@@ -1197,6 +1228,9 @@ def test_ratio_overlap_with_incompatible_currency_is_rejected_before_comparison(
             candidates=(tushare_overlap,),
             subrequest_keys=("ticket-05-ratio-key-tushare",),
             physical_attempt_ids=("ticket-05-ratio-key-tushare-attempt",),
+            indicator_metadata_compatibility=_indicator_compatibility(
+                (tushare_overlap,)
+            ),
         ),
         "akshare": FinancialProviderPeriodResponse.available(
             provider_id="akshare",
@@ -1205,6 +1239,9 @@ def test_ratio_overlap_with_incompatible_currency_is_rejected_before_comparison(
             candidates=(akshare_overlap, akshare_gap),
             subrequest_keys=("ticket-05-ratio-key-akshare",),
             physical_attempt_ids=("ticket-05-ratio-key-akshare-attempt",),
+            indicator_metadata_compatibility=_indicator_compatibility(
+                (akshare_overlap, akshare_gap)
+            ),
         ),
     }
 

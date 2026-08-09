@@ -65,7 +65,8 @@ from tradingagents.market_history.coordinator import (
 )
 
 BAOSTOCK_RATIO_ADAPTER_VERSION = "baostock-ratio-family-adapter-v1"
-BAOSTOCK_RATIO_NORMALIZER_VERSION = "baostock-ratio-family-normalizer-v1"
+BAOSTOCK_RATIO_NORMALIZER_VERSION_V1 = "baostock-ratio-family-normalizer-v1"
+BAOSTOCK_RATIO_NORMALIZER_VERSION = "baostock-ratio-family-normalizer-v2"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
@@ -602,10 +603,11 @@ class BaoStockRatioFamilyAdapter:
             raise BaoStockRatioAdapterConfigurationError(
                 BaoStockRatioAdapterFailureReason.DATA_USAGE_MODE_NOT_PERMITTED
             )
-        if not normalizer_version or any(
-            marker in normalizer_version.casefold() for marker in _CREDENTIAL_MARKERS
-        ):
-            raise ValueError("BaoStock ratio normalizer identity is unsafe")
+        if normalizer_version not in {
+            BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
+            BAOSTOCK_RATIO_NORMALIZER_VERSION,
+        }:
+            raise ValueError("BaoStock ratio normalizer version is unsupported")
         self._plan = routing_plan
         self._cache = subrequest_cache
         self._transport = transport
@@ -879,6 +881,7 @@ class BaoStockRatioFamilyAdapter:
             expected_period_end=period_end,
             pit_as_of_date=as_of_date,
             fields=fields,
+            normalizer_version=self._normalizer_version,
         )
         return BaoStockRatioFamilyAdapterResult(
             request=key,
@@ -1052,6 +1055,7 @@ def _project_candidates(
     expected_period_end: date,
     pit_as_of_date: date,
     fields: Mapping[str, _SourceField],
+    normalizer_version: str,
 ) -> tuple[
     tuple[FinancialPeriodCandidate, ...],
     tuple[FinancialPeriodCompletenessAssessment, ...],
@@ -1071,10 +1075,17 @@ def _project_candidates(
                 raise ValueError("BaoStock ratio period is incompatible")
             normalized_fields = _normalized_fields(row=row, fields=fields)
             currency_text = str(row.get("currency", "") or "").strip().upper()
-            currency = instrument_identity.currency
-            if currency_text and currency_text != currency:
-                raise _RatioNormalizationError(
-                    FinancialPeriodRejectionReason.INCOMPATIBLE_CURRENCY
+            if normalizer_version == BAOSTOCK_RATIO_NORMALIZER_VERSION_V1:
+                currency = instrument_identity.currency
+                if currency_text and currency_text != currency:
+                    raise _RatioNormalizationError(
+                        FinancialPeriodRejectionReason.INCOMPATIBLE_CURRENCY
+                    )
+            else:
+                currency = (
+                    currency_text
+                    if len(currency_text) == 3 and currency_text.isalpha()
+                    else "XXX"
                 )
             period_identity = FinancialPeriodIdentity.create(
                 instrument_identity=instrument_identity,
@@ -1113,7 +1124,7 @@ def _project_candidates(
                 requested_ratio_family=ratio_family,
                 expected_instrument_identity=instrument_identity,
                 expected_frequency=FinancialReportingFrequency.QUARTERLY,
-                expected_currency=instrument_identity.currency,
+                expected_currency=currency,
                 expected_consolidation_scope=FinancialConsolidationScope.UNKNOWN,
                 pit_as_of_date=pit_as_of_date,
                 ratio_declaration_version=(
@@ -1661,6 +1672,7 @@ def _upstream_rate_limit(exc: Exception) -> bool:
 __all__ = [
     "BAOSTOCK_RATIO_ADAPTER_VERSION",
     "BAOSTOCK_RATIO_NORMALIZER_VERSION",
+    "BAOSTOCK_RATIO_NORMALIZER_VERSION_V1",
     "BaoStockRatioAdapterConfigurationError",
     "BaoStockRatioAdapterFailureReason",
     "BaoStockRatioCapabilityOutcome",

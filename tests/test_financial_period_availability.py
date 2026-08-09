@@ -21,6 +21,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     render_indicator_routing_result,
 )
 from tradingagents.dataflows.financial_contracts import (
+    FINANCIAL_RATIO_DECLARATION_V2,
     FinancialAvailabilityScope,
     FinancialCapability,
     FinancialCompanyType,
@@ -43,6 +44,9 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolRequest,
     project_financial_dispatch_ledger,
     project_financial_selection_evidence,
+)
+from tradingagents.dataflows.financial_indicator_metadata import (
+    evaluate_financial_indicator_candidates,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
@@ -124,6 +128,19 @@ def _indicator_fixture(
         subrequest_keys=(event.request_key,),
         physical_attempt_ids=(event.attempt_event_id,),
         physical_attempt_events=(event,),
+        indicator_metadata_compatibility=evaluate_financial_indicator_candidates(
+            candidates=candidates,
+            instrument_identity=identity,
+            requested_value_currency="CNY",
+            requested_filing_consolidation_scope=(
+                FinancialConsolidationScope.CONSOLIDATED
+            ),
+            pit_as_of_date=as_of_date,
+            declaration_version=FINANCIAL_RATIO_DECLARATION_V2,
+            normalizer_contract_version=(
+                "tushare-financial-indicator-adapter-v1"
+            ),
+        ),
     )
     request = FinancialIndicatorRoutingRequest(
         contract_version="financial-indicator-routing-request-v3",
