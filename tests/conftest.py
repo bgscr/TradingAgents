@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest_plugins = ("tests.live_test_guard",)
+
 
 def pytest_configure(config):
     for marker in ("unit", "integration", "smoke"):
