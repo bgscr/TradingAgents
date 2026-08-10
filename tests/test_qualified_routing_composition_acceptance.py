@@ -537,6 +537,7 @@ class _FreshRun:
         *,
         tool_names: tuple[str, ...] = ("get_balance_sheet",),
         indicator_families: tuple[FinancialRatioFamily, ...] | None = None,
+        include_indicator_arguments: bool = True,
         tool_call_prefix: str = "qcf",
     ) -> dict[str, object]:
         tool_calls = []
@@ -547,7 +548,7 @@ class _FreshRun:
             }
             if tool_name != "get_fundamentals":
                 arguments["freq"] = "quarterly"
-            else:
+            elif include_indicator_arguments:
                 families = indicator_families or tuple(FinancialRatioFamily)
                 requirements = FinancialIndicatorEvidenceRequirements.create(
                     requested_families=families,
@@ -1091,6 +1092,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert all(provider.calls == [] for provider in fresh.providers.values())
         state = fresh.state(
             tool_names=("get_balance_sheet", "get_fundamentals"),
+            include_indicator_arguments=False,
         )
         initial_evidence_state = copy.deepcopy(state["evidence_state"])
         assert "financial_dispatch_shadow_ledger" not in state

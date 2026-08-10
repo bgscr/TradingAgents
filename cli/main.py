@@ -2449,38 +2449,58 @@ def run_analysis(
         analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
         display.refresh(spinner_text)
 
-        # Initialize state and get graph args with callbacks. Acquire trusted
-        # evidence first so a missing registry identity can short-circuit without
-        # optional provider enrichment or model-mediated work.
-        evidence_state = graph.resolve_evidence_state(
-            selections["ticker"], selections["analysis_date"]
-        )
+        # Initialize state and get graph args with callbacks. A validated resume
+        # must reuse its checkpoint evidence instead of reacquiring providers
+        # before LangGraph restores the saved node state.
         checkpoint_thread_id = checkpoint_graph_config.get(
             "configurable",
             {},
         ).get("thread_id")
-        initial_state_kwargs: dict[str, Any] = {
-            "asset_type": selections["asset_type"],
-            "evidence_state": evidence_state,
-        }
-        if checkpoint_thread_id is not None:
-            initial_state_kwargs["checkpoint_thread_id"] = str(
-                checkpoint_thread_id
+        checkpoint_state = checkpoint_session.checkpoint_state
+        if checkpoint_session.resume_from_checkpoint:
+            if not isinstance(checkpoint_state, Mapping):
+                raise RuntimeError("resumable checkpoint state is unavailable")
+            init_agent_state = dict(checkpoint_state)
+        else:
+            evidence_state = graph.resolve_evidence_state(
+                selections["ticker"], selections["analysis_date"]
             )
-        init_agent_state = graph.create_initial_state(
-            selections["ticker"],
-            selections["analysis_date"],
-            **initial_state_kwargs,
-        )
+            initial_state_kwargs: dict[str, Any] = {
+                "asset_type": selections["asset_type"],
+                "evidence_state": evidence_state,
+            }
+            if checkpoint_thread_id is not None:
+                initial_state_kwargs["checkpoint_thread_id"] = str(
+                    checkpoint_thread_id
+                )
+            init_agent_state = graph.create_initial_state(
+                selections["ticker"],
+                selections["analysis_date"],
+                **initial_state_kwargs,
+            )
         if checkpoint_session.routing_compatibility is not None:
             init_agent_state[
                 "capability_routing_checkpoint_compatibility"
             ] = checkpoint_session.routing_compatibility.model_dump(mode="json")
         runtime_binder = getattr(graph, "bind_qualified_routing_runtime", None)
         if callable(runtime_binder):
+            resume_qualified_routing = bool(
+                checkpoint_session.resume_from_checkpoint
+                and init_agent_state.get("financial_dispatch_shadow_ledger")
+                is not None
+            )
             runtime_binder(
                 run_id=init_agent_state["run_id"],
                 checkpoint_compatibility_known=True,
+                resume_from_checkpoint=resume_qualified_routing,
+                checkpoint_thread_id=(
+                    str(checkpoint_thread_id)
+                    if checkpoint_thread_id is not None
+                    else None
+                ),
+                checkpoint_state=(
+                    checkpoint_state if resume_qualified_routing else None
+                ),
                 analysis_as_of_date=str(init_agent_state["trade_date"]),
             )
         # Pass callbacks to graph config for tool execution tracking

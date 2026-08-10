@@ -131,6 +131,7 @@ class CheckpointSession:
     resume_from_checkpoint: bool
     routing_compatibility: MainlandCapabilityRoutingCheckpointCompatibility | None = None
     run_signature: str | None = None
+    checkpoint_state: Mapping[str, Any] | None = None
 
 
 def _coerce_max_retries(value):
@@ -1361,6 +1362,7 @@ class TradingAgentsGraph:
                     if checkpoint is not None
                     else None
                 )
+                checkpoint_state = None
                 routing_compatibility = None
                 if step is not None:
                     logger.info(
@@ -1372,6 +1374,7 @@ class TradingAgentsGraph:
                     if checkpoint is None:  # pragma: no cover - saver invariant
                         raise RuntimeError("checkpoint disappeared during validation")
                     channel_values = checkpoint_values(checkpoint)
+                    checkpoint_state = channel_values
                     if isinstance(financial_tool_node, FinancialDispatchToolNode):
                         routing_compatibility = (
                             financial_tool_node.validate_checkpoint_state(
@@ -1401,6 +1404,7 @@ class TradingAgentsGraph:
                         migrated_checkpoint = saver.get_tuple(graph_config)
                         if migrated_checkpoint is None:
                             step = None
+                            checkpoint_state = None
                         else:
                             migrated_values = checkpoint_values(migrated_checkpoint)
                             if isinstance(
@@ -1427,6 +1431,7 @@ class TradingAgentsGraph:
                                         "migrated routing checkpoint is incompatible"
                                     )
                             step = migrated_checkpoint.metadata.get("step")
+                            checkpoint_state = migrated_values
                 else:
                     if (
                         active_plan is not None
@@ -1541,6 +1546,7 @@ class TradingAgentsGraph:
                     resume_from_checkpoint=step is not None,
                     routing_compatibility=routing_compatibility,
                     run_signature=selected_signature,
+                    checkpoint_state=checkpoint_state,
                 )
             finally:
                 self._active_checkpointer = None

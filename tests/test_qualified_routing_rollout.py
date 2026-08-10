@@ -2337,13 +2337,7 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
     assert "LegacyTotal,100" in result["messages"][0].content
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
     assert "provider_subrequest_cache" not in result["financial_dispatch_ledger"]
-    assert result["financial_dispatch_shadow_ledger"][
-        "provider_subrequest_cache"
-    ] == {
-        "contract_version": "1.0",
-        "run_scope_id": "run:" + "b" * 64,
-        "entries": [],
-    }
+    assert "financial_dispatch_shadow_ledger" not in result
     assert result["financial_dispatch_shadow_failure"] == {
         "contract_version": "1.0",
         "diagnostic_code": "shadow_dispatch_failed",
@@ -2353,6 +2347,15 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
         result,
         default=str,
     )
+    checkpoint_state = _financial_tool_state(asset, plan)
+    checkpoint_state.update(result)
+    compatibility = node.validate_checkpoint_state(
+        checkpoint_state,
+        expected_asset_configuration=asset,
+        expected_capability_routing_plan=plan,
+    )
+    assert compatibility is not None
+    assert compatibility.action is MainlandCapabilityRoutingCheckpointAction.RESUME
 
     historical_state = _financial_tool_state(asset, plan)
     historical_ledger = copy.deepcopy(result["financial_dispatch_ledger"])
@@ -2414,6 +2417,90 @@ def test_shadow_request_factory_failure_cannot_change_legacy_output(
     assert "LegacyTotal,100" in result["messages"][0].content
     assert result["financial_dispatch_shadow_failure"]["failure_count"] == 1
     assert "raw-shadow-factory-secret" not in json.dumps(result, default=str)
+
+
+def test_shadow_request_enrichment_failure_cannot_change_legacy_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = _preflight(
+        monkeypatch,
+        "qualified_v1_shadow",
+        enabled=("financial_indicators",),
+    ).plan
+    assert plan is not None
+
+    def legacy_fundamentals(*_args, **_kwargs) -> str:
+        return (
+            "# Company Fundamentals for 601328.SS\n"
+            "# Data retrieved on: 2026-08-10 12:00:00\n\n"
+            "LegacyMetric: 100"
+        )
+
+    def failing_enrichment(*_args, **_kwargs):
+        raise RuntimeError("raw-shadow-enrichment-secret")
+
+    config = _rollout_config(
+        "qualified_v1_shadow",
+        enabled=("financial_indicators",),
+    )
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    config["tool_vendors"] = dict.fromkeys(
+        (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        ),
+        "scripted",
+    )
+    vendor_methods = _financial_vendor_methods(lambda *_args, **_kwargs: "unused")
+    vendor_methods["get_fundamentals"] = {"scripted": legacy_fundamentals}
+    node = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods=vendor_methods,
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            indicator_sources={},
+        ),
+        qualified_indicator_request_factory=lambda _request: None,
+    )
+    monkeypatch.setattr(
+        node,
+        "_qualified_dispatch_request",
+        failing_enrichment,
+    )
+    state = _financial_tool_state(asset, plan)
+    state["messages"] = [
+        AIMessage(
+            content="",
+            id="shadow-enrichment-message",
+            tool_calls=[
+                {
+                    "name": "get_fundamentals",
+                    "args": {
+                        "ticker": asset.instrument_identity.symbol,
+                        "curr_date": "2026-07-30",
+                    },
+                    "id": "shadow-fundamentals",
+                    "type": "tool_call",
+                }
+            ],
+        )
+    ]
+
+    result = node(state)
+
+    assert "LegacyMetric: 100" in result["messages"][0].content
+    assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
+    assert "financial_dispatch_shadow_ledger" not in result
+    assert result["financial_dispatch_shadow_failure"] == {
+        "contract_version": "1.0",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+    }
+    assert "raw-shadow-enrichment-secret" not in json.dumps(result, default=str)
 
 
 def test_later_shadow_failure_preserves_prior_manifest_and_legacy_authority(

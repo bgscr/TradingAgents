@@ -28,6 +28,10 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialStatementRoutingRequest,
     MainlandFinancialCapabilityRouter,
 )
+from tradingagents.dataflows.financial_contracts import (
+    FinancialIndicatorEvidenceRequirements,
+    FinancialRatioFamily,
+)
 from tradingagents.dataflows.financial_dispatch import (
     FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
@@ -68,6 +72,13 @@ _FINANCIAL_TOOL_CONTRACTS = {
         FinancialReportingFrequency.QUARTERLY,
     ),
 }
+
+_QUALIFIED_INDICATOR_CANONICAL_EVIDENCE_CONTRACT_ID = (
+    "canonical-evidence-contract.v1"
+)
+_QUALIFIED_INDICATOR_STRATEGY_RULES_ID = (
+    "mainland-equity-strategy-rules.v1"
+)
 
 class FinancialDispatchToolNode:
     """Execute one fundamentals tool turn through a checkpoint-aware dispatcher."""
@@ -220,6 +231,9 @@ class FinancialDispatchToolNode:
                 FinancialDispatchCheckpointFailureReason.ELIGIBILITY_POLICY_MISMATCH
             )
         dispatcher, evidence = self._dispatcher_from_state(state)
+        asset_configuration = RunAssetConfigurationProjection.model_validate(
+            state.get("asset_configuration")
+        )
         graph_message_id = getattr(model_message, "id", None)
         requests = [
             _financial_request_from_tool_call(
@@ -284,8 +298,13 @@ class FinancialDispatchToolNode:
             if rollout_mode == "qualified_v1_shadow":
                 tool_messages.append(dispatcher.dispatch_tool_message(request))
                 if self._qualified_route_enabled(request) and shadow_dispatcher is not None:
-                    shadow_executed = True
+                    qualified_dispatch_request = None
+                    qualified_selection_started = False
                     try:
+                        qualified_dispatch_request = self._qualified_dispatch_request(
+                            request,
+                            asset_configuration=asset_configuration,
+                        )
                         if (
                             request.statement_type
                             is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
@@ -293,29 +312,43 @@ class FinancialDispatchToolNode:
                         ):
                             selection_request = (
                                 shadow_dispatcher.restored_indicator_selection_request(
-                                    request
+                                    qualified_dispatch_request
                                 )
-                                or active_indicator_factory(request)
+                                or active_indicator_factory(
+                                    qualified_dispatch_request
+                                )
                             )
+                            qualified_selection_started = True
                             shadow_dispatcher.dispatch_indicator_selection(
-                                request,
+                                qualified_dispatch_request,
                                 selection_request,
                             )
+                            shadow_executed = True
                         elif active_statement_factory is not None:
                             selection_request = (
                                 shadow_dispatcher.restored_statement_selection_request(
-                                    request
+                                    qualified_dispatch_request
                                 )
-                                or active_statement_factory(request)
+                                or active_statement_factory(
+                                    qualified_dispatch_request
+                                )
                             )
+                            qualified_selection_started = True
                             shadow_dispatcher.dispatch_statement_selection(
-                                request,
+                                qualified_dispatch_request,
                                 selection_request,
                             )
+                            shadow_executed = True
                     except Exception:  # noqa: BLE001 - shadow cannot affect authority
                         shadow_failure_count += 1
-                        with suppress(Exception):
-                            shadow_dispatcher.discard_failed_qualified_selection(request)
+                        if (
+                            qualified_dispatch_request is not None
+                            and qualified_selection_started
+                        ):
+                            with suppress(Exception):
+                                shadow_dispatcher.discard_failed_qualified_selection(
+                                    qualified_dispatch_request
+                                )
             elif (
                 self._qualified_route_enabled(request)
                 and
@@ -323,9 +356,15 @@ class FinancialDispatchToolNode:
                 is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
                 and self._qualified_indicator_request_factory is not None
             ):
-                dispatch_result = dispatcher.dispatch_indicator_selection(
+                qualified_dispatch_request = self._qualified_dispatch_request(
                     request,
-                    self._qualified_indicator_request_factory(request),
+                    asset_configuration=asset_configuration,
+                )
+                dispatch_result = dispatcher.dispatch_indicator_selection(
+                    qualified_dispatch_request,
+                    self._qualified_indicator_request_factory(
+                        qualified_dispatch_request
+                    ),
                 )
                 evidence = project_financial_selection_evidence(
                     evidence,
@@ -375,6 +414,40 @@ class FinancialDispatchToolNode:
                 "failure_count": shadow_failure_count,
             }
         return result
+
+    @staticmethod
+    def _qualified_dispatch_request(
+        request: FinancialToolRequest,
+        *,
+        asset_configuration: RunAssetConfigurationProjection,
+    ) -> FinancialToolRequest:
+        """Supply graph-owned indicator premises absent from the model schema."""
+
+        if (
+            request.statement_type
+            is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+            or request.indicator_request_arguments is not None
+        ):
+            return request
+        families = tuple(FinancialRatioFamily)
+        requirements = FinancialIndicatorEvidenceRequirements.create(
+            requested_families=families,
+            canonical_evidence_contract_id=(
+                _QUALIFIED_INDICATOR_CANONICAL_EVIDENCE_CONTRACT_ID
+            ),
+            capability_profile_id=(
+                asset_configuration.capability_profile.profile_id
+            ),
+            strategy_rules_id=_QUALIFIED_INDICATOR_STRATEGY_RULES_ID,
+        )
+        return request.model_copy(
+            update={
+                "indicator_request_arguments": FinancialIndicatorRequestArguments(
+                    requested_families=families,
+                    family_evidence_requirements=requirements,
+                )
+            }
+        )
 
     def _qualified_route_enabled(self, request: FinancialToolRequest) -> bool:
         router = self._qualified_statement_router

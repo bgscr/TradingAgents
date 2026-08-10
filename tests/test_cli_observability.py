@@ -120,6 +120,8 @@ def _run_with_chunks(
     checkpoint_session=None,
     observed_initial_kwargs=None,
     observed_checkpoint_clears=None,
+    observed_evidence_resolutions=None,
+    observed_runtime_bindings=None,
 ):
     class FakeStream:
         def __init__(self):
@@ -164,6 +166,13 @@ def _run_with_chunks(
                 yield checkpoint_session
                 return
             if self.config["checkpoint_enabled"]:
+                restored_state = None
+                if resume_from_checkpoint:
+                    restored_state = self.propagator.create_initial_state(
+                        ticker,
+                        trade_date,
+                        asset_type=asset_type,
+                    )
                 yield cli_main.CheckpointSession(
                     {
                         "configurable": {
@@ -171,6 +180,7 @@ def _run_with_chunks(
                         }
                     },
                     resume_from_checkpoint,
+                    checkpoint_state=restored_state,
                 )
             else:
                 yield cli_main.CheckpointSession({}, False)
@@ -192,6 +202,8 @@ def _run_with_chunks(
             return "resolved identity"
 
         def resolve_evidence_state(self, *args, **kwargs):
+            if observed_evidence_resolutions is not None:
+                observed_evidence_resolutions.append((args, kwargs))
             return None
 
     class RecordingDisplay:
@@ -217,6 +229,14 @@ def _run_with_chunks(
             return None
 
     display = RecordingDisplay()
+    if observed_runtime_bindings is not None:
+        def bind_qualified_routing_runtime(_self, **kwargs):
+            observed_runtime_bindings.append(dict(kwargs))
+            return None
+
+        FakeTradingAgentsGraph.bind_qualified_routing_runtime = (
+            bind_qualified_routing_runtime
+        )
     monkeypatch.setattr(cli_main, "get_user_selections", _run_selections)
     monkeypatch.setattr(
         cli_main,
@@ -348,6 +368,121 @@ def test_cli_clears_checkpoint_after_completed_analysis_outcome(
 
     assert graph_inputs == [None]
     assert not checkpoint_marker.exists()
+
+
+@pytest.mark.unit
+def test_cli_resume_uses_validated_checkpoint_state_without_reacquiring_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_thread_id = "resume-thread"
+    restored_state = {
+        "run_id": "run:" + "d" * 64,
+        "company_of_interest": "601658.SS",
+        "trade_date": "2026-07-09",
+        "asset_type": "stock",
+        "evidence_state": EvidenceState().model_dump(mode="json"),
+        "messages": [],
+    }
+    session = cli_main.CheckpointSession(
+        graph_config={"configurable": {"thread_id": checkpoint_thread_id}},
+        resume_from_checkpoint=True,
+        checkpoint_state=restored_state,
+    )
+    graph_inputs = []
+    initial_kwargs = []
+    evidence_resolutions = []
+    runtime_bindings = []
+
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "messages": [],
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
+        checkpoint=True,
+        checkpoint_session=session,
+        observed_graph_inputs=graph_inputs,
+        observed_initial_kwargs=initial_kwargs,
+        observed_evidence_resolutions=evidence_resolutions,
+        observed_runtime_bindings=runtime_bindings,
+    )
+
+    assert graph_inputs == [None]
+    assert initial_kwargs == []
+    assert evidence_resolutions == []
+    assert runtime_bindings == [
+        {
+            "run_id": restored_state["run_id"],
+            "checkpoint_compatibility_known": True,
+            "resume_from_checkpoint": False,
+            "checkpoint_thread_id": checkpoint_thread_id,
+            "checkpoint_state": None,
+            "analysis_as_of_date": restored_state["trade_date"],
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_cli_resume_forwards_exact_qualified_shadow_checkpoint_binding(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint_thread_id = "qualified-resume-thread"
+    restored_state = {
+        "run_id": "run:" + "e" * 64,
+        "company_of_interest": "601328.SS",
+        "trade_date": "2026-08-10",
+        "asset_type": "stock",
+        "evidence_state": EvidenceState().model_dump(mode="json"),
+        "financial_dispatch_shadow_ledger": {
+            "contract_version": "1.5",
+        },
+        "messages": [],
+    }
+    session = cli_main.CheckpointSession(
+        graph_config={"configurable": {"thread_id": checkpoint_thread_id}},
+        resume_from_checkpoint=True,
+        checkpoint_state=restored_state,
+    )
+    graph_inputs = []
+    evidence_resolutions = []
+    runtime_bindings = []
+
+    _run_with_chunks(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "messages": [],
+                "financial_dispatch_shadow_ledger": None,
+                "analysis_outcome": _INSUFFICIENT_OUTCOME,
+                "analysis_outcome_contract": _INSUFFICIENT_OUTCOME_CONTRACT,
+            }
+        ],
+        checkpoint=True,
+        checkpoint_session=session,
+        observed_graph_inputs=graph_inputs,
+        observed_evidence_resolutions=evidence_resolutions,
+        observed_runtime_bindings=runtime_bindings,
+    )
+
+    assert graph_inputs == [None]
+    assert evidence_resolutions == []
+    assert len(runtime_bindings) == 1
+    assert runtime_bindings[0] == {
+        "run_id": restored_state["run_id"],
+        "checkpoint_compatibility_known": True,
+        "resume_from_checkpoint": True,
+        "checkpoint_thread_id": checkpoint_thread_id,
+        "checkpoint_state": restored_state,
+        "analysis_as_of_date": restored_state["trade_date"],
+    }
+    assert runtime_bindings[0]["checkpoint_state"] is restored_state
 
 
 @pytest.mark.unit
