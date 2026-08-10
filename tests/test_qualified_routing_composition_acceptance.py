@@ -3,16 +3,19 @@ from __future__ import annotations
 import copy
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 import cli.main as cli_main
@@ -29,10 +32,12 @@ from tests.test_financial_capability_routing_selection import (
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
+    MainlandCapability,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
 )
 from tradingagents.dataflows.financial_capability_routing import (
+    FinancialCapabilityRoutingRequest,
     FinancialIndicatorRoutingRequest,
     MainlandFinancialCapabilityRouter,
 )
@@ -46,6 +51,8 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialRatioFamily,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchCheckpointError,
+    FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
     FinancialIndicatorRequestArguments,
     FinancialToolDispatcher,
@@ -55,6 +62,9 @@ from tradingagents.dataflows.financial_indicator_metadata import (
     FinancialIndicatorMetadataDimension,
     FinancialIndicatorMetadataEvidenceOrigin,
     FinancialIndicatorSemanticAssessmentState,
+)
+from tradingagents.dataflows.provider_subrequests import (
+    ProviderSubrequestArtifactStore,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
@@ -423,16 +433,21 @@ class _YahooTicker:
     def quarterly_cashflow(self) -> pd.DataFrame:
         return self._unused("quarterly_cashflow")
 
-    def get_info(self) -> dict[str, str]:
+    def get_info(self) -> dict[str, object]:
         self._provider._record("get_info", {})
-        return {}
+        return dict(self._provider.info)
 
     def history(self, **kwargs: object) -> pd.DataFrame:
         self._provider._record("history", kwargs)
-        return pd.DataFrame()
+        return self._provider.history_frame.copy(deep=True)
 
 
 class _YahooProvider(_OwnedFakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.info: dict[str, object] = {}
+        self.history_frame = pd.DataFrame()
+
     def Ticker(self, symbol: str) -> _YahooTicker:
         self._record("Ticker", {"symbol": symbol})
         return _YahooTicker(self)
@@ -506,6 +521,7 @@ class _FreshRun:
     providers: dict[str, _OwnedFakeProvider]
     resolver_calls: list[object]
     compiled_fundamentals: Any
+    checkpoint_config: dict[str, object]
     deterministic_llm: MagicMock
 
     @property
@@ -520,6 +536,8 @@ class _FreshRun:
         self,
         *,
         tool_names: tuple[str, ...] = ("get_balance_sheet",),
+        indicator_families: tuple[FinancialRatioFamily, ...] | None = None,
+        tool_call_prefix: str = "qcf",
     ) -> dict[str, object]:
         tool_calls = []
         for index, tool_name in enumerate(tool_names):
@@ -530,7 +548,7 @@ class _FreshRun:
             if tool_name != "get_fundamentals":
                 arguments["freq"] = "quarterly"
             else:
-                families = tuple(FinancialRatioFamily)
+                families = indicator_families or tuple(FinancialRatioFamily)
                 requirements = FinancialIndicatorEvidenceRequirements.create(
                     requested_families=families,
                     canonical_evidence_contract_id=(
@@ -549,7 +567,7 @@ class _FreshRun:
                 {
                     "name": tool_name,
                     "args": arguments,
-                    "id": f"qcf:{index}:{tool_name}",
+                    "id": f"{tool_call_prefix}:{index}:{tool_name}",
                     "type": "tool_call",
                 }
             )
@@ -577,7 +595,14 @@ class _FreshRun:
         self.host.close_qualified_routing_runtime()
 
     def invoke(self, state: dict[str, object]) -> dict[str, object]:
-        return self.compiled_fundamentals.invoke(state)
+        return self.compiled_fundamentals.invoke(
+            state,
+            config=self.checkpoint_config,
+        )
+
+    def checkpoint_state(self) -> dict[str, object]:
+        snapshot = self.compiled_fundamentals.get_state(self.checkpoint_config)
+        return copy.deepcopy(dict(snapshot.values))
 
 
 def _legacy_vendor_methods() -> dict[str, dict[str, object]]:
@@ -736,7 +761,10 @@ def _fresh_builtin_run(
     workflow.add_node("tools_fundamentals", financial_node)
     workflow.add_edge(START, "tools_fundamentals")
     workflow.add_edge("tools_fundamentals", END)
-    compiled_fundamentals = workflow.compile()
+    compiled_fundamentals = workflow.compile(checkpointer=MemorySaver())
+    checkpoint_config: dict[str, object] = {
+        "configurable": {"thread_id": checkpoint_thread_id}
+    }
     return _FreshRun(
         symbol=symbol,
         config=config,
@@ -748,6 +776,7 @@ def _fresh_builtin_run(
         providers=providers,
         resolver_calls=resolver_calls,
         compiled_fundamentals=compiled_fundamentals,
+        checkpoint_config=checkpoint_config,
         deterministic_llm=deterministic_llm,
     )
 
@@ -1565,3 +1594,1373 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
 
     assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
     assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+def _assert_fresh_builtin_origin(fresh: _FreshRun) -> None:
+    assert isinstance(fresh.composition, RegisteredProductionQualifiedRoutingComposition)
+    assert fresh.composition.factory_identity == (
+        cli_main.BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.identity
+    )
+    assert fresh.owner is not None
+    assert fresh.owner.context is None
+    assert fresh.runtime.financial_routing is None
+    assert all(provider.calls == [] for provider in fresh.providers.values())
+
+
+def _capability_request(
+    fresh: _FreshRun,
+    capability: MainlandCapability,
+    *,
+    range_start: date = date(2026, 7, 23),
+    as_of_date: date = date(2026, 7, 24),
+) -> FinancialCapabilityRoutingRequest:
+    return FinancialCapabilityRoutingRequest(
+        instrument_identity=fresh.asset.instrument_identity,
+        capability=capability,
+        range_start=range_start,
+        as_of_date=as_of_date,
+    )
+
+
+@pytest.mark.unit
+def test_qcf5_fresh_builtin_preserves_partial_tushare_work_and_gaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="600895.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000005",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    assert isinstance(tushare, _TushareProvider)
+    original_balance = tushare.balancesheet
+    original_income = tushare.income
+    balance_calls = 0
+
+    def partial_balance(**kwargs: object) -> pd.DataFrame:
+        nonlocal balance_calls
+        balance_calls += 1
+        frame = original_balance(**kwargs)
+        return frame if balance_calls == 1 else frame.iloc[-2:].reset_index(drop=True)
+
+    def partial_income(**kwargs: object) -> pd.DataFrame:
+        return original_income(**kwargs).iloc[-2:].reset_index(drop=True)
+
+    def unavailable_cashflow(**kwargs: object) -> pd.DataFrame:
+        tushare._record("cashflow", kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(tushare, "balancesheet", partial_balance)
+    monkeypatch.setattr(tushare, "income", partial_income)
+    monkeypatch.setattr(tushare, "cashflow", unavailable_cashflow)
+    dispatches: list[tuple[object, object]] = []
+    original_dispatch = FinancialToolDispatcher.dispatch_statement_selection
+
+    def capture(dispatcher, request, selection_request):
+        result = original_dispatch(dispatcher, request, selection_request)
+        dispatches.append((selection_request, result))
+        return result
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "dispatch_statement_selection",
+        capture,
+    )
+    try:
+        result = fresh.invoke(
+            fresh.state(
+                tool_names=(
+                    "get_balance_sheet",
+                    "get_income_statement",
+                    "get_cashflow",
+                )
+            )
+        )
+        assert "financial_dispatch_shadow_failure" not in result
+        assert fresh.owner.context is not None
+        assert len(dispatches) == 3
+        partial_results = tuple(
+            dispatched.routing_result
+            for _request, dispatched in dispatches
+            if dispatched.routing_result.selected_candidates
+        )
+        assert len(partial_results) == 2
+        for routing in partial_results:
+            assert routing.missing_annual_period_ends or (
+                routing.missing_reporting_period_ends
+            )
+            assert tuple(call.provider_id for call in routing.provider_calls) == (
+                "tushare",
+                "akshare_sina",
+                "yfinance",
+            )
+            first, second, third = routing.provider_calls
+            first_targets = {
+                *first.missing_annual_period_ends,
+                *first.missing_reporting_period_ends,
+            }
+            second_targets = {
+                *second.missing_annual_period_ends,
+                *second.missing_reporting_period_ends,
+            }
+            third_targets = {
+                *third.missing_annual_period_ends,
+                *third.missing_reporting_period_ends,
+            }
+            assert second_targets < first_targets
+            assert third_targets == second_targets
+            assert all(
+                candidate.artifact.dataset.provider_id == "tushare"
+                for candidate in routing.selected_candidates
+            )
+        cashflow_routing = next(
+            dispatched.routing_result
+            for request, dispatched in dispatches
+            if request.statement_type.value == "cash_flow"
+        )
+        assert cashflow_routing.selected_candidates == ()
+        assert balance_calls == 2
+        assert [endpoint for endpoint, _ in tushare.calls].count("income") == 1
+        assert [endpoint for endpoint, _ in tushare.calls].count("cashflow") == 1
+        attempts = _attempt_events(result["financial_dispatch_shadow_ledger"])
+        assert len({event["attempt_event_id"] for event in attempts}) == len(attempts)
+        assert all(event["final_physical_attempt_count"] == 1 for event in attempts)
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf6_fresh_builtin_akshare_salvages_only_unresolved_statement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="600895.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000006",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    akshare = fresh.providers["akshare"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(akshare, _AkshareProvider)
+    original_balance = tushare.balancesheet
+    balance_calls = 0
+
+    def one_gap_balance(**kwargs: object) -> pd.DataFrame:
+        nonlocal balance_calls
+        balance_calls += 1
+        frame = original_balance(**kwargs)
+        if balance_calls == 1:
+            return frame
+        return frame.loc[frame["end_date"] != "20251231"].reset_index(drop=True)
+
+    def salvaged_balance(**kwargs: object) -> pd.DataFrame:
+        akshare._record("stock_financial_report_sina", kwargs)
+        return pd.DataFrame(
+            [
+                {
+                    "报告日": "2025-12-31",
+                    "公告日期": "2026-04-20",
+                    "币种": "CNY",
+                    "类型": "合并期末",
+                    "更新日期": "2026-04-22T08:30:00+08:00",
+                    "资产总计": 1_000,
+                    "负债合计": 400,
+                    "所有者权益合计": 600,
+                    "货币资金": 100,
+                    "应收账款": 80,
+                    "存货": 60,
+                    "应付账款": 70,
+                    "短期借款": 50,
+                    "长期借款": 40,
+                    "固定资产": 300,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(tushare, "balancesheet", one_gap_balance)
+    monkeypatch.setattr(akshare, "stock_financial_report_sina", salvaged_balance)
+    dispatches: list[object] = []
+    original_dispatch = FinancialToolDispatcher.dispatch_statement_selection
+
+    def capture(dispatcher, request, selection_request):
+        result = original_dispatch(dispatcher, request, selection_request)
+        dispatches.append(result)
+        return result
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "dispatch_statement_selection",
+        capture,
+    )
+    try:
+        result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in result
+        assert fresh.owner.context is not None
+        assert len(dispatches) == 1
+        routing = dispatches[0].routing_result
+        assert routing.missing_annual_period_ends == ()
+        assert routing.missing_reporting_period_ends == ()
+        assert tuple(call.provider_id for call in routing.provider_calls) == (
+            "tushare",
+            "akshare_sina",
+        )
+        assert {
+            candidate.artifact.dataset.provider_id
+            for candidate in routing.selected_candidates
+        } == {"tushare", "akshare_sina"}
+        akshare_call = routing.provider_calls[1]
+        assert set(akshare_call.missing_annual_period_ends) | set(
+            akshare_call.missing_reporting_period_ends
+        ) == {date(2025, 12, 31)}
+        assert [endpoint for endpoint, _ in akshare.calls] == [
+            "stock_financial_report_sina"
+        ]
+        assert fresh.providers["yfinance"].calls == []
+        assert len(routing.physical_attempt_ids) == 2
+        assert balance_calls == 2
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf7_fresh_builtin_yahoo_profile_and_derived_factor_stay_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000007",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    akshare = fresh.providers["akshare"]
+    yahoo = fresh.providers["yfinance"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(akshare, _AkshareProvider)
+    assert isinstance(yahoo, _YahooProvider)
+    yahoo.info = {
+        "industry": "Banks - Diversified",
+        "sector": "Financial Services",
+        "raw_token": "must-not-survive",
+    }
+    yahoo.history_frame = pd.DataFrame(
+        {"Close": [10.0, 20.0], "Adj Close": [5.0, 15.0]},
+        index=pd.to_datetime(["2026-07-29", "2026-07-30"]),
+    )
+
+    def empty_tushare_factor(**kwargs: object) -> pd.DataFrame:
+        tushare._record("adj_factor", kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(tushare, "adj_factor", empty_tushare_factor)
+    indicator_dispatches: list[object] = []
+    original_indicator_dispatch = FinancialToolDispatcher.dispatch_indicator_selection
+
+    def capture_indicator(dispatcher, request, selection_request):
+        result = original_indicator_dispatch(dispatcher, request, selection_request)
+        indicator_dispatches.append(result)
+        return result
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "dispatch_indicator_selection",
+        capture_indicator,
+    )
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_fundamentals",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        context = fresh.owner.context
+        assert context is not None
+        assert len(indicator_dispatches) == 1
+        indicator_routing = indicator_dispatches[0].routing_result
+        assert indicator_routing.provider_calls[-1].provider_id == "yfinance"
+        assert not any(
+            candidate.artifact.dataset.provider_id == "yfinance"
+            for manifest in indicator_routing.family_manifests
+            for wrapper in manifest.provider_candidates
+            for candidate in (wrapper.candidate,)
+        )
+        assert not any(
+            candidate.artifact.dataset.provider_id == "yfinance"
+            for candidate in indicator_routing.selected_candidates
+        )
+
+        factor_request = _capability_request(
+            fresh,
+            MainlandCapability.ADJUSTMENT_FACTORS,
+            range_start=date(2026, 7, 29),
+            as_of_date=date(2026, 7, 30),
+        )
+        factors = fresh.owner.financial_routing.router.route_capability(factor_request)
+        assert factors.selected_provider == "yfinance_derived"
+        assert factors.derived is True
+        assert factors.degraded is True
+        assert factors.strict_bundle_established is False
+        assert factors.provider_history_bundle_identity is None
+        assert factors.authoritative_provider == "baostock"
+        assert [endpoint for endpoint, _ in yahoo.calls].count("get_info") == 1
+        assert [endpoint for endpoint, _ in yahoo.calls].count("history") == 1
+        assert "must-not-survive" not in json.dumps(
+            {
+                "indicator_routing": indicator_routing.model_dump(mode="json"),
+                "factors": factors.model_dump(mode="json"),
+            },
+            sort_keys=True,
+        )
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("suspended", "expected_tradeability"),
+    ((False, "tradeable"), (True, "suspended")),
+)
+def test_qcf8_fresh_builtin_baostock_owns_strict_bundle_and_tradeability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suspended: bool,
+    expected_tradeability: str,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id=(
+            "0600000000000081" if suspended else "0600000000000080"
+        ),
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    baostock = fresh.providers["baostock"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(baostock, _BaoStockProvider)
+
+    def empty_tushare_factor(**kwargs: object) -> pd.DataFrame:
+        tushare._record("adj_factor", kwargs)
+        return pd.DataFrame()
+
+    def raw_daily(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_raw_daily", kwargs)
+        return pd.DataFrame(
+            {
+                "date": ["2026-07-23", "2026-07-24"],
+                "code": ["sh.601328", "sh.601328"],
+                "open": ["6.0", "6.1"],
+                "high": ["6.2", "6.3"],
+                "low": ["5.9", "6.0"],
+                "close": ["6.1", "6.2"],
+                "preclose": ["6.0", "6.1"],
+                "volume": ["100", "120"],
+                "amount": ["600", "744"],
+            }
+        )
+
+    def factors(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_forward_adjustment_factors", kwargs)
+        return pd.DataFrame(
+            {
+                "code": ["sh.601328"],
+                "dividOperateDate": ["2026-07-01"],
+                "foreAdjustFactor": ["0.5000000000"],
+            }
+        )
+
+    def status(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_session_status", kwargs)
+        return pd.DataFrame(
+            {
+                "date": ["2026-07-23", "2026-07-24"],
+                "code": ["sh.601328", "sh.601328"],
+                "tradestatus": ["1", "0" if suspended else "1"],
+                "isST": ["0", "0"],
+                "preclose": ["6.0", "6.1"],
+            }
+        )
+
+    monkeypatch.setattr(tushare, "adj_factor", empty_tushare_factor)
+    monkeypatch.setattr(baostock, "query_raw_daily", raw_daily)
+    monkeypatch.setattr(baostock, "query_forward_adjustment_factors", factors)
+    monkeypatch.setattr(baostock, "query_session_status", status)
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        assert fresh.owner.context is not None
+        indicator_result = fresh.invoke(
+            fresh.state(
+                tool_names=("get_fundamentals",),
+                tool_call_prefix="qcf8-ratios",
+            )
+        )
+        assert "financial_dispatch_shadow_failure" not in indicator_result
+        factor_result = fresh.owner.financial_routing.router.route_capability(
+            _capability_request(fresh, MainlandCapability.ADJUSTMENT_FACTORS)
+        )
+        status_result = fresh.owner.financial_routing.router.route_capability(
+            _capability_request(fresh, MainlandCapability.SUSPENSION_STATUS)
+        )
+        assert factor_result.authoritative_provider == "baostock"
+        assert factor_result.strict_bundle_provider == "baostock"
+        if suspended:
+            assert factor_result.selected_provider is None
+            assert factor_result.strict_bundle_established is False
+        else:
+            assert factor_result.selected_provider == "baostock"
+            assert factor_result.strict_bundle_established is True
+            assert len(factor_result.strict_bundle_component_artifact_identities) == 3
+        assert status_result.selected_provider == "baostock"
+        assert status_result.authoritative_provider == "baostock"
+        assert status_result.current_tradeability == expected_tradeability
+        endpoints = [endpoint for endpoint, _ in baostock.calls]
+        assert endpoints.count("query_lifecycle") == 1
+        assert endpoints.count("query_raw_daily") == 1
+        assert endpoints.count("query_forward_adjustment_factors") == 1
+        assert endpoints.count("query_session_status") == 1
+        for endpoint in (
+            "query_profit_data",
+            "query_operation_data",
+            "query_growth_data",
+            "query_balance_data",
+            "query_cash_flow_data",
+            "query_dupont_data",
+        ):
+            assert endpoints.count(endpoint) == 8
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf9_fresh_builtin_factor_and_name_routes_remain_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000009",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    akshare = fresh.providers["akshare"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(akshare, _AkshareProvider)
+
+    def empty_tushare_factor(**kwargs: object) -> pd.DataFrame:
+        tushare._record("adj_factor", kwargs)
+        return pd.DataFrame()
+
+    def empty_tushare_names(**kwargs: object) -> pd.DataFrame:
+        tushare._record("namechange", kwargs)
+        return pd.DataFrame()
+
+    def akshare_factors(**kwargs: object) -> pd.DataFrame:
+        akshare._record("stock_zh_a_daily", kwargs)
+        return pd.DataFrame(
+            [
+                {"date": "2026-07-23", "qfq_factor": "0.5"},
+                {"date": "2026-07-24", "qfq_factor": "0.75"},
+            ]
+        )
+
+    def akshare_names(**kwargs: object) -> pd.DataFrame:
+        akshare._record("stock_info_change_name", kwargs)
+        return pd.DataFrame(
+            [
+                {
+                    "变更日期": "2020-01-02",
+                    "证券简称": "*ST交通",
+                    "变更原因": "描述性简称变更",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(tushare, "adj_factor", empty_tushare_factor)
+    monkeypatch.setattr(tushare, "namechange", empty_tushare_names)
+    monkeypatch.setattr(akshare, "stock_zh_a_daily", akshare_factors)
+    monkeypatch.setattr(akshare, "stock_info_change_name", akshare_names)
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        assert fresh.owner.context is not None
+        router = fresh.owner.financial_routing.router
+        factor_result = router.route_capability(
+            _capability_request(fresh, MainlandCapability.ADJUSTMENT_FACTORS)
+        )
+        name_result = router.route_capability(
+            _capability_request(
+                fresh,
+                MainlandCapability.NAME_EVENTS,
+                range_start=date(2019, 1, 1),
+                as_of_date=date(2026, 7, 24),
+            )
+        )
+        assert factor_result.selected_provider == "akshare"
+        assert name_result.selected_provider == "akshare"
+        assert factor_result.route != name_result.route
+        assert set(factor_result.physical_attempt_ids).isdisjoint(
+            name_result.physical_attempt_ids
+        )
+        assert set(factor_result.retained_artifact_identities).isdisjoint(
+            name_result.retained_artifact_identities
+        )
+        assert factor_result.strict_bundle_established is False
+        assert name_result.current_tradeability == "unknown"
+        assert name_result.listing_metadata is None
+        assert name_result.status_or_lifecycle_fact_created is False
+        assert name_result.source_facts_created is False
+        shared_cache = fresh.owner.financial_routing.provider_subrequest_cache
+        assert shared_cache is not None
+        cache_entries = shared_cache.checkpoint()["entries"]
+        akshare_entries = tuple(
+            entry
+            for entry in cache_entries
+            if entry["key"]["provider_id"] == "akshare_sina"
+        )
+        assert len(akshare_entries) == 2
+        assert len(
+            {
+                entry["key"]["subrequest_key"] for entry in akshare_entries
+            }
+        ) == 2
+        assert len(
+            {
+                entry["key"]["normalizer_version"] for entry in akshare_entries
+            }
+        ) == 2
+        akshare_endpoints = [endpoint for endpoint, _ in akshare.calls]
+        assert akshare_endpoints == [
+            "stock_zh_a_daily",
+            "stock_info_change_name",
+        ]
+        assert fresh.providers["yfinance"].calls == []
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf9_fresh_builtin_tushare_factor_and_name_successes_stay_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000091",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        router = fresh.owner.financial_routing.router
+        factor_result = router.route_capability(
+            _capability_request(
+                fresh,
+                MainlandCapability.ADJUSTMENT_FACTORS,
+                range_start=date(2026, 8, 7),
+                as_of_date=date(2026, 8, 7),
+            )
+        )
+        name_result = router.route_capability(
+            _capability_request(
+                fresh,
+                MainlandCapability.NAME_EVENTS,
+                range_start=date(2020, 1, 1),
+                as_of_date=date(2026, 8, 7),
+            )
+        )
+        assert factor_result.selected_provider == "tushare"
+        assert name_result.selected_provider == "tushare"
+        assert factor_result.route != name_result.route
+        assert set(factor_result.physical_attempt_ids).isdisjoint(
+            name_result.physical_attempt_ids
+        )
+        assert set(factor_result.retained_artifact_identities).isdisjoint(
+            name_result.retained_artifact_identities
+        )
+        assert factor_result.strict_bundle_established is False
+        assert name_result.current_tradeability == "unknown"
+        assert name_result.status_or_lifecycle_fact_created is False
+        assert [
+            endpoint
+            for endpoint, _ in fresh.providers["tushare"].calls
+            if endpoint in {"adj_factor", "namechange"}
+        ] == ["adj_factor", "namechange"]
+        assert fresh.providers["akshare"].calls == []
+        assert fresh.providers["yfinance"].calls == []
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf9_fresh_builtin_baostock_strict_factor_does_not_blend_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000092",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    baostock = fresh.providers["baostock"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(baostock, _BaoStockProvider)
+
+    def empty_tushare_factor(**kwargs: object) -> pd.DataFrame:
+        tushare._record("adj_factor", kwargs)
+        return pd.DataFrame()
+
+    def raw_daily(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_raw_daily", kwargs)
+        return pd.DataFrame(
+            {
+                "date": ["2026-07-23", "2026-07-24"],
+                "code": ["sh.601328", "sh.601328"],
+                "open": ["6.0", "6.1"],
+                "high": ["6.2", "6.3"],
+                "low": ["5.9", "6.0"],
+                "close": ["6.1", "6.2"],
+                "preclose": ["6.0", "6.1"],
+                "volume": ["100", "120"],
+                "amount": ["600", "744"],
+            }
+        )
+
+    def factors(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_forward_adjustment_factors", kwargs)
+        return pd.DataFrame(
+            {
+                "code": ["sh.601328"],
+                "dividOperateDate": ["2026-07-01"],
+                "foreAdjustFactor": ["0.5000000000"],
+            }
+        )
+
+    def status(**kwargs: object) -> pd.DataFrame:
+        baostock._record("query_session_status", kwargs)
+        return pd.DataFrame(
+            {
+                "date": ["2026-07-23", "2026-07-24"],
+                "code": ["sh.601328", "sh.601328"],
+                "tradestatus": ["1", "1"],
+                "isST": ["0", "0"],
+                "preclose": ["6.0", "6.1"],
+            }
+        )
+
+    monkeypatch.setattr(tushare, "adj_factor", empty_tushare_factor)
+    monkeypatch.setattr(baostock, "query_raw_daily", raw_daily)
+    monkeypatch.setattr(baostock, "query_forward_adjustment_factors", factors)
+    monkeypatch.setattr(baostock, "query_session_status", status)
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        router = fresh.owner.financial_routing.router
+        factor_result = router.route_capability(
+            _capability_request(fresh, MainlandCapability.ADJUSTMENT_FACTORS)
+        )
+        name_result = router.route_capability(
+            _capability_request(
+                fresh,
+                MainlandCapability.NAME_EVENTS,
+                range_start=date(2020, 1, 1),
+                as_of_date=date(2026, 7, 24),
+            )
+        )
+        assert factor_result.selected_provider == "baostock"
+        assert factor_result.strict_bundle_established is True
+        assert len(factor_result.strict_bundle_component_artifact_identities) == 3
+        assert name_result.selected_provider == "tushare"
+        assert name_result.current_tradeability == "unknown"
+        assert name_result.listing_metadata is None
+        assert set(factor_result.retained_artifact_identities).isdisjoint(
+            name_result.retained_artifact_identities
+        )
+        assert factor_result.route != name_result.route
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf9_fresh_builtin_baostock_and_akshare_gaps_reach_yahoo_derived(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000093",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    tushare = fresh.providers["tushare"]
+    yahoo = fresh.providers["yfinance"]
+    assert isinstance(tushare, _TushareProvider)
+    assert isinstance(yahoo, _YahooProvider)
+
+    def empty_tushare_factor(**kwargs: object) -> pd.DataFrame:
+        tushare._record("adj_factor", kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(tushare, "adj_factor", empty_tushare_factor)
+    yahoo.history_frame = pd.DataFrame(
+        {"Close": [10.0, 20.0], "Adj Close": [5.0, 15.0]},
+        index=pd.to_datetime(["2026-07-29", "2026-07-30"]),
+    )
+    try:
+        graph_result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+        assert "financial_dispatch_shadow_failure" not in graph_result
+        factors = fresh.owner.financial_routing.router.route_capability(
+            _capability_request(
+                fresh,
+                MainlandCapability.ADJUSTMENT_FACTORS,
+                range_start=date(2026, 7, 29),
+                as_of_date=date(2026, 7, 30),
+            )
+        )
+        assert factors.selected_provider == "yfinance_derived"
+        assert factors.derived is True
+        assert factors.degraded is True
+        assert factors.authoritative_provider == "baostock"
+        assert factors.strict_bundle_established is False
+        assert tuple(call.provider_id for call in factors.provider_calls) == (
+            factors.route
+        )
+        assert factors.route[-1] == "yfinance_derived"
+        assert {"baostock", "akshare"}.issubset(factors.route)
+        assert [endpoint for endpoint, _ in yahoo.calls] == ["Ticker", "history"]
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf10_fresh_builtin_exact_terminal_attempt_and_cache_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="600895.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000010",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    akshare = fresh.providers["akshare"]
+    assert isinstance(akshare, _AkshareProvider)
+    original_indicator = akshare.stock_financial_analysis_indicator
+    physical_invocations = 0
+
+    class _RateLimitError(RuntimeError):
+        retry_after_seconds = 60
+
+    def retry_once(**kwargs: object) -> pd.DataFrame:
+        nonlocal physical_invocations
+        physical_invocations += 1
+        if physical_invocations == 1:
+            akshare._record("stock_financial_analysis_indicator", kwargs)
+            raise _RateLimitError("rate limit")
+        return original_indicator(**kwargs)
+
+    monkeypatch.setattr(akshare, "stock_financial_analysis_indicator", retry_once)
+    try:
+        first = fresh.invoke(fresh.state(tool_names=("get_fundamentals",)))
+        assert "financial_dispatch_shadow_failure" not in first
+        first_ledger = copy.deepcopy(first["financial_dispatch_shadow_ledger"])
+        akshare_entries = tuple(
+            entry
+            for entry in first_ledger["provider_subrequest_cache"]["entries"]
+            if entry["key"]["provider_id"] == "akshare_sina"
+        )
+        assert len(akshare_entries) == 1
+        retry_events = akshare_entries[0]["attempt_events"]
+        assert physical_invocations == 1
+        assert len(retry_events) == 1
+        assert [event["attempt_index"] for event in retry_events] == [1]
+        assert retry_events[0]["outcome"] == "rate_limited"
+        assert retry_events[0]["retryable"] is True
+        assert retry_events[0]["final_physical_attempt_count"] == 1
+        cooldown = fresh.invoke(
+            fresh.state(
+                tool_names=("get_fundamentals",),
+                indicator_families=(FinancialRatioFamily.PROFIT,),
+                tool_call_prefix="qcf10-cooldown",
+            )
+        )
+        assert "financial_dispatch_shadow_failure" not in cooldown
+        assert physical_invocations == 1
+        cooldown_entries = tuple(
+            entry
+            for entry in cooldown["financial_dispatch_shadow_ledger"][
+                "provider_subrequest_cache"
+            ]["entries"]
+            if entry["key"]["provider_id"] == "akshare_sina"
+        )
+        assert len(cooldown_entries) == 2
+        skipped = next(
+            entry for entry in cooldown_entries if not entry["attempt_events"]
+        )
+        assert skipped["outcome"]["kind"] == "rate_limited"
+        provider_calls_before_repeat = {
+            provider_id: copy.deepcopy(provider.calls)
+            for provider_id, provider in fresh.providers.items()
+        }
+        second = fresh.invoke(
+            fresh.state(
+                tool_names=("get_fundamentals",),
+                indicator_families=(FinancialRatioFamily.PROFIT,),
+                tool_call_prefix="qcf10-cache-hit",
+            )
+        )
+        assert "financial_dispatch_shadow_failure" not in second
+        assert {
+            provider_id: provider.calls
+            for provider_id, provider in fresh.providers.items()
+        } == provider_calls_before_repeat
+        second_attempts = _attempt_events(second["financial_dispatch_shadow_ledger"])
+        cooldown_attempts = _attempt_events(
+            cooldown["financial_dispatch_shadow_ledger"]
+        )
+        assert second_attempts == cooldown_attempts
+        first_attempts = _attempt_events(first_ledger)
+        assert len({event["attempt_event_id"] for event in first_attempts}) == len(
+            first_attempts
+        )
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0600000000000011",
+    )
+    _assert_fresh_builtin_origin(fresh)
+    statement_dispatches: list[object] = []
+    original_dispatch = FinancialToolDispatcher.dispatch_statement_selection
+
+    def capture(dispatcher, request, selection_request):
+        result = original_dispatch(dispatcher, request, selection_request)
+        statement_dispatches.append(result)
+        return result
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "dispatch_statement_selection",
+        capture,
+    )
+    metadata_acquirer = fresh.owner._metadata_acquirer
+    acquirer_type = type(metadata_acquirer)
+    original_acquire = acquirer_type.acquire
+    acquisition_entered = threading.Event()
+    release_acquisition = threading.Event()
+    metadata_acquisitions = 0
+
+    def blocked_acquire(acquirer, *args, **kwargs):
+        nonlocal metadata_acquisitions
+        if acquirer is metadata_acquirer:
+            metadata_acquisitions += 1
+            acquisition_entered.set()
+            assert release_acquisition.wait(timeout=5)
+        return original_acquire(acquirer, *args, **kwargs)
+
+    monkeypatch.setattr(acquirer_type, "acquire", blocked_acquire)
+    try:
+        first_use_start = threading.Barrier(3)
+
+        def first_financial_use(index: int):
+            state = fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix=f"qcf11-first-use-{index}",
+            )
+            first_use_start.wait(timeout=5)
+            return fresh.tool_node(state)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = tuple(
+                executor.submit(first_financial_use, index) for index in range(2)
+            )
+            first_use_start.wait(timeout=5)
+            assert acquisition_entered.wait(timeout=5)
+            release_acquisition.set()
+            first_results = tuple(future.result(timeout=20) for future in futures)
+
+        assert all(
+            "financial_dispatch_shadow_failure" not in result
+            for result in first_results
+        )
+        assert fresh.owner.context is not None
+        assert metadata_acquisitions == 1
+        assert len(fresh.resolver_calls) == 1
+        assert len(statement_dispatches) == 2
+        statement_routing = statement_dispatches[0].routing_result
+        assert statement_dispatches[1].routing_result == statement_routing
+        assert len(statement_routing.manifest.selections) > 1
+        assert tuple(
+            call.provider_id for call in statement_routing.provider_calls
+        ) == ("tushare",)
+        assert len(statement_routing.provider_calls[0].physical_attempt_ids) == 1
+        balance_calls = [
+            call
+            for call in fresh.providers["tushare"].calls
+            if call[0] == "balancesheet"
+        ]
+        assert len(balance_calls) == 2
+        assert [
+            endpoint for endpoint, _ in fresh.providers["baostock"].calls
+        ].count("query_lifecycle") == 1
+        first_attempts = _attempt_events(
+            first_results[0]["financial_dispatch_shadow_ledger"]
+        )
+        repeated = fresh.tool_node(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="qcf11-bulk-repeat",
+            )
+        )
+        assert "financial_dispatch_shadow_failure" not in repeated
+        assert len(
+            [
+                call
+                for call in fresh.providers["tushare"].calls
+                if call[0] == "balancesheet"
+            ]
+        ) == 2
+        assert _attempt_events(repeated["financial_dispatch_shadow_ledger"]) == (
+            first_attempts
+        )
+
+        tushare = fresh.providers["tushare"]
+        assert isinstance(tushare, _TushareProvider)
+        original_factor = tushare.adj_factor
+        provider_entered = threading.Event()
+        release_provider = threading.Event()
+        factor_invocations = 0
+
+        def blocked_factor(**kwargs: object) -> pd.DataFrame:
+            nonlocal factor_invocations
+            factor_invocations += 1
+            provider_entered.set()
+            assert release_provider.wait(timeout=5)
+            return original_factor(**kwargs)
+
+        monkeypatch.setattr(tushare, "adj_factor", blocked_factor)
+        factor_request = _capability_request(
+            fresh,
+            MainlandCapability.ADJUSTMENT_FACTORS,
+            range_start=date(2026, 8, 7),
+            as_of_date=date(2026, 8, 7),
+        )
+        start = threading.Barrier(3)
+
+        def route_factor():
+            start.wait(timeout=5)
+            return fresh.owner.financial_routing.router.route_capability(
+                factor_request
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = tuple(executor.submit(route_factor) for _ in range(2))
+            start.wait(timeout=5)
+            assert provider_entered.wait(timeout=5)
+            release_provider.set()
+            factor_results = tuple(future.result(timeout=10) for future in futures)
+
+        assert factor_results[0] == factor_results[1]
+        assert factor_results[0].selected_provider == "tushare"
+        assert factor_invocations == 1
+        shared_cache = fresh.owner.financial_routing.provider_subrequest_cache
+        assert shared_cache is not None
+        factor_entries = tuple(
+            entry
+            for entry in shared_cache.checkpoint()["entries"]
+            if entry["key"]["provider_id"] == "tushare"
+            and entry["key"]["capacity_scope"] == "adj_factor"
+        )
+        assert len(factor_entries) == 1
+        assert len(factor_entries[0]["attempt_events"]) == 1
+    finally:
+        fresh.close()
+
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+
+@pytest.mark.unit
+def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_thread_id = "0600000000000012"
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="600895.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id=checkpoint_thread_id,
+    )
+    _assert_fresh_builtin_origin(fresh)
+    indicator_dispatches: list[tuple[object, object, object]] = []
+    original_dispatch = FinancialToolDispatcher.dispatch_indicator_selection
+
+    def capture(dispatcher, request, selection_request):
+        result = original_dispatch(dispatcher, request, selection_request)
+        indicator_dispatches.append((request, selection_request, result))
+        return result
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "dispatch_indicator_selection",
+        capture,
+    )
+    source_result = fresh.invoke(fresh.state(tool_names=("get_fundamentals",)))
+    assert "financial_dispatch_shadow_failure" not in source_result
+    assert fresh.owner.context is not None
+    assert len(indicator_dispatches) == 1
+    original_request, selection_request, original_selection = indicator_dispatches[0]
+    source_context = fresh.owner.context
+    source_ledger = copy.deepcopy(source_result["financial_dispatch_shadow_ledger"])
+    checkpoint_state = fresh.checkpoint_state()
+    assert checkpoint_state["financial_dispatch_shadow_ledger"] == source_ledger
+    assert checkpoint_state["run_id"] == fresh.owner.run_id
+    assert checkpoint_state["trade_date"] == _AS_OF.isoformat()
+    checkpoint_before_restore = copy.deepcopy(checkpoint_state)
+    source_attempts = _attempt_events(source_ledger)
+    source_attempt_ids = tuple(event["attempt_event_id"] for event in source_attempts)
+    source_routing = original_selection.routing_result
+    artifact_root = (
+        fresh.composition.blueprint.provider_artifact_root_path
+        / "qualified-provider-subrequests"
+    )
+
+    def artifact_bytes() -> dict[str, bytes]:
+        return {
+            path.relative_to(artifact_root).as_posix(): path.read_bytes()
+            for path in artifact_root.rglob("*")
+            if path.is_file()
+        }
+
+    source_artifacts = artifact_bytes()
+    runtime_factories = fresh.composition.runtime_factories
+    assert runtime_factories is not None
+    fresh.close()
+    assert all(provider.interrupt_calls == 1 for provider in fresh.providers.values())
+    assert all(provider.close_calls == 1 for provider in fresh.providers.values())
+
+    restore_providers: dict[str, _OwnedFakeProvider] = {
+        "tushare": _TushareProvider("600895.SS", reverse_input_order=False),
+        "akshare": _AkshareProvider(reverse_input_order=False),
+        "yfinance": _YahooProvider(),
+        "baostock": _BaoStockProvider("600895.SS"),
+    }
+    coordinator_sequences = 0
+    artifact_writes = 0
+    metadata_acquisitions = 0
+    company_type_resolutions = 0
+    closed_resources: list[str] = []
+
+    def track_close(resource_name: str, resource):
+        close = resource.close
+
+        def tracked_close():
+            closed_resources.append(resource_name)
+            close()
+
+        resource.close = tracked_close
+        return resource
+
+    def open_store(blueprint):
+        return track_close(
+            "coordinator_store",
+            runtime_factories.open_coordinator_store(blueprint),
+        )
+
+    def build_coordinator(store, stop_signal):
+        coordinator = runtime_factories.build_coordinator(store, stop_signal)
+
+        def forbidden_sequence(**_kwargs):
+            nonlocal coordinator_sequences
+            coordinator_sequences += 1
+            pytest.fail("QCF12 restore requested a coordinator permit")
+
+        coordinator.execute_retry_sequence = forbidden_sequence
+        return track_close("coordinator", coordinator)
+
+    def build_cache(coordinator, artifact_store, run_id, stop_signal):
+        return track_close(
+            "subrequest_cache",
+            runtime_factories.build_subrequest_cache(
+                coordinator,
+                artifact_store,
+                run_id,
+                stop_signal,
+            ),
+        )
+
+    def forbidden_install(self, *args, **kwargs):
+        nonlocal artifact_writes
+        artifact_writes += 1
+        pytest.fail("QCF12 restore attempted an artifact write")
+
+    monkeypatch.setattr(
+        ProviderSubrequestArtifactStore,
+        "install",
+        forbidden_install,
+    )
+
+    def forbidden_acquire(*_args, **_kwargs):
+        nonlocal metadata_acquisitions
+        metadata_acquisitions += 1
+        pytest.fail("QCF12 restore attempted metadata acquisition")
+
+    def forbidden_resolution(**_kwargs):
+        nonlocal company_type_resolutions
+        company_type_resolutions += 1
+        pytest.fail("QCF12 restore attempted company-type resolution")
+
+    monkeypatch.setattr(
+        metadata_module.FinancialEligibilityMetadataAcquirer,
+        "acquire",
+        forbidden_acquire,
+    )
+    monkeypatch.setattr(
+        metadata_module,
+        "resolve_financial_company_type",
+        forbidden_resolution,
+    )
+    restore_factories = replace(
+        runtime_factories,
+        open_coordinator_store=open_store,
+        build_coordinator=build_coordinator,
+        build_subrequest_cache=build_cache,
+        build_tushare_client=lambda _blueprint, _stop: restore_providers["tushare"],
+        build_akshare_facade=lambda _blueprint, _stop: restore_providers["akshare"],
+        build_yahoo_transport=lambda _blueprint, _stop: restore_providers["yfinance"],
+        build_baostock_transport=lambda _blueprint, _stop: restore_providers["baostock"],
+    )
+    monkeypatch.setattr(
+        composition_module,
+        "production_qualified_routing_runtime_factories",
+        lambda: restore_factories,
+    )
+    restore_llm = MagicMock(name="qcf12_zero_io_llm")
+    restore_client = MagicMock(name="qcf12_zero_io_llm_client")
+    restore_client.get_llm.return_value = restore_llm
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.create_llm_client",
+        lambda **_kwargs: restore_client,
+    )
+    restored_composition = cli_main.build_qualified_financial_routing_composition(
+        plan=fresh.plan,
+        asset_configuration=fresh.asset,
+        config=fresh.config,
+        validation_workload=True,
+    )
+    assert isinstance(
+        restored_composition,
+        RegisteredProductionQualifiedRoutingComposition,
+    )
+    restored_host = TradingAgentsGraph(
+        selected_analysts=("fundamentals",),
+        config=fresh.config,
+        asset_configuration=fresh.asset,
+        capability_routing_plan=fresh.plan,
+        qualified_financial_routing=restored_composition,
+    )
+    assert restored_host.financial_eligibility_context_owner is None
+    restored_runtime = restored_host.bind_qualified_routing_runtime(
+        run_id=fresh.owner.run_id,
+        checkpoint_compatibility_known=True,
+        resume_from_checkpoint=True,
+        checkpoint_thread_id=checkpoint_thread_id,
+        checkpoint_state=MappingProxyType(checkpoint_state),
+        analysis_as_of_date=_AS_OF,
+    )
+    assert restored_runtime is not None
+    restored_owner = restored_host.financial_eligibility_context_owner
+    assert restored_owner is not None
+    assert restored_owner.context == source_context
+    restored_routing = restored_owner.financial_routing
+    restored_dispatcher = restored_routing.restored_shadow_dispatcher
+    restored_cache = restored_routing.provider_subrequest_cache
+    assert restored_dispatcher is not None
+    assert restored_cache is not None
+    assert restored_dispatcher.checkpoint_ledger() == source_ledger
+    assert restored_cache.checkpoint() == source_ledger["provider_subrequest_cache"]
+    repeated = restored_dispatcher.dispatch_indicator_selection(
+        original_request.model_copy(update={"tool_call_id": "qcf12-restored-repeat"}),
+        selection_request,
+    )
+    assert repeated.disposition == "duplicate_suppressed"
+    assert repeated.routing_result == source_routing
+    repeated_ledger = restored_dispatcher.checkpoint_ledger()
+    repeated_attempts = _attempt_events(repeated_ledger)
+    assert tuple(event["attempt_event_id"] for event in repeated_attempts) == (
+        source_attempt_ids
+    )
+    assert restored_cache.checkpoint() == source_ledger["provider_subrequest_cache"]
+    assert checkpoint_state == checkpoint_before_restore
+    assert artifact_bytes() == source_artifacts
+    assert coordinator_sequences == 0
+    assert artifact_writes == 0
+    assert metadata_acquisitions == 0
+    assert company_type_resolutions == 0
+    assert all(provider.calls == [] for provider in restore_providers.values())
+    restore_llm.invoke.assert_not_called()
+    restored_host.close_qualified_routing_runtime()
+    closed_once = tuple(closed_resources)
+    restored_host.close_qualified_routing_runtime()
+    assert tuple(closed_resources) == closed_once
+    assert set(closed_resources) == {
+        "coordinator_store",
+        "coordinator",
+        "subrequest_cache",
+    }
+    assert all(
+        provider.interrupt_calls == 1 for provider in restore_providers.values()
+    )
+    assert all(provider.close_calls == 1 for provider in restore_providers.values())
+
+    invalid_states: dict[str, dict[str, object]] = {}
+    old_state = copy.deepcopy(checkpoint_state)
+    old_ledger = old_state["financial_dispatch_shadow_ledger"]
+    old_ledger["contract_version"] = "1.4"
+    for field_name in (
+        "capability_routing_plan_version",
+        "financial_indicator_manifest_version",
+        "indicator_field_semantics_version",
+        "indicator_metadata_compatibility_version",
+        "indicator_metadata_assessments",
+        "indicator_metadata_rejections",
+        "indicator_provider_artifact_identities",
+        "indicator_candidate_identities",
+        "indicator_provider_topology",
+    ):
+        old_ledger.pop(field_name, None)
+    invalid_states["old"] = old_state
+
+    absent_state = copy.deepcopy(checkpoint_state)
+    absent_state["financial_dispatch_shadow_ledger"].pop(
+        "indicator_metadata_assessments"
+    )
+    invalid_states["absent"] = absent_state
+
+    corrupt_state = copy.deepcopy(checkpoint_state)
+    corrupt_state["financial_dispatch_shadow_ledger"][
+        "indicator_metadata_compatibility_version"
+    ] = "financial-indicator-metadata-compatibility-v0"
+    invalid_states["corrupt"] = corrupt_state
+
+    contradictory_state = copy.deepcopy(checkpoint_state)
+    contradictory_state["financial_dispatch_shadow_ledger"][
+        "indicator_metadata_assessments"
+    ][0]["assessment_identity"] = (
+        "financial-indicator-metadata-compatibility:v1:" + "f" * 64
+    )
+    invalid_states["contradictory"] = contradictory_state
+
+    mismatched_state = copy.deepcopy(checkpoint_state)
+    mismatched_state["financial_dispatch_shadow_ledger"][
+        "indicator_candidate_identities"
+    ][0] = "financial-period-candidate:v1:" + "f" * 64
+    invalid_states["mismatched"] = mismatched_state
+
+    accepted_failure_reasons = {
+        FinancialDispatchCheckpointFailureReason.MALFORMED,
+        FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+    }
+    resources_after_valid_restore = tuple(closed_resources)
+    for case_name, invalid_state in invalid_states.items():
+        state_before_failure = copy.deepcopy(invalid_state)
+        invalid_composition = cli_main.build_qualified_financial_routing_composition(
+            plan=fresh.plan,
+            asset_configuration=fresh.asset,
+            config=fresh.config,
+            validation_workload=True,
+        )
+        assert isinstance(
+            invalid_composition,
+            RegisteredProductionQualifiedRoutingComposition,
+        )
+        invalid_host = TradingAgentsGraph(
+            selected_analysts=("fundamentals",),
+            config=fresh.config,
+            asset_configuration=fresh.asset,
+            capability_routing_plan=fresh.plan,
+            qualified_financial_routing=invalid_composition,
+        )
+        with pytest.raises(FinancialDispatchCheckpointError) as failure:
+            invalid_host.bind_qualified_routing_runtime(
+                run_id=fresh.owner.run_id,
+                checkpoint_compatibility_known=True,
+                resume_from_checkpoint=True,
+                checkpoint_thread_id=checkpoint_thread_id,
+                checkpoint_state=MappingProxyType(invalid_state),
+                analysis_as_of_date=_AS_OF,
+            )
+        assert failure.value.reason in accepted_failure_reasons, case_name
+        assert invalid_state == state_before_failure
+        invalid_host.close_qualified_routing_runtime()
+
+    assert tuple(closed_resources) == resources_after_valid_restore
+    assert all(provider.calls == [] for provider in restore_providers.values())
+    assert all(
+        provider.interrupt_calls == 1 for provider in restore_providers.values()
+    )
+    assert all(provider.close_calls == 1 for provider in restore_providers.values())
+    assert artifact_bytes() == source_artifacts
+    assert checkpoint_state == checkpoint_before_restore
