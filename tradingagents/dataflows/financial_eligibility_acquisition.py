@@ -46,6 +46,12 @@ from tradingagents.dataflows.financial_eligibility_policy import (
 from tradingagents.dataflows.financial_period_targets import (
     derive_mainland_financial_acquisition_period_supersets,
 )
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    FinancialMetadataTemporalEligibilityDecision,
+    MarketSessionEligibilityBinding,
+    TemporalEligibilityMode,
+    TemporalEvidenceClass,
+)
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
 
 FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION = (
@@ -57,11 +63,17 @@ FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION = (
 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION = (
     "financial-eligibility-acquisition-context-v1"
 )
+FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2 = (
+    "financial-eligibility-acquisition-context-v2"
+)
 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION = (
     "financial-eligibility-acquisition-result-v1"
 )
 FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION = (
     "financial-eligibility-request-binding-v1"
+)
+FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2 = (
+    "financial-eligibility-request-binding-v2"
 )
 
 _CLOSED_MODEL_CONFIG = ConfigDict(
@@ -78,6 +90,7 @@ _RUN_ID_PATTERN = r"^run:[0-9a-f]{64}$"
 _ASSET_SIGNATURE_PATTERN = r"^asset-config:v1:[0-9a-f]{64}$"
 _PLAN_SIGNATURE_PATTERN = r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
 _CONTEXT_IDENTITY_PREFIX = "financial-eligibility-acquisition-context:v1:"
+_CONTEXT_IDENTITY_PREFIX_V2 = "financial-eligibility-acquisition-context:v2:"
 _EVIDENCE_IDENTITY_PREFIX = "financial-company-type-evidence:v1:"
 _MAINLAND_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _URL_QUERY = re.compile(r"https?://\S*\?", re.IGNORECASE)
@@ -158,7 +171,13 @@ def financial_eligibility_acquisition_context_identity(
 ) -> str:
     """Return the deterministic identity of complete safe context material."""
 
-    return f"{_CONTEXT_IDENTITY_PREFIX}{_canonical_digest(material)}"
+    prefix = (
+        _CONTEXT_IDENTITY_PREFIX_V2
+        if material.get("contract_version")
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        else _CONTEXT_IDENTITY_PREFIX
+    )
+    return f"{prefix}{_canonical_digest(material)}"
 
 
 def _evidence_identity(material: Mapping[str, object]) -> str:
@@ -478,21 +497,105 @@ class FinancialListingMetadataProjection(BaseModel):
         return self
 
 
+class FinancialEligibilityTemporalContextBinding(BaseModel):
+    """Exact temporal inputs and accepted prerequisite decisions for context v2."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-eligibility-temporal-binding-v1"] = (
+        "financial-eligibility-temporal-binding-v1"
+    )
+    capability_routing_plan_version: Literal["1.3"] = "1.3"
+    temporal_policy_version: Literal[
+        "provider-neutral-temporal-eligibility-v1"
+    ] = "provider-neutral-temporal-eligibility-v1"
+    calendar_eligibility_binding_version: Literal[
+        "market-session-eligibility-binding-v1"
+    ] = "market-session-eligibility-binding-v1"
+    temporal_decision_version: Literal[
+        "financial-metadata-temporal-eligibility-decision-v1"
+    ] = "financial-metadata-temporal-eligibility-decision-v1"
+    requested_session: date
+    temporal_mode: TemporalEligibilityMode
+    eligibility_evaluated_at: datetime
+    calendar_binding: MarketSessionEligibilityBinding
+    latest_completed_session: date | None = None
+    company_type_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    listing_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    strict_cutoff: datetime | None = None
+
+    @field_validator("eligibility_evaluated_at", "strict_cutoff")
+    @classmethod
+    def _validate_temporal_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return None if value is None else _utc_datetime(value)
+
+    @model_validator(mode="after")
+    def _validate_temporal_binding(self) -> Self:
+        decisions = (
+            self.company_type_temporal_decision,
+            self.listing_temporal_decision,
+        )
+        if (
+            not self.calendar_binding.has_valid_identity()
+            or self.requested_session != self.calendar_binding.requested_session
+            or self.eligibility_evaluated_at
+            != self.calendar_binding.eligibility_evaluated_at
+            or self.latest_completed_session
+            != self.calendar_binding.latest_completed_session
+            or any(
+                decision.result != "accepted"
+                or decision.mode != self.temporal_mode.value
+                or decision.calendar_binding != self.calendar_binding
+                or decision.eligible_session != self.requested_session
+                for decision in decisions
+            )
+        ):
+            raise ValueError("financial eligibility temporal binding is inconsistent")
+        if (
+            self.company_type_temporal_decision.evidence_class
+            not in {
+                TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+                TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
+            }
+            or self.listing_temporal_decision.evidence_class
+            is not TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING
+        ):
+            raise ValueError("financial eligibility temporal evidence roles mismatch")
+        strict = self.temporal_mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
+        if strict != (self.strict_cutoff is not None) or any(
+            decision.strict_cutoff != self.strict_cutoff for decision in decisions
+        ):
+            raise ValueError("financial eligibility strict cutoff binding is inconsistent")
+        _assert_safe_projection(self.model_dump(mode="json"))
+        return self
+
+
 class FinancialEligibilityAcquisitionContext(BaseModel):
     """Immutable provider-neutral authoritative metadata for one qualified run."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal[
-        "financial-eligibility-acquisition-context-v1"
+        "financial-eligibility-acquisition-context-v1",
+        "financial-eligibility-acquisition-context-v2",
     ] = FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
     context_identity: str = Field(
-        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$"
+        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$"
     )
     run_id: str = Field(pattern=_RUN_ID_PATTERN)
     asset_configuration_signature: str = Field(pattern=_ASSET_SIGNATURE_PATTERN)
     instrument_identity: InstrumentIdentityEvidence
-    as_of_date: date
+    as_of_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_session: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     availability_scope: FinancialAvailabilityScope
     acquisition_purpose: Literal["foreground_current_analysis"] = (
         "foreground_current_analysis"
@@ -507,6 +610,9 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
     consolidation_scope: FinancialConsolidationScope
     acquisition_annual_period_ends: tuple[date, ...]
     acquisition_reporting_period_ends: tuple[date, ...]
+    temporal_eligibility_binding: FinancialEligibilityTemporalContextBinding | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
 
     @field_validator(
         "acquisition_annual_period_ends",
@@ -529,6 +635,52 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
 
     @model_validator(mode="after")
     def _validate_context(self) -> Self:
+        temporal_bound = (
+            self.contract_version
+            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        )
+        historical_shape = (
+            self.as_of_date is not None and self.requested_session is None
+        )
+        temporal_shape = (
+            self.as_of_date is None and self.requested_session is not None
+        )
+        if (temporal_bound and not temporal_shape) or (
+            not temporal_bound and not historical_shape
+        ):
+            raise ValueError(
+                "financial eligibility context requested-session shape mismatch"
+            )
+        if temporal_bound != (self.temporal_eligibility_binding is not None):
+            raise ValueError("financial eligibility context temporal version mismatch")
+        analysis_session = (
+            self.requested_session if temporal_bound else self.as_of_date
+        )
+        assert analysis_session is not None
+        if temporal_bound:
+            temporal = self.temporal_eligibility_binding
+            assert temporal is not None
+            expected_scope = (
+                FinancialAvailabilityScope.CURRENT_ONLY
+                if temporal.temporal_mode
+                is TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY
+                else FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+            )
+            if (
+                analysis_session != temporal.requested_session
+                or self.availability_scope is not expected_scope
+                or temporal.company_type_temporal_decision.immutable_artifact_identity
+                != self.company_type_evidence.artifact_identity
+                or temporal.company_type_temporal_decision.observed_at
+                != self.company_type_evidence.observed_at
+                or temporal.company_type_temporal_decision.retrieved_at
+                != self.company_type_evidence.retrieved_at
+                or temporal.listing_temporal_decision.immutable_artifact_identity
+                != self.listing_provenance.source_ref
+                or temporal.listing_temporal_decision.observed_at
+                != self.listing_provenance.observed_at
+            ):
+                raise ValueError("financial eligibility context temporal binding mismatch")
         identity = InstrumentIdentityEvidence.model_validate(
             self.instrument_identity.model_dump(mode="json")
         )
@@ -564,7 +716,7 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             evidence, FinancialCompanyTypeAcquisitionEvidenceBinding
         ) and (
             evidence.instrument_identity != identity
-            or evidence.as_of_date != self.as_of_date
+            or evidence.as_of_date != analysis_session
         ):
             raise ValueError("company-type acquisition evidence context mismatch")
         listing = FinancialListingProvenance.model_validate(
@@ -574,7 +726,7 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             not listing.authoritative
             or listing.provider_id != "baostock"
             or re.fullmatch(_LISTING_ARTIFACT_ID_PATTERN, listing.source_ref) is None
-            or self.listing_date > self.as_of_date
+            or self.listing_date > analysis_session
         ):
             raise ValueError("financial listing provenance is not BaoStock authoritative")
         policy = build_mainland_financial_eligibility_policy_v2()
@@ -585,7 +737,7 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             raise ValueError("financial eligibility context policy binding mismatch")
         expected_annual, expected_reporting = (
             derive_mainland_financial_acquisition_period_supersets(
-                run_as_of_date=self.as_of_date,
+                run_as_of_date=analysis_session,
                 listing_date=self.listing_date,
                 policy=policy,
             )
@@ -659,20 +811,29 @@ class FinancialEligibilityRequestBinding(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-eligibility-request-binding-v1"] = (
-        FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION
-    )
+    contract_version: Literal[
+        "financial-eligibility-request-binding-v1",
+        "financial-eligibility-request-binding-v2",
+    ] = FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION
     context_contract_version: Literal[
-        "financial-eligibility-acquisition-context-v1"
+        "financial-eligibility-acquisition-context-v1",
+        "financial-eligibility-acquisition-context-v2",
     ]
     context_identity: str = Field(
-        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$"
+        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$"
     )
     canonical_run_id: str = Field(pattern=_RUN_ID_PATTERN)
     asset_configuration_signature: str = Field(pattern=_ASSET_SIGNATURE_PATTERN)
     instrument_identity: InstrumentIdentityEvidence
     canonical_symbol: str = Field(min_length=1, max_length=64)
-    as_of_date: date
+    as_of_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_session: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     availability_scope: FinancialAvailabilityScope
     acquisition_purpose: Literal["foreground_current_analysis"]
     financial_eligibility_binding: MainlandFinancialEligibilityProjectionBinding
@@ -685,9 +846,38 @@ class FinancialEligibilityRequestBinding(BaseModel):
     consolidation_scope: FinancialConsolidationScope
     acquisition_annual_period_ends: tuple[date, ...]
     acquisition_reporting_period_ends: tuple[date, ...]
+    temporal_eligibility_binding: FinancialEligibilityTemporalContextBinding | None = (
+        Field(default=None, exclude_if=lambda value: value is None)
+    )
 
     @model_validator(mode="after")
     def _validate_binding(self) -> Self:
+        temporal_bound = (
+            self.contract_version == FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2
+        )
+        historical_shape = (
+            self.as_of_date is not None and self.requested_session is None
+        )
+        temporal_shape = (
+            self.as_of_date is None and self.requested_session is not None
+        )
+        if (
+            temporal_bound
+            != (
+                self.context_contract_version
+                == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+            )
+            or temporal_bound != (self.temporal_eligibility_binding is not None)
+            or (temporal_bound and not temporal_shape)
+            or (not temporal_bound and not historical_shape)
+        ):
+            raise ValueError("request binding temporal version is inconsistent")
+        if temporal_bound and (
+            self.temporal_eligibility_binding is None
+            or self.requested_session
+            != self.temporal_eligibility_binding.requested_session
+        ):
+            raise ValueError("request binding temporal decision is inconsistent")
         if self.canonical_symbol != self.instrument_identity.symbol.strip().upper():
             raise ValueError("request binding symbol contradicts Instrument Identity")
         if self.currency != self.instrument_identity.currency:
@@ -703,7 +893,11 @@ class FinancialEligibilityRequestBinding(BaseModel):
             != self.company_type_resolution.provider_declaration_qualified
         ):
             raise ValueError("request binding company-type evidence is inconsistent")
-        if self.listing_date > self.as_of_date:
+        analysis_session = (
+            self.requested_session if temporal_bound else self.as_of_date
+        )
+        assert analysis_session is not None
+        if self.listing_date > analysis_session:
             raise ValueError("request binding listing date is after its as-of date")
         _assert_safe_projection(self.model_dump(mode="json"))
         return self
@@ -716,6 +910,12 @@ class FinancialEligibilityRequestBinding(BaseModel):
         """Project the complete immutable context without recomputing policy."""
 
         return cls(
+            contract_version=(
+                FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2
+                if context.contract_version
+                == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                else FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION
+            ),
             context_contract_version=context.contract_version,
             context_identity=context.context_identity,
             canonical_run_id=context.run_id,
@@ -723,6 +923,7 @@ class FinancialEligibilityRequestBinding(BaseModel):
             instrument_identity=context.instrument_identity,
             canonical_symbol=context.instrument_identity.symbol.strip().upper(),
             as_of_date=context.as_of_date,
+            requested_session=context.requested_session,
             availability_scope=context.availability_scope,
             acquisition_purpose=context.acquisition_purpose,
             financial_eligibility_binding=context.financial_eligibility_binding,
@@ -737,6 +938,7 @@ class FinancialEligibilityRequestBinding(BaseModel):
             acquisition_reporting_period_ends=(
                 context.acquisition_reporting_period_ends
             ),
+            temporal_eligibility_binding=context.temporal_eligibility_binding,
         )
 
 
@@ -1047,8 +1249,10 @@ __all__ = [
     "FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION",
     "FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION",
+    "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION",
     "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION",
+    "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2",
     "FinancialCompanyTypeAcquisitionEvidenceBinding",
     "FinancialCompanyTypeContextEvidence",
     "FinancialCompanyTypeEvidenceBinding",
@@ -1058,6 +1262,7 @@ __all__ = [
     "FinancialEligibilityAcquisitionFailureReason",
     "FinancialEligibilityMetadataBinding",
     "FinancialEligibilityRequestBinding",
+    "FinancialEligibilityTemporalContextBinding",
     "FinancialEligibilityAcquisitionResult",
     "FinancialListingMetadata",
     "FinancialListingMetadataProjection",

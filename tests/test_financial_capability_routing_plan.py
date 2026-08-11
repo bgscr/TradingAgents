@@ -10,11 +10,13 @@ import pytest
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     CAPABILITY_ROUTING_PLAN_VERSION,
+    CAPABILITY_ROUTING_PLAN_VERSION_1_3,
     CAPABILITY_ROUTING_PLAN_VERSION_V2,
     MainlandCapability,
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -134,3 +136,85 @@ def test_historical_plan_1_1_remains_readable_under_recorded_contracts(
     assert historical.routes == current.routes
     assert historical.completeness_policy_version == current.completeness_policy_version
     assert historical.eligibility_policy_version == current.eligibility_policy_version
+
+
+def test_plan_1_3_binds_exact_temporal_versions_without_activating_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predecessor = _qualified_plan(monkeypatch)
+    plan = prepare_mainland_temporal_capability_routing_plan(predecessor)
+
+    assert CAPABILITY_ROUTING_PLAN_VERSION == "1.2"
+    assert CAPABILITY_ROUTING_PLAN_VERSION_1_3 == "1.3"
+    assert predecessor.plan_version == "1.2"
+    assert plan.plan_version == "1.3"
+    assert plan.routes == predecessor.routes
+    assert plan.financial_eligibility_binding == predecessor.financial_eligibility_binding
+    assert plan.indicator_field_semantics_version == (
+        predecessor.indicator_field_semantics_version
+    )
+    assert plan.indicator_metadata_compatibility_version == (
+        predecessor.indicator_metadata_compatibility_version
+    )
+    assert plan.indicator_manifest_contract_version == "financial-manifest-v3"
+    assert plan.indicator_selection_contract_version == (
+        "financial-period-selection-v3"
+    )
+    assert plan.completeness_policy_version == predecessor.completeness_policy_version
+    assert plan.plan_signature.startswith("mainland-routing-plan:v1:")
+    assert plan.plan_signature != predecessor.plan_signature
+
+    temporal = plan.temporal_contract_bindings
+    assert temporal is not None
+    assert temporal.model_dump(mode="json") == {
+        "aggregate_completeness_version": "financial-aggregate-completeness-v4",
+        "calendar_eligibility_binding_version": "market-session-eligibility-binding-v1",
+        "company_type_evidence_binding_version": "financial-company-type-evidence-binding-v3",
+        "company_type_evidence_projection_version": "financial-company-type-evidence-projection-v2",
+        "company_type_provider_response_version": "financial-company-type-evidence-provider-response-v2",
+        "company_type_routing_request_version": "financial-company-type-evidence-routing-request-v2",
+        "completeness_row_version": "financial-completeness-row-v5",
+        "eligibility_metadata_binding_version": "financial-eligibility-metadata-binding-v2",
+        "financial_dispatch_audit_projection_version": "4.0",
+        "financial_dispatch_ledger_version": "1.6",
+        "financial_eligibility_acquisition_result_version": "financial-eligibility-acquisition-result-v2",
+        "financial_eligibility_context_version": "financial-eligibility-acquisition-context-v2",
+        "financial_eligibility_request_binding_version": "financial-eligibility-request-binding-v2",
+        "financial_tool_manifest_version": "financial-tool-manifest-v4",
+        "financial_tool_message_envelope_version": "financial-tool-message-envelope-v4",
+        "indicator_manifest_version": "financial-manifest-v4",
+        "indicator_routing_request_version": "financial-indicator-routing-request-v7",
+        "indicator_routing_result_version": "financial-indicator-routing-result-v4",
+        "indicator_selection_checkpoint_version": "financial-indicator-selection-checkpoint-v3",
+        "indicator_selection_dispatch_version": "financial-indicator-selection-dispatch-v3",
+        "listing_metadata_projection_version": "financial-listing-metadata-projection-v2",
+        "listing_metadata_version": "financial-listing-metadata-v2",
+        "manifest_audit_version": "financial-manifest-audit-v4",
+        "manifest_request_audit_version": "financial-manifest-request-audit-v4",
+        "provider_subrequest_cache_checkpoint_version": "1.2",
+        "statement_manifest_version": "financial-manifest-v4",
+        "statement_routing_request_version": "financial-statement-routing-request-v4",
+        "statement_routing_result_version": "financial-statement-routing-result-v2",
+        "statement_selection_checkpoint_version": "financial-statement-selection-checkpoint-v2",
+        "statement_selection_dispatch_version": "financial-statement-selection-dispatch-v2",
+        "temporal_decision_version": "financial-metadata-temporal-eligibility-decision-v1",
+        "temporal_policy_version": "provider-neutral-temporal-eligibility-v1",
+    }
+
+
+def test_historical_plan_1_2_remains_readable_under_recorded_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predecessor = _qualified_plan(monkeypatch)
+    forward = prepare_mainland_temporal_capability_routing_plan(predecessor)
+
+    historical = MainlandCapabilityRoutingPlan.model_validate(
+        predecessor.model_dump(mode="json")
+    )
+    projection = MainlandCapabilityRoutingRunProjection.from_plan(historical)
+
+    assert historical == predecessor
+    assert historical.plan_version == "1.2"
+    assert historical.temporal_contract_bindings is None
+    assert projection.temporal_contract_bindings is None
+    assert forward.plan_signature != historical.plan_signature

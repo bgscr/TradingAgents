@@ -52,6 +52,8 @@ from tradingagents.market_history.maintenance import (
     assess_history_gaps,
     decide_history_request,
     latest_completed_session,
+    market_session_close,
+    next_open_market_session,
     plan_incremental_refresh,
     reconciliation_due,
 )
@@ -172,6 +174,8 @@ __all__ = [
     "assess_history_gaps",
     "decide_history_request",
     "latest_completed_session",
+    "market_session_close",
+    "next_open_market_session",
     "normalize_mainland_session",
     "plan_incremental_refresh",
     "reconciliation_due",

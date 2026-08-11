@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 
 from tradingagents.market_history.calendar import (
+    MarketSession,
     MarketSessionStatus,
     StoredSessionCalendar,
 )
@@ -179,14 +180,46 @@ def latest_completed_session(
             continue
         if session.session_date > local_as_of.date():
             continue
-        closes_at = session.closes_at or datetime.combine(
-            session.session_date,
-            time(15, 0),
-            tzinfo=market_timezone,
-        )
+        closes_at = market_session_close(calendar, session=session)
         if local_as_of >= closes_at.astimezone(market_timezone):
             completed.append(session.session_date)
     return max(completed) if completed else None
+
+
+def market_session_close(
+    calendar: StoredSessionCalendar,
+    *,
+    session: MarketSession,
+) -> datetime:
+    """Return the authoritative close projection used by calendar consumers."""
+
+    if session.status is not MarketSessionStatus.OPEN:
+        raise ValueError("closed market session has no session close")
+    market_timezone = ZoneInfo(calendar.timezone_name)
+    return session.closes_at or datetime.combine(
+        session.session_date,
+        time(15, 0),
+        tzinfo=market_timezone,
+    )
+
+
+def next_open_market_session(
+    calendar: StoredSessionCalendar,
+    *,
+    after: date,
+) -> MarketSession | None:
+    """Return the next open session from the pinned calendar revision."""
+
+    return min(
+        (
+            session
+            for session in calendar.sessions
+            if session.status is MarketSessionStatus.OPEN
+            and session.session_date > after
+        ),
+        key=lambda session: session.session_date,
+        default=None,
+    )
 
 
 def decide_history_request(

@@ -15,6 +15,7 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.financial_contracts import (
     FinancialAvailabilityScope,
@@ -26,17 +27,39 @@ from tradingagents.dataflows.financial_contracts import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+    FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2,
     FinancialCompanyTypeEvidenceBinding,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityAcquisitionFailureReason,
     FinancialEligibilityAcquisitionResult,
+    FinancialEligibilityRequestBinding,
+    FinancialEligibilityTemporalContextBinding,
     build_financial_eligibility_acquisition_context,
     derive_mainland_financial_acquisition_period_supersets,
     financial_eligibility_acquisition_context_identity,
     validate_financial_eligibility_acquisition_context_binding,
 )
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    EvidenceEffectiveAsOfDerivation,
+    FinancialMetadataTemporalEvidence,
+    ProviderPublicationDateDerivation,
+    ProviderPublicationDateSemantics,
+    PublicationDateKind,
+    TemporalEligibilityMode,
+    TemporalEvidenceArtifactBinding,
+    TemporalEvidenceClass,
+    build_market_session_eligibility_binding,
+    evaluate_financial_metadata_temporal_eligibility,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
+from tradingagents.market_history import (
+    MarketSession,
+    MarketSessionStatus,
+    ProvenanceClass,
+    StoredSessionCalendar,
+)
 
 _AS_OF = date(2026, 8, 8)
 _OBSERVED_AT = datetime(2026, 8, 8, 1, 2, tzinfo=timezone.utc)
@@ -112,30 +135,23 @@ def _evidence(
     return FinancialCompanyTypeEvidenceBinding.create(
         provider_id=provider_id,
         artifact_identity=(
-            "provider-artifact:v1:"
-            + sha256(f"artifact-{provider_id}".encode()).hexdigest()
+            "provider-artifact:v1:" + sha256(f"artifact-{provider_id}".encode()).hexdigest()
         ),
         source_ref=(
-            "acq.v1:financial.company-type:"
-            + sha256(f"source-{provider_id}".encode()).hexdigest()
+            "acq.v1:financial.company-type:" + sha256(f"source-{provider_id}".encode()).hexdigest()
         ),
         observed_at=_OBSERVED_AT,
         retrieved_at=_RETRIEVED_AT,
         provider_declared_type=resolution.provider_declared_type,
         provider_declaration_qualified=resolution.provider_declaration_qualified,
-        normalized_resolver_inputs=(
-            resolution.classifier_inputs if inputs is None else inputs
-        ),
+        normalized_resolver_inputs=(resolution.classifier_inputs if inputs is None else inputs),
     )
 
 
 def _listing_provenance(label: str = "listing") -> FinancialListingProvenance:
     return FinancialListingProvenance(
         provider_id="baostock",
-        source_ref=(
-            "provider-artifact:v1:"
-            + sha256(label.encode("utf-8")).hexdigest()
-        ),
+        source_ref=("provider-artifact:v1:" + sha256(label.encode("utf-8")).hexdigest()),
         observed_at=_OBSERVED_AT,
     )
 
@@ -228,9 +244,12 @@ def test_valid_contexts_construct_deterministically(
     assert first.company_type_resolution.company_type is company_type
     assert first.instrument_identity.symbol == symbol
     assert first.safe_projection() == second.safe_projection()
-    assert FinancialEligibilityAcquisitionContext.model_validate(
-        json.loads(json.dumps(first.safe_projection()))
-    ) == first
+    assert (
+        FinancialEligibilityAcquisitionContext.model_validate(
+            json.loads(json.dumps(first.safe_projection()))
+        )
+        == first
+    )
 
 
 def test_context_cross_binding_validation_is_centralized_and_fail_closed(
@@ -308,9 +327,7 @@ def test_each_context_field_is_identity_material(
         "acquisition_purpose": "future_replay",
         "financial_eligibility_binding": {
             **projection["financial_eligibility_binding"],
-            "policy_signature": (
-                "mainland-financial-eligibility-policy:v2:" + "2" * 64
-            ),
+            "policy_signature": ("mainland-financial-eligibility-policy:v2:" + "2" * 64),
         },
         "routing_plan_signature": "mainland-routing-plan:v1:" + "3" * 64,
         "company_type_resolution": {
@@ -335,10 +352,9 @@ def test_each_context_field_is_identity_material(
     for field, replacement in mutations.items():
         candidate = {key: value for key, value in projection.items() if key != "context_identity"}
         candidate[field] = replacement
-        assert (
-            financial_eligibility_acquisition_context_identity(candidate)
-            != original_identity
-        ), field
+        assert financial_eligibility_acquisition_context_identity(candidate) != original_identity, (
+            field
+        )
 
 
 def test_source_dict_order_does_not_change_context_identity(
@@ -363,13 +379,16 @@ def test_unknown_ambiguous_contradictory_and_missing_evidence_fail_typed(
         classifier_metadata={},
         present_fields=(),
     )
-    assert _failure_reason(
-        dict(
-            inputs,
-            company_type_resolution=unresolved,
-            company_type_evidence=_evidence(unresolved),
+    assert (
+        _failure_reason(
+            dict(
+                inputs,
+                company_type_resolution=unresolved,
+                company_type_evidence=_evidence(unresolved),
+            )
         )
-    ) is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_UNRESOLVED
+        is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_UNRESOLVED
+    )
 
     ambiguous_result = FinancialEligibilityAcquisitionResult.failed(
         FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_AMBIGUOUS,
@@ -385,23 +404,30 @@ def test_unknown_ambiguous_contradictory_and_missing_evidence_fail_typed(
         classifier_metadata={"industry": "industrial"},
         present_fields=("inventory",),
     )
-    assert _failure_reason(
-        dict(
-            inputs,
-            company_type_resolution=contradictory,
-            company_type_evidence=_evidence(contradictory),
+    assert (
+        _failure_reason(
+            dict(
+                inputs,
+                company_type_resolution=contradictory,
+                company_type_evidence=_evidence(contradictory),
+            )
         )
-    ) is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_CONTRADICTORY
+        is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_CONTRADICTORY
+    )
 
-    assert _failure_reason(
-        dict(inputs, company_type_evidence=None)
-    ) is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE
+    assert (
+        _failure_reason(dict(inputs, company_type_evidence=None))
+        is FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE
+    )
 
     resolution = inputs["company_type_resolution"]
     assert isinstance(resolution, FinancialCompanyTypeResolution)
-    assert _failure_reason(
-        dict(inputs, company_type_evidence=_evidence(resolution, provider_id="baostock"))
-    ) is FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+    assert (
+        _failure_reason(
+            dict(inputs, company_type_evidence=_evidence(resolution, provider_id="baostock"))
+        )
+        is FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+    )
 
 
 def test_resolution_failure_preserves_only_the_safe_typed_resolution(
@@ -457,9 +483,10 @@ def test_listing_provenance_failures_are_typed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inputs = _context_inputs(monkeypatch)
-    assert _failure_reason(
-        dict(inputs, listing_provenance=None)
-    ) is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    assert (
+        _failure_reason(dict(inputs, listing_provenance=None))
+        is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    )
 
     non_authoritative = FinancialListingProvenance.model_construct(
         provider_id="baostock",
@@ -467,18 +494,20 @@ def test_listing_provenance_failures_are_typed(
         observed_at=_OBSERVED_AT,
         authoritative=False,
     )
-    assert _failure_reason(
-        dict(inputs, listing_provenance=non_authoritative)
-    ) is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    assert (
+        _failure_reason(dict(inputs, listing_provenance=non_authoritative))
+        is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    )
 
     wrong_provider = FinancialListingProvenance(
         provider_id="tushare",
         source_ref="provider-artifact:v1:" + "7" * 64,
         observed_at=_OBSERVED_AT,
     )
-    assert _failure_reason(
-        dict(inputs, listing_provenance=wrong_provider)
-    ) is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    assert (
+        _failure_reason(dict(inputs, listing_provenance=wrong_provider))
+        is FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    )
 
 
 @pytest.mark.parametrize(
@@ -526,9 +555,10 @@ def test_non_cny_non_mainland_and_non_equity_identities_fail_typed(
         {"instrument_kind": InstrumentKind.FUND},
     ):
         invalid = identity.model_copy(update=update)
-        assert _failure_reason(
-            dict(inputs, instrument_identity=invalid)
-        ) is FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+        assert (
+            _failure_reason(dict(inputs, instrument_identity=invalid))
+            is FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+        )
 
 
 def test_eligibility_policy_mismatch_fails_typed(
@@ -537,9 +567,7 @@ def test_eligibility_policy_mismatch_fails_typed(
     inputs = _context_inputs(monkeypatch)
     binding = inputs["financial_eligibility_binding"]
     payload = binding.model_dump(mode="json")
-    payload["policy_signature"] = (
-        "mainland-financial-eligibility-policy:v2:" + "a" * 64
-    )
+    payload["policy_signature"] = "mainland-financial-eligibility-policy:v2:" + "a" * 64
     inputs["financial_eligibility_binding"] = payload
     assert _failure_reason(inputs) is (
         FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
@@ -632,9 +660,12 @@ def test_qualified_plan_adds_exact_company_type_evidence_route_only_once(
         "akshare_sina",
         "yfinance",
     )
-    assert tuple(route.capability for route in plan.routes).count(
-        MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
-    ) == 1
+    assert (
+        tuple(route.capability for route in plan.routes).count(
+            MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+        )
+        == 1
+    )
 
 
 def test_plan_input_order_does_not_change_signature(
@@ -709,8 +740,7 @@ def test_composition_factory_contains_no_duplicate_company_type_route_table() ->
     assert "_COMPANY_TYPE_EVIDENCE_ROUTE" not in composition_source
     assert '("tushare", "akshare_sina", "yfinance")' not in composition_source
     assert (
-        "company_type_evidence_source_ids = blueprint.routing_plan.route_for"
-        in composition_source
+        "company_type_evidence_source_ids = blueprint.routing_plan.route_for" in composition_source
     )
 
 
@@ -739,3 +769,174 @@ def test_legacy_plan_and_authoritative_mode_controls_remain_unchanged(
     assert authoritative.plan is None
     assert authoritative.failure is not None
     assert authoritative.failure.reason.value == "qualified_v1_authority_disabled"
+
+
+def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _context_inputs(monkeypatch)
+    historical = _success_context(inputs)
+    forward_observed_at = datetime(2026, 8, 8, 15, tzinfo=timezone.utc)
+    forward_company_evidence = FinancialCompanyTypeEvidenceBinding.create(
+        provider_id=historical.company_type_evidence.provider_id,
+        artifact_identity=historical.company_type_evidence.artifact_identity,
+        source_ref=historical.company_type_evidence.source_ref,
+        observed_at=forward_observed_at,
+        retrieved_at=forward_observed_at,
+        provider_declared_type=(historical.company_type_evidence.provider_declared_type),
+        provider_declaration_qualified=(
+            historical.company_type_evidence.provider_declaration_qualified
+        ),
+        normalized_resolver_inputs=(historical.company_type_evidence.normalized_resolver_inputs),
+    )
+    forward_listing_provenance = FinancialListingProvenance(
+        provider_id=historical.listing_provenance.provider_id,
+        source_ref=historical.listing_provenance.source_ref,
+        observed_at=forward_observed_at,
+    )
+    predecessor = inputs["routing_plan"]
+    assert isinstance(predecessor, MainlandCapabilityRoutingPlan)
+    plan_1_3 = prepare_mainland_temporal_capability_routing_plan(predecessor)
+    calendar = StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar:v1:" + "a" * 64,
+        reference_market="mainland-cn",
+        timezone_name="Asia/Shanghai",
+        provider_dataset_id="provider-dataset:baostock-calendar-v1",
+        observed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        sessions=(
+            MarketSession(_AS_OF, MarketSessionStatus.OPEN),
+            MarketSession(date(2026, 8, 10), MarketSessionStatus.OPEN),
+        ),
+    )
+    evaluated_at = datetime(2026, 8, 8, 15, 5, tzinfo=timezone.utc)
+    calendar_binding = build_market_session_eligibility_binding(
+        calendar,
+        requested_session=_AS_OF,
+        eligibility_evaluated_at=evaluated_at,
+    )
+
+    def accepted_decision(
+        *,
+        evidence_class: TemporalEvidenceClass,
+        artifact_identity: str,
+        semantics: str,
+        source_field: str,
+        row_identity: str,
+    ):
+        artifact = TemporalEvidenceArtifactBinding(
+            artifact_identity=artifact_identity,
+            revision_identity=(
+                "provider-revision:v1:" + sha256(row_identity.encode("utf-8")).hexdigest()
+            ),
+            row_identity=row_identity,
+        )
+        evidence = FinancialMetadataTemporalEvidence(
+            evidence_class=evidence_class,
+            artifact=artifact,
+            evidence_effective_as_of=date(2026, 6, 30),
+            evidence_effective_as_of_derivation=EvidenceEffectiveAsOfDerivation(
+                semantics=semantics,
+                source_field=source_field,
+                artifact=artifact,
+            ),
+            ann_date=_AS_OF,
+            ann_date_derivation=ProviderPublicationDateDerivation(
+                date_kind=PublicationDateKind.ANN_DATE,
+                semantics=(
+                    ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS
+                    if evidence_class is TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE
+                    else ProviderPublicationDateSemantics.BAOSTOCK_LIFECYCLE_PUBLICATION_FIELDS
+                ),
+                source_field=(
+                    "ann_date"
+                    if evidence_class is TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE
+                    else "announcement_date"
+                ),
+                artifact=artifact,
+            ),
+            f_ann_date=_AS_OF,
+            f_ann_date_derivation=ProviderPublicationDateDerivation(
+                date_kind=PublicationDateKind.F_ANN_DATE,
+                semantics=(
+                    ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS
+                    if evidence_class is TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE
+                    else ProviderPublicationDateSemantics.BAOSTOCK_LIFECYCLE_PUBLICATION_FIELDS
+                ),
+                source_field=(
+                    "f_ann_date"
+                    if evidence_class is TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE
+                    else "first_publication_date"
+                ),
+                artifact=artifact,
+            ),
+            observed_at=forward_observed_at,
+            retrieved_at=forward_observed_at,
+        )
+        return evaluate_financial_metadata_temporal_eligibility(
+            mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+            evidence=evidence,
+            calendar_binding=calendar_binding,
+        )
+
+    company_decision = accepted_decision(
+        evidence_class=TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+        artifact_identity=forward_company_evidence.artifact_identity,
+        semantics="tushare_statement_period_end",
+        source_field="end_date",
+        row_identity="row:company-type",
+    )
+    listing_decision = accepted_decision(
+        evidence_class=TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
+        artifact_identity=forward_listing_provenance.source_ref,
+        semantics="baostock_lifecycle_listing_date",
+        source_field="listing_date",
+        row_identity="row:listing",
+    )
+    temporal = FinancialEligibilityTemporalContextBinding(
+        requested_session=_AS_OF,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=calendar_binding,
+        latest_completed_session=_AS_OF,
+        company_type_temporal_decision=company_decision,
+        listing_temporal_decision=listing_decision,
+    )
+    payload = historical.model_dump(mode="python", exclude={"context_identity"})
+    payload.pop("as_of_date")
+    payload.update(
+        contract_version=FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+        requested_session=_AS_OF,
+        routing_plan_signature=plan_1_3.plan_signature,
+        company_type_evidence=forward_company_evidence,
+        listing_provenance=forward_listing_provenance,
+        temporal_eligibility_binding=temporal,
+    )
+    context = FinancialEligibilityAcquisitionContext(
+        **payload,
+        context_identity=financial_eligibility_acquisition_context_identity(payload),
+    )
+    request_binding = FinancialEligibilityRequestBinding.from_context(context)
+
+    assert context.contract_version == (FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2)
+    assert context.context_identity.startswith("financial-eligibility-acquisition-context:v2:")
+    assert request_binding.contract_version == (FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2)
+    assert request_binding.context_contract_version == context.contract_version
+    assert context.requested_session == _AS_OF
+    assert context.as_of_date is None
+    assert request_binding.requested_session == _AS_OF
+    assert request_binding.as_of_date is None
+    assert request_binding.temporal_eligibility_binding == temporal
+    assert (
+        FinancialEligibilityAcquisitionContext.model_validate(historical.model_dump(mode="json"))
+        == historical
+    )
+
+    upgraded_v1_payload = {**payload, "as_of_date": _AS_OF}
+    with pytest.raises(ValidationError, match="requested-session shape"):
+        FinancialEligibilityAcquisitionContext(
+            **upgraded_v1_payload,
+            context_identity=financial_eligibility_acquisition_context_identity(
+                upgraded_v1_payload
+            ),
+        )

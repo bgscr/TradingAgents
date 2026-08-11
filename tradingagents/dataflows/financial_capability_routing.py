@@ -618,6 +618,7 @@ class FinancialStatementRoutingRequest(BaseModel):
         "financial-statement-routing-request-v1",
         "financial-statement-routing-request-v2",
         "financial-statement-routing-request-v3",
+        "financial-statement-routing-request-v4",
     ] = (
         "financial-statement-routing-request-v1"
     )
@@ -629,7 +630,14 @@ class FinancialStatementRoutingRequest(BaseModel):
     ) = Field(default=None, exclude_if=lambda value: value is None)
     instrument_identity: InstrumentIdentityEvidence
     statement_type: FinancialStatementType
-    as_of_date: date
+    as_of_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_session: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     company_type: FinancialCompanyType
     consolidation_scope: FinancialConsolidationScope
     currency: str = Field(pattern=r"^[A-Z]{3}$")
@@ -675,7 +683,7 @@ class FinancialStatementRoutingRequest(BaseModel):
     ) = Field(default=None, exclude_if=lambda value: value is None)
     request_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-statement-routing-request:v3:[0-9a-f]{64}$",
+        pattern=r"^financial-statement-routing-request:v[34]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
 
@@ -688,6 +696,19 @@ class FinancialStatementRoutingRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialStatementRoutingRequest:
+        temporal_contract = (
+            self.contract_version == "financial-statement-routing-request-v4"
+        )
+        historical_shape = (
+            self.as_of_date is not None and self.requested_session is None
+        )
+        temporal_shape = (
+            self.as_of_date is None and self.requested_session is not None
+        )
+        if (temporal_contract and not temporal_shape) or (
+            not temporal_contract and not historical_shape
+        ):
+            raise ValueError("statement routing requested-session shape mismatch")
         if self.statement_type not in _STATEMENT_CAPABILITY:
             raise ValueError("statement routing requires one full statement")
         if self.company_type is FinancialCompanyType.UNKNOWN:
@@ -697,6 +718,7 @@ class FinancialStatementRoutingRequest(BaseModel):
         policy_bound = self.contract_version in {
             "financial-statement-routing-request-v2",
             "financial-statement-routing-request-v3",
+            "financial-statement-routing-request-v4",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -709,7 +731,10 @@ class FinancialStatementRoutingRequest(BaseModel):
             != self.eligibility_policy_version
         ):
             raise ValueError("statement routing eligibility binding is inconsistent")
-        context_bound = self.contract_version == "financial-statement-routing-request-v3"
+        context_bound = self.contract_version in {
+            "financial-statement-routing-request-v3",
+            "financial-statement-routing-request-v4",
+        }
         new_fields = (
             self.requested_capability,
             self.requested_analysis_scope,
@@ -729,6 +754,12 @@ class FinancialStatementRoutingRequest(BaseModel):
         if context_bound:
             binding = self.financial_eligibility_context_binding
             assert binding is not None
+            temporal_bound = temporal_contract
+            if temporal_bound != (
+                binding.contract_version
+                == "financial-eligibility-request-binding-v2"
+            ):
+                raise ValueError("statement routing temporal binding is inconsistent")
             expected_capability = _STATEMENT_CAPABILITY[self.statement_type]
             if (
                 self.requested_capability is not expected_capability
@@ -741,7 +772,11 @@ class FinancialStatementRoutingRequest(BaseModel):
                 or self.requested_analysis_scope is not binding.availability_scope
                 or self.acquisition_purpose != binding.acquisition_purpose
                 or self.instrument_identity != binding.instrument_identity
-                or self.as_of_date != binding.as_of_date
+                or (
+                    self.requested_session != binding.requested_session
+                    if temporal_bound
+                    else self.as_of_date != binding.as_of_date
+                )
                 or self.company_type_resolution != binding.company_type_resolution
                 or self.company_type_evidence != binding.company_type_evidence
                 or self.company_type is not binding.company_type_resolution.company_type
@@ -773,7 +808,11 @@ class FinancialStatementRoutingRequest(BaseModel):
                 raise ValueError("statement routing material arguments are not canonical")
             payload = self.model_dump(mode="json", exclude={"request_identity"})
             expected_identity = (
-                "financial-statement-routing-request:v3:"
+                (
+                    "financial-statement-routing-request:v4:"
+                    if temporal_bound
+                    else "financial-statement-routing-request:v3:"
+                )
                 + sha256(
                     json.dumps(
                         payload,
@@ -804,6 +843,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         "financial-indicator-routing-request-v4",
         "financial-indicator-routing-request-v5",
         "financial-indicator-routing-request-v6",
+        "financial-indicator-routing-request-v7",
     ] = (
         "financial-indicator-routing-request-v1"
     )
@@ -818,7 +858,14 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         exclude_if=lambda value: value is None,
     )
     instrument_identity: InstrumentIdentityEvidence
-    as_of_date: date
+    as_of_date: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_session: date | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     company_type: FinancialCompanyType
     company_type_resolution: FinancialCompanyTypeResolution | None = Field(
         default=None,
@@ -872,7 +919,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     ) = Field(default=None, exclude_if=lambda value: value is None)
     request_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-indicator-routing-request:v6:[0-9a-f]{64}$",
+        pattern=r"^financial-indicator-routing-request:v[67]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
 
@@ -885,6 +932,19 @@ class FinancialIndicatorRoutingRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_request(self) -> FinancialIndicatorRoutingRequest:
+        temporal_contract = (
+            self.contract_version == "financial-indicator-routing-request-v7"
+        )
+        historical_shape = (
+            self.as_of_date is not None and self.requested_session is None
+        )
+        temporal_shape = (
+            self.as_of_date is None and self.requested_session is not None
+        )
+        if (temporal_contract and not temporal_shape) or (
+            not temporal_contract and not historical_shape
+        ):
+            raise ValueError("indicator routing requested-session shape mismatch")
         canonical = tuple(
             family for family in FinancialRatioFamily if family in self.ratio_families
         )
@@ -892,12 +952,14 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
             "financial-indicator-routing-request-v6",
+            "financial-indicator-routing-request-v7",
         }
         provenance_bound = (
             self.contract_version
             in {
                 "financial-indicator-routing-request-v5",
                 "financial-indicator-routing-request-v6",
+                "financial-indicator-routing-request-v7",
             }
         )
         if not canonical or len(self.ratio_families) != len(canonical):
@@ -925,6 +987,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
             "financial-indicator-routing-request-v6",
+            "financial-indicator-routing-request-v7",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -944,6 +1007,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 "financial-indicator-routing-request-v4",
                 "financial-indicator-routing-request-v5",
                 "financial-indicator-routing-request-v6",
+                "financial-indicator-routing-request-v7",
             }
         )
         if availability_bound and self.requested_analysis_scope is None:
@@ -964,7 +1028,10 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 or self.remaining_evidence_decision_ready
             ):
                 raise ValueError("indicator family requirement binding is inconsistent")
-        context_bound = self.contract_version == "financial-indicator-routing-request-v6"
+        context_bound = self.contract_version in {
+            "financial-indicator-routing-request-v6",
+            "financial-indicator-routing-request-v7",
+        }
         new_fields = (
             self.eligible_annual_period_ends,
             self.requested_capability,
@@ -983,6 +1050,12 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         if context_bound:
             binding = self.financial_eligibility_context_binding
             assert binding is not None
+            temporal_bound = temporal_contract
+            if temporal_bound != (
+                binding.contract_version
+                == "financial-eligibility-request-binding-v2"
+            ):
+                raise ValueError("indicator routing temporal binding is inconsistent")
             if (
                 self.requested_capability is not MainlandCapability.FINANCIAL_INDICATORS
                 or self.tool_name != "get_fundamentals"
@@ -990,7 +1063,11 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 or self.requested_analysis_scope is not binding.availability_scope
                 or self.acquisition_purpose != binding.acquisition_purpose
                 or self.instrument_identity != binding.instrument_identity
-                or self.as_of_date != binding.as_of_date
+                or (
+                    self.requested_session != binding.requested_session
+                    if temporal_bound
+                    else self.as_of_date != binding.as_of_date
+                )
                 or self.company_type_resolution != binding.company_type_resolution
                 or self.company_type_evidence != binding.company_type_evidence
                 or self.company_type is not binding.company_type_resolution.company_type
@@ -1022,7 +1099,11 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 raise ValueError("indicator routing material arguments are not canonical")
             payload = self.model_dump(mode="json", exclude={"request_identity"})
             expected_identity = (
-                "financial-indicator-routing-request:v6:"
+                (
+                    "financial-indicator-routing-request:v7:"
+                    if temporal_bound
+                    else "financial-indicator-routing-request:v6:"
+                )
                 + sha256(
                     json.dumps(
                         payload,
