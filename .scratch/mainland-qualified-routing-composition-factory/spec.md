@@ -44,6 +44,18 @@ neither proof nor semantic irrelevance. Ticket 06 therefore remains
 FAIL/BLOCKED until the provider-neutral metadata contract and corrected QCF4
 path are implemented.
 
+The completed Ticket 07 temporal-eligibility prototype exposed a fourth
+Critical gap in the fresh metadata path. The failed `601328.SS` run requested
+mainland session `2026-08-10`, while its Tushare company-type artifact was
+retrieved at `2026-08-10T16:48:07Z`, or `2026-08-11 00:48:07` in
+`Asia/Shanghai`. The retained and post-route validators require the local
+retrieval calendar date to equal the requested session date, so they rejected
+the artifact even though `2026-08-10` was still the latest completed mainland
+session. Local midnight is not a Market Session Calendar boundary and does not
+prove when the evidence became effective or available. The failed run and all
+historical state remain immutable, Ticket 07 remains **BLOCKED**, and
+authoritative `qualified_v1` remains disabled.
+
 ## Solution
 
 Ship and statically register one built-in qualified routing composition factory.
@@ -119,6 +131,26 @@ Capability Routing Plan. No provider-specific router exception, requested-
 metadata backfill, companion-filing inference, completeness-threshold change,
 or Evidence Admission rewrite is introduced.
 
+For fresh and retained financial eligibility metadata, use temporal Design D:
+keep provider observation/retrieval time separate from provider-derived
+effective/publication proof. For `current_analysis_only`, use Design B's
+session-bounded frontier: the requested mainland session remains eligible only
+while it equals `latest_completed_session(...)` under the pinned Market Session
+Calendar at one run-owned `eligibility_evaluated_at`. The frontier advances when
+the next open market session completes, not at local midnight, next-session
+open, or an elapsed grace window. `strict_historical_pit` remains a separate,
+stricter exact-cutoff predicate and never inherits the current-analysis window.
+
+One versioned, provider-neutral temporal evaluator owns this decision for
+fresh and retained company-type and listing/lifecycle metadata, context
+construction, request binding, checkpoint validation, and replay. It consumes
+immutable provider proof and a pinned calendar binding, produces one immutable
+typed context-level decision binding (with its artifact subdecisions), and is
+evaluated in one transaction once inside the existing run-owned
+single-flight with an injected fixed `eligibility_evaluated_at`. Exact replay
+uses the recorded decision inputs and result with zero provider/model I/O; it
+does not consult today's calendar frontier or reinterpret historical evidence.
+
 ## User Stories
 
 1. As a shadow-run operator, I want a shipped factory to be selected without test injection, so that real qualified shadow preflight can proceed.
@@ -180,6 +212,22 @@ or Evidence Admission rewrite is introduced.
 57. As a historical-artifact reader, I want recorded old versions replayed under their pinned contracts and never rewritten, so that the amendment is forward-versioned rather than migratory.
 58. As a QCF4 owner, I want complete Tushare statements to stop statement fallback while incompatible indicator families continue, so that acceptance proves metadata truth rather than provider preference.
 59. As a regression owner, I want the separately completed deterministic live-test isolation fix retained, so that deterministic acceptance remains isolated from live providers independently of this metadata change.
+60. As a current-analysis user, I want metadata retrieved after local midnight to remain eligible while my requested session is still the latest completed mainland session, so that calendar dates do not create false rejections.
+61. As a Market Session Calendar owner, I want the current-analysis frontier to advance only when the next open session completes, so that weekends, holidays, and intraday retrieval use market semantics.
+62. As an evidence owner, I want `requested_session`, `evidence_effective_as_of`, `ann_date`, `f_ann_date`, `observed_at`, and `retrieved_at` kept separate, so that request intent cannot masquerade as provider proof.
+63. As an audit owner, I want observation and retrieval timestamps preserved immutably, so that late retrieval is visible and never rewritten to manufacture eligibility.
+64. As a provider-contract owner, I want `evidence_effective_as_of` populated only by an explicit provider/evidence-class derivation, so that ticker, company name, route, request defaults, retrieval date, and model output cannot fabricate applicability.
+65. As a current-analysis user, I want retrieval immediately before and during the next mainland session to remain eligible for the prior session until that later session closes, so that the frontier reflects completed evidence rather than session open.
+66. As a weekend or holiday user, I want the prior open session to remain the frontier throughout non-session dates, so that no arbitrary wall-clock grace window is needed.
+67. As a strict-replay user, I want post-cutoff retrieval rejected unless authoritative proof binds the exact revision to pre-cutoff availability, so that current-frontier eligibility cannot weaken no-lookahead guarantees.
+68. As a strict-replay user, I want missing `f_ann_date` or exact first-publication/revision availability proof to fail closed, so that an old effective date cannot prove historical availability.
+69. As an integration maintainer, I want retained metadata, fresh provider metadata, context construction, request binding, checkpoints, and replay to call one temporal evaluator, so that equivalent equality checks cannot diverge.
+70. As a checkpoint user, I want both accepted and rejected temporal decisions persisted with their pinned calendar and evaluation inputs, so that exact restore reproduces the original result without live repair.
+71. As a historical-state owner, I want old plan/context checkpoints interpreted only under their recorded temporal contracts, so that a new policy never relabels the failed Ticket 07 evidence.
+72. As a new-plan user with an old checkpoint, I want a typed incompatibility or explicit `START_NEW`, so that missing temporal proof is never invented by migration.
+73. As a concurrency user, I want simultaneous first metadata requests to share one fixed evaluation time and one terminal temporal decision, so that a midnight or session-close race cannot split the run.
+74. As a rollout owner, I want all temporal matrices and the complete QCF1–QCF18, PE1–PE15, and AC1–AC13 suites rerun before Ticket 07, so that the policy change receives full deterministic acceptance.
+75. As a rollout owner, I want any Ticket 07 retry to allocate a new run ID, run `601328.SS` first, and run `600895.SS` only after the bank case passes, so that the immutable failed run is not reused and the gate remains fail-closed.
 
 ## Implementation Decisions
 
@@ -199,6 +247,15 @@ or Evidence Admission rewrite is introduced.
   Strategy Rules, and decision authority are unchanged. Indicator metadata
   compatibility is an additional provider-neutral pre-selection hard gate and
   receives the exact forward versions defined below.
+- Temporal Design D is authoritative for new metadata decisions, with Design
+  B's session-bounded frontier used only for `current_analysis_only`. Exact
+  local-calendar equality, arbitrary next-day grace windows, and ad hoc `<=` or
+  `>=` substitutions are not authorities. `strict_historical_pit` retains its
+  separate exact-cutoff proof and is never weakened by the current frontier.
+- The pinned mainland Market Session Calendar remains the sole session/frontier
+  authority under ADR-0036. Providers prove evidence applicability and
+  publication; the calendar proves which session is latest completed. Neither
+  authority may substitute for the other.
 - Request factories, the composition factory, the context acquirer, and provider
   adapters must not implement fallback, provider ordering, duplicated
   completeness rules, duplicated company-type policy, another capability
@@ -305,7 +362,8 @@ existing canonical identity rules.
 | Contract version and context identity | A new explicit context contract version and its deterministic identity. The identity changes for any material field change and is safe to persist. |
 | Run and asset bindings | Canonical run ID and authoritative Run Asset Configuration signature. These bind the value to one run/asset and are immutable acquisition metadata, not routing policy. |
 | Instrument Identity | The authoritative `InstrumentIdentityEvidence` for a CNY XSHG/XSHE Equity. Symbol, venue, kind, currency, identity provenance, and asset signature must agree. |
-| Run as-of date | The one authoritative analysis as-of date used for metadata and financial target construction. Tool requests must match it exactly. |
+| Requested session and temporal mode | `requested_session` is the one authoritative open mainland analysis session used for metadata and financial target construction. It is request intent, never provider proof. The context also binds `current_analysis_only` or `strict_historical_pit`; tool requests must match both exactly. Historical v1 `as_of_date` remains readable only under its recorded contract. |
+| Temporal evaluation binding | Context v2 binds `provider-neutral-temporal-eligibility-v1`, `market-session-eligibility-binding-v1`, the pinned calendar revision, the injected fixed `eligibility_evaluated_at`, the latest-completed-session decision, and the accepted temporal-decision identities for company-type and listing/lifecycle evidence. Strict mode additionally binds `strict_cutoff` and any exact-revision availability proof. |
 | Requested availability scope | The existing typed Financial Availability Scope requested for the run, plus the bounded `foreground_current_analysis` acquisition purpose. It cannot be broadened for prewarming or replay. |
 | Financial eligibility-policy binding | The active immutable Mainland Financial Eligibility projection/binding identity. Context validation must prove it is the exact binding committed by the plan and run. |
 | Routing-plan signature | The exact immutable Capability Routing Plan signature that governed prerequisite metadata acquisition and will govern ordinary financial routing. |
@@ -322,7 +380,8 @@ artifacts and canonical normalized resolver inputs, but it must not embed raw
 rows or operational error text.
 
 Context construction validates all cross-bindings before single assignment:
-authoritative identity and currency, run and asset signatures, as-of date,
+authoritative identity and currency, run and asset signatures, requested
+session/mode and temporal decisions,
 availability scope, canonical acquisition periods, active financial eligibility
 binding, active plan signature, non-unknown resolved company type with qualified
 artifact-bound evidence, and authoritative listing provenance. The identity and
@@ -336,6 +395,154 @@ contradictory, listing metadata/provenance unavailable, context binding
 mismatch, and interrupted acquisition. These distinctions are safe and payload-
 free; none carries provider error text or a partial context.
 
+### Provider-neutral temporal terminology and evidence contract
+
+The completed temporal-eligibility prototype report is authoritative design
+evidence. New writes use the following closed terms exactly; historical fields
+remain readable under their recorded contracts and are not renamed in place.
+
+| Term | Normative meaning |
+| --- | --- |
+| `requested_session` | The open Reference Market session whose completed state is requested. It is request intent and never provider proof. |
+| `evidence_effective_as_of` | Provider-origin/evidence-derived date or timestamp at which the material value, classification, or lifecycle fact applies, plus an evidence-class semantics identifier naming the permitted derivation. It is never a caller-supplied eligible date. |
+| `ann_date` | The existing provider announcement-date value with unchanged inclusive semantics. It is provider-derived, remains distinct from effective date and retrieval, and is never synthesized. |
+| `f_ann_date` | The existing first/actual-publication value with unchanged semantics. It remains required for strict PIT where it is required today and is never inferred from `ann_date`. |
+| `observed_at` | Immutable timestamp assigned to observation of the provider revision. It is never rewritten. |
+| `retrieved_at` | Immutable timestamp at which the provider artifact was retrieved. It is never rewritten. |
+| `eligibility_evaluated_at` | One timezone-aware run-owned instant injected before first metadata acquisition and shared by every leader/follower, retained/fresh evaluation, context bind, and checkpoint decision in the run. One context-level evaluation transaction consumes all required artifact proofs once and emits one terminal decision binding. |
+| `strict_cutoff` | Exact historical availability cutoff supplied by the invoking strict-PIT contract; for session-close replay it is the pinned requested-session close unless another versioned historical contract explicitly supplies a different cutoff. |
+| `exact_revision_authoritative_available_at` | Optional authoritative provider/exchange timestamp proving that the exact immutable material revision—not merely a filing generally—was available. It is qualified only when the proof identity binds the exact artifact/revision. |
+| `latest_completed_session` | The session returned by the pinned Market Session Calendar revision at `eligibility_evaluated_at`. It is derived calendar authority, not provider or request evidence. |
+| `retrieval_local_date` | Diagnostic rendering of `retrieved_at` in `Asia/Shanghai`. It has no eligibility authority. |
+
+Every provider-derived metadata proof admitted to the evaluator must satisfy
+all of the following before mode-specific rules are applied:
+
+1. `observed_at <= retrieved_at`; both values are immutable and timezone-aware.
+2. `evidence_effective_as_of` is non-null, is produced by the permitted
+   evidence-class derivation below, and is no later than `requested_session`.
+3. `ann_date` is non-null, is read from provider-origin evidence with its
+   existing meaning, and is no later than `requested_session`.
+4. No request field, factory default, provider route, model output, symbol,
+   company/display name, retrieval date, or derived eligible session supplies
+   evidence proof.
+
+The evaluator derives the eligible session and decision. A provider, caller,
+request factory, context factory, or checkpoint reader cannot supply a passing
+result. Missing or contradictory proof produces a typed fail-closed rejection.
+For the currently qualified classes below, `evidence_effective_as_of`,
+`ann_date`, and `f_ann_date` are canonical provider dates and compare directly
+and inclusively to `requested_session`. A future timestamp-valued effective
+class must version and define its provider-semantic projection to a Reference
+Market session/date; it cannot reuse retrieval timezone conversion as that
+projection.
+
+### Permitted `evidence_effective_as_of` and publication derivations
+
+The following table is exhaustive for the currently relevant company-type and
+listing metadata evidence classes. Any source not listed is unavailable under
+`provider-neutral-temporal-eligibility-v1` until a forward evidence-class
+contract explicitly qualifies its provider-origin semantics.
+
+| Evidence class | Exact permitted effective-as-of derivation | Exact permitted publication derivation | Consequence when absent |
+| --- | --- | --- | --- |
+| Tushare statement-derived company type | The selected immutable statement candidate's provider `end_date` / bound `period_end` for the same row and artifact that supplies `comp_type`; the evidence-class semantics identifier records `tushare_statement_period_end`. | `ann_date` and, for strict PIT, `f_ann_date` are copied only from those exact provider filing fields on the same candidate/revision. | Missing `end_date`, `ann_date`, or artifact/revision binding rejects. Missing `f_ann_date` limits evidence to current-only at most and rejects strict PIT. |
+| AKShare-Sina statement-derived company type/classifier input | The selected immutable statement row's provider report-period/end-date field already normalized into its bound period identity; the semantics identifier records `akshare_sina_statement_period_end`. | Only an explicit provider announcement/publication field on that same row/revision may populate `ann_date`; only an explicit first-publication field may populate `f_ann_date`. | If the qualified endpoint/normalizer cannot project either required field, it returns typed temporal proof unavailable. Observation or retrieval time cannot fill it. |
+| Yahoo current-profile classifier input | No permitted historical effective-date or announcement-date derivation exists in the current profile contract. `retrieved_at`, the profile's current nature, and request date are not applicability proof. | None under the current evidence class. | The profile may remain a retained current diagnostic/classifier artifact, but it cannot satisfy temporally eligible company-type proof for context v2. |
+| BaoStock issuer-lifecycle/listing metadata | `ipoDate`, normalized as the authoritative `listing_date`, may populate `evidence_effective_as_of` for the exact lifecycle row/artifact; the semantics identifier records `baostock_lifecycle_listing_date`. `outDate` remains a distinct lifecycle bound and never substitutes for listing applicability. | Only a provider-origin announcement/publication field explicitly bound to the same lifecycle event/revision may populate `ann_date`; `listing_date`, `observed_at`, and `retrieved_at` are not announcement aliases. Exact-revision availability proof must bind the same row/artifact. | The current `query_stock_basic` projection is insufficient if it lacks provider announcement proof; the evaluator fails closed until 02H projects qualified provider-origin proof. No request-date or listing-date backfill is allowed. |
+
+This provider-neutral contract deliberately permits an evidence class to be
+unavailable. It does not manufacture proof to keep a route successful. The
+source projection retains its original provider field identities and artifact/
+row/revision bindings so audit and replay can verify the derivation exactly.
+
+### One temporal evaluator and mode-specific predicates
+
+Add one closed evaluator contract,
+`provider-neutral-temporal-eligibility-v1`, and one immutable decision
+projection, `financial-metadata-temporal-eligibility-decision-v1`. All fresh and
+retained company-type evidence, fresh and retained listing/lifecycle metadata,
+Financial Eligibility Acquisition Context construction, statement/indicator
+request binding, checkpoint validation, and exact replay must use this evaluator
+or validate its persisted decision identity. No retained/post-route equality
+validator remains an authority.
+
+For `current_analysis_only`, common provider proof must pass and all of the
+following are required:
+
+1. `requested_session` is an open session in the pinned calendar revision.
+2. `retrieved_at >= session_close(requested_session)`.
+3. `retrieved_at <= eligibility_evaluated_at`.
+4. `latest_completed_session(pinned Market Session Calendar,
+   eligibility_evaluated_at) == requested_session`.
+
+The lower boundary is inclusive at the requested session close. The prior
+frontier's upper boundary is exclusive at the next open session's close: the
+calendar regards that next session as completed at its close, at which instant
+`latest_completed_session` advances. Local midnight, the next-session open,
+and a fixed elapsed duration have no authority. Therefore a retrieval at
+`2026-08-11 00:48:07 Asia/Shanghai` may remain eligible for requested session
+`2026-08-10`; retrieval immediately before or during the next open session may
+also remain eligible; at the next session's close, a new current run for
+`2026-08-10` is rejected.
+
+Weekends and holidays follow only the pinned authoritative calendar. Friday
+remains the frontier through Saturday and Sunday and during Monday until Monday
+completes. A session preceding a mainland holiday remains the frontier
+throughout the non-session interval and during the next open session until that
+session completes. No wall-clock grace duration is computed.
+
+For `strict_historical_pit`, common provider proof must pass and all of the
+following are required:
+
+1. `f_ann_date` exists and `f_ann_date <= requested_session`.
+2. Either both `observed_at <= strict_cutoff` and
+   `retrieved_at <= strict_cutoff`, or a qualified
+   `exact_revision_authoritative_available_at <= strict_cutoff` binds the exact
+   immutable revision.
+
+A generic filing/announcement date does not prove availability of a later
+corrected revision. Post-cutoff observation or retrieval does not become strict
+PIT because the current-analysis frontier still equals `requested_session`.
+Missing first-publication or exact-revision availability proof remains
+fail-closed. Financial-period eligibility v2 and the current-only versus strict-
+PIT distinction remain otherwise unchanged.
+
+The exact rule
+`retrieved_at.astimezone(Asia/Shanghai).date() == requested_session` is retired
+as an eligibility authority in the company-type acquisition evidence validator,
+retained company-type compatibility filter, post-route company-type validator,
+and equivalent retained listing-metadata check. It may survive only as a safe
+diagnostic projection. It must not be replaced with a local-date `<=` or `>=`
+comparison or another scattered temporal predicate.
+
+The decision result is exactly `accepted` or `rejected`; an accepted decision
+also derives `eligible_session=requested_session`, while a rejected decision
+has no eligible session. Rejection reasons are a sorted, duplicate-free tuple
+from this closed v1 vocabulary:
+
+| Reason | Exact condition |
+| --- | --- |
+| `requested_session_not_open_in_pinned_calendar` | The requested session is absent or not open in the pinned calendar revision. |
+| `calendar_eligibility_binding_mismatch` | The supplied calendar identity/session/close/frontier inputs do not match their content-derived binding. |
+| `observation_after_retrieval` | `observed_at > retrieved_at`. |
+| `evidence_effective_as_of_unproven` | Effective proof is null or its evidence-class derivation is not permitted/qualified. |
+| `evidence_effective_after_requested_session` | Provider-derived effective proof is later than the requested session. |
+| `ann_date_missing` | Provider `ann_date` is null. |
+| `ann_date_after_requested_session` | Provider `ann_date` is later than the requested session. |
+| `retrieval_before_requested_session_completed` | Current-analysis retrieval is earlier than the pinned requested-session close. |
+| `retrieval_after_eligibility_evaluation` | Current-analysis retrieval is later than the fixed evaluation instant. |
+| `requested_session_not_latest_completed_frontier` | The pinned calendar's derived latest-completed session at evaluation differs from the request. |
+| `f_ann_date_missing_for_strict_pit` | Strict mode lacks first/actual-publication proof. |
+| `f_ann_date_after_requested_session` | Strict-mode `f_ann_date` is later than the requested session. |
+| `exact_revision_not_available_by_strict_cutoff` | Neither direct observation/retrieval nor qualified exact-revision availability is no later than `strict_cutoff`. |
+| `temporal_evidence_artifact_binding_mismatch` | Effective/publication/availability proof does not bind the evaluated immutable artifact/row/revision. |
+| `unknown_temporal_eligibility_mode` | The closed mode is neither current-analysis-only nor strict historical PIT. |
+
+No reason in this vocabulary authorizes fallback or provider ordering. Adding,
+removing, or changing a reason condition requires a new temporal policy version;
+unknown reasons fail checkpoint compatibility.
+
 ### Provider-neutral company-type resolution
 
 - Add `financial_company_type_evidence` as a prerequisite capability in the
@@ -343,7 +550,8 @@ free; none carries provider error text or a partial context.
   shadow route is `tushare -> akshare_sina -> yfinance`; the plan is immutable
   after creation, and no composition/factory table may replace or reorder that
   route.
-- The capability accepts only authoritative Instrument Identity, run as-of or
+- The capability accepts only authoritative Instrument Identity, requested
+  session or
   bounded evidence range, requested availability scope, and acquisition
   purpose. It does not accept a Financial Company Type, so it can run before an
   ordinary statement or indicator request exists.
@@ -365,7 +573,10 @@ free; none carries provider error text or a partial context.
   provider ordering, or an adapter's incidental branch.
 - A qualified retained artifact projection is checked before physical work. A
   provider request is allowed only when the current financial request needs the
-  value and no exact compatible retained projection exists. Every physical call
+  value and no exact compatible retained projection exists. Retained and fresh
+  projections pass through the same temporal evaluator using the run's fixed
+  `eligibility_evaluated_at`; retained acceptance from an older run is not
+  rebound after the latest-completed frontier advances. Every physical call
   remains sequential, coordinated, cached, and attempt-accounted under
   ADR-0031.
 - `UNKNOWN`/unresolved, ambiguous, contradictory, missing-provenance, or invalid
@@ -414,13 +625,25 @@ type that its own output contract already requires.
   `issuer_lifecycle -> baostock` route through the same router, cache, and
   coordinator. No additional provider work is performed merely to improve a
   future restore.
+- Both retained and fresh lifecycle projections must carry the provider-neutral
+  temporal proof and decision defined above. The existing comparison between a
+  retained projection's retrieval-local date and the request date is retired;
+  `ipoDate`/listing date is not allowed to synthesize `ann_date`, and a projection
+  without qualified publication proof fails typed rather than backfilling from
+  the request.
 
 ### Fresh-run acquisition and pure request factories
 
 Blueprint validation and managed-runtime assembly remain provider-I/O-free. On
 the first current qualified financial request in a fresh
 `qualified_v1_shadow` run, the graph/run host starts one context-acquisition
-single-flight. Concurrent callers join it. The acquirer first uses exact
+single-flight. Before the leader evaluates retained state or performs provider
+work, the run host injects one fixed `eligibility_evaluated_at` and pins the
+Market Session Calendar eligibility binding. Concurrent callers join the same
+operation and receive the same terminal context-level temporal decision binding
+and artifact subdecisions; no follower invokes the evaluator, samples a clock,
+or can split the context at a midnight/session-close boundary. The
+acquirer first uses exact
 compatible retained metadata, then only the prerequisite plan routes required
 for current work. On success the host binds the immutable context once and the
 managed composition may expose financial factories and the shadow dispatcher.
@@ -618,8 +841,11 @@ publication, observation, availability-scope, or strict-PIT requirements.
 
 ### Exact contract versions and migration behavior
 
-The following labels are exact new-write requirements. “Unchanged” means no new
-version is created; it does not permit reinterpretation under the new policy.
+The following labels are the exact QCF4 semantic-compatibility versions and
+remain required material bindings. The temporal amendment then advances every
+affected top-level/context-bound writer through the second table below.
+“Unchanged” means no new version is created; it does not permit reinterpretation
+under either policy.
 
 | Contract | Required new-write version and binding |
 | --- | --- |
@@ -634,24 +860,48 @@ version is created; it does not permit reinterpretation under the new policy.
 | Indicator financial manifest | Add `financial-manifest-v3` and `financial-manifest:v3`; it retains field-semantics/compatibility versions, assessment identities/states, raw-marker-safe diagnostics, and typed incompatibility reasons. Statement manifests remain `financial-manifest-v2`. |
 | Indicator routing result | Add `financial-indicator-routing-result-v3`; selected and unresolved families must agree exactly with manifest-v3 compatibility outcomes. Statement routing behavior remains on its existing contracts. |
 | Indicator dispatch/checkpoint entry | Add `financial-indicator-selection-dispatch-v2` and `financial-indicator-selection-checkpoint-v2`; both bind routing-result v3 and manifest-v3 identities. |
-| Dispatch checkpoint ledger | Add exact ledger version `1.5`, carrying statement manifest v2, indicator manifest v3, field-semantics and metadata-compatibility versions, all assessment identities/states, and the existing context/cache/plan bindings. |
+| Dispatch checkpoint ledger | Ledger `1.5` is the exact semantic-compatibility predecessor, carrying statement manifest v2, indicator manifest v3, field-semantics and metadata-compatibility versions, all assessment identities/states, and the context/cache/plan bindings. Temporal new writes advance it to `1.6` below. |
 | Indicator report/audit operational projections | Add `financial-completeness-row-v4`, `financial-aggregate-completeness-v3`, `financial-manifest-audit-v3`, `financial-manifest-request-audit-v3`, and Financial Dispatch Audit Projection `3.0`. They bind indicator manifest v3, selection v3, the pinned semantics/compatibility versions, assessment identities/states, and safe typed reasons without normalized provider values or raw payloads. Statement projections remain on their existing versions. |
 | Indicator tool manifest projection/envelope | Add `financial-tool-manifest-v3` and `financial-tool-message-envelope-v3` with the same safe bindings. Statement tool projections remain v2. Canonical Evidence, Source Fact, Decision Report, and Decision Audit contracts do not change. |
-| Capability Routing Plan | Add plan payload version `1.2` with new indicator-specific bindings for `financial-indicator-field-semantics-v1`, `financial-indicator-metadata-compatibility-v1`, `financial-manifest-v3`, and `financial-period-selection-v3`. Existing statement manifest/selection bindings remain v2. Provider routes, policy version, financial-period eligibility v2, completeness policy/thresholds, and the `mainland-routing-plan:v1:<sha256>` signature namespace remain unchanged; the digest changes because the new indicator contract bindings are material. |
+| Capability Routing Plan | Plan payload `1.2` is the exact semantic-compatibility predecessor with indicator-specific bindings for `financial-indicator-field-semantics-v1`, `financial-indicator-metadata-compatibility-v1`, `financial-manifest-v3`, and `financial-period-selection-v3`. Existing statement manifest/selection bindings remain v2. Temporal new writes advance the payload to `1.3` below; provider routes, financial-period eligibility v2, completeness thresholds, and the `mainland-routing-plan:v1:<sha256>` signature namespace remain unchanged. |
+
+The exact temporal forward-only version set is:
+
+| Contract | Required temporal new-write version and material binding |
+| --- | --- |
+| Capability Routing Plan | `1.3`; pins `provider-neutral-temporal-eligibility-v1`, `market-session-eligibility-binding-v1`, and every downstream temporal version below in addition to all plan-1.2 semantic bindings. The `mainland-routing-plan:v1:<sha256>` namespace stays stable and its digest changes because these bindings are material. |
+| Temporal policy/evaluator | Add `provider-neutral-temporal-eligibility-v1`; its closed mode, reason, boundary-inclusivity, and provider-proof rules are immutable for the version. |
+| Calendar eligibility binding | Add `market-session-eligibility-binding-v1` and identity namespace `market-session-eligibility-binding:v1:`; bind calendar revision ID, Reference Market/timezone, requested session/open status, requested close, next open session/close, fixed evaluation instant, and derived latest-completed session. |
+| Temporal decision projection | Add `financial-metadata-temporal-eligibility-decision-v1` and identity namespace `financial-metadata-temporal-eligibility-decision:v1:`; bind mode, artifact/revision, all proof fields, policy/calendar identities, result, and typed reasons. |
+| Company-type acquisition evidence | Advance `financial-company-type-evidence-binding-v2` to `financial-company-type-evidence-binding-v3`; add provider-origin effective/publication derivation references and immutable timestamps without relabeling v2 evidence. |
+| Eligibility metadata binding | Advance `financial-eligibility-metadata-binding-v1` to `financial-eligibility-metadata-binding-v2`; replace request-only as-of ambiguity with `requested_session`, mode, fixed evaluation time, calendar binding, and strict cutoff where applicable. |
+| Company-type evidence projection | Advance `financial-company-type-evidence-projection-v1` to `financial-company-type-evidence-projection-v2`; embed the temporal-decision identity and exact evidence derivation binding. |
+| Listing metadata and retained projection | Advance `financial-listing-metadata-v1` and `financial-listing-metadata-projection-v1` to `financial-listing-metadata-v2` and `financial-listing-metadata-projection-v2`; carry provider-origin effective/publication proof and the same temporal decision rather than local-date equality. |
+| Company-type routing request/response | Advance `financial-company-type-evidence-routing-request-v1` to `financial-company-type-evidence-routing-request-v2` and `financial-company-type-evidence-provider-response-v1` to `financial-company-type-evidence-provider-response-v2`; request v2 carries metadata binding v2, and an available response v2 carries evidence v3 plus decision v1. |
+| Financial Eligibility Acquisition Context | Advance `financial-eligibility-acquisition-context-v1` to `financial-eligibility-acquisition-context-v2` and identity namespace to `financial-eligibility-acquisition-context:v2:`; bind both prerequisite temporal decisions and the latest-completed-session decision. |
+| Eligibility request binding and result/failure | Advance `financial-eligibility-request-binding-v1` to `financial-eligibility-request-binding-v2` and `financial-eligibility-acquisition-result-v1` to `financial-eligibility-acquisition-result-v2`; v2 failures include closed temporal reason codes and may retain a safe rejected decision without creating a partial context. |
+| Statement and indicator routing requests | Advance `financial-statement-routing-request-v3` to `financial-statement-routing-request-v4` and `financial-indicator-routing-request-v6` to `financial-indicator-routing-request-v7`; both bind context v2 and temporal decision identities without letting factories recompute eligibility. |
+| Routing results and manifests | Advance `financial-statement-routing-result-v1` to `financial-statement-routing-result-v2`, `financial-indicator-routing-result-v3` to `financial-indicator-routing-result-v4`, and both statement/indicator new-write manifests to `financial-manifest-v4` / `financial-manifest:v4`; v4 retains the applicable temporal decision identities/results/reasons while preserving the indicator semantic-compatibility bindings. |
+| Selection dispatch/checkpoint | Advance `financial-statement-selection-dispatch-v1` to `financial-statement-selection-dispatch-v2`, `financial-statement-selection-checkpoint-v1` to `financial-statement-selection-checkpoint-v2`, `financial-indicator-selection-dispatch-v2` to `financial-indicator-selection-dispatch-v3`, and `financial-indicator-selection-checkpoint-v2` to `financial-indicator-selection-checkpoint-v3`. |
+| Provider Subrequest Cache checkpoint | Advance `1.1` to `1.2`; bind plan 1.3, metadata binding/context v2, calendar binding, artifact identity, and accepted/rejected temporal decision identity. |
+| Financial dispatch ledger | Advance `1.5` to `1.6`; persist context v2, manifest v4, temporal policy/calendar versions, fixed evaluation inputs, decisions/results/reasons, and existing semantic-compatibility/attempt state. |
+| Manifest/audit/report operational projections | Advance `financial-completeness-row-v4` to `financial-completeness-row-v5`, `financial-aggregate-completeness-v3` to `financial-aggregate-completeness-v4`, `financial-manifest-audit-v3` to `financial-manifest-audit-v4`, `financial-manifest-request-audit-v3` to `financial-manifest-request-audit-v4`, Financial Dispatch Audit Projection `3.0` to `4.0`, `financial-tool-manifest-v3` to `financial-tool-manifest-v4`, and `financial-tool-message-envelope-v3` to `financial-tool-message-envelope-v4` wherever temporal decisions surface. These carry only safe decision identity/result/reasons and never raw payloads or credentials. `mainland-financial-report-projection-v2`, Canonical Evidence, Source Fact, Decision Report, and Decision Audit contracts remain unchanged and do not recompute or become authorities for temporal eligibility; qualified shadow report diagnostics consume the safe v4 operational projections. |
 
 Historical artifacts, candidates, manifests, routing results, tool projections,
 audits, reports, and checkpoints remain readable under their recorded versions
-and are never rewritten. Historical replay uses the semantic/compatibility
-contract pinned in the recorded plan/checkpoint; a reader must not apply the new
-registry retroactively. New qualified runs write only plan 1.2 and the new-write
-contracts above.
+and are never rewritten. Historical replay uses the semantic/compatibility and
+temporal contracts pinned in the recorded plan/checkpoint; a reader must not
+apply the new registry or temporal frontier retroactively. New qualified runs
+write plan 1.3 and the temporal new-write contracts above while retaining every
+unchanged plan-1.2 semantic binding.
 
-An attempted restore of a new run from a qualified checkpoint that carries the
-old metadata-compatibility contract—or carries no pinned compatibility contract—
-must fail with a typed compatibility error or require the explicit existing
-`START_NEW` choice. `START_NEW` allocates a new run identity and performs the
-fresh path. Restore performs zero provider/model I/O, does not consult the
-current registry to repair old state, and never upgrades a checkpoint in place.
+An attempted plan-1.3 restore from a checkpoint that carries plan 1.2/context
+v1, an old/absent metadata-compatibility contract, or an old/absent temporal
+policy must fail with a typed compatibility error or require the explicit
+existing `START_NEW` choice. `START_NEW` allocates a new run identity and
+performs the fresh path. Restore performs zero provider/model I/O, does not
+consult the current registry or today's calendar frontier to repair old state,
+and never upgrades a checkpoint in place.
 
 ### Adapter and route composition
 
@@ -764,17 +1014,26 @@ singleton.
   restored Provider Subrequest Cache only after all bindings validate.
 - The existing shadow financial dispatch ledger remains the owner of qualified
   selection progress and Provider Subrequest Cache checkpoint. Its existing
-  qualified checkpoint projection advances to ledger `1.5` and carries the safe
-  Financial Eligibility Acquisition Context projection plus pinned indicator
-  field-semantics and metadata-compatibility versions/assessment identities; no
-  second checkpoint file, sidecar, or competing checkpoint owner is introduced.
+  qualified checkpoint projection advances to ledger `1.6` and carries the safe
+  Financial Eligibility Acquisition Context v2 projection, temporal policy and
+  Market Session Calendar binding, accepted/rejected temporal decisions, plus
+  pinned indicator field-semantics and metadata-compatibility versions/
+  assessment identities; no second checkpoint file, sidecar, or competing
+  checkpoint owner is introduced.
 - The checkpoint binds the context contract version, deterministic context
   identity, complete safe context fields, run/asset signatures, authoritative
-  Instrument Identity, run as-of date, requested availability scope, financial
-  eligibility-policy binding, routing-plan signature, company-type resolution
-  and evidence identity, listing date/provenance, and canonical acquisition
-  metadata. Context identity therefore cannot be detached from the cache,
-  dispatcher selection state, or historical request identities it governed.
+  Instrument Identity, `requested_session`, temporal mode,
+  `eligibility_evaluated_at`, `evidence_effective_as_of`, `ann_date`, applicable
+  `f_ann_date`, immutable `observed_at`/`retrieved_at`, requested availability
+  scope, financial
+  eligibility-policy binding, routing-plan signature, calendar revision and
+  target/next-session completion binding, derived latest-completed session,
+  company-type resolution/evidence/temporal-decision identity, listing date/
+  provenance/temporal-decision identity, and canonical acquisition metadata.
+  Strict mode additionally binds `strict_cutoff` and qualified
+  exact-revision availability proof when used. Context identity therefore
+  cannot be detached from the cache, dispatcher selection state, or historical
+  request identities it governed.
 - On exact compatible resume, validate every context binding together with run
   scope, provider-chain topology, immutable artifacts, attempt identities,
   Provider Subrequest Cache, field-semantics policy, metadata-compatibility
@@ -785,12 +1044,15 @@ singleton.
   repeated request returns identical context, cache, attempts, candidates,
   metadata assessments, typed rejections, selections, artifacts, and IDs with
   zero provider/network I/O, zero coordinator permits, zero new attempt events,
-  and zero model I/O. Local checkpoint/artifact reads are the restoration
-  boundary.
+  and zero model I/O. Replay reproduces the recorded temporal decision directly
+  from its deterministic recorded inputs/result, does not sample the restore
+  clock, and does not call `latest_completed_session` against today's calendar.
+  Local checkpoint/artifact reads are the restoration boundary.
 - A missing context projection, unknown/ambiguous/contradictory company-type
   result, non-authoritative or mismatched listing provenance, context identity or
-  version mismatch, malformed context, plan/asset/as-of/availability/eligibility
-  mismatch, or corrupt cache/artifact projection fails typed before external
+  version mismatch, malformed context, plan/asset/requested-session/temporal-
+  mode/availability/eligibility mismatch, or corrupt cache/artifact projection
+  fails typed before external
   work. Restoration does not call the provider-neutral acquirer, silently
   reconstruct context from live providers, delete bad state, reuse a convenient
   subset, or rewrite the historical checkpoint.
@@ -798,12 +1060,14 @@ singleton.
   occurs only at the existing safe terminal boundary; otherwise the existing
   unsafe-checkpoint failure is preserved.
 - Legacy and historical qualified checkpoints remain readable under their
-  recorded paths and pinned contracts. A new plan-1.2 qualified restore from a
-  checkpoint carrying the old or absent metadata-compatibility contract follows
-  the existing explicit typed-failure/`START_NEW` compatibility rule. Choosing
-  `START_NEW` requires a new run identity and the fresh acquisition path; it is
-  never an implicit repair of a restoration. No historical checkpoint receives
-  an in-place upgrade or semantic reinterpretation.
+  recorded paths and pinned contracts. A plan-1.2 checkpoint carrying its
+  recorded semantic-compatibility state remains readable only as its original
+  plan-1.2 run. A plan-1.3 run cannot resume a plan-1.2/context-v1 checkpoint:
+  it follows the explicit typed temporal incompatibility/`START_NEW` rule
+  without live repair. Choosing `START_NEW`
+  requires a new run identity and the fresh acquisition path; it is never an
+  implicit repair of a restoration. No historical checkpoint receives an
+  in-place upgrade or semantic reinterpretation.
 
 ### Historical and shadow compatibility
 
@@ -815,6 +1079,10 @@ singleton.
   static factory identity may be reported as safe operational metadata, but it
   is not part of evidence, route policy, or an existing content identity unless
   an explicitly versioned contract requires it.
+- New temporal decisions never relabel a historical artifact as eligible or
+  ineligible. The failed Ticket 07 `601328.SS` run, its rejected evidence,
+  checkpoint/report/audit state, run ID, and attempts remain immutable and are
+  interpreted only under their recorded exact-local-date contract.
 - Qualified shadow manifests, reports, checkpoints, and decision audits continue
   to say `shadow_non_authoritative`. They cannot replace legacy-selected tool
   output, admitted Source Facts, Validated Decision Context, or the final Trading
@@ -849,6 +1117,16 @@ singleton.
   contradictory outcomes, pure request-factory projection, and rejection of
   forbidden provider-specific or mutable fields. Lifecycle tests inject failure
   at every metadata-acquisition and context-bind boundary.
+- Temporal contract tests exercise the one provider-neutral evaluator at the
+  highest metadata-admission seam. They use a pinned fake Market Session
+  Calendar and fixed injected `eligibility_evaluated_at`, cover both fresh and
+  retained company-type/listing evidence, and assert observable decisions and
+  typed reasons rather than duplicating private date comparisons.
+- Provenance tests enumerate every permitted `evidence_effective_as_of`
+  derivation and reject request/session/factory-default/model/route/name/ticker/
+  retrieval-date backfill. They prove `observed_at` and `retrieved_at` remain
+  byte-for-byte unchanged, provider `ann_date` remains distinct, and missing
+  exact first-publication/revision proof fails strict PIT.
 - Indicator contract tests enumerate the entire pinned field registry and test
   compatibility at the highest existing candidate-selection seam. They prove
   that response sparsity cannot change classification; `UNKNOWN`, `UNPROVEN`,
@@ -857,10 +1135,12 @@ singleton.
   and material unproven scope retains/rejects a complete candidate while the
   plan advances only its unresolved family.
 - Migration tests open each historical candidate/manifest/routing/checkpoint
-  version under its recorded contract, then prove that a new plan-1.2 run writes
-  only the exact new versions. A plan-1.2 restore from old/absent compatibility
-  state must fail typed or require explicit `START_NEW`, with no repair, provider
-  or model I/O, historical rewrite, or current-registry reinterpretation.
+  version under its recorded contract, then prove that a new plan-1.3 run writes
+  only the exact temporal versions while retaining plan-1.2 semantic bindings.
+  A plan-1.3 restore from plan-1.2/context-v1 or old/absent temporal state must
+  fail typed or require explicit `START_NEW`, with no repair, provider/model I/O,
+  historical rewrite, current-registry reinterpretation, or consultation of
+  today's calendar frontier.
 - The real two-symbol gate is deliberately separate from deterministic
   acceptance. It runs only after all non-live criteria pass and only with
   explicit operator authorization.
@@ -905,31 +1185,74 @@ strengthens, but does not waive or replace, QCF4–QCF12:
 | QCF8 | From the required fresh origin, exercise BaoStock raw/factor/status/lifecycle and ratio-family fixtures with tradeable and suspended latest sessions. | The context carries the BaoStock lifecycle listing date and authoritative provenance before factory use; BaoStock alone establishes Current Tradeability; strict bundle identity requires its complete three-component binding; missing ratio families are requested narrowly; Tushare names and other sources cannot establish status. |
 | QCF9 | From the required fresh origin, exercise Adjustment Factors and Name Events together, with Tushare factor success, Tushare name success, BaoStock factor success/failure, and Yahoo-derived terminal fallback. | The context is acquired once without seeded state; factor and name requests use distinct plan routes, endpoint scopes, keys, artifacts, and attempts while sharing one cache; name output remains descriptive; Yahoo factor output is `derived` and `degraded`; provider bundles are never blended. |
 | QCF10 | From the required fresh origin, run complete, retryable-failure, terminal-failure, cooldown-skip, partial-fallback, and fresh-produced restored-cache matrices for every assembled provider. | Context and provider work share the one plan/router/coordinator. Every actual transport call has one and only one attempt event; retries and fallback match exact configured cardinality; cache hits, skips, normalization, selection, and restore add zero attempts; no hidden adapter retry or fan-out exists. |
-| QCF11 | From the required fresh origin, concurrently issue identical first requests and request multiple periods/families/graph calls covered by one bulk artifact. | Concurrent first use performs one company-type resolution, one compatible listing acquisition, and one context bind; one leader performs each physical sequence, followers receive the same terminal result, bulk payloads are acquired once, reuse counts are deterministic, and differing material keys do not collide. |
-| QCF12 | Produce a checkpoint from a fresh built-in context acquisition and terminal qualified shadow request under plan 1.2, close all resources, reconstruct through the built-in factory, and repeat the exact request. | Context version/identity and all context fields, plan, eligibility binding, field-semantics/metadata-compatibility versions, compatibility assessment identities/states, dispatcher state, cache entries, artifacts, candidates, typed rejections, selections, attempts, and IDs restore exactly; the repeat causes zero provider/network/model I/O, zero coordinator permits, and zero new attempts. Missing, old/absent, contradictory, corrupt, or mismatched semantic/context/cache controls fail typed or require explicit `START_NEW` before work and do not call live providers, consult the current registry for repair, or rewrite history. |
+| QCF11 | From the required fresh origin, concurrently issue identical first requests and request multiple periods/families/graph calls covered by one bulk artifact. | Concurrent first use performs one company-type resolution, one compatible listing acquisition, one context-level temporal evaluation transaction under one fixed `eligibility_evaluated_at`, one deterministic terminal decision binding, and one context bind; one leader performs each physical sequence, followers receive the same terminal result/decision, bulk payloads are acquired once, reuse counts are deterministic, and differing material keys do not collide. |
+| QCF12 | Produce a checkpoint from a fresh built-in context acquisition and terminal qualified shadow request under plan 1.3, close all resources, reconstruct through the built-in factory, and repeat the exact request. | Context v2 identity/fields, temporal policy/calendar binding, fixed evaluation inputs, accepted/rejected decisions/results/reasons, plan, eligibility binding, field-semantics/metadata-compatibility versions, dispatcher state, cache entries, artifacts, candidates, typed rejections, selections, attempts, and IDs restore exactly; the repeat causes zero provider/network/model I/O, zero coordinator permits, and zero new attempts and does not consult today's calendar frontier. Missing, old/absent, contradictory, corrupt, or mismatched semantic/temporal/context/cache controls fail typed or require explicit `START_NEW` before work and do not repair or rewrite history. |
 | QCF13 | Supply missing token/dependency, invalid mode, invalid plan/asset/context signature, invalid pacing/Safety Ceiling/account scope/Data Usage Mode/runtime root, incomplete source coverage including any of the six required executable bindings, and unsafe factory output. | Each pre-construction failure is secret-free and occurs before graph/model/provider work, store/artifact/report creation, or physical attempts. Typed context-acquisition failures occur only after allowed prerequisite work, leave the context slot unbound, and expose no partial callable composition. |
 | QCF14 | Inject failure after each construction step, at every eligibility-metadata acquisition and context-binding step, during graph initialization, during provider dispatch, during graph execution, during checkpoint publication, and interrupt with `KeyboardInterrupt`. | The original failure remains primary; no partial context or callable dispatcher escapes; interrupt/close occur exactly once; new work stops; all sessions, BaoStock login, coordinator connections/store, leases, and workers are released or terminally abandoned; repeated close is harmless; no process-global mutable provider or eligibility state remains. |
 | QCF15 | Put tokens, credential-like text, URLs with credentials, and raw provider exception text in fake environment values and transport failures. | Tokens and raw errors are absent from config, plan, repr, IDs, events, exceptions, logs, reports, checkpoints, artifacts, manifests, audits, and terminal output; only existing typed safe diagnostics cross boundaries. |
 | QCF16 | Compare legacy output, qualified shadow output, daily market acquisition, Evidence Admission, Decision Gate, report, checkpoint, and decision audit before and after built-in registration. | Legacy-selected output and daily AKShare -> BaoStock -> Yahoo routing are unchanged; qualified output remains `shadow_non_authoritative`; no factory result changes admitted evidence or decision authority. |
-| QCF17 | Open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs, then create a new built-in-factory run. | Historical material is byte-for-byte untouched, remains readable, and is interpreted only under its recorded contracts; new qualified material uses the exact forward versions in this amendment while unchanged raw artifact/candidate namespaces remain stable; no in-place migration, reinterpretation, rewrite, deletion, or ID renumbering occurs. |
-| QCF18 | Run PE1–PE15 and parent AC1–AC13 with their existing fixtures and expected results, followed by the full supported suite, Ruff, and whitespace/diff checks. | Every criterion passes unchanged and without waiver. Parent joint acceptance is run twice as already required; any failure blocks the real rollout gate. |
+| QCF17 | Open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs—including the failed Ticket 07 run—then create a new built-in-factory run. | Historical material is byte-for-byte untouched, remains readable, and is interpreted only under its recorded semantic and temporal contracts; new qualified material uses the exact plan-1.3/context-v2 forward versions while unchanged raw artifact/candidate namespaces remain stable; no in-place migration, temporal reinterpretation, rewrite, deletion, or ID renumbering occurs. |
+| QCF18 | Run PE1–PE15 and parent AC1–AC13 with their existing fixtures and expected results, followed by the full supported suite, Ruff, and whitespace/diff checks. | Every criterion passes unchanged and without waiver. QCF1–QCF18, PE1–PE15, AC1–AC13, and the full supported suite are run twice from the changed tree; any failure blocks the real rollout gate. |
+
+### 06B deterministic temporal acceptance matrix
+
+This matrix is additive acceptance under the existing QCF/PE/AC authority; it
+does not renumber or replace QCF1–QCF18, PE1–PE15, or AC1–AC13. Every row runs
+for fresh and retained company-type evidence and applicable listing/lifecycle
+evidence through the one evaluator with a pinned calendar revision and fixed
+`eligibility_evaluated_at`. `A/R` below means current-analysis accepted and
+strict-PIT rejected; `R/R` means both rejected; `R/A` is the strict pre-cutoff
+control. Boundary expectations are exact and session close is the frontier
+transition instant.
+
+| Scenario | Required current / strict result and proof |
+| --- | --- |
+| Requested session day, after session close and before evaluation | `A/R` when common provider proof passes; strict remains rejected for post-cutoff observation/retrieval. |
+| Real next-calendar-day `00:48:07 Asia/Shanghai` retrieval for `2026-08-10` | `A/R` while `2026-08-10` is latest completed; proves local-date inequality has no authority. |
+| Immediately before the next open session | `A/R`; the prior session remains latest completed. |
+| During the next open session, before its close | `A/R`; session open does not advance the frontier. |
+| At and immediately after the next session close | `R/R` for a new prior-session decision; the later session is now latest completed. |
+| Friday retrieval on Saturday | `A/R` when Friday remains latest completed. |
+| Friday retrieval on Sunday | `A/R` when Friday remains latest completed. |
+| Pre-holiday session retrieved during the mainland holiday | `A/R` throughout the non-session interval and until the next open session completes. |
+| Retained evidence reused after one or more later completed sessions | `R/R` for a new run; an earlier acceptance cannot be rebound to an obsolete frontier. Exact replay of the original run remains unchanged. |
+| Provider `ann_date` after `requested_session` | `R/R`. |
+| Eligible `ann_date` but missing or later `f_ann_date` | Current may be accepted; strict is rejected. |
+| Exact real `00:48` artifact in current-only versus strict mode | Current may be accepted with complete provider-derived proof; strict remains rejected unless the independent exact-cutoff predicate passes. |
+| Direct pre-cutoff strict control | `R/A` when `f_ann_date` is eligible and both immutable observation/retrieval timestamps are no later than `strict_cutoff`. |
+| Qualified exact-revision availability control | Strict accepts a post-cutoff retrieval only when `exact_revision_authoritative_available_at <= strict_cutoff` is authoritative and binds the exact revision; generic filing availability rejects. |
+| Missing provider-derived `evidence_effective_as_of` or missing provider `ann_date` | `R/R`; no request-date, retrieval-date, route, name, ticker, factory, or model backfill. |
+| Replay of every accepted and rejected row | The original decision identity, inputs, result, and reasons reproduce exactly with zero provider/network/model I/O and no consultation of the restore-time calendar frontier. |
+| Thirty-two concurrent followers on first acquisition | One leader performs acquisition and exactly one context-level temporal evaluation transaction; evaluator count is one, all followers receive one immutable terminal decision/context, and no clock race occurs. |
+
+06B also reruns the complete Ticket 06 acceptance—QCF1–QCF18, PE1–PE15,
+AC1–AC13, non-integration/full suites, Ruff, diff/whitespace, secret/history
+checks, and two-stage review—twice from the same changed tree. Targeted temporal
+tests cannot by themselves re-authorize Ticket 07.
 
 ### Final real two-symbol shadow rollout gate
 
 This is the only live-provider step and is not run while writing or implementing
 the deterministic tests. It requires explicit operator authorization after
-QCF1–QCF18 pass.
+02G, 02H, 05C, 06B, the complete Ticket 06 rerun, and all QCF1–QCF18 pass.
+Ticket 07 remains **BLOCKED**. The failed `601328.SS` run for requested session
+`2026-08-10`, including the Tushare artifact retrieved at
+`2026-08-10T16:48:07Z`, remains historical and immutable and cannot be resumed,
+repaired, relabeled, or reused as the retry namespace.
 
 1. Use the shipped built-in registration with no direct composition and no
    explicit operator factory. Use the existing qualified profile, Capability
    Routing Plan, environment credential boundary, Data Usage Mode, Safety
    Ceilings, completeness thresholds, and provider routes.
-2. Use a newly allocated run/checkpoint namespace and retained content-addressed
-   artifacts; do not clear or reuse historical reports, checkpoints, attempts,
-   or IDs to manufacture a clean result.
+2. Use a newly allocated run ID and checkpoint namespace under plan 1.3/context
+   v2 and retained content-addressed artifacts only when they independently pass
+   the new temporal evaluator. Do not clear or reuse historical reports,
+   checkpoints, attempts, decisions, or IDs to manufacture a clean result.
 3. Run one symbol at a time for the same latest completed mainland session:
-   `601328.SS` as the bank case, then `600895.SS` as the non-bank case. Invoke
-   explicit `qualified_v1_shadow` validation through the real CLI seam.
+   `601328.SS` first as the bank case. Run `600895.SS` as the non-bank case only
+   after the new `601328.SS` run passes every gate. Invoke explicit
+   `qualified_v1_shadow` validation through the real CLI seam; a failure of the
+   bank case ends the retry without calling the second symbol.
 4. For each symbol, retain the safe preflight result, Capability Routing Plan
    signature, Financial Eligibility Acquisition Context identity/projection,
    dispatcher/cache checkpoint projection, provider attempt events, manifest,
@@ -938,16 +1261,19 @@ QCF1–QCF18 pass.
 5. The gate passes only if both runs avoid
    `qualified_routing_composition_missing`, complete through the registered
    production composition, originate and bind one eligibility context without
-   seeded state, route all physical calls through the coordinator, establish
+   seeded state, record one plan-1.3 temporal evaluation/binding with provider-
+   derived effective/publication proof and the pinned latest-completed-session
+   frontier, route all physical calls through the coordinator, establish
    BaoStock Current Tradeability authority, retain and truthfully assess
    Tushare indicator artifacts, continue only metadata-unresolved indicator
    families through the plan, show exact/non-duplicated attempts, and publish
    report plus decision audit as
    `shadow_non_authoritative` while legacy-selected output remains authoritative.
-6. A typed provider/configuration failure, missing status authority, unexplained
-   attempt, secret/raw-error exposure, authority drift, historical-state
-   mutation, or failure of either symbol blocks the gate. A retry must use a new
-   run identity and must not rewrite the failed run.
+6. A typed provider/configuration/temporal failure, missing status authority,
+   unexplained attempt, secret/raw-error exposure, authority drift, historical-
+   state mutation, or failure of either symbol blocks the gate. Every later
+   retry must use another new run identity, start again with `601328.SS`, and
+   must not rewrite any failed run.
 7. Before and after the gate, verify that authoritative `qualified_v1` is still
    disabled. Passing this gate produces evidence for a separate future
    activation decision; it does not enable or recommend activation.
@@ -971,6 +1297,10 @@ design evidence only and is not copied into production.
 | **02F — Truthful provider indicator normalization and compatibility evaluation** | Consume 02E. Write AKShare indicator normalizer v2 and BaoStock ratio normalizer v2 without request metadata backfill; add versioned Tushare/BaoStock result projections only where needed to carry assessments; evaluate Tushare, AKShare, BaoStock, and Yahoo through one provider-neutral compatibility seam; retain incompatible candidates and return only unresolved families to the existing router. No route or Evidence Admission changes. | 02E. | 05B, 06A, and Ticket 06. |
 | **05B — Persist and restore indicator metadata compatibility** | Add indicator manifest v3, indicator routing-result v3, provider-candidate/selection v2/v3 bindings, indicator dispatch/checkpoint v2, dispatch ledger 1.5, indicator completeness/aggregate audit rows v4/v3, indicator manifest/request audit v3, Financial Dispatch Audit Projection 3.0, tool-manifest v3, and tool-message envelope v3 while statement projections remain v2. Preserve historical readers, exact pinned-contract replay, typed/`START_NEW` rejection of old compatibility checkpoints under plan 1.2, and zero-I/O/no-repair restore. | 02E, 02F, and 05A. | 06A and Ticket 06. |
 | **06A — Correct QCF4 deterministic acceptance** | Replace only the over-specified QCF4 expectation with the fresh-origin statement-success plus retained/rejected-indicator plus plan-owned lower-provider fallback behavior above. Trace both fixed symbols; prove no request metadata is provider evidence and prove exact prerequisite/ordinary attempt cardinality. Retain the separately completed deterministic live-test isolation fix and rerun QCF1–QCF18, PE1–PE15, and AC1–AC13 unchanged outside corrected QCF4. | 02F, 05B, and all existing Ticket 06 prerequisites. | Ticket 06; QCF5–QCF12 cannot proceed until corrected QCF4 passes. |
+| **02G — Temporal eligibility contracts/evaluator** | Close the temporal terminology; add provider-neutral `evidence_effective_as_of`, `provider-neutral-temporal-eligibility-v1`, `market-session-eligibility-binding-v1`, the decision projection/identity, current-analysis session-frontier predicate, strict-PIT predicate, exact reason taxonomy, and plan 1.3/context-v2 forward bindings. Preserve `ann_date`/`f_ann_date` and immutable timestamps. No provider implementation, live I/O, grace window, or local-date substitution. | 02A and ADR-0036. | 02H, 05C, 06B, Ticket 06, and Ticket 07. |
+| **02H — Temporal proof projection/acquisition integration** | Project only the exact provider-origin effective/publication derivations listed above for fresh and retained company-type/listing metadata; replace all exact-local-date authorities with the single evaluator; bind one fixed evaluation context through acquisition, context construction, request binding, and relevant listing/lifecycle seams; fail closed without request-date backfill. Preserve provider routes and single-flight ownership. | 02G, 02B, and 02D. | 05C, 06B, Ticket 06, and Ticket 07. |
+| **05C — Temporal checkpoint/replay compatibility** | Persist policy/calendar versions, requested session/mode, fixed evaluation inputs, provider proof/timestamps, latest-completed binding, strict proof, accepted/rejected result/reasons, and decision identity in context v2, cache checkpoint 1.2, ledger 1.6, manifest v4, and exact downstream projections. Reproduce exact decisions with zero provider/model I/O and no restore-time frontier lookup. Plan-1.2/context-v1 under plan 1.3 fails typed or requires explicit `START_NEW`; no migration or historical reinterpretation. | 02G, 02H, 05A, and 05B. | 06B, Ticket 06, and Ticket 07. |
+| **06B — Deterministic temporal acceptance** | Run every temporal matrix above: next-day 00:48, before/during next session, next-session close, weekend, holiday, stale reuse, announcement/effective-proof failures, strict cutoff/exact revision proof, zero-I/O every-case replay, and concurrent first acquisition with one fixed evaluation. Then rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13, non-integration/full suites, Ruff, history/secret/diff checks, and two-stage review twice. No live providers or paid models. | 02H, 05C, 06A, and all existing Ticket 06 prerequisites. | Ticket 06 and Ticket 07. |
 
 The exact dependency graph is:
 
@@ -984,9 +1314,19 @@ The exact dependency graph is:
 01 + QCF4 prototype report -> 02E
 02E -> 02F
 02E + 02F + 05A -> 05B
+02A + ADR-0036 -> 02G
+02G + 02B + 02D -> 02H
+02G + 02H + 05A + 05B -> 05C
 03 + 02D + 04A + 02F + 05B -> 06A
-03 + 02D + 04A + 05B + 06A -> 06
-06 -> 07
+02H + 05C + 06A + all existing Ticket 06 prerequisites -> 06B
+03 + 02D + 04A + 05B + 06A + 06B -> 06
+06 + 06B -> 07
+```
+
+The mandatory temporal chain inside that integrated graph is exactly:
+
+```text
+02G -> 02H -> 05C -> 06B -> Ticket 07
 ```
 
 Existing Ticket 03 remains the static-selection/caller-precedence slice and may
@@ -994,10 +1334,11 @@ proceed after Ticket 01; it does not own context construction. Existing Ticket
 04 remains the resource-lifecycle prerequisite to 04A. Existing Ticket 05
 remains the cache/dispatcher restoration prerequisite to 05A. Ticket 06 remains
 **FAIL/BLOCKED** even if its original Tickets 02–05 are marked complete: it
-cannot resume until 02A–02F, 04A, 05A, 05B, and 06A are complete and their
-deterministic tests pass. Within Ticket 06, QCF5–QCF12 remain blocked behind the
-corrected QCF4 path. Ticket 07 remains blocked by Ticket 06 and fresh explicit
-operator authorization for live-provider work.
+cannot complete until 02A–02H, 04A, 05A–05C, 06A, and 06B are complete and their
+deterministic tests pass twice as specified. Within Ticket 06, QCF5–QCF12 remain
+blocked behind the corrected QCF4 path. Ticket 07 remains blocked by 06B,
+completed Ticket 06, and fresh explicit operator authorization for live-provider
+work.
 
 ## Out of Scope
 
@@ -1029,10 +1370,22 @@ operator authorization for live-provider work.
 - Running live providers or paid models while amending or implementing this
   deterministic contract. The separately authorized future two-symbol gate is
   outside this amendment and remains blocked by Ticket 06.
+- Running the blocked Ticket 07 retry, mutating its failed `601328.SS` run, or
+  treating an amended spec as rollout authorization.
+- Using exact retrieval-local-date equality, a next-calendar-day or elapsed
+  grace window, next-session open, or a simple `<=`/`>=` date substitution as a
+  replacement temporal policy.
+- Backfilling `evidence_effective_as_of`, `ann_date`, `f_ann_date`, observation,
+  retrieval, or exact-revision availability from request intent, retrieval
+  convenience, provider route, factory defaults, symbol/name, or model output.
 - Copying either the fresh-run or QCF4 metadata-compatibility prototype into
   production, importing prototype code at runtime, or treating prototype
   code/tests as implementation completion. Their reports are design evidence;
   production work uses the existing contracts and seams named here.
+- Copying the temporal-eligibility prototype implementation into production or
+  treating its successful matrices as implementation/rollout completion. Its
+  report is authoritative design evidence only; 02G–06B must implement through
+  the existing production seams.
 
 ## Further Notes
 
@@ -1049,6 +1402,10 @@ operator authorization for live-provider work.
   strict-history authority. ADR-0035 prevents the factory from adding foreground
   work for replay. ADR-0036 and ADR-0037 preserve Market Session Calendar and
   History Gap behavior.
+- ADR-0036 is the authority for the current-analysis frontier. The calendar
+  decides session completion while provider artifacts decide material
+  effective/publication proof. This resolves the Ticket 07 midnight failure
+  without weakening strict PIT or inventing a grace interval.
 - The highest seams are fixed: host builder for static selection; graph/run host
   for context lifetime and single assignment; provider-neutral acquisition over
   the one plan/router for metadata construction; and the checkpoint-aware
@@ -1056,12 +1413,16 @@ operator authorization for live-provider work.
   factory may add lifecycle capabilities to the managed composition contract,
   but it must not add another routing, eligibility, or persistence authority.
 - `Status: ready-for-agent` is justified because fresh-run ownership, metadata
-  applicability semantics, the complete field classification, exact forward
-  versions/migrations, the unchanged Evidence Admission boundary, corrected
-  QCF4 expectation, plan-owned fallback, checkpoint compatibility, provider
-  source wiring, lifecycle behavior, and exact work dependencies are fully
+  applicability semantics, current-analysis latest-completed frontier, strict-
+  PIT cutoff proof, provider-neutral `evidence_effective_as_of` provenance,
+  calendar/weekend/holiday/session boundaries, one evaluator seam, exact
+  forward versions, checkpoint/replay compatibility, fixed-time concurrency,
+  Ticket 07 retry order, the complete field classification, unchanged Evidence
+  Admission boundary, corrected QCF4 expectation, plan-owned fallback, provider
+  source wiring, lifecycle behavior, and integrated work dependencies are fully
   resolved above. Ticket 06 nevertheless remains **FAIL/BLOCKED** until
-  02A–02F, 04A, 05A, 05B, and 06A are implemented and corrected QCF4 passes;
-  QCF5–QCF12 remain behind that path. Any implementation that cannot satisfy
-  one of these decisions must return the specification to `needs-info` rather
-  than inventing a second owner or weakening a trust boundary.
+  02A–02H, 04A, 05A–05C, 06A, and 06B are implemented and the complete
+  deterministic acceptance passes twice; Ticket 07 remains **BLOCKED** and its
+  failed run immutable. Any implementation that cannot satisfy one of these
+  decisions must return the specification to `needs-info` rather than inventing
+  a second owner or weakening a trust boundary.
