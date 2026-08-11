@@ -16,6 +16,7 @@ from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     MainlandCapabilityRoutingDisposition,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
@@ -32,6 +33,13 @@ from tradingagents.dataflows.financial_contracts import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialEligibilityMetadataBinding,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    TemporalEligibilityMode,
+    build_market_session_eligibility_binding,
+)
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    FinancialEligibilityTemporalEvaluationTransaction,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -58,6 +66,10 @@ from tradingagents.market_history import (
     MarketHistoryConfig,
     MarketHistoryMode,
     MarketHistoryStore,
+    MarketSession,
+    MarketSessionStatus,
+    ProvenanceClass,
+    StoredSessionCalendar,
 )
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptOutcome,
@@ -87,7 +99,12 @@ def _identity() -> InstrumentIdentityEvidence:
     )
 
 
-def _blueprint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _blueprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    temporal: bool = False,
+):
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
@@ -117,7 +134,11 @@ def _blueprint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         environment={"TUSHARE_TOKEN": "fixture-token"},
     )
     assert preflight.plan is not None
-    plan = preflight.plan
+    plan = (
+        prepare_mainland_temporal_capability_routing_plan(preflight.plan)
+        if temporal
+        else preflight.plan
+    )
     config["mainland_capability_routing_plan_signature"] = plan.plan_signature
     config["asset_configuration_signature"] = asset.asset_configuration_signature
     return build_production_qualified_routing_composition_blueprint(
@@ -412,6 +433,21 @@ class _AkshareStatement(_AkshareFacade):
                 }
             ]
         )
+
+
+class _AkshareStatementMissingAnnouncement(_AkshareStatement):
+    def stock_financial_report_sina(self, **kwargs: object) -> pd.DataFrame:
+        frame = super().stock_financial_report_sina(**kwargs)
+        return frame.drop(columns=["公告日期"])
+
+
+class _AkshareStatementAliasProof(_AkshareStatement):
+    def stock_financial_report_sina(self, **kwargs: object) -> pd.DataFrame:
+        frame = super().stock_financial_report_sina(**kwargs).rename(
+            columns={"报告日": "报告日期", "公告日期": "publish_date"}
+        )
+        frame["首次披露日期"] = "2026-04-28"
+        return frame
 
 
 def _company_type_resolution():
@@ -1442,3 +1478,163 @@ def test_statement_company_type_evidence_projections_are_artifact_bound(
     assert evidence.as_of_date == request.metadata_binding.as_of_date
     assert len(routed.physical_attempt_ids) == attempts
     assert "DataFrame" not in repr(routed)
+
+
+def _temporal_company_type_request(blueprint):
+    requested_session = date(2026, 7, 30)
+    evaluated_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    calendar_binding = build_market_session_eligibility_binding(
+        StoredSessionCalendar(
+            calendar_revision_id="market-session-calendar:v1:" + "9" * 64,
+            reference_market="mainland-cn",
+            timezone_name="Asia/Shanghai",
+            provider_dataset_id="provider-dataset:fixture-calendar-v1",
+            observed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+            sessions=(
+                MarketSession(requested_session, MarketSessionStatus.OPEN),
+            ),
+        ),
+        requested_session=requested_session,
+        eligibility_evaluated_at=evaluated_at,
+    )
+    binding = FinancialEligibilityMetadataBinding(
+        contract_version="financial-eligibility-metadata-binding-v2",
+        instrument_identity=_identity(),
+        requested_session=requested_session,
+        availability_scope="current_only",
+        financial_eligibility_binding=(
+            blueprint.routing_plan.financial_eligibility_binding
+        ),
+        routing_plan_signature=blueprint.routing_plan.plan_signature,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=calendar_binding,
+    )
+    return (
+        FinancialCompanyTypeEvidenceRoutingRequest(
+            contract_version="financial-company-type-evidence-routing-request-v2",
+            metadata_binding=binding,
+        ),
+        FinancialEligibilityTemporalEvaluationTransaction(
+            mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+            calendar_binding=calendar_binding,
+        ),
+    )
+
+
+def test_temporal_tushare_company_type_route_uses_exact_provider_row_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blueprint = _blueprint(tmp_path, monkeypatch, temporal=True)
+    request, transaction = _temporal_company_type_request(blueprint)
+
+    with _production_sources(
+        blueprint=blueprint,
+        tmp_path=tmp_path,
+        yahoo=_YahooFacade(),
+        akshare=_AkshareStatement(),
+        tushare=_TushareStatement(),
+    ) as sources:
+        routed = sources.router.route_company_type_evidence(
+            request,
+            temporal_transaction=transaction,
+        )
+
+    assert routed.selected_provider == "tushare"
+    assert routed.provider_calls[-1].temporal_decision is not None
+    assert routed.provider_calls[-1].temporal_decision.result == "accepted"
+    evidence = routed.selected_evidence
+    assert evidence is not None and evidence.temporal_evidence is not None
+    proof = evidence.temporal_evidence
+    assert proof.evidence_effective_as_of == date(2025, 12, 31)
+    assert proof.evidence_effective_as_of_derivation.source_field == "end_date"
+    assert proof.ann_date == date(2026, 4, 29)
+    assert proof.ann_date_derivation.source_field == "ann_date"
+    assert proof.f_ann_date == date(2026, 4, 30)
+    assert proof.f_ann_date_derivation.source_field == "f_ann_date"
+    assert proof.artifact.artifact_identity == evidence.artifact_identity
+    assert transaction.evaluation_count == 1
+    assert len(routed.physical_attempt_ids) == 1
+
+
+def test_temporal_akshare_missing_announcement_and_yahoo_profile_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blueprint = _blueprint(tmp_path, monkeypatch, temporal=True)
+    request, transaction = _temporal_company_type_request(blueprint)
+    yahoo = _YahooFacade()
+
+    with _production_sources(
+        blueprint=blueprint,
+        tmp_path=tmp_path,
+        yahoo=yahoo,
+        akshare=_AkshareStatementMissingAnnouncement(),
+        tushare=_EmptyTushare(),
+    ) as sources:
+        routed = sources.router.route_company_type_evidence(
+            request,
+            temporal_transaction=transaction,
+        )
+
+    assert routed.route == ("tushare", "akshare_sina", "yfinance")
+    assert routed.selected_provider is None
+    assert routed.selected_evidence is None
+    assert tuple(call.kind.value for call in routed.provider_calls) == (
+        "unavailable",
+        "unavailable",
+        "unavailable",
+    )
+    assert yahoo.calls == ["get_info"]
+    assert tuple(call.reason.value for call in routed.provider_calls) == (
+        "empty_frame",
+        "integrity_failure",
+        "integrity_failure",
+    )
+    assert transaction.evaluation_count == 0
+    assert len(routed.physical_attempt_ids) == 3
+
+
+def test_temporal_akshare_route_preserves_exact_provider_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blueprint = _blueprint(tmp_path, monkeypatch, temporal=True)
+    request, transaction = _temporal_company_type_request(blueprint)
+
+    with _production_sources(
+        blueprint=blueprint,
+        tmp_path=tmp_path,
+        yahoo=_YahooFacade(),
+        akshare=_AkshareStatementAliasProof(),
+        tushare=_EmptyTushare(),
+    ) as sources:
+        routed = sources.router.route_company_type_evidence(
+            request,
+            temporal_transaction=transaction,
+        )
+
+    assert routed.selected_provider == "akshare_sina"
+    assert tuple(call.provider_id for call in routed.provider_calls) == (
+        "tushare",
+        "akshare_sina",
+    )
+    evidence = routed.selected_evidence
+    assert evidence is not None
+    proof = evidence.temporal_evidence
+    source = evidence.provider_temporal_proof
+    assert proof is not None and source is not None
+    assert proof.evidence_effective_as_of_derivation.source_field == "report_period"
+    assert proof.ann_date_derivation.source_field == "publish_date"
+    assert proof.f_ann_date_derivation.source_field == "首次披露日期"
+    assert source.artifact == proof.artifact
+    assert source.provider_effective_source_field == "报告日期"
+    assert source.evidence_effective_as_of_derivation == (
+        proof.evidence_effective_as_of_derivation
+    )
+    assert source.ann_date_derivation == proof.ann_date_derivation
+    assert source.f_ann_date_derivation == proof.f_ann_date_derivation
+    assert transaction.evaluation_count == 1
+    assert len(routed.physical_attempt_ids) == 2

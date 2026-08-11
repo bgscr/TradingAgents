@@ -17,18 +17,30 @@ from tradingagents.capability_routing import (
     preflight_mainland_capability_routing,
     prepare_mainland_temporal_capability_routing_plan,
 )
+from tradingagents.dataflows.financial_capability_routing import (
+    MainlandFinancialCapabilityRouter,
+)
 from tradingagents.dataflows.financial_contracts import (
     FinancialAvailabilityScope,
     FinancialCompanyType,
     FinancialCompanyTypeResolution,
     FinancialConsolidationScope,
+    FinancialIndicatorEvidenceRequirements,
     FinancialListingProvenance,
+    FinancialRatioFamily,
+    FinancialReportingFrequency,
+    FinancialStatementType,
     resolve_financial_company_type,
+)
+from tradingagents.dataflows.financial_dispatch import (
+    FinancialIndicatorRequestArguments,
+    FinancialToolRequest,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2,
+    FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceBinding,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityAcquisitionFailureReason,
@@ -39,6 +51,11 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     derive_mainland_financial_acquisition_period_supersets,
     financial_eligibility_acquisition_context_identity,
     validate_financial_eligibility_acquisition_context_binding,
+)
+from tradingagents.dataflows.financial_request_factory import (
+    FinancialRequestFactoryError,
+    build_financial_indicator_routing_request,
+    build_financial_statement_routing_request,
 )
 from tradingagents.dataflows.financial_temporal_eligibility import (
     EvidenceEffectiveAsOfDerivation,
@@ -775,9 +792,11 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inputs = _context_inputs(monkeypatch)
+    asset = inputs["asset_configuration"]
+    assert isinstance(asset, RunAssetConfiguration)
     historical = _success_context(inputs)
     forward_observed_at = datetime(2026, 8, 8, 15, tzinfo=timezone.utc)
-    forward_company_evidence = FinancialCompanyTypeEvidenceBinding.create(
+    classifier_evidence = FinancialCompanyTypeEvidenceBinding.create(
         provider_id=historical.company_type_evidence.provider_id,
         artifact_identity=historical.company_type_evidence.artifact_identity,
         source_ref=historical.company_type_evidence.source_ref,
@@ -823,6 +842,7 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
         semantics: str,
         source_field: str,
         row_identity: str,
+        effective_as_of: date = date(2026, 6, 30),
     ):
         artifact = TemporalEvidenceArtifactBinding(
             artifact_identity=artifact_identity,
@@ -834,7 +854,7 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
         evidence = FinancialMetadataTemporalEvidence(
             evidence_class=evidence_class,
             artifact=artifact,
-            evidence_effective_as_of=date(2026, 6, 30),
+            evidence_effective_as_of=effective_as_of,
             evidence_effective_as_of_derivation=EvidenceEffectiveAsOfDerivation(
                 semantics=semantics,
                 source_field=source_field,
@@ -873,25 +893,44 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
             observed_at=forward_observed_at,
             retrieved_at=forward_observed_at,
         )
-        return evaluate_financial_metadata_temporal_eligibility(
-            mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
-            evidence=evidence,
-            calendar_binding=calendar_binding,
+        return (
+            evidence,
+            evaluate_financial_metadata_temporal_eligibility(
+                mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+                evidence=evidence,
+                calendar_binding=calendar_binding,
+            ),
         )
 
-    company_decision = accepted_decision(
+    company_proof, company_decision = accepted_decision(
         evidence_class=TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
-        artifact_identity=forward_company_evidence.artifact_identity,
+        artifact_identity=classifier_evidence.artifact_identity,
         semantics="tushare_statement_period_end",
         source_field="end_date",
         row_identity="row:company-type",
     )
-    listing_decision = accepted_decision(
+    listing_proof, listing_decision = accepted_decision(
         evidence_class=TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
         artifact_identity=forward_listing_provenance.source_ref,
         semantics="baostock_lifecycle_listing_date",
         source_field="listing_date",
         row_identity="row:listing",
+        effective_as_of=historical.listing_date,
+    )
+    forward_company_evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        instrument_identity=historical.instrument_identity,
+        requested_session=_AS_OF,
+        temporal_evidence=company_proof,
+        provider_id=classifier_evidence.provider_id,
+        artifact_identity=classifier_evidence.artifact_identity,
+        source_ref=classifier_evidence.source_ref,
+        observed_at=classifier_evidence.observed_at,
+        retrieved_at=classifier_evidence.retrieved_at,
+        provider_declared_type=classifier_evidence.provider_declared_type,
+        provider_declaration_qualified=(
+            classifier_evidence.provider_declaration_qualified
+        ),
+        normalized_resolver_inputs=classifier_evidence.normalized_resolver_inputs,
     )
     temporal = FinancialEligibilityTemporalContextBinding(
         requested_session=_AS_OF,
@@ -911,12 +950,75 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
         company_type_evidence=forward_company_evidence,
         listing_provenance=forward_listing_provenance,
         temporal_eligibility_binding=temporal,
+        listing_temporal_evidence=listing_proof,
     )
     context = FinancialEligibilityAcquisitionContext(
         **payload,
         context_identity=financial_eligibility_acquisition_context_identity(payload),
     )
     request_binding = FinancialEligibilityRequestBinding.from_context(context)
+
+    _detached_listing_proof, detached_listing_decision = accepted_decision(
+        evidence_class=TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
+        artifact_identity=forward_listing_provenance.source_ref,
+        semantics="baostock_lifecycle_listing_date",
+        source_field="listing_date",
+        row_identity="row:detached-listing",
+        effective_as_of=historical.listing_date,
+    )
+    detached_temporal = FinancialEligibilityTemporalContextBinding(
+        requested_session=_AS_OF,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=calendar_binding,
+        latest_completed_session=_AS_OF,
+        company_type_temporal_decision=company_decision,
+        listing_temporal_decision=detached_listing_decision,
+    )
+    detached_context_payload = context.model_dump(
+        mode="python",
+        exclude={"context_identity"},
+    )
+    detached_context_payload["temporal_eligibility_binding"] = detached_temporal
+    with pytest.raises(ValueError, match="temporal binding mismatch"):
+        FinancialEligibilityAcquisitionContext(
+            **detached_context_payload,
+            context_identity=financial_eligibility_acquisition_context_identity(
+                detached_context_payload
+            ),
+        )
+
+    legacy_evidence_payload = context.model_dump(
+        mode="python",
+        exclude={"context_identity"},
+    )
+    legacy_evidence_payload["company_type_evidence"] = classifier_evidence
+    with pytest.raises(ValueError, match="temporal binding mismatch"):
+        FinancialEligibilityAcquisitionContext(
+            **legacy_evidence_payload,
+            context_identity=financial_eligibility_acquisition_context_identity(
+                legacy_evidence_payload
+            ),
+        )
+
+    detached_request_payload = request_binding.model_dump(mode="python")
+    detached_request_payload["temporal_eligibility_binding"] = detached_temporal
+    detached_request_binding = FinancialEligibilityRequestBinding.model_validate(
+        detached_request_payload
+    )
+    with pytest.raises(FinancialRequestFactoryError):
+        build_financial_statement_routing_request(
+            FinancialToolRequest(
+                tool_name="get_balance_sheet",
+                statement_type=FinancialStatementType.BALANCE_SHEET,
+                frequency=FinancialReportingFrequency.QUARTERLY,
+                as_of_date=_AS_OF,
+                material_arguments={"format": "canonical"},
+                tool_call_id="detached-temporal-binding",
+                financial_eligibility_context_binding=detached_request_binding,
+            ),
+            context,
+        )
 
     assert context.contract_version == (FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2)
     assert context.context_identity.startswith("financial-eligibility-acquisition-context:v2:")
@@ -927,6 +1029,59 @@ def test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions(
     assert request_binding.requested_session == _AS_OF
     assert request_binding.as_of_date is None
     assert request_binding.temporal_eligibility_binding == temporal
+    statement = build_financial_statement_routing_request(
+        FinancialToolRequest(
+            tool_name="get_balance_sheet",
+            statement_type=FinancialStatementType.BALANCE_SHEET,
+            frequency=FinancialReportingFrequency.QUARTERLY,
+            as_of_date=_AS_OF,
+            material_arguments={"format": "canonical"},
+            tool_call_id="temporal-statement",
+            financial_eligibility_context_binding=request_binding,
+        ),
+        context,
+    )
+    families = (FinancialRatioFamily.PROFIT,)
+    indicator = build_financial_indicator_routing_request(
+        FinancialToolRequest(
+            tool_name="get_fundamentals",
+            statement_type=FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS,
+            frequency=FinancialReportingFrequency.NOT_APPLICABLE,
+            as_of_date=_AS_OF,
+            material_arguments={"format": "canonical"},
+            tool_call_id="temporal-indicator",
+            indicator_request_arguments=FinancialIndicatorRequestArguments(
+                requested_families=families,
+                family_evidence_requirements=(
+                    FinancialIndicatorEvidenceRequirements.create(
+                        requested_families=families,
+                        canonical_evidence_contract_id="canonical-evidence-contract.v1",
+                        capability_profile_id=asset.capability_profile.profile_id,
+                        strategy_rules_id="mainland-equity-strategy-rules.v1",
+                    )
+                ),
+            ),
+            financial_eligibility_context_binding=request_binding,
+        ),
+        context,
+    )
+    assert statement.contract_version == "financial-statement-routing-request-v4"
+    assert statement.as_of_date is None
+    assert statement.requested_session == _AS_OF
+    assert statement.financial_eligibility_context_binding == request_binding
+    assert indicator.contract_version == "financial-indicator-routing-request-v7"
+    assert indicator.as_of_date is None
+    assert indicator.requested_session == _AS_OF
+    assert indicator.financial_eligibility_context_binding == request_binding
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=plan_1_3,
+        statement_sources={},
+        indicator_sources={},
+    )
+    statement_result = router.route_statement(statement)
+    indicator_result = router.route_indicators(indicator)
+    assert statement_result.physical_attempt_ids == ()
+    assert indicator_result.physical_attempt_ids == ()
     assert (
         FinancialEligibilityAcquisitionContext.model_validate(historical.model_dump(mode="json"))
         == historical

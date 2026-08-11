@@ -835,6 +835,8 @@ class TradingAgentsGraph:
                 ),
                 retained_listing_metadata=inputs.retained_listing_metadata,
                 checkpoint_thread_id=checkpoint_thread_id,
+                eligibility_clock=inputs.eligibility_clock,
+                calendar_provider=inputs.eligibility_calendar_provider,
                 interrupt_runtime=composition.interrupt,
                 close_runtime=composition.close,
             )

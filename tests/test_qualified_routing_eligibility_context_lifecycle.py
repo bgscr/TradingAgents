@@ -17,6 +17,7 @@ from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     MainlandCapability,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
@@ -68,6 +69,12 @@ from tradingagents.graph.financial_tools import (
     QualifiedFinancialRoutingComposition,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.market_history import (
+    MarketSession,
+    MarketSessionStatus,
+    ProvenanceClass,
+    StoredSessionCalendar,
+)
 from tradingagents.qualified_routing_composition import (
     ProductionFinancialEligibilityRuntimeInputs,
     ProductionQualifiedRoutingRuntime,
@@ -552,6 +559,69 @@ def test_typed_acquisition_failure_leaves_slot_unbound_and_cleanup_errors_do_not
     assert raised.value.reason is (
         ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_UNBOUND
     )
+
+
+@pytest.mark.unit
+def test_temporal_failure_leaves_no_routing_or_factories_and_preserves_cleanup_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset, legacy_plan = _qualified_asset_and_plan(monkeypatch)
+    plan = prepare_mainland_temporal_capability_routing_plan(legacy_plan)
+    failure = FinancialEligibilityAcquisitionResult.failed(
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE,
+        temporal_proof_unavailable=True,
+    )
+    cleanup_events: list[str] = []
+    fixed_at = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+    calendar = StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar:v1:" + "7" * 64,
+        reference_market="mainland-cn",
+        timezone_name="Asia/Shanghai",
+        provider_dataset_id="provider-dataset:fixture-calendar-v1",
+        observed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        sessions=(MarketSession(_AS_OF, MarketSessionStatus.OPEN),),
+    )
+
+    def close() -> None:
+        cleanup_events.append("close")
+        raise SystemExit("cleanup token=must-not-replace-temporal-failure")
+
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id="run:" + sha256(b"ticket-02h-temporal-failure").hexdigest(),
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=_TerminalAcquirer(failure),
+        unbound_financial_routing=_raw_routing(plan),
+        expected_as_of_date=_AS_OF,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        eligibility_clock=lambda: fixed_at,
+        calendar_provider=lambda: calendar,
+        interrupt_runtime=lambda: cleanup_events.append("interrupt"),
+        close_runtime=close,
+    )
+
+    result = owner.acquire_context(as_of_date=_AS_OF)
+
+    assert result is failure
+    assert result.failure is not None
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE
+    )
+    assert owner.context is None
+    assert cleanup_events == ["interrupt", "close"]
+    for attribute in (
+        "financial_routing",
+        "statement_request_factory",
+        "indicator_request_factory",
+    ):
+        with pytest.raises(ProductionQualifiedRoutingLifecycleError) as raised:
+            getattr(owner, attribute)
+        assert raised.value.reason is (
+            ProductionQualifiedRoutingLifecycleFailureReason.ELIGIBILITY_CONTEXT_UNBOUND
+        )
+    assert "must-not-replace" not in result.model_dump_json()
 
 
 @pytest.mark.unit

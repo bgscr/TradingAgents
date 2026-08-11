@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -12,7 +13,10 @@ import pandas as pd
 import pytest
 
 from tradingagents.asset_configuration import resolve_run_asset_configuration
-from tradingagents.capability_routing import preflight_mainland_capability_routing
+from tradingagents.capability_routing import (
+    preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
+)
 from tradingagents.dataflows.baostock_capabilities import (
     BaoStockCapabilityAdapter,
     BaoStockCapabilityOutcomeKind,
@@ -20,6 +24,9 @@ from tradingagents.dataflows.baostock_capabilities import (
     BaoStockCurrentTradeability,
     BaoStockStrictBundleState,
     assemble_baostock_history_bundle,
+)
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    project_baostock_listing_temporal_evidence,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -87,6 +94,29 @@ def _legacy_plan():
     )
     assert preflight.plan is not None
     return preflight.plan
+
+
+def _temporal_plan(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config.update(
+        {
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
+            "tushare_enabled_capabilities": ("statements", "financial_indicators"),
+            "tushare_qualification_profile": "cn-a-2000-20260729-v1",
+            "tushare_account_scope_label": "personal-research-primary",
+            "tushare_calls_per_minute": 40,
+            "tushare_operator_safety_ceiling_calls_per_minute": 40,
+        }
+    )
+    asset = resolve_run_asset_configuration("600895.SS", config=config)
+    preflight = preflight_mainland_capability_routing(
+        asset,
+        config=config,
+        environment={"TUSHARE_TOKEN": "fixture-only"},
+    )
+    assert preflight.plan is not None
+    return prepare_mainland_temporal_capability_routing_plan(preflight.plan)
 
 
 def _history_config(tmp_path) -> MarketHistoryConfig:
@@ -231,6 +261,7 @@ def _build_harness(
     checkpoint: dict[str, object] | None = None,
     coordinator: ProviderRequestCoordinator | None = None,
     observed_at: datetime = _OBSERVED_AT,
+    routing_plan=None,
 ) -> _Harness:
     coordinator = coordinator or ProviderRequestCoordinator(store)
     upstream_id, service_name = upstream_service_identity_for_provider("baostock")
@@ -243,7 +274,7 @@ def _build_harness(
     )
     return _Harness(
         adapter=BaoStockCapabilityAdapter(
-            routing_plan=_legacy_plan(),
+            routing_plan=routing_plan or _legacy_plan(),
             subrequest_cache=cache,
             transport=transport,
             owner_id=run_scope_id,
@@ -498,6 +529,106 @@ def test_lifecycle_preserves_exact_ipo_listing_out_and_delisting_provenance(
     assert result.listing_metadata.listing_provenance == provenance
     assert "original_ipo_date" not in result.listing_metadata.model_dump(mode="json")
     assert "observed_name" not in result.listing_metadata.model_dump(mode="json")
+
+
+@pytest.mark.unit
+def test_temporal_lifecycle_projects_ipodate_without_publication_backfill(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temporal_plan = _temporal_plan(monkeypatch)
+    transport = _FakeTransport()
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=transport,
+            run_scope_id="ticket-02h-temporal-lifecycle",
+            routing_plan=temporal_plan,
+        )
+        result = harness.adapter.acquire_lifecycle(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert transport.calls == [("lifecycle", {"code": "sh.600895"})]
+    assert len(result.attempt_events) == 1
+    assert result.listing_metadata is not None
+    metadata = result.listing_metadata
+    assert metadata.contract_version == "financial-listing-metadata-v2"
+    assert metadata.as_of_date is None
+    assert metadata.requested_session == date(2026, 7, 30)
+    assert metadata.listing_date == date(1996, 4, 22)
+    proof = metadata.temporal_evidence
+    assert proof is not None
+    assert proof.evidence_effective_as_of == date(1996, 4, 22)
+    assert proof.evidence_effective_as_of_derivation is not None
+    assert proof.evidence_effective_as_of_derivation.source_field == "ipoDate"
+    assert proof.ann_date is None
+    assert proof.ann_date_derivation is None
+    assert proof.f_ann_date is None
+    assert proof.f_ann_date_derivation is None
+    assert proof.artifact.artifact_identity == result.candidates[0].artifact_identity
+    assert proof.artifact.row_identity == result.candidates[0].row_artifact_identities[0]
+    assert proof.observed_at == _OBSERVED_AT
+    assert proof.retrieved_at == _OBSERVED_AT
+
+    wrong_row_proof = project_baostock_listing_temporal_evidence(
+        artifact_identity=result.candidates[0].artifact_identity,
+        row_identity="provider-row-artifact:v1:" + "f" * 64,
+        listing_date=metadata.listing_date,
+        observed_at=proof.observed_at,
+        retrieved_at=proof.retrieved_at,
+    )
+    metadata_payload = metadata.model_dump(mode="python")
+    metadata_payload["temporal_evidence"] = wrong_row_proof
+    wrong_row_metadata = type(metadata).model_validate(metadata_payload)
+    result_payload = result.model_dump(mode="python")
+    result_payload["listing_metadata"] = wrong_row_metadata
+    with pytest.raises(
+        ValueError,
+        match="contradicts lifecycle provenance",
+    ):
+        type(result).model_validate(result_payload)
+
+
+@pytest.mark.unit
+def test_temporal_lifecycle_projects_explicit_provider_publication_fields(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = _lifecycle_rows()
+    lifecycle["publication_date"] = "1996-04-23"
+    lifecycle["first_publication_date"] = "1996-04-22"
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=_FakeTransport(lifecycle=lifecycle),
+            run_scope_id="ticket-02h-temporal-lifecycle-publication",
+            routing_plan=_temporal_plan(monkeypatch),
+        )
+        result = harness.adapter.acquire_lifecycle(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    candidate = result.candidates[0]
+    assert candidate.announcement_date == date(1996, 4, 23)
+    assert candidate.announcement_date_source_field == "publication_date"
+    assert candidate.first_publication_date == date(1996, 4, 22)
+    assert candidate.first_publication_date_source_field == "first_publication_date"
+    assert result.listing_metadata is not None
+    proof = result.listing_metadata.temporal_evidence
+    assert proof is not None
+    assert proof.ann_date == date(1996, 4, 23)
+    assert proof.ann_date_derivation is not None
+    assert proof.ann_date_derivation.source_field == "publication_date"
+    assert proof.f_ann_date == date(1996, 4, 22)
+    assert proof.f_ann_date_derivation is not None
+    assert proof.f_ann_date_derivation.source_field == "first_publication_date"
+    assert proof.artifact.artifact_identity == candidate.artifact_identity
+    assert proof.artifact.row_identity == candidate.row_artifact_identities[0]
 
 
 @pytest.mark.unit

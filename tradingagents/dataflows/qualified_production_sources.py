@@ -57,6 +57,7 @@ from tradingagents.dataflows.financial_indicator_metadata import (
 )
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestResult
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
+from tradingagents.evidence import AcquisitionUnavailableReason
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptFailure,
     PhysicalAttemptOutcome,
@@ -924,6 +925,17 @@ def decode_yahoo_company_type_evidence_response(
             classifier_metadata=classifier_inputs,
             present_fields=(),
         )
+        if (
+            request.metadata_binding.contract_version
+            == "financial-eligibility-metadata-binding-v2"
+        ):
+            return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+                provider_id="yfinance",
+                metadata_binding=request.metadata_binding,
+                reason=AcquisitionUnavailableReason.INTEGRITY_FAILURE,
+                subrequest_keys=(),
+                physical_attempt_ids=(),
+            )
         evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
             instrument_identity=request.metadata_binding.instrument_identity,
             as_of_date=request.metadata_binding.as_of_date,

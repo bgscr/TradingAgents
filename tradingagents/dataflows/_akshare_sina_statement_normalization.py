@@ -37,6 +37,9 @@ from tradingagents.evidence import InstrumentIdentityEvidence
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
 _SAFE_PROVIDER_FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _QUARTER_ENDS = frozenset({(3, 31), (6, 30), (9, 30), (12, 31)})
+_EFFECTIVE_DATE_ALIASES = ("报告日", "报告日期", "end_date")
+_ANNOUNCEMENT_DATE_ALIASES = ("公告日期", "ann_date", "publish_date")
+_FIRST_PUBLICATION_DATE_ALIASES = ("首次公告日期", "首次披露日期", "f_ann_date")
 _CNY_ALIASES = frozenset({"CNY", "RMB", "人民币", "人民币元"})
 _CONSOLIDATED_TYPES = frozenset(
     {"合并", "合并报表", "合并口径", "合并期末", "consolidated", "group"}
@@ -210,6 +213,47 @@ class AkshareSinaStatementRowRejection(BaseModel):
         return self
 
 
+class AkshareSinaStatementTemporalProofSource(BaseModel):
+    """Exact provider fields retained beside one normalized statement candidate."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["akshare-sina-statement-temporal-proof-source-v1"] = (
+        "akshare-sina-statement-temporal-proof-source-v1"
+    )
+    candidate_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    artifact_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    revision_identity: str = Field(
+        pattern=r"^financial-provider-artifact:v1:[0-9a-f]{64}$"
+    )
+    row_identity: str = Field(
+        pattern=r"^financial-period-candidate:v1:[0-9a-f]{64}$"
+    )
+    evidence_effective_as_of: date
+    evidence_effective_as_of_source_field: Literal["报告日", "报告日期", "end_date"]
+    ann_date: date | None = None
+    ann_date_source_field: Literal["公告日期", "ann_date", "publish_date"] | None = None
+    f_ann_date: date | None = None
+    f_ann_date_source_field: (
+        Literal["首次公告日期", "首次披露日期", "f_ann_date"] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> AkshareSinaStatementTemporalProofSource:
+        if (
+            self.revision_identity != self.artifact_identity
+            or self.row_identity != self.candidate_identity
+            or (self.ann_date is None) != (self.ann_date_source_field is None)
+            or (self.f_ann_date is None) != (self.f_ann_date_source_field is None)
+        ):
+            raise ValueError("AKShare-Sina temporal proof source binding is invalid")
+        return self
+
+
 def project_candidates(
     *,
     payload: Mapping[str, object],
@@ -313,6 +357,81 @@ def project_candidates(
         tuple(sorted(reporting, key=candidate_key)),
         tuple(rejections),
     )
+
+
+def project_temporal_proof_sources(
+    *,
+    payload: Mapping[str, object],
+    row_artifacts: Sequence[FinancialProviderArtifactIdentity],
+    candidates: Sequence[FinancialPeriodCandidate],
+) -> tuple[AkshareSinaStatementTemporalProofSource, ...]:
+    """Retain exact date aliases while the immutable provider rows are present."""
+
+    rows = payload["rows"]
+    assert isinstance(rows, list)
+    if len(rows) != len(row_artifacts):
+        raise ValueError("AKShare-Sina statement row artifacts are incomplete")
+    row_index_by_artifact = {
+        artifact.artifact_identity: index
+        for index, artifact in enumerate(row_artifacts)
+    }
+    if len(row_index_by_artifact) != len(row_artifacts):
+        raise ValueError("AKShare-Sina statement row artifacts are not distinct")
+    projected: list[AkshareSinaStatementTemporalProofSource] = []
+    for candidate in candidates:
+        row_index = row_index_by_artifact.get(candidate.artifact.artifact_identity)
+        if row_index is None:
+            raise ValueError("AKShare-Sina candidate has no exact provider row")
+        row = rows[row_index]
+        assert isinstance(row, dict)
+        effective = _populated_alias(row, _EFFECTIVE_DATE_ALIASES)
+        announcement = _populated_alias(row, _ANNOUNCEMENT_DATE_ALIASES)
+        first_publication = _populated_alias(row, _FIRST_PUBLICATION_DATE_ALIASES)
+        if effective is None:
+            raise ValueError("AKShare-Sina candidate has no effective-date source")
+        effective_date = _provider_date(effective[1], required=True)
+        ann_date = (
+            _provider_date(announcement[1], required=True)
+            if announcement is not None
+            else None
+        )
+        f_ann_date = (
+            _provider_date(first_publication[1], required=True)
+            if first_publication is not None
+            else None
+        )
+        if (
+            effective_date != candidate.period_identity.period_end
+            or ann_date != candidate.filing_metadata.ann_date
+            or f_ann_date != candidate.filing_metadata.f_ann_date
+            or candidate.period_identity.provider_revision_binding
+            != candidate.artifact.artifact_identity
+            or candidate.filing_metadata.local_provider_revision_identity
+            != candidate.artifact.artifact_identity
+        ):
+            raise ValueError("AKShare-Sina temporal proof contradicts its candidate")
+        assert effective_date is not None
+        projected.append(
+            AkshareSinaStatementTemporalProofSource(
+                candidate_identity=candidate.candidate_identity,
+                artifact_identity=candidate.artifact.artifact_identity,
+                revision_identity=candidate.artifact.artifact_identity,
+                row_identity=candidate.candidate_identity,
+                evidence_effective_as_of=effective_date,
+                evidence_effective_as_of_source_field=effective[0],
+                ann_date=ann_date,
+                ann_date_source_field=(
+                    announcement[0] if announcement is not None else None
+                ),
+                f_ann_date=f_ann_date,
+                f_ann_date_source_field=(
+                    first_publication[0]
+                    if first_publication is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(sorted(projected, key=lambda item: item.candidate_identity))
 
 
 def _candidate(

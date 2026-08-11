@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
-from threading import Event
+from threading import Barrier, Event, Lock
 
 import pandas as pd
 import pytest
@@ -19,11 +20,13 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
+    FinancialCompanyTypeEvidenceProviderProjection,
     FinancialCompanyTypeEvidenceProviderResponse,
     FinancialCompanyTypeEvidenceRoutingRequest,
     FinancialCompanyTypeEvidenceRoutingResult,
@@ -39,6 +42,9 @@ from tradingagents.dataflows.financial_contracts import (
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
+    FinancialCompanyTypeProviderTemporalProofBinding,
+    FinancialEligibilityAcquisitionFailureReason,
+    FinancialEligibilityAcquisitionResult,
     FinancialEligibilityMetadataBinding,
     FinancialListingMetadata,
     FinancialListingMetadataProjection,
@@ -46,6 +52,22 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
 from tradingagents.dataflows.financial_eligibility_metadata import (
     FinancialEligibilityMetadataAcquirer,
     FinancialEligibilityMetadataAcquisitionRequest,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    EvidenceEffectiveAsOfDerivation,
+    EvidenceEffectiveAsOfSemantics,
+    FinancialMetadataTemporalEvidence,
+    ProviderPublicationDateDerivation,
+    ProviderPublicationDateSemantics,
+    PublicationDateKind,
+    TemporalEligibilityMode,
+    TemporalEvidenceArtifactBinding,
+    TemporalEvidenceClass,
+    build_market_session_eligibility_binding,
+    evaluate_financial_metadata_temporal_eligibility,
+)
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    FinancialEligibilityTemporalEvaluationTransaction,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -60,9 +82,17 @@ from tradingagents.market_history import (
     MarketHistoryConfig,
     MarketHistoryMode,
     MarketHistoryStore,
+    MarketSession,
+    MarketSessionStatus,
+    ProvenanceClass,
     ProviderRequestCoordinator,
     RequestPriority,
+    StoredSessionCalendar,
     upstream_service_identity_for_provider,
+)
+from tradingagents.qualified_routing_eligibility_lifecycle import (
+    FinancialEligibilityAcquisitionContextOwner,
+    QualifiedFinancialRoutingComposition,
 )
 
 _AS_OF = date(2026, 8, 8)
@@ -224,6 +254,460 @@ def _request(
     )
 
 
+@pytest.mark.unit
+def test_historical_v1_serialization_does_not_emit_temporal_v2_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = _qualified_plan(monkeypatch, asset)
+    request = _request(asset, plan)
+    company = _company_type_projection(asset, plan)
+    response = FinancialCompanyTypeEvidenceProviderResponse.available(
+        provider_id="tushare",
+        metadata_binding=company.metadata_binding,
+        source_projection_kind="tushare_statement",
+        evidence=company.evidence,
+    )
+    routed = FinancialCompanyTypeEvidenceRoutingResult(
+        route=("tushare",),
+        provider_calls=(response,),
+        selected_provider="tushare",
+        selected_evidence=company.evidence,
+    )
+    assert routed.contract_version == "financial-company-type-evidence-routing-result-v1"
+    failure = FinancialEligibilityAcquisitionResult.failed(
+        FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE
+    )
+
+    request_payload = request.model_dump(mode="json")
+    assert {
+        "requested_session",
+        "temporal_mode",
+        "eligibility_evaluated_at",
+        "calendar_binding",
+        "strict_cutoff",
+    }.isdisjoint(request_payload)
+    assert "temporal_decision" not in response.model_dump(mode="json")
+    assert "selected_temporal_decision" not in routed.model_dump(mode="json")
+    assert failure.failure is not None
+    failure_payload = failure.failure.model_dump(mode="json")
+    assert "rejected_temporal_decision" not in failure_payload
+    assert "temporal_rejection_reasons" not in failure_payload
+
+    request_with_cutoff = request.model_dump(mode="python")
+    request_with_cutoff["asset_configuration"] = request.asset_configuration
+    request_with_cutoff["strict_cutoff"] = _OBSERVED_AT
+    with pytest.raises(ValueError, match="temporal shape mismatch"):
+        FinancialEligibilityMetadataAcquisitionRequest.model_validate(
+            request_with_cutoff
+        )
+    metadata_with_cutoff = company.metadata_binding.model_dump(mode="python")
+    metadata_with_cutoff["strict_cutoff"] = _OBSERVED_AT
+    with pytest.raises(ValueError, match="requires a CNY"):
+        FinancialEligibilityMetadataBinding.model_validate(metadata_with_cutoff)
+
+    temporal_plan = prepare_mainland_temporal_capability_routing_plan(plan)
+    temporal_company, temporal_listing = _retained_temporal_projections(
+        asset,
+        temporal_plan,
+        evaluated_at=datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc),
+    )
+    with pytest.raises(ValueError, match="acquisition binding mismatch"):
+        FinancialCompanyTypeEvidenceProjection(
+            metadata_binding=company.metadata_binding,
+            evidence=company.evidence,
+            temporal_decision=temporal_company.temporal_decision,
+        )
+    listing = _listing_projection(asset, plan)
+    with pytest.raises(ValueError, match="acquisition binding mismatch"):
+        FinancialListingMetadataProjection(
+            metadata_binding=listing.metadata_binding,
+            metadata=listing.metadata,
+            temporal_decision=temporal_listing.temporal_decision,
+        )
+
+
+@pytest.mark.unit
+def test_temporal_run_emits_result_v2_for_non_temporal_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    stop_signal = Event()
+    stop_signal.set()
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+        ),
+        stop_signal=stop_signal,
+    ).acquire(
+        _temporal_request(
+            asset,
+            plan,
+            evaluated_at=datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc),
+        )
+    )
+
+    assert result.contract_version == "financial-eligibility-acquisition-result-v2"
+    assert result.failure is not None
+    assert result.failure.contract_version == result.contract_version
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.INTERRUPTED_ACQUISITION
+    )
+
+
+def _stored_temporal_calendar() -> StoredSessionCalendar:
+    return StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar:v1:" + "7" * 64,
+        reference_market="mainland-cn",
+        timezone_name="Asia/Shanghai",
+        provider_dataset_id="provider-dataset:fixture-calendar-v1",
+        observed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        sessions=(
+            MarketSession(date(2026, 8, 10), MarketSessionStatus.OPEN),
+            MarketSession(date(2026, 8, 11), MarketSessionStatus.OPEN),
+        ),
+    )
+
+
+def _temporal_calendar(evaluated_at: datetime):
+    return build_market_session_eligibility_binding(
+        _stored_temporal_calendar(),
+        requested_session=date(2026, 8, 10),
+        eligibility_evaluated_at=evaluated_at,
+    )
+
+
+def _temporal_proof(
+    *,
+    evidence_class: TemporalEvidenceClass,
+    artifact_identity: str,
+    row_identity: str,
+    effective: date,
+    effective_semantics: EvidenceEffectiveAsOfSemantics,
+    effective_source_field: str,
+    publication_semantics: ProviderPublicationDateSemantics,
+    ann_source_field: str,
+    first_source_field: str,
+) -> FinancialMetadataTemporalEvidence:
+    artifact = TemporalEvidenceArtifactBinding(
+        artifact_identity=artifact_identity,
+        revision_identity=artifact_identity,
+        row_identity=row_identity,
+    )
+    retrieved = datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc)
+    return FinancialMetadataTemporalEvidence(
+        evidence_class=evidence_class,
+        artifact=artifact,
+        evidence_effective_as_of=effective,
+        evidence_effective_as_of_derivation=EvidenceEffectiveAsOfDerivation(
+            semantics=effective_semantics,
+            source_field=effective_source_field,
+            artifact=artifact,
+        ),
+        ann_date=date(2026, 8, 10),
+        ann_date_derivation=ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.ANN_DATE,
+            semantics=publication_semantics,
+            source_field=ann_source_field,
+            artifact=artifact,
+        ),
+        f_ann_date=date(2026, 8, 10),
+        f_ann_date_derivation=ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.F_ANN_DATE,
+            semantics=publication_semantics,
+            source_field=first_source_field,
+            artifact=artifact,
+        ),
+        observed_at=retrieved,
+        retrieved_at=retrieved,
+    )
+
+
+def _temporal_request(
+    asset: RunAssetConfiguration,
+    plan: MainlandCapabilityRoutingPlan,
+    *,
+    evaluated_at: datetime,
+) -> FinancialEligibilityMetadataAcquisitionRequest:
+    run_id = _run_id("temporal-" + evaluated_at.isoformat())
+    binding = _temporal_calendar(evaluated_at)
+    assert plan.financial_eligibility_binding is not None
+    return FinancialEligibilityMetadataAcquisitionRequest(
+        contract_version="financial-eligibility-metadata-acquisition-request-v2",
+        canonical_run_id=run_id,
+        run_id=run_id,
+        asset_configuration=asset,
+        asset_configuration_signature=asset.asset_configuration_signature,
+        instrument_identity=asset.instrument_identity,
+        requested_session=date(2026, 8, 10),
+        authoritative_availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        acquisition_purpose="foreground_current_analysis",
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan_signature=plan.plan_signature,
+        currency="CNY",
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=binding,
+    )
+
+
+def _retained_temporal_projections(
+    asset: RunAssetConfiguration,
+    plan: MainlandCapabilityRoutingPlan,
+    *,
+    evaluated_at: datetime,
+):
+    calendar_binding = _temporal_calendar(evaluated_at)
+    metadata_binding = FinancialEligibilityMetadataBinding(
+        contract_version="financial-eligibility-metadata-binding-v2",
+        instrument_identity=asset.instrument_identity,
+        requested_session=date(2026, 8, 10),
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        acquisition_purpose="foreground_current_analysis",
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan_signature=plan.plan_signature,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=calendar_binding,
+    )
+    company_artifact = "financial-provider-artifact:v1:" + "4" * 64
+    company_proof = _temporal_proof(
+        evidence_class=TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+        artifact_identity=company_artifact,
+        row_identity="financial-period-candidate:v1:" + "5" * 64,
+        effective=date(2026, 6, 30),
+        effective_semantics=EvidenceEffectiveAsOfSemantics.TUSHARE_STATEMENT_PERIOD_END,
+        effective_source_field="end_date",
+        publication_semantics=(
+            ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS
+        ),
+        ann_source_field="ann_date",
+        first_source_field="f_ann_date",
+    )
+    company_evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        instrument_identity=asset.instrument_identity,
+        requested_session=date(2026, 8, 10),
+        temporal_evidence=company_proof,
+        provider_id="tushare",
+        artifact_identity=company_artifact,
+        source_ref=company_artifact,
+        observed_at=company_proof.observed_at,
+        retrieved_at=company_proof.retrieved_at,
+        provider_declared_type=FinancialCompanyType.BANK,
+        provider_declaration_qualified=True,
+        normalized_resolver_inputs=(
+            FinancialCompanyTypeClassifierInput(key="metadata:industry", value="bank"),
+            FinancialCompanyTypeClassifierInput(
+                key="present_field", value="customer_deposits"
+            ),
+        ),
+    )
+    company_decision = evaluate_financial_metadata_temporal_eligibility(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=company_proof,
+        calendar_binding=calendar_binding,
+    )
+    company_projection = FinancialCompanyTypeEvidenceProjection(
+        contract_version="financial-company-type-evidence-projection-v2",
+        metadata_binding=metadata_binding,
+        evidence=company_evidence,
+        temporal_decision=company_decision,
+    )
+    listing_artifact = "provider-artifact:v1:" + "6" * 64
+    listing_proof = _temporal_proof(
+        evidence_class=TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
+        artifact_identity=listing_artifact,
+        row_identity="provider-row-artifact:v1:" + "7" * 64,
+        effective=date(2010, 1, 4),
+        effective_semantics=EvidenceEffectiveAsOfSemantics.BAOSTOCK_LIFECYCLE_LISTING_DATE,
+        effective_source_field="ipoDate",
+        publication_semantics=(
+            ProviderPublicationDateSemantics.BAOSTOCK_LIFECYCLE_PUBLICATION_FIELDS
+        ),
+        ann_source_field="announcement_date",
+        first_source_field="first_publication_date",
+    )
+    listing_metadata = FinancialListingMetadata(
+        contract_version="financial-listing-metadata-v2",
+        instrument_identity=asset.instrument_identity,
+        requested_session=date(2026, 8, 10),
+        listing_date=date(2010, 1, 4),
+        listing_provenance=FinancialListingProvenance(
+            provider_id="baostock",
+            source_ref=listing_artifact,
+            observed_at=listing_proof.observed_at,
+        ),
+        temporal_evidence=listing_proof,
+    )
+    listing_decision = evaluate_financial_metadata_temporal_eligibility(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=listing_proof,
+        calendar_binding=calendar_binding,
+    )
+    listing_projection = FinancialListingMetadataProjection(
+        contract_version="financial-listing-metadata-projection-v2",
+        metadata_binding=metadata_binding,
+        metadata=listing_metadata,
+        temporal_decision=listing_decision,
+    )
+    return company_projection, listing_projection
+
+
+class _FailingTemporalEvaluationTransaction(
+    FinancialEligibilityTemporalEvaluationTransaction
+):
+    def __init__(self, *, fail_on: int, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.fail_on = fail_on
+        self.calls = 0
+
+    def evaluate(
+        self,
+        evidence: FinancialMetadataTemporalEvidence,
+    ):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise RuntimeError("sensitive-evaluator-detail")
+        return super().evaluate(evidence)
+
+
+@pytest.mark.unit
+def test_temporal_company_evidence_retains_an_exact_provider_proof_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc),
+    )
+
+    source = company.evidence.provider_temporal_proof
+    assert source is not None
+    proof = company.evidence.temporal_evidence
+    assert proof is not None
+    assert source.provider_id == "tushare"
+    assert source.provider_effective_source_field == "end_date"
+    assert source.artifact == proof.artifact
+    assert source.evidence_effective_as_of == proof.evidence_effective_as_of
+    assert (
+        source.evidence_effective_as_of_derivation
+        == proof.evidence_effective_as_of_derivation
+    )
+    assert source.ann_date == proof.ann_date
+    assert source.ann_date_derivation == proof.ann_date_derivation
+    assert source.f_ann_date == proof.f_ann_date
+    assert source.f_ann_date_derivation == proof.f_ann_date_derivation
+
+
+@pytest.mark.unit
+def test_temporal_listing_route_uses_v2_outer_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    _company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc),
+    )
+
+    response = FinancialCapabilityProviderResponse.available(
+        provider_id="baostock",
+        capability=MainlandCapability.ISSUER_LIFECYCLE,
+        retained_artifact_identities=(
+            listing.metadata.temporal_evidence.artifact.artifact_identity,
+        ),
+        candidate_count=1,
+        subrequest_keys=(),
+        physical_attempt_ids=(),
+        listing_metadata=listing.metadata,
+    )
+    routed = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        capability_sources={
+            MainlandCapability.ISSUER_LIFECYCLE: {
+                "baostock": lambda _request: response,
+            }
+        },
+    ).route_capability(
+        FinancialCapabilityRoutingRequest(
+            instrument_identity=asset.instrument_identity,
+            capability=MainlandCapability.ISSUER_LIFECYCLE,
+            range_start=date(2026, 8, 10),
+            as_of_date=date(2026, 8, 10),
+        )
+    )
+
+    assert response.contract_version == "financial-capability-provider-response-v2"
+    assert routed.contract_version == "financial-capability-routing-result-v2"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fail_on", (1, 2))
+def test_retained_temporal_evaluator_exception_fails_typed_and_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+    fail_on: int,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    transactions: list[_FailingTemporalEvaluationTransaction] = []
+
+    def transaction_factory(**kwargs):
+        transaction = _FailingTemporalEvaluationTransaction(
+            fail_on=fail_on,
+            **kwargs,
+        )
+        transactions.append(transaction)
+        return transaction
+
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+        ),
+        stop_signal=Event(),
+        temporal_transaction_factory=transaction_factory,
+    ).acquire(
+        _temporal_request(asset, plan, evaluated_at=evaluated_at),
+        retained_company_type_evidence=(company,),
+        retained_listing_metadata=(listing,),
+    )
+
+    assert result.context is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE
+    )
+    assert result.contract_version == "financial-eligibility-acquisition-result-v2"
+    assert "sensitive-evaluator-detail" not in repr(result)
+    assert len(transactions) == 1
+    assert transactions[0].calls == fail_on
+
+
 def _history_config(tmp_path) -> MarketHistoryConfig:
     root = tmp_path / "history"
     return MarketHistoryConfig(
@@ -291,6 +775,718 @@ def test_exact_retained_metadata_builds_context_without_source_io(
     assert result.context.company_type_evidence.provider_id == "tushare"
     assert result.context.listing_date == date(1987, 4, 1)
     assert result.context.listing_provenance.provider_id == "baostock"
+
+
+@pytest.mark.unit
+def test_retained_temporal_proof_is_reevaluated_once_under_new_run_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    retained_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    current_at = datetime(2026, 8, 11, 1, 0, tzinfo=timezone.utc)
+    company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=retained_at,
+    )
+    transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
+
+    def transaction_factory(**kwargs):
+        transaction = FinancialEligibilityTemporalEvaluationTransaction(**kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    def forbidden_source(_request):
+        raise AssertionError("compatible retained proof must not perform provider work")
+
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        capability_sources={
+            MainlandCapability.ISSUER_LIFECYCLE: {"baostock": forbidden_source}
+        },
+        company_type_evidence_sources={"tushare": forbidden_source},
+    )
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=router,
+        stop_signal=Event(),
+        temporal_transaction_factory=transaction_factory,
+    ).acquire(
+        _temporal_request(asset, plan, evaluated_at=current_at),
+        retained_company_type_evidence=(company,),
+        retained_listing_metadata=(listing,),
+    )
+
+    assert result.outcome == "success"
+    assert result.contract_version == "financial-eligibility-acquisition-result-v2"
+    assert result.context is not None
+    assert result.context.contract_version == "financial-eligibility-acquisition-context-v2"
+    temporal = result.context.temporal_eligibility_binding
+    assert temporal is not None
+    assert temporal.eligibility_evaluated_at == current_at
+    assert temporal.company_type_temporal_decision != company.temporal_decision
+    assert temporal.listing_temporal_decision != listing.temporal_decision
+    assert len(transactions) == 1
+    assert transactions[0].evaluation_count == 2
+
+
+@pytest.mark.unit
+def test_stale_retained_decision_rejects_without_rebinding_old_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc),
+    )
+    transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
+
+    def transaction_factory(**kwargs):
+        transaction = FinancialEligibilityTemporalEvaluationTransaction(**kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+        ),
+        stop_signal=Event(),
+        temporal_transaction_factory=transaction_factory,
+    ).acquire(
+        _temporal_request(
+            asset,
+            plan,
+            evaluated_at=datetime(2026, 8, 11, 8, tzinfo=timezone.utc),
+        ),
+        retained_company_type_evidence=(company,),
+        retained_listing_metadata=(listing,),
+    )
+
+    assert result.context is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
+    )
+    assert result.failure.rejected_temporal_decision is not None
+    assert result.failure.rejected_temporal_decision != company.temporal_decision
+    assert len(transactions) == 1
+    assert transactions[0].evaluation_count == 1
+
+
+@pytest.mark.unit
+def test_first_use_single_flight_fixes_one_temporal_frontier_for_32_followers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    fixed_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=datetime(2026, 8, 11, 0, 58, tzinfo=timezone.utc),
+    )
+    transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
+    counts = {"clock": 0, "calendar": 0}
+    counts_lock = Lock()
+    calendar_entered = Event()
+    release_calendar = Event()
+    synchronization_timeout = 30.0
+
+    def eligibility_clock() -> datetime:
+        with counts_lock:
+            counts["clock"] += 1
+        return fixed_at
+
+    def calendar_provider() -> StoredSessionCalendar:
+        with counts_lock:
+            counts["calendar"] += 1
+        calendar_entered.set()
+        assert release_calendar.wait(timeout=synchronization_timeout)
+        return _stored_temporal_calendar()
+
+    def transaction_factory(**kwargs):
+        transaction = FinancialEligibilityTemporalEvaluationTransaction(**kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    def forbidden_source(_request):
+        raise AssertionError("retained temporal proof must not perform provider work")
+
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        capability_sources={
+            MainlandCapability.ISSUER_LIFECYCLE: {"baostock": forbidden_source}
+        },
+        company_type_evidence_sources={"tushare": forbidden_source},
+    )
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=_run_id("temporal-owner"),
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=FinancialEligibilityMetadataAcquirer(
+            routing_plan=plan,
+            router=router,
+            stop_signal=Event(),
+            temporal_transaction_factory=transaction_factory,
+        ),
+        unbound_financial_routing=QualifiedFinancialRoutingComposition(
+            router=router,
+            statement_request_factory=lambda *_args: None,
+        ),
+        expected_as_of_date=date(2026, 8, 10),
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        retained_company_type_evidence=(company,),
+        retained_listing_metadata=(listing,),
+        eligibility_clock=eligibility_clock,
+        calendar_provider=calendar_provider,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    start = Barrier(33)
+
+    def acquire():
+        start.wait(timeout=synchronization_timeout)
+        return owner.acquire_context(as_of_date=date(2026, 8, 10))
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        futures = [executor.submit(acquire) for _ in range(32)]
+        start.wait(timeout=synchronization_timeout)
+        assert calendar_entered.wait(timeout=synchronization_timeout)
+        release_calendar.set()
+        results = tuple(
+            future.result(timeout=synchronization_timeout) for future in futures
+        )
+
+    assert counts == {"clock": 1, "calendar": 1}
+    assert len(transactions) == 1
+    assert transactions[0].evaluation_count == 2
+    assert len({id(result) for result in results}) == 1
+    assert results[0].outcome == "success", results[0].failure
+    assert results[0].context is owner.context
+    assert owner.context is not None
+    temporal = owner.context.temporal_eligibility_binding
+    assert temporal is not None
+    assert temporal.eligibility_evaluated_at == fixed_at
+    assert temporal.calendar_binding == _temporal_calendar(fixed_at)
+
+
+@pytest.mark.unit
+def test_fresh_temporal_company_type_route_uses_the_active_transaction_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+
+    def source(
+        request: FinancialCompanyTypeEvidenceRoutingRequest,
+    ) -> FinancialCompanyTypeEvidenceProviderProjection:
+        return FinancialCompanyTypeEvidenceProviderProjection(
+            provider_id="tushare",
+            metadata_binding=request.metadata_binding,
+            source_projection_kind="tushare_statement",
+            evidence=company.evidence,
+        )
+
+    transaction = FinancialEligibilityTemporalEvaluationTransaction(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        calendar_binding=_temporal_calendar(evaluated_at),
+    )
+    routed = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        company_type_evidence_sources={"tushare": source},
+    ).route_company_type_evidence(
+        FinancialCompanyTypeEvidenceRoutingRequest(
+            contract_version="financial-company-type-evidence-routing-request-v2",
+            metadata_binding=company.metadata_binding,
+        ),
+        temporal_transaction=transaction,
+    )
+
+    assert transaction.evaluation_count == 1
+    assert (
+        routed.contract_version
+        == "financial-company-type-evidence-routing-result-v2"
+    )
+    assert routed.provider_calls[-1].temporal_decision is not None
+    assert routed.provider_calls[-1].temporal_decision.result == "accepted"
+    assert routed.physical_attempt_ids == ()
+
+    with pytest.raises(
+        ValueError,
+        match="available company-type temporal proof is unavailable",
+    ):
+        FinancialCompanyTypeEvidenceProviderResponse.available(
+            provider_id="tushare",
+            metadata_binding=company.metadata_binding,
+            source_projection_kind="tushare_statement",
+            evidence=company.evidence,
+        )
+
+
+@pytest.mark.unit
+def test_temporal_company_type_route_continues_after_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    calls: list[str] = []
+
+    def evidence_for(
+        *,
+        provider_id: str,
+        proof: FinancialMetadataTemporalEvidence,
+    ) -> FinancialCompanyTypeAcquisitionEvidenceBinding:
+        return FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+            instrument_identity=asset.instrument_identity,
+            requested_session=date(2026, 8, 10),
+            temporal_evidence=proof,
+            provider_temporal_proof=(
+                FinancialCompanyTypeProviderTemporalProofBinding.from_temporal_evidence(
+                    provider_id=provider_id,
+                    evidence=proof,
+                    provider_effective_source_field="报告日",
+                )
+                if provider_id == "akshare_sina"
+                else None
+            ),
+            provider_id=provider_id,
+            artifact_identity=proof.artifact.artifact_identity,
+            source_ref=proof.artifact.artifact_identity,
+            observed_at=proof.observed_at,
+            retrieved_at=proof.retrieved_at,
+            provider_declared_type=FinancialCompanyType.BANK,
+            provider_declaration_qualified=True,
+            normalized_resolver_inputs=(
+                FinancialCompanyTypeClassifierInput(
+                    key="metadata:industry",
+                    value="bank",
+                ),
+            ),
+        )
+
+    rejected_proof = _temporal_proof(
+        evidence_class=TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+        artifact_identity="financial-provider-artifact:v1:" + "8" * 64,
+        row_identity="financial-period-candidate:v1:" + "9" * 64,
+        effective=date(2026, 8, 11),
+        effective_semantics=EvidenceEffectiveAsOfSemantics.TUSHARE_STATEMENT_PERIOD_END,
+        effective_source_field="end_date",
+        publication_semantics=(
+            ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS
+        ),
+        ann_source_field="ann_date",
+        first_source_field="f_ann_date",
+    )
+    accepted_proof = _temporal_proof(
+        evidence_class=TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
+        artifact_identity="financial-provider-artifact:v1:" + "a" * 64,
+        row_identity="financial-period-candidate:v1:" + "b" * 64,
+        effective=date(2026, 6, 30),
+        effective_semantics=(
+            EvidenceEffectiveAsOfSemantics.AKSHARE_SINA_STATEMENT_PERIOD_END
+        ),
+        effective_source_field="report_period",
+        publication_semantics=(
+            ProviderPublicationDateSemantics.AKSHARE_SINA_STATEMENT_PUBLICATION_FIELDS
+        ),
+        ann_source_field="公告日期",
+        first_source_field="首次公告日期",
+    )
+
+    def source_for(provider_id: str, proof: FinancialMetadataTemporalEvidence):
+        def source(
+            request: FinancialCompanyTypeEvidenceRoutingRequest,
+        ) -> FinancialCompanyTypeEvidenceProviderProjection:
+            calls.append(provider_id)
+            return FinancialCompanyTypeEvidenceProviderProjection(
+                provider_id=provider_id,
+                metadata_binding=request.metadata_binding,
+                source_projection_kind=f"{provider_id}_statement",
+                evidence=evidence_for(provider_id=provider_id, proof=proof),
+            )
+
+        return source
+
+    transaction = FinancialEligibilityTemporalEvaluationTransaction(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        calendar_binding=_temporal_calendar(evaluated_at),
+    )
+    routed = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        company_type_evidence_sources={
+            "tushare": source_for("tushare", rejected_proof),
+            "akshare_sina": source_for("akshare_sina", accepted_proof),
+        },
+    ).route_company_type_evidence(
+        FinancialCompanyTypeEvidenceRoutingRequest(
+            contract_version="financial-company-type-evidence-routing-request-v2",
+            metadata_binding=company.metadata_binding,
+        ),
+        temporal_transaction=transaction,
+    )
+
+    assert calls == ["tushare", "akshare_sina"]
+    assert routed.selected_provider == "akshare_sina"
+    assert tuple(
+        call.temporal_decision.result
+        for call in routed.provider_calls
+        if call.temporal_decision is not None
+    ) == ("rejected", "accepted")
+    assert transaction.evaluation_count == 2
+    assert routed.physical_attempt_ids == ()
+
+
+@pytest.mark.unit
+def test_temporal_acquirer_preserves_route_order_rejection_when_no_source_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    proof = company.evidence.temporal_evidence
+    assert proof is not None
+    rejected_proof = proof.model_copy(
+        update={"evidence_effective_as_of": date(2026, 8, 11)}
+    )
+    rejected_evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        instrument_identity=asset.instrument_identity,
+        requested_session=date(2026, 8, 10),
+        temporal_evidence=rejected_proof,
+        provider_id="tushare",
+        artifact_identity=rejected_proof.artifact.artifact_identity,
+        source_ref=rejected_proof.artifact.artifact_identity,
+        observed_at=rejected_proof.observed_at,
+        retrieved_at=rejected_proof.retrieved_at,
+        provider_declared_type=FinancialCompanyType.BANK,
+        provider_declaration_qualified=True,
+        normalized_resolver_inputs=(
+            FinancialCompanyTypeClassifierInput(key="metadata:industry", value="bank"),
+        ),
+    )
+    transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
+
+    def source(
+        request: FinancialCompanyTypeEvidenceRoutingRequest,
+    ) -> FinancialCompanyTypeEvidenceProviderProjection:
+        return FinancialCompanyTypeEvidenceProviderProjection(
+            provider_id="tushare",
+            metadata_binding=request.metadata_binding,
+            source_projection_kind="tushare_statement",
+            evidence=rejected_evidence,
+        )
+
+    def transaction_factory(**kwargs):
+        transaction = FinancialEligibilityTemporalEvaluationTransaction(**kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            company_type_evidence_sources={"tushare": source},
+        ),
+        stop_signal=Event(),
+        temporal_transaction_factory=transaction_factory,
+    ).acquire(
+        _temporal_request(asset, plan, evaluated_at=evaluated_at),
+        retained_listing_metadata=(listing,),
+    )
+
+    assert result.context is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
+    )
+    assert result.failure.rejected_temporal_decision is not None
+    assert result.failure.rejected_temporal_decision.result == "rejected"
+    assert len(transactions) == 1
+    assert transactions[0].evaluation_count == 1
+
+
+@pytest.mark.unit
+def test_temporal_company_type_response_binds_requested_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    mismatched_evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        instrument_identity=company.evidence.instrument_identity,
+        requested_session=date(2026, 8, 11),
+        temporal_evidence=company.evidence.temporal_evidence,
+        provider_id=company.evidence.provider_id,
+        artifact_identity=company.evidence.artifact_identity,
+        source_ref=company.evidence.source_ref,
+        observed_at=company.evidence.observed_at,
+        retrieved_at=company.evidence.retrieved_at,
+        provider_declared_type=company.evidence.provider_declared_type,
+        provider_declaration_qualified=(
+            company.evidence.provider_declaration_qualified
+        ),
+        normalized_resolver_inputs=company.evidence.normalized_resolver_inputs,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="company-type evidence acquisition binding mismatch",
+    ):
+        FinancialCompanyTypeEvidenceProviderResponse.available(
+            provider_id="tushare",
+            metadata_binding=company.metadata_binding,
+            source_projection_kind="tushare_statement",
+            evidence=mismatched_evidence,
+            temporal_decision=company.temporal_decision,
+        )
+
+
+@pytest.mark.unit
+def test_fresh_baostock_lifecycle_uses_common_evaluator_and_fails_without_ann_date(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    transport = _FakeBaoStockLifecycleTransport()
+    transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
+    acquired_listing: list[FinancialListingMetadata] = []
+
+    def transaction_factory(**kwargs):
+        transaction = FinancialEligibilityTemporalEvaluationTransaction(**kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        upstream_id, service_name = upstream_service_identity_for_provider("baostock")
+        coordinator.register_upstream_service(upstream_id, service_name)
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(tmp_path / "artifacts"),
+            run_scope_id="ticket-02h-baostock-temporal",
+        )
+        adapter = BaoStockCapabilityAdapter(
+            routing_plan=plan,
+            subrequest_cache=cache,
+            transport=transport,
+            owner_id="ticket-02h-baostock-temporal",
+            now=lambda: _RETRIEVED_AT,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+        )
+
+        def lifecycle_source(request) -> FinancialCapabilityProviderResponse:
+            acquired = adapter.acquire_lifecycle(
+                instrument_identity=request.instrument_identity,
+                as_of_date=request.as_of_date,
+            )
+            assert acquired.listing_metadata is not None
+            assert acquired.artifact is not None
+            acquired_listing.append(acquired.listing_metadata)
+            response = FinancialCapabilityProviderResponse.available(
+                provider_id="baostock",
+                capability=MainlandCapability.ISSUER_LIFECYCLE,
+                retained_artifact_identities=(acquired.artifact.artifact_identity,),
+                candidate_count=1,
+                subrequest_keys=(acquired.subrequest_key,),
+                physical_attempt_ids=tuple(
+                    event.attempt_event_id for event in acquired.attempt_events
+                ),
+                listing_metadata=acquired.listing_metadata,
+            )
+            assert response.contract_version == "financial-capability-provider-response-v2"
+            return response
+
+        router = MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            capability_sources={
+                MainlandCapability.ISSUER_LIFECYCLE: {
+                    "baostock": lifecycle_source,
+                }
+            },
+        )
+        result = FinancialEligibilityMetadataAcquirer(
+            routing_plan=plan,
+            router=router,
+            stop_signal=Event(),
+            temporal_transaction_factory=transaction_factory,
+        ).acquire(
+            _temporal_request(asset, plan, evaluated_at=evaluated_at),
+            retained_company_type_evidence=(company,),
+        )
+
+    assert result.context is None
+    assert result.failure is not None
+    assert transport.lifecycle_calls == 1
+    assert len(acquired_listing) == 1
+    assert len(transactions) == 1
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
+    )
+    decision = result.failure.rejected_temporal_decision
+    assert decision is not None
+    assert decision.evidence_class.value == "baostock_issuer_lifecycle_listing"
+    assert "ann_date_missing" in {reason.value for reason in decision.reasons}
+    assert transactions[0].evaluation_count == 2
+    proof = acquired_listing[0].temporal_evidence
+    assert proof is not None
+    assert proof.evidence_effective_as_of == date(2007, 5, 15)
+    assert proof.ann_date is None
+    assert proof.ann_date_derivation is None
+
+
+@pytest.mark.unit
+def test_fresh_baostock_evaluator_exception_preserves_the_exact_provider_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    evaluated_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
+    company, _listing = _retained_temporal_projections(
+        asset,
+        plan,
+        evaluated_at=evaluated_at,
+    )
+    transport = _FakeBaoStockLifecycleTransport()
+    transactions: list[_FailingTemporalEvaluationTransaction] = []
+    provider_attempt_ids: list[str] = []
+
+    def transaction_factory(**kwargs):
+        transaction = _FailingTemporalEvaluationTransaction(
+            fail_on=2,
+            **kwargs,
+        )
+        transactions.append(transaction)
+        return transaction
+
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        upstream_id, service_name = upstream_service_identity_for_provider("baostock")
+        coordinator.register_upstream_service(upstream_id, service_name)
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(tmp_path / "artifacts"),
+            run_scope_id="ticket-02h-baostock-evaluator-exception",
+        )
+        adapter = BaoStockCapabilityAdapter(
+            routing_plan=plan,
+            subrequest_cache=cache,
+            transport=transport,
+            owner_id="ticket-02h-baostock-evaluator-exception",
+            now=lambda: _RETRIEVED_AT,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+        )
+
+        def lifecycle_source(request) -> FinancialCapabilityProviderResponse:
+            acquired = adapter.acquire_lifecycle(
+                instrument_identity=request.instrument_identity,
+                as_of_date=request.as_of_date,
+            )
+            assert acquired.listing_metadata is not None
+            assert acquired.artifact is not None
+            attempt_ids = tuple(
+                event.attempt_event_id for event in acquired.attempt_events
+            )
+            provider_attempt_ids.extend(attempt_ids)
+            return FinancialCapabilityProviderResponse.available(
+                provider_id="baostock",
+                capability=MainlandCapability.ISSUER_LIFECYCLE,
+                retained_artifact_identities=(acquired.artifact.artifact_identity,),
+                candidate_count=1,
+                subrequest_keys=(acquired.subrequest_key,),
+                physical_attempt_ids=attempt_ids,
+                listing_metadata=acquired.listing_metadata,
+            )
+
+        result = FinancialEligibilityMetadataAcquirer(
+            routing_plan=plan,
+            router=MainlandFinancialCapabilityRouter(
+                routing_plan=plan,
+                statement_sources={},
+                capability_sources={
+                    MainlandCapability.ISSUER_LIFECYCLE: {
+                        "baostock": lifecycle_source,
+                    }
+                },
+            ),
+            stop_signal=Event(),
+            temporal_transaction_factory=transaction_factory,
+        ).acquire(
+            _temporal_request(asset, plan, evaluated_at=evaluated_at),
+            retained_company_type_evidence=(company,),
+        )
+
+    assert result.context is None
+    assert result.failure is not None
+    assert result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE
+    )
+    assert "sensitive-evaluator-detail" not in repr(result)
+    assert transport.lifecycle_calls == 1
+    assert len(provider_attempt_ids) == 1
+    assert len(transactions) == 1
+    assert transactions[0].calls == 2
+    assert transactions[0].evaluation_count == 1
 
 
 @pytest.mark.unit
@@ -1230,7 +2426,7 @@ def test_expired_retained_listing_projection_is_reacquired(
 
 
 @pytest.mark.unit
-def test_expired_listing_observation_is_reacquired(
+def test_listing_observation_local_date_is_not_a_retention_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset = _asset()
@@ -1286,7 +2482,7 @@ def test_expired_listing_observation_is_reacquired(
     )
 
     assert result.outcome == "success"
-    assert calls == 1
+    assert calls == 0
 
 
 @pytest.mark.unit

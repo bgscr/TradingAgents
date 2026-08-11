@@ -30,7 +30,9 @@ from tradingagents.dataflows._akshare_sina_statement_artifacts import (
 )
 from tradingagents.dataflows._akshare_sina_statement_normalization import (
     AkshareSinaStatementRowRejection,
+    AkshareSinaStatementTemporalProofSource,
     project_candidates,
+    project_temporal_proof_sources,
 )
 from tradingagents.dataflows.financial_contracts import (
     FinancialPeriodCandidate,
@@ -171,18 +173,65 @@ class AkshareSinaStatementAdapterResult(BaseModel):
         return self
 
 
+class AkshareSinaStatementAdapterResultV2(AkshareSinaStatementAdapterResult):
+    """Plan-1.3 result retaining exact temporal provider-field aliases."""
+
+    contract_version: Literal["akshare-sina-statement-adapter-v2"] = (
+        "akshare-sina-statement-adapter-v2"
+    )
+    temporal_proof_sources: tuple[AkshareSinaStatementTemporalProofSource, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_temporal_sources(self) -> AkshareSinaStatementAdapterResultV2:
+        candidates = (*self.annual_candidates, *self.reporting_period_candidates)
+        source_by_candidate = {
+            source.candidate_identity: source for source in self.temporal_proof_sources
+        }
+        if len(source_by_candidate) != len(self.temporal_proof_sources):
+            raise ValueError("AKShare-Sina temporal proof sources must be distinct")
+        if set(source_by_candidate) != {
+            candidate.candidate_identity for candidate in candidates
+        }:
+            raise ValueError("AKShare-Sina temporal proof sources are incomplete")
+        for candidate in candidates:
+            source = source_by_candidate[candidate.candidate_identity]
+            if (
+                source.artifact_identity != candidate.artifact.artifact_identity
+                or source.revision_identity != candidate.artifact.artifact_identity
+                or source.row_identity != candidate.candidate_identity
+                or source.evidence_effective_as_of
+                != candidate.period_identity.period_end
+                or source.ann_date != candidate.filing_metadata.ann_date
+                or source.f_ann_date != candidate.filing_metadata.f_ann_date
+            ):
+                raise ValueError(
+                    "AKShare-Sina temporal proof source contradicts its candidate"
+                )
+        return self
+
+
 class AkshareSinaStatementBatchResult(BaseModel):
     """Three independent statement outcomes with no provider fallback policy."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["akshare-sina-statement-batch-v1"] = (
-        "akshare-sina-statement-batch-v1"
-    )
-    results: tuple[AkshareSinaStatementAdapterResult, ...]
+    contract_version: Literal[
+        "akshare-sina-statement-batch-v1",
+        "akshare-sina-statement-batch-v2",
+    ] = "akshare-sina-statement-batch-v1"
+    results: tuple[
+        AkshareSinaStatementAdapterResultV2 | AkshareSinaStatementAdapterResult,
+        ...,
+    ]
 
     @model_validator(mode="after")
     def _validate_results(self) -> AkshareSinaStatementBatchResult:
+        temporal = self.contract_version.endswith("-v2")
+        if any(
+            result.contract_version.endswith("-v2") != temporal
+            for result in self.results
+        ):
+            raise ValueError("AKShare-Sina statement batch version mismatch")
         expected = tuple(_STATEMENT_IDS)
         actual = tuple(result.statement_type for result in self.results)
         if actual != expected:
@@ -276,6 +325,11 @@ class AkshareSinaStatementAdapter:
         """Acquire all three statements sequentially and salvage every sibling."""
 
         return AkshareSinaStatementBatchResult(
+            contract_version=(
+                "akshare-sina-statement-batch-v2"
+                if self._routing_plan.plan_version == "1.3"
+                else "akshare-sina-statement-batch-v1"
+            ),
             results=tuple(
                 self._acquire(
                     statement_type=statement_type,
@@ -367,6 +421,11 @@ class AkshareSinaStatementAdapter:
             media_type="application/json",
             physical_request=physical_request,
         )
+        result_type = (
+            AkshareSinaStatementAdapterResultV2
+            if self._routing_plan.plan_version == "1.3"
+            else AkshareSinaStatementAdapterResult
+        )
         common = {
             "statement_type": statement_type,
             "statement_id": statement_id,
@@ -377,7 +436,7 @@ class AkshareSinaStatementAdapter:
             "attempt_events": subrequest.attempt_events,
         }
         if subrequest.outcome.kind is not ProviderSubrequestOutcomeKind.AVAILABLE:
-            return AkshareSinaStatementAdapterResult(**common)
+            return result_type(**common)
         assert subrequest.value is not None
         assert subrequest.artifact is not None
         payload = decode_provider_artifact(
@@ -398,7 +457,16 @@ class AkshareSinaStatementAdapter:
             range_start=range_start,
             as_of_date=as_of_date,
         )
-        return AkshareSinaStatementAdapterResult(
+        temporal_proof_sources = (
+            project_temporal_proof_sources(
+                payload=payload,
+                row_artifacts=row_artifacts,
+                candidates=(*annual, *reporting),
+            )
+            if result_type is AkshareSinaStatementAdapterResultV2
+            else ()
+        )
+        return result_type(
             **common,
             provider_artifact=subrequest.artifact,
             artifact=artifact,
@@ -406,6 +474,11 @@ class AkshareSinaStatementAdapter:
             annual_candidates=annual,
             reporting_period_candidates=reporting,
             row_rejections=rejections,
+            **(
+                {"temporal_proof_sources": temporal_proof_sources}
+                if result_type is AkshareSinaStatementAdapterResultV2
+                else {}
+            ),
         )
 
 
@@ -525,6 +598,8 @@ __all__ = [
     "AkshareSinaStatementAdapterFailureReason",
     "AkshareSinaStatementBatchResult",
     "AkshareSinaStatementAdapterResult",
+    "AkshareSinaStatementAdapterResultV2",
     "AkshareSinaStatementRowRejection",
+    "AkshareSinaStatementTemporalProofSource",
     "AkshareSinaStatementSdkClient",
 ]

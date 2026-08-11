@@ -15,6 +15,7 @@ from tradingagents.dataflows.financial_contracts import FinancialStatementType
 from tradingagents.dataflows.financial_dispatch import FinancialToolRequest
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
     assert_safe_financial_eligibility_projection,
@@ -98,7 +99,10 @@ def _validate_context_binding(
     assert binding is not None
     if (
         context.contract_version
-        != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
+        not in {
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+        }
         or binding.context_contract_version != context.contract_version
     ):
         _fail(FinancialRequestFactoryFailureReason.CONTEXT_VERSION_MISMATCH)
@@ -121,7 +125,16 @@ def _validate_context_binding(
         _fail(FinancialRequestFactoryFailureReason.INSTRUMENT_IDENTITY_MISMATCH)
     if binding.canonical_symbol != context.instrument_identity.symbol.strip().upper():
         _fail(FinancialRequestFactoryFailureReason.SYMBOL_MISMATCH)
-    if binding.as_of_date != context.as_of_date or tool_request.as_of_date != context.as_of_date:
+    temporal = (
+        context.contract_version
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+    )
+    expected_session = context.requested_session if temporal else context.as_of_date
+    if (
+        (binding.requested_session if temporal else binding.as_of_date)
+        != expected_session
+        or tool_request.as_of_date != expected_session
+    ):
         _fail(FinancialRequestFactoryFailureReason.AS_OF_MISMATCH)
     if binding.availability_scope is not context.availability_scope:
         _fail(FinancialRequestFactoryFailureReason.AVAILABILITY_SCOPE_MISMATCH)
@@ -150,6 +163,8 @@ def _validate_context_binding(
         binding.acquisition_purpose != context.acquisition_purpose
         or binding.currency != context.currency
         or binding.consolidation_scope is not context.consolidation_scope
+        or binding.temporal_eligibility_binding
+        != context.temporal_eligibility_binding
     ):
         _fail(FinancialRequestFactoryFailureReason.CONTEXT_BINDING_MISMATCH)
     return binding
@@ -163,7 +178,12 @@ def _statement_identity(payload: dict[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return "financial-statement-routing-request:v3:" + sha256(encoded).hexdigest()
+    prefix = (
+        "financial-statement-routing-request:v4:"
+        if payload.get("contract_version") == "financial-statement-routing-request-v4"
+        else "financial-statement-routing-request:v3:"
+    )
+    return prefix + sha256(encoded).hexdigest()
 
 
 def _indicator_identity(payload: dict[str, object]) -> str:
@@ -174,7 +194,12 @@ def _indicator_identity(payload: dict[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return "financial-indicator-routing-request:v6:" + sha256(encoded).hexdigest()
+    prefix = (
+        "financial-indicator-routing-request:v7:"
+        if payload.get("contract_version") == "financial-indicator-routing-request-v7"
+        else "financial-indicator-routing-request:v6:"
+    )
+    return prefix + sha256(encoded).hexdigest()
 
 
 def build_financial_statement_routing_request(
@@ -202,15 +227,25 @@ def build_financial_statement_routing_request(
             FinancialRequestFactoryFailureReason.UNSUPPORTED_CAPABILITY
         )
     material_arguments_json = _canonical_material_arguments(tool_request)
+    temporal = (
+        context.contract_version
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+    )
     payload: dict[str, object] = {
-        "contract_version": "financial-statement-routing-request-v3",
+        "contract_version": (
+            "financial-statement-routing-request-v4"
+            if temporal
+            else "financial-statement-routing-request-v3"
+        ),
         "eligibility_policy_version": (
             context.financial_eligibility_binding.eligibility_policy_version
         ),
         "financial_eligibility_binding": context.financial_eligibility_binding,
         "instrument_identity": context.instrument_identity,
         "statement_type": tool_request.statement_type,
-        "as_of_date": context.as_of_date,
+        (
+            "requested_session" if temporal else "as_of_date"
+        ): context.requested_session if temporal else context.as_of_date,
         "company_type": context.company_type_resolution.company_type,
         "consolidation_scope": context.consolidation_scope,
         "currency": context.currency,
@@ -264,15 +299,25 @@ def build_financial_indicator_routing_request(
             FinancialRequestFactoryFailureReason.UNSUPPORTED_CAPABILITY
         )
     material_arguments_json = _canonical_material_arguments(tool_request)
+    temporal = (
+        context.contract_version
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+    )
     payload: dict[str, object] = {
-        "contract_version": "financial-indicator-routing-request-v6",
+        "contract_version": (
+            "financial-indicator-routing-request-v7"
+            if temporal
+            else "financial-indicator-routing-request-v6"
+        ),
         "eligibility_policy_version": (
             context.financial_eligibility_binding.eligibility_policy_version
         ),
         "financial_eligibility_binding": context.financial_eligibility_binding,
         "requested_analysis_scope": context.availability_scope,
         "instrument_identity": context.instrument_identity,
-        "as_of_date": context.as_of_date,
+        (
+            "requested_session" if temporal else "as_of_date"
+        ): context.requested_session if temporal else context.as_of_date,
         "company_type": context.company_type_resolution.company_type,
         "company_type_resolution": context.company_type_resolution,
         "consolidation_scope": context.consolidation_scope,

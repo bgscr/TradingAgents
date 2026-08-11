@@ -15,10 +15,12 @@ from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows import interface, y_finance
 from tradingagents.dataflows.akshare_sina_statements import (
     AkshareSinaStatementAdapter,
+    AkshareSinaStatementAdapterResultV2,
     AkshareSinaStatementSdkClient,
 )
 from tradingagents.dataflows.financial_contracts import (
@@ -407,6 +409,80 @@ def test_complete_non_bank_balance_sheet_uses_sina_endpoint_and_emits_periods(
     assert assessment.strict_pit_eligible is False
     assert assessment.critical_coverage == 1
     assert assessment.core_coverage == 1
+
+
+@pytest.mark.unit
+def test_temporal_adapter_retains_exact_provider_date_aliases_per_candidate(
+    tmp_path,
+) -> None:
+    frame = _non_bank_balance_rows().iloc[[0]].copy(deep=True)
+    frame["首次披露日期"] = "2026-04-18"
+    client = _FakeAkshareSinaClient({"资产负债表": frame})
+    artifact_store = ProviderSubrequestArtifactStore(tmp_path / "artifacts")
+
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_adapter_harness(
+            plan=prepare_mainland_temporal_capability_routing_plan(_qualified_plan()),
+            client=client,
+            store=store,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-02h-akshare-temporal-aliases",
+        )
+        result = harness.adapter.acquire_balance_sheet(
+            instrument_identity=_identity(),
+            range_start=date(2025, 12, 31),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert isinstance(result, AkshareSinaStatementAdapterResultV2)
+    assert len(result.temporal_proof_sources) == 2
+    annual = result.annual_candidates[0]
+    source = next(
+        item
+        for item in result.temporal_proof_sources
+        if item.candidate_identity == annual.candidate_identity
+    )
+    assert source.artifact_identity == annual.artifact.artifact_identity
+    assert source.revision_identity == annual.artifact.artifact_identity
+    assert source.row_identity == annual.candidate_identity
+    assert source.evidence_effective_as_of == date(2025, 12, 31)
+    assert source.evidence_effective_as_of_source_field == "报告日"
+    assert source.ann_date == date(2026, 4, 20)
+    assert source.ann_date_source_field == "公告日期"
+    assert source.f_ann_date == date(2026, 4, 18)
+    assert source.f_ann_date_source_field == "首次披露日期"
+
+
+@pytest.mark.unit
+def test_temporal_statement_batch_uses_a_v2_outer_contract(tmp_path) -> None:
+    client = _FakeAkshareSinaClient(
+        {
+            "资产负债表": _non_bank_balance_rows().iloc[[0]],
+            "利润表": _non_bank_income_rows(),
+            "现金流量表": _non_bank_cash_flow_rows(),
+        }
+    )
+    artifact_store = ProviderSubrequestArtifactStore(tmp_path / "artifacts")
+
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_adapter_harness(
+            plan=prepare_mainland_temporal_capability_routing_plan(_qualified_plan()),
+            client=client,
+            store=store,
+            artifact_store=artifact_store,
+            run_scope_id="ticket-02h-akshare-temporal-batch",
+        )
+        batch = harness.adapter.acquire_statements(
+            instrument_identity=_identity(),
+            range_start=date(2021, 1, 1),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert batch.contract_version == "akshare-sina-statement-batch-v2"
+    assert all(
+        result.contract_version == "akshare-sina-statement-adapter-v2"
+        for result in batch.results
+    )
 
 
 @pytest.mark.unit

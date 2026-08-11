@@ -32,6 +32,9 @@ from tradingagents.dataflows.financial_contracts import FinancialListingProvenan
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialListingMetadata,
 )
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    project_baostock_listing_temporal_evidence,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactRef,
     ProviderSubrequestAttemptEvent,
@@ -69,6 +72,11 @@ _RAW_SCOPE = "raw_daily"
 _FACTOR_SCOPE = "forward_adjustment_factors"
 _STATUS_SCOPE = "session_status"
 _LIFECYCLE_SCOPE = "issuer_lifecycle"
+_LIFECYCLE_ANNOUNCEMENT_DATE_FIELDS = (
+    "announcement_date",
+    "publication_date",
+)
+_LIFECYCLE_FIRST_PUBLICATION_DATE_FIELDS = ("first_publication_date",)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 _CREDENTIAL_FIELD_MARKERS = (
     "api-key",
@@ -309,9 +317,26 @@ class BaoStockLifecycleCandidate(_BaoStockCandidateBase):
     original_out_date: str
     original_type: str
     original_status: str
+    announcement_date: date | None = None
+    announcement_date_source_field: Literal[
+        "announcement_date",
+        "publication_date",
+    ] | None = None
+    first_publication_date: date | None = None
+    first_publication_date_source_field: Literal["first_publication_date"] | None = None
     observed_name: str | None = None
     st_status_established: Literal[False] = False
     current_tradeability_established: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _validate_publication_dates(self):
+        if (self.announcement_date is None) != (
+            self.announcement_date_source_field is None
+        ) or (self.first_publication_date is None) != (
+            self.first_publication_date_source_field is None
+        ):
+            raise ValueError("BaoStock publication date has no exact provider field")
+        return self
 
     def financial_listing_provenance(self) -> FinancialListingProvenance:
         if self.listing_date is None:
@@ -428,15 +453,43 @@ class BaoStockLifecycleAdapterResult(_BaoStockAdapterResultBase):
         ):
             raise ValueError("BaoStock listing metadata has no unique lifecycle candidate")
         candidate = self.candidates[0]
+        temporal = (
+            self.listing_metadata.contract_version
+            == "financial-listing-metadata-v2"
+        )
+        analysis_session = (
+            self.listing_metadata.requested_session
+            if temporal
+            else self.listing_metadata.as_of_date
+        )
+        proof = self.listing_metadata.temporal_evidence
         if (
             ProviderSubrequestInstrumentIdentity.from_authoritative(
                 self.listing_metadata.instrument_identity
             )
             != self.request.instrument_identity
-            or self.listing_metadata.as_of_date != self.request.as_of_date
+            or analysis_session != self.request.as_of_date
             or candidate.listing_date != self.listing_metadata.listing_date
             or candidate.financial_listing_provenance()
             != self.listing_metadata.listing_provenance
+            or (
+                temporal
+                and (
+                    proof is None
+                    or proof.artifact.artifact_identity
+                    != candidate.artifact_identity
+                    or proof.artifact.revision_identity
+                    != candidate.artifact_identity
+                    or proof.artifact.row_identity
+                    != candidate.row_artifact_identities[0]
+                    or proof.ann_date != candidate.announcement_date
+                    or getattr(proof.ann_date_derivation, "source_field", None)
+                    != candidate.announcement_date_source_field
+                    or proof.f_ann_date != candidate.first_publication_date
+                    or getattr(proof.f_ann_date_derivation, "source_field", None)
+                    != candidate.first_publication_date_source_field
+                )
+            )
         ):
             raise ValueError("BaoStock listing metadata contradicts lifecycle provenance")
         return self
@@ -693,6 +746,23 @@ def _optional_decimal(value: object) -> tuple[Decimal | None, str]:
 
 def _provider_date(value: object) -> date:
     return date.fromisoformat(str(value).strip())
+
+
+def _provider_publication_date(
+    value: Mapping[str, object],
+    fields: tuple[str, ...],
+) -> tuple[date | None, str | None]:
+    populated = tuple(
+        (field, str(value.get(field) or "").strip())
+        for field in fields
+        if str(value.get(field) or "").strip()
+    )
+    if not populated:
+        return None, None
+    parsed = tuple((field, date.fromisoformat(raw)) for field, raw in populated)
+    if len({item[1] for item in parsed}) != 1:
+        raise ValueError("BaoStock publication fields contradict each other")
+    return parsed[0][1], parsed[0][0]
 
 
 def _transport_capability_outcome(
@@ -995,11 +1065,37 @@ class BaoStockCapabilityAdapter:
         )
         listing_metadata = None
         if len(candidates) == 1 and candidates[0].listing_date is not None:
+            candidate = candidates[0]
+            temporal = self._plan.plan_version == "1.3"
+            temporal_evidence = (
+                project_baostock_listing_temporal_evidence(
+                    artifact_identity=candidate.artifact_identity,
+                    row_identity=candidate.row_artifact_identities[0],
+                    listing_date=candidate.listing_date,
+                    observed_at=candidate.observed_at,
+                    retrieved_at=candidate.retrieved_at,
+                    ann_date=candidate.announcement_date,
+                    ann_date_source_field=candidate.announcement_date_source_field,
+                    f_ann_date=candidate.first_publication_date,
+                    f_ann_date_source_field=(
+                        candidate.first_publication_date_source_field
+                    ),
+                )
+                if temporal
+                else None
+            )
             listing_metadata = FinancialListingMetadata(
+                contract_version=(
+                    "financial-listing-metadata-v2"
+                    if temporal
+                    else "financial-listing-metadata-v1"
+                ),
                 instrument_identity=instrument_identity,
-                as_of_date=as_of_date,
-                listing_date=candidates[0].listing_date,
-                listing_provenance=candidates[0].financial_listing_provenance(),
+                as_of_date=None if temporal else as_of_date,
+                requested_session=as_of_date if temporal else None,
+                listing_date=candidate.listing_date,
+                listing_provenance=candidate.financial_listing_provenance(),
+                temporal_evidence=temporal_evidence,
             )
         return BaoStockLifecycleAdapterResult(
             request=key,
@@ -1450,6 +1546,18 @@ def _lifecycle_candidates(
                 raise LookupError
             if original_status not in {"", "0", "1"}:
                 raise ValueError
+            announcement_date, announcement_date_source_field = (
+                _provider_publication_date(
+                    value,
+                    _LIFECYCLE_ANNOUNCEMENT_DATE_FIELDS,
+                )
+            )
+            first_publication_date, first_publication_date_source_field = (
+                _provider_publication_date(
+                    value,
+                    _LIFECYCLE_FIRST_PUBLICATION_DATE_FIELDS,
+                )
+            )
             ipo_date = date.fromisoformat(original_ipo) if original_ipo else None
             out_date = date.fromisoformat(original_out) if original_out else None
             if ipo_date is not None and ipo_date > as_of_date:
@@ -1481,6 +1589,14 @@ def _lifecycle_candidates(
                     original_out_date=original_out,
                     original_type=original_type,
                     original_status=original_status,
+                    announcement_date=announcement_date,
+                    announcement_date_source_field=(
+                        announcement_date_source_field
+                    ),
+                    first_publication_date=first_publication_date,
+                    first_publication_date_source_field=(
+                        first_publication_date_source_field
+                    ),
                     observed_name=(
                         str(value.get("code_name")).strip()
                         if value.get("code_name") is not None

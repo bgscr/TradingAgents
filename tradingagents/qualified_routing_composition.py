@@ -43,6 +43,7 @@ from tradingagents.capability_routing import (
 )
 from tradingagents.dataflows.akshare_sina_statements import (
     AkshareSinaStatementAdapter,
+    AkshareSinaStatementAdapterResultV2,
 )
 from tradingagents.dataflows.baostock_capabilities import (
     BAOSTOCK_CAPABILITY_NORMALIZER_VERSION,
@@ -58,6 +59,7 @@ from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
     FinancialCapabilitySource,
+    FinancialCompanyTypeEvidenceProviderProjection,
     FinancialCompanyTypeEvidenceProviderResponse,
     FinancialCompanyTypeEvidenceRoutingRequest,
     FinancialCompanyTypeEvidenceSource,
@@ -95,6 +97,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
+    FinancialCompanyTypeProviderTemporalProofBinding,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
     FinancialListingMetadataProjection,
@@ -113,6 +116,11 @@ from tradingagents.dataflows.financial_indicator_metadata import (
 from tradingagents.dataflows.financial_request_factory import (
     build_financial_indicator_routing_request,
     build_financial_statement_routing_request,
+)
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    TemporalProofProjectionUnavailable,
+    project_akshare_sina_company_type_temporal_evidence,
+    project_tushare_company_type_temporal_evidence,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -157,6 +165,7 @@ from tradingagents.evidence import (
     EvidenceState,
     InstrumentKind,
 )
+from tradingagents.market_history.calendar import StoredSessionCalendar
 from tradingagents.market_history.config import (
     DataUsageMode,
     MarketHistoryConfig,
@@ -488,6 +497,16 @@ class ProductionFinancialEligibilityRuntimeInputs:
 
     financial_routing: object = field(repr=False, compare=False)
     metadata_acquirer: object = field(repr=False, compare=False)
+    eligibility_clock: Callable[[], datetime] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    eligibility_calendar_provider: Callable[[], StoredSessionCalendar] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     retained_company_type_evidence: tuple[
         FinancialCompanyTypeEvidenceProjection, ...
     ] = field(default=(), repr=False, compare=False)
@@ -498,8 +517,21 @@ class ProductionFinancialEligibilityRuntimeInputs:
     )
 
     def __post_init__(self) -> None:
-        if self.financial_routing is None or not callable(
-            getattr(self.metadata_acquirer, "acquire", None)
+        routing_plan = getattr(
+            getattr(self.financial_routing, "router", None),
+            "routing_plan",
+            None,
+        )
+        if (
+            self.financial_routing is None
+            or not callable(getattr(self.metadata_acquirer, "acquire", None))
+            or (
+                getattr(routing_plan, "plan_version", None) == "1.3"
+                and (
+                    not callable(self.eligibility_clock)
+                    or not callable(self.eligibility_calendar_provider)
+                )
+            )
         ):
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
@@ -599,6 +631,16 @@ class ProductionQualifiedRoutingRuntimeAssembly:
     source_composition: object | None = field(default=None, repr=False, compare=False)
     dependencies: object | None = field(default=None, repr=False, compare=False)
     eligibility_metadata_acquirer: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    eligibility_clock: Callable[[], datetime] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    eligibility_calendar_provider: Callable[[], StoredSessionCalendar] | None = field(
         default=None,
         repr=False,
         compare=False,
@@ -1667,6 +1709,10 @@ class RegisteredProductionQualifiedRoutingComposition:
             eligibility_inputs = ProductionFinancialEligibilityRuntimeInputs(
                 financial_routing=financial_routing,
                 metadata_acquirer=assembly.eligibility_metadata_acquirer,
+                eligibility_clock=assembly.eligibility_clock,
+                eligibility_calendar_provider=(
+                    assembly.eligibility_calendar_provider
+                ),
                 retained_company_type_evidence=(
                     assembly.retained_company_type_evidence
                 ),
@@ -2820,21 +2866,30 @@ def _statement_company_type_evidence_source(
 
     def source(
         request: FinancialCompanyTypeEvidenceRoutingRequest,
-    ) -> FinancialCompanyTypeEvidenceProviderResponse:
-        as_of_date = request.metadata_binding.as_of_date
+    ) -> (
+        FinancialCompanyTypeEvidenceProviderResponse
+        | FinancialCompanyTypeEvidenceProviderProjection
+    ):
+        temporal = (
+            request.metadata_binding.contract_version
+            == "financial-eligibility-metadata-binding-v2"
+        )
+        as_of_date = (
+            request.metadata_binding.requested_session
+            if temporal
+            else request.metadata_binding.as_of_date
+        )
+        if as_of_date is None:
+            raise ValueError("company-type evidence request has no analysis session")
         target_period = date(as_of_date.year - 1, 12, 31)
-        period_response = _statement_adapter_source(
+        adapter_result = adapter.acquire_balance_sheet(
+            instrument_identity=request.metadata_binding.instrument_identity,
+            range_start=target_period,
+            as_of_date=as_of_date,
+        )
+        period_response = financial_period_response_from_statement_adapter(
             provider_id=provider_id,
-            adapter=adapter,
-        )(
-            FinancialProviderGapRequest(
-                provider_id=provider_id,
-                instrument_identity=request.metadata_binding.instrument_identity,
-                statement_type=FinancialStatementType.BALANCE_SHEET,
-                as_of_date=as_of_date,
-                missing_annual_period_ends=(target_period,),
-                missing_reporting_period_ends=(),
-            )
+            result=adapter_result,
         )
         if period_response.kind.value != "available" or not period_response.candidates:
             return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
@@ -2855,9 +2910,59 @@ def _statement_company_type_evidence_source(
             ),
         )
         resolution = candidate.company_type_resolution
+        temporal_evidence = None
+        provider_temporal_proof = None
+        if temporal:
+            try:
+                if provider_id == "tushare":
+                    temporal_evidence = (
+                        project_tushare_company_type_temporal_evidence(candidate)
+                    )
+                else:
+                    if not isinstance(
+                        adapter_result,
+                        AkshareSinaStatementAdapterResultV2,
+                    ):
+                        raise ValueError("AKShare temporal adapter proof is unavailable")
+                    proof_source = next(
+                        (
+                            item
+                            for item in adapter_result.temporal_proof_sources
+                            if item.candidate_identity == candidate.candidate_identity
+                        ),
+                        None,
+                    )
+                    if proof_source is None:
+                        raise ValueError("AKShare temporal row proof is unavailable")
+                    temporal_evidence = (
+                        project_akshare_sina_company_type_temporal_evidence(
+                            candidate,
+                            proof_source,
+                        )
+                    )
+                    provider_temporal_proof = (
+                        FinancialCompanyTypeProviderTemporalProofBinding.from_temporal_evidence(
+                            provider_id=provider_id,
+                            evidence=temporal_evidence,
+                            provider_effective_source_field=(
+                                proof_source.evidence_effective_as_of_source_field
+                            ),
+                        )
+                    )
+            except (TemporalProofProjectionUnavailable, ValueError):
+                return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
+                    provider_id=provider_id,
+                    metadata_binding=request.metadata_binding,
+                    reason=AcquisitionUnavailableReason.INTEGRITY_FAILURE,
+                    subrequest_keys=period_response.subrequest_keys,
+                    physical_attempt_ids=period_response.physical_attempt_ids,
+                )
         evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
             instrument_identity=request.metadata_binding.instrument_identity,
-            as_of_date=as_of_date,
+            as_of_date=None if temporal else as_of_date,
+            requested_session=as_of_date if temporal else None,
+            temporal_evidence=temporal_evidence,
+            provider_temporal_proof=provider_temporal_proof,
             provider_id=provider_id,
             artifact_identity=candidate.artifact.artifact_identity,
             source_ref=candidate.artifact.artifact_identity,
@@ -2869,6 +2974,15 @@ def _statement_company_type_evidence_source(
             ),
             normalized_resolver_inputs=resolution.classifier_inputs,
         )
+        if temporal:
+            return FinancialCompanyTypeEvidenceProviderProjection(
+                provider_id=provider_id,
+                metadata_binding=request.metadata_binding,
+                source_projection_kind=projection_kind,
+                evidence=evidence,
+                subrequest_keys=period_response.subrequest_keys,
+                physical_attempt_ids=period_response.physical_attempt_ids,
+            )
         return FinancialCompanyTypeEvidenceProviderResponse.available(
             provider_id=provider_id,
             metadata_binding=request.metadata_binding,
@@ -3384,10 +3498,18 @@ def _external_request_material(
             identity = request.instrument_identity
             as_of_date = request.as_of_date
         elif isinstance(request, FinancialCompanyTypeEvidenceRoutingRequest):
-            identity = request.metadata_binding.instrument_identity
-            as_of_date = request.metadata_binding.as_of_date
+            binding = request.metadata_binding
+            identity = binding.instrument_identity
+            as_of_date = (
+                binding.requested_session
+                if binding.contract_version
+                == "financial-eligibility-metadata-binding-v2"
+                else binding.as_of_date
+            )
         else:
             raise ValueError("qualified Yahoo profile request is invalid")
+        if as_of_date is None:
+            raise ValueError("qualified Yahoo profile request session is unavailable")
         return (
             identity,
             as_of_date,
@@ -4259,6 +4381,10 @@ def _assemble_production_qualified_runtime(
         source_composition=source_composition,
         dependencies=dependencies,
         eligibility_metadata_acquirer=eligibility_metadata_acquirer,
+        eligibility_clock=dependencies.now,
+        eligibility_calendar_provider=lambda: coordinator_store.read_current_session_calendar(
+            "mainland-cn"
+        ),
     )
 
 
