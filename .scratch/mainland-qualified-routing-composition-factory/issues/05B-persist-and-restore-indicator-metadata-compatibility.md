@@ -15,7 +15,7 @@ resume as plan 1.2.
 Truthful provider indicator normalization and compatibility
 evaluation; 05A — Bind and restore eligibility context through checkpoints.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

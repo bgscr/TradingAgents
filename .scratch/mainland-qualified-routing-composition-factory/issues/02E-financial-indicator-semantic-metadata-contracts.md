@@ -14,7 +14,7 @@ eligibility, current-only, strict-PIT, or Evidence Admission behavior.
 **Blocked by:** 01 — Add the production composition contract and immutable
 blueprint; accepted QCF4 metadata-compatibility prototype report.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

@@ -12,7 +12,7 @@ truthful artifact-bound metadata.
 
 **Blocked by:** 02E — Financial-indicator semantic metadata contracts.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 

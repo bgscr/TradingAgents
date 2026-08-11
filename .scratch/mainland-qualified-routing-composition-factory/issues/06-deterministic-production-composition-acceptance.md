@@ -6,21 +6,26 @@
 bullet through the real deterministic CLI and programmatic host builders, graph,
 checkpoint-aware dispatcher, qualified router, production adapters, shared
 Provider Subrequest Cache, Provider Request Coordinator, immutable artifacts,
-checkpoint/report/audit publication, and managed cleanup. Produce a traceability
-record for QCF1–QCF18, rerun PE1–PE15 and parent AC1–AC13 unchanged, run the full
-suite twice, and complete Spec Compliance review before Code Quality review.
-Any failure blocks Ticket 07.
+checkpoint/report/audit publication, and managed cleanup. After Ticket 06B
+passes, produce a new plan-1.3/context-v2 traceability record for the complete
+QCF1–QCF18 set, rerun PE1–PE15 and parent AC1–AC13 unchanged, run the full suite
+twice, and complete Spec Compliance review before Code Quality review. The
+2026-08-10 pre-temporal pass remains immutable historical evidence but does not
+satisfy the amended contract. Any amended failure blocks Ticket 07.
 
 **Blocked by:** 03 — Add static registration and caller precedence; 02D — Add
 executable production-source wiring; 04A — Integrate managed eligibility-context
 acquisition; 05B — Persist and restore indicator metadata compatibility; 06A —
-Correct QCF4 deterministic acceptance.
+Correct QCF4 deterministic acceptance; 06B — Run deterministic temporal
+acceptance.
 
-**Status:** COMPLETE
+**Status:** blocked
 
-**Acceptance state:** PASS and complete on 2026-08-10. Prerequisites 02E, 02F,
-05B, and 06A are complete; corrected QCF4 passed before QCF5–QCF12. This clears
-Ticket 07's blocker but does not execute Ticket 07 or authorize rollout.
+**Acceptance state:** The pre-temporal contract passed on 2026-08-10 and its
+evidence below remains immutable. The amended temporal contract is pending: 06B
+must pass first, then every QCF1–QCF18, PE1–PE15, AC1–AC13, non-integration/full
+suite, Ruff, history/security/diff, and two-stage-review requirement must be
+rerun completely. Ticket 07 remains blocked and no rollout is authorized.
 
 ## Observable behavior
 
@@ -31,6 +36,13 @@ Ticket 07's blocker but does not execute Ticket 07 or authorize rollout.
 - QCF4–QCF12 each begin from a new built-in run with no manually seeded
   eligibility context, callable runtime, or checkpoint. The run must originate
   and bind its own immutable context before ordinary factory/dispatcher use.
+- New acceptance uses Capability Routing Plan 1.3 and Financial Eligibility
+  Acquisition Context v2. Fresh and retained company-type/listing evidence is
+  decided by the one temporal evaluator under one fixed evaluation instant and
+  pinned Market Session Calendar binding.
+- QCF11 proves one context-level temporal evaluation transaction for concurrent
+  first acquisition. QCF12 proves exact accepted/rejected temporal replay with
+  no restore-time clock, evaluator, or today's-calendar-frontier lookup.
 - The matrix covers complete and partial Tushare, AKShare-Sina salvage, Yahoo
   degraded/current-only terminal fallback, BaoStock tradeable/suspended and
   strict-bundle authority, factor/name separation, ratio families, exact
@@ -43,7 +55,11 @@ Ticket 07's blocker but does not execute Ticket 07 or authorize rollout.
   manifests, audits, snapshots, pins, provider rows, and IDs remain
   byte-for-byte untouched and readable.
 
-## Acceptance criteria
+## Preserved pre-temporal acceptance criteria
+
+The checked QCF1–QCF18 rows below record the immutable 2026-08-10 pass under the
+pre-temporal contract. Their IDs, scenarios, and strength remain part of the
+amended gate; the check marks do not represent a plan-1.3/context-v2 pass.
 
 QCF1–QCF18 retain their IDs and authority. QCF1–QCF3 and QCF5–QCF18 retain
 their scenarios and pass/fail meaning; QCF4 alone uses the corrected semantics
@@ -138,10 +154,52 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   by the full supported suite twice, Ruff, whitespace, and diff/scope checks,
   all without waiver.
 
+## Amended acceptance criteria
+
+- [ ] Ticket 06B passes its complete temporal matrix before the Ticket 06 rerun
+  begins. Focused temporal tests alone cannot satisfy or partially clear this
+  ticket.
+- [ ] **QCF1–QCF10:** rerun every preserved scenario above from the amended tree
+  without waiver. QCF4–QCF10 use plan 1.3/context v2, provider-derived temporal
+  proof, the one evaluator, a pinned calendar binding, and the same or stronger
+  fresh-origin, metadata-truthfulness, route, attempt, cache, and authority
+  assertions.
+- [ ] **QCF11 — Temporal single-flight:** in addition to every preserved
+  single-flight/bulk assertion, concurrent first use performs one company-type
+  resolution, one compatible listing acquisition, exactly one context-level
+  temporal evaluation transaction under one fixed
+  `eligibility_evaluated_at`, one terminal decision binding, and one context
+  bind; no follower samples a clock or invokes the evaluator.
+- [ ] **QCF12 — Temporal exact restoration:** a fresh plan-1.3/context-v2 run
+  produces cache checkpoint 1.2, dispatch ledger 1.6, and manifest v4 state.
+  Exact restore reproduces temporal policy/calendar bindings, fixed evaluation
+  inputs, provider proof/timestamps, accepted/rejected decisions/results/reasons,
+  semantic compatibility, dispatcher/cache state, attempts, artifacts, and IDs
+  with zero I/O, permits, attempts, evaluator/clock calls, or consultation of
+  today's calendar frontier. Plan-1.2/context-v1 under plan 1.3 fails typed or
+  requires explicit `START_NEW` without repair.
+- [ ] **QCF13–QCF15:** rerun every preserved pre-open, lifecycle, and security
+  assertion and additionally cover invalid temporal/calendar/context bindings,
+  failure at every temporal projection/evaluation/bind boundary, and proof/
+  timestamp/reason canaries without leaking raw provider data or credentials.
+- [ ] **QCF16:** legacy-selected output, daily AKShare → BaoStock → Yahoo,
+  Evidence Admission, Decision Gate, BaoStock authority, and
+  `shadow_non_authoritative` disposition remain unchanged under temporal
+  forward contracts; authoritative `qualified_v1` remains disabled.
+- [ ] **QCF17 — Forward-only history:** historical material—including the
+  failed Ticket 07 run—is byte-for-byte untouched and read only under its
+  recorded semantic/temporal contract. New material uses the exact
+  plan-1.3/context-v2/cache-1.2/ledger-1.6/manifest-v4 versions with no rewrite,
+  migration, relabeling, reinterpretation, deletion, or ID reuse.
+- [ ] **QCF18:** rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13,
+  non-integration/full suites twice, Ruff, whitespace/diff, secret/history
+  checks, and Spec Compliance then Code Quality review from the same amended
+  tree. Any failure or waiver keeps Tickets 06 and 07 blocked.
+
 ## Deterministic regressions
 
-- Run every focused test added by Tickets 01–05, 02A–02F, 04A, 05A, 05B, and
-  06A plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
+- Run every focused test added by Tickets 01–05, 02A–02H, 04A, 05A–05C, 06A,
+  and 06B plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
   dispatch, report, audit, Evidence Admission, Decision Gate, Current
   Tradeability, strict-history, and daily-market tests.
 - Cover exact attempt cardinality for success, retry, capacity cooldown, skip,
@@ -156,6 +214,10 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   without altering fixtures or expected results.
 - Run the complete supported suite twice from the identical code tree and
   compare deterministic results.
+- Rerun every 06B temporal case at the integrated QCF seam, including the real
+  next-day 00:48 Shanghai case, next-session-close frontier, weekends/holidays,
+  strict-cutoff/exact-revision controls, every-case zero-I/O replay, and 32
+  followers sharing one temporal evaluation.
 
 ## Compatibility and migration behavior
 
@@ -163,10 +225,12 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   content-addressed artifact behavior. It does not clear, recycle, repair, or
   overwrite historical state.
 - Historical checkpoints retain their recorded-version read behavior and are
-  never reinterpreted or upgraded in place. A plan-1.2 restore from an old or
-  absent metadata-compatibility checkpoint fails typed or requires explicit
-  `START_NEW`, with zero I/O and no repair.
-- Capability Routing Plan 1.2 remains the sole routing authority. The unchanged
+  never reinterpreted or upgraded in place. A plan-1.3 restore from plan-1.2/
+  context-v1, old/absent temporal state, or mismatched metadata compatibility
+  fails typed or requires explicit `START_NEW`, with zero I/O, no restore-time
+  calendar frontier, and no repair.
+- Capability Routing Plan 1.3 remains the sole routing authority and preserves
+  all plan-1.2 semantic bindings. The unchanged
   completeness gates (100% critical and at least 90% declared-core), financial-
   period eligibility v2, current-only/strict-PIT boundaries,
   Evidence Admission, Decision Gate, Strategy Rules, BaoStock status/lifecycle/
@@ -179,6 +243,8 @@ runnable or passing until Ticket 06A passes corrected QCF4.
 
 - Live Tushare, AKShare, Yahoo, or BaoStock calls; paid models; live
   qualification caches; real credentials; or the two-symbol rollout.
+- Copying or importing the temporal prototype implementation, rewriting the
+  failed Ticket 07 run, or treating its historical evidence as plan-1.3 proof.
 - Enabling/recommending \`qualified_v1\`, changing activation gates, provider
   routes/order, thresholds, eligibility, revision selection, evidence/decision
   authority, BaoStock authority, daily routing, or shadow disposition.
@@ -194,6 +260,7 @@ runnable or passing until Ticket 06A passes corrected QCF4.
 Run production-composition and provider focused suites:
 
 \`\`\`powershell
+pytest -q tests/test_financial_metadata_temporal_eligibility.py tests/test_financial_temporal_proof_projection.py tests/test_financial_temporal_checkpoint_compatibility.py
 pytest -q tests/test_qualified_routing_composition_contract.py tests/test_production_qualified_provider_composition.py tests/test_qualified_routing_static_registration.py tests/test_qualified_routing_managed_lifecycle.py tests/test_qualified_routing_factory_checkpoint_restore.py
 pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_financial_eligibility_metadata_acquisition.py tests/test_financial_request_factory_context_binding.py
 pytest -q tests/test_qualified_production_source_bindings.py tests/test_qualified_routing_eligibility_context_lifecycle.py tests/test_qualified_routing_checkpoint_context_restore.py
@@ -225,7 +292,11 @@ No command in this ticket may select integration tests or contact a live
 provider/model. If a test would do so, stop and correct the deterministic seam
 instead of running it.
 
-## Acceptance evidence — 2026-08-10
+## Historical pre-temporal acceptance evidence — 2026-08-10
+
+This evidence is immutable and remains valid for the contract it tested. It is
+not amended plan-1.3/context-v2 evidence and does not clear 06B, Ticket 06, or
+Ticket 07.
 
 All deterministic pytest invocations explicitly set
 `RUN_LIVE_DEEPSEEK_TESTS=0`, `RUN_LIVE_TUSHARE_TESTS=0`, and
@@ -397,9 +468,11 @@ Legacy authority and bytes remain unchanged; qualified output remains
 → Yahoo; BaoStock remains Current Tradeability and strict-history authority;
 Evidence Admission and Decision Gate remain unchanged. Authoritative
 `qualified_v1` remains disabled. Ticket 07 was neither implemented nor run; its
-blocker is cleared only by this completed evidence package.
+pre-temporal blocker was considered cleared by this completed evidence package.
+The temporal amendment supersedes that gate: Ticket 07 is currently blocked by
+06B and the complete amended Ticket 06 rerun.
 
-## Definition of done
+## Historical pre-temporal definition of done
 
 - [x] A durable traceability record maps QCF1–QCF18, PE1–PE15, and parent
   AC1–AC13 to named deterministic tests, commands, evidence, and passing results.
@@ -416,3 +489,19 @@ blocker is cleared only by this completed evidence package.
   unrelated changes. All Critical and Important findings are resolved.
 - [x] Authoritative \`qualified_v1\` remains disabled, no live traffic occurred,
   and Ticket 07 is unblocked only by a complete passing evidence package.
+
+## Amended definition of done
+
+- [ ] Ticket 06B passes before a complete new QCF1–QCF18 rerun begins.
+- [ ] A durable plan-1.3/context-v2 traceability record maps every QCF1–QCF18,
+  PE1–PE15, and AC1–AC13 ID to named deterministic tests, commands, and results
+  without weakening the preserved pre-temporal criteria.
+- [ ] Focused temporal/composition suites, non-integration, two full-suite
+  passes, Ruff, whitespace/diff, secret/raw-error, historical immutability, and
+  scope/dependency checks all pass from the same tree without live work.
+- [ ] Stage 1 Spec Compliance review passes before Stage 2 Code Quality review;
+  all Critical and Important findings are resolved and the classification is
+  recorded.
+- [ ] The failed Ticket 07 run remains immutable, Ticket 07 is unblocked only by
+  both 06B and this complete amended rerun plus fresh live authorization, and
+  authoritative `qualified_v1` remains disabled.

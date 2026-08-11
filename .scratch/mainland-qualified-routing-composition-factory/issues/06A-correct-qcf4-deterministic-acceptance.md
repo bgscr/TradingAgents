@@ -17,7 +17,7 @@ acquisition; 02F — Truthful provider indicator normalization and
 compatibility evaluation; 05B — Persist and restore indicator metadata
 compatibility.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Observable behavior
 
