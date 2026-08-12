@@ -801,6 +801,7 @@ class MainlandCapabilityRoutingCheckpointFailureReason(str, Enum):
     INDICATOR_METADATA_COMPATIBILITY_MISMATCH = (
         "indicator_metadata_compatibility_mismatch"
     )
+    TEMPORAL_COMPATIBILITY_MISMATCH = "temporal_compatibility_mismatch"
 
 
 class MainlandCapabilityRoutingCheckpointError(ValueError):
@@ -898,11 +899,30 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 raise ValueError(
                     "indicator-mismatch new-run state requires distinct run identities"
                 )
+        elif self.reason is (
+            MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+        ):
+            if (
+                self.checkpoint is None
+                or self.checkpoint.mode is MainlandCapabilityRoutingMode.LEGACY
+                or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
+                or self.active.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                or self.checkpoint.plan_version
+                == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                or self.active.temporal_contract_bindings is None
+                or self.previous_run_id is None
+                or self.new_run_id is None
+                or self.previous_run_id == self.new_run_id
+            ):
+                raise ValueError(
+                    "temporal-mismatch new-run state requires distinct run identities"
+                )
         else:
             raise ValueError("new-run routing decision requires a legacy mismatch")
         if self.reason not in {
             MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH,
             MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+            MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH,
         } and (
             self.previous_run_id is not None or self.new_run_id is not None
         ):
@@ -970,6 +990,15 @@ def validate_mainland_capability_routing_checkpoint(
             MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
         )
     if (
+        active_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+        and restored.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_3
+        and restored.mode is not MainlandCapabilityRoutingMode.LEGACY
+        and active_plan.mode is not MainlandCapabilityRoutingMode.LEGACY
+    ):
+        raise MainlandCapabilityRoutingCheckpointError(
+            MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+        )
+    if (
         active_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION
         and restored.plan_version != CAPABILITY_ROUTING_PLAN_VERSION
         and restored.mode is not MainlandCapabilityRoutingMode.LEGACY
@@ -1031,6 +1060,7 @@ def start_new_mainland_capability_routing_run(
         if exc.reason not in {
             MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH,
             MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+            MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH,
         }:
             raise
         mismatch_reason = exc.reason

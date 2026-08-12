@@ -473,15 +473,22 @@ class FinancialEligibilityAcquisitionContextOwner:
                 self._fail_binding()
             try:
                 cache = raw.provider_subrequest_cache
-                if (
-                    cache is not None
-                    and context.contract_version
-                    != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
-                ):
-                    # Ticket 05C owns context-v2 cache/checkpoint persistence.
+                if cache is not None:
                     cache.bind_financial_eligibility_context(
                         context_contract_version=context.contract_version,
                         context_identity=context.context_identity,
+                        context=(
+                            context
+                            if context.contract_version
+                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            else None
+                        ),
+                        capability_routing_plan=(
+                            self._routing_plan
+                            if context.contract_version
+                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            else None
+                        ),
                     )
                 bound = QualifiedFinancialRoutingComposition(
                     router=raw.router,
@@ -528,6 +535,18 @@ class FinancialEligibilityAcquisitionContextOwner:
                     cache.bind_financial_eligibility_context(
                         context_contract_version=context.contract_version,
                         context_identity=context.context_identity,
+                        context=(
+                            context
+                            if context.contract_version
+                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            else None
+                        ),
+                        capability_routing_plan=(
+                            self._routing_plan
+                            if context.contract_version
+                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            else None
+                        ),
                     )
                 except Exception:
                     self._fail_binding()

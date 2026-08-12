@@ -18,6 +18,9 @@ from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
 )
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    FinancialTemporalEligibilityCheckpointProjection,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
 )
@@ -52,6 +55,7 @@ FINANCIAL_PROVIDER_CANDIDATE_V2 = "financial-provider-candidate-v2"
 FINANCIAL_MANIFEST_V1 = "financial-manifest-v1"
 FINANCIAL_MANIFEST_V2 = "financial-manifest-v2"
 FINANCIAL_MANIFEST_V3 = "financial-manifest-v3"
+FINANCIAL_MANIFEST_V4 = "financial-manifest-v4"
 FINANCIAL_FAMILY_REQUIREMENTS_V1 = "financial-family-requirements-v1"
 FINANCIAL_FAMILY_ASSESSMENT_V2 = "financial-family-assessment-v2"
 FINANCIAL_FAMILY_AGGREGATE_V2 = "financial-family-aggregate-v2"
@@ -4836,6 +4840,7 @@ def _manifest_identity_payload(
         "financial-manifest-v1",
         "financial-manifest-v2",
         "financial-manifest-v3",
+        "financial-manifest-v4",
     ],
     capability_routing_plan_signature: str,
     instrument_identity: InstrumentIdentityEvidence,
@@ -4882,6 +4887,9 @@ def _manifest_identity_payload(
     selected_families: Sequence[FinancialRatioFamily] = (),
     unselected_families: Sequence[FinancialRatioFamily] = (),
     unresolved_families: Sequence[FinancialRatioFamily] = (),
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "contract_version": contract_version,
@@ -4917,7 +4925,11 @@ def _manifest_identity_payload(
         payload["revision_selections"] = [
             item.model_dump(mode="json") for item in revision_selections
         ]
-    if contract_version in {FINANCIAL_MANIFEST_V2, FINANCIAL_MANIFEST_V3}:
+    if contract_version in {
+        FINANCIAL_MANIFEST_V2,
+        FINANCIAL_MANIFEST_V3,
+        FINANCIAL_MANIFEST_V4,
+    }:
         payload.update(
             {
                 "physical_attempt_events": [
@@ -4959,7 +4971,7 @@ def _manifest_identity_payload(
             payload["financial_eligibility_binding"] = (
                 financial_eligibility_binding.model_dump(mode="json")
             )
-    if contract_version == FINANCIAL_MANIFEST_V3:
+    if contract_version in {FINANCIAL_MANIFEST_V3, FINANCIAL_MANIFEST_V4}:
         payload.update(
             {
                 "indicator_field_semantics_version": (
@@ -4981,6 +4993,12 @@ def _manifest_identity_payload(
                 "unresolved_families": [item.value for item in unresolved_families],
             }
         )
+    if contract_version == FINANCIAL_MANIFEST_V4:
+        payload["temporal_eligibility_binding"] = (
+            temporal_eligibility_binding.model_dump(mode="json")
+            if temporal_eligibility_binding is not None
+            else None
+        )
     if publication_target_construction is not None:
         payload["publication_target_construction"] = (
             publication_target_construction.model_dump(mode="json")
@@ -4997,6 +5015,7 @@ class FinancialAcquisitionManifest(BaseModel):
         "financial-manifest-v1",
         "financial-manifest-v2",
         "financial-manifest-v3",
+        "financial-manifest-v4",
     ] = FINANCIAL_MANIFEST_V1
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
@@ -5071,7 +5090,10 @@ class FinancialAcquisitionManifest(BaseModel):
     unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
-    manifest_identity: str = Field(pattern=r"^financial-manifest:v[123]:[0-9a-f]{64}$")
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    manifest_identity: str = Field(pattern=r"^financial-manifest:v[1234]:[0-9a-f]{64}$")
 
     @classmethod
     def create(
@@ -5197,6 +5219,9 @@ class FinancialAcquisitionManifest(BaseModel):
         selected_families: Sequence[FinancialRatioFamily] = (),
         unselected_families: Sequence[FinancialRatioFamily] = (),
         unresolved_families: Sequence[FinancialRatioFamily] = (),
+        temporal_eligibility_binding: (
+            FinancialTemporalEligibilityCheckpointProjection | None
+        ) = None,
     ) -> FinancialAcquisitionManifest:
         """Bind the v1 selection contract to Ticket 11 operational lineage."""
 
@@ -5318,7 +5343,9 @@ class FinancialAcquisitionManifest(BaseModel):
                     FinancialPeriodRejectionReason.PIT_CUTOFF_NOT_SATISFIED
                 )
         forward_contract_version = (
-            FINANCIAL_MANIFEST_V3 if indicator_v3 else FINANCIAL_MANIFEST_V2
+            FINANCIAL_MANIFEST_V4
+            if temporal_eligibility_binding is not None
+            else (FINANCIAL_MANIFEST_V3 if indicator_v3 else FINANCIAL_MANIFEST_V2)
         )
         canonical_metadata_assessments = tuple(
             sorted(
@@ -5369,6 +5396,7 @@ class FinancialAcquisitionManifest(BaseModel):
             selected_families=selected_families,
             unselected_families=unselected_families,
             unresolved_families=unresolved_families,
+            temporal_eligibility_binding=temporal_eligibility_binding,
         )
         return FinancialAcquisitionManifest(
             **self.model_dump(
@@ -5393,6 +5421,7 @@ class FinancialAcquisitionManifest(BaseModel):
                     "selected_families",
                     "unselected_families",
                     "unresolved_families",
+                    "temporal_eligibility_binding",
                 },
             ),
             contract_version=forward_contract_version,
@@ -5417,10 +5446,85 @@ class FinancialAcquisitionManifest(BaseModel):
             selected_families=tuple(selected_families),
             unselected_families=tuple(unselected_families),
             unresolved_families=tuple(unresolved_families),
+            temporal_eligibility_binding=temporal_eligibility_binding,
             manifest_identity=(
-                f"financial-manifest:{'v3' if indicator_v3 else 'v2'}:"
+                "financial-manifest:"
+                + (
+                    "v4:"
+                    if temporal_eligibility_binding is not None
+                    else ("v3:" if indicator_v3 else "v2:")
+                )
                 + _canonical_digest(payload)
             ),
+        )
+
+    def bind_temporal_eligibility(
+        self,
+        temporal_eligibility_binding: FinancialTemporalEligibilityCheckpointProjection,
+    ) -> FinancialAcquisitionManifest:
+        """Promote an already-finalized v2/v3 manifest to the temporal v4 shape."""
+
+        if self.contract_version == FINANCIAL_MANIFEST_V4:
+            if self.temporal_eligibility_binding != temporal_eligibility_binding:
+                raise ValueError("financial manifest temporal binding mismatch")
+            return self
+        if self.contract_version not in {FINANCIAL_MANIFEST_V2, FINANCIAL_MANIFEST_V3}:
+            raise ValueError("only a finalized financial manifest may bind temporal state")
+        payload = _manifest_identity_payload(
+            contract_version=FINANCIAL_MANIFEST_V4,
+            capability_routing_plan_signature=self.capability_routing_plan_signature,
+            instrument_identity=self.instrument_identity,
+            requested_capability=self.requested_capability,
+            requested_statement_type=self.requested_statement_type,
+            requested_ratio_family=self.requested_ratio_family,
+            artifacts=self.artifacts,
+            acquisition_outcomes=self.acquisition_outcomes,
+            provider_candidates=self.provider_candidates,
+            selections=self.selections,
+            rejected_periods=self.rejected_periods,
+            overlaps=self.overlaps,
+            conflicts=self.conflicts,
+            revision_selections=self.revision_selections,
+            aggregate_completeness=self.aggregate_completeness,
+            publication_target_construction=self.publication_target_construction,
+            physical_attempt_events=self.physical_attempt_events,
+            disposition=self.disposition,
+            final_rendered_artifact=self.final_rendered_artifact,
+            requested_analysis_scope=self.requested_analysis_scope,
+            availability_scope=self.availability_scope,
+            availability_basis=self.availability_basis,
+            eligibility_policy_version=self.eligibility_policy_version,
+            financial_eligibility_binding=self.financial_eligibility_binding,
+            availability_reason=self.availability_reason,
+            indicator_field_semantics_version=self.indicator_field_semantics_version,
+            indicator_metadata_compatibility_version=(
+                self.indicator_metadata_compatibility_version
+            ),
+            metadata_compatibility_assessments=(
+                self.metadata_compatibility_assessments
+            ),
+            metadata_incompatible_rejections=self.metadata_incompatible_rejections,
+            selected_families=self.selected_families,
+            unselected_families=self.unselected_families,
+            unresolved_families=self.unresolved_families,
+            temporal_eligibility_binding=temporal_eligibility_binding,
+        )
+        return FinancialAcquisitionManifest.model_validate(
+            {
+                **self.model_dump(
+                    mode="python",
+                    exclude={
+                        "contract_version",
+                        "manifest_identity",
+                        "temporal_eligibility_binding",
+                    },
+                ),
+                "contract_version": FINANCIAL_MANIFEST_V4,
+                "temporal_eligibility_binding": temporal_eligibility_binding,
+                "manifest_identity": (
+                    "financial-manifest:v4:" + _canonical_digest(payload)
+                ),
+            }
         )
 
     @model_validator(mode="after")
@@ -5527,6 +5631,7 @@ class FinancialAcquisitionManifest(BaseModel):
                 or self.selected_families
                 or self.unselected_families
                 or self.unresolved_families
+                or self.temporal_eligibility_binding is not None
             ):
                 raise ValueError("legacy financial manifest carries v2 lineage")
         else:
@@ -5573,7 +5678,8 @@ class FinancialAcquisitionManifest(BaseModel):
                     != self.contract_version
                 )
                 or (
-                    self.contract_version == FINANCIAL_MANIFEST_V3
+                    self.contract_version
+                    in {FINANCIAL_MANIFEST_V3, FINANCIAL_MANIFEST_V4}
                     and self.financial_eligibility_binding.financial_manifest_version
                     != FINANCIAL_MANIFEST_V2
                 )
@@ -5600,10 +5706,15 @@ class FinancialAcquisitionManifest(BaseModel):
                     or self.unresolved_families
                 ):
                     raise ValueError("financial manifest v2 carries indicator compatibility")
-            elif (
+            elif self.contract_version == FINANCIAL_MANIFEST_V3 and (
                 any(value is None for value in metadata_values)
             ):
                 raise ValueError("indicator manifest v3 metadata binding is incomplete")
+            if self.contract_version == FINANCIAL_MANIFEST_V4:
+                if self.temporal_eligibility_binding is None:
+                    raise ValueError("financial manifest v4 temporal binding is incomplete")
+            elif self.temporal_eligibility_binding is not None:
+                raise ValueError("historical financial manifest carries temporal binding")
         artifact_ids = tuple(item.artifact.artifact_identity for item in self.artifacts)
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("manifest artifact identities must be unique")
@@ -5613,7 +5724,9 @@ class FinancialAcquisitionManifest(BaseModel):
         }
         if len(candidate_by_id) != len(self.provider_candidates):
             raise ValueError("manifest candidate identities must be unique")
-        if self.contract_version == FINANCIAL_MANIFEST_V3:
+        if self.contract_version in {FINANCIAL_MANIFEST_V3, FINANCIAL_MANIFEST_V4} and (
+            self.requested_capability is FinancialCapability.RATIO_FAMILY
+        ):
             assert self.requested_ratio_family is not None
             family_order = tuple(FinancialRatioFamily)
             family_dispositions = (
@@ -5922,11 +6035,13 @@ class FinancialAcquisitionManifest(BaseModel):
             selected_families=self.selected_families,
             unselected_families=self.unselected_families,
             unresolved_families=self.unresolved_families,
+            temporal_eligibility_binding=self.temporal_eligibility_binding,
         )
         version = {
             FINANCIAL_MANIFEST_V1: "v1",
             FINANCIAL_MANIFEST_V2: "v2",
             FINANCIAL_MANIFEST_V3: "v3",
+            FINANCIAL_MANIFEST_V4: "v4",
         }[self.contract_version]
         expected = "financial-manifest:" + version + ":" + _canonical_digest(payload)
         if self.manifest_identity != expected:

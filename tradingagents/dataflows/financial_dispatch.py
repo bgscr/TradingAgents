@@ -95,6 +95,7 @@ from tradingagents.dataflows.financial_contracts import (
     assess_financial_ratio_history_coverage,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
     validate_financial_eligibility_acquisition_context_binding,
@@ -104,6 +105,9 @@ from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
     MainlandFinancialPeriodTargetConstruction,
     restore_mainland_financial_eligibility_projection_binding,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    FinancialTemporalEligibilityCheckpointProjection,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestAttemptEvent,
@@ -142,9 +146,11 @@ FINANCIAL_DISPATCH_MANIFEST_LEDGER_VERSION = "1.2"
 FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION = "1.3"
 FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION = "1.4"
 FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION = "1.5"
+FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION = "1.6"
 FINANCIAL_DISPATCH_AUDIT_VERSION = "1.0"
 FINANCIAL_DISPATCH_MANIFEST_AUDIT_VERSION = "2.0"
 FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_AUDIT_VERSION = "3.0"
+FINANCIAL_DISPATCH_TEMPORAL_AUDIT_VERSION = "4.0"
 DEFAULT_FINANCIAL_ACQUISITION_POLICY_VERSION = "financial-acquisition:v1"
 
 _CLOSED_MODEL_CONFIG = ConfigDict(
@@ -580,7 +586,10 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-statement-selection-dispatch-v1"] = (
+    contract_version: Literal[
+        "financial-statement-selection-dispatch-v1",
+        "financial-statement-selection-dispatch-v2",
+    ] = (
         "financial-statement-selection-dispatch-v1"
     )
     tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
@@ -592,9 +601,15 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialStatementSelectionDispatchResult:
+        selection_session = (
+            self.selection_request.requested_session
+            if self.selection_request.contract_version
+            == "financial-statement-routing-request-v4"
+            else self.selection_request.as_of_date
+        )
         if (
             self.request_key.statement_type is not self.selection_request.statement_type
-            or self.request_key.as_of_date != self.selection_request.as_of_date
+            or self.request_key.as_of_date != selection_session
             or self.routing_result.manifest.instrument_identity
             != self.selection_request.instrument_identity
             or self.request_key.capability_routing_plan_signature
@@ -608,6 +623,12 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
             != render_statement_routing_result(self.routing_result)
         ):
             raise ValueError("qualified financial selection binding is invalid")
+        temporal = self.contract_version == "financial-statement-selection-dispatch-v2"
+        if temporal != (
+            self.routing_result.contract_version
+            == "financial-statement-routing-result-v2"
+        ):
+            raise ValueError("statement selection temporal binding is invalid")
         return self
 
     def to_tool_message(self) -> ToolMessage:
@@ -627,7 +648,8 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
             _financial_tool_manifest_envelope(
                 dispatch_result=self,
             ).model_dump(mode="json")
-            if manifest.contract_version == "financial-manifest-v2"
+            if manifest.contract_version
+            in {"financial-manifest-v2", "financial-manifest-v4"}
             else {
                 "contract_version": "financial-statement-selection-dispatch-v1",
                 "request_ref": self.request_key.request_key,
@@ -655,6 +677,7 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
     contract_version: Literal[
         "financial-indicator-selection-dispatch-v1",
         "financial-indicator-selection-dispatch-v2",
+        "financial-indicator-selection-dispatch-v3",
     ] = (
         "financial-indicator-selection-dispatch-v1"
     )
@@ -670,11 +693,12 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
         exclude_if=lambda value: value is None,
     )
     financial_eligibility_context_contract_version: Literal[
-        "financial-eligibility-acquisition-context-v1"
+        "financial-eligibility-acquisition-context-v1",
+        "financial-eligibility-acquisition-context-v2",
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     financial_eligibility_context_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$",
+        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
     manifest_identities: tuple[str, ...] = Field(
@@ -692,6 +716,12 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorSelectionDispatchResult:
+        selection_session = (
+            self.selection_request.requested_session
+            if self.selection_request.contract_version
+            == "financial-indicator-routing-request-v7"
+            else self.selection_request.as_of_date
+        )
         expected_eligibility_policy = (
             self.selection_request.eligibility_policy_version
             if self.selection_request.requested_analysis_scope is not None
@@ -728,7 +758,7 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
         if (
             self.request_key.statement_type
             is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
-            or self.request_key.as_of_date != self.selection_request.as_of_date
+            or self.request_key.as_of_date != selection_session
             or any(
                 manifest.instrument_identity
                 != self.selection_request.instrument_identity
@@ -744,7 +774,10 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             self.financial_eligibility_context_contract_version,
             self.financial_eligibility_context_identity,
         )
-        if self.contract_version == "financial-indicator-selection-dispatch-v2":
+        if self.contract_version in {
+            "financial-indicator-selection-dispatch-v2",
+            "financial-indicator-selection-dispatch-v3",
+        }:
             context_binding = (
                 self.selection_request.financial_eligibility_context_binding
             )
@@ -769,10 +802,21 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
             )
             if (
                 self.routing_result.contract_version
-                != "financial-indicator-routing-result-v3"
+                != (
+                    "financial-indicator-routing-result-v4"
+                    if self.contract_version
+                    == "financial-indicator-selection-dispatch-v3"
+                    else "financial-indicator-routing-result-v3"
+                )
                 or not self.routing_result.family_manifests
                 or any(
-                    manifest.contract_version != "financial-manifest-v3"
+                    manifest.contract_version
+                    != (
+                        "financial-manifest-v4"
+                        if self.contract_version
+                        == "financial-indicator-selection-dispatch-v3"
+                        else "financial-manifest-v3"
+                    )
                     for manifest in self.routing_result.family_manifests
                 )
                 or context_binding is None
@@ -787,7 +831,7 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
                 or self.provider_artifact_identities != expected_artifacts
                 or self.candidate_identities != expected_candidates
             ):
-                raise ValueError("indicator dispatch v2 cross-binding is invalid")
+                raise ValueError("indicator dispatch cross-binding is invalid")
         elif (
             any(value is not None for value in v2_values)
             or self.manifest_identities
@@ -800,7 +844,12 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
 
     def to_tool_message(self) -> ToolMessage:
         forward = bool(self.routing_result.family_manifests) and all(
-            manifest.contract_version in {"financial-manifest-v2", "financial-manifest-v3"}
+            manifest.contract_version
+            in {
+                "financial-manifest-v2",
+                "financial-manifest-v3",
+                "financial-manifest-v4",
+            }
             for manifest in self.routing_result.family_manifests
         )
         artifact = (
@@ -899,6 +948,9 @@ class FinancialDispatchCheckpointFailureReason(str, Enum):
     INDICATOR_METADATA_COMPATIBILITY_MISMATCH = (
         "financial_indicator_metadata_compatibility_mismatch"
     )
+    TEMPORAL_COMPATIBILITY_MISMATCH = (
+        "financial_temporal_compatibility_mismatch"
+    )
 
 
 class FinancialDispatchCheckpointError(ValueError):
@@ -992,7 +1044,10 @@ class FinancialDispatchCheckpointEntry(BaseModel):
 class FinancialStatementSelectionCheckpointEntry(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-statement-selection-checkpoint-v1"] = (
+    contract_version: Literal[
+        "financial-statement-selection-checkpoint-v1",
+        "financial-statement-selection-checkpoint-v2",
+    ] = (
         "financial-statement-selection-checkpoint-v1"
     )
     canonical_request_key: CanonicalFinancialRequestKey
@@ -1003,6 +1058,13 @@ class FinancialStatementSelectionCheckpointEntry(BaseModel):
     def _validate_entry(self) -> FinancialStatementSelectionCheckpointEntry:
         if self.terminal.request_key != self.canonical_request_key:
             raise ValueError("qualified selection checkpoint request key mismatch")
+        if (
+            self.contract_version == "financial-statement-selection-checkpoint-v2"
+        ) != (
+            self.terminal.contract_version
+            == "financial-statement-selection-dispatch-v2"
+        ):
+            raise ValueError("statement checkpoint temporal version mismatch")
         return self
 
 
@@ -1012,13 +1074,14 @@ class FinancialIndicatorSelectionCheckpointEntry(BaseModel):
     contract_version: Literal[
         "financial-indicator-selection-checkpoint-v1",
         "financial-indicator-selection-checkpoint-v2",
+        "financial-indicator-selection-checkpoint-v3",
     ] = (
         "financial-indicator-selection-checkpoint-v1"
     )
     canonical_request_key: CanonicalFinancialRequestKey
     terminal: FinancialIndicatorSelectionDispatchResult
     reuse_count: int = Field(default=0, ge=0)
-    provider_subrequest_cache_contract_version: Literal["1.1"] | None = Field(
+    provider_subrequest_cache_contract_version: Literal["1.1", "1.2"] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -1036,15 +1099,23 @@ class FinancialIndicatorSelectionCheckpointEntry(BaseModel):
             self.provider_subrequest_cache_contract_version,
             self.provider_subrequest_cache_run_scope_id,
         )
-        if self.contract_version == "financial-indicator-selection-checkpoint-v2":
+        if self.contract_version in {
+            "financial-indicator-selection-checkpoint-v2",
+            "financial-indicator-selection-checkpoint-v3",
+        }:
             if (
                 self.terminal.contract_version
-                != "financial-indicator-selection-dispatch-v2"
+                != (
+                    "financial-indicator-selection-dispatch-v3"
+                    if self.contract_version
+                    == "financial-indicator-selection-checkpoint-v3"
+                    else "financial-indicator-selection-dispatch-v2"
+                )
                 or any(value is None for value in cache_values)
                 or self.provider_subrequest_cache_run_scope_id
                 != self.terminal.selection_request.financial_eligibility_context_binding.canonical_run_id
             ):
-                raise ValueError("indicator checkpoint v2 cross-binding is invalid")
+                raise ValueError("indicator checkpoint cross-binding is invalid")
         elif any(value is not None for value in cache_values):
             raise ValueError("historical indicator checkpoint carries v2 cache binding")
         return self
@@ -1055,7 +1126,9 @@ class FinancialDispatchCheckpointLedger(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"] = (
+    contract_version: Literal[
+        "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"
+    ] = (
         FINANCIAL_DISPATCH_LEDGER_VERSION
     )
     acquisition_policy_version: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
@@ -1073,13 +1146,17 @@ class FinancialDispatchCheckpointLedger(BaseModel):
         default=None,
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$",
     )
-    financial_manifest_version: Literal["financial-manifest-v2"] | None = None
-    capability_routing_plan_version: Literal["1.2"] | None = Field(
+    financial_manifest_version: Literal[
+        "financial-manifest-v2",
+        "financial-manifest-v4",
+    ] | None = None
+    capability_routing_plan_version: Literal["1.2", "1.3"] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
     financial_indicator_manifest_version: Literal[
-        "financial-manifest-v3"
+        "financial-manifest-v3",
+        "financial-manifest-v4",
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     indicator_field_semantics_version: Literal[
         "financial-indicator-field-semantics-v1"
@@ -1119,6 +1196,9 @@ class FinancialDispatchCheckpointLedger(BaseModel):
     financial_eligibility_context: FinancialEligibilityAcquisitionContext | None = (
         Field(default=None, exclude_if=lambda value: value is None)
     )
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     entries: tuple[FinancialDispatchCheckpointEntry, ...] = ()
     qualified_statement_selections: tuple[
         FinancialStatementSelectionCheckpointEntry,
@@ -1173,12 +1253,38 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             or self.financial_eligibility_context is None
         ):
             raise ValueError("financial checkpoint context projection is incomplete")
+        temporal_bound = (
+            self.contract_version == FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+            or self.capability_routing_plan_version == "1.3"
+            or self.temporal_eligibility_binding is not None
+        )
+        if temporal_bound:
+            context = self.financial_eligibility_context
+            if (
+                not has_context_projection
+                or context is None
+                or context.contract_version
+                != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                or context.temporal_eligibility_binding is None
+                or self.temporal_eligibility_binding is None
+                or self.temporal_eligibility_binding
+                != FinancialTemporalEligibilityCheckpointProjection.model_validate(
+                    context.temporal_eligibility_binding.model_dump(mode="python")
+                )
+                or manifest_versions != {"financial-manifest-v4"}
+            ):
+                raise ValueError("financial checkpoint temporal binding is invalid")
+            expected_version = FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        else:
+            expected_version = None
         compatibility_bound = (
             self.capability_routing_plan_version == "1.2"
             or self.contract_version
             == FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         )
-        if compatibility_bound:
+        if temporal_bound:
+            pass
+        elif compatibility_bound:
             if not has_context_projection:
                 raise ValueError("financial checkpoint 1.5 requires context projection")
             expected_version = (
@@ -1218,13 +1324,19 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
         }:
             signatures = {
                 manifest.capability_routing_plan_signature
                 for manifest in manifests
             }
             if (
-                self.financial_manifest_version != "financial-manifest-v2"
+                self.financial_manifest_version
+                != (
+                    "financial-manifest-v4"
+                    if temporal_bound
+                    else "financial-manifest-v2"
+                )
                 or self.run_scope_id is None
                 or signatures != {self.capability_routing_plan_signature}
             ):
@@ -1233,6 +1345,7 @@ class FinancialDispatchCheckpointLedger(BaseModel):
                 FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
                 FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                 FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+                FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
             }:
                 if self.financial_eligibility_binding is None or any(
                     manifest.financial_eligibility_binding
@@ -1254,7 +1367,10 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             self.indicator_field_semantics_version,
             self.indicator_metadata_compatibility_version,
         )
-        if expected_version == FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION:
+        if expected_version in {
+            FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
+        }:
             expected_assessments = tuple(
                 binding
                 for manifest in indicator_manifests
@@ -1292,21 +1408,37 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             )
             if (
                 any(value is None for value in indicator_v15_values)
+                or self.capability_routing_plan_version
+                != ("1.3" if temporal_bound else "1.2")
                 or any(
-                    manifest.contract_version != "financial-manifest-v2"
+                    manifest.contract_version
+                    != ("financial-manifest-v4" if temporal_bound else "financial-manifest-v2")
                     for manifest in statement_manifests
                 )
                 or any(
-                    manifest.contract_version != "financial-manifest-v3"
+                    manifest.contract_version
+                    != ("financial-manifest-v4" if temporal_bound else "financial-manifest-v3")
                     for manifest in indicator_manifests
                 )
                 or any(
                     entry.contract_version
-                    != "financial-indicator-selection-checkpoint-v2"
+                    != (
+                        "financial-indicator-selection-checkpoint-v3"
+                        if temporal_bound
+                        else "financial-indicator-selection-checkpoint-v2"
+                    )
                     or entry.terminal.contract_version
-                    != "financial-indicator-selection-dispatch-v2"
+                    != (
+                        "financial-indicator-selection-dispatch-v3"
+                        if temporal_bound
+                        else "financial-indicator-selection-dispatch-v2"
+                    )
                     or entry.terminal.routing_result.contract_version
-                    != "financial-indicator-routing-result-v3"
+                    != (
+                        "financial-indicator-routing-result-v4"
+                        if temporal_bound
+                        else "financial-indicator-routing-result-v3"
+                    )
                     for entry in self.qualified_indicator_selections
                 )
                 or self.indicator_metadata_assessments != expected_assessments
@@ -1334,10 +1466,12 @@ class FinancialDispatchCheckpointLedger(BaseModel):
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
         }:
             if expected_version in {
                 FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                 FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+                FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
             }:
                 context = self.financial_eligibility_context
                 cache = self.provider_subrequest_cache
@@ -1382,12 +1516,26 @@ class FinancialDispatchCheckpointLedger(BaseModel):
                         for binding in selection_bindings
                     )
                     or cache is None
-                    or cache.contract_version != "1.1"
+                    or cache.contract_version
+                    != ("1.2" if temporal_bound else "1.1")
                     or cache.run_scope_id != context.run_id
                     or cache.financial_eligibility_context_contract_version
                     != context.contract_version
                     or cache.financial_eligibility_context_identity
                     != context.context_identity
+                    or (
+                        temporal_bound
+                        and (
+                            cache.capability_routing_plan_version != "1.3"
+                            or cache.calendar_eligibility_binding
+                            != self.temporal_eligibility_binding.calendar_binding
+                            or cache.temporal_decisions
+                            != (
+                                self.temporal_eligibility_binding.company_type_temporal_decision,
+                                self.temporal_eligibility_binding.listing_temporal_decision,
+                            )
+                        )
+                    )
                 ):
                     raise ValueError(
                         "financial checkpoint context cross-binding is invalid"
@@ -1463,6 +1611,7 @@ class FinancialCompletenessAuditRow(BaseModel):
     contract_version: Literal[
         "financial-completeness-row-v3",
         "financial-completeness-row-v4",
+        "financial-completeness-row-v5",
     ] = (
         "financial-completeness-row-v3"
     )
@@ -1577,6 +1726,10 @@ class FinancialCompletenessAuditRow(BaseModel):
         default=(), exclude_if=lambda value: not value
     )
 
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+
     @model_validator(mode="after")
     def _validate_listing_binding(self) -> FinancialCompletenessAuditRow:
         canonical_field_sets = (
@@ -1634,7 +1787,11 @@ class FinancialCompletenessAuditRow(BaseModel):
                     and self.availability_scope is None
                 )
                 or (
-                    self.contract_version == "financial-completeness-row-v4"
+                    self.contract_version
+                    in {
+                        "financial-completeness-row-v4",
+                        "financial-completeness-row-v5",
+                    }
                     and self.disposition in {"selected", "current_only"}
                     and self.availability_scope is None
                 )
@@ -1645,10 +1802,22 @@ class FinancialCompletenessAuditRow(BaseModel):
             self.indicator_field_semantics_version,
             self.indicator_metadata_compatibility_version,
         )
-        if self.contract_version == "financial-completeness-row-v4":
+        metadata_forward = (
+            self.contract_version
+            in {
+                "financial-completeness-row-v4",
+                "financial-completeness-row-v5",
+            }
+            and self.capability is FinancialCapability.RATIO_FAMILY
+        )
+        if metadata_forward:
+            expected_manifest_prefix = (
+                "financial-manifest:v4:"
+                if self.contract_version == "financial-completeness-row-v5"
+                else "financial-manifest:v3:"
+            )
             if (
-                self.capability is not FinancialCapability.RATIO_FAMILY
-                or not self.manifest_identity.startswith("financial-manifest:v3:")
+                not self.manifest_identity.startswith(expected_manifest_prefix)
                 or any(value is None for value in metadata_values)
                 or (
                     self.compatibility_state != "unresolved"
@@ -1664,6 +1833,14 @@ class FinancialCompletenessAuditRow(BaseModel):
                 )
             ):
                 raise ValueError("financial completeness row v4 binding is incomplete")
+        elif self.contract_version == "financial-completeness-row-v5":
+            if (
+                not self.manifest_identity.startswith("financial-manifest:v4:")
+                or any(value is not None for value in metadata_values)
+                or self.metadata_compatibility_assessment_identity is not None
+                or self.metadata_typed_reasons
+            ):
+                raise ValueError("financial completeness row v5 binding is incomplete")
         elif (
             not self.manifest_identity.startswith("financial-manifest:v2:")
             or any(value is not None for value in metadata_values)
@@ -1671,7 +1848,14 @@ class FinancialCompletenessAuditRow(BaseModel):
             or self.metadata_typed_reasons
         ):
             raise ValueError("financial completeness row v3 carries indicator metadata")
-        if self.contract_version == "financial-completeness-row-v4":
+        if (
+            self.contract_version == "financial-completeness-row-v5"
+        ) != (self.temporal_eligibility_binding is not None):
+            raise ValueError("financial completeness temporal binding is incomplete")
+        if self.contract_version in {
+            "financial-completeness-row-v4",
+            "financial-completeness-row-v5",
+        }:
             _assert_safe_indicator_operational_projection(self)
         else:
             assert_safe_financial_projection(self.model_dump(mode="json"))
@@ -1686,6 +1870,7 @@ class FinancialAggregateCompletenessProjection(BaseModel):
     contract_version: Literal[
         "financial-aggregate-completeness-v2",
         "financial-aggregate-completeness-v3",
+        "financial-aggregate-completeness-v4",
     ] = (
         "financial-aggregate-completeness-v2"
     )
@@ -1729,6 +1914,9 @@ class FinancialAggregateCompletenessProjection(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_capability_shape(
@@ -1753,7 +1941,15 @@ class FinancialAggregateCompletenessProjection(BaseModel):
             self.indicator_metadata_compatibility_version,
             self.family_disposition,
         )
-        if self.contract_version == "financial-aggregate-completeness-v3":
+        metadata_forward = (
+            self.contract_version
+            in {
+                "financial-aggregate-completeness-v3",
+                "financial-aggregate-completeness-v4",
+            }
+            and self.capability is FinancialCapability.RATIO_FAMILY
+        )
+        if metadata_forward:
             if (
                 self.capability is not FinancialCapability.RATIO_FAMILY
                 or self.source_contract_version != "financial-period-selection-v3"
@@ -1774,7 +1970,14 @@ class FinancialAggregateCompletenessProjection(BaseModel):
             or self.compatibility_states
         ):
             raise ValueError("financial aggregate completeness v2 carries indicator metadata")
-        if self.contract_version == "financial-aggregate-completeness-v3":
+        if (
+            self.contract_version == "financial-aggregate-completeness-v4"
+        ) != (self.temporal_eligibility_binding is not None):
+            raise ValueError("financial aggregate temporal binding is incomplete")
+        if self.contract_version in {
+            "financial-aggregate-completeness-v3",
+            "financial-aggregate-completeness-v4",
+        }:
             _assert_safe_indicator_operational_projection(self)
         else:
             assert_safe_financial_projection(self.model_dump(mode="json"))
@@ -1789,11 +1992,12 @@ class FinancialManifestAuditProjection(BaseModel):
     contract_version: Literal[
         "financial-manifest-audit-v2",
         "financial-manifest-audit-v3",
+        "financial-manifest-audit-v4",
     ] = (
         "financial-manifest-audit-v2"
     )
     manifest_identity: str = Field(
-        pattern=r"^financial-manifest:v[23]:[0-9a-f]{64}$"
+        pattern=r"^financial-manifest:v[234]:[0-9a-f]{64}$"
     )
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
@@ -1801,6 +2005,7 @@ class FinancialManifestAuditProjection(BaseModel):
     financial_manifest_version: Literal[
         "financial-manifest-v2",
         "financial-manifest-v3",
+        "financial-manifest-v4",
     ] = (
         "financial-manifest-v2"
     )
@@ -1871,6 +2076,9 @@ class FinancialManifestAuditProjection(BaseModel):
     unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_safe_projection(self) -> FinancialManifestAuditProjection:
@@ -1878,10 +2086,19 @@ class FinancialManifestAuditProjection(BaseModel):
             self.indicator_field_semantics_version,
             self.indicator_metadata_compatibility_version,
         )
-        if self.contract_version == "financial-manifest-audit-v3":
+        temporal = self.contract_version == "financial-manifest-audit-v4"
+        metadata_forward = (
+            self.contract_version == "financial-manifest-audit-v3"
+            or temporal
+            and self.capability is FinancialCapability.RATIO_FAMILY
+        )
+        if metadata_forward:
             if (
-                self.financial_manifest_version != "financial-manifest-v3"
-                or not self.manifest_identity.startswith("financial-manifest:v3:")
+                self.financial_manifest_version
+                != ("financial-manifest-v4" if temporal else "financial-manifest-v3")
+                or not self.manifest_identity.startswith(
+                    "financial-manifest:v4:" if temporal else "financial-manifest:v3:"
+                )
                 or self.capability is not FinancialCapability.RATIO_FAMILY
                 or any(value is None for value in metadata_values)
                 or (
@@ -1889,11 +2106,29 @@ class FinancialManifestAuditProjection(BaseModel):
                     and not self.metadata_compatibility_assessments
                 )
                 or self.aggregate_completeness.contract_version
-                != "financial-aggregate-completeness-v3"
+                != (
+                    "financial-aggregate-completeness-v4"
+                    if temporal
+                    else "financial-aggregate-completeness-v3"
+                )
                 or (*self.selected_families, *self.unselected_families, *self.unresolved_families)
                 != (FinancialRatioFamily(self.statement_or_ratio_family),)
             ):
                 raise ValueError("financial manifest audit v3 binding is incomplete")
+        elif temporal:
+            if (
+                self.financial_manifest_version != "financial-manifest-v4"
+                or not self.manifest_identity.startswith("financial-manifest:v4:")
+                or self.aggregate_completeness.contract_version
+                != "financial-aggregate-completeness-v4"
+                or any(value is not None for value in metadata_values)
+                or self.metadata_compatibility_assessments
+                or self.metadata_incompatible_rejections
+                or self.selected_families
+                or self.unselected_families
+                or self.unresolved_families
+            ):
+                raise ValueError("financial manifest audit v4 binding is incomplete")
         elif (
             self.financial_manifest_version != "financial-manifest-v2"
             or not self.manifest_identity.startswith("financial-manifest:v2:")
@@ -1905,7 +2140,17 @@ class FinancialManifestAuditProjection(BaseModel):
             or self.unresolved_families
         ):
             raise ValueError("financial manifest audit v2 carries indicator metadata")
-        if self.contract_version == "financial-manifest-audit-v3":
+        if temporal != (self.temporal_eligibility_binding is not None):
+            raise ValueError("financial manifest audit temporal binding is incomplete")
+        if temporal and (
+            self.aggregate_completeness.temporal_eligibility_binding
+            != self.temporal_eligibility_binding
+        ):
+            raise ValueError("financial manifest audit temporal binding is inconsistent")
+        if self.contract_version in {
+            "financial-manifest-audit-v3",
+            "financial-manifest-audit-v4",
+        }:
             _assert_safe_indicator_operational_projection(self)
         else:
             assert_safe_financial_projection(self.model_dump(mode="json"))
@@ -1920,6 +2165,7 @@ class FinancialManifestAuditRequest(BaseModel):
     contract_version: Literal[
         "financial-manifest-request-audit-v2",
         "financial-manifest-request-audit-v3",
+        "financial-manifest-request-audit-v4",
     ] = (
         "financial-manifest-request-audit-v2"
     )
@@ -1950,6 +2196,9 @@ class FinancialManifestAuditRequest(BaseModel):
     metadata_assessment_identities: tuple[str, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_manifest_versions(self) -> FinancialManifestAuditRequest:
@@ -1962,7 +2211,22 @@ class FinancialManifestAuditRequest(BaseModel):
             for manifest in self.manifests
             for item in manifest.metadata_compatibility_assessments
         )
-        if self.contract_version == "financial-manifest-request-audit-v3":
+        if self.contract_version == "financial-manifest-request-audit-v4":
+            if (
+                any(
+                    manifest.contract_version != "financial-manifest-audit-v4"
+                    or manifest.temporal_eligibility_binding
+                    != self.temporal_eligibility_binding
+                    for manifest in self.manifests
+                )
+                or self.temporal_eligibility_binding is None
+                or self.as_of_date
+                != self.temporal_eligibility_binding.requested_session
+                or self.metadata_assessment_identities
+                != expected_assessment_identities
+            ):
+                raise ValueError("financial manifest request audit v4 is incomplete")
+        elif self.contract_version == "financial-manifest-request-audit-v3":
             if (
                 any(
                     manifest.contract_version != "financial-manifest-audit-v3"
@@ -1982,6 +2246,10 @@ class FinancialManifestAuditRequest(BaseModel):
             or self.metadata_assessment_identities
         ):
             raise ValueError("financial manifest request audit v2 carries indicator metadata")
+        if self.contract_version != "financial-manifest-request-audit-v4" and (
+            self.temporal_eligibility_binding is not None
+        ):
+            raise ValueError("historical manifest audit carries temporal binding")
         return self
 
 
@@ -2120,6 +2388,83 @@ class FinancialDispatchAuditProjectionV3(FinancialDispatchAuditProjectionV2):
         return self
 
 
+class FinancialDispatchAuditProjectionV4(FinancialDispatchAuditProjectionV2):
+    """05C audit projection for plan-1.3 temporal replay state."""
+
+    contract_version: Literal["4.0"] = FINANCIAL_DISPATCH_TEMPORAL_AUDIT_VERSION
+    financial_manifest_version: Literal["financial-manifest-v4"] = (
+        "financial-manifest-v4"
+    )
+    financial_indicator_manifest_version: Literal["financial-manifest-v4"] = (
+        "financial-manifest-v4"
+    )
+    indicator_field_semantics_version: Literal[
+        "financial-indicator-field-semantics-v1"
+    ] = "financial-indicator-field-semantics-v1"
+    indicator_metadata_compatibility_version: Literal[
+        "financial-indicator-metadata-compatibility-v1"
+    ] = "financial-indicator-metadata-compatibility-v1"
+    metadata_assessment_identities: tuple[str, ...] = ()
+    metadata_compatibility_states: tuple[
+        Literal["compatible", "incompatible"], ...
+    ] = ()
+    metadata_incompatibility_reasons: tuple[str, ...] = ()
+    temporal_eligibility_binding: FinancialTemporalEligibilityCheckpointProjection
+
+    @model_validator(mode="after")
+    def _validate_temporal_bindings(self) -> FinancialDispatchAuditProjectionV4:
+        manifests = tuple(
+            manifest
+            for request in self.manifest_requests
+            for manifest in request.manifests
+        )
+        assessments = tuple(
+            assessment
+            for manifest in manifests
+            for assessment in manifest.metadata_compatibility_assessments
+        )
+        expected_reasons = tuple(
+            sorted(
+                {
+                    reason.reason
+                    for manifest in manifests
+                    for rejection in manifest.metadata_incompatible_rejections
+                    for reason in rejection.typed_reasons
+                }
+            )
+        )
+        if (
+            not self.manifest_requests
+            or any(
+                request.contract_version
+                != "financial-manifest-request-audit-v4"
+                or request.temporal_eligibility_binding
+                != self.temporal_eligibility_binding
+                for request in self.manifest_requests
+            )
+            or any(
+                manifest.contract_version != "financial-manifest-audit-v4"
+                or manifest.temporal_eligibility_binding
+                != self.temporal_eligibility_binding
+                for manifest in manifests
+            )
+            or any(
+                row.contract_version != "financial-completeness-row-v5"
+                or row.temporal_eligibility_binding
+                != self.temporal_eligibility_binding
+                for row in self.completeness_rows
+            )
+            or self.metadata_assessment_identities
+            != tuple(item.assessment_identity for item in assessments)
+            or self.metadata_compatibility_states
+            != tuple(item.compatibility_state for item in assessments)
+            or self.metadata_incompatibility_reasons != expected_reasons
+        ):
+            raise ValueError("financial dispatch audit 4.0 binding is incomplete")
+        _assert_safe_indicator_operational_projection(self)
+        return self
+
+
 class FinancialToolManifestOperationalProjection(BaseModel):
     """Tool-bound manifest references without coordinator or payload details."""
 
@@ -2128,11 +2473,12 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     contract_version: Literal[
         "financial-tool-manifest-v2",
         "financial-tool-manifest-v3",
+        "financial-tool-manifest-v4",
     ] = (
         "financial-tool-manifest-v2"
     )
     manifest_identity: str = Field(
-        pattern=r"^financial-manifest:v[23]:[0-9a-f]{64}$"
+        pattern=r"^financial-manifest:v[234]:[0-9a-f]{64}$"
     )
     capability_routing_plan_signature: str = Field(
         pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
@@ -2201,6 +2547,9 @@ class FinancialToolManifestOperationalProjection(BaseModel):
     unresolved_families: tuple[FinancialRatioFamily, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_safe_projection(self) -> FinancialToolManifestOperationalProjection:
@@ -2208,9 +2557,17 @@ class FinancialToolManifestOperationalProjection(BaseModel):
             self.indicator_field_semantics_version,
             self.indicator_metadata_compatibility_version,
         )
-        if self.contract_version == "financial-tool-manifest-v3":
+        temporal = self.contract_version == "financial-tool-manifest-v4"
+        metadata_forward = (
+            self.contract_version == "financial-tool-manifest-v3"
+            or temporal
+            and self.capability is FinancialCapability.RATIO_FAMILY
+        )
+        if metadata_forward:
             if (
-                not self.manifest_identity.startswith("financial-manifest:v3:")
+                not self.manifest_identity.startswith(
+                    "financial-manifest:v4:" if temporal else "financial-manifest:v3:"
+                )
                 or any(value is None for value in metadata_values)
                 or (
                     bool(self.candidate_identities)
@@ -2219,6 +2576,16 @@ class FinancialToolManifestOperationalProjection(BaseModel):
                 or bool(self.selected_families) == bool(self.unresolved_families)
             ):
                 raise ValueError("financial tool manifest v3 binding is incomplete")
+        elif temporal:
+            if (
+                not self.manifest_identity.startswith("financial-manifest:v4:")
+                or any(value is not None for value in metadata_values)
+                or self.metadata_compatibility_assessments
+                or self.metadata_incompatible_rejections
+                or self.selected_families
+                or self.unresolved_families
+            ):
+                raise ValueError("financial tool manifest v4 binding is incomplete")
         elif (
             not self.manifest_identity.startswith("financial-manifest:v2:")
             or any(value is not None for value in metadata_values)
@@ -2228,7 +2595,17 @@ class FinancialToolManifestOperationalProjection(BaseModel):
             or self.unresolved_families
         ):
             raise ValueError("financial tool manifest v2 carries indicator metadata")
-        if self.contract_version == "financial-tool-manifest-v3":
+        if temporal != (self.temporal_eligibility_binding is not None):
+            raise ValueError("financial tool manifest temporal binding is incomplete")
+        if temporal and (
+            self.aggregate_completeness.temporal_eligibility_binding
+            != self.temporal_eligibility_binding
+        ):
+            raise ValueError("financial tool manifest temporal binding is inconsistent")
+        if self.contract_version in {
+            "financial-tool-manifest-v3",
+            "financial-tool-manifest-v4",
+        }:
             _assert_safe_indicator_operational_projection(self)
         else:
             assert_safe_financial_projection(self.model_dump(mode="json"))
@@ -2243,6 +2620,7 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
     contract_version: Literal[
         "financial-tool-message-envelope-v2",
         "financial-tool-message-envelope-v3",
+        "financial-tool-message-envelope-v4",
     ] = (
         "financial-tool-message-envelope-v2"
     )
@@ -2257,6 +2635,7 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
     financial_manifest_version: Literal[
         "financial-manifest-v2",
         "financial-manifest-v3",
+        "financial-manifest-v4",
     ] = (
         "financial-manifest-v2"
     )
@@ -2291,6 +2670,9 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
         FinancialIndicatorMetadataRejectionBinding,
         ...,
     ] = Field(default=(), exclude_if=lambda value: not value)
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
     selected_artifact: SourceArtifact | FinancialRenderedArtifactIdentity
 
     @model_validator(mode="after")
@@ -2306,7 +2688,41 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
             for manifest in self.manifests
         ):
             raise ValueError("financial ToolMessage eligibility binding is invalid")
-        if self.contract_version == "financial-tool-message-envelope-v3":
+        if self.contract_version == "financial-tool-message-envelope-v4":
+            expected_assessments = tuple(
+                item.assessment_identity
+                for manifest in self.manifests
+                for item in manifest.metadata_compatibility_assessments
+            )
+            expected_rejections = tuple(
+                item
+                for manifest in self.manifests
+                for item in manifest.metadata_incompatible_rejections
+            )
+            if (
+                self.financial_manifest_version != "financial-manifest-v4"
+                or self.temporal_eligibility_binding is None
+                or any(
+                    manifest.contract_version != "financial-tool-manifest-v4"
+                    or manifest.temporal_eligibility_binding
+                    != self.temporal_eligibility_binding
+                    for manifest in self.manifests
+                )
+                or any(
+                    row.contract_version != "financial-completeness-row-v5"
+                    or row.temporal_eligibility_binding
+                    != self.temporal_eligibility_binding
+                    for row in self.completeness_rows
+                )
+                or self.metadata_assessment_identities != expected_assessments
+                or self.incompatibility_summary != expected_rejections
+                or not isinstance(
+                    self.selected_artifact,
+                    FinancialRenderedArtifactIdentity,
+                )
+            ):
+                raise ValueError("financial ToolMessage v4 binding is incomplete")
+        elif self.contract_version == "financial-tool-message-envelope-v3":
             expected_assessments = tuple(
                 item.assessment_identity
                 for manifest in self.manifests
@@ -2379,7 +2795,10 @@ class FinancialToolMessageManifestEnvelope(BaseModel):
         )
         if source_binding_invalid or rendered_digests != {selected_digest}:
             raise ValueError("financial ToolMessage selected artifact is invalid")
-        if self.contract_version == "financial-tool-message-envelope-v3":
+        if self.contract_version in {
+            "financial-tool-message-envelope-v3",
+            "financial-tool-message-envelope-v4",
+        }:
             _assert_safe_indicator_operational_projection(self)
         else:
             assert_safe_financial_projection(self.model_dump(mode="json"))
@@ -2390,6 +2809,7 @@ FinancialDispatchAuditProjection = (
     FinancialDispatchAuditProjectionV1
     | FinancialDispatchAuditProjectionV2
     | FinancialDispatchAuditProjectionV3
+    | FinancialDispatchAuditProjectionV4
 )
 
 
@@ -2523,6 +2943,19 @@ class FinancialToolDispatcher:
                 provider_subrequest_cache.bind_financial_eligibility_context(
                     context_contract_version=context.contract_version,
                     context_identity=context.context_identity,
+                    context=(
+                        context
+                        if context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        else None
+                    ),
+                    capability_routing_plan=(
+                        qualified_statement_router.routing_plan
+                        if context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        and qualified_statement_router is not None
+                        else None
+                    ),
                 )
             except ProviderSubrequestCacheError as exc:
                 raise FinancialDispatchCheckpointError(
@@ -2900,7 +3333,13 @@ class FinancialToolDispatcher:
         if (
             request.statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
             or request.statement_type is not selection_request.statement_type
-            or request.as_of_date != selection_request.as_of_date
+            or request.as_of_date
+            != (
+                selection_request.requested_session
+                if selection_request.contract_version
+                == "financial-statement-routing-request-v4"
+                else selection_request.as_of_date
+            )
             or selection_request.instrument_identity != self._instrument_identity
         ):
             raise ValueError("financial tool and statement selection requests contradict")
@@ -2952,12 +3391,32 @@ class FinancialToolDispatcher:
                     routing_result = finalize_statement_routing_result(
                         routing_result,
                         physical_attempt_events=attempt_events,
+                        temporal_eligibility_binding=(
+                            FinancialTemporalEligibilityCheckpointProjection.model_validate(
+                                selection_request.financial_eligibility_context_binding.temporal_eligibility_binding.model_dump(
+                                    mode="python"
+                                )
+                            )
+                            if selection_request.contract_version
+                            == "financial-statement-routing-request-v4"
+                            and selection_request.financial_eligibility_context_binding
+                            is not None
+                            and selection_request.financial_eligibility_context_binding.temporal_eligibility_binding
+                            is not None
+                            else None
+                        ),
                     )
                 except (TypeError, ValueError) as exc:
                     raise FinancialDispatchCheckpointError(
                         FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
                     ) from exc
             result = FinancialStatementSelectionDispatchResult(
+                contract_version=(
+                    "financial-statement-selection-dispatch-v2"
+                    if routing_result.contract_version
+                    == "financial-statement-routing-result-v2"
+                    else "financial-statement-selection-dispatch-v1"
+                ),
                 tool_call_id=request.tool_call_id,
                 disposition="executed",
                 request_key=canonical_key,
@@ -3026,7 +3485,13 @@ class FinancialToolDispatcher:
         if (
             request.statement_type
             is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
-            or request.as_of_date != selection_request.as_of_date
+            or request.as_of_date
+            != (
+                selection_request.requested_session
+                if selection_request.contract_version
+                == "financial-indicator-routing-request-v7"
+                else selection_request.as_of_date
+            )
             or selection_request.instrument_identity != self._instrument_identity
         ):
             raise ValueError("financial tool and indicator selection requests contradict")
@@ -3079,6 +3544,20 @@ class FinancialToolDispatcher:
                         routing_result,
                         request=selection_request,
                         physical_attempt_events=attempt_events,
+                        temporal_eligibility_binding=(
+                            FinancialTemporalEligibilityCheckpointProjection.model_validate(
+                                selection_request.financial_eligibility_context_binding.temporal_eligibility_binding.model_dump(
+                                    mode="python"
+                                )
+                            )
+                            if selection_request.contract_version
+                            == "financial-indicator-routing-request-v7"
+                            and selection_request.financial_eligibility_context_binding
+                            is not None
+                            and selection_request.financial_eligibility_context_binding.temporal_eligibility_binding
+                            is not None
+                            else None
+                        ),
                     )
                 except (TypeError, ValueError) as exc:
                     raise FinancialDispatchCheckpointError(
@@ -3086,7 +3565,10 @@ class FinancialToolDispatcher:
                     ) from exc
             result = FinancialIndicatorSelectionDispatchResult(
                 contract_version=(
-                    "financial-indicator-selection-dispatch-v2"
+                    "financial-indicator-selection-dispatch-v3"
+                    if routing_result.contract_version
+                    == "financial-indicator-routing-result-v4"
+                    else "financial-indicator-selection-dispatch-v2"
                     if routing_result.contract_version
                     == "financial-indicator-routing-result-v3"
                     and selection_request.financial_eligibility_context_binding
@@ -3274,6 +3756,12 @@ class FinancialToolDispatcher:
                     ) from exc
                 qualified_entries.append(
                     FinancialStatementSelectionCheckpointEntry(
+                        contract_version=(
+                            "financial-statement-selection-checkpoint-v2"
+                            if result.contract_version
+                            == "financial-statement-selection-dispatch-v2"
+                            else "financial-statement-selection-checkpoint-v1"
+                        ),
                         canonical_request_key=result.request_key,
                         terminal=result.model_copy(
                             update={
@@ -3300,24 +3788,29 @@ class FinancialToolDispatcher:
                     raise FinancialDispatchCheckpointError(
                         FinancialDispatchCheckpointFailureReason.QUALIFIED_SELECTION_INVALID
                     ) from exc
-                indicator_v2 = (
-                    result.contract_version
-                    == "financial-indicator-selection-dispatch-v2"
-                )
+                indicator_forward = result.contract_version in {
+                    "financial-indicator-selection-dispatch-v2",
+                    "financial-indicator-selection-dispatch-v3",
+                }
                 cache_checkpoint = (
                     ProviderSubrequestCacheCheckpoint.model_validate(
                         self._provider_subrequest_cache.checkpoint()
                     )
-                    if indicator_v2
+                    if indicator_forward
                     and self._provider_subrequest_cache is not None
                     else None
                 )
                 qualified_indicator_entries.append(
                     FinancialIndicatorSelectionCheckpointEntry(
                         contract_version=(
-                            "financial-indicator-selection-checkpoint-v2"
-                            if indicator_v2
-                            else "financial-indicator-selection-checkpoint-v1"
+                            "financial-indicator-selection-checkpoint-v3"
+                            if result.contract_version
+                            == "financial-indicator-selection-dispatch-v3"
+                            else (
+                                "financial-indicator-selection-checkpoint-v2"
+                                if indicator_forward
+                                else "financial-indicator-selection-checkpoint-v1"
+                            )
                         ),
                         canonical_request_key=result.request_key,
                         terminal=result.model_copy(
@@ -3362,6 +3855,11 @@ class FinancialToolDispatcher:
             and routing_plan.plan_version == "1.2"
             and bool(qualified_entries or qualified_indicator_entries)
         )
+        writes_temporal_v16 = (
+            routing_plan is not None
+            and routing_plan.plan_version == "1.3"
+            and bool(qualified_entries or qualified_indicator_entries)
+        )
         if writes_indicator_v15 and any(
             entry.contract_version
             != "financial-indicator-selection-checkpoint-v2"
@@ -3371,11 +3869,16 @@ class FinancialToolDispatcher:
                 FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
             )
         has_manifest_v2 = bool(qualified_manifests) and all(
-            manifest.contract_version == "financial-manifest-v2"
+            manifest.contract_version
+            == ("financial-manifest-v4" if writes_temporal_v16 else "financial-manifest-v2")
             for manifest in statement_manifests
         ) and all(
             manifest.contract_version
-            == ("financial-manifest-v3" if writes_indicator_v15 else "financial-manifest-v2")
+            == (
+                "financial-manifest-v4"
+                if writes_temporal_v16
+                else ("financial-manifest-v3" if writes_indicator_v15 else "financial-manifest-v2")
+            )
             for manifest in indicator_manifests
         )
         has_eligibility_binding = has_manifest_v2 and all(
@@ -3413,7 +3916,9 @@ class FinancialToolDispatcher:
             )
         ledger = FinancialDispatchCheckpointLedger(
             contract_version=(
-                FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+                FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+                if writes_temporal_v16 and has_context_binding
+                else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
                 if writes_indicator_v15 and has_context_binding
                 else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
                 if has_context_binding
@@ -3457,24 +3962,36 @@ class FinancialToolDispatcher:
                 else None
             ),
             financial_manifest_version=(
-                "financial-manifest-v2" if has_manifest_v2 else None
+                (
+                    "financial-manifest-v4"
+                    if writes_temporal_v16
+                    else "financial-manifest-v2"
+                )
+                if has_manifest_v2
+                else None
             ),
             capability_routing_plan_version=(
-                routing_plan.plan_version if writes_indicator_v15 else None
+                routing_plan.plan_version
+                if writes_indicator_v15 or writes_temporal_v16
+                else None
             ),
             financial_indicator_manifest_version=(
-                routing_plan.indicator_manifest_contract_version
-                if writes_indicator_v15
+                (
+                    "financial-manifest-v4"
+                    if writes_temporal_v16
+                    else routing_plan.indicator_manifest_contract_version
+                )
+                if writes_indicator_v15 or writes_temporal_v16
                 else None
             ),
             indicator_field_semantics_version=(
                 routing_plan.indicator_field_semantics_version
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else None
             ),
             indicator_metadata_compatibility_version=(
                 routing_plan.indicator_metadata_compatibility_version
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else None
             ),
             indicator_metadata_assessments=(
@@ -3483,7 +4000,7 @@ class FinancialToolDispatcher:
                     for manifest in indicator_manifests
                     for binding in manifest.metadata_compatibility_assessments
                 )
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else ()
             ),
             indicator_metadata_rejections=(
@@ -3492,7 +4009,7 @@ class FinancialToolDispatcher:
                     for manifest in indicator_manifests
                     for rejection in manifest.metadata_incompatible_rejections
                 )
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else ()
             ),
             indicator_provider_artifact_identities=(
@@ -3505,7 +4022,7 @@ class FinancialToolDispatcher:
                         }
                     )
                 )
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else ()
             ),
             indicator_candidate_identities=(
@@ -3518,12 +4035,12 @@ class FinancialToolDispatcher:
                         }
                     )
                 )
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else ()
             ),
             indicator_provider_topology=(
                 routing_plan.route_for(MainlandCapability.FINANCIAL_INDICATORS)
-                if writes_indicator_v15
+                if writes_indicator_v15 or writes_temporal_v16
                 else ()
             ),
             financial_eligibility_binding=(
@@ -3537,6 +4054,15 @@ class FinancialToolDispatcher:
             ),
             financial_eligibility_context=(
                 context if has_context_binding else None
+            ),
+            temporal_eligibility_binding=(
+                FinancialTemporalEligibilityCheckpointProjection.model_validate(
+                    context.temporal_eligibility_binding.model_dump(mode="python")
+                )
+                if writes_temporal_v16
+                and context is not None
+                and context.temporal_eligibility_binding is not None
+                else None
             ),
             entries=tuple(entries),
             qualified_statement_selections=tuple(qualified_entries),
@@ -3605,6 +4131,7 @@ class FinancialToolDispatcher:
                     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
                     FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                     FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+                    FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
                 }
                 or restored_binding != self._financial_eligibility_binding
             ):
@@ -3620,9 +4147,10 @@ class FinancialToolDispatcher:
                 else checkpoint_ledger.contract_version
             )
             raise FinancialDispatchCheckpointError(
-                FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
-                if raw_version
-                == FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+                if raw_version == FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+                else FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
+                if raw_version == FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
                 else (
                     FinancialDispatchCheckpointFailureReason.MANIFEST_INVALID
                     if raw_version in {
@@ -3683,9 +4211,25 @@ class FinancialToolDispatcher:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.ROUTING_PLAN_MISMATCH
             )
+        if (
+            router is not None
+            and router.routing_plan.plan_version == "1.3"
+            and (
+                ledger.contract_version != FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+                or ledger.capability_routing_plan_version != "1.3"
+                or ledger.financial_manifest_version != "financial-manifest-v4"
+                or ledger.financial_indicator_manifest_version
+                != "financial-manifest-v4"
+                or ledger.temporal_eligibility_binding is None
+            )
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            )
         if ledger.contract_version in {
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
         }:
             restored_context = ledger.financial_eligibility_context
             if restored_context is None or ledger.checkpoint_thread_id is None:
@@ -3716,6 +4260,19 @@ class FinancialToolDispatcher:
                 self._provider_subrequest_cache.bind_financial_eligibility_context(
                     context_contract_version=restored_context.contract_version,
                     context_identity=restored_context.context_identity,
+                    context=(
+                        restored_context
+                        if restored_context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        else None
+                    ),
+                    capability_routing_plan=(
+                        router.routing_plan
+                        if restored_context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        and router is not None
+                        else None
+                    ),
                 )
             except ProviderSubrequestCacheError as exc:
                 raise FinancialDispatchCheckpointError(
@@ -3730,6 +4287,7 @@ class FinancialToolDispatcher:
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
         }:
             if ledger.run_scope_id != self._run_scope_id:
                 raise FinancialDispatchCheckpointError(
@@ -3854,6 +4412,7 @@ class FinancialToolDispatcher:
                             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
                         }
                     ),
                 )
@@ -3922,6 +4481,7 @@ class FinancialToolDispatcher:
                             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
                             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+                            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
                         }
                     ),
                 )
@@ -4728,12 +5288,34 @@ def _financial_tool_manifest_envelope(
         provider_calls = routing_result.provider_calls
         family_assessments = routing_result.family_assessments
         aggregate_family_assessment = routing_result.aggregate_family_assessment
+    temporal_v4 = bool(manifests) and all(
+        manifest.contract_version == "financial-manifest-v4"
+        for manifest in manifests
+    )
+    temporal_binding = (
+        manifests[0].temporal_eligibility_binding if temporal_v4 else None
+    )
+    if temporal_v4 and (
+        temporal_binding is None
+        or any(
+            manifest.temporal_eligibility_binding != temporal_binding
+            for manifest in manifests
+        )
+    ):
+        raise ValueError("financial ToolMessage temporal binding is inconsistent")
     indicator_v3 = isinstance(
         dispatch_result,
         FinancialIndicatorSelectionDispatchResult,
     ) and all(
         manifest.contract_version == "financial-manifest-v3"
         for manifest in manifests
+    )
+    indicator_metadata = indicator_v3 or (
+        temporal_v4
+        and isinstance(
+            dispatch_result,
+            FinancialIndicatorSelectionDispatchResult,
+        )
     )
     provider_attempt_counts = {
         call.provider_id: len(call.physical_attempt_events)
@@ -4753,7 +5335,9 @@ def _financial_tool_manifest_envelope(
     )
     return FinancialToolMessageManifestEnvelope(
         contract_version=(
-            "financial-tool-message-envelope-v3"
+            "financial-tool-message-envelope-v4"
+            if temporal_v4
+            else "financial-tool-message-envelope-v3"
             if indicator_v3
             else "financial-tool-message-envelope-v2"
         ),
@@ -4765,7 +5349,9 @@ def _financial_tool_manifest_envelope(
             dispatch_result.request_key.capability_routing_plan_signature
         ),
         financial_manifest_version=(
-            "financial-manifest-v3"
+            "financial-manifest-v4"
+            if temporal_v4
+            else "financial-manifest-v3"
             if indicator_v3
             else "financial-manifest-v2"
         ),
@@ -4804,12 +5390,12 @@ def _financial_tool_manifest_envelope(
         aggregate_family_assessment=aggregate_family_assessment,
         indicator_field_semantics_version=(
             "financial-indicator-field-semantics-v1"
-            if indicator_v3
+            if indicator_metadata
             else None
         ),
         indicator_metadata_compatibility_version=(
             "financial-indicator-metadata-compatibility-v1"
-            if indicator_v3
+            if indicator_metadata
             else None
         ),
         metadata_assessment_identities=(
@@ -4818,7 +5404,7 @@ def _financial_tool_manifest_envelope(
                 for manifest in projected_manifests
                 for item in manifest.metadata_compatibility_assessments
             )
-            if indicator_v3
+            if indicator_metadata
             else ()
         ),
         incompatibility_summary=(
@@ -4827,14 +5413,15 @@ def _financial_tool_manifest_envelope(
                 for manifest in projected_manifests
                 for item in manifest.metadata_incompatible_rejections
             )
-            if indicator_v3
+            if indicator_metadata
             else ()
         ),
+        temporal_eligibility_binding=temporal_binding,
         selected_artifact=(
             FinancialRenderedArtifactIdentity.create(
                 dispatch_result.rendered_value
             )
-            if indicator_v3
+            if indicator_v3 or temporal_v4
             else SourceArtifact(
                 artifact_sha256=sha256(
                     dispatch_result.rendered_value.encode("utf-8")
@@ -4882,6 +5469,18 @@ def _project_aggregate_completeness(
     }
     if isinstance(completeness, FinancialHistoryCompletenessAssessment):
         return FinancialAggregateCompletenessProjection(
+            contract_version=(
+                "financial-aggregate-completeness-v4"
+                if manifest is not None
+                and manifest.contract_version == "financial-manifest-v4"
+                else "financial-aggregate-completeness-v2"
+            ),
+            temporal_eligibility_binding=(
+                manifest.temporal_eligibility_binding
+                if manifest is not None
+                and manifest.contract_version == "financial-manifest-v4"
+                else None
+            ),
             capability=FinancialCapability.STATEMENT,
             statement_type=completeness.statement_type,
             target_annual_period_ends=completeness.target_annual_period_ends,
@@ -4893,11 +5492,18 @@ def _project_aggregate_completeness(
     if isinstance(completeness, FinancialRatioHistoryCompletenessAssessment):
         indicator_v3 = (
             manifest is not None
-            and manifest.contract_version == "financial-manifest-v3"
+            and manifest.contract_version
+            in {"financial-manifest-v3", "financial-manifest-v4"}
+        )
+        temporal_v4 = (
+            manifest is not None
+            and manifest.contract_version == "financial-manifest-v4"
         )
         return FinancialAggregateCompletenessProjection(
             contract_version=(
-                "financial-aggregate-completeness-v3"
+                "financial-aggregate-completeness-v4"
+                if temporal_v4
+                else "financial-aggregate-completeness-v3"
                 if indicator_v3
                 else "financial-aggregate-completeness-v2"
             ),
@@ -4939,6 +5545,9 @@ def _project_aggregate_completeness(
             )
             if indicator_v3
             else None,
+            temporal_eligibility_binding=(
+                manifest.temporal_eligibility_binding if temporal_v4 else None
+            ),
             **common,
         )
     raise TypeError("unsupported financial aggregate completeness assessment")
@@ -4948,14 +5557,21 @@ def _project_manifest_for_tool(
     manifest: FinancialAcquisitionManifest,
 ) -> FinancialToolManifestOperationalProjection:
     if (
-        manifest.contract_version not in {"financial-manifest-v2", "financial-manifest-v3"}
+        manifest.contract_version
+        not in {
+            "financial-manifest-v2",
+            "financial-manifest-v3",
+            "financial-manifest-v4",
+        }
         or manifest.disposition is None
         or manifest.final_rendered_artifact is None
     ):
         raise ValueError("financial ToolMessage requires forward manifest lineage")
     return FinancialToolManifestOperationalProjection(
         contract_version=(
-            "financial-tool-manifest-v3"
+            "financial-tool-manifest-v4"
+            if manifest.contract_version == "financial-manifest-v4"
+            else "financial-tool-manifest-v3"
             if manifest.contract_version == "financial-manifest-v3"
             else "financial-tool-manifest-v2"
         ),
@@ -5015,6 +5631,7 @@ def _project_manifest_for_tool(
         ),
         selected_families=manifest.selected_families,
         unresolved_families=manifest.unresolved_families,
+        temporal_eligibility_binding=manifest.temporal_eligibility_binding,
     )
 
 
@@ -5036,15 +5653,19 @@ def _project_manifest_for_audit(
         manifest.contract_version not in {
             "financial-manifest-v2",
             "financial-manifest-v3",
+            "financial-manifest-v4",
         }
         or manifest.disposition is None
         or manifest.final_rendered_artifact is None
     ):
         raise ValueError("financial manifest audit requires forward lineage")
     indicator_v3 = manifest.contract_version == "financial-manifest-v3"
+    temporal_v4 = manifest.contract_version == "financial-manifest-v4"
     return FinancialManifestAuditProjection(
         contract_version=(
-            "financial-manifest-audit-v3"
+            "financial-manifest-audit-v4"
+            if temporal_v4
+            else "financial-manifest-audit-v3"
             if indicator_v3
             else "financial-manifest-audit-v2"
         ),
@@ -5103,6 +5724,7 @@ def _project_manifest_for_audit(
         selected_families=manifest.selected_families,
         unselected_families=manifest.unselected_families,
         unresolved_families=manifest.unresolved_families,
+        temporal_eligibility_binding=manifest.temporal_eligibility_binding,
     )
 
 
@@ -5112,6 +5734,11 @@ def _project_manifest_completeness_rows(
     provider_attempt_counts: Mapping[str, int],
 ) -> tuple[FinancialCompletenessAuditRow, ...]:
     indicator_v3 = manifest.contract_version == "financial-manifest-v3"
+    temporal_v4 = manifest.contract_version == "financial-manifest-v4"
+    indicator_metadata = indicator_v3 or (
+        temporal_v4
+        and manifest.requested_capability is FinancialCapability.RATIO_FAMILY
+    )
     selection_by_candidate = {
         item.candidate_identity: item for item in manifest.selections
     }
@@ -5261,8 +5888,10 @@ def _project_manifest_completeness_rows(
         rows.append(
             FinancialCompletenessAuditRow(
                 contract_version=(
-                    "financial-completeness-row-v4"
-                    if indicator_v3
+                    "financial-completeness-row-v5"
+                    if temporal_v4
+                    else "financial-completeness-row-v4"
+                    if indicator_metadata
                     else "financial-completeness-row-v3"
                 ),
                 manifest_identity=manifest.manifest_identity,
@@ -5357,12 +5986,12 @@ def _project_manifest_completeness_rows(
                 ),
                 indicator_field_semantics_version=(
                     manifest.indicator_field_semantics_version
-                    if indicator_v3
+                    if indicator_metadata
                     else None
                 ),
                 indicator_metadata_compatibility_version=(
                     manifest.indicator_metadata_compatibility_version
-                    if indicator_v3
+                    if indicator_metadata
                     else None
                 ),
                 metadata_compatibility_assessment_identity=(
@@ -5382,6 +6011,9 @@ def _project_manifest_completeness_rows(
                     )
                     if metadata_assessment is not None
                     else ()
+                ),
+                temporal_eligibility_binding=(
+                    manifest.temporal_eligibility_binding if temporal_v4 else None
                 ),
             )
         )
@@ -5414,8 +6046,10 @@ def _project_manifest_completeness_rows(
         rows.append(
             FinancialCompletenessAuditRow(
                 contract_version=(
-                    "financial-completeness-row-v4"
-                    if indicator_v3
+                    "financial-completeness-row-v5"
+                    if temporal_v4
+                    else "financial-completeness-row-v4"
+                    if indicator_metadata
                     else "financial-completeness-row-v3"
                 ),
                 manifest_identity=manifest.manifest_identity,
@@ -5435,7 +6069,7 @@ def _project_manifest_completeness_rows(
                 critical_threshold=Decimal("1"),
                 core_coverage=Decimal("0"),
                 core_threshold=Decimal("0.9"),
-                disposition="unresolved" if indicator_v3 else "rejected",
+                disposition="unresolved" if indicator_metadata else "rejected",
                 typed_reason=tuple(
                     reason.value for reason in completeness.rejection_reasons
                 ),
@@ -5458,16 +6092,19 @@ def _project_manifest_completeness_rows(
                     if listing_provenance is not None
                     else None
                 ),
-                compatibility_state="unresolved" if indicator_v3 else None,
+                compatibility_state="unresolved" if indicator_metadata else None,
                 indicator_field_semantics_version=(
                     manifest.indicator_field_semantics_version
-                    if indicator_v3
+                    if indicator_metadata
                     else None
                 ),
                 indicator_metadata_compatibility_version=(
                     manifest.indicator_metadata_compatibility_version
-                    if indicator_v3
+                    if indicator_metadata
                     else None
+                ),
+                temporal_eligibility_binding=(
+                    manifest.temporal_eligibility_binding if temporal_v4 else None
                 ),
             )
         )
@@ -5500,6 +6137,11 @@ def _project_statement_manifest_audit_request(
     )
     return (
         FinancialManifestAuditRequest(
+            contract_version=(
+                "financial-manifest-request-audit-v4"
+                if manifest.contract_version == "financial-manifest-v4"
+                else "financial-manifest-request-audit-v2"
+            ),
             request_ref=entry.canonical_request_key.request_key,
             tool_name=entry.canonical_request_key.tool_name,
             statement_type=entry.canonical_request_key.statement_type,
@@ -5510,6 +6152,7 @@ def _project_statement_manifest_audit_request(
             physical_request_count=len(manifest.physical_attempt_events),
             duplicate_suppressed_count=entry.reuse_count,
             manifests=(_project_manifest_for_audit(manifest),),
+            temporal_eligibility_binding=manifest.temporal_eligibility_binding,
         ),
         rows,
     )
@@ -5546,10 +6189,19 @@ def _project_indicator_manifest_audit_request(
         manifest.contract_version == "financial-manifest-v3"
         for manifest in manifests
     )
+    temporal_v4 = bool(manifests) and all(
+        manifest.contract_version == "financial-manifest-v4"
+        for manifest in manifests
+    )
+    temporal_binding = (
+        manifests[0].temporal_eligibility_binding if temporal_v4 else None
+    )
     return (
         FinancialManifestAuditRequest(
             contract_version=(
-                "financial-manifest-request-audit-v3"
+                "financial-manifest-request-audit-v4"
+                if temporal_v4
+                else "financial-manifest-request-audit-v3"
                 if indicator_v3
                 else "financial-manifest-request-audit-v2"
             ),
@@ -5570,17 +6222,18 @@ def _project_indicator_manifest_audit_request(
             aggregate_family_assessment=result.aggregate_family_assessment,
             indicator_field_semantics_version=(
                 result.indicator_field_semantics_version
-                if indicator_v3
+                if indicator_v3 or temporal_v4
                 else None
             ),
             indicator_metadata_compatibility_version=(
                 result.indicator_metadata_compatibility_version
-                if indicator_v3
+                if indicator_v3 or temporal_v4
                 else None
             ),
             metadata_assessment_identities=(
-                assessment_identities if indicator_v3 else ()
+                assessment_identities if indicator_v3 or temporal_v4 else ()
             ),
+            temporal_eligibility_binding=temporal_binding,
         ),
         tuple(
             sorted(
@@ -6194,6 +6847,8 @@ def _validate_financial_dispatch_audit_integrity(
         FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
         FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
         FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
+        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
     }:
         if run_scope_id != ledger.run_scope_id:
             raise FinancialDispatchCheckpointError(
@@ -6211,6 +6866,7 @@ def _validate_financial_dispatch_audit_integrity(
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+            FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
         } and (
                 capability_routing_plan.financial_eligibility_binding is None
                 or ledger.financial_eligibility_binding
@@ -6238,6 +6894,28 @@ def _validate_financial_dispatch_audit_integrity(
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
             )
+        if ledger.contract_version == FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION:
+            temporal_bindings = capability_routing_plan.temporal_contract_bindings
+            context = ledger.financial_eligibility_context
+            if (
+                capability_routing_plan.plan_version != "1.3"
+                or temporal_bindings is None
+                or ledger.capability_routing_plan_version != "1.3"
+                or ledger.financial_manifest_version != "financial-manifest-v4"
+                or ledger.financial_indicator_manifest_version
+                != "financial-manifest-v4"
+                or context is None
+                or context.contract_version
+                != "financial-eligibility-acquisition-context-v2"
+                or context.temporal_eligibility_binding is None
+                or ledger.temporal_eligibility_binding
+                != FinancialTemporalEligibilityCheckpointProjection.model_validate(
+                    context.temporal_eligibility_binding.model_dump(mode="python")
+                )
+            ):
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+                )
         return
     effective_config = config
     if effective_config is None:
@@ -6345,6 +7023,7 @@ def project_financial_dispatch_ledger(
         FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
         FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
         FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
+        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
     }:
         manifest_requests: list[FinancialManifestAuditRequest] = []
         completeness_rows: list[FinancialCompletenessAuditRow] = []
@@ -6408,6 +7087,33 @@ def project_financial_dispatch_ledger(
             "manifest_requests": tuple(manifest_requests),
             "completeness_rows": tuple(completeness_rows),
         }
+        if ledger.contract_version == FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION:
+            temporal_binding = ledger.temporal_eligibility_binding
+            if temporal_binding is None:
+                raise FinancialDispatchCheckpointError(
+                    FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+                )
+            return FinancialDispatchAuditProjectionV4(
+                metadata_assessment_identities=tuple(
+                    item.assessment_identity
+                    for item in ledger.indicator_metadata_assessments
+                ),
+                metadata_compatibility_states=tuple(
+                    item.compatibility_state
+                    for item in ledger.indicator_metadata_assessments
+                ),
+                metadata_incompatibility_reasons=tuple(
+                    sorted(
+                        {
+                            reason.reason
+                            for rejection in ledger.indicator_metadata_rejections
+                            for reason in rejection.typed_reasons
+                        }
+                    )
+                ),
+                temporal_eligibility_binding=temporal_binding,
+                **common_projection,
+            )
         if ledger.contract_version == (
             FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         ) and any(

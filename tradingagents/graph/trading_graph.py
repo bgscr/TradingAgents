@@ -1504,9 +1504,11 @@ class TradingAgentsGraph:
                                     )
                                 )
                             except MainlandCapabilityRoutingCheckpointError as exc:
-                                if exc.reason is not (
-                                    MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
-                                ):
+                                if exc.reason not in {
+                                    MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH,
+                                    MainlandCapabilityRoutingCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+                                    MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH,
+                                }:
                                     raise
                                 previous_run_id = values.get("run_id")
                                 if not isinstance(

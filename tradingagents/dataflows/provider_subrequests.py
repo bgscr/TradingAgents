@@ -13,10 +13,15 @@ from datetime import date, datetime, timedelta
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    FinancialMetadataTemporalEligibilityDecision,
+    MarketSessionEligibilityBinding,
+    TemporalEvidenceClass,
+)
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
 from tradingagents.market_history.config import DataUsageMode
 from tradingagents.market_history.coordinator import (
@@ -32,8 +37,12 @@ from tradingagents.market_history.coordinator import (
 
 PROVIDER_SUBREQUEST_KEY_VERSION = "1.0"
 PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION = "1.1"
+PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION = "1.2"
 FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION = (
     "financial-eligibility-acquisition-context-v1"
+)
+FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION = (
+    "financial-eligibility-acquisition-context-v2"
 )
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
@@ -546,15 +555,41 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
 class ProviderSubrequestCacheCheckpoint(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1"] = "1.0"
+    contract_version: Literal["1.0", "1.1", "1.2"] = "1.0"
     run_scope_id: str = Field(pattern=_SAFE_ID_PATTERN)
     financial_eligibility_context_contract_version: Literal[
-        "financial-eligibility-acquisition-context-v1"
+        "financial-eligibility-acquisition-context-v1",
+        "financial-eligibility-acquisition-context-v2",
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     financial_eligibility_context_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-eligibility-acquisition-context:v1:[0-9a-f]{64}$",
+        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
+    )
+    capability_routing_plan_version: Literal["1.3"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    capability_routing_plan_signature: str | None = Field(
+        default=None,
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    financial_eligibility_metadata_binding: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    calendar_eligibility_binding: MarketSessionEligibilityBinding | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    temporal_decisions: tuple[
+        FinancialMetadataTemporalEligibilityDecision,
+        ...,
+    ] = Field(default=(), exclude_if=lambda value: not value)
+    temporal_artifact_identities: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
     )
     entries: tuple[ProviderSubrequestCheckpointEntry, ...] = ()
 
@@ -566,10 +601,81 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             self.financial_eligibility_context_contract_version is not None
             and self.financial_eligibility_context_identity is not None
         )
-        if (
-            self.contract_version == PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
-        ) != has_context_binding:
+        context_bound_version = self.contract_version in {
+            PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION,
+        }
+        if context_bound_version != has_context_binding:
             raise ValueError("provider subrequest context binding is incomplete")
+        temporal_values = (
+            self.capability_routing_plan_version,
+            self.capability_routing_plan_signature,
+            self.financial_eligibility_metadata_binding,
+            self.calendar_eligibility_binding,
+        )
+        temporal = (
+            self.contract_version
+            == PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
+        )
+        if temporal:
+            if (
+                self.financial_eligibility_context_contract_version
+                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                or any(value is None for value in temporal_values)
+                or len(self.temporal_decisions) != 2
+            ):
+                raise ValueError("provider subrequest temporal binding is incomplete")
+            from tradingagents.dataflows.financial_eligibility_acquisition import (
+                FinancialEligibilityMetadataBinding,
+            )
+
+            metadata_binding = FinancialEligibilityMetadataBinding.model_validate(
+                self.financial_eligibility_metadata_binding
+            )
+            expected_artifacts = tuple(
+                sorted(
+                    decision.immutable_artifact_identity
+                    for decision in self.temporal_decisions
+                )
+            )
+            if (
+                metadata_binding.contract_version
+                != "financial-eligibility-metadata-binding-v2"
+                or metadata_binding.routing_plan_signature
+                != self.capability_routing_plan_signature
+                or metadata_binding.calendar_binding
+                != self.calendar_eligibility_binding
+                or self.temporal_artifact_identities != expected_artifacts
+                or tuple(
+                    decision.evidence_class for decision in self.temporal_decisions
+                )
+                not in {
+                    (
+                        TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+                        TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
+                    ),
+                    (
+                        TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
+                        TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
+                    ),
+                }
+                or any(
+                    decision.calendar_binding != self.calendar_eligibility_binding
+                    or decision.mode != metadata_binding.temporal_mode.value
+                    for decision in self.temporal_decisions
+                )
+            ):
+                raise ValueError("provider subrequest temporal binding is inconsistent")
+        elif (
+            any(value is not None for value in temporal_values)
+            or self.temporal_decisions
+            or self.temporal_artifact_identities
+            or self.financial_eligibility_context_contract_version
+            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "historical provider subrequest checkpoint carries temporal state"
+            )
         return self
 
 
@@ -625,6 +731,15 @@ class ProviderSubrequestCache:
         self._keys: dict[str, ProviderSubrequestKey] = {}
         self._financial_eligibility_context_contract_version: str | None = None
         self._financial_eligibility_context_identity: str | None = None
+        self._capability_routing_plan_version: str | None = None
+        self._capability_routing_plan_signature: str | None = None
+        self._financial_eligibility_metadata_binding: dict[str, Any] | None = None
+        self._calendar_eligibility_binding: MarketSessionEligibilityBinding | None = None
+        self._temporal_decisions: tuple[
+            FinancialMetadataTemporalEligibilityDecision,
+            ...,
+        ] = ()
+        self._temporal_artifact_identities: tuple[str, ...] = ()
         self._interrupted = False
         self._closed = False
         if checkpoint is not None:
@@ -648,21 +763,97 @@ class ProviderSubrequestCache:
         *,
         context_contract_version: str,
         context_identity: str,
+        context: object | None = None,
+        capability_routing_plan: object | None = None,
     ) -> None:
         """Single-assign the safe context identity governing this run cache."""
 
+        temporal = (
+            context_contract_version
+            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+        )
+        expected_identity_pattern = (
+            r"financial-eligibility-acquisition-context:v2:[0-9a-f]{64}"
+            if temporal
+            else r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}"
+        )
         if (
             context_contract_version
-            != FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION
-            or re.fullmatch(
-                r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}",
-                context_identity,
-            )
-            is None
+            not in {
+                FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+            }
+            or re.fullmatch(expected_identity_pattern, context_identity) is None
             or _contains_reserved_secret_text(
                 (context_contract_version, context_identity)
             )
         ):
+            raise ProviderSubrequestCacheError(
+                ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
+            )
+        temporal_projection: dict[str, object] = {}
+        if temporal:
+            from tradingagents.capability_routing import MainlandCapabilityRoutingPlan
+            from tradingagents.dataflows.financial_eligibility_acquisition import (
+                FinancialEligibilityAcquisitionContext,
+                FinancialEligibilityMetadataBinding,
+            )
+
+            if (
+                not isinstance(context, FinancialEligibilityAcquisitionContext)
+                or not isinstance(
+                    capability_routing_plan,
+                    MainlandCapabilityRoutingPlan,
+                )
+                or context.contract_version
+                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                or context.context_identity != context_identity
+                or capability_routing_plan.plan_version != "1.3"
+                or context.routing_plan_signature
+                != capability_routing_plan.plan_signature
+                or context.temporal_eligibility_binding is None
+            ):
+                raise ProviderSubrequestCacheError(
+                    ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
+                )
+            bound = context.temporal_eligibility_binding
+            metadata_binding = FinancialEligibilityMetadataBinding(
+                contract_version="financial-eligibility-metadata-binding-v2",
+                instrument_identity=context.instrument_identity,
+                requested_session=context.requested_session,
+                availability_scope=context.availability_scope,
+                acquisition_purpose=context.acquisition_purpose,
+                financial_eligibility_binding=context.financial_eligibility_binding,
+                routing_plan_signature=context.routing_plan_signature,
+                temporal_mode=bound.temporal_mode,
+                eligibility_evaluated_at=bound.eligibility_evaluated_at,
+                calendar_binding=bound.calendar_binding,
+                strict_cutoff=bound.strict_cutoff,
+            )
+            decisions = (
+                bound.company_type_temporal_decision,
+                bound.listing_temporal_decision,
+            )
+            temporal_projection = {
+                "capability_routing_plan_version": (
+                    capability_routing_plan.plan_version
+                ),
+                "capability_routing_plan_signature": (
+                    capability_routing_plan.plan_signature
+                ),
+                "financial_eligibility_metadata_binding": (
+                    metadata_binding.model_dump(mode="json")
+                ),
+                "calendar_eligibility_binding": bound.calendar_binding,
+                "temporal_decisions": decisions,
+                "temporal_artifact_identities": tuple(
+                    sorted(
+                        decision.immutable_artifact_identity
+                        for decision in decisions
+                    )
+                ),
+            }
+        elif context is not None or capability_routing_plan is not None:
             raise ProviderSubrequestCacheError(
                 ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
             )
@@ -684,6 +875,23 @@ class ProviderSubrequestCache:
                 self._financial_eligibility_context_contract_version,
                 self._financial_eligibility_context_identity,
             ) = requested
+            if temporal:
+                self._capability_routing_plan_version = str(
+                    temporal_projection["capability_routing_plan_version"]
+                )
+                self._capability_routing_plan_signature = str(
+                    temporal_projection["capability_routing_plan_signature"]
+                )
+                self._financial_eligibility_metadata_binding = dict(
+                    temporal_projection["financial_eligibility_metadata_binding"]
+                )
+                self._calendar_eligibility_binding = temporal_projection[
+                    "calendar_eligibility_binding"
+                ]
+                self._temporal_decisions = temporal_projection["temporal_decisions"]
+                self._temporal_artifact_identities = temporal_projection[
+                    "temporal_artifact_identities"
+                ]
 
     def checkpoint(self) -> dict[str, object]:
         entries: list[ProviderSubrequestCheckpointEntry] = []
@@ -716,17 +924,33 @@ class ProviderSubrequestCache:
                 self._financial_eligibility_context_contract_version
             )
             context_identity = self._financial_eligibility_context_identity
+            plan_version = self._capability_routing_plan_version
+            plan_signature = self._capability_routing_plan_signature
+            metadata_binding = self._financial_eligibility_metadata_binding
+            calendar_binding = self._calendar_eligibility_binding
+            temporal_decisions = self._temporal_decisions
+            temporal_artifact_identities = self._temporal_artifact_identities
         return ProviderSubrequestCacheCheckpoint(
             contract_version=(
-                PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
-                if context_identity is not None
-                else "1.0"
+                PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
+                if plan_version is not None
+                else (
+                    PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
+                    if context_identity is not None
+                    else "1.0"
+                )
             ),
             run_scope_id=self._run_scope_id,
             financial_eligibility_context_contract_version=(
                 context_contract_version
             ),
             financial_eligibility_context_identity=context_identity,
+            capability_routing_plan_version=plan_version,
+            capability_routing_plan_signature=plan_signature,
+            financial_eligibility_metadata_binding=metadata_binding,
+            calendar_eligibility_binding=calendar_binding,
+            temporal_decisions=temporal_decisions,
+            temporal_artifact_identities=temporal_artifact_identities,
             entries=tuple(entries),
         ).model_dump(mode="json")
 
@@ -765,7 +989,26 @@ class ProviderSubrequestCache:
                 restored.financial_eligibility_context_contract_version,
                 restored.financial_eligibility_context_identity,
             )
-            if expected_context != restored_context:
+            expected_temporal = (
+                self._capability_routing_plan_version,
+                self._capability_routing_plan_signature,
+                self._financial_eligibility_metadata_binding,
+                self._calendar_eligibility_binding,
+                self._temporal_decisions,
+                self._temporal_artifact_identities,
+            )
+            restored_temporal = (
+                restored.capability_routing_plan_version,
+                restored.capability_routing_plan_signature,
+                restored.financial_eligibility_metadata_binding,
+                restored.calendar_eligibility_binding,
+                restored.temporal_decisions,
+                restored.temporal_artifact_identities,
+            )
+            if (
+                expected_context != restored_context
+                or expected_temporal != restored_temporal
+            ):
                 raise ProviderSubrequestCacheError(
                     ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
                 )

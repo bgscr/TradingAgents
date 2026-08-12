@@ -98,6 +98,7 @@ from tradingagents.dataflows.financial_period_targets import (
 )
 from tradingagents.dataflows.financial_temporal_eligibility import (
     FinancialMetadataTemporalEligibilityDecision,
+    FinancialTemporalEligibilityCheckpointProjection,
 )
 from tradingagents.dataflows.financial_temporal_proof_projection import (
     FinancialEligibilityTemporalEvaluationTransaction,
@@ -1942,7 +1943,10 @@ def _validate_indicator_metadata_compatibility_binding(
 class FinancialStatementRoutingResult(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-statement-routing-result-v1"] = (
+    contract_version: Literal[
+        "financial-statement-routing-result-v1",
+        "financial-statement-routing-result-v2",
+    ] = (
         "financial-statement-routing-result-v1"
     )
     route: tuple[str, ...]
@@ -1960,6 +1964,9 @@ class FinancialStatementRoutingResult(BaseModel):
     financial_eligibility_binding: (
         MainlandFinancialEligibilityProjectionBinding | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialStatementRoutingResult:
@@ -1967,13 +1974,17 @@ class FinancialStatementRoutingResult(BaseModel):
             self.manifest.publication_target_construction is not None
         ):
             raise ValueError("statement v1 manifest carries publication targets")
-        if self.manifest.contract_version == "financial-manifest-v2" and (
+        if self.manifest.contract_version in {
+            "financial-manifest-v2",
+            "financial-manifest-v4",
+        } and (
             self.manifest.publication_target_construction
             != self.publication_target_construction
         ):
             raise ValueError("statement publication targets contradict manifest")
         if (
-            self.manifest.contract_version == "financial-manifest-v2"
+            self.manifest.contract_version
+            in {"financial-manifest-v2", "financial-manifest-v4"}
             and self.manifest.financial_eligibility_binding
             != self.financial_eligibility_binding
         ):
@@ -1989,13 +2000,28 @@ class FinancialStatementRoutingResult(BaseModel):
             item.attempt_event_id
             for item in self.manifest.physical_attempt_events
         )
-        if self.manifest.contract_version == "financial-manifest-v2" and (
+        if self.manifest.contract_version in {
+            "financial-manifest-v2",
+            "financial-manifest-v4",
+        } and (
             set(manifest_attempt_ids) != set(self.physical_attempt_ids)
             or self.manifest.final_rendered_artifact is None
             or self.manifest.final_rendered_artifact.content_sha256
             != _rendered_sha256(render_statement_routing_result(self))
         ):
             raise ValueError("statement routing manifest operational binding is invalid")
+        temporal = self.contract_version == "financial-statement-routing-result-v2"
+        if temporal != (self.manifest.contract_version == "financial-manifest-v4") or (
+            temporal
+            and (
+                self.temporal_eligibility_binding is None
+                or self.manifest.temporal_eligibility_binding
+                != self.temporal_eligibility_binding
+            )
+        ):
+            raise ValueError("statement temporal routing binding is invalid")
+        if not temporal and self.temporal_eligibility_binding is not None:
+            raise ValueError("historical statement result carries temporal binding")
         return self
 
 
@@ -2006,6 +2032,7 @@ class FinancialIndicatorRoutingResult(BaseModel):
         "financial-indicator-routing-result-v1",
         "financial-indicator-routing-result-v2",
         "financial-indicator-routing-result-v3",
+        "financial-indicator-routing-result-v4",
     ] = (
         "financial-indicator-routing-result-v1"
     )
@@ -2061,11 +2088,17 @@ class FinancialIndicatorRoutingResult(BaseModel):
     indicator_metadata_compatibility_version: Literal[
         "financial-indicator-metadata-compatibility-v1"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_serializer(mode="wrap")
     def _serialize_versioned(self, handler):
         payload = handler(self)
-        if self.contract_version != "financial-indicator-routing-result-v3":
+        if self.contract_version not in {
+            "financial-indicator-routing-result-v3",
+            "financial-indicator-routing-result-v4",
+        }:
             payload.pop("unresolved_families", None)
             payload.pop("metadata_compatibility_assessments", None)
             payload.pop("metadata_incompatible_rejections", None)
@@ -2248,7 +2281,10 @@ class FinancialIndicatorRoutingResult(BaseModel):
             raise ValueError(
                 "indicator metadata compatibility disposition is inconsistent"
             )
-        metadata_bound = self.contract_version == "financial-indicator-routing-result-v3"
+        metadata_bound = self.contract_version in {
+            "financial-indicator-routing-result-v3",
+            "financial-indicator-routing-result-v4",
+        }
         if metadata_bound:
             if (
                 self.indicator_field_semantics_version
@@ -2256,7 +2292,13 @@ class FinancialIndicatorRoutingResult(BaseModel):
                 or self.indicator_metadata_compatibility_version
                 != "financial-indicator-metadata-compatibility-v1"
                 or any(
-                    manifest.contract_version != "financial-manifest-v3"
+                    manifest.contract_version
+                    != (
+                        "financial-manifest-v4"
+                        if self.contract_version
+                        == "financial-indicator-routing-result-v4"
+                        else "financial-manifest-v3"
+                    )
                     for manifest in self.family_manifests
                 )
             ):
@@ -2316,6 +2358,16 @@ class FinancialIndicatorRoutingResult(BaseModel):
             or self.indicator_metadata_compatibility_version is not None
         ):
             raise ValueError("historical indicator result carries metadata binding")
+        temporal = self.contract_version == "financial-indicator-routing-result-v4"
+        if temporal:
+            if self.temporal_eligibility_binding is None or any(
+                manifest.temporal_eligibility_binding
+                != self.temporal_eligibility_binding
+                for manifest in self.family_manifests
+            ):
+                raise ValueError("indicator temporal routing binding is invalid")
+        elif self.temporal_eligibility_binding is not None:
+            raise ValueError("historical indicator result carries temporal binding")
         forward_manifests = tuple(
             manifest
             for manifest in self.family_manifests
@@ -4019,6 +4071,7 @@ class MainlandFinancialCapabilityRouter:
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
             "financial-indicator-routing-request-v6",
+            "financial-indicator-routing-request-v7",
         }:
             (
                 family_assessments,
@@ -4608,6 +4661,7 @@ def assess_financial_indicator_family_outcomes(
             "financial-indicator-routing-request-v4",
             "financial-indicator-routing-request-v5",
             "financial-indicator-routing-request-v6",
+            "financial-indicator-routing-request-v7",
         }
         or requirements is None
         or request.requested_analysis_scope is None
@@ -4997,10 +5051,31 @@ def finalize_statement_routing_result(
     result: FinancialStatementRoutingResult,
     *,
     physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = None,
 ) -> FinancialStatementRoutingResult:
     """Upgrade one qualified statement result to the run-scoped v2 manifest."""
 
-    if result.manifest.contract_version == "financial-manifest-v2":
+    if result.manifest.contract_version in {
+        "financial-manifest-v2",
+        "financial-manifest-v4",
+    }:
+        if (
+            temporal_eligibility_binding is not None
+            and result.manifest.contract_version == "financial-manifest-v2"
+        ):
+            payload = result.model_dump(mode="python")
+            payload.update(
+                {
+                    "contract_version": "financial-statement-routing-result-v2",
+                    "manifest": result.manifest.bind_temporal_eligibility(
+                        temporal_eligibility_binding
+                    ),
+                    "temporal_eligibility_binding": temporal_eligibility_binding,
+                }
+            )
+            return FinancialStatementRoutingResult.model_validate(payload)
         return result
     finalized = result.manifest.finalize(
         physical_attempt_events=physical_attempt_events,
@@ -5013,9 +5088,13 @@ def finalize_statement_routing_result(
             else None
         ),
         financial_eligibility_binding=result.financial_eligibility_binding,
+        temporal_eligibility_binding=temporal_eligibility_binding,
     )
     payload = result.model_dump(mode="python")
     payload["manifest"] = finalized
+    if temporal_eligibility_binding is not None:
+        payload["contract_version"] = "financial-statement-routing-result-v2"
+        payload["temporal_eligibility_binding"] = temporal_eligibility_binding
     return FinancialStatementRoutingResult.model_validate(payload)
 
 
@@ -5024,13 +5103,35 @@ def finalize_indicator_routing_result(
     *,
     request: FinancialIndicatorRoutingRequest,
     physical_attempt_events: Sequence[ProviderSubrequestAttemptEvent],
+    temporal_eligibility_binding: (
+        FinancialTemporalEligibilityCheckpointProjection | None
+    ) = None,
 ) -> FinancialIndicatorRoutingResult:
     """Upgrade all families in one qualified indicator result to v2."""
 
     if all(
-        manifest.contract_version in {"financial-manifest-v2", "financial-manifest-v3"}
+        manifest.contract_version
+        in {"financial-manifest-v2", "financial-manifest-v3", "financial-manifest-v4"}
         for manifest in result.family_manifests
     ):
+        if temporal_eligibility_binding is not None and all(
+            manifest.contract_version != "financial-manifest-v4"
+            for manifest in result.family_manifests
+        ):
+            payload = result.model_dump(mode="python")
+            payload.update(
+                {
+                    "contract_version": "financial-indicator-routing-result-v4",
+                    "family_manifests": tuple(
+                        manifest.bind_temporal_eligibility(
+                            temporal_eligibility_binding
+                        )
+                        for manifest in result.family_manifests
+                    ),
+                    "temporal_eligibility_binding": temporal_eligibility_binding,
+                }
+            )
+            return FinancialIndicatorRoutingResult.model_validate(payload)
         return result
     rendered_value = render_indicator_routing_result(result)
     finalized = tuple(
@@ -5054,11 +5155,15 @@ def finalize_indicator_routing_result(
             financial_eligibility_binding=(
                 result.financial_eligibility_binding
             ),
+            temporal_eligibility_binding=temporal_eligibility_binding,
         )
         for manifest in result.family_manifests
     )
     payload = result.model_dump(mode="python")
     payload["family_manifests"] = finalized
+    if temporal_eligibility_binding is not None:
+        payload["contract_version"] = "financial-indicator-routing-result-v4"
+        payload["temporal_eligibility_binding"] = temporal_eligibility_binding
     return FinancialIndicatorRoutingResult.model_validate(payload)
 
 

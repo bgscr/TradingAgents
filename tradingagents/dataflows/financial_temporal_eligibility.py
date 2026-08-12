@@ -499,6 +499,76 @@ class FinancialMetadataTemporalEligibilityDecision(BaseModel):
         return self
 
 
+class FinancialTemporalEligibilityCheckpointProjection(BaseModel):
+    """Complete safe temporal decision state copied into replay contracts."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-eligibility-temporal-binding-v1"] = (
+        "financial-eligibility-temporal-binding-v1"
+    )
+    capability_routing_plan_version: Literal["1.3"] = "1.3"
+    temporal_policy_version: Literal[
+        "provider-neutral-temporal-eligibility-v1"
+    ] = PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION
+    calendar_eligibility_binding_version: Literal[
+        "market-session-eligibility-binding-v1"
+    ] = MARKET_SESSION_ELIGIBILITY_BINDING_VERSION
+    temporal_decision_version: Literal[
+        "financial-metadata-temporal-eligibility-decision-v1"
+    ] = FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION
+    requested_session: date
+    temporal_mode: TemporalEligibilityMode
+    eligibility_evaluated_at: datetime
+    calendar_binding: MarketSessionEligibilityBinding
+    latest_completed_session: date | None = None
+    company_type_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    listing_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    strict_cutoff: datetime | None = None
+
+    @field_validator("eligibility_evaluated_at", "strict_cutoff")
+    @classmethod
+    def _validate_checkpoint_time(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        return None if value is None else _aware(value, field_name="temporal time")
+
+    @model_validator(mode="after")
+    def _validate_checkpoint_projection(self) -> Self:
+        decisions = (
+            self.company_type_temporal_decision,
+            self.listing_temporal_decision,
+        )
+        if (
+            not self.calendar_binding.has_valid_identity()
+            or self.requested_session != self.calendar_binding.requested_session
+            or self.eligibility_evaluated_at
+            != self.calendar_binding.eligibility_evaluated_at
+            or self.latest_completed_session
+            != self.calendar_binding.latest_completed_session
+            or any(
+                decision.mode != self.temporal_mode.value
+                or decision.calendar_binding != self.calendar_binding
+                or decision.strict_cutoff != self.strict_cutoff
+                for decision in decisions
+            )
+            or self.company_type_temporal_decision.evidence_class
+            not in {
+                TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+                TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
+            }
+            or self.listing_temporal_decision.evidence_class
+            is not TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING
+            or (
+                self.temporal_mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
+            )
+            != (self.strict_cutoff is not None)
+        ):
+            raise ValueError("temporal checkpoint projection is inconsistent")
+        return self
+
+
 def _artifact_bindings_match(
     evidence: FinancialMetadataTemporalEvidence,
     *,
@@ -714,6 +784,7 @@ __all__ = [
     "ExactRevisionAvailabilityScope",
     "FinancialMetadataTemporalEligibilityDecision",
     "FinancialMetadataTemporalEvidence",
+    "FinancialTemporalEligibilityCheckpointProjection",
     "MarketSessionEligibilityBinding",
     "ProviderPublicationDateDerivation",
     "ProviderPublicationDateSemantics",

@@ -41,6 +41,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingRunProjection,
     TushareCapability,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
@@ -1585,6 +1586,102 @@ def test_graph_starts_distinct_v2_run_for_pre_v2_qualified_checkpoint(
         assert new_state["capability_routing_plan"] == active.model_dump(
             mode="json"
         )
+
+    with get_checkpointer(graph.config["data_cache_dir"], ticker) as saver:
+        assert saver.get_tuple(old_config).checkpoint == before
+
+
+def test_graph_starts_distinct_temporal_run_for_plan_1_2_checkpoint(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.create_llm_client",
+        lambda **_kwargs: SimpleNamespace(get_llm=lambda: object()),
+    )
+    asset = _asset()
+    historical = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert historical is not None
+    active = prepare_mainland_temporal_capability_routing_plan(historical)
+    ticker = asset.instrument_identity.symbol
+    trade_date = "2026-08-10"
+    graph = TradingAgentsGraph(
+        selected_analysts=("fundamentals",),
+        config=_graph_config(tmp_path, active),
+        asset_configuration=asset,
+        capability_routing_plan=active,
+        qualified_financial_routing=_composition(active, asset),
+    )
+    old_run_id = "run:" + "c" * 64
+    historical_state = graph.create_initial_state(
+        ticker,
+        trade_date,
+        evidence_state=EvidenceState(
+            instrument_identity=asset.instrument_identity
+        ),
+        run_id=old_run_id,
+    )
+    historical_state["capability_routing_plan"] = historical.model_dump(
+        mode="json"
+    )
+    historical_state["capability_routing_rollout"] = (
+        MainlandCapabilityRoutingRunProjection.from_plan(historical).model_dump(
+            mode="json"
+        )
+    )
+    historical_signature = graph._run_signature("stock").replace(
+        active.plan_signature,
+        historical.plan_signature,
+    )
+    old_config = {
+        "configurable": {
+            "thread_id": thread_id(
+                ticker,
+                trade_date,
+                historical_signature,
+            )
+        }
+    }
+    workflow = StateGraph(AgentState)
+    workflow.add_node("checkpoint", lambda _state: {})
+    workflow.set_entry_point("checkpoint")
+    workflow.add_edge("checkpoint", END)
+    with get_checkpointer(graph.config["data_cache_dir"], ticker) as saver:
+        workflow.compile(checkpointer=saver).invoke(
+            historical_state,
+            config=old_config,
+        )
+        before = saver.get_tuple(old_config).checkpoint
+
+    with graph.checkpoint_scope(ticker, trade_date) as session:
+        compatibility = session.routing_compatibility
+        assert session.resume_from_checkpoint is False
+        assert compatibility is not None
+        assert compatibility.action is (
+            MainlandCapabilityRoutingCheckpointAction.START_NEW
+        )
+        assert compatibility.reason is (
+            MainlandCapabilityRoutingCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+        )
+        assert compatibility.previous_run_id == old_run_id
+        assert compatibility.new_run_id is not None
+        assert compatibility.new_run_id != old_run_id
+        new_state = graph.create_initial_state(
+            ticker,
+            trade_date,
+            evidence_state=EvidenceState(
+                instrument_identity=asset.instrument_identity
+            ),
+            checkpoint_thread_id=session.graph_config["configurable"][
+                "thread_id"
+            ],
+        )
+        assert new_state["run_id"] == compatibility.new_run_id
+        assert new_state["capability_routing_plan"] == active.model_dump(
+            mode="json"
+        )
+        assert "financial_eligibility_context" not in new_state
 
     with get_checkpointer(graph.config["data_cache_dir"], ticker) as saver:
         assert saver.get_tuple(old_config).checkpoint == before

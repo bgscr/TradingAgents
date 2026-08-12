@@ -77,8 +77,8 @@ from tradingagents.dataflows.financial_capability_routing import (
 )
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_MANIFEST_V2,
+    FINANCIAL_MANIFEST_V4,
     FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
-    FinancialAvailabilityScope,
     FinancialConsolidationScope,
     FinancialRatioFamily,
     FinancialStatementType,
@@ -88,6 +88,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
@@ -95,6 +96,7 @@ from tradingagents.dataflows.financial_dispatch import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
     FinancialCompanyTypeProviderTemporalProofBinding,
@@ -1074,11 +1076,17 @@ def _restore_checkpoint_eligibility_context(
         )
     raw_ledger_version = raw_shadow_ledger.get("contract_version")
     expected_ledger_version = (
-        FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.3"
+        else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.2"
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
     if raw_ledger_version != expected_ledger_version:
+        if run_binding.routing_plan.plan_version == "1.3":
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            )
         if run_binding.routing_plan.plan_version == "1.2" and raw_ledger_version in {
             FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
             FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
@@ -1100,11 +1108,16 @@ def _restore_checkpoint_eligibility_context(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
         )
-    if raw_context.get("contract_version") != (
-        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
-    ):
+    expected_context_version = (
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        if run_binding.routing_plan.plan_version == "1.3"
+        else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
+    )
+    if raw_context.get("contract_version") != expected_context_version:
         raise FinancialDispatchCheckpointError(
-            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
+            FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            if run_binding.routing_plan.plan_version == "1.3"
+            else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
         )
     raw_identity = raw_context.get("context_identity")
     try:
@@ -1129,10 +1142,17 @@ def _restore_checkpoint_eligibility_context(
         ) from exc
     checkpoint_thread_id = run_binding.checkpoint_thread_id
     trade_date = state.get("trade_date")
+    context_session = (
+        context.requested_session
+        if context.contract_version
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        else context.as_of_date
+    )
     if (
         checkpoint_thread_id is None
         or raw_shadow_ledger.get("checkpoint_thread_id") != checkpoint_thread_id
-        or trade_date != context.as_of_date.isoformat()
+        or context_session is None
+        or trade_date != context_session.isoformat()
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_BINDING_MISMATCH
@@ -1145,8 +1165,8 @@ def _restore_checkpoint_eligibility_context(
                 run_binding.asset_configuration.asset_configuration_signature
             ),
             instrument_identity=run_binding.asset_configuration.instrument_identity,
-            as_of_date=context.as_of_date,
-            availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+            as_of_date=context_session,
+            availability_scope=context.availability_scope,
             acquisition_purpose="foreground_current_analysis",
             financial_eligibility_binding=(
                 run_binding.routing_plan.financial_eligibility_binding
@@ -1290,7 +1310,9 @@ def _validated_checkpoint_restoration(
         )
     )
     expected_shadow_version = (
-        FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
+        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        if plan.plan_version == "1.3"
+        else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if plan.plan_version == "1.2"
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
@@ -1302,7 +1324,12 @@ def _validated_checkpoint_restoration(
         or shadow_ledger.run_asset_configuration_signature
         != expected_asset.asset_configuration_signature
         or shadow_ledger.capability_routing_plan_signature != plan.plan_signature
-        or shadow_ledger.financial_manifest_version != FINANCIAL_MANIFEST_V2
+        or shadow_ledger.financial_manifest_version
+        != (
+            FINANCIAL_MANIFEST_V4
+            if plan.plan_version == "1.3"
+            else FINANCIAL_MANIFEST_V2
+        )
         or shadow_ledger.financial_eligibility_binding != expected_binding
         or shadow_ledger.run_scope_id != run_binding.run_id
         or cache_checkpoint is None
@@ -1332,15 +1359,40 @@ def _validated_checkpoint_restoration(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
         )
+    if plan.plan_version == "1.3":
+        temporal = context.temporal_eligibility_binding
+        if (
+            context.contract_version
+            != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+            or temporal is None
+            or shadow_ledger.capability_routing_plan_version != "1.3"
+            or shadow_ledger.financial_indicator_manifest_version
+            != FINANCIAL_MANIFEST_V4
+            or shadow_ledger.indicator_field_semantics_version
+            != plan.indicator_field_semantics_version
+            or shadow_ledger.indicator_metadata_compatibility_version
+            != plan.indicator_metadata_compatibility_version
+            or shadow_ledger.indicator_provider_topology
+            != plan.route_for(MainlandCapability.FINANCIAL_INDICATORS)
+            or shadow_ledger.temporal_eligibility_binding is None
+            or shadow_ledger.temporal_eligibility_binding.model_dump(mode="json")
+            != temporal.model_dump(mode="json")
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            )
     if (
-        cache_checkpoint.contract_version != "1.1"
+        cache_checkpoint.contract_version
+        != ("1.2" if plan.plan_version == "1.3" else "1.1")
         or cache_checkpoint.financial_eligibility_context_contract_version
         != context.contract_version
         or cache_checkpoint.financial_eligibility_context_identity
         != context.context_identity
     ):
         raise FinancialDispatchCheckpointError(
-            FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
+            FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            if plan.plan_version == "1.3"
+            else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
         )
 
     expected_identity = ProviderSubrequestInstrumentIdentity.from_authoritative(
@@ -1585,6 +1637,18 @@ class RegisteredProductionQualifiedRoutingComposition:
                 subrequest_cache.bind_financial_eligibility_context(
                     context_contract_version=restoration.context.contract_version,
                     context_identity=restoration.context.context_identity,
+                    context=(
+                        restoration.context
+                        if restoration.context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        else None
+                    ),
+                    capability_routing_plan=(
+                        run_binding.routing_plan
+                        if restoration.context.contract_version
+                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        else None
+                    ),
                 )
                 subrequest_cache.restore_checkpoint(restoration.cache_checkpoint)
             except ProviderSubrequestCacheError as exc:
