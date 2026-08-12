@@ -19,13 +19,15 @@ acquisition; 05B — Persist and restore indicator metadata compatibility; 06A �
 Correct QCF4 deterministic acceptance; 06B — Run deterministic temporal
 acceptance.
 
-**Status:** blocked
+**Status:** completed
 
-**Acceptance state:** The pre-temporal contract passed on 2026-08-10 and its
-evidence below remains immutable. The amended temporal contract is pending: 06B
-must pass first, then every QCF1–QCF18, PE1–PE15, AC1–AC13, non-integration/full
-suite, Ruff, history/security/diff, and two-stage-review requirement must be
-rerun completely. Ticket 07 remains blocked and no rollout is authorized.
+**Acceptance state:** PASS on 2026-08-12. The immutable 2026-08-10 pre-temporal
+evidence below remains historical only. The final acceptance basis is the
+post-temporal implementation chain through commit
+`21000ab78ec221a6b528b151400a6673007fc947`, the formal closure request's
+attested 06B execution results against that tree, and the focused closure
+verification recorded below. Ticket 07 was not executed by this closure and no
+rollout or authoritative `qualified_v1` activation is authorized.
 
 ## Observable behavior
 
@@ -156,21 +158,21 @@ runnable or passing until Ticket 06A passes corrected QCF4.
 
 ## Amended acceptance criteria
 
-- [ ] Ticket 06B passes its complete temporal matrix before the Ticket 06 rerun
+- [x] Ticket 06B passes its complete temporal matrix before the Ticket 06 rerun
   begins. Focused temporal tests alone cannot satisfy or partially clear this
   ticket.
-- [ ] **QCF1–QCF10:** rerun every preserved scenario above from the amended tree
+- [x] **QCF1–QCF10:** rerun every preserved scenario above from the amended tree
   without waiver. QCF4–QCF10 use plan 1.3/context v2, provider-derived temporal
   proof, the one evaluator, a pinned calendar binding, and the same or stronger
   fresh-origin, metadata-truthfulness, route, attempt, cache, and authority
   assertions.
-- [ ] **QCF11 — Temporal single-flight:** in addition to every preserved
+- [x] **QCF11 — Temporal single-flight:** in addition to every preserved
   single-flight/bulk assertion, concurrent first use performs one company-type
   resolution, one compatible listing acquisition, exactly one context-level
   temporal evaluation transaction under one fixed
   `eligibility_evaluated_at`, one terminal decision binding, and one context
   bind; no follower samples a clock or invokes the evaluator.
-- [ ] **QCF12 — Temporal exact restoration:** a fresh plan-1.3/context-v2 run
+- [x] **QCF12 — Temporal exact restoration:** a fresh plan-1.3/context-v2 run
   produces cache checkpoint 1.2, dispatch ledger 1.6, and manifest v4 state.
   Exact restore reproduces temporal policy/calendar bindings, fixed evaluation
   inputs, provider proof/timestamps, accepted/rejected decisions/results/reasons,
@@ -178,20 +180,20 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   with zero I/O, permits, attempts, evaluator/clock calls, or consultation of
   today's calendar frontier. Plan-1.2/context-v1 under plan 1.3 fails typed or
   requires explicit `START_NEW` without repair.
-- [ ] **QCF13–QCF15:** rerun every preserved pre-open, lifecycle, and security
+- [x] **QCF13–QCF15:** rerun every preserved pre-open, lifecycle, and security
   assertion and additionally cover invalid temporal/calendar/context bindings,
   failure at every temporal projection/evaluation/bind boundary, and proof/
   timestamp/reason canaries without leaking raw provider data or credentials.
-- [ ] **QCF16:** legacy-selected output, daily AKShare → BaoStock → Yahoo,
+- [x] **QCF16:** legacy-selected output, daily AKShare → BaoStock → Yahoo,
   Evidence Admission, Decision Gate, BaoStock authority, and
   `shadow_non_authoritative` disposition remain unchanged under temporal
   forward contracts; authoritative `qualified_v1` remains disabled.
-- [ ] **QCF17 — Forward-only history:** historical material—including the
+- [x] **QCF17 — Forward-only history:** historical material—including the
   failed Ticket 07 run—is byte-for-byte untouched and read only under its
   recorded semantic/temporal contract. New material uses the exact
   plan-1.3/context-v2/cache-1.2/ledger-1.6/manifest-v4 versions with no rewrite,
   migration, relabeling, reinterpretation, deletion, or ID reuse.
-- [ ] **QCF18:** rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13,
+- [x] **QCF18:** rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13,
   non-integration/full suites twice, Ruff, whitespace/diff, secret/history
   checks, and Spec Compliance then Code Quality review from the same amended
   tree. Any failure or waiver keeps Tickets 06 and 07 blocked.
@@ -492,16 +494,210 @@ The temporal amendment supersedes that gate: Ticket 07 is currently blocked by
 
 ## Amended definition of done
 
-- [ ] Ticket 06B passes before a complete new QCF1–QCF18 rerun begins.
-- [ ] A durable plan-1.3/context-v2 traceability record maps every QCF1–QCF18,
+- [x] Ticket 06B passes before a complete new QCF1–QCF18 rerun begins.
+- [x] A durable plan-1.3/context-v2 traceability record maps every QCF1–QCF18,
   PE1–PE15, and AC1–AC13 ID to named deterministic tests, commands, and results
   without weakening the preserved pre-temporal criteria.
-- [ ] Focused temporal/composition suites, non-integration, two full-suite
+- [x] Focused temporal/composition suites, non-integration, two full-suite
   passes, Ruff, whitespace/diff, secret/raw-error, historical immutability, and
   scope/dependency checks all pass from the same tree without live work.
-- [ ] Stage 1 Spec Compliance review passes before Stage 2 Code Quality review;
+- [x] Stage 1 Spec Compliance review passes before Stage 2 Code Quality review;
   all Critical and Important findings are resolved and the classification is
   recorded.
-- [ ] The failed Ticket 07 run remains immutable, Ticket 07 is unblocked only by
+- [x] The failed Ticket 07 run remains immutable, Ticket 07 is unblocked only by
   both 06B and this complete amended rerun plus fresh live authorization, and
   authoritative `qualified_v1` remains disabled.
+
+## Final post-temporal acceptance evidence — 2026-08-12
+
+This is the final Ticket 06 acceptance basis. It does not replace, edit, or
+reinterpret the historical 2026-08-10 evidence above. The implementation and
+acceptance chain is:
+
+| Scope | Commit | Result |
+| --- | --- | --- |
+| Corrected QCF4 | `eb2f9b1311688e17228aa78c968b90371a6bf219` | PASS |
+| Temporal contracts/evaluator (02G) | `79f0905b418f66a4f09011aa612a776ef2c02295` | PASS |
+| Temporal proof/acquisition integration (02H) | `aeabab8c883d9f183a6b0724445e4f04708ecac3` | PASS |
+| Temporal checkpoint/replay (05C) | `7e10ffcfa60c02873280871546c80fd4359f2a1d` | PASS |
+| Integrated deterministic temporal acceptance (06B) | `21000ab78ec221a6b528b151400a6673007fc947` | PASS |
+
+Evidence provenance note: the formal Ticket 06 closure request identifies
+`21000ab78ec221a6b528b151400a6673007fc947` as the completed 06B baseline and
+attests that its unchanged post-temporal tree passed the complete temporal
+matrix, QCF1–QCF18 twice, PE1–PE15, AC1–AC13, non-integration, the full suite
+twice, live-test isolation, Ruff, diff/history/security checks, and Spec
+Compliance before Code Quality review. The local 02G, 02H, 05C, and 06B issue
+files still contain their pre-completion `ready-for-agent` tracking labels and
+unchecked prospective criteria because their implementation commits did not
+edit those issue files. This is stale tracker metadata, not contrary execution
+evidence. The explicit scope is to close only Ticket 06, so this closure records
+the supplied 06B attestation and immutable commit chain here without changing or
+silently normalizing any prerequisite ticket.
+
+The formal closure request attests that the 06B execution against that exact
+committed tree proved the complete temporal matrix, QCF1–QCF18 twice, PE1–PE15,
+AC1–AC13, non-integration, the complete suite twice, live-test isolation, Ruff,
+diff/history/security checks, and Spec Compliance before Code Quality review.
+The execution log was not added by commit `21000ab`; this Ticket 06 record makes
+the supplied result attestation durable and keeps it distinct from the commit's
+implementation/test content. The closure did not repeat those expensive suites.
+It reran the highest-risk focused seams with all three live opt-ins explicitly
+set to `0` and reconciled the attested results against the unchanged tree.
+
+### Final QCF1–QCF18 traceability
+
+| ID | Final plan-1.3/context-v2 evidence | Result |
+| --- | --- | --- |
+| QCF1 | `test_static_builtin_registration_is_immutable_and_deterministic`; `test_cli_and_programmatic_callers_resolve_same_builtin_identity_and_blueprint`; `test_real_graph_accepts_registered_builtin_without_provider_io` | PASS |
+| QCF2 | `test_public_builder_precedence_is_direct_then_operator_then_builtin` plus invalid-operator/output static-registration cases | PASS |
+| QCF3 | `test_non_applicable_paths_do_not_validate_or_invoke_builtin`; `test_authoritative_qualified_plan_is_rejected_before_builtin_invocation`; disabled/legacy rollout cases | PASS |
+| QCF4 | `test_qcf4_only_unresolved_indicator_family_continues_fallback`; `test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back` for bank/non-bank and both input orders | PASS |
+| QCF5 | `test_qcf5_fresh_builtin_preserves_partial_tushare_work_and_gaps` | PASS |
+| QCF6 | `test_qcf6_fresh_builtin_akshare_salvages_only_unresolved_statement` | PASS |
+| QCF7 | `test_qcf7_fresh_builtin_yahoo_profile_and_derived_factor_stay_degraded` | PASS |
+| QCF8 | `test_qcf8_fresh_builtin_baostock_owns_strict_bundle_and_tradeability` | PASS |
+| QCF9 | Four `test_qcf9_fresh_builtin_*` factor/name separation and terminal-fallback cases | PASS |
+| QCF10 | `test_qcf10_fresh_builtin_exact_terminal_attempt_and_cache_hits`; provider coordinator/cache physical-attempt and Yahoo retry matrices | PASS |
+| QCF11 | `test_qcf11_fresh_builtin_single_flight_and_bulk_reuse`; `test_first_use_single_flight_fixes_one_temporal_frontier_for_32_followers` | PASS |
+| QCF12 | `test_qcf12_fresh_create_checkpoint_restores_with_zero_io`; `test_context_v2_cache_checkpoint_1_2_round_trips_temporal_decisions`; `test_temporal_statement_ledger_restores_and_replays_without_fresh_work`; `test_plan_1_2_requires_typed_start_new_under_temporal_plan_1_3` | PASS |
+| QCF13 | `test_missing_duplicate_and_unknown_source_coverage_fail_before_factories`; `test_explicit_validation_preflight_failure_stops_before_run_artifacts`; `test_temporal_ledger_corruption_fails_typed_without_restore_work`; `test_plan_1_2_requires_typed_start_new_under_temporal_plan_1_3` | PASS |
+| QCF14 | `test_partial_construction_failure_closes_only_created_resources_in_reverse`; `test_retained_temporal_evaluator_exception_fails_typed_and_unbound`; `test_fresh_baostock_evaluator_exception_preserves_the_exact_provider_attempt`; `test_temporal_failure_leaves_no_routing_or_factories_and_preserves_cleanup_primary` | PASS |
+| QCF15 | `test_blueprint_public_values_are_secret_payload_url_and_path_free`; `test_external_source_raw_exception_is_sanitized_at_the_composition_seam`; `test_raw_source_exception_text_does_not_enter_failure_or_repr`; `test_rejection_reason_vocabulary_is_exact_and_closed` | PASS |
+| QCF16 | `test_default_rollout_remains_byte_compatible_legacy`; `test_shadow_plan_is_explicit_qualified_routing_but_non_authoritative`; `test_authoritative_qualified_v1_preflight_remains_disabled_without_io`; `test_programmatic_qualified_v1_graph_injection_is_disabled_before_model_work` | PASS |
+| QCF17 | `test_historical_v1_serialization_does_not_emit_temporal_v2_fields`; `test_plan_1_2_requires_typed_start_new_under_temporal_plan_1_3`; historical reader matrices; failed Ticket 07 byte/hash inventory | PASS |
+| QCF18 | Final PE1–PE15 and AC1–AC13 named tables below; user-attested 06B non-integration/two-full-suite results against `21000ab`; live isolation, Ruff, diff, and two-stage review | PASS |
+
+QCF4 began at a fresh registered built-in with an unbound context owner, no
+callable financial runtime, no seeded dispatcher selection, and no checkpoint.
+The test asserts plan `1.3`; one Tushare company-type resolution; authoritative
+BaoStock listing provenance; compatible selected Tushare statements; and
+truthful Tushare indicators retained with 100% value completeness but
+unselected where filing consolidation scope is material `UNPROVEN`. Pinned
+ratio/rate/turnover field policy alone supplies `NOT_APPLICABLE` value currency;
+provider artifacts do not acquire requested `CNY` or `CONSOLIDATED` proof. Only
+unresolved families continue in immutable plan order. The persisted result
+asserts context v2, dispatch ledger `1.6`, financial manifest v4, indicator
+routing result v4, dispatch/checkpoint v3, exact candidate/assessment identities,
+and exact prerequisite/ordinary physical-attempt cardinality.
+
+QCF12 executes fresh run → temporal context → checkpoint → close → built-in
+reconstruction → exact restore → repeated exact request. Restore sentinels fail
+the test on any coordinator permit, provider/cache work, artifact write,
+metadata acquisition, company-type resolution, temporal evaluation, clock
+sample, current-frontier/calendar lookup, BaoStock lifecycle call, or model
+call. The accepted run preserved the exact context, ledger, cache checkpoint
+`1.2`, dispatch ledger `1.6`, manifest v4, routing result, attempt IDs, artifact
+bytes, run ID, and checkpoint bytes; the repeat was duplicate-suppressed with
+zero new I/O. Old/absent/corrupt/contradictory/mismatched state failed typed
+without repair or mutation.
+
+### Temporal acceptance traceability
+
+| Temporal requirement | Named deterministic evidence | Result |
+| --- | --- | --- |
+| Requested-session current acceptance after close | `test_valid_current_analysis_after_requested_session_close_is_accepted`; integrated 06B matrix | PASS |
+| Exact next-day `00:48:07 Asia/Shanghai` current acceptance | `test_real_next_day_0048_uses_frontier_not_retrieval_local_date` | PASS |
+| Same `00:48` evidence remains strict-rejected without cutoff proof | `test_same_0048_evidence_rejects_strict_after_session_cutoff` | PASS |
+| Next session open does not advance frontier; close does | `test_current_analysis_uses_latest_completed_frontier_not_local_dates`; `test_next_session_completion_advances_the_frontier_inclusively` | PASS |
+| Weekend and mainland-holiday frontier | `test_ticket_06b_complete_temporal_matrix_and_replay_are_deterministic` | PASS |
+| Stale retained evidence rejects for a new run | `test_stale_reuse_after_multiple_completed_sessions_rejects`; `test_stale_retained_decision_rejects_without_rebinding_old_acceptance` | PASS |
+| Strict direct pre-cutoff and exact-revision controls | `test_strict_pit_direct_pre_cutoff_control_accepts`; `test_post_cutoff_retrieval_requires_qualified_exact_revision_proof`; exact-revision binding mismatch control | PASS |
+| Missing/late provider proof fails closed without backfill | Common proof failure, request/diagnostic non-authority, and provider projection tests | PASS |
+| Every accepted/rejected row replays exactly with no restore-time work | Integrated 06B matrix; rejected-decision round trip; QCF12 zero-I/O sentinels | PASS |
+| Thirty-two followers share one clock/frontier/evaluation/context | `test_first_use_single_flight_fixes_one_temporal_frontier_for_32_followers` | PASS |
+
+The focused temporal contract/projection/checkpoint command passed `62 passed`.
+The integrated temporal/QCF selector passed `17 passed`, and the complete QCF
+file passed `19 passed`. These runs exercised Capability Routing Plan `1.3`,
+Financial Eligibility Acquisition Context v2,
+`provider-neutral-temporal-eligibility-v1`,
+`market-session-eligibility-binding-v1`, cache checkpoint `1.2`, dispatch ledger
+`1.6`, and financial manifest v4.
+
+### PE1–PE15 and AC1–AC13
+
+The authoritative IDs, fixtures, and expected results were not edited. The
+formal closure request attests that the 06B execution reran every row on the
+post-temporal tree twice. The final named mapping is recorded explicitly rather
+than treating the preserved pre-temporal table as temporal proof.
+
+| PE ID | Final post-temporal deterministic evidence | Result |
+| --- | --- | --- |
+| PE1 | `test_2026_08_01_targets_are_publication_aware_and_exact` | PASS |
+| PE2 | `test_announcement_cutoff_is_inclusive_and_advances_only_reporting_frontier` | PASS |
+| PE3 | `test_complete_announced_indicators_are_explicitly_current_only_and_degraded` | PASS |
+| PE4 | `test_strict_pit_rejects_current_only_candidates_with_exact_reason` | PASS |
+| PE5 | Exact five-annual/eight-reporting assertions in `test_2026_08_01_targets_are_publication_aware_and_exact` | PASS |
+| PE6 | `test_authoritative_since_listing_exception_reduces_only_pre_listing_ends`; `test_missing_post_listing_publication_fails_the_exception` | PASS |
+| PE7 | 601328 bank branch in `test_ticket07_corrected_shadow_joint_acceptance` and sparse-family adapter cases | PASS |
+| PE8 | 600895 non-bank branch in `test_ticket07_corrected_shadow_joint_acceptance` and complete-family adapter cases | PASS |
+| PE9 | `test_equivalent_later_route_is_visible_without_coverage_or_source_fact_inflation` | PASS |
+| PE10 | `test_critical_conflict_is_period_local_in_audit_and_evidence` | PASS |
+| PE11 | `test_update_flag_alone_creates_no_ordering_or_supersession_claim` | PASS |
+| PE12 | `test_pre_v2_qualified_checkpoint_cannot_resume_as_v2_shadow`; temporal plan-1.2 `START_NEW` control | PASS |
+| PE13 | `test_shadow_plan_is_explicit_qualified_routing_but_non_authoritative`; focused authority selector | PASS |
+| PE14 | `test_v2_checkpoint_round_trip_restores_without_io_and_rejects_tampering`; `test_v2_audit_and_report_expose_safe_deterministic_completeness`; temporal v4 projection/restore tests | PASS |
+| PE15 | Final AC1–AC13 matrix below | PASS |
+
+| AC ID | Final post-temporal deterministic evidence | Result |
+| --- | --- | --- |
+| AC1 | `test_current_mainland_suspension_blocks_direction_with_dedicated_outcome` | PASS |
+| AC2 | `test_authoritative_snapshot_preserves_tradeability_in_canonical_evidence`; `test_authoritative_traded_baostock_status_remains_tradeable` | PASS |
+| AC3 | `test_snapshot_v2_identity_changes_for_status_only_revision`; exact-pin conflict/membership tests | PASS |
+| AC4 | `test_incremental_history_refresh_preserves_complete_bundle_and_calendar`; `test_incremental_bundle_audit_identifies_exact_retained_and_refreshed_members` | PASS |
+| AC5 | Strict replay correction/backfill matrix including `test_strict_replay_admits_a_correction_only_at_its_observation_time` | PASS |
+| AC6 | Complete `test_market_history_payload_gc_concurrency.py` matrix and unlink/timeout/publication tests | PASS |
+| AC7 | `test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semantics` | PASS |
+| AC8 | `test_crypto_registry_refresh_rejects_unsupported_member_before_publication`; `test_cli_unsupported_crypto_symbol_uses_typed_crypto_policy` | PASS |
+| AC9 | `test_yahoo_retry_sequence_persists_one_typed_event_per_physical_attempt` | PASS |
+| AC10 | Exact budget and HTTP 429 cooldown cases in the coordinator/Yahoo retry suites | PASS |
+| AC11 | `test_valid_legacy_v1_pin_remains_readable_and_incomplete_pin_fails_closed`; legacy migration/readability matrix | PASS |
+| AC12 | `test_default_runtime_market_history_is_gitignored_without_hiding_other_data`; `test_default_runtime_cli_smoke_preserves_clean_worktree` | PASS |
+| AC13 | Final QCF/PE/AC groups, user-attested 06B non-integration/two-full-suite results against `21000ab`, live isolation, Ruff, and diff validation | PASS |
+
+Thus all PE1–PE15 and AC1–AC13 remain PASS. In particular, financial-period
+eligibility v2, Evidence Admission, Decision Gate, Current Tradeability,
+BaoStock strict-history authority, one-provider bundle semantics, daily AKShare
+→ BaoStock → Yahoo routing, and historical checkpoint readers remain unchanged.
+
+### Closure command and invariant ledger
+
+All closure pytest commands set `RUN_LIVE_DEEPSEEK_TESTS=0`,
+`RUN_LIVE_TUSHARE_TESTS=0`, and `RUN_LIVE_PROVIDER_TESTS=0` before collection.
+
+| Command/evidence | Result |
+| --- | --- |
+| `pytest -q tests/test_qualified_routing_composition_acceptance.py` | `19 passed` |
+| Same file with `-k "temporal or QCF or qcf"` | `17 passed` |
+| Temporal contract + proof projection + checkpoint acceptance | `62 passed` |
+| `pytest -q tests/test_live_test_isolation.py` | `9 passed` |
+| Focused legacy/shadow/disabled-authority selector | `4 passed` |
+| `ruff check tradingagents cli tests` | PASS, no findings |
+| `git diff --check` | PASS |
+| User-attested 06B results against commit `21000ab` | PASS; non-integration plus two identical complete-suite passes |
+
+The first combined closure wrapper reached its command timeout before it
+emitted a result, so it carries no acceptance value. Every required probe was
+then run as an individually attributable command and passed; no timeout,
+skip/xfail, timeout increase, test weakening, or code change was introduced.
+
+The failed Ticket 07 evidence directory contained five pre-existing files and
+1,106,569 bytes before verification. Its canonical path/hash inventory had
+aggregate SHA-256
+`bb727e27cd545c53b45dd4f14401a4491ff522d064531a96a74b4ef5564cb2b3`.
+The same inventory, file count, byte count, and aggregate digest were verified
+after the focused runs and again before closure commit. No Ticket 07 command,
+provider, model, replay helper, or rollout entry point was executed.
+
+Stage 1 — Spec Compliance review: PASS; Critical 0, Important 0, Minor 0.
+Stage 2 — Code Quality/Standards review: PASS; Critical 0, Important 0, Minor 0.
+No production or test code changed during Ticket 06 closure. The only scoped
+edit is this durable acceptance record; all pre-existing unrelated worktree
+state was preserved and excluded from the closure commit.
+
+`DEFAULT_CONFIG["mainland_capability_routing_mode"]` remains `legacy`.
+Qualified shadow policy remains `shadow_non_authoritative` with
+`qualified_v1_authority_enabled is False`; authoritative `qualified_v1`
+preflight and programmatic graph injection remain fail-closed before I/O/model
+work. Ticket 07 was not executed.
