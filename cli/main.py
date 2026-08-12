@@ -66,6 +66,7 @@ from tradingagents.capability_routing import (
     is_mainland_equity_configuration,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
@@ -2142,6 +2143,33 @@ def run_analysis(
                 )
                 if routing_preflight.passed:
                     capability_routing_plan = routing_preflight.plan
+                    if (
+                        capability_routing_plan is not None
+                        and capability_routing_plan.mode.value
+                        == "qualified_v1_shadow"
+                    ):
+                        direct_plan = (
+                            qualified_financial_routing.blueprint.routing_plan
+                            if isinstance(
+                                qualified_financial_routing,
+                                RegisteredProductionQualifiedRoutingComposition,
+                            )
+                            else qualified_financial_routing.router.routing_plan
+                            if isinstance(
+                                qualified_financial_routing,
+                                QualifiedFinancialRoutingComposition,
+                            )
+                            else None
+                        )
+                        if qualified_financial_routing is None or (
+                            direct_plan is not None
+                            and direct_plan.plan_version == "1.3"
+                        ):
+                            capability_routing_plan = (
+                                prepare_mainland_temporal_capability_routing_plan(
+                                    capability_routing_plan
+                                )
+                            )
                     if (
                         capability_routing_plan is not None
                         and capability_routing_plan.mode.value

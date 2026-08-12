@@ -444,6 +444,18 @@ class ProviderRequestCoordinator:
                 self._peer_connections.add(connection)
         return connection
 
+    def read_current_session_calendar(self, reference_market: str):
+        """Read the pinned calendar through this coordinator's thread-safe authority."""
+
+        from tradingagents.market_history.calendar import (
+            _read_current_session_calendar,
+        )
+
+        return _read_current_session_calendar(
+            self._database_connection(),
+            reference_market,
+        )
+
     def register_upstream_service(
         self,
         upstream_service_id: str,

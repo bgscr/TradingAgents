@@ -944,8 +944,13 @@ def _decision_matches_temporal_evidence(
         and decision.f_ann_date_derivation == evidence.f_ann_date_derivation
         and decision.observed_at == evidence.observed_at
         and decision.retrieved_at == evidence.retrieved_at
-        and decision.exact_revision_availability_proof
-        == evidence.exact_revision_availability_proof
+        and (
+            decision.exact_revision_availability_proof
+            == evidence.exact_revision_availability_proof
+            if decision.mode
+            == TemporalEligibilityMode.STRICT_HISTORICAL_PIT.value
+            else decision.exact_revision_availability_proof is None
+        )
     )
 
 

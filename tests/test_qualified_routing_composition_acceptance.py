@@ -22,6 +22,8 @@ import cli.main as cli_main
 import tradingagents.capability_routing as capability_routing_module
 import tradingagents.dataflows.financial_dispatch as financial_dispatch_module
 import tradingagents.dataflows.financial_eligibility_metadata as metadata_module
+import tradingagents.dataflows.financial_temporal_eligibility as temporal_module
+import tradingagents.dataflows.financial_temporal_proof_projection as temporal_projection_module
 import tradingagents.dataflows.interface as vendor_interface
 import tradingagents.qualified_routing_composition as composition_module
 from tests.test_financial_capability_routing_selection import (
@@ -35,7 +37,9 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
+from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
     FinancialIndicatorRoutingRequest,
@@ -70,6 +74,12 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
 from tradingagents.graph.financial_tools import FinancialDispatchToolNode
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.market_history.calendar import (
+    MarketSession,
+    MarketSessionCalendarPublication,
+    MarketSessionStatus,
+)
+from tradingagents.market_history.models import ProvenanceClass, ProviderDatasetSpec
 from tradingagents.qualified_routing_composition import (
     ProductionQualifiedRoutingRuntime,
     RegisteredProductionQualifiedRoutingComposition,
@@ -467,6 +477,8 @@ class _BaoStockProvider(_OwnedFakeProvider):
                 "code_name": ["fixture issuer"],
                 "ipoDate": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
                 "outDate": [""],
+                "publication_date": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
+                "first_publication_date": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
                 "type": ["1"],
                 "status": ["1"],
             }
@@ -629,6 +641,32 @@ def _legacy_vendor_methods() -> dict[str, dict[str, object]]:
     }
 
 
+def _publish_pinned_temporal_calendar(store: object) -> None:
+    store.publish_session_calendar(
+        MarketSessionCalendarPublication(
+            provider=ProviderDatasetSpec(
+                upstream_service_id="upstream-service:baostock",
+                upstream_service_name="BaoStock",
+                provider_dataset_id="provider-dataset:baostock-calendar-qcf-v1",
+                provider_name="baostock",
+                dataset_name="mainland-session-calendar-v1",
+                adjustment_methodology="not-applicable",
+                strict_history_qualified=False,
+            ),
+            reference_market="mainland-cn",
+            timezone_name="Asia/Shanghai",
+            observed_at=_NOW,
+            provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+            raw_payload=b'{"calendar":"qcf-plan-1.3-pinned"}',
+            sessions=(
+                MarketSession(date(2026, 8, 31), MarketSessionStatus.OPEN),
+                MarketSession(date(2026, 9, 1), MarketSessionStatus.OPEN),
+                MarketSession(date(2026, 9, 2), MarketSessionStatus.OPEN),
+            ),
+        )
+    )
+
+
 def _fresh_builtin_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -674,7 +712,7 @@ def _fresh_builtin_run(
     asset = resolve_run_asset_configuration(symbol, config=config)
     preflight = preflight_mainland_capability_routing(asset, config=config)
     assert preflight.plan is not None
-    plan = preflight.plan
+    plan = prepare_mainland_temporal_capability_routing_plan(preflight.plan)
     config["asset_configuration_signature"] = asset.asset_configuration_signature
     config["mainland_capability_routing_plan_signature"] = plan.plan_signature
     vendor_methods = _legacy_vendor_methods()
@@ -693,8 +731,15 @@ def _fresh_builtin_run(
         "baostock": _BaoStockProvider(symbol),
     }
     production_factories = composition_module.production_qualified_routing_runtime_factories()
+
+    def open_coordinator_store(blueprint: object):
+        store = production_factories.open_coordinator_store(blueprint)
+        _publish_pinned_temporal_calendar(store)
+        return store
+
     deterministic_factories = replace(
         production_factories,
+        open_coordinator_store=open_coordinator_store,
         build_tushare_client=lambda _blueprint, _stop: providers["tushare"],
         build_akshare_facade=lambda _blueprint, _stop: providers["akshare"],
         build_yahoo_transport=lambda _blueprint, _stop: providers["yfinance"],
@@ -1415,7 +1460,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
 
         ledger = FinancialDispatchCheckpointLedger.model_validate(indicator_ledger)
-        assert fresh.plan.plan_version == "1.2"
+        assert fresh.plan.plan_version == "1.3"
         assert fresh.plan.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -1426,12 +1471,12 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert fresh.plan.indicator_selection_contract_version == (
             "financial-period-selection-v3"
         )
-        assert routing.contract_version == "financial-indicator-routing-result-v3"
+        assert routing.contract_version == "financial-indicator-routing-result-v4"
         assert indicator_result.contract_version == (
-            "financial-indicator-selection-dispatch-v2"
+            "financial-indicator-selection-dispatch-v3"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-v3"
+            manifest.contract_version == "financial-manifest-v4"
             for manifest in routing.family_manifests
         )
         assert all(
@@ -1444,9 +1489,9 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             for manifest in routing.family_manifests
             for selection in manifest.selections
         )
-        assert ledger.contract_version == "1.5"
-        assert ledger.financial_manifest_version == "financial-manifest-v2"
-        assert ledger.financial_indicator_manifest_version == "financial-manifest-v3"
+        assert ledger.contract_version == "1.6"
+        assert ledger.financial_manifest_version == "financial-manifest-v4"
+        assert ledger.financial_indicator_manifest_version == "financial-manifest-v4"
         assert ledger.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -1457,7 +1502,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert len(ledger.qualified_indicator_selections) == 1
         indicator_entry = ledger.qualified_indicator_selections[0]
         assert indicator_entry.contract_version == (
-            "financial-indicator-selection-checkpoint-v2"
+            "financial-indicator-selection-checkpoint-v3"
         )
         assert indicator_entry.terminal.routing_result == routing
         assessment_identities = {
@@ -1503,17 +1548,17 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             run_scope_id=context.run_id,
         )
         assert audit is not None
-        assert audit.contract_version == "3.0"
+        assert audit.contract_version == "4.0"
         assert set(audit.metadata_assessment_identities) == assessment_identities
         indicator_audit_request = next(
             request
             for request in audit.manifest_requests
-            if request.contract_version == "financial-manifest-request-audit-v3"
+            if request.contract_version == "financial-manifest-request-audit-v4"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-audit-v3"
+            manifest.contract_version == "financial-manifest-audit-v4"
             and manifest.aggregate_completeness.contract_version
-            == "financial-aggregate-completeness-v3"
+            == "financial-aggregate-completeness-v4"
             for manifest in indicator_audit_request.manifests
         )
         indicator_completeness_rows = tuple(
@@ -1523,15 +1568,15 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
         assert indicator_completeness_rows
         assert all(
-            row.contract_version == "financial-completeness-row-v4"
+            row.contract_version == "financial-completeness-row-v5"
             for row in indicator_completeness_rows
         )
         tool_envelope = indicator_result.to_tool_message().artifact
         assert tool_envelope["contract_version"] == (
-            "financial-tool-message-envelope-v3"
+            "financial-tool-message-envelope-v4"
         )
         assert all(
-            manifest["contract_version"] == "financial-tool-manifest-v3"
+            manifest["contract_version"] == "financial-tool-manifest-v4"
             for manifest in tool_envelope["manifests"]
         )
 
@@ -2508,20 +2553,80 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
     metadata_acquirer = fresh.owner._metadata_acquirer
     acquirer_type = type(metadata_acquirer)
     original_acquire = acquirer_type.acquire
+    original_clock = fresh.owner._eligibility_clock
+    original_calendar_provider = fresh.owner._calendar_provider
+    original_transaction_factory = metadata_acquirer._temporal_transaction_factory
     acquisition_entered = threading.Event()
     release_acquisition = threading.Event()
     metadata_acquisitions = 0
+    clock_samples = 0
+    calendar_lookups = 0
+    temporal_transactions: list[object] = []
+
+    def counted_clock():
+        nonlocal clock_samples
+        clock_samples += 1
+        acquisition_entered.set()
+        assert release_acquisition.wait(timeout=5)
+        return original_clock()
+
+    def counted_calendar_provider():
+        nonlocal calendar_lookups
+        calendar_lookups += 1
+        return original_calendar_provider()
+
+    def counted_transaction_factory(**kwargs: object):
+        transaction = original_transaction_factory(**kwargs)
+        temporal_transactions.append(transaction)
+        return transaction
 
     def blocked_acquire(acquirer, *args, **kwargs):
         nonlocal metadata_acquisitions
         if acquirer is metadata_acquirer:
             metadata_acquisitions += 1
-            acquisition_entered.set()
-            assert release_acquisition.wait(timeout=5)
         return original_acquire(acquirer, *args, **kwargs)
 
     monkeypatch.setattr(acquirer_type, "acquire", blocked_acquire)
+    fresh.owner._eligibility_clock = counted_clock
+    fresh.owner._calendar_provider = counted_calendar_provider
+    metadata_acquirer._temporal_transaction_factory = counted_transaction_factory
     try:
+        acquisition_start = threading.Barrier(33)
+
+        def acquire_context():
+            acquisition_start.wait(timeout=5)
+            return fresh.owner.acquire_context(as_of_date=_AS_OF)
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            acquisition_futures = tuple(
+                executor.submit(acquire_context) for _ in range(32)
+            )
+            acquisition_start.wait(timeout=5)
+            assert acquisition_entered.wait(timeout=5)
+            release_acquisition.set()
+            acquisition_results = tuple(
+                future.result(timeout=20) for future in acquisition_futures
+            )
+
+        assert len({id(result) for result in acquisition_results}) == 1
+        assert acquisition_results[0].context is fresh.owner.context
+        assert acquisition_results[0].outcome == "success"
+        assert metadata_acquisitions == 1
+        assert clock_samples == 1
+        assert calendar_lookups == 1
+        assert len(temporal_transactions) == 1
+        assert temporal_transactions[0].evaluation_count == 2
+        context = fresh.owner.context
+        assert context is not None
+        temporal = context.temporal_eligibility_binding
+        assert temporal is not None
+        assert temporal.eligibility_evaluated_at == _NOW
+        assert temporal.calendar_binding.calendar_revision_id.startswith(
+            "market-session-calendar=sha256:"
+        )
+        assert temporal.company_type_temporal_decision.result == "accepted"
+        assert temporal.listing_temporal_decision.result == "accepted"
+
         first_use_start = threading.Barrier(3)
 
         def first_financial_use(index: int):
@@ -2537,8 +2642,6 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
                 executor.submit(first_financial_use, index) for index in range(2)
             )
             first_use_start.wait(timeout=5)
-            assert acquisition_entered.wait(timeout=5)
-            release_acquisition.set()
             first_results = tuple(future.result(timeout=20) for future in futures)
 
         assert all(
@@ -2546,7 +2649,6 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
             for result in first_results
         )
         assert fresh.owner.context is not None
-        assert metadata_acquisitions == 1
         assert len(fresh.resolver_calls) == 1
         assert len(statement_dispatches) == 2
         statement_routing = statement_dispatches[0].routing_result
@@ -2713,6 +2815,11 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
     artifact_writes = 0
     metadata_acquisitions = 0
     company_type_resolutions = 0
+    temporal_evaluations = 0
+    frontier_lookups = 0
+    restore_clock_samples = 0
+    restore_calendar_lookups = 0
+    baostock_lifecycle_calls = 0
     closed_resources: list[str] = []
 
     def track_close(resource_name: str, resource):
@@ -2740,6 +2847,13 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
             pytest.fail("QCF12 restore requested a coordinator permit")
 
         coordinator.execute_retry_sequence = forbidden_sequence
+
+        def forbidden_calendar(_reference_market):
+            nonlocal restore_calendar_lookups
+            restore_calendar_lookups += 1
+            pytest.fail("QCF12 restore read the current calendar frontier")
+
+        coordinator.read_current_session_calendar = forbidden_calendar
         return track_close("coordinator", coordinator)
 
     def build_cache(coordinator, artifact_store, run_id, stop_signal):
@@ -2784,6 +2898,57 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
         "resolve_financial_company_type",
         forbidden_resolution,
     )
+
+    def forbidden_temporal_evaluation(**_kwargs):
+        nonlocal temporal_evaluations
+        temporal_evaluations += 1
+        pytest.fail("QCF12 restore invoked the temporal evaluator")
+
+    def forbidden_frontier(*_args, **_kwargs):
+        nonlocal frontier_lookups
+        frontier_lookups += 1
+        pytest.fail("QCF12 restore recomputed latest_completed_session")
+
+    def forbidden_lifecycle(*_args, **_kwargs):
+        nonlocal baostock_lifecycle_calls
+        baostock_lifecycle_calls += 1
+        pytest.fail("QCF12 restore invoked BaoStock lifecycle acquisition")
+
+    monkeypatch.setattr(
+        temporal_projection_module,
+        "evaluate_financial_metadata_temporal_eligibility",
+        forbidden_temporal_evaluation,
+    )
+    monkeypatch.setattr(
+        temporal_module,
+        "latest_completed_session",
+        forbidden_frontier,
+    )
+    monkeypatch.setattr(
+        BaoStockCapabilityAdapter,
+        "acquire_lifecycle",
+        forbidden_lifecycle,
+    )
+
+    def assemble_restore_runtime(**kwargs):
+        assembly = runtime_factories.assemble_runtime(**kwargs)
+
+        def forbidden_clock():
+            nonlocal restore_clock_samples
+            restore_clock_samples += 1
+            pytest.fail("QCF12 restore sampled the eligibility clock")
+
+        def forbidden_calendar_provider():
+            nonlocal restore_calendar_lookups
+            restore_calendar_lookups += 1
+            pytest.fail("QCF12 restore consulted the calendar provider")
+
+        return replace(
+            assembly,
+            eligibility_clock=forbidden_clock,
+            eligibility_calendar_provider=forbidden_calendar_provider,
+        )
+
     restore_factories = replace(
         runtime_factories,
         open_coordinator_store=open_store,
@@ -2793,6 +2958,7 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
         build_akshare_facade=lambda _blueprint, _stop: restore_providers["akshare"],
         build_yahoo_transport=lambda _blueprint, _stop: restore_providers["yfinance"],
         build_baostock_transport=lambda _blueprint, _stop: restore_providers["baostock"],
+        assemble_runtime=assemble_restore_runtime,
     )
     monkeypatch.setattr(
         composition_module,
@@ -2861,6 +3027,11 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
     assert artifact_writes == 0
     assert metadata_acquisitions == 0
     assert company_type_resolutions == 0
+    assert temporal_evaluations == 0
+    assert frontier_lookups == 0
+    assert restore_clock_samples == 0
+    assert restore_calendar_lookups == 0
+    assert baostock_lifecycle_calls == 0
     assert all(provider.calls == [] for provider in restore_providers.values())
     restore_llm.invoke.assert_not_called()
     restored_host.close_qualified_routing_runtime()
@@ -2924,6 +3095,7 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
     accepted_failure_reasons = {
         FinancialDispatchCheckpointFailureReason.MALFORMED,
         FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+        FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH,
     }
     resources_after_valid_restore = tuple(closed_resources)
     for case_name, invalid_state in invalid_states.items():

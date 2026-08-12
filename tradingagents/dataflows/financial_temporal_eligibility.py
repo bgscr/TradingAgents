@@ -31,6 +31,9 @@ FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION = (
 _CALENDAR_IDENTITY_PREFIX = "market-session-eligibility-binding:v1:"
 _DECISION_IDENTITY_PREFIX = "financial-metadata-temporal-eligibility-decision:v1:"
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+_CALENDAR_REVISION_ID_PATTERN = (
+    r"^(?:market-session-calendar=sha256:|market-session-calendar:v1:)[0-9a-f]{64}$"
+)
 _CLOSED_MODEL_CONFIG = ConfigDict(
     extra="forbid",
     frozen=True,
@@ -304,7 +307,7 @@ class MarketSessionEligibilityBinding(BaseModel):
         MARKET_SESSION_ELIGIBILITY_BINDING_VERSION
     )
     binding_identity: str = Field(pattern=r"^market-session-eligibility-binding:v1:[0-9a-f]{64}$")
-    calendar_revision_id: str = Field(pattern=_SAFE_ID_PATTERN)
+    calendar_revision_id: str = Field(pattern=_CALENDAR_REVISION_ID_PATTERN)
     reference_market: str = Field(pattern=_SAFE_ID_PATTERN)
     timezone_name: str = Field(min_length=1, max_length=64)
     requested_session: date

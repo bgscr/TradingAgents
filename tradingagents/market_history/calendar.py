@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -198,7 +199,16 @@ def read_current_session_calendar(
     store: MarketHistoryStore,
     reference_market: str,
 ) -> StoredSessionCalendar:
-    row = store._connection.execute(
+    return _read_current_session_calendar(store._connection, reference_market)
+
+
+def _read_current_session_calendar(
+    connection: sqlite3.Connection,
+    reference_market: str,
+) -> StoredSessionCalendar:
+    """Read one pinned calendar through the caller's lifecycle-owned connection."""
+
+    row = connection.execute(
         "SELECT calendar_revision_id, timezone_name, provider_dataset_id, observed_at, "
         "provenance_class FROM market_session_calendars WHERE reference_market = ? "
         "ORDER BY observed_at DESC, calendar_revision_id DESC LIMIT 1",
@@ -213,7 +223,7 @@ def read_current_session_calendar(
             opens_at=_optional_datetime(item[2]),
             closes_at=_optional_datetime(item[3]),
         )
-        for item in store._connection.execute(
+        for item in connection.execute(
             "SELECT session_date, session_status, opens_at, closes_at "
             "FROM market_sessions WHERE calendar_revision_id = ? ORDER BY session_date",
             (str(row[0]),),

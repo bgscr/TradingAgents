@@ -4446,7 +4446,7 @@ def _assemble_production_qualified_runtime(
         dependencies=dependencies,
         eligibility_metadata_acquirer=eligibility_metadata_acquirer,
         eligibility_clock=dependencies.now,
-        eligibility_calendar_provider=lambda: coordinator_store.read_current_session_calendar(
+        eligibility_calendar_provider=lambda: coordinator.read_current_session_calendar(
             "mainland-cn"
         ),
     )

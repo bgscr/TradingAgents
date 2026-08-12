@@ -20,6 +20,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingPreflightError,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     MainlandFinancialCapabilityRouter,
@@ -63,7 +64,7 @@ def _valid_shadow_inputs(
     asset = resolve_run_asset_configuration("601328.SS", config=config)
     preflight = preflight_mainland_capability_routing(asset, config=config)
     assert preflight.plan is not None
-    plan = preflight.plan
+    plan = prepare_mainland_temporal_capability_routing_plan(preflight.plan)
     config["asset_configuration_signature"] = asset.asset_configuration_signature
     config["mainland_capability_routing_plan_signature"] = plan.plan_signature
     return plan, asset, config
@@ -689,6 +690,7 @@ def test_cli_and_programmatic_callers_resolve_same_builtin_identity_and_blueprin
         cli_main.run_analysis(qualified_routing_validation=True)
 
     assert isinstance(received, RegisteredProductionQualifiedRoutingComposition)
+    assert programmatic.blueprint.routing_plan.plan_version == "1.3"
     assert received.factory_identity == programmatic.factory_identity
     assert received.blueprint == programmatic.blueprint
     assert received.blueprint.routing_plan.plan_signature == plan.plan_signature

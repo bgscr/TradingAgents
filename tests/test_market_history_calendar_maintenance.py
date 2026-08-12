@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -130,6 +131,30 @@ def test_versioned_mainland_session_calendar_round_trips(tmp_path) -> None:
         date(2026, 7, 27),
     )
     assert loaded.sessions[1].status is MarketSessionStatus.CLOSED
+
+
+@pytest.mark.unit
+def test_coordinator_reads_canonical_calendar_revision_from_worker_thread(
+    tmp_path,
+) -> None:
+    with MarketHistoryStore.open(_config(tmp_path)) as store:
+        published = store.publish_session_calendar(_calendar_publication())
+        coordinator = ProviderRequestCoordinator(store)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                loaded = executor.submit(
+                    coordinator.read_current_session_calendar,
+                    "mainland-cn",
+                ).result(timeout=5)
+            assert loaded.calendar_revision_id == published.calendar_revision_id
+            assert loaded.calendar_revision_id.startswith(
+                "market-session-calendar=sha256:"
+            )
+            assert coordinator.active_peer_connection_count == 1
+        finally:
+            coordinator.close()
+
+    assert coordinator.active_peer_connection_count == 0
 
 
 @pytest.mark.unit

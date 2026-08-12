@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 import tradingagents.dataflows.financial_eligibility_metadata as metadata_module
+import tradingagents.dataflows.financial_temporal_eligibility as temporal_module
 from tradingagents.asset_configuration import (
     RunAssetConfiguration,
     resolve_run_asset_configuration,
@@ -56,6 +57,9 @@ from tradingagents.dataflows.financial_eligibility_metadata import (
 from tradingagents.dataflows.financial_temporal_eligibility import (
     EvidenceEffectiveAsOfDerivation,
     EvidenceEffectiveAsOfSemantics,
+    ExactRevisionAvailabilityProof,
+    ExactRevisionAvailabilityScope,
+    FinancialMetadataTemporalEligibilityDecision,
     FinancialMetadataTemporalEvidence,
     ProviderPublicationDateDerivation,
     ProviderPublicationDateSemantics,
@@ -561,6 +565,782 @@ def _retained_temporal_projections(
     return company_projection, listing_projection
 
 
+def _matrix_calendar() -> StoredSessionCalendar:
+    return StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar:v1:" + "8" * 64,
+        reference_market="mainland-cn",
+        timezone_name="Asia/Shanghai",
+        provider_dataset_id="provider-dataset:ticket-06b-calendar-v1",
+        observed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        sessions=tuple(
+            MarketSession(
+                date(2026, 8, day),
+                (
+                    MarketSessionStatus.OPEN
+                    if day in {7, 10, 11, 17}
+                    else MarketSessionStatus.CLOSED
+                ),
+            )
+            for day in range(7, 18)
+        ),
+    )
+
+
+def _matrix_binding(
+    *,
+    requested_session: date,
+    evaluated_at: datetime,
+):
+    return build_market_session_eligibility_binding(
+        _matrix_calendar(),
+        requested_session=requested_session,
+        eligibility_evaluated_at=evaluated_at,
+    )
+
+
+def _matrix_proof(
+    *,
+    subject: str,
+    requested_session: date,
+    retrieved_at: datetime,
+    observed_at: datetime,
+    changes: dict[str, object],
+    exact_scope: ExactRevisionAvailabilityScope | None,
+) -> FinancialMetadataTemporalEvidence:
+    company = subject == "company"
+    artifact_identity = (
+        "financial-provider-artifact:v1:" + "c" * 64
+        if company
+        else "provider-artifact:v1:" + "d" * 64
+    )
+    artifact = TemporalEvidenceArtifactBinding(
+        artifact_identity=artifact_identity,
+        revision_identity=artifact_identity,
+        row_identity=(
+            "financial-period-candidate:v1:" + "e" * 64
+            if company
+            else "provider-row-artifact:v1:" + "f" * 64
+        ),
+    )
+    evidence_class = (
+        TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE
+        if company
+        else TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING
+    )
+    effective_semantics = (
+        EvidenceEffectiveAsOfSemantics.TUSHARE_STATEMENT_PERIOD_END
+        if company
+        else EvidenceEffectiveAsOfSemantics.BAOSTOCK_LIFECYCLE_LISTING_DATE
+    )
+    publication_semantics = (
+        ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS
+        if company
+        else ProviderPublicationDateSemantics.BAOSTOCK_LIFECYCLE_PUBLICATION_FIELDS
+    )
+    payload: dict[str, object] = {
+        "evidence_class": evidence_class,
+        "artifact": artifact,
+        "evidence_effective_as_of": (
+            date(2026, 6, 30) if company else date(2010, 1, 4)
+        ),
+        "evidence_effective_as_of_derivation": EvidenceEffectiveAsOfDerivation(
+            semantics=effective_semantics,
+            source_field="end_date" if company else "ipoDate",
+            artifact=artifact,
+        ),
+        "ann_date": requested_session,
+        "ann_date_derivation": ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.ANN_DATE,
+            semantics=publication_semantics,
+            source_field="ann_date" if company else "announcement_date",
+            artifact=artifact,
+        ),
+        "f_ann_date": requested_session,
+        "f_ann_date_derivation": ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.F_ANN_DATE,
+            semantics=publication_semantics,
+            source_field="f_ann_date" if company else "first_publication_date",
+            artifact=artifact,
+        ),
+        "observed_at": observed_at,
+        "retrieved_at": retrieved_at,
+        "retrieval_local_date": retrieved_at.astimezone(
+            timezone(timedelta(hours=8))
+        ).date(),
+    }
+    if exact_scope is not None:
+        payload["exact_revision_availability_proof"] = (
+            ExactRevisionAvailabilityProof(
+                exact_revision_authoritative_available_at=(
+                    _session_time(requested_session, 14, 59)
+                ),
+                authoritative=True,
+                scope=exact_scope,
+                proof_identity="exchange-revision-proof:v1:" + "9" * 64,
+                artifact=artifact,
+            )
+        )
+    payload.update(changes)
+    return FinancialMetadataTemporalEvidence(**payload)
+
+
+def _session_time(
+    session: date,
+    hour: int,
+    minute: int = 0,
+    second: int = 0,
+) -> datetime:
+    return datetime(
+        session.year,
+        session.month,
+        session.day,
+        hour,
+        minute,
+        second,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+
+def _matrix_metadata_binding(
+    *,
+    asset: RunAssetConfiguration,
+    plan: MainlandCapabilityRoutingPlan,
+    requested_session: date,
+    mode: TemporalEligibilityMode,
+    evaluated_at: datetime,
+):
+    calendar_binding = _matrix_binding(
+        requested_session=requested_session,
+        evaluated_at=evaluated_at,
+    )
+    strict = mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
+    return FinancialEligibilityMetadataBinding(
+        contract_version="financial-eligibility-metadata-binding-v2",
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        availability_scope=(
+            FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+            if strict
+            else FinancialAvailabilityScope.CURRENT_ONLY
+        ),
+        acquisition_purpose="foreground_current_analysis",
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan_signature=plan.plan_signature,
+        temporal_mode=mode,
+        eligibility_evaluated_at=evaluated_at,
+        calendar_binding=calendar_binding,
+        strict_cutoff=(
+            calendar_binding.requested_session_close if strict else None
+        ),
+    )
+
+
+def _matrix_request(
+    *,
+    asset: RunAssetConfiguration,
+    plan: MainlandCapabilityRoutingPlan,
+    binding: FinancialEligibilityMetadataBinding,
+    label: str,
+) -> FinancialEligibilityMetadataAcquisitionRequest:
+    run_id = _run_id("ticket-06b-" + label)
+    return FinancialEligibilityMetadataAcquisitionRequest(
+        contract_version="financial-eligibility-metadata-acquisition-request-v2",
+        canonical_run_id=run_id,
+        run_id=run_id,
+        asset_configuration=asset,
+        asset_configuration_signature=asset.asset_configuration_signature,
+        instrument_identity=asset.instrument_identity,
+        requested_session=binding.requested_session,
+        authoritative_availability_scope=binding.availability_scope,
+        availability_scope=binding.availability_scope,
+        acquisition_purpose="foreground_current_analysis",
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan_signature=plan.plan_signature,
+        currency="CNY",
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        temporal_mode=binding.temporal_mode,
+        eligibility_evaluated_at=binding.eligibility_evaluated_at,
+        calendar_binding=binding.calendar_binding,
+        strict_cutoff=binding.strict_cutoff,
+    )
+
+
+def _matrix_company_evidence(
+    asset: RunAssetConfiguration,
+    requested_session: date,
+    proof: FinancialMetadataTemporalEvidence,
+) -> FinancialCompanyTypeAcquisitionEvidenceBinding:
+    return FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        temporal_evidence=proof,
+        provider_id="tushare",
+        artifact_identity=proof.artifact.artifact_identity,
+        source_ref=proof.artifact.artifact_identity,
+        observed_at=proof.observed_at,
+        retrieved_at=proof.retrieved_at,
+        provider_declared_type=FinancialCompanyType.BANK,
+        provider_declaration_qualified=True,
+        normalized_resolver_inputs=(
+            FinancialCompanyTypeClassifierInput(
+                key="metadata:industry",
+                value="bank",
+            ),
+            FinancialCompanyTypeClassifierInput(
+                key="present_field",
+                value="customer_deposits",
+            ),
+        ),
+    )
+
+
+def _matrix_listing_metadata(
+    asset: RunAssetConfiguration,
+    requested_session: date,
+    proof: FinancialMetadataTemporalEvidence,
+) -> FinancialListingMetadata:
+    return FinancialListingMetadata(
+        contract_version="financial-listing-metadata-v2",
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        listing_date=date(2010, 1, 4),
+        listing_provenance=FinancialListingProvenance(
+            provider_id="baostock",
+            source_ref=proof.artifact.artifact_identity,
+            observed_at=proof.observed_at,
+        ),
+        temporal_evidence=proof,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("origin", ("fresh", "retained"))
+@pytest.mark.parametrize("subject", ("company", "listing"))
+def test_ticket_06b_complete_temporal_matrix_and_replay_are_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    subject: str,
+) -> None:
+    asset = _asset()
+    plan = prepare_mainland_temporal_capability_routing_plan(
+        _qualified_plan(monkeypatch, asset)
+    )
+    real_0048 = datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc)
+    scenarios = (
+        (
+            "requested_day_after_close",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 10), 15, 1),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "real_ticket07_0048",
+            date(2026, 8, 10),
+            real_0048,
+            _session_time(date(2026, 8, 11), 0, 49),
+            {"retrieval_local_date": date(2099, 1, 1)},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "immediately_before_next_open",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 9, 29, 59),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "during_next_session_before_close",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 14, 59, 59),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "at_next_session_close",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 15),
+            {},
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "after_next_session_close",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 15, 0, 1),
+            {},
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "friday_to_saturday",
+            date(2026, 8, 7),
+            _session_time(date(2026, 8, 7), 15, 0, 1),
+            _session_time(date(2026, 8, 8), 12),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "friday_to_sunday",
+            date(2026, 8, 7),
+            _session_time(date(2026, 8, 7), 15, 0, 1),
+            _session_time(date(2026, 8, 9), 12),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "mainland_holiday_interval",
+            date(2026, 8, 11),
+            _session_time(date(2026, 8, 11), 15, 0, 1),
+            _session_time(date(2026, 8, 14), 12),
+            {},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "stale_after_later_sessions",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 17), 15),
+            {},
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "ann_date_after_requested",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {"ann_date": date(2026, 8, 11)},
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "missing_f_ann_date",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {"f_ann_date": None, "f_ann_date_derivation": None},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "f_ann_date_after_requested",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {"f_ann_date": date(2026, 8, 11)},
+            None,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "direct_strict_pre_cutoff",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 14, 59),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {},
+            None,
+            "rejected",
+            "accepted",
+        ),
+        (
+            "exact_revision_authoritative",
+            date(2026, 8, 10),
+            real_0048,
+            _session_time(date(2026, 8, 11), 0, 49),
+            {},
+            ExactRevisionAvailabilityScope.EXACT_IMMUTABLE_REVISION,
+            "accepted",
+            "accepted",
+        ),
+        (
+            "generic_filing_availability",
+            date(2026, 8, 10),
+            real_0048,
+            _session_time(date(2026, 8, 11), 0, 49),
+            {},
+            ExactRevisionAvailabilityScope.GENERIC_FILING,
+            "accepted",
+            "rejected",
+        ),
+        (
+            "missing_effective_as_of",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {
+                "evidence_effective_as_of": None,
+                "evidence_effective_as_of_derivation": None,
+            },
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "missing_ann_date",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {"ann_date": None, "ann_date_derivation": None},
+            None,
+            "rejected",
+            "rejected",
+        ),
+        (
+            "observation_after_retrieval",
+            date(2026, 8, 10),
+            _session_time(date(2026, 8, 10), 15, 0, 1),
+            _session_time(date(2026, 8, 11), 0, 49),
+            {},
+            None,
+            "rejected",
+            "rejected",
+        ),
+    )
+    recorded = []
+    replay_records = []
+    for (
+        name,
+        requested_session,
+        retrieved_at,
+        evaluated_at,
+        changes,
+        exact_scope,
+        expected_current,
+        expected_strict,
+    ) in scenarios:
+        observed_at = (
+            retrieved_at + timedelta(seconds=1)
+            if name == "observation_after_retrieval"
+            else retrieved_at
+        )
+        proof = _matrix_proof(
+            subject=subject,
+            requested_session=requested_session,
+            retrieved_at=retrieved_at,
+            observed_at=observed_at,
+            changes=changes,
+            exact_scope=exact_scope,
+        )
+        if origin == "retained":
+            proof = FinancialMetadataTemporalEvidence.model_validate_json(
+                proof.model_dump_json()
+            )
+        binding = _matrix_binding(
+            requested_session=requested_session,
+            evaluated_at=evaluated_at,
+        )
+        for mode, expected in (
+            (TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY, expected_current),
+            (TemporalEligibilityMode.STRICT_HISTORICAL_PIT, expected_strict),
+        ):
+            decision = evaluate_financial_metadata_temporal_eligibility(
+                mode=mode,
+                evidence=proof,
+                calendar_binding=binding,
+                strict_cutoff=(
+                    binding.requested_session_close
+                    if mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
+                    else None
+                ),
+            )
+            assert decision.result == expected, (origin, subject, name, mode)
+            assert tuple(reason.value for reason in decision.reasons) == tuple(
+                sorted(reason.value for reason in decision.reasons)
+            )
+            recorded.append((name, mode, decision))
+
+            metadata_binding = _matrix_metadata_binding(
+                asset=asset,
+                plan=plan,
+                requested_session=requested_session,
+                mode=mode,
+                evaluated_at=evaluated_at,
+            )
+            support_subject = "listing" if subject == "company" else "company"
+            support_retrieved_at = _session_time(
+                requested_session,
+                15,
+                0,
+                1,
+            )
+            support_proof = _matrix_proof(
+                subject=support_subject,
+                requested_session=requested_session,
+                retrieved_at=support_retrieved_at,
+                observed_at=support_retrieved_at,
+                changes={},
+                exact_scope=(
+                    ExactRevisionAvailabilityScope.EXACT_IMMUTABLE_REVISION
+                ),
+            )
+            support_decision = evaluate_financial_metadata_temporal_eligibility(
+                mode=mode,
+                evidence=support_proof,
+                calendar_binding=binding,
+                strict_cutoff=metadata_binding.strict_cutoff,
+            )
+            if subject == "listing" and support_decision.result != "accepted":
+                assert decision.result == "rejected"
+                replay_records.append(
+                    (
+                        None,
+                        FinancialEligibilityAcquisitionResult.failed(
+                            FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED,
+                            rejected_temporal_decision=decision,
+                        ),
+                        decision,
+                    )
+                )
+                continue
+            company_proof = proof if subject == "company" else support_proof
+            company_decision = decision if subject == "company" else support_decision
+            listing_proof = proof if subject == "listing" else support_proof
+            listing_decision = decision if subject == "listing" else support_decision
+            company_projection_unavailable = subject == "company" and name in {
+                "missing_effective_as_of",
+                "missing_ann_date",
+                "observation_after_retrieval",
+            }
+            listing_projection_unavailable = (
+                subject == "listing" and name == "missing_effective_as_of"
+            )
+            if (
+                company_projection_unavailable
+                or listing_projection_unavailable
+            ):
+                # The provider contract rejects these company payloads before an
+                # acquisition projection can exist, or the company prerequisite
+                # deterministically ends acquisition before listing is reachable.
+                assert decision.result == "rejected"
+                replay_records.append(
+                    (
+                        None,
+                        FinancialEligibilityAcquisitionResult.failed(
+                            FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED,
+                            rejected_temporal_decision=decision,
+                        ),
+                        decision,
+                    )
+                )
+                continue
+            company_evidence = _matrix_company_evidence(
+                asset,
+                requested_session,
+                company_proof,
+            )
+            listing_metadata = _matrix_listing_metadata(
+                asset,
+                requested_session,
+                listing_proof,
+            )
+            company_projection = FinancialCompanyTypeEvidenceProjection(
+                contract_version="financial-company-type-evidence-projection-v2",
+                metadata_binding=metadata_binding,
+                evidence=company_evidence,
+                temporal_decision=company_decision,
+            )
+            listing_projection = FinancialListingMetadataProjection(
+                contract_version="financial-listing-metadata-projection-v2",
+                metadata_binding=metadata_binding,
+                metadata=listing_metadata,
+                temporal_decision=listing_decision,
+            )
+
+            def company_source(request, evidence=company_evidence):
+                return FinancialCompanyTypeEvidenceProviderProjection(
+                    provider_id="tushare",
+                    metadata_binding=request.metadata_binding,
+                    source_projection_kind="tushare_statement",
+                    evidence=evidence,
+                )
+
+            def listing_source(
+                _request,
+                proof=listing_proof,
+                metadata=listing_metadata,
+            ):
+                return FinancialCapabilityProviderResponse.available(
+                    provider_id="baostock",
+                    capability=MainlandCapability.ISSUER_LIFECYCLE,
+                    retained_artifact_identities=(
+                        proof.artifact.artifact_identity,
+                    ),
+                    candidate_count=1,
+                    subrequest_keys=(),
+                    physical_attempt_ids=(),
+                    listing_metadata=metadata,
+                )
+
+            transactions: list[
+                FinancialEligibilityTemporalEvaluationTransaction
+            ] = []
+
+            def transaction_factory(
+                *,
+                _transactions=transactions,
+                **kwargs,
+            ):
+                transaction = FinancialEligibilityTemporalEvaluationTransaction(
+                    **kwargs
+                )
+                _transactions.append(transaction)
+                return transaction
+
+            acquisition_request = _matrix_request(
+                asset=asset,
+                plan=plan,
+                binding=metadata_binding,
+                label=f"{origin}-{subject}-{name}-{mode.value}",
+            )
+            result = FinancialEligibilityMetadataAcquirer(
+                routing_plan=plan,
+                router=MainlandFinancialCapabilityRouter(
+                    routing_plan=plan,
+                    statement_sources={},
+                    company_type_evidence_sources=(
+                        {"tushare": company_source}
+                        if origin == "fresh"
+                        else {}
+                    ),
+                    capability_sources=(
+                        {
+                            MainlandCapability.ISSUER_LIFECYCLE: {
+                                "baostock": listing_source
+                            }
+                        }
+                        if origin == "fresh"
+                        else {}
+                    ),
+                ),
+                stop_signal=Event(),
+                temporal_transaction_factory=transaction_factory,
+            ).acquire(
+                acquisition_request,
+                retained_company_type_evidence=(
+                    (company_projection,) if origin == "retained" else ()
+                ),
+                retained_listing_metadata=(
+                    (listing_projection,) if origin == "retained" else ()
+                ),
+            )
+            assert len(transactions) == 1
+            assert transactions[0].evaluation_count in {1, 2}
+            if expected == "accepted":
+                assert result.context is not None, (origin, subject, name, mode)
+                temporal = result.context.temporal_eligibility_binding
+                assert temporal is not None
+                acquired_decision = (
+                    temporal.company_type_temporal_decision
+                    if subject == "company"
+                    else temporal.listing_temporal_decision
+                )
+            else:
+                assert result.failure is not None, (origin, subject, name, mode)
+                assert result.failure.reason is (
+                    FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
+                )
+                acquired_decision = result.failure.rejected_temporal_decision
+                assert acquired_decision is not None
+            assert acquired_decision == decision
+            replay_records.append((acquisition_request, result, decision))
+
+    monkeypatch.setattr(
+        temporal_module,
+        "evaluate_financial_metadata_temporal_eligibility",
+        lambda **_kwargs: pytest.fail("temporal replay invoked the evaluator"),
+    )
+    monkeypatch.setattr(
+        temporal_module,
+        "latest_completed_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "temporal replay consulted the restore-time frontier"
+        ),
+    )
+    monkeypatch.setattr(
+        FinancialEligibilityMetadataAcquirer,
+        "acquire",
+        lambda *_args, **_kwargs: pytest.fail(
+            "temporal replay performed metadata acquisition"
+        ),
+    )
+    monkeypatch.setattr(
+        ProviderSubrequestCache,
+        "execute",
+        lambda *_args, **_kwargs: pytest.fail(
+            "temporal replay performed provider/cache work"
+        ),
+    )
+    monkeypatch.setattr(
+        FinancialEligibilityAcquisitionContextOwner,
+        "acquire_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "temporal replay sampled a clock or acquired a new context"
+        ),
+    )
+    for name, mode, decision in recorded:
+        replayed = FinancialMetadataTemporalEligibilityDecision.model_validate_json(
+            decision.model_dump_json()
+        )
+        assert replayed is not decision
+        assert replayed == decision, (origin, subject, name, mode)
+        assert replayed.decision_identity == decision.decision_identity
+        assert replayed.result == decision.result
+        assert replayed.reasons == decision.reasons
+        assert replayed.calendar_binding == decision.calendar_binding
+        assert replayed.identity_payload() == decision.identity_payload()
+    assert len(replay_records) == len(recorded)
+    for request, result, decision in replay_records:
+        if request is not None:
+            restored_request = FinancialEligibilityMetadataAcquisitionRequest.model_validate(
+                {
+                    **request.model_dump(mode="python"),
+                    "asset_configuration": request.asset_configuration,
+                }
+            )
+            assert restored_request == request
+        restored_result = FinancialEligibilityAcquisitionResult.model_validate_json(
+            result.model_dump_json()
+        )
+        assert restored_result == result
+        if restored_result.context is not None:
+            temporal = restored_result.context.temporal_eligibility_binding
+            assert temporal is not None
+            restored_decisions = (
+                temporal.company_type_temporal_decision,
+                temporal.listing_temporal_decision,
+            )
+            assert decision in restored_decisions
+        else:
+            assert restored_result.failure is not None
+            assert restored_result.failure.rejected_temporal_decision == decision
+
+
 class _FailingTemporalEvaluationTransaction(
     FinancialEligibilityTemporalEvaluationTransaction
 ):
@@ -886,20 +1666,27 @@ def test_stale_retained_decision_rejects_without_rebinding_old_acceptance(
 @pytest.mark.unit
 def test_first_use_single_flight_fixes_one_temporal_frontier_for_32_followers(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     asset = _asset()
     plan = prepare_mainland_temporal_capability_routing_plan(
         _qualified_plan(monkeypatch, asset)
     )
     fixed_at = datetime(2026, 8, 11, 0, 59, tzinfo=timezone.utc)
-    company, listing = _retained_temporal_projections(
-        asset,
-        plan,
-        evaluated_at=datetime(2026, 8, 11, 0, 58, tzinfo=timezone.utc),
-    )
     transactions: list[FinancialEligibilityTemporalEvaluationTransaction] = []
-    counts = {"clock": 0, "calendar": 0}
+    counts = {
+        "clock": 0,
+        "calendar": 0,
+        "metadata_acquisition": 0,
+        "company_source": 0,
+        "company_transport": 0,
+        "lifecycle_source": 0,
+        "lifecycle_transport": 0,
+    }
     counts_lock = Lock()
+    provider_attempt_ids: list[str] = []
+    provider_outcomes: list[tuple[str, str, int]] = []
+    source_errors: list[tuple[str, str, object]] = []
     calendar_entered = Event()
     release_calendar = Event()
     synchronization_timeout = 30.0
@@ -921,59 +1708,241 @@ def test_first_use_single_flight_fixes_one_temporal_frontier_for_32_followers(
         transactions.append(transaction)
         return transaction
 
-    def forbidden_source(_request):
-        raise AssertionError("retained temporal proof must not perform provider work")
-
-    router = MainlandFinancialCapabilityRouter(
-        routing_plan=plan,
-        statement_sources={},
-        capability_sources={
-            MainlandCapability.ISSUER_LIFECYCLE: {"baostock": forbidden_source}
-        },
-        company_type_evidence_sources={"tushare": forbidden_source},
-    )
-    owner = FinancialEligibilityAcquisitionContextOwner(
-        run_id=_run_id("temporal-owner"),
-        asset_configuration=asset,
-        routing_plan=plan,
-        metadata_acquirer=FinancialEligibilityMetadataAcquirer(
-            routing_plan=plan,
-            router=router,
-            stop_signal=Event(),
-            temporal_transaction_factory=transaction_factory,
-        ),
-        unbound_financial_routing=QualifiedFinancialRoutingComposition(
-            router=router,
-            statement_request_factory=lambda *_args: None,
-        ),
-        expected_as_of_date=date(2026, 8, 10),
-        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
-        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
-        retained_company_type_evidence=(company,),
-        retained_listing_metadata=(listing,),
-        eligibility_clock=eligibility_clock,
-        calendar_provider=calendar_provider,
-        interrupt_runtime=lambda: None,
-        close_runtime=lambda: None,
-    )
-    start = Barrier(33)
-
-    def acquire():
-        start.wait(timeout=synchronization_timeout)
-        return owner.acquire_context(as_of_date=date(2026, 8, 10))
-
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        futures = [executor.submit(acquire) for _ in range(32)]
-        start.wait(timeout=synchronization_timeout)
-        assert calendar_entered.wait(timeout=synchronization_timeout)
-        release_calendar.set()
-        results = tuple(
-            future.result(timeout=synchronization_timeout) for future in futures
+    run_id = _run_id("temporal-owner-fresh")
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        coordinator = ProviderRequestCoordinator(store)
+        tushare_upstream, tushare_name = upstream_service_identity_for_provider(
+            "tushare",
+            account_scope=plan.account_scope_label,
+        )
+        baostock_upstream, baostock_name = upstream_service_identity_for_provider(
+            "baostock"
+        )
+        coordinator.register_upstream_service(
+            tushare_upstream,
+            tushare_name,
+            account_scope=plan.account_scope_label,
+        )
+        coordinator.register_upstream_service(baostock_upstream, baostock_name)
+        cache = ProviderSubrequestCache(
+            coordinator=coordinator,
+            artifact_store=ProviderSubrequestArtifactStore(tmp_path / "artifacts"),
+            run_scope_id=run_id,
         )
 
-    assert counts == {"clock": 1, "calendar": 1}
+        def execute_fixture(
+            *,
+            provider_id: str,
+            upstream_service_id: str,
+            capacity_scope: str,
+            requested_fields: tuple[str, ...],
+            payload: bytes,
+        ):
+            key = ProviderSubrequestKey.create(
+                provider_id=provider_id,
+                upstream_service_id=upstream_service_id,
+                account_scope=(
+                    plan.account_scope_label
+                    if provider_id == "tushare"
+                    else "not-applicable"
+                ),
+                capacity_scope=capacity_scope,
+                instrument_identity=asset.instrument_identity,
+                requested_range_start="2026-08-10",
+                requested_range_end="2026-08-10",
+                requested_fields=requested_fields,
+                as_of_date=date(2026, 8, 10),
+                qualification_profile=plan.qualification_profile,
+                normalizer_version=f"ticket-06b-{capacity_scope}-v1",
+                data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+            )
+
+            def physical_request() -> bytes:
+                with counts_lock:
+                    transport_name = (
+                        "company_transport"
+                        if provider_id == "tushare"
+                        else "lifecycle_transport"
+                    )
+                    counts[transport_name] += 1
+                return payload
+
+            try:
+                acquired = cache.execute(
+                    key,
+                    owner_id="ticket-06b-fresh-single-flight",
+                    priority=RequestPriority.INTERACTIVE_MAINLAND,
+                    now=lambda: fixed_at,
+                    sleep=lambda _seconds: None,
+                    lease_duration=timedelta(seconds=30),
+                    operation=f"financial_eligibility:{capacity_scope}",
+                    media_type="application/json",
+                    physical_request=physical_request,
+                )
+            except Exception as exc:
+                source_errors.append(
+                    (provider_id, type(exc).__name__, getattr(exc, "reason", None))
+                )
+                raise
+            provider_outcomes.append(
+                (provider_id, acquired.outcome.kind.value, len(acquired.attempt_events))
+            )
+            return key, acquired
+
+        def company_source(request):
+            with counts_lock:
+                counts["company_source"] += 1
+            key, acquired = execute_fixture(
+                provider_id="tushare",
+                upstream_service_id=tushare_upstream,
+                capacity_scope="financial_company_type_evidence",
+                requested_fields=("ann_date", "end_date", "f_ann_date"),
+                payload=b'{"company_type":"bank","fixture":"ticket-06b"}',
+            )
+            assert acquired.artifact is not None
+            proof = _matrix_proof(
+                subject="company",
+                requested_session=date(2026, 8, 10),
+                retrieved_at=datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc),
+                observed_at=datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc),
+                changes={},
+                exact_scope=None,
+            )
+            evidence = _matrix_company_evidence(asset, date(2026, 8, 10), proof)
+            attempt_ids = tuple(
+                event.attempt_event_id for event in acquired.attempt_events
+            )
+            provider_attempt_ids.extend(attempt_ids)
+            return FinancialCompanyTypeEvidenceProviderProjection(
+                provider_id="tushare",
+                metadata_binding=request.metadata_binding,
+                source_projection_kind="tushare_statement",
+                evidence=evidence,
+                subrequest_keys=(key.subrequest_key,),
+                physical_attempt_ids=attempt_ids,
+            )
+
+        def lifecycle_source(request):
+            with counts_lock:
+                counts["lifecycle_source"] += 1
+            key, acquired = execute_fixture(
+                provider_id="baostock",
+                upstream_service_id=baostock_upstream,
+                capacity_scope="issuer_lifecycle",
+                requested_fields=("ann_date", "f_ann_date", "ipoDate"),
+                payload=b'{"fixture":"ticket-06b","ipoDate":"2010-01-04"}',
+            )
+            assert acquired.artifact is not None
+            proof = _matrix_proof(
+                subject="listing",
+                requested_session=date(2026, 8, 10),
+                retrieved_at=datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc),
+                observed_at=datetime(2026, 8, 10, 16, 48, 7, tzinfo=timezone.utc),
+                changes={},
+                exact_scope=None,
+            )
+            metadata = _matrix_listing_metadata(asset, date(2026, 8, 10), proof)
+            attempt_ids = tuple(
+                event.attempt_event_id for event in acquired.attempt_events
+            )
+            provider_attempt_ids.extend(attempt_ids)
+            return FinancialCapabilityProviderResponse.available(
+                provider_id="baostock",
+                capability=MainlandCapability.ISSUER_LIFECYCLE,
+                retained_artifact_identities=(proof.artifact.artifact_identity,),
+                candidate_count=1,
+                subrequest_keys=(key.subrequest_key,),
+                physical_attempt_ids=attempt_ids,
+                listing_metadata=metadata,
+            )
+
+        router = MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={},
+            capability_sources={
+                MainlandCapability.ISSUER_LIFECYCLE: {
+                    "baostock": lifecycle_source
+                }
+            },
+            company_type_evidence_sources={"tushare": company_source},
+        )
+        metadata_acquirer = FinancialEligibilityMetadataAcquirer(
+            router=router,
+            routing_plan=plan,
+            stop_signal=Event(),
+            temporal_transaction_factory=transaction_factory,
+        )
+        original_acquire = metadata_acquirer.acquire
+
+        def counted_metadata_acquisition(*args, **kwargs):
+            with counts_lock:
+                counts["metadata_acquisition"] += 1
+            return original_acquire(*args, **kwargs)
+
+        metadata_acquirer.acquire = counted_metadata_acquisition
+        owner = FinancialEligibilityAcquisitionContextOwner(
+            run_id=run_id,
+            asset_configuration=asset,
+            routing_plan=plan,
+            metadata_acquirer=metadata_acquirer,
+            unbound_financial_routing=QualifiedFinancialRoutingComposition(
+                router=router,
+                statement_request_factory=lambda *_args: None,
+                provider_subrequest_cache=cache,
+            ),
+            expected_as_of_date=date(2026, 8, 10),
+            availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+            consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+            eligibility_clock=eligibility_clock,
+            calendar_provider=calendar_provider,
+            interrupt_runtime=lambda: None,
+            close_runtime=lambda: None,
+        )
+        start = Barrier(33)
+
+        def acquire():
+            start.wait(timeout=synchronization_timeout)
+            return owner.acquire_context(as_of_date=date(2026, 8, 10))
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = [executor.submit(acquire) for _ in range(32)]
+            start.wait(timeout=synchronization_timeout)
+            assert calendar_entered.wait(timeout=synchronization_timeout)
+            release_calendar.set()
+            results = tuple(
+                future.result(timeout=synchronization_timeout) for future in futures
+            )
+        checkpoint = cache.checkpoint()
+
+    assert not source_errors, source_errors
+    assert counts["company_source"] == counts["lifecycle_source"] == 1, (
+        counts,
+        provider_outcomes,
+        len(transactions),
+        tuple(transaction.evaluation_count for transaction in transactions),
+    )
+    assert all(result.outcome == "success" for result in results), results[0].failure
+    assert provider_outcomes == [
+        ("tushare", "available", 1),
+        ("baostock", "available", 1),
+    ]
+    assert counts == {
+        "clock": 1,
+        "calendar": 1,
+        "metadata_acquisition": 1,
+        "company_source": 1,
+        "company_transport": 1,
+        "lifecycle_source": 1,
+        "lifecycle_transport": 1,
+    }
     assert len(transactions) == 1
     assert transactions[0].evaluation_count == 2
+    assert len(provider_attempt_ids) == len(set(provider_attempt_ids)) == 2
+    assert checkpoint["contract_version"] == "1.2"
+    assert len(checkpoint["entries"]) == 2
+    assert sum(
+        len(entry["attempt_events"]) for entry in checkpoint["entries"]
+    ) == 2
     assert len({id(result) for result in results}) == 1
     assert results[0].outcome == "success", results[0].failure
     assert results[0].context is owner.context

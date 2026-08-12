@@ -153,6 +153,29 @@ def test_valid_current_analysis_after_requested_session_close_is_accepted() -> N
 
 
 @pytest.mark.unit
+def test_canonical_store_calendar_revision_binds_without_relabeling() -> None:
+    calendar = _calendar()
+    canonical = StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar=sha256:" + "f" * 64,
+        reference_market=calendar.reference_market,
+        timezone_name=calendar.timezone_name,
+        provider_dataset_id=calendar.provider_dataset_id,
+        observed_at=calendar.observed_at,
+        provenance_class=calendar.provenance_class,
+        sessions=calendar.sessions,
+    )
+
+    binding = build_market_session_eligibility_binding(
+        canonical,
+        requested_session=date(2026, 8, 10),
+        eligibility_evaluated_at=_at(10, 15, 5),
+    )
+
+    assert binding.calendar_revision_id == canonical.calendar_revision_id
+    assert binding.has_valid_identity()
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("retrieved_at", "evaluated_at"),
     (
@@ -487,7 +510,11 @@ def test_calendar_mismatch_and_closed_requested_session_are_typed() -> None:
         requested_session=date(2026, 8, 10),
         eligibility_evaluated_at=_at(10, 15, 5),
     )
-    mismatched = valid.model_copy(update={"calendar_revision_id": "calendar:other"})
+    mismatched = valid.model_copy(
+        update={
+            "calendar_revision_id": "market-session-calendar:v1:" + "e" * 64
+        }
+    )
     mismatch_decision = evaluate_financial_metadata_temporal_eligibility(
         mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
         evidence=_evidence(retrieved_at=_at(10, 15)),

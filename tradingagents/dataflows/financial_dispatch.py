@@ -1616,7 +1616,7 @@ class FinancialCompletenessAuditRow(BaseModel):
         "financial-completeness-row-v3"
     )
     manifest_identity: str = Field(
-        pattern=r"^financial-manifest:v[23]:[0-9a-f]{64}$"
+        pattern=r"^financial-manifest:v[234]:[0-9a-f]{64}$"
     )
     capability: FinancialCapability
     statement_or_ratio_family: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)

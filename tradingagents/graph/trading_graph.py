@@ -46,6 +46,7 @@ from tradingagents.capability_routing import (
     is_mainland_equity_configuration,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
+    prepare_mainland_temporal_capability_routing_plan,
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
@@ -261,6 +262,16 @@ class TradingAgentsGraph:
                         routing_preflight.failure
                     )
                 capability_routing_plan = routing_preflight.plan
+                if (
+                    capability_routing_plan is not None
+                    and capability_routing_plan.mode.value
+                    == "qualified_v1_shadow"
+                ):
+                    capability_routing_plan = (
+                        prepare_mainland_temporal_capability_routing_plan(
+                            capability_routing_plan
+                        )
+                    )
         elif capability_routing_plan is not None:
             raise ValueError(
                 "mainland Capability Routing Plan requires a mainland Equity identity"
