@@ -463,6 +463,41 @@ class ProviderRequestCoordinator:
             reference_market,
         )
 
+    def read_session_calendar_revision(self, calendar_revision_id: str):
+        """Read one exact calendar revision through the thread-safe authority."""
+
+        from tradingagents.market_history.calendar import (
+            _read_session_calendar_revision,
+        )
+
+        connection = self._database_connection()
+
+        def read_payload(digest: str) -> bytes:
+            row = connection.execute(
+                "SELECT relative_path, byte_length FROM payload_artifacts "
+                "WHERE digest = ?",
+                (digest,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("calendar payload missing")
+            from pathlib import Path
+
+            from tradingagents.market_history.store import MarketHistoryStore
+
+            path = MarketHistoryStore._checked_path(
+                Path(self._store.config.payload_root),
+                Path(str(row[0])),
+            )
+            payload = path.read_bytes()
+            MarketHistoryStore._verify_payload_bytes(payload, digest, int(row[1]))
+            return payload
+
+        return _read_session_calendar_revision(
+            connection,
+            calendar_revision_id,
+            read_payload=read_payload,
+        )
+
     def register_upstream_service(
         self,
         upstream_service_id: str,

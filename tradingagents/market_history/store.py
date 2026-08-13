@@ -1264,14 +1264,27 @@ class MarketHistoryStore:
         publication: MarketSessionCalendarPublication,
     ) -> PublishedSessionCalendar:
         self._require_open()
-        from tradingagents.market_history.calendar import publish_session_calendar
+        from tradingagents.market_history.calendar import (
+            canonical_session_calendar_publication,
+            publish_session_calendar,
+        )
 
+        publication = canonical_session_calendar_publication(publication)
         digest = sha256(publication.raw_payload).hexdigest()
-        with self._payload_mutation_scope("publisher", digest):
-            published = publish_session_calendar(self, publication)
-            self._phase_hook("publisher_references_committed", digest)
-            self._verify_registered_payload_digest(digest)
-            return published
+        mutex_timed_out = False
+        try:
+            with self._payload_mutation_scope("publisher", digest):
+                published = publish_session_calendar(self, publication)
+                if publication.payload_contract != "mainland-session-calendar-payload-v1":
+                    self._phase_hook("publisher_references_committed", digest)
+                    self._verify_registered_payload_digest(digest)
+        except PayloadMutationTimeoutError:
+            mutex_timed_out = True
+        if mutex_timed_out:
+            raise PayloadMutationTimeoutError(
+                "payload-mutation mutex unavailable"
+            ) from None
+        return published
 
     def read_history_bundle_provenance_audit(
         self,
@@ -1292,6 +1305,38 @@ class MarketHistoryStore:
         from tradingagents.market_history.calendar import read_current_session_calendar
 
         return read_current_session_calendar(self, reference_market)
+
+    def read_session_calendar_revision(
+        self,
+        calendar_revision_id: str,
+    ) -> StoredSessionCalendar:
+        self._require_open()
+        from tradingagents.market_history.calendar import (
+            read_session_calendar_revision,
+        )
+
+        return read_session_calendar_revision(self, calendar_revision_id)
+
+    def assess_mainland_session_calendar_readiness(
+        self,
+        calendar_revision_id: str,
+        *,
+        requested_start_date,
+        requested_end_date,
+        evaluated_at,
+    ):
+        self._require_open()
+        from tradingagents.market_history.calendar import (
+            assess_mainland_session_calendar_readiness,
+        )
+
+        return assess_mainland_session_calendar_readiness(
+            self,
+            calendar_revision_id,
+            requested_start_date=requested_start_date,
+            requested_end_date=requested_end_date,
+            evaluated_at=evaluated_at,
+        )
 
     def record_publication_watermark(self, **kwargs):
         self._require_open()
@@ -1901,8 +1946,9 @@ class MarketHistoryStore:
             temporary_path = None
             self._verify_payload_file(destination, sha256(payload).hexdigest(), len(payload))
         finally:
-            if temporary_path is not None and temporary_path.exists():
-                temporary_path.unlink()
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink()
 
     @staticmethod
     def _write_new_file(path: Path, payload: bytes) -> None:

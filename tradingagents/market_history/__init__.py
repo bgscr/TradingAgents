@@ -1,11 +1,17 @@
 """Durable point-in-time market-history contracts."""
 
 from tradingagents.market_history.calendar import (
+    MainlandSessionCalendarReadiness,
+    MainlandSessionCalendarReadinessError,
+    MainlandSessionCalendarReadinessFailure,
     MarketSession,
+    MarketSessionCalendarIntegrityError,
     MarketSessionCalendarPublication,
+    MarketSessionCalendarReadFailure,
     MarketSessionStatus,
     PublishedSessionCalendar,
     StoredSessionCalendar,
+    publication_from_baostock_session_calendar_acquisition,
 )
 from tradingagents.market_history.config import (
     DataUsageMode,
@@ -125,7 +131,12 @@ __all__ = [
     "PublicationState",
     "PublicationWatermark",
     "MarketSession",
+    "MainlandSessionCalendarReadiness",
+    "MainlandSessionCalendarReadinessError",
+    "MainlandSessionCalendarReadinessFailure",
     "MarketSessionCalendarPublication",
+    "MarketSessionCalendarIntegrityError",
+    "MarketSessionCalendarReadFailure",
     "MarketSessionStatus",
     "NormalizedMainlandSession",
     "MarketHistoryConfig",
@@ -153,6 +164,7 @@ __all__ = [
     "ProviderHistoryBundlePublication",
     "PublishedHistoryBundle",
     "PublishedSessionCalendar",
+    "publication_from_baostock_session_calendar_acquisition",
     "RawMarketObservation",
     "ReconstructedMarketSnapshot",
     "RevisionKind",
