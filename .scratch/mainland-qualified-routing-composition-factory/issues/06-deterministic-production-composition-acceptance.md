@@ -609,11 +609,20 @@ without repair or mutation.
 
 The focused temporal contract/projection/checkpoint command passed `62 passed`.
 The integrated temporal/QCF selector passed `17 passed`, and the complete QCF
-file passed `19 passed`. These runs exercised Capability Routing Plan `1.3`,
-Financial Eligibility Acquisition Context v2,
-`provider-neutral-temporal-eligibility-v1`,
-`market-session-eligibility-binding-v1`, cache checkpoint `1.2`, dispatch ledger
-`1.6`, and financial manifest v4.
+file passed `19 passed`. These runs exercised the complete final forward
+contract inventory:
+
+| Forward contract | Named deterministic evidence | Result |
+| --- | --- | --- |
+| Capability Routing Plan `1.3` | `test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions`; temporal checkpoint/QCF matrices | PASS |
+| `provider-neutral-temporal-eligibility-v1` | temporal contract, proof-projection, and replay matrices above | PASS |
+| `market-session-eligibility-binding-v1` | temporal frontier/calendar matrices above | PASS |
+| Financial Eligibility Acquisition Context v2 | `test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions`; QCF4/QCF12 | PASS |
+| Statement request `financial-statement-routing-request-v4` | `test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions` | PASS |
+| Indicator request `financial-indicator-routing-request-v7` | `test_context_v2_and_request_binding_v2_bind_accepted_temporal_decisions` | PASS |
+| Financial manifest v4 | temporal statement/indicator dispatch and QCF checkpoint matrices | PASS |
+| Provider Subrequest Cache checkpoint `1.2` | `test_context_v2_cache_checkpoint_1_2_round_trips_temporal_decisions`; QCF12 | PASS |
+| Financial dispatch ledger `1.6` | `test_temporal_statement_ledger_restores_and_replays_without_fresh_work`; QCF12 | PASS |
 
 ### PE1–PE15 and AC1–AC13
 
@@ -691,10 +700,11 @@ after the focused runs and again before closure commit. No Ticket 07 command,
 provider, model, replay helper, or rollout entry point was executed.
 
 Stage 1 — Spec Compliance review: PASS; Critical 0, Important 0, Minor 0.
-Stage 2 — Code Quality/Standards review: PASS; Critical 0, Important 0, Minor 0.
-No production or test code changed during Ticket 06 closure. The only scoped
-edit is this durable acceptance record; all pre-existing unrelated worktree
-state was preserved and excluded from the closure commit.
+Documentation Standards review: PASS; Critical 0, Important 0, Minor 0.
+Production/test Code Quality review was not triggered because no production or
+test code changed during Ticket 06 closure. The only scoped edit is this durable
+acceptance record; all pre-existing unrelated worktree state was preserved and
+excluded from the closure commit.
 
 `DEFAULT_CONFIG["mainland_capability_routing_mode"]` remains `legacy`.
 Qualified shadow policy remains `shadow_non_authoritative` with
