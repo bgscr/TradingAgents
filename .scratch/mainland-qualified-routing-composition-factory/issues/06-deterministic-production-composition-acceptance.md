@@ -11,7 +11,11 @@ passes, produce a new plan-1.3/context-v2 traceability record for the complete
 QCF1–QCF18 set, rerun PE1–PE15 and parent AC1–AC13 unchanged, run the full suite
 twice, and complete Spec Compliance review before Code Quality review. The
 2026-08-10 pre-temporal pass remains immutable historical evidence but does not
-satisfy the amended contract. Any amended failure blocks Ticket 07.
+satisfy the amended temporal contract. The 2026-08-12 post-temporal PASS is the
+historical pre-calendar-bootstrap acceptance. After CAL-01 through CAL-03 change
+production and CAL-04 accepts the integrated bootstrap, rerun this complete
+ticket on the exact reviewed post-CAL production tree. Neither future work nor a
+future failure invalidates or rewrites the current historical PASS evidence.
 
 **Blocked by:** 03 — Add static registration and caller precedence; 02D — Add
 executable production-source wiring; 04A — Integrate managed eligibility-context
@@ -19,15 +23,27 @@ acquisition; 05B — Persist and restore indicator metadata compatibility; 06A �
 Correct QCF4 deterministic acceptance; 06B — Run deterministic temporal
 acceptance.
 
+**Post-CAL rerun blocked by:** CAL-04 — Deterministic bootstrap acceptance and
+two-stage review; then a separately authorized production calendar bootstrap and
+zero-I/O exact-ID readiness verification. The production-bootstrap authorization
+does not authorize Ticket 07.
+
 **Status:** completed
 
-**Acceptance state:** PASS on 2026-08-12. The immutable 2026-08-10 pre-temporal
-evidence below remains historical only. The final acceptance basis is the
+**Acceptance state:** PASS on 2026-08-12 as historical pre-calendar-bootstrap
+acceptance. The immutable 2026-08-10 pre-temporal evidence below remains
+historical only. The current acceptance basis is the
 post-temporal implementation chain through commit
 `21000ab78ec221a6b528b151400a6673007fc947`, the formal closure request's
 attested 06B execution results against that tree, and the focused closure
 verification recorded below. Ticket 07 was not executed by this closure and no
-rollout or authoritative `qualified_v1` activation is authorized.
+rollout or authoritative `qualified_v1` activation is authorized. A complete
+post-CAL rerun is required before a fresh Ticket 07 authorization; that additive
+requirement does not mark this historical evidence invalid.
+
+**Post-CAL regression state:** required after CAL-01–CAL-03 production changes,
+CAL-04 acceptance, separately authorized production bootstrap, and exact-ID
+readiness verification, on the exact reviewed post-CAL production tree.
 
 ## Observable behavior
 
@@ -198,6 +214,37 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   checks, and Spec Compliance then Code Quality review from the same amended
   tree. Any failure or waiver keeps Tickets 06 and 07 blocked.
 
+## Required post-CAL acceptance rerun
+
+The checked acceptance criteria and evidence in this file remain the immutable
+2026-08-12 historical pre-calendar-bootstrap PASS. The unchecked criteria below
+are a new regression prerequisite created by the settled Design D calendar
+chain; they do not reopen, relabel, or invalidate that PASS.
+
+- [ ] CAL-01, CAL-02, and CAL-03 production work is complete and CAL-04 passes
+  its full deterministic matrix and two-stage review on one reviewed tree.
+- [ ] Under a separate live authorization limited to calendar bootstrap, the
+  production store receives a bounded BaoStock-backed `mainland-cn` Market
+  Session Calendar revision. No symbol, analysis run/checkpoint, Ticket 07, or
+  model work occurs under that authorization.
+- [ ] The exact returned calendar revision is reopened by ID and passes
+  `mainland-session-calendar-readiness-v1` with zero read-time provider I/O,
+  including complete range, pinned authority/times, latest completed frontier
+  and close, later open session and close, and exact identity/content.
+- [ ] From the exact reviewed post-CAL production tree, rerun every Ticket 06
+  criterion without waiver: temporal matrix, QCF1–QCF18, PE1–PE15, AC1–AC13,
+  focused suites, non-integration/full repository checks, Ruff, whitespace/diff,
+  secret/raw-error, historical immutability, and Spec Compliance then Code
+  Quality review.
+- [ ] The post-CAL evidence records the exact tree/revision identities and proves
+  that all reads/replay are zero-provider-I/O, all prior snapshots/checkpoints/
+  reports/attempts/failed Ticket 07 evidence remain immutable, provider routing
+  and authority contracts remain unchanged, output stays
+  `shadow_non_authoritative`, and `qualified_v1` remains disabled.
+- [ ] Only a complete post-CAL PASS may satisfy Ticket 07's deterministic
+  prerequisite. Ticket 07 still requires its own separate fresh live
+  authorization and NEW run ID after this rerun.
+
 ## Deterministic regressions
 
 - Run every focused test added by Tickets 01–05, 02A–02H, 04A, 05A–05C, 06A,
@@ -262,6 +309,7 @@ runnable or passing until Ticket 06A passes corrected QCF4.
 Run production-composition and provider focused suites:
 
 \`\`\`powershell
+pytest -q tests/test_baostock_session_calendar_acquisition.py tests/test_market_session_calendar_publication.py tests/test_market_session_calendar_exact_reader.py tests/test_market_session_calendar_readiness.py tests/test_market_session_calendar_bootstrap.py
 pytest -q tests/test_financial_metadata_temporal_eligibility.py tests/test_financial_temporal_proof_projection.py tests/test_financial_temporal_checkpoint_compatibility.py
 pytest -q tests/test_qualified_routing_composition_contract.py tests/test_production_qualified_provider_composition.py tests/test_qualified_routing_static_registration.py tests/test_qualified_routing_managed_lifecycle.py tests/test_qualified_routing_factory_checkpoint_restore.py
 pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_financial_eligibility_metadata_acquisition.py tests/test_financial_request_factory_context_binding.py
@@ -293,6 +341,9 @@ git status --short
 No command in this ticket may select integration tests or contact a live
 provider/model. If a test would do so, stop and correct the deterministic seam
 instead of running it.
+
+The separately authorized production calendar bootstrap precedes this rerun but
+is not a verification command of Ticket 06 and does not authorize Ticket 07.
 
 ## Historical pre-temporal acceptance evidence — 2026-08-10
 
@@ -471,8 +522,11 @@ Legacy authority and bytes remain unchanged; qualified output remains
 Evidence Admission and Decision Gate remain unchanged. Authoritative
 `qualified_v1` remains disabled. Ticket 07 was neither implemented nor run; its
 pre-temporal blocker was considered cleared by this completed evidence package.
-The temporal amendment supersedes that gate: Ticket 07 is currently blocked by
-06B and the complete amended Ticket 06 rerun.
+The temporal amendment superseded that gate, and the post-temporal acceptance
+then cleared 06B plus the complete amended Ticket 06 rerun. The later calendar-
+bootstrap amendment now keeps Ticket 07 blocked by CAL-01–CAL-04, separately
+authorized production bootstrap, exact-ID zero-I/O readiness, the complete
+post-CAL Ticket 06 rerun, and a separate fresh Ticket 07 authorization.
 
 ## Historical pre-temporal definition of done
 
@@ -490,7 +544,8 @@ The temporal amendment supersedes that gate: Ticket 07 is currently blocked by
   deterministic tests, reuse of existing seams, maintainability, and absence of
   unrelated changes. All Critical and Important findings are resolved.
 - [x] Authoritative \`qualified_v1\` remains disabled, no live traffic occurred,
-  and Ticket 07 is unblocked only by a complete passing evidence package.
+  and the then-current Ticket 07 prerequisite required a complete passing
+  evidence package. The later post-CAL prerequisites are recorded separately.
 
 ## Amended definition of done
 
@@ -504,15 +559,31 @@ The temporal amendment supersedes that gate: Ticket 07 is currently blocked by
 - [x] Stage 1 Spec Compliance review passes before Stage 2 Code Quality review;
   all Critical and Important findings are resolved and the classification is
   recorded.
-- [x] The failed Ticket 07 run remains immutable, Ticket 07 is unblocked only by
-  both 06B and this complete amended rerun plus fresh live authorization, and
-  authoritative `qualified_v1` remains disabled.
+- [x] The failed Ticket 07 run remains immutable, the then-current temporal
+  prerequisites required both 06B and this complete amended rerun plus fresh
+  live authorization, and authoritative `qualified_v1` remains disabled. The
+  later post-CAL prerequisites are recorded separately.
+
+## Post-CAL definition of done
+
+- [ ] CAL-04 acceptance and review pass; a separately authorized production
+  calendar bootstrap returns a revision that is exact-ID reopened and ready with
+  zero read-time provider I/O.
+- [ ] The complete Ticket 06 matrix is rerun without waiver on the exact reviewed
+  post-CAL production tree and records a new PASS while preserving the 2026-08-10
+  and 2026-08-12 historical evidence unchanged.
+- [ ] Spec Compliance and Code Quality reviews pass in order with Critical,
+  Important, and Minor counts recorded and all Critical/Important findings
+  resolved.
+- [ ] Historical state and failed Ticket 07 evidence remain immutable,
+  `qualified_v1` remains disabled, and no Ticket 07 run ID/provider/model work is
+  allocated or performed by this rerun.
 
 ## Final post-temporal acceptance evidence — 2026-08-12
 
-This is the final Ticket 06 acceptance basis. It does not replace, edit, or
-reinterpret the historical 2026-08-10 evidence above. The implementation and
-acceptance chain is:
+This is the final post-temporal and historical pre-calendar-bootstrap Ticket 06
+acceptance basis. It does not replace, edit, or reinterpret the historical
+2026-08-10 evidence above. The implementation and acceptance chain is:
 
 | Scope | Commit | Result |
 | --- | --- | --- |
