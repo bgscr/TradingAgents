@@ -2880,6 +2880,176 @@ def runtime_artifacts_gc(
         typer.echo(str(candidate))
 
 
+@app.command("market-session-calendar-bootstrap")
+def market_session_calendar_bootstrap(
+    reference_market: Annotated[
+        str,
+        typer.Option("--reference-market", help="Pinned Reference Market authority."),
+    ],
+    provider: Annotated[
+        str,
+        typer.Option("--provider", help="Pinned calendar provider authority."),
+    ],
+    start_date: Annotated[
+        str,
+        typer.Option("--start-date", help="Inclusive civil-date lower bound."),
+    ],
+    end_date: Annotated[
+        str,
+        typer.Option("--end-date", help="Inclusive civil-date upper bound."),
+    ],
+    evaluated_at: Annotated[
+        str,
+        typer.Option(
+            "--evaluated-at",
+            help="Timezone-aware RFC3339 readiness evaluation instant.",
+        ),
+    ],
+    authorize_provider_io: Annotated[
+        bool,
+        typer.Option(
+            "--authorize-provider-io",
+            help="Explicitly authorize the required BaoStock provider workflow.",
+        ),
+    ] = False,
+    force_refresh: Annotated[
+        bool,
+        typer.Option(
+            "--force-refresh",
+            help="Acquire and publish even when a ready revision already exists.",
+        ),
+    ] = False,
+) -> None:
+    """Explicitly reuse or bootstrap the mainland Market Session Calendar."""
+
+    from pydantic import ValidationError
+
+    from tradingagents.dataflows.baostock_calendar import (
+        BaoStockSessionCalendarAcquisitionError,
+        BaoStockSessionCalendarFailureReason,
+    )
+    from tradingagents.market_history import (
+        MainlandSessionCalendarReadinessError,
+        MarketHistoryConfig,
+        MarketSessionCalendarIntegrityError,
+        bootstrap as bootstrap_module,
+    )
+    from tradingagents.market_history.bootstrap import (
+        MarketSessionCalendarBootstrapError,
+        MarketSessionCalendarBootstrapRequest,
+        SystemClock,
+    )
+
+    def emit(payload: Mapping[str, object]) -> None:
+        typer.echo(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
+    try:
+        parsed_start_date = datetime.date.fromisoformat(start_date)
+        parsed_end_date = datetime.date.fromisoformat(end_date)
+        if re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+            evaluated_at,
+        ) is None:
+            raise ValueError
+        parsed_evaluated_at = datetime.datetime.fromisoformat(
+            evaluated_at.replace("Z", "+00:00")
+        )
+        history_config = MarketHistoryConfig.from_mapping(DEFAULT_CONFIG)
+        request = MarketSessionCalendarBootstrapRequest(
+            provider=provider,
+            reference_market=reference_market,
+            start_date=parsed_start_date,
+            end_date=parsed_end_date,
+            evaluated_at=parsed_evaluated_at,
+            data_usage_mode=history_config.data_usage_mode,
+            authorize_provider_io=authorize_provider_io,
+            force_refresh=force_refresh,
+        )
+    except (KeyError, TypeError, ValueError, ValidationError):
+        emit(
+            {
+                "contract_version": "market-session-calendar-bootstrap-error-v1",
+                "diagnostic_code": "calendar_bootstrap_request_invalid",
+                "failure_category": "request",
+            }
+        )
+        raise typer.Exit(code=2) from None
+
+    try:
+        receipt = bootstrap_module.bootstrap_mainland_session_calendar(
+            request,
+            history_config=history_config,
+            clock=SystemClock(),
+        )
+    except BaoStockSessionCalendarAcquisitionError as exc:
+        request_failures = {
+            BaoStockSessionCalendarFailureReason.OPERATOR_AUTHORIZATION_REQUIRED,
+            BaoStockSessionCalendarFailureReason.UNBOUNDED_RANGE,
+            BaoStockSessionCalendarFailureReason.REVERSED_RANGE,
+            BaoStockSessionCalendarFailureReason.RANGE_OUT_OF_POLICY,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_PROVIDER,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_REFERENCE_MARKET,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_TIMEZONE,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_DATA_USAGE_MODE,
+            BaoStockSessionCalendarFailureReason.UNSAFE_ACCOUNT_SCOPE,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_CAPACITY_SCOPE,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_DATASET,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_NORMALIZER,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_PAYLOAD_CONTRACT,
+            BaoStockSessionCalendarFailureReason.UNSUPPORTED_SESSION_TIME_CONTRACT,
+        }
+        category = "request" if exc.reason in request_failures else "provider"
+        emit(
+            {
+                "contract_version": "market-session-calendar-bootstrap-error-v1",
+                "diagnostic_code": exc.diagnostic_code,
+                "failure_category": category,
+                "physical_attempt_count": exc.physical_attempt_count,
+                "retryable": exc.retryable,
+            }
+        )
+        raise typer.Exit(code=2 if category == "request" else 3) from None
+    except MarketSessionCalendarBootstrapError as exc:
+        emit(
+            {
+                "contract_version": "market-session-calendar-bootstrap-error-v1",
+                "diagnostic_code": exc.diagnostic_code,
+                "failure_category": "request",
+            }
+        )
+        raise typer.Exit(code=2) from None
+    except (
+        MainlandSessionCalendarReadinessError,
+        MarketSessionCalendarIntegrityError,
+    ) as exc:
+        emit(
+            {
+                "contract_version": "market-session-calendar-bootstrap-error-v1",
+                "diagnostic_code": exc.diagnostic_code,
+                "failure_category": "calendar",
+            }
+        )
+        raise typer.Exit(code=4) from None
+    except Exception:
+        emit(
+            {
+                "contract_version": "market-session-calendar-bootstrap-error-v1",
+                "diagnostic_code": "calendar_bootstrap_failed",
+                "failure_category": "internal",
+            }
+        )
+        raise typer.Exit(code=5) from None
+
+    emit(receipt.model_dump(mode="json"))
+
+
 @app.command("crypto-identity-registry-refresh")
 def crypto_identity_registry_refresh(
     candidate: Annotated[
