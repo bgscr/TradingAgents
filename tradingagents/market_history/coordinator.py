@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 from tradingagents.market_history.result_codec import (
     decode_coordinated_result,
@@ -48,7 +48,7 @@ def record_active_physical_attempt_io() -> None:
 
     recorder = _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER.get()
     if recorder is None:
-        raise RuntimeError("Yahoo transport I/O has no active coordinator permit")
+        raise RuntimeError("provider transport I/O has no active coordinator permit")
     recorder()
 
 
@@ -221,6 +221,13 @@ class ProviderPhysicalAttemptEvent:
     cooldown_changed: bool
     cooldown_until: datetime | None
     final_physical_attempt_count: int | None
+    operation: str = ""
+
+
+class PhysicalWorkflowOperation(Protocol):
+    """One physical operation issued under a lease-owned provider workflow."""
+
+    def __call__(self, operation: str, physical_request: Callable[[], T]) -> T: ...
 
 
 @dataclass(frozen=True)
@@ -1058,6 +1065,421 @@ class ProviderRequestCoordinator:
             _wait_for_initial_pacing=True,
         )
 
+    def execute_physical_workflow(
+        self,
+        *,
+        request_key: str,
+        upstream_service_id: str,
+        owner_id: str,
+        priority: RequestPriority,
+        now: Callable[[], datetime],
+        sleep: Callable[[float], None],
+        lease_duration: timedelta,
+        max_physical_operations: int,
+        workflow: Callable[[PhysicalWorkflowOperation], T],
+        cooldown_scope: str = "all",
+    ) -> CoordinatedRequestResult[T]:
+        """Run a bounded multi-operation provider workflow under one lease.
+
+        The workflow controls provider-session cleanup and error precedence. Each
+        call through its operation executor consumes exactly one physical-attempt
+        event; the coordinator adds no retry or implicit operation.
+        """
+
+        if max_physical_operations < 1:
+            raise ValueError("physical-operation budget must be positive")
+        self._raise_if_stopped()
+        flight_key = (
+            str(self._store.config.database_path),
+            upstream_service_id,
+            request_key,
+        )
+        with self._single_flight_lock:
+            shared = self._single_flights.get(flight_key)
+            if shared is None:
+                shared = Future()
+                self._single_flights[flight_key] = shared
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            while True:
+                self._raise_if_stopped()
+                try:
+                    return shared.result(timeout=0.05)  # type: ignore[return-value]
+                except FutureTimeoutError:
+                    continue
+
+        try:
+            result = self._execute_physical_workflow_as_leader(
+                request_key=request_key,
+                upstream_service_id=upstream_service_id,
+                owner_id=owner_id,
+                priority=priority,
+                now=now,
+                sleep=sleep,
+                lease_duration=lease_duration,
+                max_physical_operations=max_physical_operations,
+                workflow=workflow,
+                cooldown_scope=cooldown_scope,
+            )
+        except BaseException as exc:
+            with self._single_flight_lock:
+                if shared.done():
+                    terminal_error = shared.exception()
+                else:
+                    shared.set_exception(exc)
+                    terminal_error = None
+            if terminal_error is not None:
+                raise terminal_error from None
+            raise
+        else:
+            with self._single_flight_lock:
+                if shared.done():
+                    terminal_error = shared.exception()
+                else:
+                    shared.set_result(result)
+                    terminal_error = None
+            if terminal_error is not None:
+                raise terminal_error from None
+            return result
+        finally:
+            with self._single_flight_lock:
+                if self._single_flights.get(flight_key) is shared:
+                    del self._single_flights[flight_key]
+
+    def _execute_physical_workflow_as_leader(
+        self,
+        *,
+        request_key: str,
+        upstream_service_id: str,
+        owner_id: str,
+        priority: RequestPriority,
+        now: Callable[[], datetime],
+        sleep: Callable[[float], None],
+        lease_duration: timedelta,
+        max_physical_operations: int,
+        workflow: Callable[[PhysicalWorkflowOperation], T],
+        cooldown_scope: str,
+    ) -> CoordinatedRequestResult[T]:
+        started_at = _as_utc(now(), label="coordinator time")
+        decision = self.acquire(
+            request_key=request_key,
+            upstream_service_id=upstream_service_id,
+            owner_id=owner_id,
+            priority=priority,
+            now=started_at,
+            lease_duration=lease_duration,
+            cooldown_scope=cooldown_scope,
+        )
+        if decision.disposition is LeaseDisposition.DUPLICATE_IN_FLIGHT:
+            assert decision.active_owner_id is not None
+            return self._wait_for_persisted_sequence(
+                request_key=request_key,
+                upstream_service_id=upstream_service_id,
+                owner_id=decision.active_owner_id,
+                now=now,
+                sleep=sleep,
+            )
+        if decision.disposition is not LeaseDisposition.ACQUIRED:
+            retry_after = (
+                max(0.0, (decision.cooldown_until - started_at).total_seconds())
+                if decision.cooldown_until is not None
+                else None
+            )
+            outcome = (
+                PhysicalAttemptOutcome.RATE_LIMITED
+                if decision.disposition is LeaseDisposition.COOLDOWN
+                else PhysicalAttemptOutcome.UPSTREAM_BUSY
+            )
+            raise PhysicalAttemptBudgetExhausted(
+                sequence_id="",
+                failure=PhysicalAttemptFailure(
+                    outcome=outcome,
+                    retryable=True,
+                    retry_after_seconds=retry_after,
+                ),
+                attempt_events=(),
+            )
+
+        lease = decision.lease
+        assert lease is not None
+        sequence_id = self._sequence_id(lease)
+        self._create_retry_sequence(sequence_id, lease)
+        attempt_count = 0
+
+        def abandon_running_workflow() -> None:
+            row = self._database_connection().execute(
+                "SELECT status FROM provider_request_sequences WHERE sequence_id = ?",
+                (sequence_id,),
+            ).fetchone()
+            if row is not None and str(row[0]) == "running":
+                connection = self._database_connection()
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    self._close_running_sequence(
+                        sequence_id=sequence_id,
+                        completed_at=_as_utc(now(), label="coordinator time"),
+                        error_code="coordinator_sequence_abandoned",
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+            self.release(lease)
+
+        def execute_operation(operation: str, physical_request: Callable[[], T]) -> T:
+            nonlocal attempt_count, lease
+            if not operation.strip():
+                raise ValueError("physical workflow operation must not be blank")
+            if attempt_count >= max_physical_operations:
+                raise RuntimeError("physical workflow exceeded its operation budget")
+            self._raise_if_stopped(
+                sequence_id=sequence_id,
+                attempt_events=self.physical_attempt_events(sequence_id),
+            )
+            attempt_index = attempt_count + 1
+            requested_at = _as_utc(now(), label="physical-attempt time")
+            earliest_at = self.earliest_physical_attempt_at(
+                lease,
+                requested_at=requested_at,
+            )
+            pacing_wait_seconds = max(
+                0.0,
+                (earliest_at - requested_at).total_seconds(),
+            )
+            attempted_at = requested_at
+            while attempted_at < earliest_at:
+                renewed = self.renew(
+                    lease,
+                    now=attempted_at,
+                    lease_duration=lease_duration,
+                )
+                if renewed is None:
+                    raise PhysicalAttemptFailure(
+                        outcome=PhysicalAttemptOutcome.UPSTREAM_BUSY,
+                        retryable=True,
+                    )
+                lease = renewed
+                wait_seconds = min(
+                    60.0,
+                    lease_duration.total_seconds() / 2,
+                    (earliest_at - attempted_at).total_seconds(),
+                )
+                self._wait_or_raise_if_stopped(
+                    wait_seconds,
+                    sleep=sleep,
+                    sequence_id=sequence_id,
+                )
+                attempted_at = max(
+                    _as_utc(now(), label="physical-attempt time"),
+                    attempted_at + timedelta(seconds=wait_seconds),
+                )
+            attempted_at = max(attempted_at, earliest_at)
+            renewed = self.renew(
+                lease,
+                now=attempted_at,
+                lease_duration=lease_duration,
+            )
+            if renewed is None:
+                raise PhysicalAttemptFailure(
+                    outcome=PhysicalAttemptOutcome.UPSTREAM_BUSY,
+                    retryable=True,
+                )
+            lease = renewed
+            pacing_event = (
+                "paced_then_permit_acquired"
+                if pacing_wait_seconds
+                else "permit_acquired"
+            )
+            connection = self._database_connection()
+            attempt_recorded = False
+
+            def record_attempt_at_io_boundary() -> None:
+                nonlocal attempt_count, attempt_recorded, attempted_at
+                self._raise_if_stopped(
+                    sequence_id=sequence_id,
+                    attempt_events=self.physical_attempt_events(sequence_id),
+                )
+                if attempt_recorded:
+                    raise RuntimeError(
+                        "one workflow operation cannot record multiple physical attempts"
+                    )
+                io_at = _as_utc(now(), label="physical-attempt time")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    attempt_event_id = self._start_attempt_event(
+                        sequence_id=sequence_id,
+                        lease=lease,
+                        service_name=self._service_name(upstream_service_id),
+                        operation=operation,
+                        attempt_index=attempt_index,
+                        attempted_at=io_at,
+                        pacing_event=pacing_event,
+                        pacing_wait_seconds=pacing_wait_seconds,
+                    )
+                    self.record_physical_attempt(
+                        lease,
+                        occurred_at=io_at,
+                        attempt_key=f"{sequence_id}:{attempt_index}:{operation}",
+                        attempt_event_id=attempt_event_id,
+                    )
+                    self._raise_if_stopped(
+                        sequence_id=sequence_id,
+                        attempt_events=self.physical_attempt_events(sequence_id),
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                attempted_at = io_at
+                attempt_count = attempt_index
+                attempt_recorded = True
+
+            recorder_token = _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER.set(
+                record_attempt_at_io_boundary
+            )
+            try:
+                try:
+                    value = physical_request()
+                    if not attempt_recorded:
+                        raise RuntimeError(
+                            "physical workflow operation did not record transport I/O"
+                        )
+                    self._raise_if_stopped(
+                        sequence_id=sequence_id,
+                        attempt_events=self.physical_attempt_events(sequence_id),
+                    )
+                finally:
+                    _ACTIVE_PHYSICAL_ATTEMPT_IO_RECORDER.reset(recorder_token)
+            except PhysicalAttemptFailure as failure:
+                if not attempt_recorded:
+                    raise
+                terminal_failure = failure
+                terminal_failure.__traceback__ = None
+                terminal_failure.__context__ = None
+                terminal_failure.__cause__ = None
+            except PhysicalAttemptBudgetExhausted as exc:
+                if not attempt_recorded:
+                    raise
+                terminal_failure = exc.failure
+            except BaseException:
+                if not attempt_recorded:
+                    raise
+                terminal_failure = PhysicalAttemptFailure(
+                    outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+                    retryable=False,
+                    error_code="unhandled_transport_exception",
+                )
+            else:
+                terminal_failure = None
+
+            cooldown_until = None
+            cooldown_changed = False
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if (
+                    terminal_failure is not None
+                    and terminal_failure.outcome is PhysicalAttemptOutcome.RATE_LIMITED
+                    and terminal_failure.retry_after_seconds is not None
+                    and terminal_failure.retry_after_seconds > 0
+                ):
+                    cooldown = self.record_rate_limit(
+                        upstream_service_id=upstream_service_id,
+                        cooldown_scope=(
+                            "all"
+                            if terminal_failure.rate_limit_scope is RateLimitScope.UPSTREAM
+                            else cooldown_scope
+                        ),
+                        observed_at=attempted_at,
+                        retry_after=timedelta(
+                            seconds=terminal_failure.retry_after_seconds
+                        ),
+                        provider_code=(
+                            terminal_failure.error_code
+                            or str(terminal_failure.status_code or "provider_capacity")
+                        ),
+                    )
+                    cooldown_until = cooldown.cooldown_until
+                    cooldown_changed = True
+                self._finish_attempt_event(
+                    sequence_id=sequence_id,
+                    attempt_index=attempt_index,
+                    failure=terminal_failure,
+                    cooldown_changed=cooldown_changed,
+                    cooldown_until=cooldown_until,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            if terminal_failure is not None:
+                raise terminal_failure
+            return value
+
+        try:
+            value = workflow(execute_operation)
+        except PhysicalAttemptBudgetExhausted as exc:
+            failure = exc.failure
+        except PhysicalAttemptFailure as exc:
+            failure = exc
+        except BaseException:
+            failure = PhysicalAttemptFailure(
+                outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
+                retryable=False,
+                error_code="unhandled_workflow_exception",
+            )
+        else:
+            try:
+                result_payload = encode_coordinated_result(value)
+            except BaseException:
+                abandon_running_workflow()
+                raise
+            connection = self._database_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._finalize_attempt_sequence(sequence_id, attempt_count)
+                self._finish_retry_sequence_success(
+                    sequence_id=sequence_id,
+                    completed_at=_as_utc(now(), label="coordinator time"),
+                    final_count=attempt_count,
+                    result_payload=result_payload,
+                )
+                self._delete_lease(lease)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                abandon_running_workflow()
+                raise
+            return CoordinatedRequestResult(
+                value=value,
+                sequence_id=sequence_id,
+                physical_attempt_count=attempt_count,
+                attempt_events=self.physical_attempt_events(sequence_id),
+            )
+
+        connection = self._database_connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._finalize_attempt_sequence(sequence_id, attempt_count)
+            self._finish_retry_sequence_failure(
+                sequence_id=sequence_id,
+                completed_at=_as_utc(now(), label="coordinator time"),
+                final_count=attempt_count,
+                failure=failure,
+            )
+            self._delete_lease(lease)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            abandon_running_workflow()
+            raise
+        raise PhysicalAttemptBudgetExhausted(
+            sequence_id=sequence_id,
+            failure=failure,
+            attempt_events=self.physical_attempt_events(sequence_id),
+        ) from failure
+
     def _execute_retry_sequence_as_leader(
         self,
         *,
@@ -1852,7 +2274,7 @@ class ProviderRequestCoordinator:
             "COALESCE(terminal_outcome_kind, terminal_outcome, outcome), "
             "retryable, status_code, error_code, "
             "retry_after_seconds, "
-            "cooldown_changed, cooldown_until, final_physical_attempt_count "
+            "cooldown_changed, cooldown_until, final_physical_attempt_count, operation "
             "FROM provider_request_attempts WHERE sequence_id = ? "
             "ORDER BY attempt_index",
             (sequence_id,),
@@ -1889,6 +2311,7 @@ class ProviderRequestCoordinator:
                 final_physical_attempt_count=(
                     int(row[16]) if row[16] is not None else None
                 ),
+                operation=str(row[17]),
             )
             for row in rows
         )
