@@ -17,10 +17,11 @@ output, and still-disabled \`qualified_v1\`.
 
 **Status:** blocked
 
-**Gate state:** BLOCKED until Ticket 06B and the complete amended Ticket 06
-rerun pass, followed by fresh operator authorization. The failed historical
-`601328.SS` run remains immutable. This remains the only live-provider gate, and
-authoritative `qualified_v1` remains disabled.
+**Gate state:** BLOCKED after the 2026-08-12 authorized retry stopped before
+live execution because no repository-pinned mainland Market Session Calendar
+revision exists. The failed historical `601328.SS` run remains immutable. This
+remains the only live-provider gate, and authoritative `qualified_v1` remains
+disabled.
 
 ## Observable behavior
 
@@ -236,3 +237,174 @@ gate evidence.
 - [ ] No code changed during rollout, unless a reproducible runtime defect was
   first confirmed and returned to the deterministic implementation/review gate;
   any such change requires Ticket 06 to pass again before retrying live.
+
+## 2026-08-12 authorized retry result
+
+**Ticket result:** BLOCKED before live execution.
+
+**Classification:** Important — insufficient evidence/configuration. This is
+not provider behavior and no concrete production-code defect was established.
+
+The fresh operator authorization was accepted and the post-temporal basis was
+confirmed at `21000ab78ec221a6b528b151400a6673007fc947`; formal Ticket 06
+closure was confirmed at `f1355714710d751cfc21ba1ee1c4647e25acd26d`, with
+the later closure ledger at `b7ff726`. Before allocating a run ID or opening a
+provider/model resource, the retry attempted to resolve the latest completed
+mainland session from the repository's pinned Market Session Calendar as the
+ticket requires. Both repository runtime databases contained zero
+`market_session_calendars` rows and zero `market_sessions` rows:
+
+- `data/market_history/market_history.sqlite3`
+- `data/market_history/market_history.sqlite3.provider-requests.sqlite3`
+
+A repository-wide read-only inventory found no other persisted mainland
+calendar. The immutable pre-live snapshot created before the historical failed
+run independently records the same zero-row calendar state. Consequently there
+was no calendar revision to pin and no ADR-0036-authoritative
+`latest_completed_session` to use. Wall-clock date, weekday inference, the old
+`2026-08-10` requested session, local midnight, next-session open, and price
+rows were not substituted for the missing calendar authority.
+
+Ticket 07 says a typed provider/configuration failure is a gate failure rather
+than permission to change policy or repair live state. It also forbids another
+provider qualification run and requires the session to be resolved before the
+first live call. Therefore no separate BaoStock calendar acquisition was added,
+no route/fallback or temporal policy was changed, and the CLI live command was
+not invoked.
+
+### Safe non-secret preflight
+
+The shipped `.venv` interpreter passed the public, resource-free production
+builder preflight without direct composition injection, an operator
+`MODULE:CALLABLE`, a test factory, or dynamic import:
+
+| Binding | Observed result |
+| --- | --- |
+| Selection | static built-in |
+| Factory | `production-qualified-routing-composition-factory-v1` |
+| Blueprint | valid and plan-bound |
+| Managed runtime | not bound; zero provider resource opened |
+| Capability Routing Plan | `1.3` |
+| Plan signature | `mainland-routing-plan:v1:63be9db56f605cee39a81f54b351e185d67d9aa2ac6bf8bf4bbfc4408ef60ded` |
+| Disposition | `shadow_non_authoritative` |
+| Data Usage Mode | `personal_research` |
+| Validation workload | `true` |
+| Intended checkpoint mode | enabled; no namespace allocated |
+| Enabled Tushare capabilities | `statements`, `financial_indicators`, `adjustment_factors`, `name_events` |
+| Tushare `suspension_status` | disabled |
+| Qualification profile | `cn-a-2000-20260729-v1` |
+| Account scope label | `personal-research-default` |
+| Tushare pacing | 40 calls/minute |
+| Tushare Operator Safety Ceiling | 40 calls/minute |
+| Yahoo physical-attempt budget | 4 per coordinated sequence |
+| Daily market route | AKShare -> BaoStock -> Yahoo |
+| Statement routes | Tushare -> AKShare-Sina -> Yahoo |
+| Indicator route | Tushare -> AKShare -> BaoStock qualified families -> Yahoo |
+| Adjustment-factor route | BaoStock -> Tushare -> AKShare -> Yahoo-derived |
+| Name-event route | Tushare -> AKShare |
+| Current Tradeability / lifecycle route | BaoStock only |
+| Default mode | `legacy` |
+| `qualified_v1_authority_enabled` | `false` |
+
+Credential presence was checked only as a boolean through the normal loaded
+environment boundary. No credential value was printed, copied, hashed,
+persisted, or included in an identity.
+
+No analysis date, model client, analyst roster, model IDs, debate/risk rounds,
+or model retry budget was materialized because the run stopped before the CLI
+questionnaire and run-config boundary. Those values therefore have no Ticket 07
+execution value and are not represented as if a run had used them.
+
+### Live-run and gate outcomes
+
+| Item | Outcome |
+| --- | --- |
+| Latest completed mainland session | unresolved; no pinned calendar revision exists |
+| `601328.SS` run ID | not allocated |
+| `601328.SS` terminal outcome | not started; pre-live Gate B/C evidence failure |
+| `600895.SS` run ID | not allocated |
+| `600895.SS` terminal outcome | not started because the bank gate did not pass |
+| New checkpoint namespace | none |
+| Complete report / decision audit paths | none; no run was created |
+| Statements provider matrix | not produced; zero live requests |
+| Six-family indicator matrix | not produced; zero live requests |
+| BaoStock tradeability/listing evidence | not produced; zero live requests |
+| Factor/name evidence | not produced; zero live requests |
+| Checkpoint/resume evidence | not applicable; no new checkpoint or retry |
+| Legacy-vs-shadow comparison | not produced; no qualified shadow result existed |
+
+Exact physical-attempt accounting for this authorized retry is:
+
+| Provider / capability | Logical requests | Physical transport invocations | Attempt events | Cache hits | Restored hits | Retries | Fallback calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| All providers / all capabilities | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Gates A, K, L, and M have safe pre-live evidence. Gates B and C are BLOCKED by
+the absent pinned calendar and session frontier. Gates D-J cannot be evaluated
+without weakening the gate because no live run exists. The overall Ticket 07
+result is therefore BLOCKED, not a partial pass.
+
+### Historical immutability and security
+
+Before and after deterministic verification, the historical failed run
+`601328.SS / 20260810_094733` retained four files, 15,982 bytes, and safe
+inventory digest
+`5f0641dfe66f5a5a7bc7d53ce5354a8919fa5dba8e57a95d6ee2a82aee353aa4`.
+Its checkpoint thread `21e972024a446846` retained seven checkpoint rows with
+safe digest
+`3cc683b0bfc04bc5bae1f2b23657e57c13858f4967b9033f77da383508bfaa6a`
+and 54 write rows with safe digest
+`ab2dab653df8c0de682793095abe23f698c2ce0e9864327e8e4db87542b70b12`.
+No historical file, checkpoint row, run ID, report, attempt, or artifact was
+rewritten or reused.
+
+Because no new live run or retained live surface was created, there are no new
+`run_status.json`, metrics, message/tool log, report, decision audit, manifest,
+checkpoint projection, provider artifact, exception, payload, URL, path, or
+`raw_text` surfaces to scan. The resource-free preflight output contained only
+safe identities, route names, versions, and booleans. Zero credential values,
+token digests, raw provider/model exceptions, URL query strings, provider
+payload bodies, machine-local absolute paths, or unsafe raw text were exposed.
+
+### Deterministic verification
+
+Every pytest command explicitly set `RUN_LIVE_DEEPSEEK_TESTS=0`,
+`RUN_LIVE_TUSHARE_TESTS=0`, and `RUN_LIVE_PROVIDER_TESTS=0` before collection.
+No live pytest integration test was invoked.
+
+| Command/evidence | Result |
+| --- | --- |
+| Temporal contract, proof projection, and checkpoint acceptance | `62 passed` |
+| Complete Ticket 06/QCF acceptance | `19 passed` |
+| Ticket 07 rollout/disabled-authority suite | `87 passed` |
+| Live-test isolation | `9 passed` |
+| PE1-PE15 current authoritative period/acceptance files | `75 passed` |
+| AC1-AC13 focused parent assurance group | `373 passed` |
+| `pytest -q -m "not integration"` | `3038 passed` |
+| `pytest -q` | `3043 passed, 2 skipped, 0 failed` |
+| `ruff check tradingagents cli tests` | PASS |
+| `git diff --check` | PASS |
+
+The obsolete documented combined PE command names a removed
+`tests/test_financial_period_eligibility.py` and collected no tests. The current
+authoritative files named by the closure ledger were run directly instead:
+`test_financial_period_targets.py`, `test_financial_period_availability.py`,
+`test_financial_period_contracts.py`, and
+`test_corrected_shadow_joint_acceptance.py`.
+
+No production or test code changed, so there was no authorized defect fix or
+TDD cycle. The only scoped tracked change is this final Ticket 07 status and
+evidence record. Existing unrelated worktree state was preserved and excluded.
+
+### Remaining blocker and recommendation
+
+The project needs a separately authorized, production-defined way to establish
+and persist the BaoStock-backed `mainland-cn` Market Session Calendar before a
+Ticket 07 rollout starts, with centralized coordination and auditable physical
+attempt accounting. That work must not be smuggled into this blocked rollout or
+change the daily route/authority contracts. A later Ticket 07 retry must begin
+again with `601328.SS`, resolve the pinned latest completed session first, and
+use new independent run/checkpoint identities.
+
+The project is **not ready** for a separate authoritative-activation review.
+`qualified_v1` remains disabled and the default remains `legacy`.
