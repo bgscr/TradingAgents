@@ -339,10 +339,12 @@ Exact physical-attempt accounting for this authorized retry is:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | All providers / all capabilities | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
-Gates A, K, L, and M have safe pre-live evidence. Gates B and C are BLOCKED by
-the absent pinned calendar and session frontier. Gates D-J cannot be evaluated
-without weakening the gate because no live run exists. The overall Ticket 07
-result is therefore BLOCKED, not a partial pass.
+The static/preflight portions of Gate A and all of Gates K, L, and M have safe
+pre-live evidence. Gate A's managed-runtime binding and run-bound execution
+requirements are unevaluated. Gates B and C are BLOCKED by the absent pinned
+calendar and session frontier. Gates D-J cannot be evaluated without weakening
+the gate because no live run exists. The overall Ticket 07 result is therefore
+BLOCKED, not a partial pass.
 
 ### Historical immutability and security
 
