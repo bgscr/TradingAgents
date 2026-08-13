@@ -40,9 +40,10 @@ scope are separate semantic dimensions. A dimensionless ratio can be complete
 and correctly associated with a CNY Instrument Identity while value currency is
 semantically `NOT_APPLICABLE`; the same candidate can still be incompatible
 because its material filing-consolidation scope is `UNPROVEN`. `UNKNOWN` is
-neither proof nor semantic irrelevance. Ticket 06 therefore remains
+neither proof nor semantic irrelevance. At that stage Ticket 06 remained
 FAIL/BLOCKED until the provider-neutral metadata contract and corrected QCF4
-path are implemented.
+path were implemented; the later post-temporal acceptance is now PASS as
+recorded below.
 
 The completed Ticket 07 temporal-eligibility prototype exposed a fourth
 Critical gap in the fresh metadata path. The failed `601328.SS` run requested
@@ -55,6 +56,14 @@ session. Local midnight is not a Market Session Calendar boundary and does not
 prove when the evidence became effective or available. The failed run and all
 historical state remain immutable, Ticket 07 remains **BLOCKED**, and
 authoritative `qualified_v1` remains disabled.
+
+Ticket 06 post-temporal acceptance is now **PASS**. The remaining Ticket 07
+blocker is operational calendar authority, not temporal-policy acceptance:
+the production Point-in-Time Market History Store contains zero persisted
+mainland Market Session Calendar revisions and zero persisted session rows.
+ADR-0036 therefore cannot resolve an authoritative `latest_completed_session`.
+Ticket 07 stopped before live execution: no Ticket 07 run ID or checkpoint
+namespace was allocated and no provider or model I/O occurred.
 
 ## Solution
 
@@ -151,6 +160,18 @@ single-flight with an injected fixed `eligibility_evaluated_at`. Exact replay
 uses the recorded decision inputs and result with zero provider/model I/O; it
 does not consult today's calendar frontier or reinterpret historical evidence.
 
+Use calendar-bootstrap **Design D** to close the remaining prerequisite: an
+explicit operator invokes one standalone, bounded, Instrument-neutral BaoStock
+calendar acquisition primitive; the primitive normalizes only
+`query_trade_dates` membership plus one pinned mainland regular-session-time
+contract; the existing `MarketHistoryStore.publish_session_calendar()` remains
+the sole persistence owner; and the bootstrap reopens the exact returned
+revision ID before returning a safe receipt. The existing
+`read_current_session_calendar()` remains the current reader, augmented only by
+the narrow `read_session_calendar_revision(calendar_revision_id)` exact reader.
+Qualified-routing and Ticket 07 preflight remain read-only and never acquire,
+refresh, publish, or repair calendar state.
+
 ## User Stories
 
 1. As a shadow-run operator, I want a shipped factory to be selected without test injection, so that real qualified shadow preflight can proceed.
@@ -228,6 +249,31 @@ does not consult today's calendar frontier or reinterpret historical evidence.
 73. As a concurrency user, I want simultaneous first metadata requests to share one fixed evaluation time and one terminal temporal decision, so that a midnight or session-close race cannot split the run.
 74. As a rollout owner, I want all temporal matrices and the complete QCF1–QCF18, PE1–PE15, and AC1–AC13 suites rerun before Ticket 07, so that the policy change receives full deterministic acceptance.
 75. As a rollout owner, I want any Ticket 07 retry to allocate a new run ID, run `601328.SS` first, and run `600895.SS` only after the bank case passes, so that the immutable failed run is not reused and the gate remains fail-closed.
+76. As an operator, I want one explicit mainland Market Session Calendar bootstrap command, so that provider I/O and durable mutation occur only with deliberate authorization.
+77. As a calendar owner, I want standalone BaoStock `query_trade_dates` acquisition without an Instrument Identity, so that a shared Reference Market calendar is not coupled to symbol history.
+78. As an evidence owner, I want BaoStock `is_trading_day` to be the only mainland session-membership authority, so that OHLCV, Yahoo, weekdays, wall-clock heuristics, and failed runs cannot fabricate sessions.
+79. As an audit reader, I want the 09:30 open and 15:00 close labeled as contract-derived `Asia/Shanghai` semantics, so that provider-returned membership is not confused with provider-returned session times.
+80. As an identity owner, I want the regular-session-time contract version and canonical membership/timestamp content bound into the calendar revision, so that every material semantic change creates a new immutable revision.
+81. As a persistence owner, I want the existing Market History Store publisher and revision namespace reused, so that bootstrap introduces no second database, writer, or calendar authority.
+82. As a Ticket 07 operator, I want bootstrap to accept explicit inclusive start/end bounds and a fixed evaluation instant, so that readiness is reproducible and BaoStock unbounded defaults are never used.
+83. As a programmatic caller, I want `bootstrap_mainland_session_calendar(...)` to return one closed receipt, so that automation can verify safe bounded operational metadata without parsing logs.
+84. As a CLI caller, I want provider I/O to require `--authorize-provider-io`, so that an ordinary command invocation cannot contact BaoStock accidentally.
+85. As a preflight owner, I want qualified analysis preflight to remain read-only, so that Ticket 07 cannot become an implicit calendar writer or allocate a run before prerequisites pass.
+86. As a verifier, I want the exact published revision reopened by ID, so that a concurrent change to “current” cannot make bootstrap verify a different revision.
+87. As a replay user, I want current and exact-ID calendar reads to perform zero provider I/O, so that persisted authority remains independently reproducible.
+88. As an operator, I want ordinary identical bootstrap to reuse a ready revision with zero provider I/O, so that repeated readiness checks do not consume upstream capacity.
+89. As an operator forcing refresh, I want identical provider semantics to reuse the same calendar revision while retaining a later ingestion audit, so that observation history grows without inventing semantic revisions.
+90. As a historical-state owner, I want changed membership or session-time semantics to publish a new revision while retaining the old one, so that snapshots and replay stay immutable.
+91. As a coordinator owner, I want BaoStock login, calendar query, and logout recorded as exactly three physical-attempt events, so that no transport is hidden from ADR-0031 accounting.
+92. As a capacity owner, I want BaoStock login code `10001005` to use the existing global cooldown and active cooldown to cause zero transports, so that callers cannot bypass shared capacity state.
+93. As a cache owner, I want an Instrument-neutral calendar request/reuse boundary, so that no fabricated Instrument Identity is introduced solely to fit the Provider Subrequest Cache.
+94. As a concurrent caller, I want identical bootstrap requests to share one acquisition leader and one login/query/logout workflow, so that followers receive one receipt without duplicate sessions or revisions.
+95. As a failure-path operator, I want acquisition/publication failures to leave no partial revision, membership, or completed ingestion state, so that readiness never observes half-published authority.
+96. As a security owner, I want bootstrap receipts to exclude credentials, raw provider errors/payloads, URL queries, and local absolute paths, so that operational evidence is safe to retain.
+97. As a readiness owner, I want structural range, authority, session-time, completed-frontier, forward-horizon, exact-content, and zero-I/O checks, so that freshness never depends on file age or retrieval-local-date equality.
+98. As a compatibility owner, I want databases with zero calendar revisions to remain valid and bootstrap to be additive, so that historical stores require no destructive migration.
+99. As a rollout owner, I want Ticket 07 blocked until an authorized production bootstrap passes exact-ID readiness and derives both frontier and next-open close, so that analysis begins only from authoritative persisted calendar state.
+100. As an acceptance owner, I want CAL-01 through CAL-04 proven with deterministic fake transports and stores before production bootstrap, so that no live provider or paid model is needed for implementation acceptance.
 
 ## Implementation Decisions
 
@@ -272,6 +318,299 @@ does not consult today's calendar frontier or reinterpret historical evidence.
 - `qualified_v1` remains disabled at configuration/preflight. The built-in
   factory accepts only a `qualified_v1_shadow` plan plus an explicit validation
   workload, providing defense in depth if called directly.
+
+### Mainland Market Session Calendar bootstrap ownership
+
+The completed calendar-bootstrap prototype report is authoritative design
+evidence. **Design D** is selected: explicit operator bootstrap over one
+standalone BaoStock acquisition primitive and the existing Market History Store
+publisher. The ownership boundaries are closed:
+
+| Responsibility | Sole owner |
+| --- | --- |
+| Calendar acquisition | Standalone, BaoStock-backed, Instrument-neutral mainland session-calendar acquisition primitive |
+| Calendar persistence | Existing `MarketHistoryStore.publish_session_calendar()` |
+| Current calendar read | Existing `read_current_session_calendar()` |
+| Exact immutable revision read | New narrow `read_session_calendar_revision(calendar_revision_id)` public seam and repository-equivalent coordinator read |
+| Ticket 07/qualified preflight | Read-only consumer of a pinned, exact-ID-verified revision |
+
+No second calendar database, table family, revision namespace, writer, router,
+provider authority, picker dependency, or Instrument-specific bootstrap path is
+permitted. The acquisition primitive may reuse the existing BaoStock session,
+row-reading, error-mapping, upstream-identity, normalizer, and Provider Request
+Coordinator infrastructure, but it must not invoke the symbol-coupled history-
+bundle workflow or copy prototype implementation into production.
+
+For Reference Market `mainland-cn`, the pinned provider authority is exactly:
+
+| Field | Contract value |
+| --- | --- |
+| Provider | `baostock` |
+| Acquisition endpoint | `query_trade_dates(start_date, end_date)` |
+| Reference Market | `mainland-cn` |
+| Timezone | `Asia/Shanghai` |
+| Dataset | existing `mainland-session-calendar-v1` |
+| Provenance class | `observed_point_in_time` |
+| Membership field | BaoStock `is_trading_day` only |
+| Acquisition normalizer | `baostock-session-calendar-normalizer-v1` |
+
+Neither open nor closed membership may be inferred from OHLCV rows, Yahoo,
+weekdays, current-date or local-date heuristics, failed Ticket 07 state,
+symbol-specific price history, picker state, issuer names, models, or another
+provider. Tushare picker-calendar state is outside this authority.
+
+BaoStock proves membership but does not return the regular open/close envelope.
+The one pinned contract is
+`mainland-cn-regular-session-times-v1`: every BaoStock-open civil date opens at
+`09:30:00 Asia/Shanghai` and closes at `15:00:00 Asia/Shanghai`; every closed
+date has null open/close timestamps. These timestamps are explicitly
+**contract-derived**, never described as provider-returned. The canonical
+calendar payload contract is `mainland-session-calendar-payload-v1`, and the
+readiness contract is `mainland-session-calendar-readiness-v1`. Changing any
+time, timezone interpretation, membership normalization, or applicable contract
+version is a material semantic change requiring a new immutable revision.
+
+### Standalone acquisition and operator interfaces
+
+The public bootstrap-package seam is equivalent to the requested shape:
+
+```python
+acquire_mainland_session_calendar(
+    request: MarketSessionCalendarBootstrapRequest,
+    *,
+    history_config: MarketHistoryConfig,
+    clock: Clock,
+) -> MarketSessionCalendarBootstrapReceipt
+```
+
+This seam may be the same application service exported programmatically as
+`bootstrap_mainland_session_calendar(...)`; it is not a second implementation.
+Within it, acquisition and persistence remain cleanly separated: an internal
+standalone BaoStock provider primitive returns a validated, canonical
+calendar-only `MarketSessionCalendarAcquisition`, and only the application
+service may pass that candidate to the existing publisher and construct the
+receipt. The closed request contract
+`market-session-calendar-bootstrap-request-v1` contains the literal provider,
+Reference Market, timezone, explicit inclusive `start_date` and `end_date`, a
+timezone-aware fixed `evaluated_at`, Data Usage Mode and safe coordinator scope,
+ephemeral operator authorization, and optional explicit `force_refresh`. It
+must reject reversed/empty/unbounded ranges. It neither requires nor accepts a
+stock symbol, Instrument Identity, Ticket 07 requested session, financial
+routing plan, analysis run ID, or `qualified_v1` state.
+
+The operator-facing service is equivalent to:
+
+```python
+bootstrap_mainland_session_calendar(
+    request: MarketSessionCalendarBootstrapRequest,
+    *,
+    history_config: MarketHistoryConfig,
+    clock: Clock,
+) -> MarketSessionCalendarBootstrapReceipt
+```
+
+The service validates/reuses persisted readiness first, acquires only when
+explicitly authorized and required (or forced), publishes through the existing
+writer, reopens the exact returned revision ID, validates content/readiness, and
+then returns one `market-session-calendar-bootstrap-receipt-v1` receipt. It
+does not allocate an analysis run/checkpoint identity, construct the qualified
+composition, invoke models, or execute Ticket 07.
+
+The CLI adds one top-level maintenance command equivalent to:
+
+```text
+tradingagents market-session-calendar-bootstrap
+  --reference-market mainland-cn
+  --provider baostock
+  --start-date YYYY-MM-DD
+  --end-date YYYY-MM-DD
+  --evaluated-at <timezone-aware RFC3339>
+  --authorize-provider-io
+```
+
+The four value options and authorization flag are required for an acquisition;
+`--force-refresh` is optional. Missing authorization returns typed
+`operator_authorization_required` before provider-client creation, coordinator
+permit, transport, publication, or analysis allocation. The command emits one
+safe deterministically ordered JSON receipt and an outcome-specific exit code.
+Qualified analysis preflight remains read-only and has no authorization or
+bootstrap option.
+
+### Bootstrap range, canonical identity, and publication
+
+- Every acquisition uses explicit configurable bounded inclusive civil-date
+  bounds. BaoStock unbounded/default history is forbidden.
+- For the current Ticket 07 prerequisite, `2026-01-01` through `2026-12-31` is
+  acceptable only when provider completeness and readiness validate the whole
+  range. At a year boundary, the operator must expand the explicit range into
+  the adjacent year far enough to establish the required completed frontier and
+  forward horizon.
+- Completeness means exactly one normalized BaoStock open/closed membership row
+  for every civil date in the requested inclusive range. Duplicate, missing,
+  out-of-range, malformed, or contradictory rows fail typed; a weekday may not
+  fill a provider gap.
+- A bounded refresh may overlay provider-authoritative membership inside its
+  acquired range on an identity-validated prior revision and carry unchanged
+  prior sessions outside that range. The resulting full canonical calendar-only
+  payload, not a mutation of the prior revision, is published atomically. No
+  unverified or heuristic row may be carried into the acquired range.
+
+Calendar revisions reuse the existing
+`market-session-calendar=sha256:<digest>` namespace. Semantic identity binds,
+directly and through canonical content validation:
+
+1. provider, upstream service, endpoint, and existing provider-dataset identity;
+2. Reference Market `mainland-cn` and timezone `Asia/Shanghai`;
+3. `baostock-session-calendar-normalizer-v1`,
+   `mainland-session-calendar-payload-v1`, and
+   `mainland-cn-regular-session-times-v1`;
+4. the canonical calendar-only payload digest;
+5. sorted unique normalized civil-date open/closed membership; and
+6. normalized timezone-aware open/close timestamps for every open session and
+   null times for every closed date.
+
+Retrieval, observation, first-observation, ingestion-start, publication, and
+other audit timestamps are excluded from semantic revision identity. Provider
+membership, normalized dates/status, session timestamps, provider/dataset/
+market/timezone authority, normalizer, payload contract, or time-contract
+changes create a new immutable revision. Byte/ordering differences that
+canonicalize to identical content do not.
+
+`MarketHistoryStore.publish_session_calendar()` remains the one writer and must
+use its existing payload mutation mutex plus one SQLite transaction covering all
+applicable provider/upstream metadata, the calendar-refresh ingestion run, the
+immutable calendar revision, and all membership rows. A revision becomes
+visible only with its complete row set. Any failure rolls back every referencing
+row and completed-ingestion state; an unreferenced content-addressed raw
+candidate may remain for existing garbage collection when consistent with
+current store semantics. The original acquisition/publication failure remains
+primary even if cleanup also fails. Historical revisions are never updated.
+
+Publication of an already-known semantic revision must verify that stored
+metadata and every session row exactly match the recomputed identity; `INSERT OR
+IGNORE` alone is not proof. A forced semantically identical refresh records and
+returns a later immutable calendar-refresh ingestion audit while reusing the
+same calendar revision ID.
+
+### Exact revision read, readiness, and receipt
+
+`read_session_calendar_revision(calendar_revision_id)` is a narrow public
+Market History Store read and has a thread-safe coordinator equivalent where
+the existing lifecycle requires it. It performs zero provider I/O, returns only
+the requested immutable revision, reconstructs its sorted membership, validates
+the stored payload digest and semantic identity, and fails typed when metadata
+or rows do not reproduce that ID. Bootstrap verification must use this exact-ID
+reader, never a second “current” lookup that could race a concurrent publication.
+
+A revision is `mainland-session-calendar-readiness-v1` ready for Ticket 07 only
+when all of the following hold at the one fixed `evaluated_at`:
+
+1. provider/dataset, Reference Market, timezone, provenance, normalizer,
+   payload, and time-contract authority match the pinned values;
+2. the explicit requested inclusive range is represented completely, one
+   provider-authoritative membership record per civil date;
+3. every open session has contract-derived open/close timestamps and every
+   closed date has neither;
+4. `latest_completed_session` is derivable from the exact persisted revision;
+5. the close of that derived requested/latest session is present;
+6. at least one later open session and its close are present, establishing the
+   forward eligibility boundary;
+7. coverage is structurally current for the requested range and evaluation
+   horizon; and
+8. exact-ID reopen reproduces identical authority, digest, membership, session
+   timestamps, counts, and revision identity with zero provider I/O.
+
+Freshness is structural. File age, database mtime, retrieval-local-date
+equality, elapsed grace periods, and today's weekday are never freshness
+authority. `incomplete_range` means the explicit bounded civil-date range is
+not fully represented; `stale_coverage` means a complete persisted range no
+longer reaches the completed/forward horizon required at `evaluated_at`.
+
+The closed typed failure vocabulary includes at least:
+
+| Failure | Condition |
+| --- | --- |
+| `calendar_missing` | No persisted candidate exists for the required Reference Market. |
+| `authority_mismatch` | Provider/dataset/market/timezone/provenance/contract authority differs. |
+| `incomplete_range` | Any requested inclusive civil date is missing, duplicated, contradictory, malformed, or outside the validated representation. |
+| `missing_session_times` | An open session lacks its contract-derived open/close pair or a closed date has times. |
+| `unresolved_completed_frontier` | No authoritative latest completed open session can be derived at `evaluated_at`. |
+| `missing_forward_horizon` | No later open session and close exist after the derived frontier. |
+| `stale_coverage` | Persisted structural coverage does not reach the required evaluation horizon. |
+| `revision_identity_mismatch` | Exact metadata, digest, membership, timestamps, or recomputed identity differs from the requested ID. |
+| `operator_authorization_required` | Provider I/O would be required but ephemeral explicit authorization is absent. |
+
+Provider/coordinator failures remain typed and payload-free, including cooldown,
+upstream busy, timeout, disconnect/transport, authentication/login, malformed or
+empty response, interrupted acquisition, and publication failure. They do not
+collapse into raw provider error text or a calendar fact.
+
+The receipt disposition is exactly `created`, `reused`, or
+`refreshed_same_revision` as applicable. Its closed safe projection contains
+only:
+
+- provider/upstream and dataset identities, Reference Market, timezone, and
+  provenance;
+- requested inclusive range and fixed `evaluated_at`;
+- calendar revision ID and calendar-refresh ingestion/refresh ID;
+- retrieval/observation and publication timestamps;
+- canonical content digest, normalizer/payload/readiness/calendar-time contract
+  versions;
+- total, open, and closed counts;
+- derived `latest_completed_session`, its derived requested/latest-session
+  close, and, where applicable, the requested-session alias used by Ticket 07;
+- next open session and its close;
+- safe coordinator logical-request/workflow identity, safe physical-attempt
+  identities/outcomes, and logical/physical counts; and
+- whether provider I/O occurred.
+
+The receipt contains no credentials or credential state, raw provider error,
+provider payload body, URL or query, machine-local absolute path, config dump,
+analysis/checkpoint ID, or unbounded diagnostic text.
+
+### Idempotence, attempt accounting, concurrency, and failure isolation
+
+- An ordinary identical bootstrap first validates a persisted ready revision.
+  A hit returns `reused`, the same revision, and zero provider I/O, coordinator
+  permits, logical provider requests, physical attempts, or ingestion writes.
+- Explicit `force_refresh` may perform a new acquisition. Identical normalized
+  membership and session semantics reuse the revision ID, retain a later
+  acquisition/ingestion audit, and return `refreshed_same_revision`. A material
+  change creates one new revision and returns `created`; the old revision and
+  its pins remain intact.
+- The durable Instrument-neutral reuse boundary is the validated persisted
+  calendar revision keyed by authority, explicit range, and semantic contracts.
+  Concurrent in-flight handoff is owned by the Provider Request Coordinator
+  workflow/single-flight key. The Instrument-specific Provider Subrequest Cache
+  is not used, and no fictitious Instrument Identity may be constructed.
+- One successful physical BaoStock workflow contains exactly three transports
+  and three existing-schema attempt events under one lease-owned logical
+  calendar request: `baostock_login`, `query_trade_dates`, then
+  `baostock_logout`. One physical transport equals one attempt event. There is no
+  hidden or adapter-local retry.
+- Each operation uses the ADR-0031 physical-attempt lifecycle and shared Safety
+  Ceiling/cooldown state. BaoStock login-capacity code `10001005` opens the
+  existing global BaoStock cooldown. An already-active cooldown returns a typed
+  result with zero provider transports and physical attempts. Query begins only
+  after successful login; if login succeeded, logout is attempted and accounted
+  after success or query failure, while the original query/provider failure
+  remains primary.
+- The logical calendar request key binds provider/upstream/account/capacity
+  scope, endpoint/dataset, explicit range, normalizer/payload/time contracts,
+  Reference Market, timezone, and Data Usage Mode, but never an Instrument.
+- Concurrent identical callers elect one acquisition leader, execute one
+  login/query/logout workflow, publish one semantic revision with no duplicate
+  session rows, and deliver the same revision/receipt content to every follower.
+  Use the existing coordinator handoff, store payload-mutation mutex, and SQLite
+  PK/FK/transaction constraints; lock waiting must not become a second workflow.
+- Acquisition or publication failure leaves zero partial calendar revision,
+  zero partial membership rows, and zero completed ingestion revision. No
+  follower may observe or return a partial receipt. Current/exact reads and
+  replay create no provider client, coordinator permit/request/attempt, or
+  ingestion run.
+- Existing databases with zero calendar revisions remain schema-valid.
+  Bootstrap is additive and never rewrites old calendars, snapshots, pins,
+  checkpoints, reports, attempts, IDs, or the failed Ticket 07 evidence.
 
 ### Registration and caller precedence
 
@@ -1140,7 +1479,27 @@ singleton.
   A plan-1.3 restore from plan-1.2/context-v1 or old/absent temporal state must
   fail typed or require explicit `START_NEW`, with no repair, provider/model I/O,
   historical rewrite, current-registry reinterpretation, or consultation of
-  today's calendar frontier.
+  today’s calendar frontier.
+- Calendar-bootstrap tests use three public seams only: the standalone
+  instrument-neutral acquisition contract for BaoStock normalization and
+  physical-attempt outcomes; `MarketHistoryStore.publish_session_calendar()`
+  plus current/exact-ID reads for atomic durability and identity; and
+  `bootstrap_mainland_session_calendar(...)`/the CLI command for end-to-end
+  authorization, idempotence, concurrency, readiness, and safe receipts. These
+  are the highest stable seams and avoid assertions on private SQL statement or
+  constructor order.
+- Existing Market History Store calendar publication/reconstruction,
+  coordinator attempt/cooldown/single-flight, payload-mutation concurrency,
+  CLI exit/output, and temporal latest-completed-session tests are prior art.
+  Deterministic bootstrap tests use a fixed clock, fictional BaoStock rows, a
+  fake three-operation transport, and a disposable migrated Market History
+  Store. They never import/start the live BaoStock SDK, contact any provider, or
+  invoke a paid/model runtime.
+- Contract tests enumerate every calendar request/acquisition/receipt field,
+  every typed failure, canonical payload/revision identity, contract-derived
+  time label, and forbidden metadata field. Fault-injection tests fail each
+  acquisition and publication boundary and assert only observable rows,
+  artifacts, attempts, identities, receipts, and typed results.
 - The real two-symbol gate is deliberately separate from deterministic
   acceptance. It runs only after all non-live criteria pass and only with
   explicit operator authorization.
@@ -1230,12 +1589,57 @@ AC1–AC13, non-integration/full suites, Ruff, diff/whitespace, secret/history
 checks, and two-stage review—twice from the same changed tree. Targeted temporal
 tests cannot by themselves re-authorize Ticket 07.
 
+The post-temporal Ticket 06 acceptance described above is now **PASS** on its
+reviewed pre-calendar-bootstrap production state. The specification/prototype
+amendment itself does not rerun Ticket 06. Because CAL-01 through CAL-03 will
+change production acquisition, storage, coordinator, and CLI surfaces, one full
+Ticket 06 rerun is required later on the exact reviewed post-CAL production tree
+after CAL-01 through CAL-03 implementation and CAL-04 acceptance are complete.
+That later rerun preserves QCF1–QCF18, PE1–PE15, and AC1–AC13 unchanged; it is a
+regression prerequisite, not a reopening of the settled temporal design.
+
+### CAL-04 deterministic calendar-bootstrap acceptance matrix
+
+CAL-04 is additive. It does not renumber, waive, or replace QCF1–QCF18,
+PE1–PE15, AC1–AC13, or the completed 06B temporal matrix.
+
+| Scenario | Required observable result |
+| --- | --- |
+| Empty store bootstrap | One authorized bounded fake acquisition performs exactly login/query/logout, publishes one complete revision/ingestion audit, and returns `created`; no analysis ID/model work exists. |
+| Exact-ID reopen | The new exact reader returns precisely the requested revision and identical authority, digest, membership, timestamps, and counts with zero provider I/O. |
+| Completed frontier | At fixed `evaluated_at`, persisted membership/times alone derive the exact `latest_completed_session` and its close. |
+| Forward boundary | The same revision derives the next open session and next-session close; missing either fails `missing_forward_horizon`. |
+| Ordinary identical rerun | Returns `reused` with the same revision/receipt semantics and zero provider I/O, permits, attempts, or new ingestion audit. |
+| Forced identical refresh | Performs one new three-transport workflow, retains a later ingestion audit, returns `refreshed_same_revision`, and reuses the semantic revision ID. |
+| Changed membership/time semantics | Publishes one new immutable revision and leaves the old revision and all old session rows readable and unchanged. |
+| Partial publication failure | Failure injected after every applicable publication phase leaves zero referencing calendar/session/completed-ingestion rows; only an unreferenced collectable content-addressed candidate may remain. |
+| Incomplete and stale ranges | Missing/duplicate/contradictory civil dates fail `incomplete_range`; structurally complete but inadequate horizon fails `stale_coverage`; neither invokes Ticket 07. |
+| Concurrent identical bootstrap | Multiple callers share one leader, one login/query/logout workflow, one semantic revision and row set, and receive the same receipt/revision without duplicate membership. |
+| Active cooldown | Returns the existing typed cooldown outcome with zero transports and zero physical-attempt events; login code `10001005` opens shared global cooldown in its separate control. |
+| Reads and replay | Current read, exact-ID read, receipt verification, and persisted replay produce zero provider clients, permits, logical requests, attempts, ingestion writes, or model I/O. |
+| Safe metadata projection | Receipt, JSON, exceptions, logs, events, and IDs contain no credentials/state, raw errors/payloads, URLs/queries, absolute local paths, or unbounded provider text. |
+| Historical compatibility | A preexisting zero-calendar database remains valid; representative old revisions, snapshots, pins, checkpoints, reports, attempts, failed Ticket 07 evidence, and IDs remain byte-for-byte immutable. |
+| Identity tamper/mismatch | Modified authority, digest, contract version, membership, or timestamps fail `revision_identity_mismatch`; `INSERT OR IGNORE` cannot conceal mismatched rows. |
+| Authorization and range | Missing authorization fails before transport; reversed, absent, or unbounded bounds fail before transport; the exact inclusive range appears in the safe receipt. |
+
 ### Final real two-symbol shadow rollout gate
 
-This is the only live-provider step and is not run while writing or implementing
-the deterministic tests. It requires explicit operator authorization after
-02G, 02H, 05C, 06B, the complete Ticket 06 rerun, and all QCF1–QCF18 pass.
-Ticket 07 remains **BLOCKED**. The failed `601328.SS` run for requested session
+There are two distinct future live-provider authorizations and neither is run
+while amending the specification or implementing deterministic tests. First,
+after CAL-01 through CAL-04 and review, an operator separately authorizes the
+production calendar bootstrap. It may perform only the bounded BaoStock
+login/`query_trade_dates`/logout workflow and calendar publication; it performs
+no model or symbol work. After exact-ID reopen/readiness passes and the complete
+Ticket 06 regression rerun passes on that exact reviewed production state, a
+fresh authorization is required for Ticket 07 itself. Calendar-bootstrap
+authorization is not Ticket 07 authorization.
+
+Before any Ticket 07 analysis run ID, checkpoint namespace, provider/model
+runtime, or symbol-specific work is allocated, preflight must read the exact
+verified BaoStock-backed `mainland-cn` revision with zero provider I/O and derive
+the authoritative `latest_completed_session`, its close, and next open-session
+close. Missing, stale, incomplete, mismatched, cooldown, acquisition, or
+publication state leaves Ticket 07 **BLOCKED**. The failed `601328.SS` run for requested session
 `2026-08-10`, including the Tushare artifact retrieved at
 `2026-08-10T16:48:07Z`, remains historical and immutable and cannot be resumed,
 repaired, relabeled, or reused as the retry namespace.
@@ -1245,8 +1649,9 @@ repaired, relabeled, or reused as the retry namespace.
    Routing Plan, environment credential boundary, Data Usage Mode, Safety
    Ceilings, completeness thresholds, and provider routes.
 2. Use a newly allocated run ID and checkpoint namespace under plan 1.3/context
-   v2 and retained content-addressed artifacts only when they independently pass
-   the new temporal evaluator. Do not clear or reuse historical reports,
+   v2 only after the read-only calendar preflight passes, and use retained
+   content-addressed artifacts only when they independently pass the new
+   temporal evaluator. Do not clear or reuse historical reports,
    checkpoints, attempts, decisions, or IDs to manufacture a clean result.
 3. Run one symbol at a time for the same latest completed mainland session:
    `601328.SS` first as the bank case. Run `600895.SS` as the non-bank case only
@@ -1301,6 +1706,10 @@ design evidence only and is not copied into production.
 | **02H — Temporal proof projection/acquisition integration** | Project only the exact provider-origin effective/publication derivations listed above for fresh and retained company-type/listing metadata; replace all exact-local-date authorities with the single evaluator; bind one fixed evaluation context through acquisition, context construction, request binding, and relevant listing/lifecycle seams; fail closed without request-date backfill. Preserve provider routes and single-flight ownership. | 02G, 02B, and 02D. | 05C, 06B, Ticket 06, and Ticket 07. |
 | **05C — Temporal checkpoint/replay compatibility** | Persist policy/calendar versions, requested session/mode, fixed evaluation inputs, provider proof/timestamps, latest-completed binding, strict proof, accepted/rejected result/reasons, and decision identity in context v2, cache checkpoint 1.2, ledger 1.6, manifest v4, and exact downstream projections. Reproduce exact decisions with zero provider/model I/O and no restore-time frontier lookup. Plan-1.2/context-v1 under plan 1.3 fails typed or requires explicit `START_NEW`; no migration or historical reinterpretation. | 02G, 02H, 05A, and 05B. | 06B, Ticket 06, and Ticket 07. |
 | **06B — Deterministic temporal acceptance** | Run every temporal matrix above: next-day 00:48, before/during next session, next-session close, weekend, holiday, stale reuse, announcement/effective-proof failures, strict cutoff/exact revision proof, zero-I/O every-case replay, and concurrent first acquisition with one fixed evaluation. Then rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13, non-integration/full suites, Ruff, history/secret/diff checks, and two-stage review twice. No live providers or paid models. | 02H, 05C, 06A, and all existing Ticket 06 prerequisites. | Ticket 06 and Ticket 07. |
+| **CAL-01 — Standalone BaoStock calendar acquisition and exact attempt accounting** | Implement the Instrument-neutral bounded `query_trade_dates` request/normalizer and the lease-owned coordinator workflow with exactly one login, query, and logout event; enforce authorization, typed provider/cooldown outcomes, no hidden retry, single-flight, and safe cleanup. Do not use the Instrument-specific Provider Subrequest Cache or publish calendar rows here. | Accepted calendar-bootstrap prototype report, ADR-0031, ADR-0036, and existing BaoStock/coordinator seams. | CAL-02. |
+| **CAL-02 — Publication/readiness hardening and exact revision reader** | Bind canonical calendar-only content and `mainland-cn-regular-session-times-v1` into existing revision semantics; harden the existing atomic publisher/existing-row verification; add exact-ID read; implement structural range/frontier/forward-horizon readiness, idempotent semantic reuse, forced-refresh audit, rollback, and historical compatibility. No second writer or namespace. | CAL-01 and existing Market History Store publisher/schema/mutex. | CAL-03. |
+| **CAL-03 — Explicit programmatic and CLI bootstrap** | Add `bootstrap_mainland_session_calendar(...)` and the maintenance command with required provider/market/bounds/evaluation/authorization inputs, optional forced refresh, safe receipt/exit contract, persisted-ready zero-I/O reuse, exact-ID verification, and no qualified analysis/model construction. | CAL-02. | CAL-04. |
+| **CAL-04 — Deterministic bootstrap acceptance and two-stage review** | Prove the complete CAL-04 matrix against real store/coordinator seams with fake transport and fixed clocks; run targeted tests and scaled repository checks; perform spec-compliance then code-quality review. No live provider or paid-model I/O. | CAL-03. | Explicitly authorized production bootstrap. |
 
 The exact dependency graph is:
 
@@ -1319,26 +1728,34 @@ The exact dependency graph is:
 02G + 02H + 05A + 05B -> 05C
 03 + 02D + 04A + 02F + 05B -> 06A
 02H + 05C + 06A + all existing Ticket 06 prerequisites -> 06B
-03 + 02D + 04A + 05B + 06A + 06B -> 06
-06 + 06B -> 07
+03 + 02D + 04A + 05B + 06A + 06B -> 06 [currently PASS]
+
+CAL-01 -> CAL-02 -> CAL-03 -> CAL-04
+CAL-04 -> explicitly authorized production calendar bootstrap
+production bootstrap exact-ID readiness -> complete Ticket 06 rerun on exact reviewed production state
+Ticket 06 rerun PASS -> fresh Ticket 07 authorization
+fresh Ticket 07 authorization -> NEW 601328.SS
+NEW 601328.SS PASS -> NEW 600895.SS
 ```
 
-The mandatory temporal chain inside that integrated graph is exactly:
+The completed temporal chain inside that integrated graph remains:
 
 ```text
-02G -> 02H -> 05C -> 06B -> Ticket 07
+02G -> 02H -> 05C -> 06B -> Ticket 06 post-temporal PASS
 ```
 
 Existing Ticket 03 remains the static-selection/caller-precedence slice and may
 proceed after Ticket 01; it does not own context construction. Existing Ticket
 04 remains the resource-lifecycle prerequisite to 04A. Existing Ticket 05
-remains the cache/dispatcher restoration prerequisite to 05A. Ticket 06 remains
-**FAIL/BLOCKED** even if its original Tickets 02–05 are marked complete: it
-cannot complete until 02A–02H, 04A, 05A–05C, 06A, and 06B are complete and their
-deterministic tests pass twice as specified. Within Ticket 06, QCF5–QCF12 remain
-blocked behind the corrected QCF4 path. Ticket 07 remains blocked by 06B,
-completed Ticket 06, and fresh explicit operator authorization for live-provider
-work.
+remains the cache/dispatcher restoration prerequisite to 05A. Those prior work
+areas and Ticket 06 post-temporal acceptance are complete/PASS; this amendment
+does not rerun them. CAL-01 through CAL-04 are the new additive chain. Because
+CAL-01 through CAL-03 will modify production behavior, the complete Ticket 06
+suite must be rerun once on the exact reviewed post-CAL production tree, after
+CAL-04 and the explicitly authorized production bootstrap, before Ticket 07.
+Ticket 07 remains blocked until that bootstrap revision is reopened by exact ID,
+passes readiness with zero read-time provider I/O, the complete Ticket 06 rerun
+passes, and a separate fresh Ticket 07 live authorization is granted.
 
 ## Out of Scope
 
@@ -1368,8 +1785,9 @@ work.
 - Moving credentials into config, files, command arguments, prompts, logs, or
   persisted state.
 - Running live providers or paid models while amending or implementing this
-  deterministic contract. The separately authorized future two-symbol gate is
-  outside this amendment and remains blocked by Ticket 06.
+  deterministic contract. The later production calendar bootstrap and Ticket 07
+  two-symbol gate are separately authorized operational steps and are not
+  authorized by this specification.
 - Running the blocked Ticket 07 retry, mutating its failed `601328.SS` run, or
   treating an amended spec as rollout authorization.
 - Using exact retrieval-local-date equality, a next-calendar-day or elapsed
@@ -1386,6 +1804,15 @@ work.
   treating its successful matrices as implementation/rollout completion. Its
   report is authoritative design evidence only; 02G–06B must implement through
   the existing production seams.
+- Copying the calendar-bootstrap prototype implementation or tests into
+  production, importing them at runtime, or treating the prototype PASS as a
+  production bootstrap. Its report is authoritative design evidence only;
+  CAL-01 through CAL-04 implement and verify the settled contracts through the
+  existing production seams.
+- Making qualified routing, Ticket 07 preflight, ordinary symbol history
+  ingestion, or a failed analysis run a calendar writer; executing Ticket 07;
+  allocating its run ID; enabling `qualified_v1`; or using the production
+  calendar-bootstrap authorization as Ticket 07 authorization.
 
 ## Further Notes
 
@@ -1412,6 +1839,12 @@ work.
   financial tool/dispatcher boundary for request binding/restoration. The
   factory may add lifecycle capabilities to the managed composition contract,
   but it must not add another routing, eligibility, or persistence authority.
+- The additional highest calendar seams are fixed: the standalone
+  Instrument-neutral BaoStock acquisition primitive, the existing Market
+  History Store publisher, current and narrow exact-ID readers, and the one
+  programmatic/CLI bootstrap service. The prototype report selected these seams
+  because they retain one provider authority, one writer, one revision
+  namespace, and read-only Ticket 07 preflight.
 - `Status: ready-for-agent` is justified because fresh-run ownership, metadata
   applicability semantics, current-analysis latest-completed frontier, strict-
   PIT cutoff proof, provider-neutral `evidence_effective_as_of` provenance,
@@ -1420,9 +1853,13 @@ work.
   Ticket 07 retry order, the complete field classification, unchanged Evidence
   Admission boundary, corrected QCF4 expectation, plan-owned fallback, provider
   source wiring, lifecycle behavior, and integrated work dependencies are fully
-  resolved above. Ticket 06 nevertheless remains **FAIL/BLOCKED** until
-  02A–02H, 04A, 05A–05C, 06A, and 06B are implemented and the complete
-  deterministic acceptance passes twice; Ticket 07 remains **BLOCKED** and its
-  failed run immutable. Any implementation that cannot satisfy one of these
-  decisions must return the specification to `needs-info` rather than inventing
-  a second owner or weakening a trust boundary.
+  resolved above. The calendar amendment additionally resolves acquisition and
+  publisher ownership, provider/session-time authority, exact semantic identity,
+  bounded range, structural readiness/freshness, attempt accounting,
+  concurrency, exact-ID verification, CLI authorization, and the Ticket 07
+  prerequisite. Ticket 06 post-temporal acceptance is **PASS**, but its complete
+  regression suite must run once on the exact reviewed post-CAL production tree
+  as specified. Ticket 07 remains **BLOCKED**, no run ID has been allocated, and
+  its failed evidence remains immutable. Any implementation that cannot satisfy
+  one of these decisions must return the specification to `needs-info` rather
+  than inventing a second owner or weakening a trust boundary.
