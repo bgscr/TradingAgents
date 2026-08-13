@@ -563,6 +563,17 @@ def assess_mainland_session_calendar_readiness(
             MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH
         )
     assert metadata is not None
+    reopen_failure = None
+    try:
+        reopened = read_session_calendar_revision(store, calendar_revision_id)
+    except MarketSessionCalendarIntegrityError as exc:
+        reopen_failure = exc.reason
+    if reopen_failure is MarketSessionCalendarReadFailure.CALENDAR_MISSING:
+        _readiness_fail(MainlandSessionCalendarReadinessFailure.CALENDAR_MISSING)
+    if reopen_failure is not None:
+        _readiness_fail(
+            MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH
+        )
     from tradingagents.market_history.coordinator import (
         upstream_service_identity_for_provider,
     )
@@ -705,17 +716,6 @@ def assess_mainland_session_calendar_readiness(
             MainlandSessionCalendarReadinessFailure.MISSING_FORWARD_HORIZON
         )
 
-    reopen_failure = None
-    try:
-        reopened = read_session_calendar_revision(store, calendar_revision_id)
-    except MarketSessionCalendarIntegrityError as exc:
-        reopen_failure = exc.reason
-    if reopen_failure is MarketSessionCalendarReadFailure.CALENDAR_MISSING:
-        _readiness_fail(MainlandSessionCalendarReadinessFailure.CALENDAR_MISSING)
-    if reopen_failure is not None:
-        _readiness_fail(
-            MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH
-        )
     if reopened.sessions != sessions:
         _readiness_fail(
             MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH

@@ -11,7 +11,7 @@ review. This ticket authorizes no live provider or model work.
 
 **Blocked by:** CAL-03 — Explicit programmatic and CLI bootstrap.
 
-**Status:** ready-for-agent
+**Status:** PASS / complete (2026-08-13)
 
 ## Observable vertical-slice behavior
 
@@ -27,56 +27,56 @@ review. This ticket authorizes no live provider or model work.
 
 ## Acceptance criteria: complete deterministic matrix
 
-- [ ] **Empty store bootstrap:** one authorized bounded fake acquisition records
+- [x] **Empty store bootstrap:** one authorized bounded fake acquisition records
   exactly login/query/logout, publishes one complete revision/ingestion audit,
   exact-reopens it, returns `created`, and creates no analysis/model/checkpoint
   state.
-- [ ] **Exact-ID reopen:** the exact reader returns precisely the requested
+- [x] **Exact-ID reopen:** the exact reader returns precisely the requested
   immutable revision and reproduces authority, digest, range, membership,
   timestamps, counts, and identity with zero provider I/O.
-- [ ] **Completed frontier:** fixed `evaluated_at` plus persisted membership and
+- [x] **Completed frontier:** fixed `evaluated_at` plus persisted membership and
   contract-derived times yield the exact `latest_completed_session` and the
   requested/latest-session close.
-- [ ] **Forward boundary:** the same exact revision yields the next open session
+- [x] **Forward boundary:** the same exact revision yields the next open session
   and its close. Missing either fails `missing_forward_horizon`.
-- [ ] **Ordinary identical rerun:** returns `reused`, the same semantic revision,
+- [x] **Ordinary identical rerun:** returns `reused`, the same semantic revision,
   and zero provider clients, permits, logical requests, transports, attempts, or
   new ingestion writes.
-- [ ] **Forced identical refresh:** performs one new login/query/logout workflow,
+- [x] **Forced identical refresh:** performs one new login/query/logout workflow,
   retains a later immutable ingestion audit, returns
   `refreshed_same_revision`, and reuses the semantic revision ID.
-- [ ] **Changed calendar:** changed membership or session-time semantics creates
+- [x] **Changed calendar:** changed membership or session-time semantics creates
   one new immutable revision; the old revision and session rows remain exactly
   readable and unchanged.
-- [ ] **Partial publication failures:** failure after every acquisition and
+- [x] **Partial publication failures:** failure after every acquisition and
   publication phase leaves zero partial referencing revision/session/completed-
   ingestion rows and no partial receipt.
-- [ ] **Incomplete range:** missing, duplicate, malformed, out-of-range, or
+- [x] **Incomplete range:** missing, duplicate, malformed, out-of-range, or
   contradictory civil-date membership fails `incomplete_range` without
   heuristic repair.
-- [ ] **Stale coverage:** a complete stored range that cannot establish the
+- [x] **Stale coverage:** a complete stored range that cannot establish the
   evaluated completed/forward horizon fails `stale_coverage`.
-- [ ] **Concurrent identical bootstrap:** all callers receive the same semantic
+- [x] **Concurrent identical bootstrap:** all callers receive the same semantic
   revision/receipt content from one leader, one login/query/logout workflow, one
   publication, and one complete row set.
-- [ ] **Active cooldown:** returns the existing typed cooldown outcome with zero
+- [x] **Active cooldown:** returns the existing typed cooldown outcome with zero
   transports/attempt events; a separate `10001005` control opens the shared
   global cooldown.
-- [ ] **Reads/replay:** current read, exact-ID read, readiness, receipt
+- [x] **Reads/replay:** current read, exact-ID read, readiness, receipt
   verification, and persisted replay create zero provider clients, permits,
   logical requests, attempts, ingestion writes, or model work.
-- [ ] **Safe metadata projection:** receipts, JSON, exceptions, logs, events, and
+- [x] **Safe metadata projection:** receipts, JSON, exceptions, logs, events, and
   IDs contain no credentials/state, raw provider errors/payloads, URLs/queries,
   absolute local paths, config dumps, or unbounded text.
-- [ ] **Zero-calendar compatibility:** a historical database with no calendar
+- [x] **Zero-calendar compatibility:** a historical database with no calendar
   revisions remains schema-valid and usable before bootstrap.
-- [ ] **Historical immutability:** representative historical calendars,
+- [x] **Historical immutability:** representative historical calendars,
   snapshots, pins, checkpoints, reports, artifacts, attempts, IDs, and all
   failed Ticket 07 evidence are byte-for-byte unchanged.
-- [ ] **Identity/content tamper:** altered authority, digest, semantic contract,
+- [x] **Identity/content tamper:** altered authority, digest, semantic contract,
   membership, times, or counts fails closed as
   `revision_identity_mismatch`; existing-row presence cannot mask tamper.
-- [ ] **Authorization/range preflight:** missing authorization and bad/absent/
+- [x] **Authorization/range preflight:** missing authorization and bad/absent/
   unbounded ranges fail before client, permit, transport, attempt, publication,
   analysis allocation, or model construction.
 
@@ -194,16 +194,41 @@ instead of running it.
 
 ## Definition of done
 
-- [ ] Every row of the complete deterministic matrix passes through public seams
+- [x] Every row of the complete deterministic matrix passes through public seams
   with exact identities, readiness results, durable state, and attempt counts.
-- [ ] Focused calendar/coordinator/store tests, temporal eligibility, QCF, PE,
+- [x] Focused calendar/coordinator/store tests, temporal eligibility, QCF, PE,
   AC, non-integration, full deterministic suite, Ruff, and `git diff --check`
   pass from the same reviewed tree without live provider/model work.
-- [ ] Spec Compliance passes before Code Quality; both reviews record Critical,
+- [x] Spec Compliance passes before Code Quality; both reviews record Critical,
   Important, and Minor counts, and all Critical/Important findings are resolved.
-- [ ] Historical/security invariants pass, `qualified_v1` remains disabled, and
+- [x] Historical/security invariants pass, `qualified_v1` remains disabled, and
   no production bootstrap or Ticket 07 execution/run-ID allocation occurs.
-- [ ] The downstream gate is recorded exactly and is not executed by CAL-04:
+- [x] The downstream gate is recorded exactly and is not executed by CAL-04:
 
   `CAL-04 → separately authorized production calendar bootstrap → exact-ID readiness verification → complete Ticket 06 rerun on the exact reviewed post-CAL production tree → fresh Ticket 07 authorization → NEW 601328.SS run → NEW 600895.SS only after bank PASS`.
 
+## Completion evidence (2026-08-13)
+
+- Public CAL-04 acceptance: `35 passed`.
+- CAL-01/02/03/04 affected calendar band: `155 passed`.
+- Coordinator/cooldown/single-flight/payload-GC band: `24 passed`.
+- Temporal latest-completed-session/calendar binding band: `62 passed`.
+- QCF compatibility: `108 passed`; PE compatibility: `73 passed`; AC/history/
+  Current Tradeability compatibility: `146 passed`; CLI: `6 passed`.
+- Qualified/temporal preflight slice: `83 passed`; live isolation:
+  `26 passed, 2 skipped` with every `RUN_LIVE_*` opt-in set to `0`.
+- Repository deterministic verification: `3199 passed` for
+  `pytest -q -m "not integration"`; `3204 passed, 2 skipped` for `pytest -q`.
+- `ruff check tradingagents cli tests`, changed-file Ruff, and
+  `git diff --check` passed. The exact `ruff check .` reported 47 pre-existing
+  `.scratch` issues in the protected dirty worktree. A clean export of both the
+  reviewed CAL-04 commit and baseline `6bb1b4b` reported the same 18 tracked
+  prototype issues, proving zero CAL-04 Ruff regression; the additional 29
+  belong to protected pre-existing untracked prototype/Ticket 07 evidence.
+  Those unrelated files were left untouched.
+- Stage 1 Spec Compliance: Critical 0, Important 0, Minor 0. Stage 2 Code
+  Quality: Critical 0, Important 0, Minor 0.
+- Protected Ticket 07 evidence hashes and the pre-existing dirty lifecycle file
+  hash matched their before-edit inventory after the complete matrix.
+- No live provider, paid model, production calendar bootstrap, Ticket 07 run, or
+  Ticket 07 run-ID allocation occurred. `qualified_v1` remains disabled.

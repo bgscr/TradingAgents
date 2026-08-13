@@ -23,7 +23,9 @@ from tradingagents.dataflows.baostock_calendar import (
     BAOSTOCK_CALENDAR_NORMALIZER_VERSION,
     BAOSTOCK_CALENDAR_PAYLOAD_CONTRACT,
     MAINLAND_REGULAR_SESSION_TIME_CONTRACT,
+    BaoStockSessionCalendarAcquisitionError,
     BaoStockSessionCalendarAttempt,
+    BaoStockSessionCalendarFailureReason,
     BaoStockSessionCalendarRequest,
     acquire_mainland_session_calendar,
 )
@@ -32,6 +34,7 @@ from tradingagents.market_history.calendar import (
     MAINLAND_SESSION_CALENDAR_READINESS_CONTRACT,
     MainlandSessionCalendarReadiness,
     MainlandSessionCalendarReadinessError,
+    MainlandSessionCalendarReadinessFailure,
     MarketSessionCalendarIntegrityError,
     MarketSessionCalendarReadFailure,
     MarketSessionStatus,
@@ -68,6 +71,17 @@ _SAFE_SCOPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _SAFE_PUBLIC_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:=+/-]{0,127}")
 _SAFE_DIGEST = re.compile(r"[0-9a-f]{64}")
 _SECRET_MARKERS = ("credential", "password", "secret", "token", "api_key")
+_INCOMPLETE_CALENDAR_ACQUISITION_REASONS = frozenset(
+    {
+        BaoStockSessionCalendarFailureReason.EMPTY_RESPONSE,
+        BaoStockSessionCalendarFailureReason.MALFORMED_ROW,
+        BaoStockSessionCalendarFailureReason.INVALID_TRADING_DAY,
+        BaoStockSessionCalendarFailureReason.DUPLICATE_DATE,
+        BaoStockSessionCalendarFailureReason.CONTRADICTORY_MEMBERSHIP,
+        BaoStockSessionCalendarFailureReason.OUT_OF_RANGE_DATE,
+        BaoStockSessionCalendarFailureReason.INCOMPLETE_RANGE,
+    }
+)
 _UPSTREAM_SERVICE_ID, _UPSTREAM_SERVICE_NAME = (
     upstream_service_identity_for_provider(_PROVIDER)
 )
@@ -449,11 +463,6 @@ def _bootstrap_mainland_session_calendar(
                 )
 
     if not request.authorize_provider_io:
-        from tradingagents.dataflows.baostock_calendar import (
-            BaoStockSessionCalendarAcquisitionError,
-            BaoStockSessionCalendarFailureReason,
-        )
-
         raise BaoStockSessionCalendarAcquisitionError(
             BaoStockSessionCalendarFailureReason.OPERATOR_AUTHORIZATION_REQUIRED
         )
@@ -516,11 +525,18 @@ def _bootstrap_mainland_session_calendar(
                     ),
                 )
 
-        acquisition = _acquire_calendar(
-            request,
-            history_config=history_config,
-            clock=clock,
-        )
+        try:
+            acquisition = _acquire_calendar(
+                request,
+                history_config=history_config,
+                clock=clock,
+            )
+        except BaoStockSessionCalendarAcquisitionError as exc:
+            if exc.reason in _INCOMPLETE_CALENDAR_ACQUISITION_REASONS:
+                raise MainlandSessionCalendarReadinessError(
+                    MainlandSessionCalendarReadinessFailure.INCOMPLETE_RANGE
+                ) from None
+            raise
         published = store.publish_session_calendar(
             publication_from_baostock_session_calendar_acquisition(acquisition)
         )

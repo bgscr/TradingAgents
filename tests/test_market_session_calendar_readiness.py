@@ -78,11 +78,14 @@ def test_complete_exact_revision_is_structurally_ready(tmp_path) -> None:
     ("case", "failure"),
     (
         ("missing", MainlandSessionCalendarReadinessFailure.CALENDAR_MISSING),
-        ("authority", MainlandSessionCalendarReadinessFailure.AUTHORITY_MISMATCH),
+        (
+            "authority",
+            MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH,
+        ),
         ("incomplete", MainlandSessionCalendarReadinessFailure.INCOMPLETE_RANGE),
         (
             "missing_times",
-            MainlandSessionCalendarReadinessFailure.MISSING_SESSION_TIMES,
+            MainlandSessionCalendarReadinessFailure.REVISION_IDENTITY_MISMATCH,
         ),
         (
             "unresolved",
@@ -138,9 +141,22 @@ def test_readiness_has_closed_structural_failures(tmp_path, case, failure) -> No
             revision_id = _publish(store, membership).calendar_revision_id
         if case == "authority":
             store._connection.execute(
-                "UPDATE provider_datasets SET provider_name = 'other' "
-                "WHERE provider_dataset_id = (SELECT provider_dataset_id "
-                "FROM market_session_calendars WHERE calendar_revision_id = ?)",
+                "INSERT INTO upstream_services "
+                "(upstream_service_id, service_name, account_scope, created_at) "
+                "VALUES ('upstream-other', 'Other service', '', ?) ",
+                ("2026-08-12T08:00:00+00:00",),
+            )
+            store._connection.execute(
+                "INSERT INTO provider_datasets "
+                "(provider_dataset_id, provider_name, upstream_service_id, "
+                "dataset_name, adjustment_methodology, strict_history_qualified, "
+                "created_at) VALUES ('provider-other', 'other', "
+                "'upstream-other', 'other-calendar', 'not-applicable', 0, ?)",
+                ("2026-08-12T08:00:00+00:00",),
+            )
+            store._connection.execute(
+                "UPDATE market_session_calendars SET provider_dataset_id = "
+                "'provider-other' WHERE calendar_revision_id = ?",
                 (revision_id,),
             )
         elif case == "missing_times":
