@@ -27,7 +27,7 @@ from tradingagents.asset_configuration import (
     resolve_run_asset_configuration,
 )
 from tradingagents.dataflows import instrument_identity as identity_module, market_snapshot
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import get_config, set_config
 from tradingagents.dataflows.market_snapshot import (
     SnapshotProvider,
     authoritative_snapshot_run,
@@ -2777,7 +2777,7 @@ def test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semant
             "Volume": [100.0] * 21,
         }
     )
-    config = copy.deepcopy(DEFAULT_CONFIG)
+    config = copy.deepcopy(get_config())
     config.update(
         {
             "results_dir": str(tmp_path / "results"),
@@ -2787,6 +2787,7 @@ def test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semant
             "evidence_gate_mode": "enforce",
         }
     )
+    assert Path(config["market_history_database_path"]).is_relative_to(tmp_path)
     selections = {
         "ticker": "SOL-USD",
         "analysis_date": "2026-07-25",
