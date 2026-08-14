@@ -24,7 +24,15 @@ from typing import Literal, Protocol
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape as xml_escape
 
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from tradingagents.offline_runtime_bundle import (
+    BUNDLE_MANIFEST_FILENAME,
+    OfflineBundleSourceBinding,
+    OfflineRuntimeBundleManifest,
+    verify_offline_runtime_bundle,
+)
 
 PROTECTED_ROOT_MANIFEST_VERSION = "windows-sandbox-protected-roots-v1"
 SOURCE_INPUT_CONTRACT_VERSION = "windows-sandbox-reviewed-source-v1"
@@ -39,6 +47,10 @@ RUNNER_CONTRACT_VERSION = "iso01-windows-sandbox-runner-v1"
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 _WINDOWS_REPARSE_POINT_ATTRIBUTE = 0x400
 _RUN_LIVE_PATTERN = re.compile(rb"\bRUN_LIVE_[A-Z0-9_]+\b")
+_HASH_LOCKED_REQUIREMENT_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9._-]*==(?P<version>[A-Za-z0-9][A-Za-z0-9.!+_-]*) "
+    r"--hash=sha256:[0-9a-f]{64}$"
+)
 _CREDENTIAL_NAME_PATTERN = r"[A-Z0-9_]*(?:API_?KEY|TOKEN|PASSWORD|SECRET|CREDENTIALS?)"
 _CREDENTIAL_KEY_PATTERN = re.compile(
     rf"^(?:{_CREDENTIAL_NAME_PATTERN})$",
@@ -737,6 +749,18 @@ def _test_source_credential_url_is_placeholder(value: str) -> bool:
     return host.endswith((".invalid", ".test")) or host in {"invalid", "test"}
 
 
+def _is_safe_hash_locked_requirement(line: str) -> bool:
+    match = _HASH_LOCKED_REQUIREMENT_PATTERN.fullmatch(line)
+    if match is None:
+        return False
+    raw_version = match.group("version")
+    try:
+        version = Version(raw_version)
+    except InvalidVersion:
+        return False
+    return version.local is None and str(version) == raw_version
+
+
 def _json_contains_credential(value: object) -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -786,6 +810,11 @@ def _validate_input_content(relative_path: str, content: bytes) -> None:
         )
     ):
         raise SandboxContractError(SandboxFailureReason.CREDENTIAL_INPUT)
+    if normalized_path == "scripts/windows_sandbox/iso02-requirements-win-cp313.txt":
+        lines = text.splitlines()
+        if not lines or not all(_is_safe_hash_locked_requirement(line) for line in lines):
+            raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
+        return
     for match in _CREDENTIAL_ASSIGNMENT_PATTERN.finditer(text):
         group_index, value = next(
             (index, group)
@@ -922,6 +951,116 @@ def _write_deterministic_source_archive(
             archive.addfile(info, io.BytesIO(content))
 
 
+def _stage_reviewed_head_objects(
+    repository: Path,
+    destination: Path,
+    *,
+    commit_id: str,
+    tree_hash: str,
+    object_format: str,
+) -> StagedSourceInput:
+    entries = _parse_source_entries(repository)
+    computed_tree = _tree_hash_from_entries(entries, object_format=object_format)
+    if computed_tree != tree_hash:
+        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
+    run_live_environment = tuple(
+        sorted(
+            {
+                match.group(0).decode("ascii")
+                for entry in entries
+                for match in _RUN_LIVE_PATTERN.finditer(
+                    _run_git(repository, ("cat-file", "blob", entry.git_object_id)).stdout
+                )
+            }
+        )
+    )
+    manifest_payload = {
+        "contract_version": SOURCE_INPUT_CONTRACT_VERSION,
+        "commit_id": commit_id,
+        "tree_hash": tree_hash,
+        "git_object_format": object_format,
+        "entries": [entry.model_dump(mode="json") for entry in entries],
+        "run_live_environment": list(run_live_environment),
+    }
+    manifest = ReviewedSourceManifest(
+        **manifest_payload,
+        source_manifest_identity=_identity(
+            "windows-sandbox-source-manifest:v1",
+            manifest_payload,
+        ),
+    )
+
+    try:
+        destination.mkdir(parents=False, exist_ok=False)
+    except OSError as exc:
+        raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT) from exc
+    archive_path = destination / "reviewed-source.tar"
+    manifest_path = destination / "source-manifest.json"
+    commit_object_path = destination / "reviewed-commit.object"
+    _write_deterministic_source_archive(repository, entries, archive_path)
+    commit_object = _run_git(repository, ("cat-file", "commit", commit_id)).stdout
+    _validate_input_content("reviewed-commit.object", commit_object)
+    if _git_object_digest(object_format, "commit", commit_object) != commit_id:
+        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
+    if not commit_object.startswith(f"tree {tree_hash}\n".encode("ascii")):
+        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
+    commit_object_path.write_bytes(commit_object)
+    manifest_path.write_bytes(_canonical_json_bytes(manifest.model_dump(mode="json")) + b"\n")
+    identity_payload = {
+        "contract_version": SOURCE_INPUT_CONTRACT_VERSION,
+        "commit_id": commit_id,
+        "tree_hash": tree_hash,
+        "git_object_format": object_format,
+        "commit_object_sha256": sha256(commit_object).hexdigest(),
+        "archive_sha256": sha256(archive_path.read_bytes()).hexdigest(),
+        "source_manifest_identity": manifest.source_manifest_identity,
+        "tracked_file_count": len(entries),
+        "run_live_environment": list(run_live_environment),
+    }
+    identity = ReviewedSourceIdentity(
+        **identity_payload,
+        source_input_identity=_identity(
+            "windows-sandbox-reviewed-source:v1",
+            identity_payload,
+        ),
+    )
+    return StagedSourceInput(
+        identity=identity,
+        manifest=manifest,
+        archive_path=archive_path,
+        manifest_path=manifest_path,
+        commit_object_path=commit_object_path,
+    )
+
+
+def stage_reviewed_head_objects(
+    repository_root: Path,
+    destination: Path,
+) -> StagedSourceInput:
+    """Stage only reviewed HEAD Git objects, independent of worktree dirt/untracked state.
+
+    ISO-02 uses this to bind a prepared bundle to a committed source identity.
+    ISO-01 launch construction continues to call :func:`stage_reviewed_source`
+    and retains its stricter clean-worktree preflight.
+    """
+
+    repository = repository_root.expanduser().resolve(strict=True)
+    if _git_text(repository, "rev-parse", "--is-inside-work-tree") != "true":
+        raise SandboxContractError(SandboxFailureReason.SOURCE_REPOSITORY_INVALID)
+    commit_id = _git_text(repository, "rev-parse", "HEAD")
+    tree_hash = _git_text(repository, "rev-parse", "HEAD^{tree}")
+    object_format = _git_text(repository, "rev-parse", "--show-object-format")
+    if object_format != "sha1":
+        raise SandboxContractError(SandboxFailureReason.SOURCE_REPOSITORY_INVALID)
+    return _stage_reviewed_head_objects(
+        repository,
+        destination,
+        commit_id=commit_id,
+        tree_hash=tree_hash,
+        object_format=object_format,
+    )
+
+
 def stage_reviewed_source(
     repository_root: Path,
     destination: Path,
@@ -999,77 +1138,12 @@ def stage_reviewed_source(
     if ignored_sensitive.strip(b"\0"):
         raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
 
-    entries = _parse_source_entries(repository)
-    computed_tree = _tree_hash_from_entries(entries, object_format=object_format)
-    if computed_tree != tree_hash:
-        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
-    run_live_environment = tuple(
-        sorted(
-            {
-                match.group(0).decode("ascii")
-                for entry in entries
-                for match in _RUN_LIVE_PATTERN.finditer(
-                    _run_git(repository, ("cat-file", "blob", entry.git_object_id)).stdout
-                )
-            }
-        )
-    )
-    manifest_payload = {
-        "contract_version": SOURCE_INPUT_CONTRACT_VERSION,
-        "commit_id": commit_id,
-        "tree_hash": tree_hash,
-        "git_object_format": object_format,
-        "entries": [entry.model_dump(mode="json") for entry in entries],
-        "run_live_environment": list(run_live_environment),
-    }
-    manifest = ReviewedSourceManifest(
-        **manifest_payload,
-        source_manifest_identity=_identity(
-            "windows-sandbox-source-manifest:v1",
-            manifest_payload,
-        ),
-    )
-
-    try:
-        destination.mkdir(parents=False, exist_ok=False)
-    except OSError as exc:
-        raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT) from exc
-    archive_path = destination / "reviewed-source.tar"
-    manifest_path = destination / "source-manifest.json"
-    commit_object_path = destination / "reviewed-commit.object"
-    _write_deterministic_source_archive(repository, entries, archive_path)
-    commit_object = _run_git(repository, ("cat-file", "commit", commit_id)).stdout
-    _validate_input_content("reviewed-commit.object", commit_object)
-    if _git_object_digest(object_format, "commit", commit_object) != commit_id:
-        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
-    if not commit_object.startswith(f"tree {tree_hash}\n".encode("ascii")):
-        raise SandboxContractError(SandboxFailureReason.SOURCE_IDENTITY_MISMATCH)
-    commit_object_path.write_bytes(commit_object)
-    manifest_path.write_bytes(_canonical_json_bytes(manifest.model_dump(mode="json")) + b"\n")
-    identity_payload = {
-        "contract_version": SOURCE_INPUT_CONTRACT_VERSION,
-        "commit_id": commit_id,
-        "tree_hash": tree_hash,
-        "git_object_format": object_format,
-        "commit_object_sha256": sha256(commit_object).hexdigest(),
-        "archive_sha256": sha256(archive_path.read_bytes()).hexdigest(),
-        "source_manifest_identity": manifest.source_manifest_identity,
-        "tracked_file_count": len(entries),
-        "run_live_environment": list(run_live_environment),
-    }
-    identity = ReviewedSourceIdentity(
-        **identity_payload,
-        source_input_identity=_identity(
-            "windows-sandbox-reviewed-source:v1",
-            identity_payload,
-        ),
-    )
-    return StagedSourceInput(
-        identity=identity,
-        manifest=manifest,
-        archive_path=archive_path,
-        manifest_path=manifest_path,
-        commit_object_path=commit_object_path,
+    return _stage_reviewed_head_objects(
+        repository,
+        destination,
+        commit_id=commit_id,
+        tree_hash=tree_hash,
+        object_format=object_format,
     )
 
 
@@ -1551,6 +1625,10 @@ class RuntimeBundleInputContract(BaseModel):
         max_length=180,
         pattern=r"^[a-z0-9][a-z0-9._:-]{0,110}:sha256:[0-9a-f]{64}$",
     )
+    bundle_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     bootstrap_relative_path: str | None = Field(default=None, max_length=260)
     git_relative_path: str | None = Field(default=None, max_length=260)
     runtime_bundle_contract_identity: str = Field(
@@ -1570,18 +1648,14 @@ class RuntimeBundleInputContract(BaseModel):
             layout.virtual_environment
         ):
             raise ValueError("runtime bundle target must use the pinned guest layout")
-        if self.state == "placeholder_for_iso_02" and self.bundle_manifest_identity is not None:
+        if self.state == "placeholder_for_iso_02" and any(
+            (self.bundle_manifest_identity, self.bundle_manifest_sha256)
+        ):
             raise ValueError("placeholder runtime bundle cannot claim a manifest")
         if self.state == "placeholder_for_iso_02" and any(
             (self.bootstrap_relative_path, self.git_relative_path)
         ):
             raise ValueError("placeholder runtime bundle cannot claim executables")
-        if self.state == "sealed" and (
-            self.bundle_manifest_identity is None
-            or self.bootstrap_relative_path is None
-            or self.git_relative_path is None
-        ):
-            raise ValueError("sealed runtime bundle requires manifest and executable paths")
         for relative_path in (self.bootstrap_relative_path, self.git_relative_path):
             if relative_path is None:
                 continue
@@ -1594,6 +1668,13 @@ class RuntimeBundleInputContract(BaseModel):
                 or any(part in {"", "."} for part in candidate.parts)
             ):
                 raise ValueError("runtime bundle relative path must remain inside the mapping")
+        if self.state == "sealed" and (
+            self.bundle_manifest_identity is None
+            or self.bundle_manifest_sha256 is None
+            or self.bootstrap_relative_path is None
+            or self.git_relative_path is None
+        ):
+            raise ValueError("sealed runtime bundle requires manifest and executable paths")
         payload = self.model_dump(
             mode="json",
             exclude={"runtime_bundle_contract_identity"},
@@ -1618,8 +1699,40 @@ def build_runtime_bundle_placeholder() -> RuntimeBundleInputContract:
         "python_install_target": layout.python_install,
         "virtual_environment_target": layout.virtual_environment,
         "bundle_manifest_identity": None,
+        "bundle_manifest_sha256": None,
         "bootstrap_relative_path": None,
         "git_relative_path": None,
+    }
+    return RuntimeBundleInputContract(
+        **payload,
+        runtime_bundle_contract_identity=_identity(
+            "windows-sandbox-runtime-bundle-input:v1",
+            payload,
+        ),
+    )
+
+
+def build_sealed_runtime_bundle_input(
+    manifest: OfflineRuntimeBundleManifest,
+    *,
+    manifest_sha256: str,
+) -> RuntimeBundleInputContract:
+    """Fill ISO-01's reviewed mapping contract from a verified ISO-02 bundle."""
+
+    layout = build_guest_layout()
+    payload = {
+        "contract_version": RUNTIME_BUNDLE_INPUT_CONTRACT_VERSION,
+        "state": "sealed",
+        "mapped_read_only": True,
+        "offline_required": True,
+        "network_install_permitted": False,
+        "hash_algorithm": "sha256",
+        "python_install_target": layout.python_install,
+        "virtual_environment_target": layout.virtual_environment,
+        "bundle_manifest_identity": manifest.bundle_identity,
+        "bundle_manifest_sha256": manifest_sha256,
+        "bootstrap_relative_path": manifest.bootstrap_relative_path,
+        "git_relative_path": manifest.portable_git_relative_path,
     }
     return RuntimeBundleInputContract(
         **payload,
@@ -2348,9 +2461,15 @@ def _input_tree_identity(
     root: Path,
     *,
     namespace: str,
-    content_validation: Literal["scan", "sealed_reviewed_source"] = "scan",
+    content_validation: Literal[
+        "scan", "sealed_reviewed_source", "sealed_offline_bundle"
+    ] = "scan",
 ) -> str:
-    if content_validation not in {"scan", "sealed_reviewed_source"}:
+    if content_validation not in {
+        "scan",
+        "sealed_reviewed_source",
+        "sealed_offline_bundle",
+    }:
         raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
     resolved = root.resolve(strict=True)
     rows: list[dict[str, object]] = []
@@ -2447,6 +2566,7 @@ class RunnerConstructionRequest:
     user_profile: Path
     host_temp: Path
     host_venv: Path
+    runtime_bundle_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2551,7 +2671,6 @@ class WindowsSandboxRunnerService:
             runtime_root = input_root / "runtime"
             results_root = run_root / "results-export"
             control_root.mkdir()
-            runtime_root.mkdir()
             results_root.mkdir()
         except OSError as exc:
             raise SandboxContractError(SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH) from exc
@@ -2572,14 +2691,46 @@ class WindowsSandboxRunnerService:
             run_live_environment=source.identity.run_live_environment,
             layout=layout,
         )
-        runtime_bundle = build_runtime_bundle_placeholder()
-        runtime_contract_path = runtime_root / "runtime-bundle-contract.json"
-        runtime_contract_path.write_bytes(
-            _canonical_json_bytes(runtime_bundle.model_dump(mode="json")) + b"\n"
-        )
+        if request.runtime_bundle_root is None:
+            runtime_root.mkdir()
+            runtime_bundle = build_runtime_bundle_placeholder()
+            runtime_contract_path = runtime_root / "runtime-bundle-contract.json"
+            runtime_contract_path.write_bytes(
+                _canonical_json_bytes(runtime_bundle.model_dump(mode="json")) + b"\n"
+            )
+            runtime_content_validation = "scan"
+        else:
+            runtime_root = _resolve_required_directory(
+                request.runtime_bundle_root,
+                reason=SandboxFailureReason.RUNTIME_BUNDLE_NOT_READY,
+            )
+            source_binding = OfflineBundleSourceBinding(
+                contract_version=source.identity.contract_version,
+                commit_id=source.identity.commit_id,
+                tree_hash=source.identity.tree_hash,
+                source_input_identity=source.identity.source_input_identity,
+                source_manifest_identity=source.identity.source_manifest_identity,
+                source_archive_sha256=source.identity.archive_sha256,
+            )
+            try:
+                bundle_manifest = verify_offline_runtime_bundle(
+                    runtime_root,
+                    expected_source=source_binding,
+                )
+                manifest_bytes = (runtime_root / BUNDLE_MANIFEST_FILENAME).read_bytes()
+            except (OSError, ValueError) as exc:
+                raise SandboxContractError(
+                    SandboxFailureReason.RUNTIME_BUNDLE_NOT_READY
+                ) from exc
+            runtime_bundle = build_sealed_runtime_bundle_input(
+                bundle_manifest,
+                manifest_sha256=sha256(manifest_bytes).hexdigest(),
+            )
+            runtime_content_validation = "sealed_offline_bundle"
         runtime_mapping_identity = _input_tree_identity(
             runtime_root,
             namespace="windows-sandbox-runtime-input:v1",
+            content_validation=runtime_content_validation,
         )
 
         preliminary_bindings = (
@@ -2783,7 +2934,12 @@ class WindowsSandboxRunnerService:
                 by_role[role].host_path,
                 namespace=namespace,
                 content_validation=(
-                    "sealed_reviewed_source" if role is SandboxMappingRole.SOURCE else "scan"
+                    "sealed_reviewed_source"
+                    if role is SandboxMappingRole.SOURCE
+                    else "sealed_offline_bundle"
+                    if role is SandboxMappingRole.RUNTIME_BUNDLE
+                    and contract.runtime_bundle.state == "sealed"
+                    else "scan"
                 ),
             )
             if actual_identity != by_role[role].content_identity:
@@ -2793,6 +2949,35 @@ class WindowsSandboxRunnerService:
                     else SandboxFailureReason.MAPPING_CONTRACT_INVALID
                 )
                 raise SandboxContractError(reason)
+
+        if contract.runtime_bundle.state == "sealed":
+            source_binding = OfflineBundleSourceBinding(
+                contract_version=contract.source.identity.contract_version,
+                commit_id=contract.source.identity.commit_id,
+                tree_hash=contract.source.identity.tree_hash,
+                source_input_identity=contract.source.identity.source_input_identity,
+                source_manifest_identity=contract.source.identity.source_manifest_identity,
+                source_archive_sha256=contract.source.identity.archive_sha256,
+            )
+            try:
+                runtime_manifest = verify_offline_runtime_bundle(
+                    by_role[SandboxMappingRole.RUNTIME_BUNDLE].host_path,
+                    expected_source=source_binding,
+                )
+                manifest_bytes = (
+                    by_role[SandboxMappingRole.RUNTIME_BUNDLE].host_path
+                    / BUNDLE_MANIFEST_FILENAME
+                ).read_bytes()
+                expected_runtime_contract = build_sealed_runtime_bundle_input(
+                    runtime_manifest,
+                    manifest_sha256=sha256(manifest_bytes).hexdigest(),
+                )
+            except (OSError, ValueError) as exc:
+                raise SandboxContractError(
+                    SandboxFailureReason.RUNTIME_BUNDLE_NOT_READY
+                ) from exc
+            if expected_runtime_contract != contract.runtime_bundle:
+                raise SandboxContractError(SandboxFailureReason.RUNTIME_BUNDLE_NOT_READY)
 
         expected_layout = build_guest_layout()
         if contract.guest_layout != expected_layout:

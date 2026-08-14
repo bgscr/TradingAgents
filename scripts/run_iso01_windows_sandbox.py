@@ -47,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", required=True, type=Path)
     parser.add_argument("--runs-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--runtime-bundle-root", type=Path)
     parser.add_argument(
         "--execution-mode",
         required=True,
@@ -99,6 +100,7 @@ def main(
             user_profile=user_profile,
             host_temp=Path(tempfile.gettempdir()),
             host_venv=repository / ".venv",
+            runtime_bundle_root=arguments.runtime_bundle_root,
         )
         service = WindowsSandboxRunnerService(platform=platform or WindowsSandboxPlatform())
         contract = service.validate_only(request)

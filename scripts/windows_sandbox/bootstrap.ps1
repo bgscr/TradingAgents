@@ -2,7 +2,6 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $controlPath = "C:\QCF17\Input\Control\run-control.json"
-$runtimeContractPath = "C:\QCF17\Input\Runtime\runtime-bundle-contract.json"
 $control = Get-Content -LiteralPath $controlPath -Raw | ConvertFrom-Json
 
 Get-ChildItem Env: | Where-Object {
@@ -19,7 +18,7 @@ foreach ($guestPath in $control.guest_layout.writable_paths) {
     New-Item -ItemType Directory -Path $guestPath -Force | Out-Null
 }
 
-$runtimeContract = Get-Content -LiteralPath $runtimeContractPath -Raw | ConvertFrom-Json
+$runtimeContract = $control.runtime_bundle
 if ($runtimeContract.state -ne "sealed") {
     throw "runtime_bundle_not_ready_for_iso_01"
 }
@@ -27,7 +26,9 @@ if ($runtimeContract.state -ne "sealed") {
 $installer = Join-Path "C:\QCF17\Input\Runtime" $runtimeContract.bootstrap_relative_path
 & $installer `
     -PythonTarget $control.guest_layout.python_install `
-    -VirtualEnvironmentTarget $control.guest_layout.virtual_environment
+    -VirtualEnvironmentTarget $control.guest_layout.virtual_environment `
+    -ControlPath $controlPath `
+    -EvidencePath (Join-Path $control.guest_layout.guest_output "runtime-provisioning.json")
 if ($LASTEXITCODE -ne 0) {
     throw "runtime_bundle_bootstrap_failed"
 }
@@ -51,4 +52,15 @@ if ($LASTEXITCODE -ne 0) {
 $actualTree = & $guestGit -C $control.guest_layout.workspace_repository rev-parse "HEAD^{tree}"
 if (($LASTEXITCODE -ne 0) -or ($actualTree.Trim() -ne $control.source.tree_hash)) {
     throw "reviewed_source_tree_mismatch"
+}
+
+& $installer `
+    -PythonTarget $control.guest_layout.python_install `
+    -VirtualEnvironmentTarget $control.guest_layout.virtual_environment `
+    -ProjectSource $control.guest_layout.workspace_repository `
+    -ProjectOnly `
+    -ControlPath $controlPath `
+    -EvidencePath (Join-Path $control.guest_layout.guest_output "project-provisioning.json")
+if ($LASTEXITCODE -ne 0) {
+    throw "project_offline_install_failed"
 }
