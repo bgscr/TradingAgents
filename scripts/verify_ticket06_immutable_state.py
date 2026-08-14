@@ -22,6 +22,28 @@ INCIDENT_SEQUENCE_IDS = (
     "provider-request-sequence=sha256:59c031e2a78af025fac9aa9933e905ce1b0fbfeb5f7eb8c90258616462725611",
     "provider-request-sequence=sha256:49d24acaf2cea5b03f2e72930101ce815f0e2ac0b993144a25524100fea686a0",
 )
+INCIDENT_IDENTITIES = (
+    (
+        INCIDENT_SEQUENCE_IDS[0],
+        "provider-physical-attempt=sha256:"
+        "4a18d589b32f8f7a1c96a7feb5dfea0c61ec4cb40c4e36d1491cf9afa566655c",
+    ),
+    (
+        INCIDENT_SEQUENCE_IDS[1],
+        "provider-physical-attempt=sha256:"
+        "d4f8f231e159c0b5daa55a05d18d7ccb016ed52211e2987ad987372ebe2daac8",
+    ),
+    (
+        INCIDENT_SEQUENCE_IDS[2],
+        "provider-physical-attempt=sha256:"
+        "1889b3fd3b09ae18b511fff36ff1e319ce8b0c9c4e8697b67fd4ac9fe1820f82",
+    ),
+    (
+        INCIDENT_SEQUENCE_IDS[3],
+        "provider-physical-attempt=sha256:"
+        "49eb75b10fdb4ed11b0f5c8d7ab04e4ac9b13d5f7f13cfaa0f958998684a0f3d",
+    ),
+)
 LEGACY_AC7_INCIDENT_SEQUENCE_IDS = INCIDENT_SEQUENCE_IDS[:3]
 
 
@@ -160,7 +182,9 @@ def _provider_ledger_inventory(
         sorted(INCIDENT_SEQUENCE_IDS)
     ):
         raise RuntimeError("one or more historical pytest incident sequences is missing")
-    if len(incident_attempts) != 4 or any(
+    if tuple((row[0], row[1]) for row in incident_attempts) != tuple(
+        sorted(INCIDENT_IDENTITIES)
+    ) or any(
         row[2:] != ("market-snapshot", "Yahoo Finance")
         for row in incident_attempts
     ):
@@ -187,7 +211,6 @@ def _provider_ledger_inventory(
             }
             for sequence_id, attempt_event_id, _operation, _service
             in incident_attempts
-            if sequence_id in LEGACY_AC7_INCIDENT_SEQUENCE_IDS
         ],
         "sequences": sequences,
     }
@@ -285,6 +308,29 @@ def _capture(
     }
 
 
+def capture_immutable_state(
+    *,
+    provider_ledger: Path,
+    calendar_database: Path,
+    ticket07_root: Path,
+    reports_root: Path,
+    checkpoints_root: Path,
+    enforce_expected_counts: bool = True,
+) -> dict[str, object]:
+    """Public read-only semantic capture seam used by the ISO-03 host harness."""
+
+    return _capture(
+        argparse.Namespace(
+            provider_ledger=provider_ledger,
+            calendar_database=calendar_database,
+            ticket07_root=ticket07_root,
+            reports_root=reports_root,
+            checkpoints_root=checkpoints_root,
+        ),
+        enforce_expected_counts=enforce_expected_counts,
+    )
+
+
 def _provider_delta(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -306,6 +352,27 @@ def _provider_delta(
             for key in old.keys() & new.keys()
         ),
     }
+
+
+def _comparison_inventory(
+    expected: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve the frozen three-row named projection without hiding row deltas."""
+
+    expected_incidents = expected.get("provider_ledger", {}).get("incident_rows")
+    if not isinstance(expected_incidents, list):
+        return current
+    expected_ids = {row.get("sequence_id") for row in expected_incidents}
+    if expected_ids != set(LEGACY_AC7_INCIDENT_SEQUENCE_IDS):
+        return current
+    projected = json.loads(json.dumps(current))
+    projected["provider_ledger"]["incident_rows"] = [
+        row
+        for row in projected["provider_ledger"]["incident_rows"]
+        if row["sequence_id"] in LEGACY_AC7_INCIDENT_SEQUENCE_IDS
+    ]
+    return projected
 
 
 def _summary(inventory: dict[str, Any]) -> str:
@@ -371,7 +438,8 @@ def main() -> int:
     expected = json.loads(args.compare.read_text(encoding="utf-8"))
     sequence_delta = _provider_delta(expected, current, "sequences")
     attempt_delta = _provider_delta(expected, current, "attempts")
-    if current != expected:
+    comparison_current = _comparison_inventory(expected, current)
+    if comparison_current != expected:
         print(f"IMMUTABILITY FAILURE: {_summary(current)}")
         print(f"sequence_delta={sequence_delta}")
         print(f"attempt_delta={attempt_delta}")

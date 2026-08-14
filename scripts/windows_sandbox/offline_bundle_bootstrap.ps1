@@ -20,11 +20,38 @@ Set-StrictMode -Version Latest
 $bundleRoot = "C:\QCF17\Input\Runtime"
 $manifestPath = Join-Path $bundleRoot "bundle-manifest.json"
 
+function ConvertTo-CanonicalJsonString {
+    param([string]$Value)
+
+    $builder = [Text.StringBuilder]::new($Value.Length + 2)
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        switch ($code) {
+            8 { [void]$builder.Append('\b'); continue }
+            9 { [void]$builder.Append('\t'); continue }
+            10 { [void]$builder.Append('\n'); continue }
+            12 { [void]$builder.Append('\f'); continue }
+            13 { [void]$builder.Append('\r'); continue }
+            34 { [void]$builder.Append('\"'); continue }
+            92 { [void]$builder.Append('\\'); continue }
+        }
+        if ($code -lt 32) {
+            [void]$builder.Append(('\u{0:x4}' -f $code))
+        }
+        else {
+            [void]$builder.Append($character)
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function ConvertTo-CanonicalJson {
     param([AllowNull()]$Value)
 
     if ($null -eq $Value) { return "null" }
-    if ($Value -is [string]) { return ($Value | ConvertTo-Json -Compress) }
+    if ($Value -is [string]) { return ConvertTo-CanonicalJsonString $Value }
     if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
     if ($Value -is [byte] -or $Value -is [sbyte] -or
         $Value -is [int16] -or $Value -is [uint16] -or
@@ -77,6 +104,77 @@ function Get-ContentIdentity {
 function Fail-Bundle {
     param([string]$Reason)
     throw $Reason
+}
+
+function Fail-Native {
+    param(
+        [string]$Reason,
+        [int]$ExitCode
+    )
+    $boundedExitCode = ([int64]$ExitCode).ToString(
+        [Globalization.CultureInfo]::InvariantCulture
+    ).Replace("-", "neg")
+    Fail-Bundle ($Reason + "_" + $boundedExitCode)
+}
+
+function Invoke-NativeClosed {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Executable,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        return -1
+    }
+    $previousPreference = $ErrorActionPreference
+    $exitCode = $null
+    try {
+        # Windows PowerShell 5.1 promotes native stderr to NativeCommandError
+        # when the script-wide preference is Stop.  Exit status, not stderr
+        # formatting, is the reviewed authority for these pinned executables.
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = $null
+        & $Executable @Arguments *> $null
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        $exitCode = -1
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($null -eq $exitCode) { return -1 }
+    return [int]$exitCode
+}
+
+function Invoke-InstallerClosed {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Executable,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        return -1
+    }
+    try {
+        # The CPython bootstrapper is a GUI-subsystem executable.  Start-Process
+        # is required for a synchronous, authoritative exit code under Windows
+        # PowerShell 5.1; the call operator can return before it completes.
+        $process = Start-Process `
+            -FilePath $Executable `
+            -ArgumentList $Arguments `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        return [int]$process.ExitCode
+    }
+    catch {
+        return -1
+    }
 }
 
 function Assert-PinnedPath {
@@ -168,18 +266,11 @@ if ($manifest.bundle_identity -ne $runtimeContract.bundle_manifest_identity) {
     Fail-Bundle "bundle_manifest_identity_mismatch"
 }
 
-$manifestPayload = @{}
-foreach ($property in $manifest.PSObject.Properties) {
-    if ($property.Name -ne "bundle_identity") {
-        $manifestPayload[$property.Name] = $property.Value
-    }
-}
-$canonicalPayload = ConvertTo-CanonicalJson $manifestPayload
-$computedIdentity = "windows-offline-runtime-bundle:v1:sha256:" +
-    (Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($canonicalPayload)))
-if ($computedIdentity -ne $manifest.bundle_identity) {
-    Fail-Bundle "bundle_manifest_identity_mismatch"
-}
+# Windows PowerShell 5.1 does not preserve the Python canonical-JSON model for
+# every nested manifest projection.  The exact manifest bytes are already
+# SHA-256 pinned by the read-only control above.  After the pinned installer is
+# installed, bootstrap/verify_bundle.py recomputes the canonical bundle identity
+# under isolated CPython before any dependency or project installation occurs.
 if ($manifest.contract_version -ne "windows-offline-runtime-bundle-v1" -or
     $manifest.supported_windows_architecture -ne "AMD64" -or
     $manifest.python_implementation -ne "CPython" -or
@@ -302,10 +393,9 @@ if ((Get-ContentIdentity "windows-offline-dependency-lock:v1" `
     $manifest.dependency_lock_identity) {
     Fail-Bundle "dependency_lock_identity_mismatch"
 }
-if ((Get-ContentIdentity "windows-offline-wheelhouse:v1" `
-        @($manifest.wheelhouse_inventory)) -ne $manifest.wheelhouse_inventory_identity) {
-    Fail-Bundle "wheelhouse_inventory_identity_mismatch"
-}
+# The complete wheel inventory remains structurally checked above and every
+# wheel is length/hash checked below.  Its canonical identity is revalidated by
+# the isolated Python verifier; PS 5.1 cannot reproduce that array projection.
 $supportEntries = @($manifest.files | Where-Object {
     $_.role -eq "bootstrap_script" -or $_.role -eq "verifier_script"
 })
@@ -472,7 +562,7 @@ if ([int64]$portableGitArchiveEntry.byte_length -ne
     Fail-Bundle "portable_git_artifact_lock_mismatch"
 }
 
-$pythonInstaller = Join-Path $bundleRoot $manifest.python_installer_relative_path
+$pythonInstallerInput = Join-Path $bundleRoot $manifest.python_installer_relative_path
 $installedPython = Join-Path $PythonTarget "python.exe"
 $venvPython = Join-Path $VirtualEnvironmentTarget "Scripts\python.exe"
 $wheelhouse = Join-Path $bundleRoot "wheelhouse"
@@ -480,35 +570,59 @@ $requirements = Join-Path $bundleRoot $manifest.dependency_lock_relative_path
 $verifier = Join-Path $bundleRoot $manifest.verifier_relative_path
 
 if (-not $ProjectOnly) {
+    $installerStagingRoot = "C:\QCF17\Runtime\Installer"
+    New-Item -ItemType Directory -Path $installerStagingRoot -Force | Out-Null
+    Assert-NoReparseComponent $installerStagingRoot
+    $pythonInstaller = Join-Path $installerStagingRoot "python-3.13.7-amd64.exe"
+    [IO.File]::Copy($pythonInstallerInput, $pythonInstaller, $false)
+    if ((Get-Item -LiteralPath $pythonInstaller).Length -ne
+            [int64]$pythonEntry.byte_length -or
+        (Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+            [string]$pythonEntry.sha256) {
+        Fail-Bundle "guest_python_installer_copy_mismatch"
+    }
     New-Item -ItemType Directory -Path $PythonTarget -Force | Out-Null
-    & $pythonInstaller /quiet InstallAllUsers=0 "TargetDir=$PythonTarget" `
-        Include_launcher=0 Include_pip=1 Include_test=0 PrependPath=0 Shortcuts=0 *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "python_runtime_install_failed" }
+    $exitCode = Invoke-InstallerClosed $pythonInstaller @(
+        "/quiet", "InstallAllUsers=0", "TargetDir=$PythonTarget", "Include_launcher=0",
+        "Include_pip=1", "Include_test=0", "PrependPath=0", "Shortcuts=0"
+    )
+    if ($exitCode -ne 0) { Fail-Native "python_runtime_install_failed" $exitCode }
 
-    & $installedPython -I -m venv --clear $VirtualEnvironmentTarget *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "virtual_environment_creation_failed" }
+    $exitCode = Invoke-NativeClosed $installedPython @(
+        "-I", "-m", "venv", "--clear", $VirtualEnvironmentTarget
+    )
+    if ($exitCode -ne 0) { Fail-Native "virtual_environment_creation_failed" $exitCode }
 
-    & $installedPython -I $verifier --bundle-root $bundleRoot `
-        --expected-bundle-identity $manifest.bundle_identity `
-        --expected-source-input-identity $manifest.source.source_input_identity *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "bundle_python_verification_failed" }
+    $exitCode = Invoke-NativeClosed $installedPython @(
+        "-I", $verifier,
+        "--bundle-root", $bundleRoot,
+        "--expected-bundle-identity", [string]$manifest.bundle_identity,
+        "--expected-source-input-identity", [string]$manifest.source.source_input_identity
+    )
+    if ($exitCode -ne 0) { Fail-Native "bundle_python_verification_failed" $exitCode }
 
-    & $venvPython -I -m pip --isolated install --dry-run --no-index --require-hashes `
-        --find-links $wheelhouse -r $requirements *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "offline_dependency_closure_failed" }
+    $exitCode = Invoke-NativeClosed $venvPython @(
+        "-I", "-m", "pip", "--isolated", "install", "--dry-run", "--no-index",
+        "--require-hashes", "--find-links", $wheelhouse, "-r", $requirements
+    )
+    if ($exitCode -ne 0) { Fail-Native "offline_dependency_closure_failed" $exitCode }
 
-    & $venvPython -I -m pip --isolated install --no-index --require-hashes `
-        --find-links $wheelhouse -r $requirements *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "offline_dependency_install_failed" }
+    $exitCode = Invoke-NativeClosed $venvPython @(
+        "-I", "-m", "pip", "--isolated", "install", "--no-index",
+        "--require-hashes", "--find-links", $wheelhouse, "-r", $requirements
+    )
+    if ($exitCode -ne 0) { Fail-Native "offline_dependency_install_failed" $exitCode }
     $stage = "runtime_and_dependencies"
 }
 else {
     if ([string]::IsNullOrWhiteSpace($ProjectSource)) {
         Fail-Bundle "project_source_required"
     }
-    & $venvPython -I -m pip --isolated install --no-index --no-deps --no-build-isolation `
-        $ProjectSource *> $null
-    if ($LASTEXITCODE -ne 0) { Fail-Bundle "offline_project_install_failed" }
+    $exitCode = Invoke-NativeClosed $venvPython @(
+        "-I", "-m", "pip", "--isolated", "install", "--no-index", "--no-deps",
+        "--no-build-isolation", $ProjectSource
+    )
+    if ($exitCode -ne 0) { Fail-Native "offline_project_install_failed" $exitCode }
     $stage = "project"
 }
 

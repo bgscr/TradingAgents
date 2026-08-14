@@ -982,8 +982,9 @@ def test_iso_02_guest_bootstrap_verifies_before_installer_and_stops_before_accep
         project_root / "scripts/windows_sandbox/offline_bundle_bootstrap.ps1"
     ).read_text(encoding="utf-8")
     normalized = bootstrap.casefold()
+    installer_invocation = "invoke-installerclosed $pythoninstaller"
 
-    assert normalized.index("get-filehash") < normalized.index("& $pythoninstaller")
+    assert normalized.index("get-filehash") < normalized.index(installer_invocation)
     for relative_path, role in (
         ("provenance/mingit-2.45.1-64-bit.zip", "portable_git_archive"),
         ("provenance/iso02-artifact-lock.json", "runtime_artifact_lock"),
@@ -992,13 +993,19 @@ def test_iso_02_guest_bootstrap_verifies_before_installer_and_stops_before_accep
     ):
         assert f'"{relative_path}" = "{role}"' in normalized
     assert normalized.index("source_manifest_identity_mismatch") < normalized.index(
-        "& $pythoninstaller"
+        installer_invocation
     )
     assert normalized.index("python_artifact_lock_mismatch") < normalized.index(
-        "& $pythoninstaller"
+        installer_invocation
     )
-    assert "--dry-run --no-index --require-hashes" in normalized
-    assert "--no-index --no-deps --no-build-isolation" in normalized
+    for argument in (
+        "--dry-run",
+        "--no-index",
+        "--require-hashes",
+        "--no-deps",
+        "--no-build-isolation",
+    ):
+        assert f'"{argument}"' in normalized
     assert "*> $null" in normalized
     assert "4096" in normalized
     assert "pip_config_file" in normalized

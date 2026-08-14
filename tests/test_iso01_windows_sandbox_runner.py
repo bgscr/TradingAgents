@@ -105,6 +105,7 @@ def test_iso_01_default_manifest_protects_full_profile_and_verifier_roots(
     bindings = default_protected_root_bindings(
         user_profile=user_profile,
         repository_root=repository_root,
+        historical_qualification_runs_root=tmp_path / "historical-sandbox-runs",
     )
     by_role = {binding.role: binding for binding in bindings}
 
@@ -135,9 +136,17 @@ def test_iso_01_default_manifest_protects_full_profile_and_verifier_roots(
     assert by_role[ProtectedRootRole.CALENDAR_DATABASE_SHM].path == (
         history / "market_history.sqlite3-shm"
     )
+    assert by_role[ProtectedRootRole.CHECKPOINTS].path == (
+        repository_root / "data" / "cache" / "checkpoints"
+    )
+    assert by_role[ProtectedRootRole.REPORTS_LOGS].path == repository_root / "logs"
+    assert by_role[ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS].path == (
+        tmp_path / "historical-sandbox-runs"
+    )
     assert ProtectedRootRole.FAKE_YAHOO_INCIDENTS in by_role
     assert ProtectedRootRole.ISOLATED_PYTHON_WRITE_PROBE in by_role
     assert ProtectedRootRole.PRIOR_INVENTORIES in by_role
+    assert ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS in by_role
 
 
 def test_iso_01_missing_required_protected_root_fails_closed(tmp_path: Path) -> None:

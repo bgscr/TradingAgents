@@ -7,6 +7,7 @@ tickets and are deliberately absent from this module.
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
@@ -204,6 +206,7 @@ class ProtectedRootRole(str, Enum):
     PRIOR_INVENTORIES = "prior_inventories"
     FAKE_YAHOO_INCIDENTS = "fake_yahoo_incidents"
     ISOLATED_PYTHON_WRITE_PROBE = "isolated_python_write_probe"
+    PRIOR_SANDBOX_QUALIFICATIONS = "prior_sandbox_qualifications"
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +433,7 @@ def default_protected_root_bindings(
     *,
     user_profile: Path,
     repository_root: Path,
+    historical_qualification_runs_root: Path | None = None,
 ) -> tuple[ProtectedRootBinding, ...]:
     """Return the reviewed ISO-01 roles without testing whether they exist."""
 
@@ -441,6 +445,9 @@ def default_protected_root_bindings(
     payload_mutation_ledger = history_root / "market_history.sqlite3.payload-mutation.sqlite3"
     payload_root = history_root / "payloads"
     evidence_root = repository_root / ".scratch" / "mainland-qualified-routing-composition-factory"
+    prior_sandbox_qualifications = historical_qualification_runs_root or (
+        evidence_root / "ticket06-post-cal-evidence"
+    )
     return (
         ProtectedRootBinding(
             ProtectedRootRole.APPLICATION_PROFILE,
@@ -504,12 +511,12 @@ def default_protected_root_bindings(
         ),
         ProtectedRootBinding(
             ProtectedRootRole.CHECKPOINTS,
-            application_root / "cache",
+            repository_root / "data" / "cache" / "checkpoints",
             ProtectedObjectKind.DIRECTORY,
         ),
         ProtectedRootBinding(
             ProtectedRootRole.REPORTS_LOGS,
-            application_root / "logs",
+            repository_root / "logs",
             ProtectedObjectKind.DIRECTORY,
         ),
         ProtectedRootBinding(
@@ -531,6 +538,11 @@ def default_protected_root_bindings(
             ProtectedRootRole.ISOLATED_PYTHON_WRITE_PROBE,
             payload_root / "isolated-python-write-probe",
             ProtectedObjectKind.FILE,
+        ),
+        ProtectedRootBinding(
+            ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+            prior_sandbox_qualifications,
+            ProtectedObjectKind.DIRECTORY,
         ),
     )
 
@@ -2219,6 +2231,8 @@ class SandboxPlatformReport(BaseModel):
 class SandboxProcessResult:
     returncode: int
     timed_out: bool
+    launched_process_ids: tuple[int, ...] = ()
+    termination_confirmed: bool = True
 
 
 class SandboxPlatform(Protocol):
@@ -2393,16 +2407,170 @@ class WindowsSandboxPlatform:
             if report.state is not SandboxPlatformState.AVAILABLE:
                 return SandboxProcessResult(returncode=-1, timed_out=False)
         assert self._executable is not None
+        before_processes = self._sandbox_process_ids()
+        if before_processes is None:
+            return SandboxProcessResult(
+                returncode=-1,
+                timed_out=False,
+                termination_confirmed=False,
+            )
+        if before_processes:
+            return SandboxProcessResult(
+                returncode=-1,
+                timed_out=False,
+                termination_confirmed=False,
+            )
+        try:
+            process = subprocess.Popen(
+                [str(self._executable), str(config_path)],
+                shell=False,
+            )
+        except OSError:
+            return SandboxProcessResult(returncode=-1, timed_out=False)
+        deadline = time.monotonic() + timeout_seconds
+        observed: set[int] = set()
+        launcher_returncode: int | None = None
+        startup_deadline = min(deadline, time.monotonic() + 30)
+        while time.monotonic() < deadline:
+            if launcher_returncode is None:
+                launcher_returncode = process.poll()
+            current = self._sandbox_process_ids()
+            if current is None:
+                termination_confirmed = self._terminate_and_confirm(
+                    process,
+                    before_processes=before_processes,
+                    observed=observed,
+                )
+                return SandboxProcessResult(
+                    returncode=-1,
+                    timed_out=False,
+                    launched_process_ids=tuple(sorted(observed)),
+                    termination_confirmed=termination_confirmed,
+                )
+            observed.update(current - before_processes - {process.pid})
+            active = observed & current
+            if launcher_returncode not in {None, 0}:
+                termination_confirmed = self._terminate_and_confirm(
+                    process,
+                    before_processes=before_processes,
+                    observed=observed,
+                )
+                return SandboxProcessResult(
+                    returncode=launcher_returncode,
+                    timed_out=False,
+                    launched_process_ids=tuple(sorted(observed)),
+                    termination_confirmed=termination_confirmed,
+                )
+            if launcher_returncode == 0 and observed and not active:
+                return SandboxProcessResult(
+                    returncode=0,
+                    timed_out=False,
+                    launched_process_ids=tuple(sorted(observed)),
+                )
+            if launcher_returncode == 0 and not observed and time.monotonic() >= startup_deadline:
+                termination_confirmed = self._terminate_and_confirm(
+                    process,
+                    before_processes=before_processes,
+                    observed=observed,
+                )
+                return SandboxProcessResult(
+                    returncode=-1,
+                    timed_out=False,
+                    termination_confirmed=termination_confirmed,
+                )
+            time.sleep(0.25)
+
+        termination_confirmed = self._terminate_and_confirm(
+            process,
+            before_processes=before_processes,
+            observed=observed,
+        )
+        return SandboxProcessResult(
+            returncode=-1,
+            timed_out=True,
+            launched_process_ids=tuple(sorted(observed)),
+            termination_confirmed=termination_confirmed,
+        )
+
+    @staticmethod
+    def _sandbox_process_ids() -> set[int] | None:
+        system_root = Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+        tasklist = system_root / "System32" / "tasklist.exe"
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             completed = subprocess.run(
-                [str(self._executable), str(config_path)],
+                [str(tasklist), "/FO", "CSV", "/NH"],
                 check=False,
+                capture_output=True,
                 shell=False,
-                timeout=timeout_seconds,
+                timeout=10,
+                creationflags=creation_flags,
             )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0 or len(completed.stdout) > 8 * 1024 * 1024:
+            return None
+        names = {
+            "windowssandbox.exe",
+            "windowssandboxclient.exe",
+            "windowssandboxremotesession.exe",
+            "windowssandboxserver.exe",
+            "vmmemwindowssandbox",
+        }
+        text = completed.stdout.decode("utf-8", errors="replace")
+        result: set[int] = set()
+        for row in csv.reader(text.splitlines()):
+            if len(row) < 2 or row[0].casefold() not in names:
+                continue
+            try:
+                result.add(int(row[1]))
+            except ValueError:
+                continue
+        return result
+
+    def _terminate_and_confirm(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        before_processes: set[int],
+        observed: set[int],
+    ) -> bool:
+        self._terminate_process_tree(process.pid)
+        for process_id in sorted(observed):
+            self._terminate_process_tree(process_id)
+        try:
+            process.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            return SandboxProcessResult(returncode=-1, timed_out=True)
-        return SandboxProcessResult(returncode=completed.returncode, timed_out=False)
+            process.kill()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            current = self._sandbox_process_ids()
+            if current is None:
+                time.sleep(0.25)
+                continue
+            active = current - before_processes - {process.pid}
+            observed.update(active)
+            if process.poll() is not None and not active:
+                return True
+            for process_id in sorted(active):
+                self._terminate_process_tree(process_id)
+            time.sleep(0.25)
+        return False
+
+    @staticmethod
+    def _terminate_process_tree(process_id: int) -> None:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                shell=False,
+                timeout=15,
+                creationflags=creation_flags,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
 
 
 def validate_wsb_configuration(

@@ -71,11 +71,11 @@ def _create_provider_ledger(path: Path) -> None:
             );
             """
         )
-        for index, sequence_id in enumerate(verifier.INCIDENT_SEQUENCE_IDS, start=1):
+        for sequence_id, attempt_event_id in verifier.INCIDENT_IDENTITIES:
             _insert_provider_row(
                 connection,
                 sequence_id=sequence_id,
-                attempt_event_id=f"incident-attempt-{index}",
+                attempt_event_id=attempt_event_id,
             )
         _insert_provider_row(
             connection,
@@ -342,6 +342,50 @@ def test_declared_post_incident_acceptance_counts_are_frozen() -> None:
         verifier.EXPECTED_SEQUENCE_COUNT,
         verifier.EXPECTED_ATTEMPT_COUNT,
     ) == (1024, 1036)
+
+
+def test_all_four_historical_incident_identities_are_named(
+    verifier_paths: _VerifierPaths,
+) -> None:
+    inventory = verifier._capture(
+        _arguments(verifier_paths),
+        enforce_expected_counts=False,
+    )
+
+    incident_rows = inventory["provider_ledger"]["incident_rows"]
+    assert len(incident_rows) == 4
+    assert {
+        (row["sequence_id"], row["attempt_event_id"])
+        for row in incident_rows
+    } == set(verifier.INCIDENT_IDENTITIES)
+
+
+def test_compare_accepts_frozen_three_row_named_inventory_without_rebaseline(
+    verifier_paths: _VerifierPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    comparison = tmp_path / "legacy-named-incident-comparison.json"
+    _write_comparison_snapshot(verifier_paths, comparison)
+    frozen = json.loads(comparison.read_text(encoding="utf-8"))
+    frozen["provider_ledger"]["incident_rows"] = [
+        row
+        for row in frozen["provider_ledger"]["incident_rows"]
+        if row["sequence_id"] in verifier.INCIDENT_SEQUENCE_IDS[:3]
+    ]
+    comparison.write_text(
+        json.dumps(frozen, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [*_cli_arguments(verifier_paths), "--compare", str(comparison)],
+    )
+
+    assert verifier.main() == 0
+    assert "IMMUTABILITY PASS" in capsys.readouterr().out
 
 
 def test_acceptance_baseline_rejects_incorrect_declared_counts(
