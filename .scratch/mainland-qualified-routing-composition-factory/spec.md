@@ -57,13 +57,21 @@ prove when the evidence became effective or available. The failed run and all
 historical state remain immutable, Ticket 07 remains **BLOCKED**, and
 authoritative `qualified_v1` remains disabled.
 
-Ticket 06 post-temporal acceptance is now **PASS**. The remaining Ticket 07
-blocker is operational calendar authority, not temporal-policy acceptance:
-the production Point-in-Time Market History Store contains zero persisted
-mainland Market Session Calendar revisions and zero persisted session rows.
-ADR-0036 therefore cannot resolve an authoritative `latest_completed_session`.
-Ticket 07 stopped before live execution: no Ticket 07 run ID or checkpoint
-namespace was allocated and no provider or model I/O occurred.
+The earlier Ticket 06 post-temporal milestone was **PASS**. At that point Ticket
+07 was blocked on operational calendar authority because the production Point-
+in-Time Market History Store had no persisted mainland Market Session Calendar
+revision. Since then CAL-01 through CAL-04 and the authorized production
+BaoStock mainland calendar bootstrap have completed, and the production
+revision is persisted and retained. Ticket 06 deterministic and business
+acceptance is otherwise green, but final Ticket 06 is not PASS: QCF17 repeatedly
+failed because deterministic acceptance itself mutated application-default
+persistent host state. Test-side Python isolation was strengthened, yet a
+Stage-1 `python -I -c` absolute-path write probe bypassed the
+`PYTHONPATH`/`sitecustomize` guard and wrote a protected host file. Python import
+hooks therefore cannot be the final containment authority. The incident is
+retained, the final acceptance baseline is not frozen, and Ticket 07 remains
+**BLOCKED**; no fresh Ticket 07 run ID or checkpoint namespace is allocated and
+no Ticket 07 provider/model I/O is authorized.
 
 ## Solution
 
@@ -172,6 +180,18 @@ the narrow `read_session_calendar_revision(calendar_revision_id)` exact reader.
 Qualified-routing and Ticket 07 preflight remain read-only and never acquire,
 refresh, publish, or repair calendar state.
 
+Close the remaining QCF17 gap with **Design B containing Design E**. A
+versioned Windows Sandbox runner supplies the OS/filesystem namespace boundary.
+Inside that boundary, a hash-locked read-only source input is copied into one
+disposable sandbox-local writable repository and all executable Ticket 06 work
+runs there. Protected host production state is not mapped, networking is
+disabled, credentials are absent, runtime/profile roots are sandbox-local, and
+only one bounded results-export directory is writable on the host. The host
+computes the protected-state inventory before launch and again after Sandbox
+exit; exact byte and semantic equality is the final QCF17 authority. Existing
+pytest guards remain defense-in-depth for readable L1 failures, not the L2
+containment boundary.
+
 ## User Stories
 
 1. As a shadow-run operator, I want a shipped factory to be selected without test injection, so that real qualified shadow preflight can proceed.
@@ -274,6 +294,36 @@ refresh, publish, or repair calendar state.
 98. As a compatibility owner, I want databases with zero calendar revisions to remain valid and bootstrap to be additive, so that historical stores require no destructive migration.
 99. As a rollout owner, I want Ticket 07 blocked until an authorized production bootstrap passes exact-ID readiness and derives both frontier and next-open close, so that analysis begins only from authoritative persisted calendar state.
 100. As an acceptance owner, I want CAL-01 through CAL-04 proven with deterministic fake transports and stores before production bootstrap, so that no live provider or paid model is needed for implementation acceptance.
+101. As a host-state owner, I want every executable Ticket 06 command inside one fresh Windows Sandbox, so that deterministic descendants cannot mutate production state.
+102. As a security owner, I want QCF17 to contain ordinary arbitrary descendants that know exact protected host paths, so that `python -I`, other Python startup modes, multiprocessing, PowerShell, cmd, filesystem APIs, and SQLite remain harmless to the host.
+103. As a platform owner, I want malicious Sandbox, Hyper-V, kernel, or administrator compromise explicitly excluded, so that Ticket 06 makes a precise L2 claim rather than an unbounded platform-security claim.
+104. As a protected-state owner, I want the real host profile, provider/coordinator ledger, Market Session Calendar, checkpoints, reports/logs, Ticket 07 evidence, and verifier-declared roots absent from writable Sandbox mappings, so that guest code has no host write path to them.
+105. As an inspector, I want any necessary protected-state view to be a prepared immutable snapshot/inventory or a read-only mapping, so that inspection never exposes the real protected root read-write.
+106. As a source reviewer, I want the exact reviewed commit/tree inventoried and supplied as a sealed read-only input, so that acceptance executes only reviewed source.
+107. As a test author, I want the sealed source copied into a sandbox-local writable repository, so that tests can create ordinary repository/runtime files without running against a writable host checkout.
+108. As a release owner, I want the host worktree clean and the staged tree hash verified against the reviewed commit before acceptance, so that untracked credentials or unreviewed edits cannot enter the run.
+109. As a network-safety owner, I want Windows Sandbox networking disabled and every live-test opt-in set to `0`, so that deterministic Ticket 06 cannot contact providers or paid models.
+110. As a credential owner, I want `.env`, `.env.enterprise`, API keys, cookies, provider credentials, credential stores, and credentialed URLs excluded from every Sandbox input, so that the offline run has no production authority.
+111. As a runtime owner, I want guest-local profile, temp, cache, checkpoint, report/log, Python-cache, pytest-temp, and TradingAgents data roots, so that no application default resolves to the host user profile.
+112. As a reproducibility owner, I want a hash-locked offline Python/dependency/tool bundle, so that Ticket 06 needs no network installation and every executable artifact has deterministic identity.
+113. As a dependency owner, I want portable Git included only if in-sandbox checks require it, so that the bundle contains no unnecessary host integration.
+114. As an audit owner, I want one new empty writable host export directory and no other writable host mapping, so that the guest output boundary is bounded and reviewable.
+115. As an acceptance reader, I want the export to identify source, bundle, runner/config, QCF/PE/AC results, probes, pytest, Ruff, and diff checks, so that the run can be reconstructed without trusting unbounded logs.
+116. As a privacy owner, I want runtime databases, production-state copies, secrets, and unsafe unbounded logs excluded from export, so that acceptance evidence cannot leak protected material.
+117. As a verifier owner, I want the canonical protected inventory computed independently on the host before and after the run, so that guest self-report cannot declare containment.
+118. As a provider-ledger owner, I want exact sequence/attempt counts and digests unchanged, so that zero append, deletion, or rewrite is mechanically proven.
+119. As a calendar owner, I want the persisted production revision and session content unchanged, so that deterministic acceptance cannot modify the authoritative Market Session Calendar.
+120. As a historical-evidence owner, I want the four fake-Yahoo incidents, `isolated-python-write-probe`, prior baselines, checkpoints/reports, and Ticket 07 evidence retained unchanged, so that failures are never repaired or rebaselined away.
+121. As a qualification owner, I want the L2 adversarial matrix run by itself before Ticket 06, so that the OS boundary is proven before it protects acceptance.
+122. As a test author, I want ordinary sandbox-local temp, runtime, SQLite, and payload writes to succeed, so that containment does not break valid deterministic behavior.
+123. As a Windows operator, I want edition, virtualization, feature enablement, minimal launch, and boundary probes qualified before accepting the runner, so that a `.wsb` file alone is not mistaken for a working boundary.
+124. As an operator on an unsupported host, I want `needs-info` and the separately specified full dedicated-VM fallback, so that QCF17 is never weakened to Python-only isolation.
+125. As a baseline owner, I want the post-incident baseline frozen only after boundary-only qualification passes with zero host delta, so that a baseline cannot legitimize a containment failure.
+126. As a Ticket 06 owner, I want systemic isolation, CAL suites, 06B, QCF1–QCF18, PE1–PE15, AC1–AC13, live-test isolation, non-integration, two full-suite passes, Ruff, diff, and executable reviews all run inside the same qualified Sandbox, so that acceptance is not split across trust boundaries.
+127. As a QCF17 owner, I want PASS to require both correct sandbox-local acceptance behavior and exact host before/after equality, so that neither application correctness nor containment can mask failure in the other.
+128. As a QCF18 owner, I want QCF18 credited as PASS only after QCF17 passes, so that evidence may be collected in the one Sandbox run without accepting a final regression result under a failed containment claim.
+129. As a Ticket 07 owner, I want Ticket 07 blocked until ISO-01 through ISO-04 and final Ticket 06 pass, so that completed calendar readiness cannot bypass acceptance containment.
+130. As a rollout owner, I want a separate fresh Ticket 07 authorization after Ticket 06, so that the deterministic Sandbox runner neither performs nor authorizes live production analysis.
 
 ## Implementation Decisions
 
@@ -1430,10 +1480,183 @@ singleton.
   results, and authority. This feature adds acceptance; it does not amend those
   criteria.
 
+### QCF17 L2 Windows Sandbox acceptance boundary
+
+- **Current state.** CAL-01 through CAL-04 and the production BaoStock mainland
+  calendar bootstrap are complete; the persisted production calendar revision
+  remains authoritative. Ticket 06 deterministic/business behavior is green
+  except QCF17 containment. No new baseline is frozen, no part of Ticket 06 or
+  Ticket 07 is authorized by this amendment, `qualified_v1` remains disabled,
+  and Ticket 07 remains blocked.
+- **Settled boundary.** Design B contains Design E. Windows Sandbox is the
+  OS/filesystem boundary; one exact disposable guest-local source copy is the
+  writable execution workspace. A Python/sitecustomize guard is secondary L1
+  defense only. QCF17 must not depend on import hooks, environment inheritance,
+  or a writable disposable source copy running directly on the host.
+- **Containment level.** L2 covers ordinary arbitrary user-mode deterministic
+  descendants even when they know the exact absolute host protected path. It
+  includes ordinary Python, `python -I`, `python -S`, `python -E`,
+  multiprocessing `spawn`, PowerShell children, `cmd` children, direct
+  filesystem calls, and direct SQLite opens/writes. L3 malicious Windows
+  Sandbox/Hyper-V/kernel/driver/firmware escape, attack on the trusted host
+  inventory process, and administrator-level host compromise are outside this
+  acceptance claim. Protected host writers must be quiescent from the before
+  inventory through the after inventory.
+- **Protected host set.** A versioned, reviewed protected-root manifest is part
+  of every run identity. At minimum it includes
+  `C:\Users\56922\.tradingagents` in full; the application provider/coordinator
+  ledger and SQLite sidecars; production Market Session Calendar state and
+  payloads; historical Ticket 07 evidence; production checkpoints; production
+  reports/logs; all retained baselines/inventories and incident evidence; and
+  every additional application-default or QCF17 root declared by the existing
+  immutable-state verifier. Missing, unresolved, unexpectedly absent, or
+  reparse-point targets fail host preflight rather than narrowing protection.
+- **Host mapping rule.** Protected host roots are not mapped into the Sandbox.
+  If an implementation needs inspection input, it may map only a prepared,
+  path-redacted immutable snapshot/inventory, or exceptionally a reviewed input
+  mapping with `ReadOnly=true`. The real protected root is never exposed
+  read-write. Host home, host temp, host venv, audit working directory,
+  credential stores, and production evidence roots are also absent.
+- **Exact source staging.** The host requires a clean reviewed `HEAD`, records
+  commit ID and tree hash, inventories the staged content, and creates a sealed
+  source archive without executing project code or hooks. The archive excludes
+  untracked files and credentials. It is mapped read-only, copied into one
+  sandbox-local writable repository, and reconstructed as a sanitized synthetic
+  Git worktree whose tree hash must equal the reviewed source tree before any
+  executable acceptance command runs. Tests never run against a writable host
+  repository mapping.
+- **Sandbox workspace.** The versioned layout has read-only input roots for
+  source, runtime bundle, runner, and path-redacted control inventory; writable
+  guest-local roots for the repository, Python/venv, runtime profile, temp,
+  TradingAgents data/cache/history/checkpoints/reports/logs, Python caches,
+  pytest temp, payloads, and output; and one host-backed export root. `HOME`,
+  `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`, all supported
+  `TRADINGAGENTS_*` writable roots, Python cache variables, and pytest temp are
+  explicitly assigned inside the guest. No guest default may resolve to the
+  host user profile.
+- **Versioned `.wsb` configuration.** Microsoft-supported Windows Sandbox
+  configuration semantics are used. The config sets
+  `<Networking>Disable</Networking>`, maps source/runtime/runner/control with
+  `<ReadOnly>true</ReadOnly>`, maps exactly one new empty result folder
+  read-write, disables clipboard redirection unless a reviewed requirement
+  proves it necessary, and minimizes vGPU, audio/video input, printer, and other
+  host integration surfaces. `ProtectedClient` is enabled when supported. A
+  logon/bootstrap command is present only when required and its identity is
+  included in the runner manifest.
+- **Network and live-test controls.** Physical Sandbox networking is disabled
+  for final deterministic Ticket 06, and qualification fails if an IPv4 or IPv6
+  default route is available. Every repository-defined `RUN_LIVE_*` variable is
+  enumerated and set to `0`; at minimum this includes DeepSeek, provider, and
+  Tushare live opt-ins. `PYTHON_DOTENV_DISABLED=1` is set. No provider/model
+  access, paid model, dependency download, or calendar refresh is permitted.
+- **Credentials.** Source, runtime, runner, control, and export validation reject
+  repository `.env`, `.env.enterprise`, provider/model credentials, API keys,
+  cookies, user credential stores, package-index tokens, and credentialed URLs.
+  Tests receive placeholder non-secret deterministic values only where their
+  external contract requires a value.
+- **Offline execution bundle.** A separately prepared, reviewed, content-
+  addressed execution bundle binds the reviewed source archive/input identity,
+  supported Windows CPython version/installer, complete hash-locked project and
+  Ticket 06 development dependencies, wheelhouse, bootstrap/runner support
+  files, and portable Git only if the suite actually requires Git. Source may
+  remain a separate read-only mapping, but its hash is part of the same expected
+  execution manifest. Every installer, lock, wheel, executable, DLL, archive,
+  and support file has a SHA-256 (or equivalent deterministic identity). The
+  network-disabled guest verifies the manifest, installs
+  to guest-local paths, uses `--no-index --require-hashes --find-links`, and
+  installs the staged project with `--no-deps --no-build-isolation`. It never
+  reuses the host venv or downloads during acceptance.
+- **Bounded result export.** The sole writable host mapping is a newly created,
+  empty, run-specific results directory. The guest writes a completion marker
+  last and exports bounded machine-readable acceptance status; pytest summaries;
+  Ruff and diff/whitespace results; QCF1–QCF18, PE1–PE15, and AC1–AC13 results;
+  adversarial and normal-write probe results; reviewed commit/tree/source hash;
+  offline bundle manifest/hash; and Sandbox runner/config identities. It does
+  not export runtime provider databases, secrets, host production-state copies,
+  raw provider/model data, or unbounded unsafe logs. The host never treats the
+  completion marker or guest verdict as final authority.
+- **Host before/after authority.** Before launch, the host quiesces writers,
+  resolves the same canonical protected manifest, records every relative path,
+  file length, bytes/SHA-256, SQLite file and sidecar, and runs the existing
+  read-only semantic verifier. After Sandbox exit, the host repeats both
+  inventories independently against the identical manifest. PASS requires the
+  same files and bytes; the same provider sequence count/digest and attempt
+  count/digest; the same calendar revision/content; the same checkpoint,
+  report/log, prior baseline, incident, and Ticket 07 evidence; and zero append,
+  delete, rewrite, or semantic change. Any delta is QCF17 FAIL and cannot be
+  repaired, waived, deleted, or rebaselined within the run.
+- **Historical incidents and baseline freeze.** Permanently retain the four
+  deterministic fake-Yahoo provider incidents, `isolated-python-write-probe`,
+  every old baseline/inventory under its existing identity, and failed Ticket
+  07 material. Do not delete, repair, renumber, or reinterpret them. Freeze one
+  new named additive post-incident baseline only after the OS boundary-only
+  qualification and normal-write smoke pass with exact host equality. The
+  baseline identity binds the qualified source, runtime bundle, runner/config,
+  and protected-manifest identities.
+- **Boundary-only qualification.** Before final Ticket 06, run only the
+  adversarial isolation matrix inside a fresh Sandbox. Target the exact host
+  protected paths through ordinary Python, `python -I`, `python -S`,
+  `python -E`, multiprocessing `spawn`, PowerShell `Set-Content`, `cmd` output
+  redirection, direct filesystem writes, and direct SQLite DDL/DML. For unmapped
+  roots, the host object must be absent from the guest namespace; a same-spelled
+  guest-local object is contained. For an exceptional read-only inspection
+  mapping, every write must be OS-denied. The trusted host after inventory must
+  equal the before inventory in either case. The Stage-1 `python -I` probe is a
+  required, valid qualification probe for this strengthened runner.
+- **Valid local-write control.** The same qualification must successfully write
+  sandbox-local temp files, TradingAgents runtime roots, SQLite databases, and
+  payloads. Containment blocks host mutation without breaking ordinary
+  deterministic test writes.
+- **Windows Sandbox qualification.** Before accepting the runner, confirm a
+  supported Windows edition, virtualization/hypervisor and nested-virtualization
+  requirements where applicable, enable `Containers-DisposableClientVM`, launch
+  a minimal Sandbox, execute the full boundary probe matrix and local-write
+  controls, and prove the protected host inventory unchanged. If the machine
+  cannot support Windows Sandbox, return `needs-info` and select the separately
+  specified full dedicated-VM fallback with equivalent unmapped-host semantics.
+  Do not weaken QCF17 to Python-only guards, a disposable host copy, ACLs without
+  separate qualification, or process-isolated Windows containers.
+- **Final Ticket 06 location.** After boundary qualification passes and the new
+  baseline is frozen, every executable Ticket 06 command runs entirely inside
+  the same qualified runner on the exact reviewed identities: systemic
+  persistence isolation; CAL-01–CAL-04 deterministic suites; 06B; QCF1–QCF18;
+  PE1–PE15; AC1–AC13; live-test isolation; non-integration; the full supported
+  suite twice; Ruff; diff/whitespace; and required reviews/checks that execute
+  code. No executable acceptance slice runs on the host or is split across host
+  and guest. Host work is limited to source/bundle staging and verification,
+  protected inventories, Sandbox launch/monitoring, bounded result validation,
+  and the final verdict.
+- **QCF17/QCF18 semantics.** QCF17 remains one criterion with two mandatory
+  conjunctive clauses: (A) sandbox-local acceptance and forward-only historical
+  behavior are correct; and (B) the trusted host before/after byte and semantic
+  inventories are identical. A Python guard failure is not itself a host
+  mutation when the OS boundary contains it, but any host mutation is QCF17
+  FAIL. The one complete Sandbox invocation may collect the QCF18 executable
+  evidence required by the matrix, but QCF18 remains conditionally unevaluable
+  and cannot be credited as PASS until the host has established QCF17 PASS after
+  Sandbox exit. No QCF, PE, or AC criterion is waived or renumbered.
+- **Ticket 07 gate.** Ticket 07 remains blocked until ISO-01 through ISO-04 are
+  implemented in order, OS qualification passes, the additive baseline is
+  frozen, the complete Ticket 06 run finishes inside the qualified runner,
+  QCF17 and QCF18 pass, host inventory delta is zero, and a separate fresh
+  Ticket 07 authorization is granted. Ticket 07 remains outside this
+  deterministic Sandbox runner when its authorized live provider/model work
+  requires ordinary production execution.
+
 ## Testing Decisions
 
 ### Test philosophy and seams
 
+- The highest acceptance seam is one host-owned, versioned Windows Sandbox
+  runner around every executable Ticket 06 command, with the existing immutable-
+  state verifier executed independently on the host before launch and after
+  exit. Tests assert the externally observable guest result bundle and exact
+  host byte/semantic equality, not private runner function order. No lower test
+  seam can substitute for this QCF17 authority.
+- Boundary qualification is a separate pre-acceptance seam. It runs only the L2
+  exact-path adversarial matrix and the sandbox-local valid-write controls, then
+  requires equal host inventories. It does not run any Ticket 06 or Ticket 07
+  criterion and it must pass before the final baseline is frozen.
 - Deterministic tests use fixed clocks, fake sleepers, fake SDK/transport objects,
   disposable existing stores, retained immutable artifacts, and fake models.
   They make no live-provider calls and assert observable contracts rather than
@@ -1503,6 +1726,17 @@ singleton.
 - The real two-symbol gate is deliberately separate from deterministic
   acceptance. It runs only after all non-live criteria pass and only with
   explicit operator authorization.
+- The `python -I` absolute-path probe is prior art for the strengthened boundary,
+  while existing pytest persistence-isolation and immutable-state-verifier
+  tests remain prior art for L1 diagnostics and host semantic inventory. Probe
+  assertions distinguish OS denial or guest-local containment from host
+  mutation, and separately prove successful guest-local temp/runtime/SQLite/
+  payload writes.
+- Result-contract tests reject missing or mismatched source, bundle, runner,
+  config, protected-manifest, and completion identities; incomplete QCF/PE/AC,
+  pytest, Ruff, diff, probe, or host-inventory evidence; extra writable host
+  mappings; secrets/runtime databases in export; and any attempt to trust a
+  guest verdict without the host after inventory.
 
 ### Deterministic acceptance criteria
 
@@ -1550,8 +1784,8 @@ strengthens, but does not waive or replace, QCF4–QCF12:
 | QCF14 | Inject failure after each construction step, at every eligibility-metadata acquisition and context-binding step, during graph initialization, during provider dispatch, during graph execution, during checkpoint publication, and interrupt with `KeyboardInterrupt`. | The original failure remains primary; no partial context or callable dispatcher escapes; interrupt/close occur exactly once; new work stops; all sessions, BaoStock login, coordinator connections/store, leases, and workers are released or terminally abandoned; repeated close is harmless; no process-global mutable provider or eligibility state remains. |
 | QCF15 | Put tokens, credential-like text, URLs with credentials, and raw provider exception text in fake environment values and transport failures. | Tokens and raw errors are absent from config, plan, repr, IDs, events, exceptions, logs, reports, checkpoints, artifacts, manifests, audits, and terminal output; only existing typed safe diagnostics cross boundaries. |
 | QCF16 | Compare legacy output, qualified shadow output, daily market acquisition, Evidence Admission, Decision Gate, report, checkpoint, and decision audit before and after built-in registration. | Legacy-selected output and daily AKShare -> BaoStock -> Yahoo routing are unchanged; qualified output remains `shadow_non_authoritative`; no factory result changes admitted evidence or decision authority. |
-| QCF17 | Open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs—including the failed Ticket 07 run—then create a new built-in-factory run. | Historical material is byte-for-byte untouched, remains readable, and is interpreted only under its recorded semantic and temporal contracts; new qualified material uses the exact plan-1.3/context-v2 forward versions while unchanged raw artifact/candidate namespaces remain stable; no in-place migration, temporal reinterpretation, rewrite, deletion, or ID renumbering occurs. |
-| QCF18 | Run PE1–PE15 and parent AC1–AC13 with their existing fixtures and expected results, followed by the full supported suite, Ruff, and whitespace/diff checks. | Every criterion passes unchanged and without waiver. QCF1–QCF18, PE1–PE15, AC1–AC13, and the full supported suite are run twice from the changed tree; any failure blocks the real rollout gate. |
+| QCF17 | Inside the boundary-qualified Windows Sandbox, open representative historical reports, checkpoints, artifacts, attempts, manifests, audits, snapshots, pins, and IDs—including all four retained fake-Yahoo incidents, `isolated-python-write-probe`, prior baselines, and failed Ticket 07 evidence—then execute the complete deterministic acceptance against sandbox-local state. Independently inventory the canonical protected host set immediately before launch and after exit. | **Both clauses pass:** (A) sandbox-local acceptance behaves correctly, historical material remains unchanged/readable under its recorded semantic and temporal contracts, new qualified material uses exact plan-1.3/context-v2 forward versions, ordinary sandbox-local writes succeed, and protected-path adversarial writes are OS-denied or guest-local only; (B) trusted host byte and semantic inventories are exactly identical, including files/digests, provider sequence/attempt counts and digests, calendar revision/content, checkpoints/reports/logs, incident evidence, and Ticket 07 evidence, with zero append/delete/rewrite. Python guard behavior is secondary; any host mutation fails QCF17 and cannot be repaired, waived, or rebaselined. |
+| QCF18 | In the same qualified Sandbox invocation, collect the PE1–PE15 and parent AC1–AC13 results with their existing fixtures and expectations, followed by the full supported suite, Ruff, and whitespace/diff checks. Evaluate QCF18 only after Sandbox exit and **conditional on QCF17 PASS**. | Every criterion passes unchanged and without waiver. QCF1–QCF18, PE1–PE15, AC1–AC13, and the full supported suite run twice from the exact reviewed sandbox-local tree; the bounded export is complete; the final host inventory remains equal; QCF18 is not credited when QCF17 fails, and any failure blocks Ticket 06 and the real rollout gate. |
 
 ### 06B deterministic temporal acceptance matrix
 
@@ -1589,14 +1823,16 @@ AC1–AC13, non-integration/full suites, Ruff, diff/whitespace, secret/history
 checks, and two-stage review—twice from the same changed tree. Targeted temporal
 tests cannot by themselves re-authorize Ticket 07.
 
-The post-temporal Ticket 06 acceptance described above is now **PASS** on its
-reviewed pre-calendar-bootstrap production state. The specification/prototype
-amendment itself does not rerun Ticket 06. Because CAL-01 through CAL-03 will
-change production acquisition, storage, coordinator, and CLI surfaces, one full
-Ticket 06 rerun is required later on the exact reviewed post-CAL production tree
-after CAL-01 through CAL-03 implementation and CAL-04 acceptance are complete.
-That later rerun preserves QCF1–QCF18, PE1–PE15, and AC1–AC13 unchanged; it is a
-regression prerequisite, not a reopening of the settled temporal design.
+The post-temporal Ticket 06 acceptance described above remains a historical
+**PASS** on its reviewed pre-calendar-bootstrap production state. CAL-01 through
+CAL-04 and the authorized production calendar bootstrap are now complete and
+persisted, and later deterministic/business checks are otherwise green. The
+specification amendment itself does not rerun Ticket 06. The final complete
+post-CAL Ticket 06 run remains blocked solely on the strengthened QCF17 OS
+boundary: it must run on the exact reviewed state entirely inside the qualified
+Sandbox after ISO-01 through ISO-03 and the additive post-incident baseline
+freeze. It preserves QCF1–QCF18, PE1–PE15, and AC1–AC13 unchanged and adds no
+waiver or temporal-policy reopening.
 
 ### CAL-04 deterministic calendar-bootstrap acceptance matrix
 
@@ -1624,15 +1860,15 @@ PE1–PE15, AC1–AC13, or the completed 06B temporal matrix.
 
 ### Final real two-symbol shadow rollout gate
 
-There are two distinct future live-provider authorizations and neither is run
-while amending the specification or implementing deterministic tests. First,
-after CAL-01 through CAL-04 and review, an operator separately authorizes the
-production calendar bootstrap. It may perform only the bounded BaoStock
-login/`query_trade_dates`/logout workflow and calendar publication; it performs
-no model or symbol work. After exact-ID reopen/readiness passes and the complete
-Ticket 06 regression rerun passes on that exact reviewed production state, a
-fresh authorization is required for Ticket 07 itself. Calendar-bootstrap
-authorization is not Ticket 07 authorization.
+The separately authorized production calendar bootstrap has completed after
+CAL-01 through CAL-04 and is persisted; it authorized only the bounded BaoStock
+login/`query_trade_dates`/logout workflow and calendar publication, not model or
+symbol work. That completed authorization is historical operational evidence,
+not Ticket 07 authorization. The complete Ticket 06 regression must still pass
+entirely inside the qualified Windows Sandbox runner with QCF17/QCF18 PASS and
+zero host inventory delta. Only then may an operator grant a fresh, separate
+Ticket 07 authorization. Neither Ticket 06 nor Ticket 07 runs while amending
+this specification.
 
 Before any Ticket 07 analysis run ID, checkpoint namespace, provider/model
 runtime, or symbol-specific work is allocated, preflight must read the exact
@@ -1706,10 +1942,14 @@ design evidence only and is not copied into production.
 | **02H — Temporal proof projection/acquisition integration** | Project only the exact provider-origin effective/publication derivations listed above for fresh and retained company-type/listing metadata; replace all exact-local-date authorities with the single evaluator; bind one fixed evaluation context through acquisition, context construction, request binding, and relevant listing/lifecycle seams; fail closed without request-date backfill. Preserve provider routes and single-flight ownership. | 02G, 02B, and 02D. | 05C, 06B, Ticket 06, and Ticket 07. |
 | **05C — Temporal checkpoint/replay compatibility** | Persist policy/calendar versions, requested session/mode, fixed evaluation inputs, provider proof/timestamps, latest-completed binding, strict proof, accepted/rejected result/reasons, and decision identity in context v2, cache checkpoint 1.2, ledger 1.6, manifest v4, and exact downstream projections. Reproduce exact decisions with zero provider/model I/O and no restore-time frontier lookup. Plan-1.2/context-v1 under plan 1.3 fails typed or requires explicit `START_NEW`; no migration or historical reinterpretation. | 02G, 02H, 05A, and 05B. | 06B, Ticket 06, and Ticket 07. |
 | **06B — Deterministic temporal acceptance** | Run every temporal matrix above: next-day 00:48, before/during next session, next-session close, weekend, holiday, stale reuse, announcement/effective-proof failures, strict cutoff/exact revision proof, zero-I/O every-case replay, and concurrent first acquisition with one fixed evaluation. Then rerun complete QCF1–QCF18, PE1–PE15, AC1–AC13, non-integration/full suites, Ruff, history/secret/diff checks, and two-stage review twice. No live providers or paid models. | 02H, 05C, 06A, and all existing Ticket 06 prerequisites. | Ticket 06 and Ticket 07. |
-| **CAL-01 — Standalone BaoStock calendar acquisition and exact attempt accounting** | Implement the Instrument-neutral bounded `query_trade_dates` request/normalizer and the lease-owned coordinator workflow with exactly one login, query, and logout event; enforce authorization, typed provider/cooldown outcomes, no hidden retry, single-flight, and safe cleanup. Do not use the Instrument-specific Provider Subrequest Cache or publish calendar rows here. | Accepted calendar-bootstrap prototype report, ADR-0031, ADR-0036, and existing BaoStock/coordinator seams. | CAL-02. |
-| **CAL-02 — Publication/readiness hardening and exact revision reader** | Bind canonical calendar-only content and `mainland-cn-regular-session-times-v1` into existing revision semantics; harden the existing atomic publisher/existing-row verification; add exact-ID read; implement structural range/frontier/forward-horizon readiness, idempotent semantic reuse, forced-refresh audit, rollback, and historical compatibility. No second writer or namespace. | CAL-01 and existing Market History Store publisher/schema/mutex. | CAL-03. |
-| **CAL-03 — Explicit programmatic and CLI bootstrap** | Add `bootstrap_mainland_session_calendar(...)` and the maintenance command with required provider/market/bounds/evaluation/authorization inputs, optional forced refresh, safe receipt/exit contract, persisted-ready zero-I/O reuse, exact-ID verification, and no qualified analysis/model construction. | CAL-02. | CAL-04. |
-| **CAL-04 — Deterministic bootstrap acceptance and two-stage review** | Prove the complete CAL-04 matrix against real store/coordinator seams with fake transport and fixed clocks; run targeted tests and scaled repository checks; perform spec-compliance then code-quality review. No live provider or paid-model I/O. | CAL-03. | Explicitly authorized production bootstrap. |
+| **CAL-01 — Standalone BaoStock calendar acquisition and exact attempt accounting (complete)** | Implement the Instrument-neutral bounded `query_trade_dates` request/normalizer and the lease-owned coordinator workflow with exactly one login, query, and logout event; enforce authorization, typed provider/cooldown outcomes, no hidden retry, single-flight, and safe cleanup. Do not use the Instrument-specific Provider Subrequest Cache or publish calendar rows here. | Accepted calendar-bootstrap prototype report, ADR-0031, ADR-0036, and existing BaoStock/coordinator seams. | CAL-02. |
+| **CAL-02 — Publication/readiness hardening and exact revision reader (complete)** | Bind canonical calendar-only content and `mainland-cn-regular-session-times-v1` into existing revision semantics; harden the existing atomic publisher/existing-row verification; add exact-ID read; implement structural range/frontier/forward-horizon readiness, idempotent semantic reuse, forced-refresh audit, rollback, and historical compatibility. No second writer or namespace. | CAL-01 and existing Market History Store publisher/schema/mutex. | CAL-03. |
+| **CAL-03 — Explicit programmatic and CLI bootstrap (complete)** | Add `bootstrap_mainland_session_calendar(...)` and the maintenance command with required provider/market/bounds/evaluation/authorization inputs, optional forced refresh, safe receipt/exit contract, persisted-ready zero-I/O reuse, exact-ID verification, and no qualified analysis/model construction. | CAL-02. | CAL-04. |
+| **CAL-04 — Deterministic bootstrap acceptance and two-stage review (complete)** | Prove the complete CAL-04 matrix against real store/coordinator seams with fake transport and fixed clocks; run targeted tests and scaled repository checks; perform spec-compliance then code-quality review. No live provider or paid-model I/O. | CAL-03. | The separately authorized, now-complete production bootstrap. |
+| **ISO-01 — Versioned Windows Sandbox runner/config and exact disposable workspace** | Implement the reviewed host launcher, protected-root manifest contract, Microsoft-supported `.wsb` configuration, read-only source/runner/control mappings, sole writable result mapping, exact source archive/tree verification, guest-local writable repository/runtime layout, live-opt-in/credential rejection, and bounded export schema. Do not launch Ticket 06 or copy prototype implementation into production. | Completed CAL-01–CAL-04, persisted production calendar readiness, and the accepted QCF17 isolation-boundary report. | ISO-02. |
+| **ISO-02 — Hash-locked offline runtime/dependency bundle and manifest** | Produce the reviewed content-addressed Windows execution bundle with pinned CPython, exact hash-locked wheelhouse and Ticket 06 tooling, project installation inputs, optional portable Git only when required, offline installer/bootstrap behavior, and complete SHA-256 manifest. Prove secret-free bundle validation and no network dependency. | ISO-01's runner/input contract. | ISO-03. |
+| **ISO-03 — OS boundary/adversarial qualification and host inventory harness** | Qualify Windows edition/feature/hypervisor and minimal Sandbox launch; implement the canonical host before/after byte plus semantic inventory around the full L2 adversarial matrix and successful guest-local write controls; require protected roots absent or OS-read-only denied and exact host equality. Run boundary qualification only—no Ticket 06/07—and return `needs-info` for the separately specified full-VM fallback when Sandbox is unsupported. | ISO-02 and the existing immutable-state verifier. | Additive final host-baseline freeze. |
+| **ISO-04 — Final Sandbox-contained Ticket 06 acceptance and QCF17/QCF18 closure** | After ISO-03 PASS and the newly named post-incident baseline freeze, execute all Ticket 06 commands entirely inside one qualified Sandbox on the exact reviewed source/bundle/runner/config identities; export the bounded result contract; require QCF17 then conditional QCF18 PASS and exact host inventory equality. No live provider/model I/O, Ticket 07, or `qualified_v1` activation. | ISO-03 and final additive baseline freeze. | Ticket 06 PASS, then eligibility for a fresh Ticket 07 authorization. |
 
 The exact dependency graph is:
 
@@ -1728,12 +1968,16 @@ The exact dependency graph is:
 02G + 02H + 05A + 05B -> 05C
 03 + 02D + 04A + 02F + 05B -> 06A
 02H + 05C + 06A + all existing Ticket 06 prerequisites -> 06B
-03 + 02D + 04A + 05B + 06A + 06B -> 06 [currently PASS]
+03 + 02D + 04A + 05B + 06A + 06B -> 06 [post-temporal milestone PASS; final QCF17 closure pending ISO-04]
 
-CAL-01 -> CAL-02 -> CAL-03 -> CAL-04
-CAL-04 -> explicitly authorized production calendar bootstrap
-production bootstrap exact-ID readiness -> complete Ticket 06 rerun on exact reviewed production state
-Ticket 06 rerun PASS -> fresh Ticket 07 authorization
+CAL-01 -> CAL-02 -> CAL-03 -> CAL-04 [complete]
+CAL-04 -> explicitly authorized production calendar bootstrap [complete and persisted]
+production bootstrap exact-ID readiness -> ISO-01
+ISO-01 -> ISO-02 -> ISO-03
+ISO-03 PASS -> freeze new additive post-incident host baseline
+final baseline freeze -> ISO-04
+ISO-04 -> Ticket 06 PASS
+Ticket 06 PASS -> fresh Ticket 07 authorization
 fresh Ticket 07 authorization -> NEW 601328.SS
 NEW 601328.SS PASS -> NEW 600895.SS
 ```
@@ -1749,13 +1993,14 @@ proceed after Ticket 01; it does not own context construction. Existing Ticket
 04 remains the resource-lifecycle prerequisite to 04A. Existing Ticket 05
 remains the cache/dispatcher restoration prerequisite to 05A. Those prior work
 areas and Ticket 06 post-temporal acceptance are complete/PASS; this amendment
-does not rerun them. CAL-01 through CAL-04 are the new additive chain. Because
-CAL-01 through CAL-03 will modify production behavior, the complete Ticket 06
-suite must be rerun once on the exact reviewed post-CAL production tree, after
-CAL-04 and the explicitly authorized production bootstrap, before Ticket 07.
-Ticket 07 remains blocked until that bootstrap revision is reopened by exact ID,
-passes readiness with zero read-time provider I/O, the complete Ticket 06 rerun
-passes, and a separate fresh Ticket 07 live authorization is granted.
+does not rerun them. CAL-01 through CAL-04 and the separately authorized
+production bootstrap are also complete, with the production calendar revision
+persisted unchanged. ISO-01 through ISO-04 are the remaining additive chain
+integrated after that completed CAL path; they do not create a parallel feature,
+calendar authority, provider route, or acceptance criterion. Ticket 06 is
+otherwise green but cannot become final PASS until ISO-04 completes with
+QCF17/QCF18 PASS and zero host inventory delta. Ticket 07 remains blocked until
+that result and a separate fresh live authorization are both present.
 
 ## Out of Scope
 
@@ -1813,6 +2058,27 @@ passes, and a separate fresh Ticket 07 live authorization is granted.
   ingestion, or a failed analysis run a calendar writer; executing Ticket 07;
   allocating its run ID; enabling `qualified_v1`; or using the production
   calendar-bootstrap authorization as Ticket 07 authorization.
+- Running any Ticket 06 command during ISO-03 boundary qualification, running
+  Ticket 06 or Ticket 07 while amending this specification, or splitting final
+  Ticket 06 execution between host and Sandbox.
+- Freezing another acceptance baseline before ISO-03 passes, replacing an old
+  baseline, deleting or repairing the four fake-Yahoo incidents or
+  `isolated-python-write-probe`, or treating any protected-state mutation as an
+  acceptable additive baseline change.
+- Mapping the real protected host root read-write, running tests against a
+  writable host repository mapping, reusing the host venv, enabling Sandbox
+  networking for installation, or placing credentials/production databases in
+  the offline bundle or result export.
+- Treating Python import hooks, a disposable host-side copy, ACLs without their
+  own qualified boundary, or a process-isolated Windows container as equivalent
+  to the selected Windows Sandbox L2 boundary.
+- Defending against malicious Windows Sandbox/Hyper-V/kernel/driver/firmware
+  escape, compromise of the trusted host inventory process, or administrator-
+  level host compromise. Those are L3 security-program concerns.
+- Copying the QCF17 isolation-boundary prototype implementation into production
+  or treating its parsed scripts/state model as an executed Sandbox
+  qualification. Its report is authoritative design evidence; ISO-01 through
+  ISO-04 implement and prove the boundary through reviewed operational seams.
 
 ## Further Notes
 
@@ -1845,6 +2111,17 @@ passes, and a separate fresh Ticket 07 live authorization is granted.
   programmatic/CLI bootstrap service. The prototype report selected these seams
   because they retain one provider authority, one writer, one revision
   namespace, and read-only Ticket 07 preflight.
+- The outermost deterministic-acceptance seam is now fixed: the versioned host
+  launcher plus Windows Sandbox boundary encloses every executable Ticket 06
+  command, and the existing immutable-state verifier remains host-owned final
+  authority. Source/runtime/runner/control are read-only inputs, the disposable
+  repository and runtime are guest-local, and one bounded results directory is
+  the only writable host mapping.
+- The QCF17 isolation-boundary prototype report is authoritative design
+  evidence for Design B containing Design E, the L2/L3 boundary, source/bundle
+  identities, adversarial probes, host inventory, incident retention, and
+  baseline order. The prototype did not launch Windows Sandbox; implementation
+  must not report qualification until ISO-03 executes successfully.
 - `Status: ready-for-agent` is justified because fresh-run ownership, metadata
   applicability semantics, current-analysis latest-completed frontier, strict-
   PIT cutoff proof, provider-neutral `evidence_effective_as_of` provenance,
@@ -1857,9 +2134,14 @@ passes, and a separate fresh Ticket 07 live authorization is granted.
   publisher ownership, provider/session-time authority, exact semantic identity,
   bounded range, structural readiness/freshness, attempt accounting,
   concurrency, exact-ID verification, CLI authorization, and the Ticket 07
-  prerequisite. Ticket 06 post-temporal acceptance is **PASS**, but its complete
-  regression suite must run once on the exact reviewed post-CAL production tree
-  as specified. Ticket 07 remains **BLOCKED**, no run ID has been allocated, and
-  its failed evidence remains immutable. Any implementation that cannot satisfy
-  one of these decisions must return the specification to `needs-info` rather
-  than inventing a second owner or weakening a trust boundary.
+  prerequisite. CAL-01 through CAL-04 and the production calendar bootstrap are
+  complete and preserved. The exact L2 threat model, OS boundary, host mapping
+  rules, disposable workspace, offline bundle, result export, adversarial and
+  valid-write probes, independent host before/after verification, post-
+  qualification baseline freeze, and entirely in-Sandbox final Ticket 06
+  execution are fully resolved by ISO-01 through ISO-04. Ticket 06 is otherwise
+  green but remains blocked on that chain and QCF17/QCF18; Ticket 07 remains
+  **BLOCKED**, `qualified_v1` remains disabled, and historical evidence remains
+  immutable. If Windows Sandbox cannot be qualified, implementation must return
+  `needs-info` and select the separately specified dedicated-VM fallback rather
+  than inventing a second owner or weakening the containment boundary.
