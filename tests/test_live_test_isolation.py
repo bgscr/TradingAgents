@@ -42,6 +42,8 @@ def _run_guarded_live_tests(
     environment.pop("TUSHARE_TOKEN", None)
     environment["RUN_LIVE_DEEPSEEK_TESTS"] = "0"
     environment["RUN_LIVE_TUSHARE_TESTS"] = "0"
+    if dotenv_credentials:
+        environment["PYTHON_DOTENV_DISABLED"] = "0"
     environment["PYTEST_PLUGINS"] = "constructor_probe"
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(
@@ -63,6 +65,8 @@ def _run_guarded_live_tests(
             "-m",
             "pytest",
             "-q",
+            "--basetemp",
+            str(tmp_path / "pytest-temp"),
             "-m",
             "live",
             str(_REPOSITORY_ROOT / "tests"),

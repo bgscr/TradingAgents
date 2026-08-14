@@ -123,6 +123,15 @@ def test_default_runtime_cli_smoke_preserves_clean_worktree(tmp_path: Path) -> N
 
     env = os.environ.copy()
     env["TRADINGAGENTS_PROJECT_ROOT"] = str(smoke_repo)
+    for name in (
+        "TRADINGAGENTS_RESULTS_DIR",
+        "TRADINGAGENTS_CACHE_DIR",
+        "TRADINGAGENTS_MEMORY_LOG_PATH",
+        "TRADINGAGENTS_MARKET_HISTORY_DATABASE_PATH",
+        "TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT",
+        "TRADINGAGENTS_MARKET_HISTORY_BACKUP_ROOT",
+    ):
+        env.pop(name, None)
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))
     )

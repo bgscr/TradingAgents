@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -68,6 +69,7 @@ from tradingagents.market_history import (
     TradingStatus,
     TradingStatusObservation,
 )
+from tradingagents.market_history.config import provider_request_authority_config
 from tradingagents.market_history.coordinator import (
     upstream_service_identity_for_provider,
 )
@@ -82,6 +84,20 @@ from tradingagents.market_history.snapshot_identity import (
     snapshot_v2_identity,
 )
 from tradingagents.strategy_registry import create_production_decision_policy
+
+
+def _coordinator_counts(database_path: Path) -> tuple[int, int]:
+    with sqlite3.connect(
+        f"file:{database_path.as_posix()}?mode=ro",
+        uri=True,
+    ) as connection:
+        row = connection.execute(
+            "SELECT (SELECT COUNT(*) FROM provider_request_sequences), "
+            "(SELECT COUNT(*) FROM provider_request_attempts)"
+        ).fetchone()
+    if row is None:
+        raise AssertionError("coordinator count query returned no row")
+    return int(row[0]), int(row[1])
 
 
 def _crypto_dataset_descriptor(
@@ -2208,12 +2224,18 @@ def test_contradictory_crypto_dataset_fails_before_provider_publication(
 
 
 def test_run_scoped_crypto_snapshot_cache_rejects_a_contradictory_configuration(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    set_config(copy.deepcopy(DEFAULT_CONFIG))
+    runtime_config = copy.deepcopy(get_config())
+    set_config(runtime_config)
+    coordinator_config = provider_request_authority_config(
+        MarketHistoryConfig.from_mapping(runtime_config)
+    )
+    assert coordinator_config.database_path.is_relative_to(tmp_path)
     asset_configuration = resolve_run_asset_configuration(
         "SOL-USD",
-        config=copy.deepcopy(DEFAULT_CONFIG),
+        config=runtime_config,
     )
     contradictory = asset_configuration.model_copy(
         update={"registry_digest": "b" * 64}
@@ -2256,6 +2278,7 @@ def test_run_scoped_crypto_snapshot_cache_rejects_a_contradictory_configuration(
             )
 
     assert provider_calls == 1
+    assert _coordinator_counts(coordinator_config.database_path) == (1, 1)
 
 
 def test_initially_unbound_snapshot_run_binds_first_crypto_configuration(
@@ -2699,6 +2722,7 @@ def test_decision_audit_records_complete_crypto_asset_configuration(
 def test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semantics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    application_default_config_snapshot: dict[str, object],
 ) -> None:
     events: list[str] = []
 
@@ -2787,7 +2811,14 @@ def test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semant
             "evidence_gate_mode": "enforce",
         }
     )
-    assert Path(config["market_history_database_path"]).is_relative_to(tmp_path)
+    history_config = MarketHistoryConfig.from_mapping(config)
+    coordinator_config = provider_request_authority_config(history_config)
+    application_coordinator_config = provider_request_authority_config(
+        MarketHistoryConfig.from_mapping(application_default_config_snapshot)
+    )
+    assert history_config.database_path.is_relative_to(tmp_path)
+    assert coordinator_config.database_path.is_relative_to(tmp_path)
+    assert coordinator_config.database_path != application_coordinator_config.database_path
     selections = {
         "ticker": "SOL-USD",
         "analysis_date": "2026-07-25",
@@ -2937,3 +2968,17 @@ def test_yahoo_backed_sol_cli_and_programmatic_contracts_match_full_asset_semant
     assert checkpoint_snapshot["snapshot_id"] in rendered_reports
     assert model.invoke.call_count > 0
     model.stream.assert_not_called()
+    coordinator_counts = _coordinator_counts(coordinator_config.database_path)
+    with sqlite3.connect(
+        f"file:{coordinator_config.database_path.as_posix()}?mode=ro",
+        uri=True,
+    ) as connection:
+        fake_yahoo_attempts = connection.execute(
+            "SELECT operation, upstream_service_name, outcome "
+            "FROM provider_request_attempts ORDER BY attempted_at"
+        ).fetchall()
+    assert coordinator_counts == (2, 2)
+    assert fake_yahoo_attempts == [
+        ("market-snapshot", "Yahoo Finance", "available"),
+        ("market-snapshot", "Yahoo Finance", "available"),
+    ]

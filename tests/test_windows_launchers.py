@@ -125,9 +125,9 @@ def test_start_launcher_uses_project_local_development_roots_from_outside_repo(
         "TRADINGAGENTS_RESULTS_DIR",
         "TRADINGAGENTS_CACHE_DIR",
         "TRADINGAGENTS_MEMORY_LOG_PATH",
-        "TRADINGAGENTS_PROJECT_ROOT",
     ):
         env.pop(name, None)
+    env["TRADINGAGENTS_PROJECT_ROOT"] = str(project_dir)
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))
     )
@@ -179,12 +179,13 @@ def test_start_launcher_project_dotenv_overrides_development_roots(
         "TRADINGAGENTS_RESULTS_DIR",
         "TRADINGAGENTS_CACHE_DIR",
         "TRADINGAGENTS_MEMORY_LOG_PATH",
-        "TRADINGAGENTS_PROJECT_ROOT",
     ):
         env.pop(name, None)
+    env["TRADINGAGENTS_PROJECT_ROOT"] = str(project_dir)
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))
     )
+    env["PYTHON_DOTENV_DISABLED"] = "0"
 
     result = _run_script(launcher, "-DryRun", cwd=outside_dir, env=env)
 
