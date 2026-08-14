@@ -203,9 +203,10 @@ instead of running it.
   Important, and Minor counts, and all Critical/Important findings are resolved.
 - [x] Historical/security invariants pass, `qualified_v1` remains disabled, and
   no production bootstrap or Ticket 07 execution/run-ID allocation occurs.
-- [x] The downstream gate is recorded exactly and is not executed by CAL-04:
+- [x] The amended downstream gate is recorded exactly and was not executed by
+  CAL-04:
 
-  `CAL-04 → separately authorized production calendar bootstrap → exact-ID readiness verification → complete Ticket 06 rerun on the exact reviewed post-CAL production tree → fresh Ticket 07 authorization → NEW 601328.SS run → NEW 600895.SS only after bank PASS`.
+  `CAL-04 → production calendar bootstrap [complete] → production calendar readiness → ISO-01 → ISO-02 → ISO-03 → ISO-03 PASS → new additive post-incident host baseline freeze → ISO-04 → Ticket 06 PASS → fresh Ticket 07 authorization → NEW 601328.SS → NEW 600895.SS only after bank PASS`.
 
 ## Completion evidence (2026-08-13)
 

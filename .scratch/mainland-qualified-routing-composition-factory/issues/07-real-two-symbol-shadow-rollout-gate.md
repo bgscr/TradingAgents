@@ -2,52 +2,62 @@
 
 **Parent specification:** [Mainland qualified routing production composition factory](../spec.md)
 
-**What to build:** After a separately authorized production calendar bootstrap
-publishes a ready BaoStock-backed revision, exact-ID reopen/readiness completes
-with zero read-time provider I/O, and the complete post-CAL Ticket 06 rerun
-passes on the exact reviewed production tree, obtain a separate fresh Ticket 07
-live authorization and run the shipped built-in production
-composition through the real CLI validation seam for \`601328.SS\` and then
-\`600895.SS\`, one at a time for the same latest completed mainland session.
-Retain complete safe evidence showing exact/non-duplicated provider attempts,
-BaoStock Current Tradeability authority, report and decision-audit publication,
-\`shadow_non_authoritative\` qualified output, unchanged authoritative legacy
-output, and still-disabled \`qualified_v1\`.
+**What to build:** Only after final Ticket 06 PASS through ISO-04, obtain a
+separate fresh Ticket 07 live authorization and run the shipped built-in
+production composition through the real CLI validation seam for `601328.SS`
+first and `600895.SS` only after the new bank run passes, one at a time for the
+same latest completed mainland session. Retain complete safe evidence showing
+exact/non-duplicated provider attempts, BaoStock Current Tradeability authority,
+report and decision-audit publication, `shadow_non_authoritative` qualified
+output, unchanged authoritative legacy output, and still-disabled
+`qualified_v1`.
 
-**Blocked by:** CAL-04 — Deterministic bootstrap acceptance and two-stage review;
-a separately authorized production calendar bootstrap; exact-ID
-`mainland-session-calendar-readiness-v1` verification with zero read-time
-provider I/O; and a complete post-CAL Ticket 06 rerun PASS on the exact reviewed
-production tree. After those blockers clear, Ticket 07 still requires a separate
-fresh live authorization before allocating a NEW run ID.
+**Blocked by:** Final Ticket 06 PASS after ISO-04. After that deterministic
+blocker clears, Ticket 07 still requires a separate fresh live authorization
+before allocating a NEW run ID or opening provider/model resources.
 
 **Status:** blocked
 
-**Gate state:** BLOCKED after the 2026-08-12 authorized retry stopped before
-live execution because no repository-pinned mainland Market Session Calendar
-revision exists. The failed historical `601328.SS` run remains immutable. This
-remains the separately authorized live two-symbol gate; the production calendar
-bootstrap is a distinct earlier live operation with its own authorization.
-That blocked retry allocated no new run ID and performed zero provider/model
-I/O. The production store still contains no persisted mainland calendar
-revision. Authoritative `qualified_v1` remains disabled.
+**Gate state:** BLOCKED. CAL-01 through CAL-04, production mainland calendar
+bootstrap, and exact-ID readiness are complete and persisted. Final Ticket 06
+is otherwise green but cannot PASS until ISO-04 establishes conjunctive QCF17
+and conditional QCF18. The historical failed `601328.SS` run and the 2026-08-12
+calendar-missing blocked attempt remain immutable. No fresh Ticket 07
+authorization or NEW run/checkpoint namespace exists, no provider/model I/O is
+authorized, and authoritative `qualified_v1` remains disabled.
+
+## Exact dependency graph
+
+```text
+CAL-01 -> CAL-02 -> CAL-03 -> CAL-04 [complete]
+CAL-04 -> production calendar bootstrap [complete]
+production calendar readiness -> ISO-01
+ISO-01 -> ISO-02 -> ISO-03
+ISO-03 PASS -> freeze new additive post-incident host baseline
+baseline freeze -> ISO-04
+ISO-04 -> Ticket 06 PASS
+Ticket 06 PASS -> fresh Ticket 07 authorization
+fresh Ticket 07 authorization -> NEW 601328.SS
+NEW 601328.SS PASS -> NEW 600895.SS
+```
 
 ## Observable behavior
 
+- The completed production calendar bootstrap and exact-ID readiness remain
+  persisted prerequisite evidence. Their earlier authorization is not Ticket 07
+  authorization and cannot be reused for symbol/provider/model work.
 - Before any Ticket 07 run/checkpoint identity, provider/model runtime, or
-  symbol-specific work, an operator separately authorizes the production
-  calendar bootstrap. That authorization permits only bounded BaoStock
-  login/query/logout and calendar publication; it is not Ticket 07 authorization.
-- Preflight reopens the exact returned calendar revision ID and proves complete
-  range, authority/session-time contracts, latest completed session and close,
-  later open session and close, and exact identity/content with zero read-time
-  provider I/O. Missing, stale, incomplete, mismatched, or unreadable calendar
+  symbol-specific work, preflight reopens the exact persisted calendar revision
+  and proves complete range, authority/session-time contracts, latest completed
+  session and close, later open session and close, and exact identity/content
+  with zero provider I/O. Missing, stale, incomplete, mismatched, or unreadable
   state keeps this ticket blocked.
-- The operator confirms the complete post-CAL Ticket 06 rerun PASS on that exact
-  reviewed production tree, then obtains a separate fresh explicit Ticket 07
-  authorization under the configured Data Usage Mode and provider terms.
-  Without that distinct authorization, stop without allocating a run ID or
-  opening provider/model resources.
+- The operator confirms final Ticket 06 PASS after ISO-04 on the exact reviewed
+  source/bundle/runner/config/protected-manifest/baseline identities, including
+  QCF17 zero host delta and conditional QCF18 PASS. Only then may the operator
+  grant a separate fresh Ticket 07 authorization under the configured Data
+  Usage Mode and provider terms. Without that distinct authorization, stop
+  without allocating a run ID or opening provider/model resources.
 - Both runs use the shipped static built-in selection with no directly injected
   composition, no \`MODULE:CALLABLE\` operator factory, no test module, and no
   dynamic-import fixture.
@@ -85,17 +95,16 @@ revision. Authoritative `qualified_v1` remains disabled.
 
 ## Acceptance criteria
 
-- [ ] CAL-01–CAL-04 are complete, and the production calendar bootstrap has its
+- [x] CAL-01–CAL-04 are complete, and the production calendar bootstrap had its
   own explicit authorization and safe receipt. That authorization performs no
   symbol, analysis run/checkpoint, Ticket 07, or model work.
-- [ ] The exact returned `mainland-cn` revision is reopened by ID and passes
+- [x] The exact returned `mainland-cn` revision is persisted and has passed
   structural readiness with zero provider clients, permits, logical requests,
   transports, attempt events, or writes at read time.
-- [ ] The complete post-CAL Ticket 06 rerun is complete on the exact reviewed
-  post-CAL production tree with
-  passing temporal matrices, QCF1–QCF18, PE1–PE15, parent AC1–AC13,
-  non-integration/full-suite-twice, Ruff, history/security/diff, and two-stage-
-  review evidence before the first live call.
+- [ ] ISO-04 completes on the exact reviewed source, bundle, runner/config,
+  protected-manifest, and frozen-baseline identities, and final Ticket 06 is
+  PASS with QCF17 sandbox acceptance plus zero trusted host delta and QCF18
+  credited only after QCF17 PASS.
 - [ ] A separate fresh Ticket 07 operator authorization, Data Usage Mode,
   credential boundary,
   Operator Safety Ceilings, pacing, exact plan signature, and latest completed
@@ -149,10 +158,11 @@ revision. Authoritative `qualified_v1` remains disabled.
 
 ## Deterministic regressions
 
-- Before live work, verify the CAL-04 deterministic acceptance, exact-ID
-  zero-I/O readiness evidence, and complete post-CAL Ticket 06 PASS from the
-  exact reviewed production tree; any missing or failed evidence stops the
-  rollout before run-ID allocation.
+- Before live work, verify the completed CAL-04 and exact-ID zero-I/O readiness
+  evidence plus final Ticket 06 PASS from ISO-04, including its exact identities,
+  bounded export, conjunctive QCF17 result, conditional QCF18 result, and zero
+  trusted host delta. Any missing or failed evidence stops the rollout before
+  run-ID allocation.
 - Reconfirm exact zero-I/O replay for every temporal decision class and the
   32-follower one-evaluation control without consulting the live calendar.
 - Capture pre/post hashes or immutable references for representative historical
@@ -187,6 +197,8 @@ revision. Authoritative `qualified_v1` remains disabled.
 
 ## Explicit non-goals
 
+- Running Ticket 07 before ISO-04/final Ticket 06 PASS or without a separate
+  fresh live authorization.
 - Enabling or recommending authoritative \`qualified_v1\`, changing its
   activation gate, or treating a shadow pass as an authority decision.
 - Direct composition injection, explicit operator factory, test factory,
@@ -206,10 +218,16 @@ revision. Authoritative `qualified_v1` remains disabled.
   symbol under the bootstrap authorization.
 - Copying/importing the calendar-bootstrap prototype implementation or enabling
   `qualified_v1`.
+- Running Ticket 06 slices on the host, weakening QCF17, reusing a QCF17
+  baseline, or copying the QCF17 isolation prototype implementation into
+  production.
 
 ## Verification commands
 
-Before seeking the separate fresh Ticket 07 live authorization:
+**Do not run any command in this ticket yet.** Before seeking the separate fresh
+Ticket 07 live authorization, first inspect and validate the completed ISO-04
+bounded evidence and final Ticket 06 PASS. Then, under that later authorization,
+run the deterministic preflight checks below without integration/live opt-ins:
 
 \`\`\`powershell
 pytest -q tests/test_baostock_session_calendar_acquisition.py tests/test_market_session_calendar_publication.py tests/test_market_session_calendar_exact_reader.py tests/test_market_session_calendar_readiness.py tests/test_market_session_calendar_bootstrap.py
@@ -220,16 +238,16 @@ pytest -q tests/test_financial_eligibility_acquisition_context.py tests/test_fin
 pytest -q tests/test_qualified_production_source_bindings.py tests/test_qualified_routing_eligibility_context_lifecycle.py tests/test_qualified_routing_checkpoint_context_restore.py
 pytest -q tests/test_qualified_routing_rollout.py tests/test_corrected_shadow_joint_acceptance.py
 pytest -q -m "not integration"
-ruff check .
+ruff check tradingagents cli tests
 git diff --check
 git status --short
 tradingagents analyze --help
 \`\`\`
 
-Only after the separately authorized production bootstrap, exact-ID zero-I/O
-readiness verification, and complete post-CAL Ticket 06 rerun PASS, obtain a
-separate fresh Ticket 07 authorization. Then allocate a NEW run ID and invoke the
-following command once per symbol. On the first invocation
+Only after final Ticket 06 PASS through ISO-04, obtain a separate fresh Ticket
+07 authorization. Then revalidate the exact persisted calendar revision with
+zero I/O, allocate a NEW run ID, and invoke the following command once per
+symbol. On the first invocation
 select \`601328.SS\`; after it finishes, allocate a new run/checkpoint namespace,
 invoke it again, and select \`600895.SS\`. Do not pass
 \`--qualified-routing-composition-factory\` and do not clear checkpoints:
@@ -254,10 +272,10 @@ gate evidence.
 
 ## Definition of done
 
-- [ ] The retained gate record links the separately authorized production
-  bootstrap receipt, exact-ID zero-I/O readiness evidence, complete post-CAL
-  Ticket 06 PASS on the exact reviewed tree, and separate fresh Ticket 07
-  authorization to two sequential, uniquely identified CLI runs.
+- [ ] The retained gate record links the completed production-bootstrap receipt,
+  exact-ID zero-I/O readiness evidence, final ISO-04/Ticket 06 PASS with QCF17
+  zero host delta, and separate fresh Ticket 07 authorization to two sequential,
+  uniquely identified CLI runs.
 - [ ] Both symbols have complete safe preflight, plan, cache/dispatcher,
   physical-attempt, manifest, report, and decision-audit evidence satisfying
   every acceptance criterion.
@@ -276,6 +294,11 @@ gate evidence.
 
 ## 2026-08-12 authorized retry result
 
+This section is immutable historical evidence for the pre-bootstrap state at
+that time. The later CAL chain and production bootstrap resolved that calendar
+prerequisite; they do not authorize a new Ticket 07 run and do not alter the
+blocked result recorded here.
+
 **Ticket result:** BLOCKED before live execution.
 
 **Classification:** Important — insufficient evidence/configuration. This is
@@ -287,7 +310,7 @@ closure was confirmed at `f1355714710d751cfc21ba1ee1c4647e25acd26d`, with
 the later closure ledger at `b7ff726`. Before allocating a run ID or opening a
 provider/model resource, the retry attempted to resolve the latest completed
 mainland session from the repository's pinned Market Session Calendar as the
-ticket requires. Both repository runtime databases contained zero
+ticket requires. At that time both repository runtime databases contained zero
 `market_session_calendars` rows and zero `market_sessions` rows:
 
 That historical authorization ended with the blocked attempt. It does not
@@ -440,17 +463,14 @@ evidence record. Existing unrelated worktree state was preserved and excluded.
 
 ### Remaining blocker and recommendation
 
-Calendar-bootstrap Design D is settled in the amended specification, but the
-production store still contains no persisted mainland Market Session Calendar
-revision. CAL-01 → CAL-02 → CAL-03 → CAL-04 must complete first. An
-operator must then separately authorize production calendar bootstrap, and the
-returned revision must be reopened by exact ID and pass readiness with zero
-read-time provider I/O. The complete Ticket 06 suite must then rerun and PASS on
-the exact reviewed post-CAL tree. Only after those gates may an operator grant a
-separate fresh Ticket 07 authorization. That retry must allocate a NEW run ID,
-begin again with `601328.SS`, and use a separate NEW run/checkpoint identity for
-`600895.SS` only if the bank case passes. All previous failed Ticket 07 evidence
-remains immutable.
+CAL-01 → CAL-02 → CAL-03 → CAL-04, the separately authorized production
+calendar bootstrap, and exact-ID readiness are now complete and persisted. The
+remaining deterministic blocker is ISO-01 → ISO-02 → ISO-03 → additive
+post-incident baseline freeze → ISO-04 → final Ticket 06 PASS. Only after that
+PASS may an operator grant a separate fresh Ticket 07 authorization. That retry
+must allocate a NEW run ID, begin again with `601328.SS`, and use a separate NEW
+run/checkpoint identity for `600895.SS` only if the bank case passes. All
+previous failed Ticket 07 and QCF17 evidence remains immutable.
 
 The project is **not ready** for a separate authoritative-activation review.
 `qualified_v1` remains disabled and the default remains `legacy`.

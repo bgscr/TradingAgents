@@ -2,48 +2,52 @@
 
 **Parent specification:** [Mainland qualified routing production composition factory](../spec.md)
 
-**What to build:** Prove the complete shipped production-composition tracer
-bullet through the real deterministic CLI and programmatic host builders, graph,
-checkpoint-aware dispatcher, qualified router, production adapters, shared
-Provider Subrequest Cache, Provider Request Coordinator, immutable artifacts,
-checkpoint/report/audit publication, and managed cleanup. After Ticket 06B
-passes, produce a new plan-1.3/context-v2 traceability record for the complete
-QCF1–QCF18 set, rerun PE1–PE15 and parent AC1–AC13 unchanged, run the full suite
-twice, and complete Spec Compliance review before Code Quality review. The
-2026-08-10 pre-temporal pass remains immutable historical evidence but does not
-satisfy the amended temporal contract. The 2026-08-12 post-temporal PASS is the
-historical pre-calendar-bootstrap acceptance. After CAL-01 through CAL-03 change
-production and CAL-04 accepts the integrated bootstrap, rerun this complete
-ticket on the exact reviewed post-CAL production tree. Neither future work nor a
-future failure invalidates or rewrites the current historical PASS evidence.
+**What to build:** Close final Ticket 06 only through ISO-04: execute every
+Ticket 06 command inside one qualified Windows Sandbox runner on the exact
+reviewed source, runtime-bundle, runner/config, protected-manifest, and frozen
+baseline identities; require QCF17 sandbox acceptance plus zero trusted host
+delta; then evaluate QCF18. The deterministic/business behavior is otherwise
+green. The 2026-08-10 pre-temporal and 2026-08-12 post-temporal/pre-calendar
+records remain immutable historical evidence and are not replaced or relabeled
+by this final acceptance.
 
-**Blocked by:** 03 — Add static registration and caller precedence; 02D — Add
-executable production-source wiring; 04A — Integrate managed eligibility-context
-acquisition; 05B — Persist and restore indicator metadata compatibility; 06A —
-Correct QCF4 deterministic acceptance; 06B — Run deterministic temporal
-acceptance.
+**Historical prerequisites:** 03, 02D, 04A, 05B, 06A, and 06B are complete;
+CAL-01 through CAL-04 are complete; the separately authorized production
+calendar bootstrap is complete and persisted; exact-ID production calendar
+readiness is established.
 
-**Post-CAL rerun blocked by:** CAL-04 — Deterministic bootstrap acceptance and
-two-stage review; then a separately authorized production calendar bootstrap and
-zero-I/O exact-ID readiness verification. The production-bootstrap authorization
-does not authorize Ticket 07.
+**Blocked by:** ISO-04 — Final Sandbox-contained Ticket 06 acceptance and
+QCF17/QCF18 closure. ISO-04 is itself blocked by ISO-03 PASS and the new
+additive post-incident baseline freeze.
 
-**Status:** completed
+**Status:** blocked
 
-**Acceptance state:** PASS on 2026-08-12 as historical pre-calendar-bootstrap
-acceptance. The immutable 2026-08-10 pre-temporal evidence below remains
-historical only. The current acceptance basis is the
-post-temporal implementation chain through commit
-`21000ab78ec221a6b528b151400a6673007fc947`, the formal closure request's
-attested 06B execution results against that tree, and the focused closure
-verification recorded below. Ticket 07 was not executed by this closure and no
-rollout or authoritative `qualified_v1` activation is authorized. A complete
-post-CAL rerun is required before a fresh Ticket 07 authorization; that additive
-requirement does not mark this historical evidence invalid.
+**Acceptance state:** Final Ticket 06 is BLOCKED only by strengthened QCF17
+containment and ISO-04. The immutable 2026-08-10 pre-temporal and 2026-08-12
+post-temporal/pre-calendar evidence below remains valid for the exact contracts
+and trees it tested. Previous failed QCF17 incidents remain retained and are not
+repaired, waived, deleted, or absorbed into a new baseline. Ticket 07 has not
+been reauthorized, and authoritative `qualified_v1` remains disabled.
 
-**Post-CAL regression state:** required after CAL-01–CAL-03 production changes,
-CAL-04 acceptance, separately authorized production bootstrap, and exact-ID
-readiness verification, on the exact reviewed post-CAL production tree.
+**Final regression state:** deterministic/business behavior is otherwise
+green. No final PASS is permitted until ISO-04 runs the entire executable
+acceptance inside one qualified Sandbox and the trusted host before/after byte
+and semantic inventories are exactly identical.
+
+## Exact dependency graph
+
+```text
+CAL-01 -> CAL-02 -> CAL-03 -> CAL-04 [complete]
+CAL-04 -> production calendar bootstrap [complete]
+production calendar readiness -> ISO-01
+ISO-01 -> ISO-02 -> ISO-03
+ISO-03 PASS -> freeze new additive post-incident host baseline
+baseline freeze -> ISO-04
+ISO-04 -> Ticket 06 PASS
+Ticket 06 PASS -> fresh Ticket 07 authorization
+fresh Ticket 07 authorization -> NEW 601328.SS
+NEW 601328.SS PASS -> NEW 600895.SS
+```
 
 ## Observable behavior
 
@@ -72,6 +76,11 @@ readiness verification, on the exact reviewed post-CAL production tree.
 - Representative historical reports, checkpoints, artifacts, attempts,
   manifests, audits, snapshots, pins, provider rows, and IDs remain
   byte-for-byte untouched and readable.
+- Every executable final-acceptance command runs in the same qualified Windows
+  Sandbox invocation. No executable Ticket 06 slice runs on the host.
+- Final QCF17 is conjunctive: sandbox-local acceptance/historical behavior is
+  correct and the independently trusted host before/after inventory has zero
+  byte or semantic delta. QCF18 is credited only after QCF17 PASS.
 
 ## Preserved pre-temporal acceptance criteria
 
@@ -172,7 +181,11 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   by the full supported suite twice, Ruff, whitespace, and diff/scope checks,
   all without waiver.
 
-## Amended acceptance criteria
+## Historical post-temporal/pre-CAL acceptance criteria
+
+The checked rows in this section record the 2026-08-12 historical acceptance
+under the then-current QCF17 seam. They do not satisfy the strengthened L2
+QCF17 or final ISO-04 gate below.
 
 - [x] Ticket 06B passes its complete temporal matrix before the Ticket 06 rerun
   begins. Focused temporal tests alone cannot satisfy or partially clear this
@@ -214,39 +227,63 @@ runnable or passing until Ticket 06A passes corrected QCF4.
   checks, and Spec Compliance then Code Quality review from the same amended
   tree. Any failure or waiver keeps Tickets 06 and 07 blocked.
 
-## Required post-CAL acceptance rerun
+## Final ISO-04 acceptance criteria
 
-The checked acceptance criteria and evidence in this file remain the immutable
-2026-08-12 historical pre-calendar-bootstrap PASS. The unchecked criteria below
-are a new regression prerequisite created by the settled Design D calendar
-chain; they do not reopen, relabel, or invalidate that PASS.
+The checked calendar prerequisites and historical evidence remain additive.
+They do not satisfy strengthened QCF17 and do not authorize Ticket 07.
 
-- [ ] CAL-01, CAL-02, and CAL-03 production work is complete and CAL-04 passes
-  its full deterministic matrix and two-stage review on one reviewed tree.
-- [ ] Under a separate live authorization limited to calendar bootstrap, the
-  production store receives a bounded BaoStock-backed `mainland-cn` Market
-  Session Calendar revision. No symbol, analysis run/checkpoint, Ticket 07, or
-  model work occurs under that authorization.
-- [ ] The exact returned calendar revision is reopened by ID and passes
-  `mainland-session-calendar-readiness-v1` with zero read-time provider I/O,
-  including complete range, pinned authority/times, latest completed frontier
-  and close, later open session and close, and exact identity/content.
-- [ ] From the exact reviewed post-CAL production tree, rerun every Ticket 06
-  criterion without waiver: temporal matrix, QCF1–QCF18, PE1–PE15, AC1–AC13,
-  focused suites, non-integration/full repository checks, Ruff, whitespace/diff,
-  secret/raw-error, historical immutability, and Spec Compliance then Code
-  Quality review.
-- [ ] The post-CAL evidence records the exact tree/revision identities and proves
-  that all reads/replay are zero-provider-I/O, all prior snapshots/checkpoints/
-  reports/attempts/failed Ticket 07 evidence remain immutable, provider routing
-  and authority contracts remain unchanged, output stays
-  `shadow_non_authoritative`, and `qualified_v1` remains disabled.
-- [ ] Only a complete post-CAL PASS may satisfy Ticket 07's deterministic
-  prerequisite. Ticket 07 still requires its own separate fresh live
-  authorization and NEW run ID after this rerun.
+- [x] CAL-01 through CAL-04 are complete, including the deterministic matrix and
+  two-stage review.
+- [x] The separately authorized bounded production BaoStock calendar bootstrap
+  is complete and persisted; it performed no symbol, Ticket 07, or model work.
+- [x] Exact-ID `mainland-session-calendar-readiness-v1` is established with zero
+  read-time provider I/O and the required frontier/forward horizon.
+- [ ] ISO-03 passes the full Windows Sandbox adversarial boundary qualification
+  and valid guest-local write controls with an exactly equal trusted host
+  before/after inventory. No Ticket 06 command runs during ISO-03.
+- [ ] After ISO-03 PASS, one new additive post-incident baseline is frozen. It
+  binds the reviewed source, runtime bundle, runner/config, protected manifest,
+  and host inventory identities without replacing any prior baseline.
+- [ ] ISO-04 runs every executable Ticket 06 command inside one qualified
+  Windows Sandbox invocation on the exact frozen identities. No executable
+  acceptance slice runs on the host.
+- [ ] **QCF17 clause A:** sandbox-local acceptance and forward-only historical
+  behavior are correct, including valid local temp/runtime/SQLite/payload writes
+  and protected-path writes that are OS-denied or guest-local only.
+- [ ] **QCF17 clause B:** the trusted host before/after inventories are exactly
+  equal: zero append/delete/rewrite and identical provider counts/digests,
+  calendar, checkpoints, reports/logs, incidents, prior evidence, and Ticket 07
+  evidence.
+- [ ] QCF18 is evaluated only after QCF17 PASS; every QCF1–QCF18, PE1–PE15,
+  AC1–AC13, non-integration, two-full-suite, Ruff, diff, security/history, and
+  executable review criterion passes unchanged and without waiver.
+- [ ] The bounded export binds the reviewed commit/tree, source, bundle,
+  runner/config, protected manifest, baseline, adversarial probe, every
+  QCF/PE/AC result, pytest summaries, Ruff/diff results, and a completion marker
+  written last; it contains no credentials, provider DBs, host state copies, or
+  unsafe unbounded logs.
+- [ ] Only ISO-04 PASS may mark Ticket 06 PASS. A separate fresh Ticket 07 live
+  authorization and NEW run ID are still required afterward.
+
+## Strengthened QCF17 incident preservation
+
+- Preserve the four deterministic fake-Yahoo provider incidents,
+  `isolated-python-write-probe`, every previous QCF17 failure, and every prior
+  baseline/inventory under its existing identity.
+- The Stage-1 `python -I` exact-absolute-path write proved that
+  Python/PYTHONPATH/sitecustomize isolation cannot be the final authority. It
+  remains a mandatory ISO-03 adversarial probe and a retained incident, not a
+  defect to erase.
+- The final authority is the Windows Sandbox OS boundary plus the independently
+  trusted exact host before/after inventory. A Python guard remains secondary
+  diagnostics only.
+- No failure may be repaired, deleted, waived, or legitimized through a new
+  baseline; the new baseline is frozen only after ISO-03 PASS.
 
 ## Deterministic regressions
 
+- Run this entire section only through ISO-04 inside the one qualified Sandbox;
+  do not execute any item on the host or during ISO-03 qualification.
 - Run every focused test added by Tickets 01–05, 02A–02H, 04A, 05A–05C, 06A,
   and 06B plus existing adapter, coordinator/cache, rollout, checkpoint, graph-
   dispatch, report, audit, Evidence Admission, Decision Gate, Current
@@ -267,6 +304,9 @@ chain; they do not reopen, relabel, or invalidate that PASS.
   next-day 00:48 Shanghai case, next-session-close frontier, weekends/holidays,
   strict-cutoff/exact-revision controls, every-case zero-I/O replay, and 32
   followers sharing one temporal evaluation.
+- Re-run the ISO-03 adversarial and valid-write controls inside the final
+  invocation, validate the bounded result export, and require the independent
+  trusted host inventory to be exactly equal after Sandbox exit.
 
 ## Compatibility and migration behavior
 
@@ -290,6 +330,8 @@ chain; they do not reopen, relabel, or invalidate that PASS.
 
 ## Explicit non-goals
 
+- Executing any Ticket 06 command on the host, during ISO-03 boundary
+  qualification, or before the new post-incident baseline is frozen.
 - Live Tushare, AKShare, Yahoo, or BaoStock calls; paid models; live
   qualification caches; real credentials; or the two-symbol rollout.
 - Copying or importing the temporal prototype implementation, rewriting the
@@ -303,8 +345,19 @@ chain; they do not reopen, relabel, or invalidate that PASS.
   exact forward contracts in the amended specification.
 - Waiving or renumbering QCF1–QCF18, PE1–PE15, or parent AC1–AC13 to obtain a
   pass; only QCF4's over-specified expectation is corrected by Ticket 06A.
+- Copying the QCF17 isolation prototype implementation into production,
+  treating Python/sitecustomize guards as the L2 authority, mapping protected
+  host roots or a writable host repository, reusing the host venv, enabling
+  Sandbox networking, or freezing/replacing a baseline after a failed run.
 
 ## Verification commands
+
+**Do not run these commands on the host or before ISO-04.** The qualified runner
+must execute every command below, plus systemic persistence isolation, CAL,
+06B, QCF/PE/AC, live-test-isolation, history/security, adversarial/valid-write,
+and executable review selectors, inside one Sandbox invocation. Host activity is
+limited to input verification, protected before/after inventory, launch,
+bounded-export validation, and final QCF17-then-QCF18 evaluation.
 
 Run production-composition and provider focused suites:
 
@@ -333,14 +386,14 @@ Run the complete suite twice and final checks:
 
 \`\`\`powershell
 1..2 | ForEach-Object { pytest -q; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-ruff check .
+ruff check tradingagents cli tests
 git diff --check
 git status --short
 \`\`\`
 
-No command in this ticket may select integration tests or contact a live
-provider/model. If a test would do so, stop and correct the deterministic seam
-instead of running it.
+No command in this ticket may select integration tests, contact a live
+provider/model, run on the host, or execute before ISO-04. If a test would do
+so, stop and correct the deterministic seam instead of running it.
 
 The separately authorized production calendar bootstrap precedes this rerun but
 is not a verification command of Ticket 06 and does not authorize Ticket 07.
@@ -523,10 +576,11 @@ Evidence Admission and Decision Gate remain unchanged. Authoritative
 `qualified_v1` remains disabled. Ticket 07 was neither implemented nor run; its
 pre-temporal blocker was considered cleared by this completed evidence package.
 The temporal amendment superseded that gate, and the post-temporal acceptance
-then cleared 06B plus the complete amended Ticket 06 rerun. The later calendar-
-bootstrap amendment now keeps Ticket 07 blocked by CAL-01–CAL-04, separately
-authorized production bootstrap, exact-ID zero-I/O readiness, the complete
-post-CAL Ticket 06 rerun, and a separate fresh Ticket 07 authorization.
+then cleared 06B plus the complete amended Ticket 06 rerun. CAL-01–CAL-04,
+production bootstrap, and exact-ID readiness are now complete. Final Ticket 06
+and Ticket 07 remain blocked by ISO-01 → ISO-02 → ISO-03 → additive baseline
+freeze → ISO-04; after ISO-04 PASS, Ticket 07 still requires a separate fresh
+live authorization.
 
 ## Historical pre-temporal definition of done
 
@@ -547,7 +601,7 @@ post-CAL Ticket 06 rerun, and a separate fresh Ticket 07 authorization.
   and the then-current Ticket 07 prerequisite required a complete passing
   evidence package. The later post-CAL prerequisites are recorded separately.
 
-## Amended definition of done
+## Historical post-temporal/pre-CAL definition of done
 
 - [x] Ticket 06B passes before a complete new QCF1–QCF18 rerun begins.
 - [x] A durable plan-1.3/context-v2 traceability record maps every QCF1–QCF18,
@@ -564,20 +618,24 @@ post-CAL Ticket 06 rerun, and a separate fresh Ticket 07 authorization.
   live authorization, and authoritative `qualified_v1` remains disabled. The
   later post-CAL prerequisites are recorded separately.
 
-## Post-CAL definition of done
+## Final definition of done
 
-- [ ] CAL-04 acceptance and review pass; a separately authorized production
-  calendar bootstrap returns a revision that is exact-ID reopened and ready with
-  zero read-time provider I/O.
-- [ ] The complete Ticket 06 matrix is rerun without waiver on the exact reviewed
-  post-CAL production tree and records a new PASS while preserving the 2026-08-10
-  and 2026-08-12 historical evidence unchanged.
+- [x] CAL-04 acceptance/review and the separately authorized production
+  calendar bootstrap/exact-ID readiness prerequisites are complete.
+- [ ] ISO-03 PASS and the new additive post-incident baseline freeze precede
+  every executable Ticket 06 command.
+- [ ] The complete Ticket 06 matrix runs without waiver inside one qualified
+  Windows Sandbox on the exact reviewed identities and records a new final PASS
+  while preserving the 2026-08-10 and 2026-08-12 historical evidence unchanged.
+- [ ] QCF17 sandbox acceptance and trusted zero-host-delta clauses both pass;
+  QCF18 is then evaluated and passes conditionally.
 - [ ] Spec Compliance and Code Quality reviews pass in order with Critical,
   Important, and Minor counts recorded and all Critical/Important findings
   resolved.
-- [ ] Historical state and failed Ticket 07 evidence remain immutable,
-  `qualified_v1` remains disabled, and no Ticket 07 run ID/provider/model work is
-  allocated or performed by this rerun.
+- [ ] The bounded result export is complete and safe; host provider/calendar/
+  checkpoint/report/log/incident/Ticket 07 state is exactly unchanged;
+  `qualified_v1` remains disabled; and no Ticket 07 run ID/provider/model work
+  is allocated or performed.
 
 ## Final post-temporal acceptance evidence — 2026-08-12
 
