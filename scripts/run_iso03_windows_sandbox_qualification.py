@@ -19,6 +19,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reviewed-source-repository-root", required=True, type=Path)
     parser.add_argument("--protected-state-repository-root", required=True, type=Path)
     parser.add_argument("--historical-qualification-runs-root", required=True, type=Path)
+    parser.add_argument("--replacement-qualification-run-root", required=True, type=Path)
     parser.add_argument("--runs-root", required=True, type=Path)
     parser.add_argument("--runtime-bundle-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
@@ -55,6 +56,9 @@ def main() -> int:
         ),
         historical_qualification_runs_root=(
             arguments.historical_qualification_runs_root
+        ),
+        replacement_qualification_run_root=(
+            arguments.replacement_qualification_run_root
         ),
         runs_root=arguments.runs_root,
         runtime_bundle_root=arguments.runtime_bundle_root,

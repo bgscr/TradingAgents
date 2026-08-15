@@ -80,6 +80,7 @@ _DIRECTORY_ROLES = {
     ProtectedRootRole.TICKET07_EVIDENCE,
     ProtectedRootRole.PRIOR_INVENTORIES,
     ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+    ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
 }
 
 
@@ -854,12 +855,14 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
     reviewed_source = tmp_path / "reviewed-source"
     protected_state = tmp_path / "actual-protected-state"
     historical_runs = tmp_path / "historical-sandbox-runs"
+    replacement_run = tmp_path / "replacement-sandbox-run"
     user_profile = tmp_path / "profile"
     for root in (
         implementation,
         reviewed_source,
         protected_state,
         historical_runs,
+        replacement_run,
         user_profile,
     ):
         root.mkdir()
@@ -868,6 +871,7 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         user_profile=user_profile,
         repository_root=protected_state,
         historical_qualification_runs_root=historical_runs,
+        replacement_qualification_run_root=replacement_run,
     )
     by_role = {binding.role: binding.path for binding in bindings}
 
@@ -877,6 +881,10 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
     assert by_role[ProtectedRootRole.REPORTS_LOGS] == protected_state / "logs"
     assert by_role[ProtectedRootRole.TICKET07_EVIDENCE].is_relative_to(protected_state)
     assert by_role[ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS] == historical_runs
+    assert (
+        by_role[ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION]
+        == replacement_run
+    )
     assert not by_role[ProtectedRootRole.TICKET07_EVIDENCE].is_relative_to(
         implementation
     )

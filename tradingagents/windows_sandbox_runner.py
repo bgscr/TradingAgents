@@ -208,6 +208,7 @@ class ProtectedRootRole(str, Enum):
     FAKE_YAHOO_INCIDENTS = "fake_yahoo_incidents"
     ISOLATED_PYTHON_WRITE_PROBE = "isolated_python_write_probe"
     PRIOR_SANDBOX_QUALIFICATIONS = "prior_sandbox_qualifications"
+    REPLACEMENT_SANDBOX_QUALIFICATION = "replacement_sandbox_qualification"
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +436,7 @@ def default_protected_root_bindings(
     user_profile: Path,
     repository_root: Path,
     historical_qualification_runs_root: Path | None = None,
+    replacement_qualification_run_root: Path | None = None,
 ) -> tuple[ProtectedRootBinding, ...]:
     """Return the reviewed ISO-01 roles without testing whether they exist."""
 
@@ -448,6 +450,9 @@ def default_protected_root_bindings(
     evidence_root = repository_root / ".scratch" / "mainland-qualified-routing-composition-factory"
     prior_sandbox_qualifications = historical_qualification_runs_root or (
         evidence_root / "ticket06-post-cal-evidence"
+    )
+    replacement_sandbox_qualification = (
+        replacement_qualification_run_root or prior_sandbox_qualifications
     )
     return (
         ProtectedRootBinding(
@@ -543,6 +548,11 @@ def default_protected_root_bindings(
         ProtectedRootBinding(
             ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
             prior_sandbox_qualifications,
+            ProtectedObjectKind.DIRECTORY,
+        ),
+        ProtectedRootBinding(
+            ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+            replacement_sandbox_qualification,
             ProtectedObjectKind.DIRECTORY,
         ),
     )

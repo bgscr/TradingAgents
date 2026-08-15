@@ -3396,6 +3396,7 @@ def execute_iso03_boundary_qualification(
     reviewed_source_repository_root: Path,
     protected_state_repository_root: Path,
     historical_qualification_runs_root: Path,
+    replacement_qualification_run_root: Path | None = None,
     runs_root: Path,
     runtime_bundle_root: Path,
     run_id: str,
@@ -3569,6 +3570,9 @@ def execute_iso03_boundary_qualification(
             repository_root=protected_state_repository,
             historical_qualification_runs_root=(
                 historical_qualification_runs_root
+            ),
+            replacement_qualification_run_root=(
+                replacement_qualification_run_root
             ),
         )
     )
