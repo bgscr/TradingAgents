@@ -44,6 +44,12 @@ _ISOLATION_ENVIRONMENT_KEYS = (
     _CHILD_PROTECTED_ROOTS_ENVIRONMENT,
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_TEST_INSTRUMENT_REGISTRY_PATH = (
+    _REPOSITORY_ROOT / "config" / "instrument_identity_registry.json"
+)
+_TEST_INSTRUMENT_REGISTRY_SHA256 = (
+    _REPOSITORY_ROOT / "config" / "instrument_identity_registry.sha256"
+).read_text(encoding="ascii").split(maxsplit=1)[0]
 _CHILD_GUARD_PATH = _REPOSITORY_ROOT / "tests" / "pytest_persistence_sitecustomize"
 _PROTECTED_TICKET07_ROOT = (
     _REPOSITORY_ROOT
@@ -259,6 +265,12 @@ def _isolated_runtime_config(root: Path) -> dict[str, Any]:
             ),
             "market_history_payload_root": str(history_root / "payloads"),
             "market_history_backup_root": str(history_root / "backups"),
+            "instrument_identity_registry_path": str(
+                _TEST_INSTRUMENT_REGISTRY_PATH
+            ),
+            "instrument_identity_registry_sha256": (
+                _TEST_INSTRUMENT_REGISTRY_SHA256
+            ),
         }
     )
     return config

@@ -3,8 +3,12 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 from datetime import date
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +168,64 @@ def _composition(plan, asset=None) -> QualifiedFinancialRoutingComposition:
         ),
         indicator_request_factory=lambda _request: None,
     )
+
+
+def test_rollout_fixture_resolves_identity_with_dotenv_disabled(tmp_path: Path) -> None:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHON_DOTENV_DISABLED": "1",
+            "RUN_LIVE_CUSTOM_TESTS": "0",
+            "RUN_LIVE_DEEPSEEK_TESTS": "0",
+            "RUN_LIVE_ENVIRONMENT": "0",
+            "RUN_LIVE_PROVIDER_TESTS": "0",
+            "RUN_LIVE_TUSHARE_TESTS": "0",
+        }
+    )
+    environment.pop("TRADINGAGENTS_IDENTITY_REGISTRY_PATH", None)
+    environment.pop("TRADINGAGENTS_IDENTITY_REGISTRY_SHA256", None)
+    for name in tuple(environment):
+        if any(
+            marker in name.upper()
+            for marker in (
+                "API_KEY",
+                "TOKEN",
+                "PASSWORD",
+                "SECRET",
+                "CREDENTIAL",
+                "COOKIE",
+            )
+        ):
+            environment.pop(name)
+
+    probe = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import copy",
+                    "import sys",
+                    "from pathlib import Path",
+                    "import tests.conftest as fixtures",
+                    "from tradingagents.asset_configuration import "
+                    "resolve_run_asset_configuration",
+                    "config = fixtures._isolated_runtime_config(Path(sys.argv[1]))",
+                    "resolve_run_asset_configuration('601328.SS', "
+                    "config=copy.deepcopy(config))",
+                )
+            ),
+            str(tmp_path / "isolated-runtime"),
+        ),
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
 
 
 def test_default_rollout_remains_byte_compatible_legacy() -> None:
