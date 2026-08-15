@@ -102,14 +102,17 @@ def _verify_runner(control: dict[str, Any], runner_root: Path) -> None:
         "bootstrap.ps1",
         "install_boundary_runtime.ps1",
         "run_boundary_qualification.py",
+        "run_ticket06_acceptance.py",
+        "run_ticket06_offline_review.py",
         "runner-manifest.json",
+        "ticket06_acceptance_contract.py",
         "verify_source.py",
     }
     if {path.name for path in runner_root.iterdir()} != expected_names:
         raise RuntimeError("runner_input_file_set_invalid")
     manifest = _load_json(runner_root / "runner-manifest.json", maximum_bytes=65_536)
     identity = manifest.pop("runner_input_identity", None)
-    if identity != _identity("windows-sandbox-boundary-runner-input:v1", manifest):
+    if identity != _identity("windows-sandbox-qualified-runner-input:v2", manifest):
         raise RuntimeError("runner_input_identity_mismatch")
     manifest["runner_input_identity"] = identity
     if manifest != control["base"]["runner_input"]:
@@ -118,6 +121,9 @@ def _verify_runner(control: dict[str, Any], runner_root: Path) -> None:
         "bootstrap.ps1",
         "install_boundary_runtime.ps1",
         "run_boundary_qualification.py",
+        "run_ticket06_acceptance.py",
+        "run_ticket06_offline_review.py",
+        "ticket06_acceptance_contract.py",
         "verify_source.py",
     )
     rows = manifest.get("files")

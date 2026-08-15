@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $controlPath = "C:\QCF17\Input\Control\run-control.json"
 $stage = "load_control"
 $failed = $false
+$executionMode = $null
 
 function Set-BoundedFailureStage {
     param(
@@ -19,7 +20,11 @@ function Set-BoundedFailureStage {
 
 try {
     $control = Get-Content -LiteralPath $controlPath -Raw | ConvertFrom-Json
-    if ([string]$control.base.execution_mode -ne "boundary_qualification") {
+    $executionMode = [string]$control.base.execution_mode
+    if ($executionMode -notin @(
+            "boundary_qualification",
+            "ticket06_acceptance"
+        )) {
         throw "unsupported_sandbox_execution_mode"
     }
 
@@ -134,41 +139,57 @@ try {
         [Environment]::SetEnvironmentVariable($entry[0], $entry[1], "Process")
     }
 
-    $stage = "execute_boundary_qualification"
-    & $guestPython `
-        "C:\QCF17\Input\Runner\run_boundary_qualification.py" `
-        --control $controlPath `
-        --source-input "C:\QCF17\Input\Source" `
-        --runner-input "C:\QCF17\Input\Runner" `
-        --runtime-input "C:\QCF17\Input\Runtime" `
-        --results "C:\QCF17\Export" `
-        --workspace $control.base.guest_layout.workspace_repository
-    if ($LASTEXITCODE -ne 0) {
-        $diagnosticPath = "C:\QCF17\Output\boundary-failure.json"
-        try {
-            if ((Test-Path -LiteralPath $diagnosticPath -PathType Leaf) -and
-                (Get-Item -LiteralPath $diagnosticPath).Length -le 4096) {
-                $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw |
-                    ConvertFrom-Json
-                if ($diagnostic.contract_version -eq
-                        "windows-sandbox-boundary-diagnostic-v1" -and
-                    $diagnostic.status -eq "fail") {
-                    Set-BoundedFailureStage `
-                        -Prefix "execute_boundary_qualification" `
-                        -Reason ([string]$diagnostic.reason)
+    if ($executionMode -eq "boundary_qualification") {
+        $stage = "execute_boundary_qualification"
+        & $guestPython `
+            "C:\QCF17\Input\Runner\run_boundary_qualification.py" `
+            --control $controlPath `
+            --source-input "C:\QCF17\Input\Source" `
+            --runner-input "C:\QCF17\Input\Runner" `
+            --runtime-input "C:\QCF17\Input\Runtime" `
+            --results "C:\QCF17\Export" `
+            --workspace $control.base.guest_layout.workspace_repository
+        if ($LASTEXITCODE -ne 0) {
+            $diagnosticPath = "C:\QCF17\Output\boundary-failure.json"
+            try {
+                if ((Test-Path -LiteralPath $diagnosticPath -PathType Leaf) -and
+                    (Get-Item -LiteralPath $diagnosticPath).Length -le 4096) {
+                    $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw |
+                        ConvertFrom-Json
+                    if ($diagnostic.contract_version -eq
+                            "windows-sandbox-boundary-diagnostic-v1" -and
+                        $diagnostic.status -eq "fail") {
+                        Set-BoundedFailureStage `
+                            -Prefix "execute_boundary_qualification" `
+                            -Reason ([string]$diagnostic.reason)
+                    }
                 }
             }
+            catch {
+                # A missing or malformed diagnostic leaves the bounded outer stage.
+            }
+            throw "boundary_qualification_guest_failed"
         }
-        catch {
-            # A missing or malformed diagnostic leaves the bounded outer stage.
+    }
+    elseif ($executionMode -eq "ticket06_acceptance") {
+        $stage = "execute_ticket06_acceptance"
+        & $guestPython `
+            "C:\QCF17\Input\Runner\run_ticket06_acceptance.py" `
+            --control $controlPath `
+            --runner-input "C:\QCF17\Input\Runner" `
+            --results "C:\QCF17\Export" `
+            --workspace $control.base.guest_layout.workspace_repository `
+            --git-executable "C:\QCF17\Input\Runtime\git\cmd\git.exe"
+        if ($LASTEXITCODE -ne 0) {
+            throw "ticket06_acceptance_guest_failed"
         }
-        throw "boundary_qualification_guest_failed"
     }
     $stage = "completed"
 }
 catch {
     $failed = $true
-    try {
+    if ($executionMode -ne "ticket06_acceptance") {
+      try {
         $material = [Text.Encoding]::UTF8.GetBytes(
             $stage + ":" + [string]$_.FullyQualifiedErrorId
         )
@@ -191,9 +212,10 @@ catch {
             $failure,
             [Text.UTF8Encoding]::new($false)
         )
-    }
-    catch {
-        # Missing/malformed bounded output is itself a fail-closed host result.
+      }
+      catch {
+          # Missing/malformed bounded output is itself a fail-closed host result.
+      }
     }
 }
 finally {

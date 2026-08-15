@@ -1287,9 +1287,9 @@ def test_iso_01_host_service_constructs_without_launching_or_executing_acceptanc
     bootstrap = (
         contract.paths.runner_input.joinpath("bootstrap.ps1").read_text(encoding="utf-8").casefold()
     )
+    assert '"boundary_qualification"' in bootstrap
+    assert '"ticket06_acceptance"' in bootstrap
     for forbidden in (
-        "ticket06",
-        "ticket 06",
         "ticket07",
         "ticket 07",
         "qualified_v1",

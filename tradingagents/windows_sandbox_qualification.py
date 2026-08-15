@@ -20,12 +20,32 @@ from xml.sax.saxutils import escape as xml_escape
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import tradingagents.offline_runtime_bundle as offline_runtime_bundle_module
+import tradingagents.windows_sandbox_acceptance as windows_sandbox_acceptance_module
 import tradingagents.windows_sandbox_runner as windows_sandbox_runner_module
 from tradingagents.offline_runtime_bundle import (
     BUNDLE_MANIFEST_FILENAME,
     OfflineBundleContractError,
     OfflineBundleSourceBinding,
     verify_offline_runtime_bundle,
+)
+from tradingagents.windows_sandbox_acceptance import (
+    QUALIFIED_RUNNER_SOURCE_FILES,
+    QUALIFIED_RUNNER_TARGET_FILES,
+    TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+    QualifiedRunnerFile,
+    QualifiedRunnerManifest,
+    Ticket06AcceptanceControlBase,
+    Ticket06AcceptanceControlEnvelope,
+    Ticket06ControlEnvironment,
+    Ticket06ControlGuestLayout,
+    Ticket06ControlRuntime,
+    Ticket06ControlSource,
+    ValidatedTicket06AcceptanceExport,
+    build_ticket06_acceptance_control_envelope,
+    build_ticket06_command_ledger,
+    build_ticket06_control_environment,
+    content_identity as acceptance_content_identity,
+    validate_ticket06_acceptance_export,
 )
 from tradingagents.windows_sandbox_runner import (
     EnvironmentPolicy,
@@ -935,44 +955,8 @@ class NetworkVerification(BaseModel):
         return not any(self.model_dump().values())
 
 
-class BoundaryRunnerFile(BaseModel):
-    model_config = _CLOSED_MODEL_CONFIG
-
-    relative_path: str = Field(min_length=1, max_length=128)
-    byte_length: int = Field(ge=1, le=1_048_576)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class BoundaryRunnerManifest(BaseModel):
-    model_config = _CLOSED_MODEL_CONFIG
-
-    contract_version: Literal["windows-sandbox-boundary-runner-input-v1"] = (
-        "windows-sandbox-boundary-runner-input-v1"
-    )
-    implementation_base_commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
-    candidate_tree_hash: str = Field(pattern=r"^[0-9a-f]{40}$")
-    source_mode: Literal["reviewed_index"] = "reviewed_index"
-    files: tuple[BoundaryRunnerFile, ...]
-    runner_input_identity: str = Field(
-        pattern=r"^windows-sandbox-boundary-runner-input:v1:sha256:[0-9a-f]{64}$"
-    )
-
-    @model_validator(mode="after")
-    def _validate_manifest(self) -> BoundaryRunnerManifest:
-        expected = (
-            "bootstrap.ps1",
-            "install_boundary_runtime.ps1",
-            "run_boundary_qualification.py",
-            "verify_source.py",
-        )
-        if tuple(item.relative_path for item in self.files) != expected:
-            raise ValueError("boundary runner input is incomplete or unordered")
-        payload = self.model_dump(mode="json", exclude={"runner_input_identity"})
-        if self.runner_input_identity != _identity(
-            "windows-sandbox-boundary-runner-input:v1", payload
-        ):
-            raise ValueError("boundary runner input identity mismatch")
-        return self
+BoundaryRunnerFile = QualifiedRunnerFile
+BoundaryRunnerManifest = QualifiedRunnerManifest
 
 
 class ReviewedHostHarnessFile(BaseModel):
@@ -1002,6 +986,7 @@ class ReviewedHostHarnessManifest(BaseModel):
         expected = (
             "scripts/run_iso03_windows_sandbox_qualification.py",
             "tradingagents/offline_runtime_bundle.py",
+            "tradingagents/windows_sandbox_acceptance.py",
             "tradingagents/windows_sandbox_qualification.py",
             "tradingagents/windows_sandbox_runner.py",
         )
@@ -1631,12 +1616,7 @@ def validate_verifier_root_ownership(inventory: ProtectedHostInventory) -> None:
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
 
 
-_BOUNDARY_RUNNER_SOURCE_FILES = (
-    ("bootstrap.ps1", "bootstrap.ps1"),
-    ("offline_bundle_bootstrap.ps1", "install_boundary_runtime.ps1"),
-    ("run_boundary_qualification.py", "run_boundary_qualification.py"),
-    ("verify_source.py", "verify_source.py"),
-)
+_BOUNDARY_RUNNER_SOURCE_FILES = QUALIFIED_RUNNER_SOURCE_FILES
 
 
 def _read_stable_regular_file(path: Path, *, maximum_bytes: int) -> bytes:
@@ -1750,6 +1730,9 @@ def build_reviewed_host_harness_manifest(
         "tradingagents/offline_runtime_bundle.py": Path(
             offline_runtime_bundle_module.__file__
         ),
+        "tradingagents/windows_sandbox_acceptance.py": Path(
+            windows_sandbox_acceptance_module.__file__
+        ),
         "tradingagents/windows_sandbox_qualification.py": Path(__file__),
         "tradingagents/windows_sandbox_runner.py": Path(
             windows_sandbox_runner_module.__file__
@@ -1822,8 +1805,7 @@ def stage_boundary_runner_input(
     base_commit_id = _committed_git_hex(repository, "HEAD^{commit}")
     candidate_tree_hash = _reviewed_index_tree_hash(repository)
     rows: list[BoundaryRunnerFile] = []
-    for source_name, target_name in _BOUNDARY_RUNNER_SOURCE_FILES:
-        relative_path = f"scripts/windows_sandbox/{source_name}"
+    for relative_path, target_name in _BOUNDARY_RUNNER_SOURCE_FILES:
         content = _read_committed_git_object(
             repository,
             ("show", f":{relative_path}"),
@@ -1838,23 +1820,23 @@ def stage_boundary_runner_input(
         except OSError as exc:
             raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT) from exc
         rows.append(
-            BoundaryRunnerFile(
+            QualifiedRunnerFile(
                 relative_path=target_name,
                 byte_length=len(content),
                 sha256=sha256(content).hexdigest(),
             )
         )
     payload = {
-        "contract_version": "windows-sandbox-boundary-runner-input-v1",
+        "contract_version": "windows-sandbox-qualified-runner-input-v2",
         "implementation_base_commit_id": base_commit_id,
         "candidate_tree_hash": candidate_tree_hash,
         "source_mode": "reviewed_index",
         "files": [item.model_dump(mode="json") for item in rows],
     }
-    manifest = BoundaryRunnerManifest(
+    manifest = QualifiedRunnerManifest(
         **payload,
-        runner_input_identity=_identity(
-            "windows-sandbox-boundary-runner-input:v1", payload
+        runner_input_identity=acceptance_content_identity(
+            "windows-sandbox-qualified-runner-input:v2", payload
         ),
     )
     try:
@@ -1881,16 +1863,11 @@ def validate_boundary_runner_input(
         entries = tuple(sorted(resolved.iterdir(), key=lambda item: item.name))
     except OSError as exc:
         raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID) from exc
-    if tuple(item.name for item in entries) != (
-        "bootstrap.ps1",
-        "install_boundary_runtime.ps1",
-        "run_boundary_qualification.py",
-        "runner-manifest.json",
-        "verify_source.py",
-    ):
+    expected_names = tuple(sorted((*QUALIFIED_RUNNER_TARGET_FILES, "runner-manifest.json")))
+    if tuple(item.name for item in entries) != expected_names:
         raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
     try:
-        parsed = BoundaryRunnerManifest.model_validate_json(
+        parsed = QualifiedRunnerManifest.model_validate_json(
             _read_stable_regular_file(
                 resolved / "runner-manifest.json", maximum_bytes=64 * 1024
             )
@@ -2120,6 +2097,41 @@ class BoundaryQualificationExecution:
     export: ValidatedBoundaryQualificationExport
 
 
+@dataclass(frozen=True, slots=True)
+class Ticket06AcceptanceConstructionRequest:
+    """Acceptance construction reuses the exact qualified runner inputs."""
+
+    qualified_runner_request: BoundaryQualificationConstructionRequest
+    boundary_qualification_identity: str
+    frozen_baseline_identity: str
+
+
+@dataclass(frozen=True, slots=True)
+class Ticket06AcceptanceRunContract:
+    platform_report: SandboxPlatformReport
+    paths: BoundaryQualificationRunPaths
+    source: StagedSourceInput
+    runtime_bundle: RuntimeBundleInputContract
+    runtime_bundle_identity: str
+    runner_input: BoundaryRunnerManifest
+    host_harness: ReviewedHostHarnessManifest
+    implementation_repository_root: Path
+    host_entrypoint_path: Path
+    protected_manifest: ResolvedProtectedRootManifest
+    mapping_manifest: ResolvedSandboxMappingManifest
+    wsb_configuration: WsbConfiguration
+    guest_layout: GuestLayout
+    environment_policy: Ticket06ControlEnvironment
+    control: Ticket06AcceptanceControlEnvelope
+    forbidden_host_roots: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Ticket06AcceptanceExecution:
+    process: SandboxProcessResult
+    export: ValidatedTicket06AcceptanceExport
+
+
 def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first.is_relative_to(second) or second.is_relative_to(first)
 
@@ -2207,6 +2219,7 @@ def _mapping_bindings(
     control_identity: str,
     runtime_bundle: RuntimeBundleInputContract,
     qualification_run_identity: str,
+    results_identity_namespace: str = "windows-sandbox-boundary-empty-results:v1",
 ) -> tuple[SandboxMappingBinding, ...]:
     return (
         SandboxMappingBinding(
@@ -2243,7 +2256,7 @@ def _mapping_bindings(
             _BOUNDARY_MAPPING_GUEST_PATHS[SandboxMappingRole.RESULTS_EXPORT],
             False,
             _identity(
-                "windows-sandbox-boundary-empty-results:v1",
+                results_identity_namespace,
                 qualification_run_identity,
             ),
             fresh_empty=True,
@@ -2546,6 +2559,320 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
         self._revalidate_boundary_contract(contract)
         return contract
 
+    def construct_ticket06_acceptance(
+        self,
+        request: Ticket06AcceptanceConstructionRequest,
+    ) -> Ticket06AcceptanceRunContract:
+        """Construct the second closed mode through the same qualified owner."""
+
+        machine_identity_pattern = (
+            r"^[a-z0-9][a-z0-9._-]*(?::[a-z0-9][a-z0-9._-]*)*:"
+            r"sha256:[0-9a-f]{64}$"
+        )
+        if any(
+            re.fullmatch(machine_identity_pattern, value) is None
+            for value in (
+                request.boundary_qualification_identity,
+                request.frozen_baseline_identity,
+            )
+        ):
+            raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
+
+        boundary = self.construct(request.qualified_runner_request)
+        source = Ticket06ControlSource.model_validate(
+            boundary.source.identity.model_dump(mode="json")
+        )
+        runtime = Ticket06ControlRuntime.model_validate(
+            boundary.runtime_bundle.model_dump(mode="json")
+        )
+        layout = Ticket06ControlGuestLayout.model_validate(
+            boundary.guest_layout.model_dump(mode="json")
+        )
+        environment = build_ticket06_control_environment(
+            boundary.environment_policy.variables
+        )
+        ledger = build_ticket06_command_ledger(environment.policy_identity)
+        control_base = Ticket06AcceptanceControlBase(
+            run_id=request.qualified_runner_request.run_id,
+            source=source,
+            runtime_bundle=runtime,
+            runtime_bundle_identity=boundary.runtime_bundle_identity,
+            runner_input_identity=boundary.runner_input.runner_input_identity,
+            protected_root_manifest_identity=(
+                boundary.protected_manifest.manifest_identity
+            ),
+            boundary_qualification_identity=request.boundary_qualification_identity,
+            frozen_baseline_identity=request.frozen_baseline_identity,
+            guest_layout=layout,
+            environment=environment,
+            command_ledger=ledger,
+            result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+        )
+        control_identity = acceptance_content_identity(
+            "windows-sandbox-ticket06-control:v1",
+            control_base.model_dump(mode="json"),
+        )
+        acceptance_run_identity = _identity(
+            "ticket06-sandbox-acceptance-run:v1",
+            {
+                "run_id": request.qualified_runner_request.run_id,
+                "source_input_identity": source.source_input_identity,
+                "runtime_bundle_identity": boundary.runtime_bundle_identity,
+                "runner_input_identity": boundary.runner_input.runner_input_identity,
+                "protected_root_manifest_identity": (
+                    boundary.protected_manifest.manifest_identity
+                ),
+                "boundary_qualification_identity": (
+                    request.boundary_qualification_identity
+                ),
+                "frozen_baseline_identity": request.frozen_baseline_identity,
+                "command_ledger_identity": ledger.ledger_identity,
+            },
+        )
+        bindings = _mapping_bindings(
+            paths=boundary.paths,
+            source=boundary.source.identity,
+            runner_input=boundary.runner_input,
+            control_identity=control_identity,
+            runtime_bundle=boundary.runtime_bundle,
+            qualification_run_identity=acceptance_run_identity,
+            results_identity_namespace=(
+                "windows-sandbox-ticket06-empty-results:v1"
+            ),
+        )
+        mapping = build_mapping_manifest(
+            bindings,
+            protected_manifest=boundary.protected_manifest,
+            forbidden_host_roots=boundary.forbidden_host_roots,
+        )
+        configuration = render_wsb_configuration(
+            mapping,
+            protected_client_supported=(
+                boundary.platform_report.protected_client_supported
+            ),
+        )
+        guest_workspace_identity = _identity(
+            "windows-sandbox-guest-workspace:v1",
+            {
+                "source_input_identity": source.source_input_identity,
+                "layout_identity": layout.layout_identity,
+                "environment_policy_identity": environment.policy_identity,
+                "execution_mode": SandboxExecutionMode.TICKET06_ACCEPTANCE.value,
+            },
+        )
+        runner_identity = build_runner_identity(
+            RunnerIdentityMaterial(
+                protected_root_manifest_identity=(
+                    boundary.protected_manifest.manifest_identity
+                ),
+                source_input_identity=source.source_input_identity,
+                wsb_config_identity=configuration.config_identity,
+                mapping_manifest_identity=mapping.mapping_manifest_identity,
+                guest_layout_identity=layout.layout_identity,
+                environment_policy_identity=environment.policy_identity,
+                result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+                runtime_bundle_contract_identity=(
+                    runtime.runtime_bundle_contract_identity
+                ),
+                runner_bootstrap_identity=(
+                    boundary.runner_input.runner_input_identity
+                ),
+                control_inventory_identity=control_identity,
+            )
+        )
+        control = build_ticket06_acceptance_control_envelope(
+            base=control_base,
+            runner_identity=runner_identity,
+            wsb_config_identity=configuration.config_identity,
+            mapping_manifest_identity=mapping.mapping_manifest_identity,
+            guest_workspace_identity=guest_workspace_identity,
+        )
+        try:
+            (boundary.paths.control_input / "run-control.json").write_bytes(
+                _canonical_json_bytes(control.model_dump(mode="json")) + b"\n"
+            )
+            boundary.paths.config_path.write_text(
+                configuration.xml,
+                encoding="utf-8",
+                newline="\n",
+            )
+        except OSError as exc:
+            raise SandboxContractError(
+                SandboxFailureReason.MAPPING_CONTRACT_INVALID
+            ) from exc
+        contract = Ticket06AcceptanceRunContract(
+            platform_report=boundary.platform_report,
+            paths=boundary.paths,
+            source=boundary.source,
+            runtime_bundle=boundary.runtime_bundle,
+            runtime_bundle_identity=boundary.runtime_bundle_identity,
+            runner_input=boundary.runner_input,
+            host_harness=boundary.host_harness,
+            implementation_repository_root=(
+                boundary.implementation_repository_root
+            ),
+            host_entrypoint_path=boundary.host_entrypoint_path,
+            protected_manifest=boundary.protected_manifest,
+            mapping_manifest=mapping,
+            wsb_configuration=configuration,
+            guest_layout=boundary.guest_layout,
+            environment_policy=environment,
+            control=control,
+            forbidden_host_roots=boundary.forbidden_host_roots,
+        )
+        self._revalidate_ticket06_contract(contract)
+        return contract
+
+    def _revalidate_ticket06_contract(
+        self,
+        contract: Ticket06AcceptanceRunContract,
+    ) -> None:
+        current_platform = self._platform.probe()
+        if current_platform != contract.platform_report:
+            raise SandboxContractError(SandboxFailureReason.PLATFORM_CONTRACT_INVALID)
+        current_host_harness = build_reviewed_host_harness_manifest(
+            contract.implementation_repository_root,
+            entrypoint_path=contract.host_entrypoint_path,
+        )
+        if current_host_harness != contract.host_harness:
+            raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
+        protected = build_protected_root_manifest(contract.protected_manifest.bindings)
+        if protected.contract != contract.protected_manifest.contract:
+            raise SandboxContractError(
+                SandboxFailureReason.PROTECTED_ROOT_MANIFEST_INCOMPLETE
+            )
+        expected_layout = build_guest_layout()
+        expected_environment = build_ticket06_control_environment(
+            build_environment_policy(
+                run_live_environment=contract.source.identity.run_live_environment,
+                layout=expected_layout,
+            ).variables
+        )
+        if (
+            contract.guest_layout != expected_layout
+            or contract.control.base.guest_layout
+            != Ticket06ControlGuestLayout.model_validate(
+                expected_layout.model_dump(mode="json")
+            )
+            or contract.environment_policy != expected_environment
+            or contract.control.base.environment != expected_environment
+        ):
+            raise SandboxContractError(
+                SandboxFailureReason.ENVIRONMENT_POLICY_INVALID
+            )
+        _validate_staged_source(contract.source, contract.paths.source_input)
+        validate_boundary_runner_input(
+            contract.paths.runner_input,
+            expected=contract.runner_input,
+        )
+        _validate_runtime_copy(
+            contract.paths.runtime_input,
+            source=contract.source.identity,
+            expected_contract=contract.runtime_bundle,
+            expected_bundle_identity=contract.runtime_bundle_identity,
+        )
+        try:
+            control_files = tuple(contract.paths.control_input.iterdir())
+            control_bytes = _read_stable_regular_file(
+                contract.paths.control_input / "run-control.json",
+                maximum_bytes=262_144,
+            )
+            parsed_control = Ticket06AcceptanceControlEnvelope.model_validate_json(
+                control_bytes
+            )
+        except ValueError as exc:
+            raise SandboxContractError(
+                SandboxFailureReason.MAPPING_CONTRACT_INVALID
+            ) from exc
+        if (
+            len(control_files) != 1
+            or control_files[0].name != "run-control.json"
+            or parsed_control != contract.control
+            or control_bytes
+            != _canonical_json_bytes(contract.control.model_dump(mode="json")) + b"\n"
+        ):
+            raise SandboxContractError(
+                SandboxFailureReason.MAPPING_CONTRACT_INVALID
+            )
+        acceptance_run_identity = _identity(
+            "ticket06-sandbox-acceptance-run:v1",
+            {
+                "run_id": contract.control.base.run_id,
+                "source_input_identity": (
+                    contract.source.identity.source_input_identity
+                ),
+                "runtime_bundle_identity": contract.runtime_bundle_identity,
+                "runner_input_identity": contract.runner_input.runner_input_identity,
+                "protected_root_manifest_identity": protected.manifest_identity,
+                "boundary_qualification_identity": (
+                    contract.control.base.boundary_qualification_identity
+                ),
+                "frozen_baseline_identity": (
+                    contract.control.base.frozen_baseline_identity
+                ),
+                "command_ledger_identity": (
+                    contract.control.base.command_ledger.ledger_identity
+                ),
+            },
+        )
+        bindings = _mapping_bindings(
+            paths=contract.paths,
+            source=contract.source.identity,
+            runner_input=contract.runner_input,
+            control_identity=contract.control.control_identity,
+            runtime_bundle=contract.runtime_bundle,
+            qualification_run_identity=acceptance_run_identity,
+            results_identity_namespace=(
+                "windows-sandbox-ticket06-empty-results:v1"
+            ),
+        )
+        mapping = build_mapping_manifest(
+            bindings,
+            protected_manifest=protected,
+            forbidden_host_roots=contract.forbidden_host_roots,
+        )
+        if mapping.contract != contract.mapping_manifest.contract:
+            raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
+        configuration = render_wsb_configuration(
+            mapping,
+            protected_client_supported=current_platform.protected_client_supported,
+        )
+        validate_wsb_configuration(
+            configuration.xml,
+            mapping_manifest=mapping,
+            protected_client_supported=current_platform.protected_client_supported,
+        )
+        config_bytes = _read_stable_regular_file(
+            contract.paths.config_path,
+            maximum_bytes=262_144,
+        )
+        if (
+            configuration != contract.wsb_configuration
+            or config_bytes != configuration.xml.encode("utf-8")
+            or any(contract.paths.results_export.iterdir())
+        ):
+            raise SandboxContractError(SandboxFailureReason.PLATFORM_CONTRACT_INVALID)
+        expected_runner = build_runner_identity(
+            RunnerIdentityMaterial(
+                protected_root_manifest_identity=protected.manifest_identity,
+                source_input_identity=contract.source.identity.source_input_identity,
+                wsb_config_identity=configuration.config_identity,
+                mapping_manifest_identity=mapping.mapping_manifest_identity,
+                guest_layout_identity=contract.guest_layout.layout_identity,
+                environment_policy_identity=contract.environment_policy.policy_identity,
+                result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+                runtime_bundle_contract_identity=(
+                    contract.runtime_bundle.runtime_bundle_contract_identity
+                ),
+                runner_bootstrap_identity=(
+                    contract.runner_input.runner_input_identity
+                ),
+                control_inventory_identity=contract.control.control_identity,
+            )
+        )
+        if expected_runner != contract.control.derived.runner_identity:
+            raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+
     def _revalidate_boundary_contract(
         self,
         contract: BoundaryQualificationRunContract,
@@ -2698,6 +3025,29 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
             expected=contract.static_bindings,
             expected_probe_targets=contract.probe_targets,
         )
+
+    def launch_ticket06_acceptance(
+        self,
+        contract: Ticket06AcceptanceRunContract,
+        *,
+        timeout_seconds: int,
+    ) -> Ticket06AcceptanceExecution:
+        """Launch one acceptance guest and retain a bounded PASS or FAIL result."""
+
+        self._revalidate_ticket06_contract(contract)
+        process = self._platform.launch(
+            contract.paths.config_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if process.timed_out or not process.termination_confirmed:
+            raise SandboxContractError(SandboxFailureReason.SANDBOX_LAUNCH_FAILED)
+        exported = validate_ticket06_acceptance_export(
+            contract.paths.results_export,
+            expected=contract.control.derived,
+        )
+        if (process.returncode == 0) is not (exported.result.guest_claim == "pass"):
+            raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+        return Ticket06AcceptanceExecution(process=process, export=exported)
 
 
 class ISO03QualificationStatus(str, Enum):

@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from tradingagents.windows_sandbox_acceptance import (
+    QUALIFIED_RUNNER_SOURCE_FILES,
+    QUALIFIED_RUNNER_TARGET_FILES,
+)
 from tradingagents.windows_sandbox_qualification import (
     AdversarialProbeResult,
     AdversarialProbeTarget,
@@ -785,15 +789,10 @@ def test_iso_03_boundary_runner_input_is_closed_and_tamper_evident(
     repository = tmp_path / "repository"
     runner_sources = repository / "scripts" / "windows_sandbox"
     runner_sources.mkdir(parents=True)
-    for name in (
-        "bootstrap.ps1",
-        "offline_bundle_bootstrap.ps1",
-        "run_boundary_qualification.py",
-        "verify_source.py",
-    ):
-        (runner_sources / name).write_bytes(
-            (source_repository / "scripts" / "windows_sandbox" / name).read_bytes()
-        )
+    for relative_path, _target_name in QUALIFIED_RUNNER_SOURCE_FILES:
+        target = repository / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((source_repository / relative_path).read_bytes())
     subprocess.run(("git", "-C", str(repository), "init", "-q"), check=True)
     subprocess.run(
         ("git", "-C", str(repository), "-c", "core.autocrlf=false", "add", "."),
@@ -828,10 +827,7 @@ def test_iso_03_boundary_runner_input_is_closed_and_tamper_evident(
     assert manifest.source_mode == "reviewed_index"
     assert (staged / "bootstrap.ps1").read_bytes() == committed_bootstrap
     assert tuple(item.relative_path for item in manifest.files) == (
-        "bootstrap.ps1",
-        "install_boundary_runtime.ps1",
-        "run_boundary_qualification.py",
-        "verify_source.py",
+        QUALIFIED_RUNNER_TARGET_FILES
     )
     bootstrap = (staged / "bootstrap.ps1").read_text(encoding="utf-8")
     assert '$property.Name -ne "workspace_repository"' in bootstrap
@@ -850,6 +846,7 @@ def test_iso_03_reviewed_host_harness_rejects_dirty_executing_module_bytes(
     relative_paths = (
         "scripts/run_iso03_windows_sandbox_qualification.py",
         "tradingagents/offline_runtime_bundle.py",
+        "tradingagents/windows_sandbox_acceptance.py",
         "tradingagents/windows_sandbox_qualification.py",
         "tradingagents/windows_sandbox_runner.py",
     )
