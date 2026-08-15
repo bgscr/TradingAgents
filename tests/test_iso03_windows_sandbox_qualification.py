@@ -10,6 +10,10 @@ import pytest
 from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_SOURCE_FILES,
     QUALIFIED_RUNNER_TARGET_FILES,
+    TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+    TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+    Ticket06AcceptanceStructuralQualification,
+    qualify_ticket06_acceptance_runner_structure,
 )
 from tradingagents.windows_sandbox_qualification import (
     AdversarialProbeResult,
@@ -51,11 +55,18 @@ from tradingagents.windows_sandbox_runner import (
     SandboxContractError,
     SandboxFailureReason,
     SandboxFeatureState,
+    SandboxMappingBinding,
+    SandboxMappingRole,
     SandboxPlatformReport,
     SandboxProcessResult,
+    SandboxProcessTopologyEntry,
     WindowsSandboxPlatform,
+    build_environment_policy,
+    build_guest_layout,
+    build_mapping_manifest,
     build_protected_root_manifest,
     default_protected_root_bindings,
+    render_wsb_configuration,
 )
 
 _DIRECTORY_ROLES = {
@@ -301,6 +312,32 @@ def _static_bindings() -> QualificationStaticBindings:
         host_before_inventory_identity=(
             "windows-sandbox-protected-host-inventory:v1:sha256:" + ("2" * 64)
         ),
+        acceptance_runner_structure=Ticket06AcceptanceStructuralQualification.create(
+            runner_input_identity=(
+                "windows-sandbox-qualified-runner-input:v2:sha256:" + ("3" * 64)
+            ),
+            environment_policy_identity=(
+                "windows-sandbox-environment-policy:v1:sha256:" + ("4" * 64)
+            ),
+            host_harness_manifest_identity=(
+                "iso03-reviewed-host-harness:v1:sha256:" + ("5" * 64)
+            ),
+            host_acceptance_module_sha256="6" * 64,
+            boundary_runner_identity=(
+                "iso01-windows-sandbox-runner:v1:sha256:" + ("a" * 64)
+            ),
+            wsb_config_identity=(
+                "windows-sandbox-config:v1:sha256:" + ("b" * 64)
+            ),
+            wsb_config_policy_identity=(
+                "windows-sandbox-config-policy:v1:sha256:" + ("c" * 64)
+            ),
+            mapping_manifest_identity=(
+                "windows-sandbox-mapping-manifest:v1:sha256:" + ("d" * 64)
+            ),
+            command_ledger_identity=TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+            result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+        ),
     )
 
 
@@ -410,6 +447,19 @@ def _supported_platform_facts() -> WindowsHostPlatformFacts:
     )
 
 
+def _successful_process_topology() -> tuple[SandboxProcessTopologyEntry, ...]:
+    return (
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=101,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxClient.exe",
+            process_id=102,
+        ),
+    )
+
+
 def _minimal_launch(*, succeeded: bool = True) -> MinimalSandboxLaunchEvidence:
     return MinimalSandboxLaunchEvidence.create(
         succeeded=succeeded,
@@ -417,7 +467,33 @@ def _minimal_launch(*, succeeded: bool = True) -> MinimalSandboxLaunchEvidence:
         timed_out=False,
         config_identity="windows-sandbox-minimal-config:v1:sha256:" + ("4" * 64),
         marker_sha256="5" * 64 if succeeded else None,
+        launched_processes=_successful_process_topology() if succeeded else (),
     )
+
+
+def test_iso_03_minimal_launch_pass_requires_observed_launcher_image() -> None:
+    without_launcher = (
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxClient.exe",
+            process_id=102,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxServer.exe",
+            process_id=103,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="closed process topology"):
+        MinimalSandboxLaunchEvidence.create(
+            succeeded=True,
+            returncode=0,
+            timed_out=False,
+            config_identity=(
+                "windows-sandbox-minimal-config:v1:sha256:" + ("4" * 64)
+            ),
+            marker_sha256="5" * 64,
+            launched_processes=without_launcher,
+        )
 
 
 def test_iso_03_platform_qualification_requires_all_real_host_signals() -> None:
@@ -540,7 +616,7 @@ def test_iso_03_platform_fails_closed_before_launch_when_process_inventory_fails
         feature_state_override=SandboxFeatureState.ENABLED,
     )
     assert platform.probe().state.value == "available"
-    monkeypatch.setattr(platform, "_sandbox_process_ids", lambda: None)
+    monkeypatch.setattr(platform, "_sandbox_process_topology", lambda: None)
 
     def forbidden_popen(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("process launch must not occur without process inventory")
@@ -568,7 +644,13 @@ def test_iso_03_platform_fails_closed_before_launch_when_sandbox_is_already_acti
         feature_state_override=SandboxFeatureState.ENABLED,
     )
     assert platform.probe().state.value == "available"
-    monkeypatch.setattr(platform, "_sandbox_process_ids", lambda: {900})
+    preexisting = (
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=900,
+        ),
+    )
+    monkeypatch.setattr(platform, "_sandbox_process_topology", lambda: preexisting)
 
     def forbidden_popen(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("process launch must not occur while Sandbox is already active")
@@ -579,10 +661,11 @@ def test_iso_03_platform_fails_closed_before_launch_when_sandbox_is_already_acti
 
     assert result.returncode == -1
     assert result.launched_process_ids == ()
+    assert result.before_processes == preexisting
     assert result.termination_confirmed is False
 
 
-def test_iso_03_platform_inventories_store_sandbox_and_utility_vm_processes(
+def test_iso_03_platform_inventories_store_sandbox_and_utility_vm_process_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tasklist = b"\r\n".join(
@@ -605,7 +688,41 @@ def test_iso_03_platform_inventories_store_sandbox_and_utility_vm_processes(
         ),
     )
 
-    assert WindowsSandboxPlatform._sandbox_process_ids() == {101, 102, 103, 104, 105}
+    topology = WindowsSandboxPlatform._sandbox_process_topology()
+
+    assert topology is not None
+    assert {(item.image_name, item.process_id) for item in topology} == {
+        ("WindowsSandbox.exe", 101),
+        ("WindowsSandboxClient.exe", 102),
+        ("WindowsSandboxServer.exe", 103),
+        ("WindowsSandboxRemoteSession.exe", 104),
+        ("VmmemWindowsSandbox", 105),
+    }
+
+
+@pytest.mark.parametrize(
+    "tasklist",
+    (
+        b'"WindowsSandbox.exe","not-a-pid","Console","1","1,000 K"',
+        b'"WindowsSandboxClient.exe"',
+        b'"WindowsSandbox.exe","0","Console","1","1,000 K"',
+    ),
+)
+def test_iso_03_platform_rejects_malformed_relevant_process_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tasklist: bytes,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=tasklist,
+        ),
+    )
+
+    assert WindowsSandboxPlatform._sandbox_process_topology() is None
 
 
 def test_iso_03_platform_timeout_terminates_and_confirms_new_sandbox_processes(
@@ -639,8 +756,18 @@ def test_iso_03_platform_timeout_terminates_and_confirms_new_sandbox_processes(
         def kill(self) -> None:
             self.returncode = -1
 
-    process_sets = iter((set(), {200}, set()))
-    monkeypatch.setattr(platform, "_sandbox_process_ids", lambda: next(process_sets))
+    launched = (
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=150,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxClient.exe",
+            process_id=200,
+        ),
+    )
+    process_sets = iter(((), launched, ()))
+    monkeypatch.setattr(platform, "_sandbox_process_topology", lambda: next(process_sets))
     monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
     terminated: list[int] = []
     monkeypatch.setattr(platform, "_terminate_process_tree", terminated.append)
@@ -649,8 +776,75 @@ def test_iso_03_platform_timeout_terminates_and_confirms_new_sandbox_processes(
 
     assert result.timed_out is True
     assert result.termination_confirmed is True
-    assert result.launched_process_ids == (200,)
-    assert terminated == [150, 200]
+    assert result.launched_process_ids == (150, 200)
+    assert result.launched_processes == launched
+    assert result.after_processes == ()
+    assert terminated == [150]
+
+
+def test_iso_03_platform_concurrent_launcher_is_recorded_but_never_killed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "WindowsSandbox.exe"
+    executable.write_bytes(b"reviewed executable placeholder")
+    config = tmp_path / "sandbox.wsb"
+    config.write_text("<Configuration />", encoding="utf-8")
+    platform = WindowsSandboxPlatform(
+        host_is_windows=True,
+        executable_override=executable,
+        windows_build=26100,
+        feature_state_override=SandboxFeatureState.ENABLED,
+    )
+    assert platform.probe().state.value == "available"
+
+    class FakeProcess:
+        pid = 150
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: int) -> int:
+            assert timeout == 15
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+    concurrent = (
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=150,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxClient.exe",
+            process_id=200,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=151,
+        ),
+        SandboxProcessTopologyEntry(
+            image_name="WindowsSandboxClient.exe",
+            process_id=201,
+        ),
+    )
+    process_sets = iter(((), concurrent, ()))
+    monkeypatch.setattr(platform, "_sandbox_process_topology", lambda: next(process_sets))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    terminated: list[int] = []
+    monkeypatch.setattr(platform, "_terminate_process_tree", terminated.append)
+
+    result = platform.launch(config, timeout_seconds=30)
+
+    assert result.returncode == -1
+    assert result.termination_confirmed is True
+    assert set(result.launched_processes) == set(concurrent)
+    assert result.after_processes == ()
+    assert terminated == [150]
+    assert 151 not in terminated
 
 
 def test_iso_03_protected_state_root_is_independent_of_runner_and_source_repositories(
@@ -731,6 +925,7 @@ class _MinimalLaunchPlatform:
         return SandboxProcessResult(
             returncode=0,
             timed_out=False,
+            launched_processes=_successful_process_topology(),
             termination_confirmed=self.termination_confirmed,
         )
 
@@ -831,6 +1026,88 @@ def test_iso_03_boundary_runner_input_is_closed_and_tamper_evident(
     )
     bootstrap = (staged / "bootstrap.ps1").read_text(encoding="utf-8")
     assert '$property.Name -ne "workspace_repository"' in bootstrap
+
+    layout = build_guest_layout()
+    boundary_environment = build_environment_policy(
+        run_live_environment=(
+            "RUN_LIVE_CUSTOM_TESTS",
+            "RUN_LIVE_DEEPSEEK_TESTS",
+            "RUN_LIVE_ENVIRONMENT",
+            "RUN_LIVE_PROVIDER_TESTS",
+            "RUN_LIVE_TUSHARE_TESTS",
+        ),
+        layout=layout,
+    )
+    mapping_root = tmp_path / "mappings"
+    guest_paths = {
+        SandboxMappingRole.SOURCE: r"C:\QCF17\Input\Source",
+        SandboxMappingRole.RUNNER: r"C:\QCF17\Input\Runner",
+        SandboxMappingRole.CONTROL: r"C:\QCF17\Input\Control",
+        SandboxMappingRole.RUNTIME_BUNDLE: r"C:\QCF17\Input\Runtime",
+        SandboxMappingRole.RESULTS_EXPORT: r"C:\QCF17\Export",
+    }
+    mapping_bindings = []
+    for index, role in enumerate(SandboxMappingRole, start=1):
+        host_path = mapping_root / role.value
+        host_path.mkdir(parents=True)
+        mapping_bindings.append(
+            SandboxMappingBinding(
+                role=role,
+                host_path=host_path,
+                guest_path=guest_paths[role],
+                read_only=role is not SandboxMappingRole.RESULTS_EXPORT,
+                content_identity=(
+                    f"iso03-test-{role.value}:v1:sha256:{index:064x}"
+                ),
+                fresh_empty=role is SandboxMappingRole.RESULTS_EXPORT,
+            )
+        )
+    mapping_manifest = build_mapping_manifest(
+        tuple(mapping_bindings),
+        protected_manifest=_protected_manifest(tmp_path / "protected"),
+        forbidden_host_roots=(),
+    )
+    configuration = render_wsb_configuration(
+        mapping_manifest,
+        protected_client_supported=True,
+    )
+    host_acceptance_module = (
+        source_repository / "tradingagents" / "windows_sandbox_qualification.py"
+    )
+    host_acceptance_sha256 = sha256(host_acceptance_module.read_bytes()).hexdigest()
+    structure = qualify_ticket06_acceptance_runner_structure(
+        staged,
+        expected_runner_identity=manifest.runner_input_identity,
+        base_environment_variables=boundary_environment.variables,
+        mapping_manifest=mapping_manifest,
+        wsb_configuration=configuration,
+        boundary_runner_identity=(
+            "iso01-windows-sandbox-runner:v1:sha256:" + ("7" * 64)
+        ),
+        host_harness_manifest_identity=(
+            "iso03-reviewed-host-harness:v1:sha256:" + ("8" * 64)
+        ),
+        host_acceptance_module_path=host_acceptance_module,
+        expected_host_acceptance_module_sha256=host_acceptance_sha256,
+    )
+    assert structure.ticket06_executed is False
+    assert structure.command_ledger_identity == TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+    assert structure.mandatory_command_count == 27
+    assert structure.full_suite_a_entry_id == "full_suite_a"
+    assert structure.full_suite_b_entry_id == "full_suite_b"
+    assert structure.result_schema_validated is True
+    assert structure.completion_marker_write_order == "last"
+    assert structure.additional_host_mapping_required is False
+    assert structure.network_permission_required is False
+    assert structure.mapping_manifest_identity == (
+        mapping_manifest.mapping_manifest_identity
+    )
+    assert structure.wsb_config_identity == configuration.config_identity
+    assert structure.host_acceptance_module_sha256 == host_acceptance_sha256
+    assert structure.offline_review_executable_closed is True
+    assert structure.acceptance_orchestrator_write_order_validated is True
+    assert structure.host_acceptance_mapping_reuse_validated is True
+    assert structure.host_acceptance_export_validation_path_validated is True
 
     (staged / "run_boundary_qualification.py").write_text(
         "raise SystemExit('tampered')\n", encoding="utf-8"

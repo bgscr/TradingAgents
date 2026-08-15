@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
@@ -2227,12 +2228,33 @@ class SandboxPlatformReport(BaseModel):
         )
 
 
+class SandboxProcessTopologyEntry(BaseModel):
+    """One closed process-image/PID observation from the Sandbox topology."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    image_name: Literal[
+        "WindowsSandbox.exe",
+        "WindowsSandboxClient.exe",
+        "WindowsSandboxRemoteSession.exe",
+        "WindowsSandboxServer.exe",
+        "VmmemWindowsSandbox",
+    ]
+    process_id: int = Field(ge=1, le=(2**31) - 1)
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxProcessResult:
     returncode: int
     timed_out: bool
-    launched_process_ids: tuple[int, ...] = ()
+    before_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
+    launched_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
+    after_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
     termination_confirmed: bool = True
+
+    @property
+    def launched_process_ids(self) -> tuple[int, ...]:
+        return tuple(item.process_id for item in self.launched_processes)
 
 
 class SandboxPlatform(Protocol):
@@ -2407,7 +2429,7 @@ class WindowsSandboxPlatform:
             if report.state is not SandboxPlatformState.AVAILABLE:
                 return SandboxProcessResult(returncode=-1, timed_out=False)
         assert self._executable is not None
-        before_processes = self._sandbox_process_ids()
+        before_processes = self._sandbox_process_topology()
         if before_processes is None:
             return SandboxProcessResult(
                 returncode=-1,
@@ -2418,6 +2440,7 @@ class WindowsSandboxPlatform:
             return SandboxProcessResult(
                 returncode=-1,
                 timed_out=False,
+                before_processes=before_processes,
                 termination_confirmed=False,
             )
         try:
@@ -2428,15 +2451,21 @@ class WindowsSandboxPlatform:
         except OSError:
             return SandboxProcessResult(returncode=-1, timed_out=False)
         deadline = time.monotonic() + timeout_seconds
-        observed: set[int] = set()
+        launcher = SandboxProcessTopologyEntry(
+            image_name="WindowsSandbox.exe",
+            process_id=process.pid,
+        )
+        observed: dict[int, SandboxProcessTopologyEntry] = {
+            launcher.process_id: launcher
+        }
         launcher_returncode: int | None = None
         startup_deadline = min(deadline, time.monotonic() + 30)
         while time.monotonic() < deadline:
             if launcher_returncode is None:
                 launcher_returncode = process.poll()
-            current = self._sandbox_process_ids()
+            current = self._sandbox_process_topology()
             if current is None:
-                termination_confirmed = self._terminate_and_confirm(
+                termination_confirmed, after_processes = self._terminate_and_confirm(
                     process,
                     before_processes=before_processes,
                     observed=observed,
@@ -2444,13 +2473,39 @@ class WindowsSandboxPlatform:
                 return SandboxProcessResult(
                     returncode=-1,
                     timed_out=False,
-                    launched_process_ids=tuple(sorted(observed)),
+                    before_processes=before_processes,
+                    launched_processes=self._ordered_topology(observed.values()),
+                    after_processes=after_processes,
                     termination_confirmed=termination_confirmed,
                 )
-            observed.update(current - before_processes - {process.pid})
-            active = observed & current
+            before_ids = {item.process_id for item in before_processes}
+            current_by_id = {item.process_id: item for item in current}
+            concurrent_launcher = any(
+                item.image_name == "WindowsSandbox.exe"
+                and item.process_id != process.pid
+                and item.process_id not in before_ids
+                for item in current
+            )
+            for item in current:
+                if item.process_id not in before_ids:
+                    observed[item.process_id] = item
+            active = set(observed).intersection(current_by_id)
+            if concurrent_launcher:
+                termination_confirmed, after_processes = self._terminate_and_confirm(
+                    process,
+                    before_processes=before_processes,
+                    observed=observed,
+                )
+                return SandboxProcessResult(
+                    returncode=-1,
+                    timed_out=False,
+                    before_processes=before_processes,
+                    launched_processes=self._ordered_topology(observed.values()),
+                    after_processes=after_processes,
+                    termination_confirmed=termination_confirmed,
+                )
             if launcher_returncode not in {None, 0}:
-                termination_confirmed = self._terminate_and_confirm(
+                termination_confirmed, after_processes = self._terminate_and_confirm(
                     process,
                     before_processes=before_processes,
                     observed=observed,
@@ -2458,17 +2513,25 @@ class WindowsSandboxPlatform:
                 return SandboxProcessResult(
                     returncode=launcher_returncode,
                     timed_out=False,
-                    launched_process_ids=tuple(sorted(observed)),
+                    before_processes=before_processes,
+                    launched_processes=self._ordered_topology(observed.values()),
+                    after_processes=after_processes,
                     termination_confirmed=termination_confirmed,
                 )
-            if launcher_returncode == 0 and observed and not active:
+            if launcher_returncode == 0 and len(observed) > 1 and not active:
                 return SandboxProcessResult(
                     returncode=0,
                     timed_out=False,
-                    launched_process_ids=tuple(sorted(observed)),
+                    before_processes=before_processes,
+                    launched_processes=self._ordered_topology(observed.values()),
+                    after_processes=current,
                 )
-            if launcher_returncode == 0 and not observed and time.monotonic() >= startup_deadline:
-                termination_confirmed = self._terminate_and_confirm(
+            if (
+                launcher_returncode == 0
+                and len(observed) == 1
+                and time.monotonic() >= startup_deadline
+            ):
+                termination_confirmed, after_processes = self._terminate_and_confirm(
                     process,
                     before_processes=before_processes,
                     observed=observed,
@@ -2476,11 +2539,14 @@ class WindowsSandboxPlatform:
                 return SandboxProcessResult(
                     returncode=-1,
                     timed_out=False,
+                    before_processes=before_processes,
+                    launched_processes=self._ordered_topology(observed.values()),
+                    after_processes=after_processes,
                     termination_confirmed=termination_confirmed,
                 )
             time.sleep(0.25)
 
-        termination_confirmed = self._terminate_and_confirm(
+        termination_confirmed, after_processes = self._terminate_and_confirm(
             process,
             before_processes=before_processes,
             observed=observed,
@@ -2488,12 +2554,25 @@ class WindowsSandboxPlatform:
         return SandboxProcessResult(
             returncode=-1,
             timed_out=True,
-            launched_process_ids=tuple(sorted(observed)),
+            before_processes=before_processes,
+            launched_processes=self._ordered_topology(observed.values()),
+            after_processes=after_processes,
             termination_confirmed=termination_confirmed,
         )
 
     @staticmethod
-    def _sandbox_process_ids() -> set[int] | None:
+    def _ordered_topology(
+        processes: Iterable[SandboxProcessTopologyEntry],
+    ) -> tuple[SandboxProcessTopologyEntry, ...]:
+        return tuple(
+            sorted(
+                processes,
+                key=lambda item: (item.image_name.casefold(), item.process_id),
+            )
+        )
+
+    @staticmethod
+    def _sandbox_process_topology() -> tuple[SandboxProcessTopologyEntry, ...] | None:
         system_root = Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
         tasklist = system_root / "System32" / "tasklist.exe"
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -2511,51 +2590,65 @@ class WindowsSandboxPlatform:
         if completed.returncode != 0 or len(completed.stdout) > 8 * 1024 * 1024:
             return None
         names = {
-            "windowssandbox.exe",
-            "windowssandboxclient.exe",
-            "windowssandboxremotesession.exe",
-            "windowssandboxserver.exe",
-            "vmmemwindowssandbox",
+            "windowssandbox.exe": "WindowsSandbox.exe",
+            "windowssandboxclient.exe": "WindowsSandboxClient.exe",
+            "windowssandboxremotesession.exe": "WindowsSandboxRemoteSession.exe",
+            "windowssandboxserver.exe": "WindowsSandboxServer.exe",
+            "vmmemwindowssandbox": "VmmemWindowsSandbox",
         }
         text = completed.stdout.decode("utf-8", errors="replace")
-        result: set[int] = set()
+        result: dict[int, SandboxProcessTopologyEntry] = {}
         for row in csv.reader(text.splitlines()):
-            if len(row) < 2 or row[0].casefold() not in names:
+            if not row or row[0].casefold() not in names:
                 continue
+            if len(row) < 2:
+                return None
             try:
-                result.add(int(row[1]))
-            except ValueError:
-                continue
-        return result
+                process_id = int(row[1])
+                item = SandboxProcessTopologyEntry(
+                    image_name=names[row[0].casefold()],
+                    process_id=process_id,
+                )
+            except (TypeError, ValueError):
+                return None
+            existing = result.get(process_id)
+            if existing is not None and existing != item:
+                return None
+            result[process_id] = item
+        return WindowsSandboxPlatform._ordered_topology(result.values())
 
     def _terminate_and_confirm(
         self,
         process: subprocess.Popen[bytes],
         *,
-        before_processes: set[int],
-        observed: set[int],
-    ) -> bool:
+        before_processes: tuple[SandboxProcessTopologyEntry, ...],
+        observed: dict[int, SandboxProcessTopologyEntry],
+    ) -> tuple[bool, tuple[SandboxProcessTopologyEntry, ...]]:
         self._terminate_process_tree(process.pid)
-        for process_id in sorted(observed):
-            self._terminate_process_tree(process_id)
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             process.kill()
         deadline = time.monotonic() + 30
+        last_current: tuple[SandboxProcessTopologyEntry, ...] = ()
+        before_ids = {item.process_id for item in before_processes}
         while time.monotonic() < deadline:
-            current = self._sandbox_process_ids()
+            current = self._sandbox_process_topology()
             if current is None:
                 time.sleep(0.25)
                 continue
-            active = current - before_processes - {process.pid}
+            last_current = current
+            current_by_id = {item.process_id: item for item in current}
+            active = {
+                process_id: item
+                for process_id, item in current_by_id.items()
+                if process_id not in before_ids
+            }
             observed.update(active)
             if process.poll() is not None and not active:
-                return True
-            for process_id in sorted(active):
-                self._terminate_process_tree(process_id)
+                return True, current
             time.sleep(0.25)
-        return False
+        return False, last_current
 
     @staticmethod
     def _terminate_process_tree(process_id: int) -> None:

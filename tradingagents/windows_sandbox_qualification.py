@@ -36,6 +36,7 @@ from tradingagents.windows_sandbox_acceptance import (
     QualifiedRunnerManifest,
     Ticket06AcceptanceControlBase,
     Ticket06AcceptanceControlEnvelope,
+    Ticket06AcceptanceStructuralQualification,
     Ticket06ControlEnvironment,
     Ticket06ControlGuestLayout,
     Ticket06ControlRuntime,
@@ -45,6 +46,7 @@ from tradingagents.windows_sandbox_acceptance import (
     build_ticket06_command_ledger,
     build_ticket06_control_environment,
     content_identity as acceptance_content_identity,
+    qualify_ticket06_acceptance_runner_structure,
     validate_ticket06_acceptance_export,
 )
 from tradingagents.windows_sandbox_runner import (
@@ -67,6 +69,7 @@ from tradingagents.windows_sandbox_runner import (
     SandboxPlatformReport,
     SandboxPlatformState,
     SandboxProcessResult,
+    SandboxProcessTopologyEntry,
     StagedSourceInput,
     WindowsSandboxPlatform,
     WindowsSandboxRunnerService,
@@ -126,6 +129,7 @@ BOUNDARY_QUALIFICATION_RESULT_SCHEMA_IDENTITY = _identity(
             "sqlite",
         ],
         "completion_written_last": True,
+        "acceptance_runner_structural_qualification_bound": True,
         "maximum_export_bytes": 524_288,
         "host_inventory_authority": False,
     },
@@ -654,7 +658,9 @@ def run_minimal_sandbox_launch(
         timed_out=process.timed_out,
         config_identity=config_identity,
         marker_sha256=marker_sha256,
-        launched_process_ids=process.launched_process_ids,
+        before_processes=process.before_processes,
+        launched_processes=process.launched_processes,
+        after_processes=process.after_processes,
         termination_confirmed=process.termination_confirmed,
     )
 
@@ -668,7 +674,9 @@ class MinimalSandboxLaunchEvidence(BaseModel):
     succeeded: bool
     returncode: int = Field(ge=-1, le=65535)
     timed_out: bool
-    launched_process_ids: tuple[int, ...] = ()
+    before_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
+    launched_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
+    after_processes: tuple[SandboxProcessTopologyEntry, ...] = ()
     termination_confirmed: bool = True
     config_identity: str = Field(min_length=1, max_length=180)
     marker_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -683,16 +691,35 @@ class MinimalSandboxLaunchEvidence(BaseModel):
             and self.marker_sha256 is not None
         ):
             raise ValueError("minimal Sandbox launch evidence is inconsistent")
-        if self.launched_process_ids != tuple(sorted(set(self.launched_process_ids))) or any(
-            process_id <= 0 for process_id in self.launched_process_ids
+        for rows in (
+            self.before_processes,
+            self.launched_processes,
+            self.after_processes,
         ):
-            raise ValueError("minimal Sandbox process evidence is invalid")
+            if rows != WindowsSandboxPlatform._ordered_topology(rows) or len(
+                {item.process_id for item in rows}
+            ) != len(rows):
+                raise ValueError("minimal Sandbox process topology is invalid")
+        if self.succeeded and (
+            self.before_processes
+            or len(self.launched_processes) < 2
+            or not any(
+                item.image_name == "WindowsSandbox.exe"
+                for item in self.launched_processes
+            )
+            or self.after_processes
+        ):
+            raise ValueError("successful minimal launch lacks closed process topology")
         payload = self.model_dump(mode="json", exclude={"evidence_identity"})
         if self.evidence_identity != _identity(
             "windows-sandbox-minimal-launch-evidence:v1", payload
         ):
             raise ValueError("minimal Sandbox launch evidence identity mismatch")
         return self
+
+    @property
+    def launched_process_ids(self) -> tuple[int, ...]:
+        return tuple(item.process_id for item in self.launched_processes)
 
     @classmethod
     def create(
@@ -703,7 +730,9 @@ class MinimalSandboxLaunchEvidence(BaseModel):
         timed_out: bool,
         config_identity: str,
         marker_sha256: str | None,
-        launched_process_ids: tuple[int, ...] = (),
+        before_processes: tuple[SandboxProcessTopologyEntry, ...] = (),
+        launched_processes: tuple[SandboxProcessTopologyEntry, ...] = (),
+        after_processes: tuple[SandboxProcessTopologyEntry, ...] = (),
         termination_confirmed: bool = True,
     ) -> MinimalSandboxLaunchEvidence:
         payload = {
@@ -711,7 +740,11 @@ class MinimalSandboxLaunchEvidence(BaseModel):
             "succeeded": succeeded,
             "returncode": returncode,
             "timed_out": timed_out,
-            "launched_process_ids": list(launched_process_ids),
+            "before_processes": [item.model_dump(mode="json") for item in before_processes],
+            "launched_processes": [
+                item.model_dump(mode="json") for item in launched_processes
+            ],
+            "after_processes": [item.model_dump(mode="json") for item in after_processes],
             "termination_confirmed": termination_confirmed,
             "config_identity": config_identity,
             "marker_sha256": marker_sha256,
@@ -1073,6 +1106,7 @@ class QualificationStaticBindings(BaseModel):
     platform_qualification_identity: str = Field(min_length=1, max_length=180)
     immutable_verifier_identity: str = Field(min_length=1, max_length=180)
     host_before_inventory_identity: str = Field(min_length=1, max_length=180)
+    acceptance_runner_structure: Ticket06AcceptanceStructuralQualification
 
 
 class BoundaryQualificationControlEnvelope(BaseModel):
@@ -1128,6 +1162,34 @@ class BoundaryQualificationControlEnvelope(BaseModel):
         derived = self.derived.model_dump(mode="json")
         if any(derived[key] != value for key, value in expected.items()):
             raise ValueError("derived boundary control binding mismatch")
+        acceptance_environment = build_ticket06_control_environment(
+            self.base.environment.variables
+        )
+        acceptance = self.derived.acceptance_runner_structure
+        host_module = next(
+            (
+                item
+                for item in self.base.host_harness.files
+                if item.relative_path
+                == "tradingagents/windows_sandbox_qualification.py"
+            ),
+            None,
+        )
+        if (
+            host_module is None
+            or acceptance.runner_input_identity
+            != self.base.runner_input.runner_input_identity
+            or acceptance.environment_policy_identity
+            != acceptance_environment.policy_identity
+            or acceptance.host_harness_manifest_identity
+            != self.base.host_harness.manifest_identity
+            or acceptance.host_acceptance_module_sha256 != host_module.sha256
+            or acceptance.boundary_runner_identity != self.derived.runner_identity
+            or acceptance.wsb_config_identity != self.derived.wsb_config_identity
+            or acceptance.mapping_manifest_identity
+            != self.derived.mapping_manifest_identity
+        ):
+            raise ValueError("acceptance-runner structural binding mismatch")
         return self
 
 
@@ -2492,6 +2554,30 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
                 control_inventory_identity=control_identity,
             )
         )
+        host_acceptance_module = next(
+            (
+                item
+                for item in request.host_harness.files
+                if item.relative_path
+                == "tradingagents/windows_sandbox_qualification.py"
+            ),
+            None,
+        )
+        if host_acceptance_module is None:
+            raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
+        acceptance_runner_structure = qualify_ticket06_acceptance_runner_structure(
+            runner_root,
+            expected_runner_identity=runner_input.runner_input_identity,
+            base_environment_variables=environment.variables,
+            mapping_manifest=mapping_manifest,
+            wsb_configuration=configuration,
+            boundary_runner_identity=runner_identity,
+            host_harness_manifest_identity=request.host_harness.manifest_identity,
+            host_acceptance_module_path=Path(__file__),
+            expected_host_acceptance_module_sha256=(
+                host_acceptance_module.sha256
+            ),
+        )
         assert runtime_bundle.bundle_manifest_sha256 is not None
         static = QualificationStaticBindings(
             qualification_run_identity=qualification_run_identity,
@@ -2516,6 +2602,7 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
             ),
             immutable_verifier_identity=request.immutable_verifier_identity,
             host_before_inventory_identity=request.host_before_inventory.inventory_identity,
+            acceptance_runner_structure=acceptance_runner_structure,
         )
         envelope = BoundaryQualificationControlEnvelope(
             base=control_base,
@@ -2982,8 +3069,34 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
                 ),
             )
         )
+        host_acceptance_module = next(
+            (
+                item
+                for item in current_host_harness.files
+                if item.relative_path
+                == "tradingagents/windows_sandbox_qualification.py"
+            ),
+            None,
+        )
+        if host_acceptance_module is None:
+            raise SandboxContractError(SandboxFailureReason.FORBIDDEN_INPUT)
+        acceptance_runner_structure = qualify_ticket06_acceptance_runner_structure(
+            contract.paths.runner_input,
+            expected_runner_identity=contract.runner_input.runner_input_identity,
+            base_environment_variables=contract.environment_policy.variables,
+            mapping_manifest=mapping,
+            wsb_configuration=configuration,
+            boundary_runner_identity=expected_runner_identity,
+            host_harness_manifest_identity=current_host_harness.manifest_identity,
+            host_acceptance_module_path=Path(__file__),
+            expected_host_acceptance_module_sha256=(
+                host_acceptance_module.sha256
+            ),
+        )
         if (
             expected_runner_identity != contract.static_bindings.runner_identity
+            or acceptance_runner_structure
+            != contract.static_bindings.acceptance_runner_structure
             or contract.control.derived != contract.static_bindings
         ):
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
@@ -3081,6 +3194,9 @@ class ISO03HostQualificationReport(BaseModel):
     sandbox_timed_out: bool
     sandbox_termination_confirmed: bool
     sandbox_process_ids: tuple[int, ...]
+    sandbox_process_before: tuple[SandboxProcessTopologyEntry, ...]
+    sandbox_process_observed: tuple[SandboxProcessTopologyEntry, ...]
+    sandbox_process_after: tuple[SandboxProcessTopologyEntry, ...]
     guest_result: GuestQualificationResult | None
     guest_export_identity: str | None = Field(default=None, max_length=180)
     host_before_inventory_identity: str | None = Field(default=None, max_length=180)
@@ -3108,6 +3224,15 @@ class ISO03HostQualificationReport(BaseModel):
             or self.sandbox_returncode != 0
             or self.sandbox_timed_out
             or not self.sandbox_termination_confirmed
+            or self.sandbox_process_before
+            or len(self.sandbox_process_observed) < 2
+            or not any(
+                item.image_name == "WindowsSandbox.exe"
+                for item in self.sandbox_process_observed
+            )
+            or self.sandbox_process_after
+            or self.sandbox_process_ids
+            != tuple(item.process_id for item in self.sandbox_process_observed)
             or self.static_bindings is None
             or self.implementation_base_commit_id is None
             or self.candidate_tree_hash is None
@@ -3251,6 +3376,11 @@ def _build_iso03_report(**values: object) -> ISO03HostQualificationReport:
         if isinstance(value, BaseModel)
         else value.value
         if isinstance(value, Enum)
+        else [
+            item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+            for item in value
+        ]
+        if isinstance(value, tuple)
         else value
         for key, value in model_values.items()
     }
@@ -3351,6 +3481,9 @@ def execute_iso03_boundary_qualification(
             sandbox_timed_out=False,
             sandbox_termination_confirmed=True,
             sandbox_process_ids=(),
+            sandbox_process_before=(),
+            sandbox_process_observed=(),
+            sandbox_process_after=(),
             guest_result=None,
             guest_export_identity=None,
             host_before_inventory_identity=None,
@@ -3388,6 +3521,9 @@ def execute_iso03_boundary_qualification(
             sandbox_timed_out=False,
             sandbox_termination_confirmed=True,
             sandbox_process_ids=(),
+            sandbox_process_before=(),
+            sandbox_process_observed=(),
+            sandbox_process_after=(),
             guest_result=None,
             guest_export_identity=None,
             host_before_inventory_identity=None,
@@ -3541,10 +3677,13 @@ def execute_iso03_boundary_qualification(
     actual_launch = False
     try:
         if quiescence_evidence is not None:
-            actual_launch = True
             process = service.launch_boundary_process(
                 contract,
                 timeout_seconds=qualification_timeout_seconds,
+            )
+            actual_launch = any(
+                item.image_name == "WindowsSandbox.exe"
+                for item in process.launched_processes
             )
             if process.timed_out or process.returncode != 0:
                 failure_reason = (
@@ -3606,6 +3745,11 @@ def execute_iso03_boundary_qualification(
             process.termination_confirmed if process is not None else True
         ),
         sandbox_process_ids=(process.launched_process_ids if process is not None else ()),
+        sandbox_process_before=(process.before_processes if process is not None else ()),
+        sandbox_process_observed=(
+            process.launched_processes if process is not None else ()
+        ),
+        sandbox_process_after=(process.after_processes if process is not None else ()),
         guest_result=exported.result if exported is not None else None,
         guest_export_identity=exported.export_identity if exported is not None else None,
         host_before_inventory_identity=immediate_before.inventory_identity,

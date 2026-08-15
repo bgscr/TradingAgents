@@ -158,6 +158,69 @@ def _verify_control(control: dict[str, Any]) -> None:
         raise RuntimeError("qualification_control_identity_mismatch")
     base = control["base"]
     derived = control["derived"]
+    acceptance_structure = derived.get("acceptance_runner_structure")
+    if not isinstance(acceptance_structure, dict):
+        raise RuntimeError("acceptance_runner_structure_missing")
+    acceptance_identity = acceptance_structure.get("qualification_identity")
+    acceptance_payload = {
+        key: value
+        for key, value in acceptance_structure.items()
+        if key != "qualification_identity"
+    }
+    if (
+        acceptance_identity
+        != _identity("ticket06-acceptance-runner-structure:v2", acceptance_payload)
+        or acceptance_structure.get("command_ledger_identity")
+        != (
+            "ticket06-sandbox-command-ledger:v1:sha256:"
+            "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+        )
+        or acceptance_structure.get("mandatory_command_count") != 27
+        or acceptance_structure.get("ticket06_executed") is not False
+        or acceptance_structure.get("guest_qcf17_host_clause_b_authority") is not False
+        or acceptance_structure.get("guest_qcf18_final_authority") is not False
+        or acceptance_structure.get("completion_marker_write_order") != "last"
+        or acceptance_structure.get("additional_host_mapping_required") is not False
+        or acceptance_structure.get("network_permission_required") is not False
+        or acceptance_structure.get("runner_input_identity")
+        != base.get("runner_input", {}).get("runner_input_identity")
+        or acceptance_structure.get("boundary_runner_identity")
+        != derived.get("runner_identity")
+        or acceptance_structure.get("wsb_config_identity")
+        != derived.get("wsb_config_identity")
+        or acceptance_structure.get("mapping_manifest_identity")
+        != derived.get("mapping_manifest_identity")
+        or acceptance_structure.get("host_harness_manifest_identity")
+        != base.get("host_harness", {}).get("manifest_identity")
+        or acceptance_structure.get("offline_review_executable_closed") is not True
+        or acceptance_structure.get(
+            "acceptance_orchestrator_write_order_validated"
+        )
+        is not True
+        or acceptance_structure.get("host_acceptance_mapping_reuse_validated")
+        is not True
+        or acceptance_structure.get(
+            "host_acceptance_export_validation_path_validated"
+        )
+        is not True
+    ):
+        raise RuntimeError("acceptance_runner_structure_invalid")
+    host_harness_files = base.get("host_harness", {}).get("files")
+    if not isinstance(host_harness_files, list):
+        raise RuntimeError("acceptance_runner_structure_invalid")
+    host_acceptance_files = [
+        item
+        for item in host_harness_files
+        if isinstance(item, dict)
+        and item.get("relative_path")
+        == "tradingagents/windows_sandbox_qualification.py"
+    ]
+    if (
+        len(host_acceptance_files) != 1
+        or acceptance_structure.get("host_acceptance_module_sha256")
+        != host_acceptance_files[0].get("sha256")
+    ):
+        raise RuntimeError("acceptance_runner_structure_invalid")
     source_alias = control.get("source", {})
     expected_source_alias = {
         "contract_version": base["source"]["contract_version"],

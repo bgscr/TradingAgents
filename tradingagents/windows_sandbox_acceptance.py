@@ -7,15 +7,22 @@ or execute an acceptance command.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import stat
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from tradingagents.windows_sandbox_runner import (
+        ResolvedSandboxMappingManifest,
+        WsbConfiguration,
+    )
 
 TICKET06_COMMAND_LEDGER_VERSION = "ticket06-sandbox-command-ledger-v1"
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
@@ -75,6 +82,18 @@ TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY = content_identity(
     "windows-sandbox-ticket06-result-schema:v1",
     _TICKET06_ACCEPTANCE_RESULT_DESCRIPTOR,
 )
+TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY = (
+    "ticket06-sandbox-command-ledger:v1:sha256:"
+    "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+)
+TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY = content_identity(
+    "windows-sandbox-ticket06-completion-contract:v1",
+    {
+        "allowed_filename": "completion.json",
+        "contract_version": "windows-sandbox-ticket06-completion-v1",
+        "write_order": "last",
+    },
+)
 
 
 QUALIFIED_RUNNER_SOURCE_FILES = (
@@ -104,6 +123,178 @@ QUALIFIED_RUNNER_SOURCE_FILES = (
 QUALIFIED_RUNNER_TARGET_FILES = tuple(
     target for _source, target in QUALIFIED_RUNNER_SOURCE_FILES
 )
+
+
+class Ticket06AcceptanceStructuralQualification(BaseModel):
+    """Identity-bearing proof that the sealed runner can safely enter ISO-01A mode."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["ticket06-acceptance-runner-structure-v2"] = (
+        "ticket06-acceptance-runner-structure-v2"
+    )
+    runner_input_identity: str = Field(
+        pattern=r"^windows-sandbox-qualified-runner-input:v2:sha256:[0-9a-f]{64}$"
+    )
+    runner_files: tuple[str, ...] = QUALIFIED_RUNNER_TARGET_FILES
+    boundary_qualification_mode_present: Literal[True] = True
+    ticket06_acceptance_mode_present: Literal[True] = True
+    bootstrap_dispatch_target: Literal[
+        r"C:\QCF17\Input\Runner\run_ticket06_acceptance.py"
+    ] = r"C:\QCF17\Input\Runner\run_ticket06_acceptance.py"
+    bootstrap_dispatch_closed: Literal[True] = True
+    orchestrator_contract_import_closed: Literal[True] = True
+    offline_review_executable_closed: Literal[True] = True
+    acceptance_orchestrator_write_order_validated: Literal[True] = True
+    host_acceptance_mapping_reuse_validated: Literal[True] = True
+    host_acceptance_export_validation_path_validated: Literal[True] = True
+    environment_policy_identity: str = Field(pattern=_IDENTITY_PATTERN)
+    host_harness_manifest_identity: str = Field(
+        pattern=r"^iso03-reviewed-host-harness:v1:sha256:[0-9a-f]{64}$"
+    )
+    host_acceptance_module_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    boundary_runner_identity: str = Field(
+        pattern=r"^iso01-windows-sandbox-runner:v1:sha256:[0-9a-f]{64}$"
+    )
+    wsb_config_identity: str = Field(
+        pattern=r"^windows-sandbox-config:v1:sha256:[0-9a-f]{64}$"
+    )
+    wsb_config_policy_identity: str = Field(
+        pattern=r"^windows-sandbox-config-policy:v1:sha256:[0-9a-f]{64}$"
+    )
+    mapping_manifest_identity: str = Field(
+        pattern=r"^windows-sandbox-mapping-manifest:v1:sha256:[0-9a-f]{64}$"
+    )
+    mapping_roles: tuple[str, ...]
+    command_ledger_identity: str = Field(
+        pattern=r"^ticket06-sandbox-command-ledger:v1:sha256:[0-9a-f]{64}$"
+    )
+    mandatory_command_count: Literal[27] = 27
+    full_suite_a_entry_id: Literal["full_suite_a"] = "full_suite_a"
+    full_suite_b_entry_id: Literal["full_suite_b"] = "full_suite_b"
+    distinct_full_suite_entries: Literal[True] = True
+    ticket07_absent: Literal[True] = True
+    guest_qcf17_host_clause_b_authority: Literal[False] = False
+    guest_qcf18_final_authority: Literal[False] = False
+    result_schema_identity: str = TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY
+    result_schema_validated: Literal[True] = True
+    completion_marker_contract_identity: str = (
+        TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+    )
+    completion_marker_write_order: Literal["last"] = "last"
+    networking_disabled: Literal[True] = True
+    input_mappings_read_only: Literal[True] = True
+    exactly_one_writable_results_mapping: Literal[True] = True
+    additional_host_mapping_required: Literal[False] = False
+    network_permission_required: Literal[False] = False
+    ticket06_executed: Literal[False] = False
+    qualification_identity: str = Field(
+        pattern=(
+            r"^ticket06-acceptance-runner-structure:v2:sha256:[0-9a-f]{64}$"
+        )
+    )
+
+    @model_validator(mode="after")
+    def _validate_qualification(self) -> Self:
+        if self.runner_files != QUALIFIED_RUNNER_TARGET_FILES:
+            raise ValueError("qualified runner structural file inventory mismatch")
+        if self.mapping_roles != (
+            "source",
+            "runner",
+            "control",
+            "runtime_bundle",
+            "results_export",
+        ):
+            raise ValueError("qualified acceptance mapping roles are not closed")
+        if self.command_ledger_identity != TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY:
+            raise ValueError("qualified Ticket 06 command ledger identity mismatch")
+        if self.result_schema_identity != TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY:
+            raise ValueError("qualified Ticket 06 result schema identity mismatch")
+        if (
+            self.completion_marker_contract_identity
+            != TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+        ):
+            raise ValueError("qualified Ticket 06 completion contract mismatch")
+        payload = self.model_dump(mode="json", exclude={"qualification_identity"})
+        if self.qualification_identity != content_identity(
+            "ticket06-acceptance-runner-structure:v2",
+            payload,
+        ):
+            raise ValueError("acceptance-runner structural identity mismatch")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        runner_input_identity: str,
+        environment_policy_identity: str,
+        host_harness_manifest_identity: str,
+        host_acceptance_module_sha256: str,
+        boundary_runner_identity: str,
+        wsb_config_identity: str,
+        wsb_config_policy_identity: str,
+        mapping_manifest_identity: str,
+        command_ledger_identity: str,
+        result_schema_identity: str = TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+    ) -> Self:
+        payload = {
+            "contract_version": "ticket06-acceptance-runner-structure-v2",
+            "runner_input_identity": runner_input_identity,
+            "runner_files": list(QUALIFIED_RUNNER_TARGET_FILES),
+            "boundary_qualification_mode_present": True,
+            "ticket06_acceptance_mode_present": True,
+            "bootstrap_dispatch_target": (
+                r"C:\QCF17\Input\Runner\run_ticket06_acceptance.py"
+            ),
+            "bootstrap_dispatch_closed": True,
+            "orchestrator_contract_import_closed": True,
+            "offline_review_executable_closed": True,
+            "acceptance_orchestrator_write_order_validated": True,
+            "host_acceptance_mapping_reuse_validated": True,
+            "host_acceptance_export_validation_path_validated": True,
+            "environment_policy_identity": environment_policy_identity,
+            "host_harness_manifest_identity": host_harness_manifest_identity,
+            "host_acceptance_module_sha256": host_acceptance_module_sha256,
+            "boundary_runner_identity": boundary_runner_identity,
+            "wsb_config_identity": wsb_config_identity,
+            "wsb_config_policy_identity": wsb_config_policy_identity,
+            "mapping_manifest_identity": mapping_manifest_identity,
+            "mapping_roles": [
+                "source",
+                "runner",
+                "control",
+                "runtime_bundle",
+                "results_export",
+            ],
+            "command_ledger_identity": command_ledger_identity,
+            "mandatory_command_count": 27,
+            "full_suite_a_entry_id": "full_suite_a",
+            "full_suite_b_entry_id": "full_suite_b",
+            "distinct_full_suite_entries": True,
+            "ticket07_absent": True,
+            "guest_qcf17_host_clause_b_authority": False,
+            "guest_qcf18_final_authority": False,
+            "result_schema_identity": result_schema_identity,
+            "result_schema_validated": True,
+            "completion_marker_contract_identity": (
+                TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+            ),
+            "completion_marker_write_order": "last",
+            "networking_disabled": True,
+            "input_mappings_read_only": True,
+            "exactly_one_writable_results_mapping": True,
+            "additional_host_mapping_required": False,
+            "network_permission_required": False,
+            "ticket06_executed": False,
+        }
+        return cls(
+            **payload,
+            qualification_identity=content_identity(
+                "ticket06-acceptance-runner-structure:v2",
+                payload,
+            ),
+        )
 
 
 class QualifiedRunnerFile(BaseModel):
@@ -1729,4 +1920,367 @@ def validate_ticket06_acceptance_export(
             "windows-sandbox-ticket06-result-export:v1",
             export_payload,
         ),
+    )
+
+
+def _python_function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"reviewed Python function is not closed: {name}")
+    return matches[0]
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return None
+
+
+def _function_calls(function: ast.AST) -> tuple[tuple[int, str], ...]:
+    calls = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if name is not None:
+            calls.append((node.lineno, name))
+    return tuple(sorted(calls))
+
+
+def _unique_call_line(
+    calls: tuple[tuple[int, str], ...],
+    expected_suffix: str,
+) -> int:
+    lines = [line for line, name in calls if name.endswith(expected_suffix)]
+    if len(lines) != 1:
+        raise ValueError(f"reviewed call path is not closed: {expected_suffix}")
+    return lines[0]
+
+
+def _validate_acceptance_orchestrator_write_order(source: str) -> None:
+    tree = ast.parse(source)
+    function = _python_function(tree, "execute_ticket06_acceptance")
+    result_write: ast.With | None = None
+    completion_write: ast.With | None = None
+    for node in ast.walk(function):
+        if not isinstance(node, ast.With) or len(node.items) != 1:
+            continue
+        context = node.items[0].context_expr
+        if (
+            not isinstance(context, ast.Call)
+            or _call_name(context.func) not in {"result_path.open", "completion_path.open"}
+            or len(context.args) != 1
+            or not isinstance(context.args[0], ast.Constant)
+            or context.args[0].value != "xb"
+        ):
+            continue
+        if _call_name(context.func) == "result_path.open":
+            result_write = node
+        else:
+            completion_write = node
+    if result_write is None or completion_write is None:
+        raise ValueError("acceptance export does not use exclusive bounded writes")
+    result_calls = _function_calls(result_write)
+    completion_calls = _function_calls(completion_write)
+    if (
+        result_write.lineno >= completion_write.lineno
+        or len([name for _line, name in result_calls if name == "handle.write"]) != 1
+        or len([name for _line, name in result_calls if name == "os.fsync"]) != 1
+        or len([name for _line, name in completion_calls if name == "handle.write"]) != 1
+        or len([name for _line, name in completion_calls if name == "os.fsync"]) != 1
+    ):
+        raise ValueError("acceptance completion marker is not the durable last write")
+    completion_end = completion_write.end_lineno or completion_write.lineno
+    forbidden_after_completion = {
+        "open",
+        "write_bytes",
+        "write_text",
+        "replace",
+        "rename",
+        "unlink",
+    }
+    if any(
+        line > completion_end and name.rsplit(".", maxsplit=1)[-1] in forbidden_after_completion
+        for line, name in _function_calls(function)
+    ):
+        raise ValueError("acceptance completion marker is not last-write")
+
+
+def _validate_host_acceptance_paths(source: str) -> None:
+    tree = ast.parse(source)
+    construct_calls = _function_calls(
+        _python_function(tree, "construct_ticket06_acceptance")
+    )
+    construct_sequence = (
+        _unique_call_line(construct_calls, "self.construct"),
+        _unique_call_line(construct_calls, "_mapping_bindings"),
+        _unique_call_line(construct_calls, "build_mapping_manifest"),
+        _unique_call_line(construct_calls, "render_wsb_configuration"),
+        _unique_call_line(
+            construct_calls,
+            "build_ticket06_acceptance_control_envelope",
+        ),
+        _unique_call_line(construct_calls, "self._revalidate_ticket06_contract"),
+    )
+    launch_calls = _function_calls(
+        _python_function(tree, "launch_ticket06_acceptance")
+    )
+    launch_sequence = (
+        _unique_call_line(launch_calls, "self._revalidate_ticket06_contract"),
+        _unique_call_line(launch_calls, "self._platform.launch"),
+        _unique_call_line(launch_calls, "validate_ticket06_acceptance_export"),
+    )
+    forbidden_mapping_calls = {
+        name
+        for _line, name in construct_calls
+        if name.endswith("SandboxMappingBinding")
+    }
+    if (
+        tuple(sorted(construct_sequence)) != construct_sequence
+        or tuple(sorted(launch_sequence)) != launch_sequence
+        or forbidden_mapping_calls
+    ):
+        raise ValueError("acceptance mapping/export validation path is not closed")
+
+
+def qualify_ticket06_acceptance_runner_structure(
+    runner_root: Path,
+    *,
+    expected_runner_identity: str,
+    base_environment_variables: tuple[tuple[str, str], ...],
+    mapping_manifest: ResolvedSandboxMappingManifest,
+    wsb_configuration: WsbConfiguration,
+    boundary_runner_identity: str,
+    host_harness_manifest_identity: str,
+    host_acceptance_module_path: Path,
+    expected_host_acceptance_module_sha256: str,
+) -> Ticket06AcceptanceStructuralQualification:
+    """Qualify the sealed acceptance mode without executing a Ticket 06 command."""
+
+    try:
+        root = runner_root.resolve(strict=True)
+        manifest = validate_qualified_runner_input(
+            root,
+            expected_identity=expected_runner_identity,
+        )
+        bootstrap = (root / "bootstrap.ps1").read_text(encoding="utf-8")
+        orchestrator = (root / "run_ticket06_acceptance.py").read_text(
+            encoding="utf-8"
+        )
+        offline_review = (root / "run_ticket06_offline_review.py").read_text(
+            encoding="utf-8"
+        )
+        sealed_contract = (root / "ticket06_acceptance_contract.py").read_bytes()
+        if sealed_contract != Path(__file__).resolve(strict=True).read_bytes():
+            raise ValueError("sealed acceptance contract differs from reviewed host contract")
+
+        boundary_dispatch = 'if ($executionMode -eq "boundary_qualification")'
+        acceptance_dispatch = 'elseif ($executionMode -eq "ticket06_acceptance")'
+        if (
+            bootstrap.count(boundary_dispatch) != 1
+            or bootstrap.count(acceptance_dispatch) != 1
+            or '"boundary_qualification"' not in bootstrap
+            or '"ticket06_acceptance"' not in bootstrap
+            or "$control.base.command" in bootstrap
+            or "$control.base.script" in bootstrap
+        ):
+            raise ValueError("bootstrap execution-mode dispatch is not closed")
+        boundary_block, acceptance_tail = bootstrap.split(
+            boundary_dispatch,
+            maxsplit=1,
+        )[1].split(
+            acceptance_dispatch,
+            maxsplit=1,
+        )
+        acceptance_block = acceptance_tail.split('$stage = "completed"', maxsplit=1)[0]
+        boundary_target = r"C:\QCF17\Input\Runner\run_boundary_qualification.py"
+        acceptance_target = r"C:\QCF17\Input\Runner\run_ticket06_acceptance.py"
+        if (
+            boundary_target not in boundary_block
+            or acceptance_target in boundary_block
+            or acceptance_block.count(acceptance_target) != 1
+            or boundary_target in acceptance_block
+        ):
+            raise ValueError("bootstrap dispatch target is not fixed by execution mode")
+        if (
+            "from ticket06_acceptance_contract import" not in orchestrator
+            or "execute_ticket06_acceptance" not in orchestrator
+            or "from ticket06_acceptance_contract import" not in offline_review
+            or "run_offline_review" not in offline_review
+            or re.search(
+                r"ticket_?07",
+                bootstrap + orchestrator + offline_review,
+                flags=re.IGNORECASE,
+            )
+        ):
+            raise ValueError("acceptance executable contract imports are not closed")
+        _validate_acceptance_orchestrator_write_order(orchestrator)
+
+        host_source_path = host_acceptance_module_path.resolve(strict=True)
+        host_metadata = host_source_path.lstat()
+        if (
+            not stat.S_ISREG(host_metadata.st_mode)
+            or stat.S_ISLNK(host_metadata.st_mode)
+            or host_metadata.st_size > 4 * 1024 * 1024
+        ):
+            raise ValueError("reviewed host acceptance module is unsafe")
+        host_source_bytes = host_source_path.read_bytes()
+        host_source_sha256 = sha256(host_source_bytes).hexdigest()
+        if host_source_sha256 != expected_host_acceptance_module_sha256:
+            raise ValueError("reviewed host acceptance module identity mismatch")
+        _validate_host_acceptance_paths(host_source_bytes.decode("utf-8"))
+
+        from tradingagents.windows_sandbox_runner import (
+            SandboxMappingRole,
+            validate_wsb_configuration,
+        )
+
+        validate_wsb_configuration(
+            wsb_configuration.xml,
+            mapping_manifest=mapping_manifest,
+            protected_client_supported=(
+                wsb_configuration.policy.protected_client_supported
+            ),
+        )
+        mappings = mapping_manifest.contract.mappings
+        if (
+            wsb_configuration.config_identity
+            != content_identity("windows-sandbox-config:v1", wsb_configuration.xml)
+            or wsb_configuration.policy.networking != "Disable"
+            or tuple(item.role for item in mappings) != tuple(SandboxMappingRole)
+            or any(not item.read_only for item in mappings[:-1])
+            or mappings[-1].role is not SandboxMappingRole.RESULTS_EXPORT
+            or mappings[-1].read_only
+            or not mappings[-1].fresh_empty
+            or sum(not item.read_only for item in mappings) != 1
+        ):
+            raise ValueError("acceptance mapping/network structure is not closed")
+
+        environment = build_ticket06_control_environment(base_environment_variables)
+        ledger = build_ticket06_command_ledger(environment.policy_identity)
+        serialized_ledger = ledger.canonical_json_bytes().decode("utf-8").casefold()
+        full_suite_a = tuple(
+            entry
+            for entry in ledger.entries
+            if entry.result_category is AcceptanceResultCategory.FULL_SUITE_A
+        )
+        full_suite_b = tuple(
+            entry
+            for entry in ledger.entries
+            if entry.result_category is AcceptanceResultCategory.FULL_SUITE_B
+        )
+        if (
+            ledger.ledger_identity != TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+            or len(ledger.entries) != 27
+            or not all(entry.mandatory for entry in ledger.entries)
+            or len(full_suite_a) != 1
+            or len(full_suite_b) != 1
+            or full_suite_a[0].command_id == full_suite_b[0].command_id
+            or any(
+                forbidden in serialized_ledger
+                for forbidden in (
+                    "ticket07",
+                    "ticket_07",
+                    "qualified_v1",
+                    "http://",
+                    "https://",
+                )
+            )
+        ):
+            raise ValueError("Ticket 06 command ledger is not the qualified closed ledger")
+
+        def identity(namespace: str, fill: str) -> str:
+            return f"{namespace}:sha256:{fill * 64}"
+
+        sample_static = Ticket06AcceptanceStaticBindings(
+            source_commit_id="1" * 40,
+            source_tree_hash="2" * 40,
+            source_input_identity=identity("windows-sandbox-reviewed-source:v1", "3"),
+            source_manifest_identity=identity("windows-sandbox-source-manifest:v1", "4"),
+            source_archive_sha256="5" * 64,
+            reconstructed_source_tree_identity=identity(
+                "windows-sandbox-reconstructed-source:v1", "6"
+            ),
+            runtime_bundle_identity=identity("windows-offline-runtime-bundle:v1", "7"),
+            runtime_bundle_manifest_sha256="8" * 64,
+            runtime_bundle_contract_identity=identity(
+                "windows-sandbox-runtime-bundle-input:v1", "9"
+            ),
+            runner_identity=identity("iso01-windows-sandbox-runner:v1", "a"),
+            runner_input_identity=manifest.runner_input_identity,
+            wsb_config_identity=identity("windows-sandbox-config:v1", "b"),
+            protected_root_manifest_identity=identity(
+                "windows-sandbox-protected-roots:v1", "c"
+            ),
+            mapping_manifest_identity=identity(
+                "windows-sandbox-mapping-manifest:v1", "d"
+            ),
+            guest_workspace_identity=identity(
+                "windows-sandbox-guest-workspace:v1", "e"
+            ),
+            environment_policy_identity=environment.policy_identity,
+            control_identity=identity("windows-sandbox-ticket06-control:v1", "f"),
+            frozen_baseline_identity=identity("ticket06-frozen-baseline:v1", "1"),
+            boundary_qualification_identity=identity(
+                "iso03-boundary-qualification-run:v1", "2"
+            ),
+            command_ledger_identity=ledger.ledger_identity,
+        )
+        sample_results = tuple(
+            build_ticket06_command_result(
+                entry,
+                status=(
+                    AcceptanceCommandStatus.FAIL
+                    if entry.ordinal == 1
+                    else AcceptanceCommandStatus.NOT_RUN
+                ),
+                returncode=1 if entry.ordinal == 1 else None,
+                failed=1 if entry.ordinal == 1 else 0,
+            )
+            for entry in ledger.entries
+        )
+        sample_result = build_ticket06_acceptance_result(
+            static=sample_static,
+            ledger=ledger,
+            command_results=sample_results,
+            live_environment=environment.variables,
+        )
+        result_bytes = sample_result.canonical_json_bytes()
+        Ticket06AcceptanceResult.model_validate_json(result_bytes)
+        sample_marker = build_ticket06_completion_marker(
+            result=sample_result,
+            result_bytes=result_bytes,
+        )
+        if (
+            Ticket06CompletionMarker.model_validate_json(
+                sample_marker.canonical_json_bytes()
+            ).write_order
+            != "last"
+        ):
+            raise ValueError("Ticket 06 completion marker is not last-write")
+    except Ticket06AcceptanceContractError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise Ticket06AcceptanceContractError(
+            Ticket06AcceptanceFailureReason.INVALID_CONTROL
+        ) from exc
+
+    return Ticket06AcceptanceStructuralQualification.create(
+        runner_input_identity=manifest.runner_input_identity,
+        environment_policy_identity=environment.policy_identity,
+        host_harness_manifest_identity=host_harness_manifest_identity,
+        host_acceptance_module_sha256=host_source_sha256,
+        boundary_runner_identity=boundary_runner_identity,
+        wsb_config_identity=wsb_configuration.config_identity,
+        wsb_config_policy_identity=wsb_configuration.policy.policy_identity,
+        mapping_manifest_identity=mapping_manifest.mapping_manifest_identity,
+        command_ledger_identity=ledger.ledger_identity,
+        result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
     )
