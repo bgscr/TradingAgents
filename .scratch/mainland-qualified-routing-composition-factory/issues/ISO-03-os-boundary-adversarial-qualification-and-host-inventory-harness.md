@@ -8,11 +8,26 @@ adversarial write matrix and valid guest-local write controls in a fresh
 Sandbox. The result must prove zero host delta before any baseline is frozen or
 Ticket 06 is allowed to run.
 
-**Blocked by:** ISO-02 — Hash-locked offline runtime/dependency bundle and
-manifest; and the existing immutable-state verifier used as the host semantic
-authority.
+**Blocked by:** ISO-01A PASS — Executable Ticket 06 Sandbox acceptance mode;
+rebuild/reseal of source and runtime inputs as needed for the materially changed
+runner identities; and the existing immutable-state verifier used as the host
+semantic authority. ISO-01 and ISO-02 remain completed historical prerequisites.
 
 **Status:** ready-for-agent
+
+## Replacement qualification requirement — 2026-08-14
+
+The prior ISO-03 qualification remains valid historical evidence for its exact
+qualified identities, but it is not qualification for the runner after ISO-01A.
+ISO-01A materially changes bootstrap dispatch, sealed runner contents, command
+ledger, support files, and bounded export validation. This ticket therefore
+requires a new actual Windows Sandbox qualification on the rebuilt/resealed
+source, runtime bundle, runner, config, mapping, and control identities.
+
+Preserve the previous ISO-03 result and all associated inventories and evidence
+unchanged. A replacement ISO-03 PASS unlocks only one new additive
+post-qualification baseline freeze. It does not reuse, replace, or mutate an old
+baseline and does not itself authorize ISO-04.
 
 ## Observable behavior
 
@@ -43,7 +58,8 @@ authority.
 
 ## Exact OS containment requirements
 
-- Use the exact reviewed ISO-01 launcher/config/source/protected-manifest and
+- Use the exact reviewed ISO-01 containment contract, the ISO-01A runner and
+  sealed acceptance-support identities, and the rebuilt/resealed source and
   ISO-02 runtime-bundle identities with networking disabled and only the one
   bounded writable result-export mapping.
 - The canonical protected set includes the full
@@ -66,9 +82,10 @@ authority.
 
 ## Input and output identities
 
-Inputs bind the reviewed commit/tree/source archive, ISO-01 runner/bootstrap and
-`.wsb` config, protected-root and mapping manifests, path-redacted control
-inventory, ISO-02 bundle manifest/hash, probe-matrix version, immutable-state
+Inputs bind the reviewed commit/tree/source archive, ISO-01 containment
+contract, ISO-01A runner/bootstrap/sealed-runner identities and `.wsb` config,
+protected-root and mapping manifests, path-redacted control inventory, rebuilt
+ISO-02 bundle manifest/hash as needed, probe-matrix version, immutable-state
 verifier version, and fresh export-directory identity.
 
 The host before/after inventory binds every protected relative path, length,
@@ -97,10 +114,14 @@ completion marker written last.
 - Retain all four fake-Yahoo incidents, `isolated-python-write-probe`, every
   prior baseline/inventory, the persisted production calendar, and failed
   Ticket 07 material byte-for-byte under their existing identities.
+- Retain the previous ISO-03 qualification and the failed ISO-04
+  `qualification_invalidated` evidence under their existing identities. They
+  remain historical only and are not rewritten as qualification for ISO-01A.
 - Do not delete, repair, renumber, reinterpret, migrate, or rebaseline any
   protected material after a failed probe.
-- ISO-03 may authorize a new additive post-incident baseline only by passing;
-  the baseline freeze is a separate next edge and does not occur in this ticket.
+- Replacement ISO-03 may authorize one new additive post-qualification baseline
+  only by passing; the baseline freeze is a separate next edge and does not
+  occur in this ticket.
 
 ## Deterministic regressions
 
@@ -171,6 +192,6 @@ fallback with equivalent unmapped-host semantics. Do not weaken QCF17.
   Ticket 07 evidence item.
 - [ ] No Ticket 06/07, live provider/model, baseline freeze, historical repair,
   or `qualified_v1` activation occurred.
-- [ ] PASS evidence binds all reviewed identities and unlocks only the new
-  additive post-incident baseline freeze. Unsupported hosts return
-  `needs-info` for the dedicated-VM fallback.
+- [ ] Replacement PASS evidence binds all new reviewed identities and unlocks
+  only one new additive post-qualification baseline freeze. Unsupported hosts
+  return `needs-info` for the dedicated-VM fallback.

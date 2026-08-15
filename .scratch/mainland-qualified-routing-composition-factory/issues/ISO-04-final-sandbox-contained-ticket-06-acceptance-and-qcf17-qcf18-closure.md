@@ -7,11 +7,31 @@ Windows Sandbox runner on the exact reviewed identities, export only the bounded
 acceptance result, and close QCF17 only when sandbox-local behavior and the
 trusted zero-host-delta proof both pass. Evaluate QCF18 only after QCF17 PASS.
 
-**Blocked by:** ISO-03 PASS; then the new additive post-incident host baseline
-freeze. The baseline must bind the qualified source, runtime bundle,
-runner/config, protected manifest, and host inventory identities.
+**Blocked by:** ISO-01A PASS — Executable Ticket 06 Sandbox acceptance mode;
+replacement ISO-03 PASS on the materially changed identities; and one new
+additive post-qualification baseline freeze. The baseline must bind the newly
+qualified source, runtime bundle, runner/config, protected manifest, command
+ledger, export contract, and host inventory identities.
 
 **Status:** ready-for-agent
+
+## Confirmed blocked attempt — 2026-08-14
+
+**Result:** `qualification_invalidated`
+
+The qualified ISO-03 runner could not execute Ticket 06 acceptance: its guest
+bootstrap accepted only `boundary_qualification`, invoked only the boundary
+qualification orchestrator, and used a contract requiring
+`ticket06_executed=False`; its sealed runner manifest contained only
+boundary-qualification files. Although `ticket06_acceptance` was reserved as an
+enum value, there was no executable Ticket 06 acceptance runner, deterministic
+command ledger, or bounded acceptance-export contract.
+
+No Sandbox was launched, no Ticket 06 command ran, and no protected host state
+changed. Preserve this failed ISO-04 evidence, the prior ISO-03 qualification,
+and the existing baseline unchanged. The attempt may be retried only through
+ISO-01A, replacement ISO-03 PASS, and the new additive post-qualification
+baseline freeze.
 
 ## Observable behavior
 
@@ -39,9 +59,10 @@ runner/config, protected manifest, and host inventory identities.
 
 ## Exact OS containment requirements
 
-- Use the ISO-03-qualified Windows Sandbox runner with the identical source,
-  bundle, runner/bootstrap, `.wsb` config, protected manifest, mapping manifest,
-  and trusted inventory contracts bound by the new baseline.
+- Use the replacement-ISO-03-qualified Windows Sandbox runner with the identical
+  source, bundle, ISO-01A runner/bootstrap/command-ledger/export-contract,
+  `.wsb` config, protected manifest, mapping manifest, and trusted inventory
+  contracts bound by the new post-qualification baseline.
 - Source, runtime bundle, runner, and path-redacted control inventory remain
   read-only inputs. Exactly one fresh empty bounded result-export folder is the
   sole writable host mapping.
@@ -60,10 +81,11 @@ runner/config, protected manifest, and host inventory identities.
 ## Input and output identities
 
 Inputs bind the reviewed commit/tree, sealed source hash, runtime-bundle
-manifest/hash, runner/bootstrap and `.wsb` config identities, protected-root and
-mapping-manifest identities, ISO-03 adversarial qualification identity, frozen
-post-incident baseline identity, command-ledger identity, and fresh result-export
-identity.
+manifest/hash, ISO-01A runner/bootstrap and `.wsb` config identities,
+protected-root and mapping-manifest identities, replacement ISO-03 adversarial
+qualification identity, frozen post-qualification baseline identity,
+command-ledger identity, bounded acceptance-export-contract identity, and fresh
+result-export identity.
 
 The bounded export must include the reviewed commit/tree, source hash, bundle
 hash, runner/config identity, protected-manifest and baseline identities,
@@ -158,9 +180,12 @@ code/count must appear in the bounded export.
 CAL-01 -> CAL-02 -> CAL-03 -> CAL-04 [complete]
 CAL-04 -> production calendar bootstrap [complete]
 production calendar readiness -> ISO-01
-ISO-01 -> ISO-02 -> ISO-03
-ISO-03 PASS -> freeze new additive post-incident host baseline
-baseline freeze -> ISO-04
+ISO-01 -> ISO-02
+ISO-01 + ISO-02 + current ISO-03 findings -> ISO-01A
+ISO-01A PASS -> rebuild/reseal source and runtime inputs as needed
+new identities -> replacement ISO-03 actual Windows Sandbox qualification
+replacement ISO-03 PASS -> freeze new additive post-qualification host baseline
+new baseline freeze -> ISO-04
 ISO-04 -> Ticket 06 PASS
 Ticket 06 PASS -> fresh Ticket 07 authorization
 fresh Ticket 07 authorization -> NEW 601328.SS
