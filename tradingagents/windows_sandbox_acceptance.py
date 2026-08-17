@@ -2035,7 +2035,27 @@ def _validate_host_acceptance_paths(source: str) -> None:
     launch_sequence = (
         _unique_call_line(launch_calls, "self._revalidate_ticket06_contract"),
         _unique_call_line(launch_calls, "self._platform.launch"),
+        _unique_call_line(
+            launch_calls,
+            "persist_iso04_sandbox_process_evidence",
+        ),
+        _unique_call_line(launch_calls, "process_evidence.to_process_result"),
         _unique_call_line(launch_calls, "validate_ticket06_acceptance_export"),
+    )
+    report_calls = _function_calls(
+        _python_function(tree, "write_iso04_ticket06_report")
+    )
+    report_sequence = (
+        _unique_call_line(
+            report_calls,
+            "persist_iso04_ticket06_operational_evidence",
+        ),
+        _unique_call_line(report_calls, "report_builder"),
+        _unique_call_line(
+            report_calls,
+            "ISO04Ticket06AcceptanceReport.model_validate",
+        ),
+        _unique_call_line(report_calls, "_write_host_audit"),
     )
     forbidden_mapping_calls = {
         name
@@ -2045,6 +2065,7 @@ def _validate_host_acceptance_paths(source: str) -> None:
     if (
         tuple(sorted(construct_sequence)) != construct_sequence
         or tuple(sorted(launch_sequence)) != launch_sequence
+        or tuple(sorted(report_sequence)) != report_sequence
         or forbidden_mapping_calls
     ):
         raise ValueError("acceptance mapping/export validation path is not closed")

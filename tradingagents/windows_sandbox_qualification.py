@@ -32,6 +32,7 @@ from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_SOURCE_FILES,
     QUALIFIED_RUNNER_TARGET_FILES,
     TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+    AcceptanceCommandStatus,
     QualifiedRunnerFile,
     QualifiedRunnerManifest,
     Ticket06AcceptanceControlBase,
@@ -88,6 +89,13 @@ from tradingagents.windows_sandbox_runner import (
 
 PROTECTED_HOST_INVENTORY_VERSION = "windows-sandbox-protected-host-inventory-v1"
 HOST_INVENTORY_DELTA_VERSION = "windows-sandbox-host-inventory-delta-v1"
+ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME = "iso04-sandbox-process-evidence.json"
+_ISO04_SANDBOX_PROCESS_EVIDENCE_MAXIMUM_BYTES = 65_536
+ISO04_TICKET06_OPERATIONAL_EVIDENCE_FILENAME = (
+    "iso04-ticket06-operational-evidence.json"
+)
+_ISO04_TICKET06_OPERATIONAL_EVIDENCE_MAXIMUM_BYTES = 131_072
+ISO04_TICKET06_REPORT_FILENAME = "iso04-ticket06-acceptance-report.json"
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 _WINDOWS_REPARSE_POINT_ATTRIBUTE = 0x400
 _UNSAFE_EXPORT_PATTERN = re.compile(
@@ -2190,8 +2198,425 @@ class Ticket06AcceptanceRunContract:
 
 @dataclass(frozen=True, slots=True)
 class Ticket06AcceptanceExecution:
-    process: SandboxProcessResult
+    sandbox_process_evidence: ISO04SandboxProcessEvidence
     export: ValidatedTicket06AcceptanceExport
+
+    @property
+    def process(self) -> SandboxProcessResult:
+        """Compatibility projection sourced only from persisted host evidence."""
+
+        return self.sandbox_process_evidence.to_process_result()
+
+
+class ISO04SandboxProcessEvidence(BaseModel):
+    """Durable host observation written before ISO-04 report synthesis."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["iso04-sandbox-process-evidence-v1"] = (
+        "iso04-sandbox-process-evidence-v1"
+    )
+    run_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{7,63}$")
+    acceptance_control_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-ticket06-control:v1:sha256:[0-9a-f]{64}$"
+        )
+    )
+    outer_sandbox_process_returncode: int = Field(
+        ge=-(2**31),
+        le=(2**32) - 1,
+    )
+    timed_out: bool
+    termination_confirmed: bool
+    before_processes: tuple[SandboxProcessTopologyEntry, ...]
+    launched_processes: tuple[SandboxProcessTopologyEntry, ...]
+    after_processes: tuple[SandboxProcessTopologyEntry, ...]
+    evidence_identity: str = Field(
+        pattern=r"^iso04-sandbox-process-evidence:v1:sha256:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_evidence(self) -> ISO04SandboxProcessEvidence:
+        for rows in (
+            self.before_processes,
+            self.launched_processes,
+            self.after_processes,
+        ):
+            if rows != WindowsSandboxPlatform._ordered_topology(rows) or len(
+                {item.process_id for item in rows}
+            ) != len(rows):
+                raise ValueError("ISO-04 Sandbox process topology is invalid")
+        payload = self.model_dump(mode="json", exclude={"evidence_identity"})
+        if self.evidence_identity != _identity(
+            "iso04-sandbox-process-evidence:v1",
+            payload,
+        ):
+            raise ValueError("ISO-04 Sandbox process evidence identity mismatch")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        acceptance_control_identity: str,
+        process: SandboxProcessResult,
+    ) -> ISO04SandboxProcessEvidence:
+        payload = {
+            "contract_version": "iso04-sandbox-process-evidence-v1",
+            "run_id": run_id,
+            "acceptance_control_identity": acceptance_control_identity,
+            "outer_sandbox_process_returncode": process.returncode,
+            "timed_out": process.timed_out,
+            "termination_confirmed": process.termination_confirmed,
+            "before_processes": [
+                item.model_dump(mode="json") for item in process.before_processes
+            ],
+            "launched_processes": [
+                item.model_dump(mode="json") for item in process.launched_processes
+            ],
+            "after_processes": [
+                item.model_dump(mode="json") for item in process.after_processes
+            ],
+        }
+        return cls(
+            **payload,
+            evidence_identity=_identity(
+                "iso04-sandbox-process-evidence:v1",
+                payload,
+            ),
+        )
+
+    def to_process_result(self) -> SandboxProcessResult:
+        return SandboxProcessResult(
+            returncode=self.outer_sandbox_process_returncode,
+            timed_out=self.timed_out,
+            before_processes=self.before_processes,
+            launched_processes=self.launched_processes,
+            after_processes=self.after_processes,
+            termination_confirmed=self.termination_confirmed,
+        )
+
+
+class ISO04Ticket06OperationalEvidence(BaseModel):
+    """Bounded authoritative host input for later ISO-04 report synthesis."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["iso04-ticket06-operational-evidence-v1"] = (
+        "iso04-ticket06-operational-evidence-v1"
+    )
+    sandbox_process: ISO04SandboxProcessEvidence
+    guest_result_identity: str | None = Field(
+        default=None,
+        pattern=r"^windows-sandbox-ticket06-result:v1:sha256:[0-9a-f]{64}$",
+    )
+    completion_marker_identity: str | None = Field(
+        default=None,
+        pattern=(
+            r"^windows-sandbox-ticket06-completion:v1:sha256:[0-9a-f]{64}$"
+        ),
+    )
+    guest_export_identity: str | None = Field(
+        default=None,
+        pattern=(
+            r"^windows-sandbox-ticket06-result-export:v1:sha256:[0-9a-f]{64}$"
+        ),
+    )
+    host_before_inventory_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-protected-host-inventory:v1:sha256:[0-9a-f]{64}$"
+        )
+    )
+    host_after_inventory_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-protected-host-inventory:v1:sha256:[0-9a-f]{64}$"
+        )
+    )
+    command_failure_identity: str | None = Field(
+        default=None,
+        pattern=r"^ticket06-command-result:v1:sha256:[0-9a-f]{64}$",
+    )
+    operational_evidence_identity: str = Field(
+        pattern=(
+            r"^iso04-ticket06-operational-evidence:v1:sha256:[0-9a-f]{64}$"
+        )
+    )
+
+    @model_validator(mode="after")
+    def _validate_evidence(self) -> ISO04Ticket06OperationalEvidence:
+        guest_identities = (
+            self.guest_result_identity,
+            self.completion_marker_identity,
+            self.guest_export_identity,
+        )
+        if any(item is None for item in guest_identities) and any(
+            item is not None for item in guest_identities
+        ):
+            raise ValueError("ISO-04 guest evidence identities are incomplete")
+        if self.command_failure_identity is not None and self.guest_result_identity is None:
+            raise ValueError("ISO-04 command failure lacks guest result authority")
+        payload = self.model_dump(
+            mode="json",
+            exclude={"operational_evidence_identity"},
+        )
+        if self.operational_evidence_identity != _identity(
+            "iso04-ticket06-operational-evidence:v1",
+            payload,
+        ):
+            raise ValueError("ISO-04 operational evidence identity mismatch")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        sandbox_process: ISO04SandboxProcessEvidence,
+        export: ValidatedTicket06AcceptanceExport | None,
+        host_before_inventory_identity: str,
+        host_after_inventory_identity: str,
+    ) -> ISO04Ticket06OperationalEvidence:
+        command_failure_identity = None
+        if export is not None:
+            failed_command = next(
+                (
+                    item
+                    for item in export.result.command_results
+                    if item.status
+                    in {
+                        AcceptanceCommandStatus.FAIL,
+                        AcceptanceCommandStatus.TIMEOUT,
+                    }
+                ),
+                None,
+            )
+            if failed_command is not None:
+                command_failure_identity = failed_command.summary_identity
+        payload = {
+            "contract_version": "iso04-ticket06-operational-evidence-v1",
+            "sandbox_process": sandbox_process.model_dump(mode="json"),
+            "guest_result_identity": (
+                export.result.result_identity if export is not None else None
+            ),
+            "completion_marker_identity": (
+                export.completion.marker_identity if export is not None else None
+            ),
+            "guest_export_identity": (
+                export.export_identity if export is not None else None
+            ),
+            "host_before_inventory_identity": host_before_inventory_identity,
+            "host_after_inventory_identity": host_after_inventory_identity,
+            "command_failure_identity": command_failure_identity,
+        }
+        return cls(
+            **payload,
+            operational_evidence_identity=_identity(
+                "iso04-ticket06-operational-evidence:v1",
+                payload,
+            ),
+        )
+
+
+class ISO04Ticket06AcceptanceReport(BaseModel):
+    """Closed host report envelope derived from durable ISO-04 authorities."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["iso04-ticket06-acceptance-report-v1"] = (
+        "iso04-ticket06-acceptance-report-v1"
+    )
+    operational_evidence: ISO04Ticket06OperationalEvidence
+    report_identity: str = Field(
+        pattern=r"^iso04-ticket06-acceptance-report:v1:sha256:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_report(self) -> ISO04Ticket06AcceptanceReport:
+        payload = self.model_dump(mode="json", exclude={"report_identity"})
+        if self.report_identity != _identity(
+            "iso04-ticket06-acceptance-report:v1",
+            payload,
+        ):
+            raise ValueError("ISO-04 Ticket 06 report identity mismatch")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        evidence: ISO04Ticket06OperationalEvidence,
+    ) -> ISO04Ticket06AcceptanceReport:
+        payload = {
+            "contract_version": "iso04-ticket06-acceptance-report-v1",
+            "operational_evidence": evidence.model_dump(mode="json"),
+        }
+        return cls(
+            **payload,
+            report_identity=_identity(
+                "iso04-ticket06-acceptance-report:v1",
+                payload,
+            ),
+        )
+
+
+def load_iso04_sandbox_process_evidence(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_acceptance_control_identity: str,
+) -> ISO04SandboxProcessEvidence:
+    """Load the canonical host process checkpoint for later report synthesis."""
+
+    content = _read_stable_regular_file(
+        path,
+        maximum_bytes=_ISO04_SANDBOX_PROCESS_EVIDENCE_MAXIMUM_BYTES,
+    )
+    try:
+        evidence = ISO04SandboxProcessEvidence.model_validate_json(content)
+    except ValueError as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.RESULT_IDENTITY_MISMATCH
+        ) from exc
+    if (
+        evidence.run_id != expected_run_id
+        or evidence.acceptance_control_identity
+        != expected_acceptance_control_identity
+        or content
+        != _canonical_json_bytes(evidence.model_dump(mode="json")) + b"\n"
+    ):
+        raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+    return evidence
+
+
+def persist_iso04_sandbox_process_evidence(
+    *,
+    audit_root: Path,
+    run_id: str,
+    acceptance_control_identity: str,
+    process: SandboxProcessResult,
+) -> ISO04SandboxProcessEvidence:
+    """Durably checkpoint the exact outer rc before any derived host report."""
+
+    evidence = ISO04SandboxProcessEvidence.create(
+        run_id=run_id,
+        acceptance_control_identity=acceptance_control_identity,
+        process=process,
+    )
+    path = audit_root / ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME
+    _write_host_audit(path, evidence)
+    return load_iso04_sandbox_process_evidence(
+        path,
+        expected_run_id=run_id,
+        expected_acceptance_control_identity=acceptance_control_identity,
+    )
+
+
+def load_iso04_ticket06_operational_evidence(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_acceptance_control_identity: str,
+) -> ISO04Ticket06OperationalEvidence:
+    """Load the canonical bounded evidence consumed by ISO-04 reporting."""
+
+    content = _read_stable_regular_file(
+        path,
+        maximum_bytes=_ISO04_TICKET06_OPERATIONAL_EVIDENCE_MAXIMUM_BYTES,
+    )
+    try:
+        evidence = ISO04Ticket06OperationalEvidence.model_validate_json(content)
+    except ValueError as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.RESULT_IDENTITY_MISMATCH
+        ) from exc
+    if (
+        evidence.sandbox_process.run_id != expected_run_id
+        or evidence.sandbox_process.acceptance_control_identity
+        != expected_acceptance_control_identity
+        or content
+        != _canonical_json_bytes(evidence.model_dump(mode="json")) + b"\n"
+    ):
+        raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+    return evidence
+
+
+def persist_iso04_ticket06_operational_evidence(
+    *,
+    audit_root: Path,
+    expected_run_id: str,
+    expected_acceptance_control_identity: str,
+    export: ValidatedTicket06AcceptanceExport | None,
+    host_before_inventory_identity: str,
+    host_after_inventory_identity: str,
+) -> ISO04Ticket06OperationalEvidence:
+    """Bind persisted process state and later authorities before report writing."""
+
+    sandbox_process = load_iso04_sandbox_process_evidence(
+        audit_root / ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME,
+        expected_run_id=expected_run_id,
+        expected_acceptance_control_identity=(
+            expected_acceptance_control_identity
+        ),
+    )
+    evidence = ISO04Ticket06OperationalEvidence.create(
+        sandbox_process=sandbox_process,
+        export=export,
+        host_before_inventory_identity=host_before_inventory_identity,
+        host_after_inventory_identity=host_after_inventory_identity,
+    )
+    path = audit_root / ISO04_TICKET06_OPERATIONAL_EVIDENCE_FILENAME
+    _write_host_audit(path, evidence)
+    return load_iso04_ticket06_operational_evidence(
+        path,
+        expected_run_id=expected_run_id,
+        expected_acceptance_control_identity=(
+            expected_acceptance_control_identity
+        ),
+    )
+
+
+def write_iso04_ticket06_report(
+    *,
+    audit_root: Path,
+    expected_run_id: str,
+    expected_acceptance_control_identity: str,
+    export: ValidatedTicket06AcceptanceExport | None,
+    host_before_inventory_identity: str,
+    host_after_inventory_identity: str,
+    report_builder: Callable[
+        [ISO04Ticket06OperationalEvidence],
+        ISO04Ticket06AcceptanceReport,
+    ],
+) -> ISO04Ticket06AcceptanceReport:
+    """Persist authorities first, then build one canonical ISO-04 report."""
+
+    evidence = persist_iso04_ticket06_operational_evidence(
+        audit_root=audit_root,
+        expected_run_id=expected_run_id,
+        expected_acceptance_control_identity=(
+            expected_acceptance_control_identity
+        ),
+        export=export,
+        host_before_inventory_identity=host_before_inventory_identity,
+        host_after_inventory_identity=host_after_inventory_identity,
+    )
+    candidate = report_builder(evidence)
+    if not isinstance(candidate, ISO04Ticket06AcceptanceReport):
+        raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+    try:
+        report = ISO04Ticket06AcceptanceReport.model_validate(
+            candidate.model_dump(mode="json")
+        )
+    except (TypeError, ValueError) as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.RESULT_IDENTITY_MISMATCH
+        ) from exc
+    if report.operational_evidence != evidence:
+        raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
+    _write_host_audit(
+        audit_root / ISO04_TICKET06_REPORT_FILENAME,
+        report,
+    )
+    return report
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
@@ -3148,10 +3573,17 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
         """Launch one acceptance guest and retain a bounded PASS or FAIL result."""
 
         self._revalidate_ticket06_contract(contract)
-        process = self._platform.launch(
+        observed_process = self._platform.launch(
             contract.paths.config_path,
             timeout_seconds=timeout_seconds,
         )
+        process_evidence = persist_iso04_sandbox_process_evidence(
+            audit_root=contract.paths.audit_root,
+            run_id=contract.control.base.run_id,
+            acceptance_control_identity=contract.control.control_identity,
+            process=observed_process,
+        )
+        process = process_evidence.to_process_result()
         if process.timed_out or not process.termination_confirmed:
             raise SandboxContractError(SandboxFailureReason.SANDBOX_LAUNCH_FAILED)
         exported = validate_ticket06_acceptance_export(
@@ -3160,7 +3592,10 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
         )
         if (process.returncode == 0) is not (exported.result.guest_claim == "pass"):
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
-        return Ticket06AcceptanceExecution(process=process, export=exported)
+        return Ticket06AcceptanceExecution(
+            sandbox_process_evidence=process_evidence,
+            export=exported,
+        )
 
 
 class ISO03QualificationStatus(str, Enum):
