@@ -30,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
     )
+    parser.add_argument(
+        "--review-invalidated-qualification-root",
+        required=True,
+        type=Path,
+    )
     parser.add_argument("--runs-root", required=True, type=Path)
     parser.add_argument("--runtime-bundle-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
@@ -75,6 +80,9 @@ def main() -> int:
         ),
         failed_iso04_ticket06_acceptance_root=(
             arguments.failed_iso04_ticket06_acceptance_root
+        ),
+        review_invalidated_qualification_root=(
+            arguments.review_invalidated_qualification_root
         ),
         runs_root=arguments.runs_root,
         runtime_bundle_root=arguments.runtime_bundle_root,

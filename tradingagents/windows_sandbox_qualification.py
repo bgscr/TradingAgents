@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 from xml.sax.saxutils import escape as xml_escape
 
@@ -1686,18 +1686,102 @@ def validate_verifier_root_ownership(inventory: ProtectedHostInventory) -> None:
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
 
 
-def validate_iso03_historical_evidence_root_coverage(
-    manifest: ResolvedProtectedRootManifest,
-) -> None:
-    """Require each retained external qualification edge to have its own root."""
+@dataclass(frozen=True, slots=True)
+class HistoricalQualificationReportPin:
+    role: ProtectedRootRole
+    run_id: str
+    relative_path: str
+    byte_length: int
+    sha256: str
+    report_identity: str
+    current_iso03_schema: bool
 
+
+_HISTORICAL_REPORT_PINS = (
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+        run_id="iso03-20260814-015",
+        relative_path="iso03-20260814-015/host-audit/iso03-report.json",
+        byte_length=15_111,
+        sha256="fd074e13ff75e6915d76c4a620c3f579f856b7a957d377cf412897d2044ec9a8",
+        report_identity=(
+            "iso03-host-qualification-report:v1:sha256:"
+            "bc0673e35050cb83c148b5766f082f526b146a6f73ba9c1a5138890742b1af22"
+        ),
+        current_iso03_schema=False,
+    ),
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+        run_id="iso03-20260814-016",
+        relative_path="iso03-20260814-016/host-audit/iso03-report.json",
+        byte_length=21_824,
+        sha256="09f70cda0e756d1af52432b83bdf73b1f013c4929a460f5f26973fabd291c056",
+        report_identity=(
+            "iso03-host-qualification-report:v1:sha256:"
+            "28d08ceb2c87f4fbee820ab58c77dfcc96bdb7bb5d237e80e210c09a2bb1e77c"
+        ),
+        current_iso03_schema=False,
+    ),
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+        run_id="iso03-20260814-017",
+        relative_path="iso03-20260814-017/host-audit/iso03-report.json",
+        byte_length=21_985,
+        sha256="d32759a2cc98867ecd6fb4b28ce926831a72aca397c990c3da02054316888ba1",
+        report_identity=(
+            "iso03-host-qualification-report:v1:sha256:"
+            "fe08bc0196ad8b2c9297f78b44b2a29e4b0cfca0cf1cac5f5d7caf84ef3aeab1"
+        ),
+        current_iso03_schema=False,
+    ),
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        run_id="iso03-20260814-018",
+        relative_path="iso03-20260814-018/host-audit/iso03-report.json",
+        byte_length=28_528,
+        sha256="82af9d92f80d71b955fffb1005f9de60d18f6db008e31367ddcc2181d95af9f3",
+        report_identity=(
+            "iso03-host-qualification-report:v1:sha256:"
+            "5a0f35c74299c1d5f0ee1220c3fd6fadaee481d91158c949fba951871f37922e"
+        ),
+        current_iso03_schema=True,
+    ),
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+        run_id="iso04-20260815-ticket06-001",
+        relative_path=(
+            "iso04-20260815-ticket06-001/host-audit/"
+            "iso04-ticket06-acceptance-report.json"
+        ),
+        byte_length=63_767,
+        sha256="ede54c71f83f554a044604e2ae3ecb4c4d3100932b83a41ac7048ab66e369def",
+        report_identity=(
+            "iso04-ticket06-acceptance-report:v1:sha256:"
+            "5f25988ca0d6776641628739963f03ef5e67a23d679800ac1213146893cb8dfe"
+        ),
+        current_iso03_schema=False,
+    ),
+    HistoricalQualificationReportPin(
+        role=ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
+        run_id="iso03-20260816-019",
+        relative_path="iso03-20260816-019/host-audit/iso03-report.json",
+        byte_length=28_516,
+        sha256="cbffff23bf8e9e782fc100267db6dd949d7064e30013500aadb7c627c6d210aa",
+        report_identity=(
+            "iso03-host-qualification-report:v1:sha256:"
+            "6a7a9a594a0968dcbaf32a61b86c27b5dda524362bf8a8a0b36c3168ffba2077"
+        ),
+        current_iso03_schema=True,
+    ),
+)
+
+
+def _validate_historical_report_pins(
+    manifest: ResolvedProtectedRootManifest,
+    pins: tuple[HistoricalQualificationReportPin, ...],
+) -> None:
     by_role = {binding.role: binding.path for binding in manifest.bindings}
-    roles = (
-        ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
-        ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
-        ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
-        ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
-    )
+    roles = tuple(dict.fromkeys(pin.role for pin in pins))
     roots = tuple(by_role[role] for role in roles)
     if any(
         _paths_overlap(first, second)
@@ -1707,6 +1791,96 @@ def validate_iso03_historical_evidence_root_coverage(
         raise SandboxContractError(
             SandboxFailureReason.PROTECTED_ROOT_MANIFEST_OVERLAP
         )
+    try:
+        for role in roles:
+            root = by_role[role]
+            role_pins = tuple(pin for pin in pins if pin.role is role)
+            expected_markers = tuple(
+                sorted(root / Path(pin.relative_path) for pin in role_pins)
+            )
+            pattern = (
+                "iso04-*/host-audit/iso04-ticket06-acceptance-report.json"
+                if role is ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE
+                else "iso03-*/host-audit/iso03-report.json"
+            )
+            if tuple(sorted(root.glob(pattern))) != expected_markers:
+                raise ValueError("historical evidence marker set is incomplete")
+            for pin, marker in zip(role_pins, expected_markers, strict=True):
+                raw = _read_stable_regular_file(marker, maximum_bytes=1_048_576)
+                if (
+                    len(raw) != pin.byte_length
+                    or sha256(raw).hexdigest() != pin.sha256
+                    or pin.report_identity.encode("ascii") not in raw
+                ):
+                    raise ValueError("historical evidence report pin mismatch")
+                if pin.current_iso03_schema:
+                    report = ISO03HostQualificationReport.model_validate_json(raw)
+                    if (
+                        report.run_id != pin.run_id
+                        or report.report_identity != pin.report_identity
+                        or raw
+                        != _canonical_json_bytes(report.model_dump(mode="json"))
+                        + b"\n"
+                    ):
+                        raise ValueError(
+                            "historical evidence closed report mismatch"
+                        )
+    except (SandboxContractError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+        ) from exc
+    if (
+        len({pin.report_identity for pin in pins}) != len(pins)
+        or len({pin.run_id for pin in pins}) != len(pins)
+    ):
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+        )
+
+
+def validate_iso03_historical_evidence_root_coverage(
+    manifest: ResolvedProtectedRootManifest,
+) -> None:
+    """Require the exact closed current/legacy historical report set."""
+
+    _validate_historical_report_pins(manifest, _HISTORICAL_REPORT_PINS)
+
+
+def _validate_historical_report_pins_in_inventory(
+    inventory: ProtectedHostInventory,
+    pins: tuple[HistoricalQualificationReportPin, ...],
+) -> None:
+    """Bind the validated report allowlist to the authoritative sentinel rows."""
+
+    roots = {root.role: root for root in inventory.roots}
+    try:
+        roles = tuple(dict.fromkeys(pin.role for pin in pins))
+        for role in roles:
+            role_pins = tuple(pin for pin in pins if pin.role is role)
+            pattern = (
+                "iso04-*/host-audit/iso04-ticket06-acceptance-report.json"
+                if role is ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE
+                else "iso03-*/host-audit/iso03-report.json"
+            )
+            rows = {
+                row.relative_path: row
+                for row in roots[role].files
+            }
+            marker_paths = {
+                relative_path
+                for relative_path in rows
+                if PurePosixPath(relative_path).match(pattern)
+            }
+            if marker_paths != {pin.relative_path for pin in role_pins}:
+                raise ValueError("historical evidence sentinel marker set mismatch")
+            for pin in role_pins:
+                row = rows[pin.relative_path]
+                if row.byte_length != pin.byte_length or row.sha256 != pin.sha256:
+                    raise ValueError("historical evidence sentinel pin mismatch")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+        ) from exc
 
 
 _BOUNDARY_RUNNER_SOURCE_FILES = QUALIFIED_RUNNER_SOURCE_FILES
@@ -3854,9 +4028,10 @@ def execute_iso03_boundary_qualification(
     reviewed_source_repository_root: Path,
     protected_state_repository_root: Path,
     historical_qualification_runs_root: Path,
-    replacement_qualification_run_root: Path | None = None,
+    replacement_qualification_run_root: Path,
     qualified_replacement_qualification_root: Path,
     failed_iso04_ticket06_acceptance_root: Path,
+    review_invalidated_qualification_root: Path,
     runs_root: Path,
     runtime_bundle_root: Path,
     run_id: str,
@@ -4040,6 +4215,9 @@ def execute_iso03_boundary_qualification(
             failed_iso04_ticket06_acceptance_root=(
                 failed_iso04_ticket06_acceptance_root
             ),
+            review_invalidated_qualification_root=(
+                review_invalidated_qualification_root
+            ),
         )
     )
     validate_iso03_historical_evidence_root_coverage(protected)
@@ -4074,6 +4252,10 @@ def execute_iso03_boundary_qualification(
             capture=semantic_capture,
         ),
         immutable_verifier_identity=immutable_verifier_identity,
+    )
+    _validate_historical_report_pins_in_inventory(
+        sentinel,
+        _HISTORICAL_REPORT_PINS,
     )
     validate_verifier_root_ownership(sentinel)
     targets = select_adversarial_probe_targets(protected, run_id=run_id)

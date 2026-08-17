@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from hashlib import sha256
+from itertools import combinations
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from tradingagents.windows_sandbox_qualification import (
     AdversarialProbeResult,
     AdversarialProbeTarget,
     GuestQualificationResult,
+    HistoricalQualificationReportPin,
     ISO03QualificationStatus,
     LocalWriteResult,
     LocalWriteTarget,
@@ -30,6 +33,8 @@ from tradingagents.windows_sandbox_qualification import (
     QualificationStaticBindings,
     WindowsHostPlatformFacts,
     WindowsHostQualificationState,
+    _validate_historical_report_pins,
+    _validate_historical_report_pins_in_inventory,
     build_guest_qualification_result,
     build_protected_writer_quiescence_contract,
     build_protected_writer_quiescence_evidence,
@@ -84,7 +89,27 @@ _DIRECTORY_ROLES = {
     ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
     ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
     ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
 }
+
+_HISTORICAL_EVIDENCE_ROLES = (
+    ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+    ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+    ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+    ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
+)
+
+
+def _test_identity(namespace: str, value: object) -> str:
+    material = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"{namespace}:sha256:{sha256(material).hexdigest()}"
 
 
 def _protected_manifest(root: Path):
@@ -101,6 +126,107 @@ def _protected_manifest(root: Path):
             kind = ProtectedObjectKind.FILE
         bindings.append(ProtectedRootBinding(role, path, kind))
     return build_protected_root_manifest(tuple(bindings))
+
+
+def _write_report_marker(
+    root: Path,
+    *,
+    run_id: str,
+    iso04: bool = False,
+    trailing_n: bool = False,
+) -> Path:
+    report_name = (
+        "iso04-ticket06-acceptance-report.json" if iso04 else "iso03-report.json"
+    )
+    contract_version = (
+        "iso04-ticket06-acceptance-report-v1"
+        if iso04
+        else "iso03-host-qualification-report-v1"
+    )
+    identity_namespace = (
+        "iso04-ticket06-acceptance-report:v1"
+        if iso04
+        else "iso03-host-qualification-report:v1"
+    )
+    payload = {
+        "contract_version": contract_version,
+        "run_id": run_id,
+        "status": "fail" if iso04 else "pass",
+    }
+    payload["report_identity"] = _test_identity(identity_namespace, payload)
+    marker = root / run_id / "host-audit" / report_name
+    marker.parent.mkdir(parents=True)
+    content = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    marker.write_bytes(content + (b"n" if trailing_n else b""))
+    return marker
+
+
+def _historical_manifest_with_markers(
+    root: Path,
+) -> tuple[object, tuple[HistoricalQualificationReportPin, ...]]:
+    manifest = _protected_manifest(root)
+    by_role = {binding.role: binding.path for binding in manifest.bindings}
+    specifications = (
+        (
+            ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+            "iso03-20260814-016",
+            False,
+            False,
+        ),
+        (
+            ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+            "iso03-20260814-017",
+            False,
+            False,
+        ),
+        (
+            ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+            "iso03-20260814-018",
+            False,
+            False,
+        ),
+        (
+            ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+            "iso04-20260815-ticket06-001",
+            True,
+            True,
+        ),
+        (
+            ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
+            "iso03-20260816-019",
+            False,
+            False,
+        ),
+    )
+    pins = []
+    for role, run_id, iso04, trailing_n in specifications:
+        marker = _write_report_marker(
+            by_role[role],
+            run_id=run_id,
+            iso04=iso04,
+            trailing_n=trailing_n,
+        )
+        raw = marker.read_bytes()
+        payload_bytes = raw[:-1] if trailing_n else raw
+        payload = json.loads(payload_bytes)
+        pins.append(
+            HistoricalQualificationReportPin(
+                role=role,
+                run_id=run_id,
+                relative_path=marker.relative_to(by_role[role]).as_posix(),
+                byte_length=len(raw),
+                sha256=sha256(raw).hexdigest(),
+                report_identity=payload["report_identity"],
+                current_iso03_schema=False,
+            )
+        )
+    return manifest, tuple(pins)
 
 
 def test_iso_03_host_inventory_is_deterministic_and_detects_rewrites(
@@ -588,11 +714,17 @@ def test_iso_03_execute_returns_needs_info_when_host_fact_capture_fails(
         reviewed_source_repository_root=tmp_path / "not-used-source",
         protected_state_repository_root=tmp_path / "not-used-protected-state",
         historical_qualification_runs_root=tmp_path / "not-used-history",
+        replacement_qualification_run_root=(
+            tmp_path / "not-used-replacement"
+        ),
         qualified_replacement_qualification_root=(
             tmp_path / "not-used-qualified-replacement"
         ),
         failed_iso04_ticket06_acceptance_root=(
             tmp_path / "not-used-failed-iso04"
+        ),
+        review_invalidated_qualification_root=(
+            tmp_path / "not-used-review-invalidated"
         ),
         runs_root=runs_root,
         runtime_bundle_root=tmp_path / "not-used-runtime",
@@ -867,6 +999,7 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
     replacement_run = tmp_path / "replacement-sandbox-run"
     qualified_replacement = tmp_path / "qualified-replacement-sandbox-run"
     failed_iso04_acceptance = tmp_path / "failed-iso04-ticket06-acceptance"
+    review_invalidated = tmp_path / "review-invalidated-sandbox-run"
     user_profile = tmp_path / "profile"
     for root in (
         implementation,
@@ -876,6 +1009,7 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         replacement_run,
         qualified_replacement,
         failed_iso04_acceptance,
+        review_invalidated,
         user_profile,
     ):
         root.mkdir()
@@ -887,6 +1021,7 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         replacement_qualification_run_root=replacement_run,
         qualified_replacement_qualification_root=qualified_replacement,
         failed_iso04_ticket06_acceptance_root=failed_iso04_acceptance,
+        review_invalidated_qualification_root=review_invalidated,
     )
     by_role = {binding.role: binding.path for binding in bindings}
 
@@ -908,6 +1043,10 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         by_role[ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE]
         == failed_iso04_acceptance
     )
+    assert (
+        by_role[ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION]
+        == review_invalidated
+    )
     assert not by_role[ProtectedRootRole.TICKET07_EVIDENCE].is_relative_to(
         implementation
     )
@@ -916,19 +1055,33 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
     )
 
 
-def test_iso_03_historical_evidence_roots_cannot_alias(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("first_role", "second_role"),
+    tuple(combinations(_HISTORICAL_EVIDENCE_ROLES, 2)),
+)
+@pytest.mark.parametrize("overlap_kind", ("equal", "nested"))
+def test_iso_03_historical_evidence_roots_cannot_overlap(
+    tmp_path: Path,
+    first_role: ProtectedRootRole,
+    second_role: ProtectedRootRole,
+    overlap_kind: str,
+) -> None:
     shared = tmp_path / "shared-qualified-evidence"
     shared.mkdir()
+    second_path = shared
+    if overlap_kind == "nested":
+        second_path = shared / "nested"
+        second_path.mkdir()
     complete = _protected_manifest(tmp_path / "protected")
-    aliased_roles = {
-        ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
-        ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    replacement_paths = {
+        first_role: shared,
+        second_role: second_path,
     }
     manifest = build_protected_root_manifest(
         tuple(
             ProtectedRootBinding(
                 role=binding.role,
-                path=shared if binding.role in aliased_roles else binding.path,
+                path=replacement_paths.get(binding.role, binding.path),
                 object_kind=binding.object_kind,
             )
             for binding in complete.bindings
@@ -944,23 +1097,160 @@ def test_iso_03_historical_evidence_roots_cannot_alias(tmp_path: Path) -> None:
     )
 
 
-def test_iso_03_programmatic_execution_requires_final_historical_evidence_roots(
+def test_iso_03_historical_evidence_roots_require_identity_bound_reports(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(TypeError, match="qualified_replacement_qualification_root"):
-        execute_iso03_boundary_qualification(
-            implementation_repository_root=tmp_path / "implementation",
-            reviewed_source_repository_root=tmp_path / "reviewed-source",
-            protected_state_repository_root=tmp_path / "protected-state",
-            historical_qualification_runs_root=tmp_path / "historical",
-            runs_root=tmp_path / "runs",
-            runtime_bundle_root=tmp_path / "runtime",
-            run_id="iso03-required-roots",
-            user_profile=tmp_path / "profile",
-            host_temp=tmp_path / "temp",
-            host_venv=tmp_path / "venv",
-            host_entrypoint_path=tmp_path / "entrypoint.py",
+    manifest, pins = _historical_manifest_with_markers(tmp_path / "protected")
+
+    _validate_historical_report_pins(manifest, pins)
+
+
+def test_iso_03_current_report_markers_require_the_closed_report_schema(
+    tmp_path: Path,
+) -> None:
+    manifest, pins = _historical_manifest_with_markers(tmp_path / "protected")
+    current_schema_pins = (
+        *pins[:-1],
+        replace(pins[-1], current_iso03_schema=True),
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins(manifest, current_schema_pins)
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+def test_iso_03_sentinel_binds_the_same_historical_report_pins(
+    tmp_path: Path,
+) -> None:
+    manifest, pins = _historical_manifest_with_markers(tmp_path / "protected")
+    _validate_historical_report_pins(manifest, pins)
+    marker = (
+        next(
+            binding.path
+            for binding in manifest.bindings
+            if binding.role
+            is ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION
         )
+        / pins[-1].relative_path
+    )
+    marker.write_bytes(b"review-invalidated-marker-replaced-before-sentinel")
+    sentinel = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=lambda: {},
+        immutable_verifier_identity="test-verifier",
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins_in_inventory(sentinel, pins)
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+def test_iso_03_sentinel_rejects_an_extra_historical_report_marker(
+    tmp_path: Path,
+) -> None:
+    manifest, pins = _historical_manifest_with_markers(tmp_path / "protected")
+    _validate_historical_report_pins(manifest, pins)
+    review_root = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role
+        is ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION
+    )
+    _write_report_marker(review_root, run_id="iso03-20260816-020")
+    sentinel = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=lambda: {},
+        immutable_verifier_identity="test-verifier",
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins_in_inventory(sentinel, pins)
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+@pytest.mark.parametrize("tamper", ("empty", "wrong_identity"))
+def test_iso_03_historical_evidence_roots_reject_wrong_or_empty_markers(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    manifest, pins = _historical_manifest_with_markers(tmp_path / "protected")
+    review_root = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role
+        is ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION
+    )
+    marker = review_root / "iso03-20260816-019" / "host-audit" / "iso03-report.json"
+    if tamper == "empty":
+        marker.unlink()
+        (review_root / "retained.bin").unlink()
+    else:
+        payload = json.loads(marker.read_bytes())
+        payload["report_identity"] = "iso03-host-qualification-report:v1:sha256:" + (
+            "0" * 64
+        )
+        marker.write_text(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins(manifest, pins)
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    (
+        "historical_qualification_runs_root",
+        "replacement_qualification_run_root",
+        "qualified_replacement_qualification_root",
+        "failed_iso04_ticket06_acceptance_root",
+        "review_invalidated_qualification_root",
+    ),
+)
+def test_iso_03_programmatic_execution_requires_all_historical_evidence_roots(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    arguments = {
+        "implementation_repository_root": tmp_path / "implementation",
+        "reviewed_source_repository_root": tmp_path / "reviewed-source",
+        "protected_state_repository_root": tmp_path / "protected-state",
+        "historical_qualification_runs_root": tmp_path / "historical",
+        "replacement_qualification_run_root": tmp_path / "replacement",
+        "qualified_replacement_qualification_root": tmp_path / "qualified",
+        "failed_iso04_ticket06_acceptance_root": tmp_path / "failed-iso04",
+        "review_invalidated_qualification_root": tmp_path / "review-invalidated",
+        "runs_root": tmp_path / "runs",
+        "runtime_bundle_root": tmp_path / "runtime",
+        "run_id": "iso03-required-roots",
+        "user_profile": tmp_path / "profile",
+        "host_temp": tmp_path / "temp",
+        "host_venv": tmp_path / "venv",
+        "host_entrypoint_path": tmp_path / "entrypoint.py",
+    }
+    arguments.pop(missing_name)
+
+    with pytest.raises(TypeError, match=missing_name):
+        execute_iso03_boundary_qualification(**arguments)
 
 
 class _MinimalLaunchPlatform:

@@ -38,7 +38,8 @@ from tradingagents.offline_runtime_bundle import (
 )
 
 PROTECTED_ROOT_MANIFEST_V1_VERSION = "windows-sandbox-protected-roots-v1"
-PROTECTED_ROOT_MANIFEST_VERSION = "windows-sandbox-protected-roots-v2"
+PROTECTED_ROOT_MANIFEST_V2_VERSION = "windows-sandbox-protected-roots-v2"
+PROTECTED_ROOT_MANIFEST_VERSION = "windows-sandbox-protected-roots-v3"
 SOURCE_INPUT_CONTRACT_VERSION = "windows-sandbox-reviewed-source-v1"
 GUEST_LAYOUT_CONTRACT_VERSION = "windows-sandbox-guest-layout-v1"
 ENVIRONMENT_POLICY_CONTRACT_VERSION = "windows-sandbox-environment-policy-v1"
@@ -123,6 +124,7 @@ class SandboxFailureReason(str, Enum):
     PROTECTED_ROOT_MANIFEST_INCOMPLETE = "protected_root_manifest_incomplete"
     PROTECTED_ROOT_MANIFEST_DUPLICATE = "protected_root_manifest_duplicate"
     PROTECTED_ROOT_MANIFEST_OVERLAP = "protected_root_manifest_overlap"
+    PROTECTED_ROOT_EVIDENCE_INVALID = "protected_root_evidence_invalid"
     SOURCE_REPOSITORY_INVALID = "source_repository_invalid"
     SOURCE_NOT_CLEAN = "source_not_clean"
     SOURCE_INDEX_MISMATCH = "source_index_mismatch"
@@ -215,6 +217,9 @@ class ProtectedRootRole(str, Enum):
         "qualified_replacement_sandbox_qualification"
     )
     FAILED_ISO04_TICKET06_ACCEPTANCE = "failed_iso04_ticket06_acceptance"
+    REVIEW_INVALIDATED_SANDBOX_QUALIFICATION = (
+        "review_invalidated_sandbox_qualification"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,36 +341,44 @@ class ProtectedRootManifest(BaseModel):
     contract_version: Literal[
         "windows-sandbox-protected-roots-v1",
         "windows-sandbox-protected-roots-v2",
+        "windows-sandbox-protected-roots-v3",
     ] = PROTECTED_ROOT_MANIFEST_VERSION
     entries: tuple[ProtectedRootEntry, ...]
     manifest_identity: str = Field(
-        pattern=r"^windows-sandbox-protected-roots:v[12]:sha256:[0-9a-f]{64}$"
+        pattern=r"^windows-sandbox-protected-roots:v[123]:sha256:[0-9a-f]{64}$"
     )
 
     @model_validator(mode="after")
     def _validate_identity(self) -> ProtectedRootManifest:
-        forward_only_roles = {
+        v1_forward_only_roles = {
             ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
             ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+            ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
         }
-        expected_roles = (
-            tuple(
-                role for role in ProtectedRootRole if role not in forward_only_roles
+        if self.contract_version == PROTECTED_ROOT_MANIFEST_V1_VERSION:
+            expected_roles = tuple(
+                role
+                for role in ProtectedRootRole
+                if role not in v1_forward_only_roles
             )
-            if self.contract_version == PROTECTED_ROOT_MANIFEST_V1_VERSION
-            else tuple(ProtectedRootRole)
-        )
+            identity_version = "v1"
+        elif self.contract_version == PROTECTED_ROOT_MANIFEST_V2_VERSION:
+            expected_roles = tuple(
+                role
+                for role in ProtectedRootRole
+                if role
+                is not ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION
+            )
+            identity_version = "v2"
+        else:
+            expected_roles = tuple(ProtectedRootRole)
+            identity_version = "v3"
         if tuple(entry.role for entry in self.entries) != expected_roles:
             raise ValueError("protected-root roles must use canonical closed ordering")
         payload = {
             "contract_version": self.contract_version,
             "entries": [entry.model_dump(mode="json") for entry in self.entries],
         }
-        identity_version = (
-            "v1"
-            if self.contract_version == PROTECTED_ROOT_MANIFEST_V1_VERSION
-            else "v2"
-        )
         if self.manifest_identity != _identity(
             f"windows-sandbox-protected-roots:{identity_version}",
             payload,
@@ -448,7 +461,7 @@ def build_protected_root_manifest(
     }
     contract = ProtectedRootManifest(
         entries=tuple(entries),
-        manifest_identity=_identity("windows-sandbox-protected-roots:v2", payload),
+        manifest_identity=_identity("windows-sandbox-protected-roots:v3", payload),
     )
     return ResolvedProtectedRootManifest(
         contract=contract,
@@ -464,6 +477,7 @@ def default_protected_root_bindings(
     replacement_qualification_run_root: Path | None = None,
     qualified_replacement_qualification_root: Path | None = None,
     failed_iso04_ticket06_acceptance_root: Path | None = None,
+    review_invalidated_qualification_root: Path | None = None,
 ) -> tuple[ProtectedRootBinding, ...]:
     """Return the reviewed ISO-01 roles without testing whether they exist."""
 
@@ -488,6 +502,10 @@ def default_protected_root_bindings(
     failed_iso04_ticket06_acceptance = (
         failed_iso04_ticket06_acceptance_root
         or qualified_replacement_sandbox_qualification
+    )
+    review_invalidated_sandbox_qualification = (
+        review_invalidated_qualification_root
+        or failed_iso04_ticket06_acceptance
     )
     return (
         ProtectedRootBinding(
@@ -598,6 +616,11 @@ def default_protected_root_bindings(
         ProtectedRootBinding(
             ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
             failed_iso04_ticket06_acceptance,
+            ProtectedObjectKind.DIRECTORY,
+        ),
+        ProtectedRootBinding(
+            ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
+            review_invalidated_sandbox_qualification,
             ProtectedObjectKind.DIRECTORY,
         ),
     )
