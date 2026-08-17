@@ -12,6 +12,7 @@ from scripts.windows_sandbox.run_ticket06_acceptance import (
 )
 from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_TARGET_FILES,
+    TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
     AcceptanceCommandStatus,
     Ticket06AcceptanceContractError,
     Ticket06AcceptanceResult,
@@ -461,6 +462,9 @@ def test_iso_01a_sealed_runner_and_bootstrap_dispatch_are_closed() -> None:
     bootstrap = (
         repository / "scripts" / "windows_sandbox" / "bootstrap.ps1"
     ).read_text(encoding="utf-8")
+    boundary_qualification = (
+        repository / "scripts" / "windows_sandbox" / "run_boundary_qualification.py"
+    ).read_text(encoding="utf-8")
     assert '"boundary_qualification"' in bootstrap
     assert '"ticket06_acceptance"' in bootstrap
     assert '"C:\\QCF17\\Input\\Runner\\run_boundary_qualification.py"' in bootstrap
@@ -479,3 +483,7 @@ def test_iso_01a_sealed_runner_and_bootstrap_dispatch_are_closed() -> None:
     )[0]
     assert "run_boundary_qualification.py" in boundary_block
     assert "run_ticket06_acceptance.py" not in boundary_block
+    assert (
+        TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY.rsplit(":", maxsplit=1)[-1]
+        in boundary_qualification
+    )

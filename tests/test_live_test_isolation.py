@@ -39,6 +39,7 @@ def _run_guarded_live_tests(
 
     environment = os.environ.copy()
     environment.pop("DEEPSEEK_API_KEY", None)
+    environment.pop("PYTEST_ADDOPTS", None)
     environment.pop("TUSHARE_TOKEN", None)
     environment["RUN_LIVE_DEEPSEEK_TESTS"] = "0"
     environment["RUN_LIVE_TUSHARE_TESTS"] = "0"

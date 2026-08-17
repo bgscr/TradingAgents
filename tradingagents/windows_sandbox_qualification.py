@@ -3781,14 +3781,16 @@ class WindowsSandboxBoundaryQualificationRunnerService(WindowsSandboxRunnerServi
             process=observed_process,
         )
         process = process_evidence.to_process_result()
-        if process.timed_out or not process.termination_confirmed:
+        if (
+            process.timed_out
+            or process.returncode != 0
+            or not process.termination_confirmed
+        ):
             raise SandboxContractError(SandboxFailureReason.SANDBOX_LAUNCH_FAILED)
         exported = validate_ticket06_acceptance_export(
             contract.paths.results_export,
             expected=contract.control.derived,
         )
-        if (process.returncode == 0) is not (exported.result.guest_claim == "pass"):
-            raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
         return Ticket06AcceptanceExecution(
             sandbox_process_evidence=process_evidence,
             export=exported,

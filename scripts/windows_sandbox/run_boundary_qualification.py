@@ -173,7 +173,7 @@ def _verify_control(control: dict[str, Any]) -> None:
         or acceptance_structure.get("command_ledger_identity")
         != (
             "ticket06-sandbox-command-ledger:v1:sha256:"
-            "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+            "8a2cb9a483e2c68dbef2b154c8c22634878c159a8a78ad0c0c7d8776570e85ea"
         )
         or acceptance_structure.get("mandatory_command_count") != 27
         or acceptance_structure.get("ticket06_executed") is not False

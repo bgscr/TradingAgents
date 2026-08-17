@@ -1399,7 +1399,7 @@ def build_environment_policy(
         "PIP_CACHE_DIR": layout.pip_cache,
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PIP_NO_INDEX": "1",
-        "PYTEST_ADDOPTS": f"--basetemp={layout.pytest_temp}",
+        "PYTEST_ADDOPTS": f"--basetemp={PureWindowsPath(layout.pytest_temp).as_posix()}",
         "PYTHONPYCACHEPREFIX": layout.python_cache,
         "PYTHONUSERBASE": str(PureWindowsPath(layout.python_install) / "UserBase"),
         "PYTHON_DOTENV_DISABLED": "1",

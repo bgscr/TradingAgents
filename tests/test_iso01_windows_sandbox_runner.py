@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import tarfile
 from dataclasses import replace
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from xml.etree import ElementTree
 
 import pytest
@@ -627,13 +628,30 @@ def test_iso_01_guest_layout_and_environment_are_entirely_guest_local() -> None:
     assert variables["TRADINGAGENTS_CACHE_DIR"] == layout.tradingagents_cache
     assert variables["TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT"] == layout.payloads
     assert variables["PYTHONPYCACHEPREFIX"] == layout.python_cache
-    assert layout.pytest_temp in variables["PYTEST_ADDOPTS"]
+    assert PureWindowsPath(
+        variables["PYTEST_ADDOPTS"].partition("=")[2]
+    ) == PureWindowsPath(layout.pytest_temp)
     assert variables["PYTHON_DOTENV_DISABLED"] == "1"
     assert {name: variables[name] for name in variables if name.startswith("RUN_LIVE_")} == {
         "RUN_LIVE_DEEPSEEK_TESTS": "0",
         "RUN_LIVE_PROVIDER_TESTS": "0",
         "RUN_LIVE_TUSHARE_TESTS": "0",
     }
+
+
+def test_iso_01_pytest_basetemp_survives_pytest_addopts_parsing() -> None:
+    layout = build_guest_layout()
+    policy = build_environment_policy(
+        run_live_environment=(),
+        layout=layout,
+    )
+
+    parsed = shlex.split(dict(policy.variables)["PYTEST_ADDOPTS"])
+
+    assert parsed == ["--basetemp=C:/QCF17/Runtime/PytestTemp"]
+    assert PureWindowsPath(parsed[0].partition("=")[2]) == PureWindowsPath(
+        layout.pytest_temp
+    )
 
 
 def test_iso_01_mapping_manifest_has_four_read_only_inputs_and_one_writable_export(

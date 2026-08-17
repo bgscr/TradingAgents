@@ -84,7 +84,7 @@ TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY = content_identity(
 )
 TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY = (
     "ticket06-sandbox-command-ledger:v1:sha256:"
-    "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+    "8a2cb9a483e2c68dbef2b154c8c22634878c159a8a78ad0c0c7d8776570e85ea"
 )
 TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY = content_identity(
     "windows-sandbox-ticket06-completion-contract:v1",

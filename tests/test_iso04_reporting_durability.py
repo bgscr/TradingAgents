@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +24,7 @@ from tradingagents.windows_sandbox_qualification import (
     ISO04SandboxProcessEvidence,
     ISO04Ticket06AcceptanceReport,
     ISO04Ticket06OperationalEvidence,
+    WindowsSandboxBoundaryQualificationRunnerService,
     load_iso04_sandbox_process_evidence,
     load_iso04_ticket06_operational_evidence,
     persist_iso04_sandbox_process_evidence,
@@ -30,6 +33,7 @@ from tradingagents.windows_sandbox_qualification import (
 )
 from tradingagents.windows_sandbox_runner import (
     SandboxContractError,
+    SandboxFailureReason,
     SandboxProcessResult,
     SandboxProcessTopologyEntry,
 )
@@ -59,6 +63,10 @@ def _process_result(returncode: int) -> SandboxProcessResult:
 
 
 def _validated_failure_export(tmp_path: Path):
+    return _validated_export(tmp_path, guest_pass=False)
+
+
+def _validated_export(tmp_path: Path, *, guest_pass: bool):
     environment = build_ticket06_control_environment(
         (
             ("PYTHON_DOTENV_DISABLED", "1"),
@@ -106,21 +114,32 @@ def _validated_failure_export(tmp_path: Path):
         ),
         command_ledger_identity=ledger.ledger_identity,
     )
-    command_results = (
-        build_ticket06_command_result(
-            ledger.entries[0],
-            status=AcceptanceCommandStatus.FAIL,
-            returncode=3,
-            failed=1,
-        ),
-        *(
+    if guest_pass:
+        command_results = tuple(
             build_ticket06_command_result(
                 entry,
-                status=AcceptanceCommandStatus.NOT_RUN,
+                status=AcceptanceCommandStatus.PASS,
+                returncode=0,
+                passed=1,
             )
-            for entry in ledger.entries[1:]
-        ),
-    )
+            for entry in ledger.entries
+        )
+    else:
+        command_results = (
+            build_ticket06_command_result(
+                ledger.entries[0],
+                status=AcceptanceCommandStatus.FAIL,
+                returncode=3,
+                failed=1,
+            ),
+            *(
+                build_ticket06_command_result(
+                    entry,
+                    status=AcceptanceCommandStatus.NOT_RUN,
+                )
+                for entry in ledger.entries[1:]
+            ),
+        )
     result = build_ticket06_acceptance_result(
         static=static,
         ledger=ledger,
@@ -139,6 +158,117 @@ def _validated_failure_export(tmp_path: Path):
         completion.canonical_json_bytes()
     )
     return validate_ticket06_acceptance_export(export_root, expected=static)
+
+
+class _FixedProcessPlatform:
+    def __init__(self, process: SandboxProcessResult) -> None:
+        self.process = process
+
+    def launch(self, _config_path: Path, *, timeout_seconds: int) -> SandboxProcessResult:
+        assert timeout_seconds == 30
+        return self.process
+
+
+def _acceptance_contract(tmp_path: Path, validated):
+    audit_root = tmp_path / "host-audit"
+    audit_root.mkdir()
+    return SimpleNamespace(
+        paths=SimpleNamespace(
+            config_path=tmp_path / "sandbox.wsb",
+            results_export=tmp_path / "results-export",
+            audit_root=audit_root,
+        ),
+        control=SimpleNamespace(
+            base=SimpleNamespace(run_id="iso04launch"),
+            control_identity=validated.result.static.control_identity,
+            derived=validated.result.static,
+        ),
+    )
+
+
+@pytest.mark.parametrize("guest_pass", (True, False))
+def test_iso04_successful_transport_retains_valid_guest_verdict_and_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guest_pass: bool,
+) -> None:
+    validated = _validated_export(tmp_path, guest_pass=guest_pass)
+    contract = _acceptance_contract(tmp_path, validated)
+    service = WindowsSandboxBoundaryQualificationRunnerService(
+        platform=_FixedProcessPlatform(_process_result(0))
+    )
+    monkeypatch.setattr(service, "_revalidate_ticket06_contract", lambda _value: None)
+
+    execution = service.launch_ticket06_acceptance(contract, timeout_seconds=30)
+
+    assert execution.process.returncode == 0
+    assert execution.export.result.guest_claim == ("pass" if guest_pass else "fail")
+    assert (
+        execution.export.result.result_identity
+        == execution.export.completion.result_identity
+    )
+    result_bytes = (contract.paths.results_export / "result.json").read_bytes()
+    assert execution.export.completion.result_sha256 == sha256(result_bytes).hexdigest()
+    persisted = load_iso04_sandbox_process_evidence(
+        contract.paths.audit_root / ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME,
+        expected_run_id="iso04launch",
+        expected_acceptance_control_identity=contract.control.control_identity,
+    )
+    assert persisted == execution.sandbox_process_evidence
+
+
+def test_iso04_outer_process_failure_is_transport_failure_even_with_guest_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validated = _validated_export(tmp_path, guest_pass=False)
+    contract = _acceptance_contract(tmp_path, validated)
+    service = WindowsSandboxBoundaryQualificationRunnerService(
+        platform=_FixedProcessPlatform(_process_result(17))
+    )
+    monkeypatch.setattr(service, "_revalidate_ticket06_contract", lambda _value: None)
+
+    with pytest.raises(SandboxContractError) as captured:
+        service.launch_ticket06_acceptance(contract, timeout_seconds=30)
+
+    assert captured.value.reason is SandboxFailureReason.SANDBOX_LAUNCH_FAILED
+    persisted = load_iso04_sandbox_process_evidence(
+        contract.paths.audit_root / ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME,
+        expected_run_id="iso04launch",
+        expected_acceptance_control_identity=contract.control.control_identity,
+    )
+    assert persisted.outer_sandbox_process_returncode == 17
+
+
+def test_iso04_outer_process_timeout_is_transport_failure_and_remains_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validated = _validated_export(tmp_path, guest_pass=True)
+    contract = _acceptance_contract(tmp_path, validated)
+    timed_out = _process_result(-1)
+    timed_out = SandboxProcessResult(
+        returncode=timed_out.returncode,
+        timed_out=True,
+        launched_processes=timed_out.launched_processes,
+        termination_confirmed=True,
+    )
+    service = WindowsSandboxBoundaryQualificationRunnerService(
+        platform=_FixedProcessPlatform(timed_out)
+    )
+    monkeypatch.setattr(service, "_revalidate_ticket06_contract", lambda _value: None)
+
+    with pytest.raises(SandboxContractError) as captured:
+        service.launch_ticket06_acceptance(contract, timeout_seconds=30)
+
+    assert captured.value.reason is SandboxFailureReason.SANDBOX_LAUNCH_FAILED
+    persisted = load_iso04_sandbox_process_evidence(
+        contract.paths.audit_root / ISO04_SANDBOX_PROCESS_EVIDENCE_FILENAME,
+        expected_run_id="iso04launch",
+        expected_acceptance_control_identity=contract.control.control_identity,
+    )
+    assert persisted.timed_out is True
+    assert persisted.outer_sandbox_process_returncode == -1
 
 
 @pytest.mark.parametrize("returncode", (0, 0xC000013A))
