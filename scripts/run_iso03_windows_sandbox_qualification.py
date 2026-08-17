@@ -20,6 +20,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-state-repository-root", required=True, type=Path)
     parser.add_argument("--historical-qualification-runs-root", required=True, type=Path)
     parser.add_argument("--replacement-qualification-run-root", required=True, type=Path)
+    parser.add_argument(
+        "--qualified-replacement-qualification-root",
+        required=True,
+        type=Path,
+    )
+    parser.add_argument(
+        "--failed-iso04-ticket06-acceptance-root",
+        required=True,
+        type=Path,
+    )
     parser.add_argument("--runs-root", required=True, type=Path)
     parser.add_argument("--runtime-bundle-root", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
@@ -59,6 +69,12 @@ def main() -> int:
         ),
         replacement_qualification_run_root=(
             arguments.replacement_qualification_run_root
+        ),
+        qualified_replacement_qualification_root=(
+            arguments.qualified_replacement_qualification_root
+        ),
+        failed_iso04_ticket06_acceptance_root=(
+            arguments.failed_iso04_ticket06_acceptance_root
         ),
         runs_root=arguments.runs_root,
         runtime_bundle_root=arguments.runtime_bundle_root,

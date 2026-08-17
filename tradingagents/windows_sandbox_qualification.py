@@ -1686,6 +1686,29 @@ def validate_verifier_root_ownership(inventory: ProtectedHostInventory) -> None:
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
 
 
+def validate_iso03_historical_evidence_root_coverage(
+    manifest: ResolvedProtectedRootManifest,
+) -> None:
+    """Require each retained external qualification edge to have its own root."""
+
+    by_role = {binding.role: binding.path for binding in manifest.bindings}
+    roles = (
+        ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
+        ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+        ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    )
+    roots = tuple(by_role[role] for role in roles)
+    if any(
+        _paths_overlap(first, second)
+        for index, first in enumerate(roots)
+        for second in roots[index + 1 :]
+    ):
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_MANIFEST_OVERLAP
+        )
+
+
 _BOUNDARY_RUNNER_SOURCE_FILES = QUALIFIED_RUNNER_SOURCE_FILES
 
 
@@ -3832,6 +3855,8 @@ def execute_iso03_boundary_qualification(
     protected_state_repository_root: Path,
     historical_qualification_runs_root: Path,
     replacement_qualification_run_root: Path | None = None,
+    qualified_replacement_qualification_root: Path,
+    failed_iso04_ticket06_acceptance_root: Path,
     runs_root: Path,
     runtime_bundle_root: Path,
     run_id: str,
@@ -4009,8 +4034,15 @@ def execute_iso03_boundary_qualification(
             replacement_qualification_run_root=(
                 replacement_qualification_run_root
             ),
+            qualified_replacement_qualification_root=(
+                qualified_replacement_qualification_root
+            ),
+            failed_iso04_ticket06_acceptance_root=(
+                failed_iso04_ticket06_acceptance_root
+            ),
         )
     )
+    validate_iso03_historical_evidence_root_coverage(protected)
     verifier_path = (
         implementation_repository
         / "scripts"

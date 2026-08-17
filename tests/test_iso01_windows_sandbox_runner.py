@@ -17,6 +17,7 @@ from tradingagents.windows_sandbox_runner import (
     ProtectedObjectKind,
     ProtectedPathMetadata,
     ProtectedRootBinding,
+    ProtectedRootManifest,
     ProtectedRootRole,
     ResultSectionStatus,
     RunnerConstructionRequest,
@@ -86,7 +87,7 @@ def test_iso_01_protected_manifest_identity_is_canonical_and_order_independent(
     forward = build_protected_root_manifest(bindings)
     reverse = build_protected_root_manifest(tuple(reversed(bindings)))
 
-    assert forward.contract_version == "windows-sandbox-protected-roots-v1"
+    assert forward.contract_version == "windows-sandbox-protected-roots-v2"
     assert forward.manifest_identity == reverse.manifest_identity
     assert forward.safe_projection() == reverse.safe_projection()
     assert tuple(entry.role for entry in forward.entries) == tuple(ProtectedRootRole)
@@ -147,6 +148,44 @@ def test_iso_01_default_manifest_protects_full_profile_and_verifier_roots(
     assert ProtectedRootRole.ISOLATED_PYTHON_WRITE_PROBE in by_role
     assert ProtectedRootRole.PRIOR_INVENTORIES in by_role
     assert ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS in by_role
+    assert ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION in by_role
+    assert ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION in by_role
+    assert ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE in by_role
+
+
+def test_iso_01_historical_v1_protected_manifest_remains_readable(
+    tmp_path: Path,
+) -> None:
+    forward = build_protected_root_manifest(_protected_bindings(tmp_path / "protected"))
+    forward_only_roles = {
+        ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    }
+    entries = tuple(
+        entry for entry in forward.entries if entry.role not in forward_only_roles
+    )
+    payload = {
+        "contract_version": "windows-sandbox-protected-roots-v1",
+        "entries": [entry.model_dump(mode="json") for entry in entries],
+    }
+    material = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    historical = ProtectedRootManifest(
+        **payload,
+        manifest_identity=(
+            "windows-sandbox-protected-roots:v1:sha256:"
+            + sha256(material).hexdigest()
+        ),
+    )
+
+    assert ProtectedRootManifest.model_validate_json(
+        historical.model_dump_json()
+    ) == historical
 
 
 def test_iso_01_missing_required_protected_root_fails_closed(tmp_path: Path) -> None:

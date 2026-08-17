@@ -46,6 +46,7 @@ from tradingagents.windows_sandbox_qualification import (
     stage_boundary_runner_input,
     validate_boundary_qualification_export,
     validate_boundary_runner_input,
+    validate_iso03_historical_evidence_root_coverage,
     validate_verifier_root_ownership,
 )
 from tradingagents.windows_sandbox_runner import (
@@ -81,6 +82,8 @@ _DIRECTORY_ROLES = {
     ProtectedRootRole.PRIOR_INVENTORIES,
     ProtectedRootRole.PRIOR_SANDBOX_QUALIFICATIONS,
     ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION,
+    ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+    ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
 }
 
 
@@ -585,6 +588,12 @@ def test_iso_03_execute_returns_needs_info_when_host_fact_capture_fails(
         reviewed_source_repository_root=tmp_path / "not-used-source",
         protected_state_repository_root=tmp_path / "not-used-protected-state",
         historical_qualification_runs_root=tmp_path / "not-used-history",
+        qualified_replacement_qualification_root=(
+            tmp_path / "not-used-qualified-replacement"
+        ),
+        failed_iso04_ticket06_acceptance_root=(
+            tmp_path / "not-used-failed-iso04"
+        ),
         runs_root=runs_root,
         runtime_bundle_root=tmp_path / "not-used-runtime",
         run_id="iso03facts",
@@ -856,6 +865,8 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
     protected_state = tmp_path / "actual-protected-state"
     historical_runs = tmp_path / "historical-sandbox-runs"
     replacement_run = tmp_path / "replacement-sandbox-run"
+    qualified_replacement = tmp_path / "qualified-replacement-sandbox-run"
+    failed_iso04_acceptance = tmp_path / "failed-iso04-ticket06-acceptance"
     user_profile = tmp_path / "profile"
     for root in (
         implementation,
@@ -863,6 +874,8 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         protected_state,
         historical_runs,
         replacement_run,
+        qualified_replacement,
+        failed_iso04_acceptance,
         user_profile,
     ):
         root.mkdir()
@@ -872,6 +885,8 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         repository_root=protected_state,
         historical_qualification_runs_root=historical_runs,
         replacement_qualification_run_root=replacement_run,
+        qualified_replacement_qualification_root=qualified_replacement,
+        failed_iso04_ticket06_acceptance_root=failed_iso04_acceptance,
     )
     by_role = {binding.role: binding.path for binding in bindings}
 
@@ -885,12 +900,67 @@ def test_iso_03_protected_state_root_is_independent_of_runner_and_source_reposit
         by_role[ProtectedRootRole.REPLACEMENT_SANDBOX_QUALIFICATION]
         == replacement_run
     )
+    assert (
+        by_role[ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION]
+        == qualified_replacement
+    )
+    assert (
+        by_role[ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE]
+        == failed_iso04_acceptance
+    )
     assert not by_role[ProtectedRootRole.TICKET07_EVIDENCE].is_relative_to(
         implementation
     )
     assert not by_role[ProtectedRootRole.TICKET07_EVIDENCE].is_relative_to(
         reviewed_source
     )
+
+
+def test_iso_03_historical_evidence_roots_cannot_alias(tmp_path: Path) -> None:
+    shared = tmp_path / "shared-qualified-evidence"
+    shared.mkdir()
+    complete = _protected_manifest(tmp_path / "protected")
+    aliased_roles = {
+        ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
+    }
+    manifest = build_protected_root_manifest(
+        tuple(
+            ProtectedRootBinding(
+                role=binding.role,
+                path=shared if binding.role in aliased_roles else binding.path,
+                object_kind=binding.object_kind,
+            )
+            for binding in complete.bindings
+        )
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        validate_iso03_historical_evidence_root_coverage(manifest)
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_MANIFEST_OVERLAP
+    )
+
+
+def test_iso_03_programmatic_execution_requires_final_historical_evidence_roots(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(TypeError, match="qualified_replacement_qualification_root"):
+        execute_iso03_boundary_qualification(
+            implementation_repository_root=tmp_path / "implementation",
+            reviewed_source_repository_root=tmp_path / "reviewed-source",
+            protected_state_repository_root=tmp_path / "protected-state",
+            historical_qualification_runs_root=tmp_path / "historical",
+            runs_root=tmp_path / "runs",
+            runtime_bundle_root=tmp_path / "runtime",
+            run_id="iso03-required-roots",
+            user_profile=tmp_path / "profile",
+            host_temp=tmp_path / "temp",
+            host_venv=tmp_path / "venv",
+            host_entrypoint_path=tmp_path / "entrypoint.py",
+        )
 
 
 class _MinimalLaunchPlatform:
