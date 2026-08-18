@@ -20,7 +20,10 @@ readiness is established.
 QCF17/QCF18 closure, PASS on 2026-08-18 after replacement ISO-03 PASS and the
 additive post-incident baseline v4 freeze.
 
-**Status:** FINAL PASS / completed (2026-08-18)
+**Status:** needs-triage
+
+**Final result:** Ticket 06 `FINAL PASS` on 2026-08-18 through ISO-04 run
+`iso04-20260818-ticket06-003`.
 
 **Acceptance state:** Final Ticket 06 is PASS through ISO-04 run
 `iso04-20260818-ticket06-003`. The immutable 2026-08-10 pre-temporal and
