@@ -13,7 +13,7 @@ additive post-qualification baseline freeze. The baseline must bind the newly
 qualified source, runtime bundle, runner/config, protected manifest, command
 ledger, export contract, and host inventory identities.
 
-**Status:** needs-triage
+**Status:** PASS / complete (2026-08-18)
 
 **Latest result:** `pass` — ISO-04 run `iso04-20260818-ticket06-003`;
 Ticket 06 `FINAL PASS`
@@ -429,7 +429,7 @@ inventories were exactly:
 This is the required post-freeze HOST identity. The historical run-022
 pre-freeze identity `c22a3764...` was not used as HOST BEFORE. Prelaunch
 semantics were exactly 1,024 provider sequences, 1,036 provider attempts, one
-persisted 2026 mainland calendar revision with 365 sessions, three checkpoint
+persisted 2026 Market Session Calendar revision with 365 sessions, three checkpoint
 files, 3,104 report/log files, all four fake-Yahoo incident rows,
 `isolated-python-write-probe`, and all five Ticket 07 evidence files.
 

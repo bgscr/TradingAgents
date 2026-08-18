@@ -16,23 +16,23 @@ CAL-01 through CAL-04 are complete; the separately authorized production
 calendar bootstrap is complete and persisted; exact-ID production calendar
 readiness is established.
 
-**Blocked by:** ISO-04 — Final Sandbox-contained Ticket 06 acceptance and
-QCF17/QCF18 closure. ISO-04 is itself blocked by ISO-03 PASS and the new
-additive post-incident baseline freeze.
+**Closed by:** ISO-04 — Final Sandbox-contained Ticket 06 acceptance and
+QCF17/QCF18 closure, PASS on 2026-08-18 after replacement ISO-03 PASS and the
+additive post-incident baseline v4 freeze.
 
-**Status:** blocked
+**Status:** FINAL PASS / completed (2026-08-18)
 
-**Acceptance state:** Final Ticket 06 is BLOCKED only by strengthened QCF17
-containment and ISO-04. The immutable 2026-08-10 pre-temporal and 2026-08-12
-post-temporal/pre-calendar evidence below remains valid for the exact contracts
-and trees it tested. Previous failed QCF17 incidents remain retained and are not
-repaired, waived, deleted, or absorbed into a new baseline. Ticket 07 has not
-been reauthorized, and authoritative `qualified_v1` remains disabled.
+**Acceptance state:** Final Ticket 06 is PASS through ISO-04 run
+`iso04-20260818-ticket06-003`. The immutable 2026-08-10 pre-temporal and
+2026-08-12 post-temporal/pre-calendar evidence below remains valid for the exact
+contracts and trees it tested. Previous failed QCF17 incidents remain retained
+and were not repaired, waived, deleted, or absorbed into a new baseline. Ticket
+07 has not been reauthorized, and authoritative `qualified_v1` remains disabled.
 
-**Final regression state:** deterministic/business behavior is otherwise
-green. No final PASS is permitted until ISO-04 runs the entire executable
-acceptance inside one qualified Sandbox and the trusted host before/after byte
-and semantic inventories are exactly identical.
+**Final regression state:** the complete deterministic/business acceptance ran
+inside one qualified Windows Sandbox; QCF17 clauses A and B passed, the trusted
+HOST BEFORE and HOST AFTER inventories were exactly identical, and QCF18 then
+passed conditionally.
 
 ## Exact dependency graph
 
@@ -238,31 +238,31 @@ They do not satisfy strengthened QCF17 and do not authorize Ticket 07.
   is complete and persisted; it performed no symbol, Ticket 07, or model work.
 - [x] Exact-ID `mainland-session-calendar-readiness-v1` is established with zero
   read-time provider I/O and the required frontier/forward horizon.
-- [ ] ISO-03 passes the full Windows Sandbox adversarial boundary qualification
+- [x] ISO-03 passes the full Windows Sandbox adversarial boundary qualification
   and valid guest-local write controls with an exactly equal trusted host
   before/after inventory. No Ticket 06 command runs during ISO-03.
-- [ ] After ISO-03 PASS, one new additive post-incident baseline is frozen. It
+- [x] After ISO-03 PASS, one new additive post-incident baseline is frozen. It
   binds the reviewed source, runtime bundle, runner/config, protected manifest,
   and host inventory identities without replacing any prior baseline.
-- [ ] ISO-04 runs every executable Ticket 06 command inside one qualified
+- [x] ISO-04 runs every executable Ticket 06 command inside one qualified
   Windows Sandbox invocation on the exact frozen identities. No executable
   acceptance slice runs on the host.
-- [ ] **QCF17 clause A:** sandbox-local acceptance and forward-only historical
+- [x] **QCF17 clause A:** sandbox-local acceptance and forward-only historical
   behavior are correct, including valid local temp/runtime/SQLite/payload writes
   and protected-path writes that are OS-denied or guest-local only.
-- [ ] **QCF17 clause B:** the trusted host before/after inventories are exactly
+- [x] **QCF17 clause B:** the trusted host before/after inventories are exactly
   equal: zero append/delete/rewrite and identical provider counts/digests,
   calendar, checkpoints, reports/logs, incidents, prior evidence, and Ticket 07
   evidence.
-- [ ] QCF18 is evaluated only after QCF17 PASS; every QCF1–QCF18, PE1–PE15,
+- [x] QCF18 is evaluated only after QCF17 PASS; every QCF1–QCF18, PE1–PE15,
   AC1–AC13, non-integration, two-full-suite, Ruff, diff, security/history, and
   executable review criterion passes unchanged and without waiver.
-- [ ] The bounded export binds the reviewed commit/tree, source, bundle,
+- [x] The bounded export binds the reviewed commit/tree, source, bundle,
   runner/config, protected manifest, baseline, adversarial probe, every
   QCF/PE/AC result, pytest summaries, Ruff/diff results, and a completion marker
   written last; it contains no credentials, provider DBs, host state copies, or
   unsafe unbounded logs.
-- [ ] Only ISO-04 PASS may mark Ticket 06 PASS. A separate fresh Ticket 07 live
+- [x] Only ISO-04 PASS may mark Ticket 06 PASS. A separate fresh Ticket 07 live
   authorization and NEW run ID are still required afterward.
 
 ## Strengthened QCF17 incident preservation
@@ -622,17 +622,17 @@ live authorization.
 
 - [x] CAL-04 acceptance/review and the separately authorized production
   calendar bootstrap/exact-ID readiness prerequisites are complete.
-- [ ] ISO-03 PASS and the new additive post-incident baseline freeze precede
+- [x] ISO-03 PASS and the new additive post-incident baseline freeze precede
   every executable Ticket 06 command.
-- [ ] The complete Ticket 06 matrix runs without waiver inside one qualified
+- [x] The complete Ticket 06 matrix runs without waiver inside one qualified
   Windows Sandbox on the exact reviewed identities and records a new final PASS
   while preserving the 2026-08-10 and 2026-08-12 historical evidence unchanged.
-- [ ] QCF17 sandbox acceptance and trusted zero-host-delta clauses both pass;
+- [x] QCF17 sandbox acceptance and trusted zero-host-delta clauses both pass;
   QCF18 is then evaluated and passes conditionally.
-- [ ] Spec Compliance and Code Quality reviews pass in order with Critical,
+- [x] Spec Compliance and Code Quality reviews pass in order with Critical,
   Important, and Minor counts recorded and all Critical/Important findings
   resolved.
-- [ ] The bounded result export is complete and safe; host provider/calendar/
+- [x] The bounded result export is complete and safe; host provider/calendar/
   checkpoint/report/log/incident/Ticket 07 state is exactly unchanged;
   `qualified_v1` remains disabled; and no Ticket 07 run ID/provider/model work
   is allocated or performed.
