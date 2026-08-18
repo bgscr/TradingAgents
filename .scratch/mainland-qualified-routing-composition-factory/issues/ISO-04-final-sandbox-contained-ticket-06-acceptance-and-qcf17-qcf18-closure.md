@@ -15,7 +15,8 @@ ledger, export contract, and host inventory identities.
 
 **Status:** needs-triage
 
-**Latest result:** `fail` — ISO-04 run `iso04-20260817-ticket06-002`
+**Latest result:** `pass` — ISO-04 run `iso04-20260818-ticket06-003`;
+Ticket 06 `FINAL PASS`
 
 ## Confirmed blocked attempt — 2026-08-14
 
@@ -196,17 +197,17 @@ NEW 601328.SS PASS -> NEW 600895.SS
 
 ## Definition of done
 
-- [ ] Every executable Ticket 06 command ran inside one qualified Sandbox on
+- [x] Every executable Ticket 06 command ran inside one qualified Sandbox on
   the exact baseline-bound identities; no executable slice ran on the host.
-- [ ] The bounded export is complete, identity-consistent, secret-free, and
+- [x] The bounded export is complete, identity-consistent, secret-free, and
   ends with the completion marker written last.
-- [ ] QCF17 clause A passes and the trusted QCF17 clause B host inventory is
+- [x] QCF17 clause A passes and the trusted QCF17 clause B host inventory is
   exactly equal with zero byte or semantic delta.
-- [ ] Only after QCF17 PASS, QCF18 and every unchanged QCF/PE/AC/full-suite,
+- [x] Only after QCF17 PASS, QCF18 and every unchanged QCF/PE/AC/full-suite,
   Ruff, diff, and review criterion are credited PASS.
-- [ ] Historical evidence remains unchanged, no live provider/model/Ticket 07
+- [x] Historical evidence remains unchanged, no live provider/model/Ticket 07
   work occurred, and `qualified_v1` remains disabled.
-- [ ] ISO-04 records PASS and thereby permits Ticket 06 final PASS; Ticket 07
+- [x] ISO-04 records PASS and thereby permits Ticket 06 final PASS; Ticket 07
   remains blocked pending a separate fresh authorization.
 
 ## ISO-04 / Ticket 06 final attempt — 2026-08-17
@@ -366,3 +367,179 @@ equality. Its delta identity is
 This establishes QCF17 clause B PASS, including unchanged provider sequences
 and attempts, calendar/checkpoints/reports/logs, incidents, prior evidence, and
 Ticket 07 evidence. It cannot make QCF17 pass because clause A failed.
+
+## ISO-04 / Ticket 06 successful retry — 2026-08-18
+
+### Final disposition
+
+- **ISO-04:** `PASS`.
+- **Ticket 06:** `FINAL PASS`.
+- **QCF17 clause A:** `PASS` — all 27 mandatory guest commands passed and the
+  guest reported the unchanged forward-only historical behavior and offline
+  acceptance contract satisfied.
+- **QCF17 clause B:** `PASS` — independent trusted HOST BEFORE and HOST AFTER
+  inventories are exactly equal with zero append, delete, rewrite, changed
+  role, or semantic delta.
+- **QCF17 overall:** `PASS`, because both mandatory clauses passed.
+- **QCF18:** `PASS`, evaluated and credited only after QCF17 PASS. All unchanged
+  QCF1-QCF18, PE1-PE15, AC1-AC13, full-suite, Ruff, whitespace/diff, workspace,
+  and two-stage offline review evidence passed.
+- **Ticket 07:** not executed or authorized. No Ticket 07 run/checkpoint ID was
+  allocated.
+
+ISO-03 was not rerun, ISO-02 was not resealed, no baseline was frozen or
+replaced, no historical or untracked evidence was cleaned, and no
+self-qualification or second ISO-04 Sandbox was performed.
+
+### Authoritative inputs and prelaunch gates
+
+The retry used exactly one fresh Windows Sandbox with run ID
+`iso04-20260818-ticket06-003` and external evidence root
+`D:\TradingAgents-ISO04-Ticket06-Acceptance-862a268`.
+
+| Binding | Verified value |
+| --- | --- |
+| Source commit | `862a268b9cc1c08a3ebc59bbf1a74550ec878d75` |
+| Source tree | `0a2944d43ed4e8b91628fe2d2f927cf70b66a15c` |
+| Reviewed source | `windows-sandbox-reviewed-source:v1:sha256:e13802cbb85bc3f7a7b129dfbd9e79699ba9d122ef994f1d0206151862e961a0` |
+| Source manifest | `windows-sandbox-source-manifest:v1:sha256:319cc9a6b21de117526a7b3597c4d6bd1668dbb24289def8f8064fcc5fdba29c` |
+| Source archive SHA-256 | `52229bed710fb2980efeb8f5b0c9b4e154f3cc5de4cc1754943bb3bd69a13a1e` |
+| Runtime bundle | `windows-offline-runtime-bundle:v1:sha256:7e66684c10c734e51f6aac72cd2bf7ece667c867ee7bd0d50aab9a2f8d828582` |
+| Runtime manifest SHA-256 | `9bf01d4a4c800fa4b653db0ee37e10fddce6c1e469664360be4f1a373636099f` |
+| Runtime input contract | `windows-sandbox-runtime-bundle-input:v1:sha256:8f7d33144fdf9ffa4f24b38540c57d75a3d83b834873ae9cbdfb8d445157ee1f` |
+| Sealed runner input | `windows-sandbox-qualified-runner-input:v2:sha256:2781c2b8d072574e04a8b506e20676eff5c41297a222b69c8542745bec836322` |
+| Exact command ledger | `ticket06-sandbox-command-ledger:v1:sha256:8a2cb9a483e2c68dbef2b154c8c22634878c159a8a78ad0c0c7d8776570e85ea` |
+| Replacement ISO-03 run | `iso03-boundary-qualification-run:v1:sha256:e561c8c9f46213b6d628173e8a8357375975ce90b13a51ec75070b183e2330c8` |
+| Replacement ISO-03 report | `iso03-host-qualification-report:v1:sha256:58cd477d0e15dc2ce6cb3e609457271e7dd35e2292e361e90cb709d62bdb030d` |
+| Frozen baseline | `qcf17-post-iso03-qualified-host-baseline:v4:sha256:a7402ab00bf9d15f0cb1c8bda681198e84bd272d38c2cd8e91ec7625c976ef53` |
+| Frozen baseline artifact SHA-256 | `5d27d5235b554bc07b604256c9090e53fdf60b7dc4eb69e323d0e155664ec626` |
+| Protected-root manifest | `windows-sandbox-protected-roots:v3:sha256:ed99639d2053a7c0bd2f542941eda5cccd95b161fd81ad610cd1684a440fee62` |
+| Immutable verifier | `ticket06-immutable-state-verifier:v1:sha256:65491e3ad63f298a5d0b9e7e6c1caf7f6a415827e22b15de81c0d6f4bd5287de` |
+| Acceptance control | `windows-sandbox-ticket06-control:v1:sha256:b8ad3c1fba31fe2fa4d0cbd52e4b5dfd5b55eef6fca804385ebdcb691d01921a` |
+| Acceptance runner | `iso01-windows-sandbox-runner:v1:sha256:73f01e029795e5ed751c7f3866abcb01da3bcaf2feb73348473c971bc6fc4a4d` |
+| Acceptance `.wsb` config | `windows-sandbox-config:v1:sha256:952dbd88db4665e7d9fb721ec5a75bf5a4e2092706bf5f2025d20f4637be4fbc` |
+| Acceptance mapping manifest | `windows-sandbox-mapping-manifest:v1:sha256:0f6f7a9256a1387d1908eff32e9bb5104526519585984565cf7d69ad0bbd528f` |
+| Environment policy | `windows-sandbox-environment-policy:v1:sha256:8428ed3a9e8435cace5541ded703613d97ac25df2e08a163b94fb6d90e18a81f` |
+
+The separately recomputed preliminary inventory and both in-run prelaunch
+inventories were exactly:
+
+`windows-sandbox-protected-host-inventory:v1:sha256:d8eab715effa7706985cfd2243eb7c3e32f87927754873f454c6370dade063e9`
+
+This is the required post-freeze HOST identity. The historical run-022
+pre-freeze identity `c22a3764...` was not used as HOST BEFORE. Prelaunch
+semantics were exactly 1,024 provider sequences, 1,036 provider attempts, one
+persisted 2026 mainland calendar revision with 365 sessions, three checkpoint
+files, 3,104 report/log files, all four fake-Yahoo incident rows,
+`isolated-python-write-probe`, and all five Ticket 07 evidence files.
+
+### Containment and authorization evidence
+
+- The `.wsb` disabled networking, vGPU, audio/video input, printer and
+  clipboard redirection, and enabled `ProtectedClient`.
+- Source, runtime, runner, and control were read-only mappings. The fresh empty
+  bounded results export was the only writable host mapping.
+- `PYTHON_DOTENV_DISABLED=1`.
+- `RUN_LIVE_CUSTOM_TESTS`, `RUN_LIVE_DEEPSEEK_TESTS`,
+  `RUN_LIVE_ENVIRONMENT`, `RUN_LIVE_PROVIDER_TESTS`, and
+  `RUN_LIVE_TUSHARE_TESTS` were all `0`.
+- No credentials entered the guest or bounded export. No provider command,
+  model command, dependency download, production calendar refresh, or Ticket 07
+  command executed.
+- The replacement ISO-03 authority retained all nine contained adversarial
+  exact-path probes, all eleven successful guest-local write controls, and no
+  IPv4/IPv6 default route.
+- `qualified_v1` remained disabled.
+
+The read-only input inventories were byte-identical before launch and after
+Sandbox exit:
+
+| Input | Files | Bytes | Before/after inventory SHA-256 |
+| --- | ---: | ---: | --- |
+| Source | 3 | 15,596,997 | `f0f0d848bce10e032313f86640c317c5743f71c28c8c709245be8c4bf4608def` |
+| Runner | 8 | 185,030 | `abe8b777c2b8b3e8a0285515db7c94a126b0f068a7b819509e7dd25476b944e4` |
+| Control | 1 | 37,996 | `ec985bd1530ff0ccc41e0180b1ee1c7d096b35e1e58cea0b81b9955b78f1857d` |
+| Runtime | 488 | 308,841,232 | `065cd134d523b7c5e46155a26982e1d207b3124bedcc9154c9af572ebfef4dda` |
+
+### Exact 27-command ledger result
+
+All commands ran inside the one guest, in the sealed order, and returned zero.
+
+| # | Command ID | Status | Bounded summary |
+| ---: | --- | --- | --- |
+| 1 | `systemic_persistence_isolation` | PASS | 38 passed |
+| 2 | `cal01_acquisition_attempts` | PASS | 44 passed |
+| 3 | `cal02_publication_exact_reader` | PASS | 47 passed |
+| 4 | `cal03_programmatic_cli_bootstrap` | PASS | 123 passed |
+| 5 | `cal04_deterministic_acceptance` | PASS | 35 passed |
+| 6 | `temporal_06b` | PASS | 62 passed |
+| 7 | `qcf_matrix` | PASS | 19 passed |
+| 8 | `composition_contracts` | PASS | 158 passed |
+| 9 | `eligibility_context` | PASS | 108 passed |
+| 10 | `production_source_bindings` | PASS | 79 passed |
+| 11 | `indicator_metadata` | PASS | 63 passed |
+| 12 | `provider_adapters` | PASS | 193 passed |
+| 13 | `provider_coordination` | PASS | 137 passed |
+| 14 | `graph_shadow_pe` | PASS | 209 passed |
+| 15 | `checkpoint_reporting_evidence` | PASS | 171 passed |
+| 16 | `history_security_checks` | PASS | 19 passed |
+| 17 | `market_history_ac` | PASS | 146 passed |
+| 18 | `financial_period_pe` | PASS | 73 passed |
+| 19 | `live_test_isolation` | PASS | 9 passed |
+| 20 | `non_integration` | PASS | 3,455 passed, 13 skipped |
+| 21 | `full_suite_a` | PASS | 3,460 passed, 15 skipped |
+| 22 | `full_suite_b` | PASS | 3,460 passed, 15 skipped |
+| 23 | `ruff` | PASS | exit 0 |
+| 24 | `diff_whitespace` | PASS | exit 0 |
+| 25 | `workspace_status` | PASS | exit 0 |
+| 26 | `offline_spec_compliance_review` | PASS | exit 0 |
+| 27 | `offline_code_quality_review` | PASS | exit 0 |
+
+The bounded export reports all QCF1-QCF18, PE1-PE15, and AC1-AC13 criterion
+rows PASS without waiver or renumbering. Both offline review stages passed.
+
+### Sandbox exit and bounded export
+
+The Sandbox outer process returned `0`, did not time out, terminated cleanly,
+and left no Sandbox process. The bounded result contains exactly `result.json`
+followed by the completion marker written last.
+
+| Evidence | Identity | Artifact SHA-256 |
+| --- | --- | --- |
+| Guest result | `windows-sandbox-ticket06-result:v1:sha256:51d716ed5a03da5d0f782e1d13d77f04c74c417c6188c6273fdc8a2677d164ae` | `0a706f0058b982366fddb7d5cd76ed1177f87d0db73c56a430a67183beda2635` |
+| Completion marker | `windows-sandbox-ticket06-completion:v1:sha256:eae3a991f5e0546751df8e0a5af864c3d9157734f05527241d327bfdfb2b8a6b` | `a7d1bf2edf88325ac66b3391866f4a2810a32e5eead196dd5d08dabc5c0e0f03` |
+| Guest export | `windows-sandbox-ticket06-result-export:v1:sha256:3f728fd963bfbd8def8b746f9d27db42ca1d53711e88b1e805f1a7c65f761ca5` | bounded two-file contract |
+| Sandbox process evidence | `iso04-sandbox-process-evidence:v1:sha256:0e7ace3ab5c02451d91c180418d235e9552df0dc43da25524836108350d8c265` | `f978e30d2475865b186668cb7613e692a26ee792ffa25025f76f1e53f035bece` |
+| Operational evidence | embedded by the acceptance report | `19f06699f3d3153420866d6c97bdeea35b702407f5c3a2b1ee700b5d3b1a114c` |
+| Acceptance report | `iso04-ticket06-acceptance-report:v1:sha256:ca1e139ae8c88385ede59fb5c69aa008850696567d04988f63d792f52128cbdf` | `bc5119140da8fb3ba24db98a5d2a168871ad74ba786b483b709cb86e2550ae45` |
+| Final verdict | `iso04-ticket06-final-verdict-v1` | `3e7e16cadd46b13161b7906cee3e20b6fa42f69c3aba78ffeeea3f451abfb162` |
+
+After all Sandbox and host-inventory authorities were durably written, the
+initial host verdict renderer treated the validated string `guest_claim` as an
+enum and raised `AttributeError`. This post-run rendering incident changed no
+guest result, completion marker, process evidence, host inventory, or input.
+The existing evidence was reparsed and the final verdict completed host-only.
+The Sandbox was not relaunched.
+
+### Independent HOST AFTER and QCF17 clause B
+
+The independently recomputed HOST AFTER identity is exactly:
+
+`windows-sandbox-protected-host-inventory:v1:sha256:d8eab715effa7706985cfd2243eb7c3e32f87927754873f454c6370dade063e9`
+
+HOST BEFORE and HOST AFTER artifacts are byte-identical, each 30,963,036 bytes
+with SHA-256
+`ac2ba85f0e938dd6c0b348fc102011900ea9a2090edf40ccf8be9ac8dce38e27`.
+The comparison records appended/deleted/rewritten `0/0/0`, no changed roles,
+equal protected manifest and immutable verifier, and exact semantic equality.
+Its delta identity is
+`windows-sandbox-host-inventory-delta:v1:sha256:0e7a6fb7b9110becae2331bc5275f4af47001551948eb260cfa1c6191b9ae33d`
+(artifact SHA-256
+`f0aaa0bf6cd43f6882566e4d502e2275a8fb2c722bfc7f8aab943e09838705bc`).
+
+This proves unchanged provider sequences/attempts, Market Session Calendar,
+checkpoints, reports/logs, incidents, baselines/prior evidence, and Ticket 07
+evidence. QCF17 clause B therefore passes. With guest clause A already PASS,
+QCF17 passes; only then was QCF18 evaluated and credited PASS. ISO-04 is PASS,
+Ticket 06 is FINAL PASS, and Ticket 07 remains blocked pending a separate fresh
+authorization.
