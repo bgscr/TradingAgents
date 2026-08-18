@@ -48,6 +48,7 @@ from tradingagents.windows_sandbox_acceptance import (
     build_ticket06_control_environment,
     content_identity as acceptance_content_identity,
     qualify_ticket06_acceptance_runner_structure,
+    validate_recorded_iso03_report_json,
     validate_ticket06_acceptance_export,
 )
 from tradingagents.windows_sandbox_runner import (
@@ -1686,6 +1687,49 @@ def validate_verifier_root_ownership(inventory: ProtectedHostInventory) -> None:
             raise SandboxContractError(SandboxFailureReason.RESULT_IDENTITY_MISMATCH)
 
 
+class HistoricalISO03ReportContract(BaseModel):
+    """Closed structural identities required to read one ISO-03 report generation."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    report_contract_version: Literal["iso03-host-qualification-report-v1"] = (
+        "iso03-host-qualification-report-v1"
+    )
+    acceptance_structure_contract_version: Literal[
+        "ticket06-acceptance-runner-structure-v2"
+    ] = "ticket06-acceptance-runner-structure-v2"
+    command_ledger_identity: str = Field(
+        pattern=r"^ticket06-sandbox-command-ledger:v1:sha256:[0-9a-f]{64}$"
+    )
+    result_schema_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-ticket06-result-schema:v1:sha256:[0-9a-f]{64}$"
+        )
+    )
+    completion_marker_contract_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-ticket06-completion-contract:v1:sha256:"
+            r"[0-9a-f]{64}$"
+        )
+    )
+
+
+_PRIOR_QUALIFIED_TICKET06_REPORT_CONTRACT = HistoricalISO03ReportContract(
+    command_ledger_identity=(
+        "ticket06-sandbox-command-ledger:v1:sha256:"
+        "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+    ),
+    result_schema_identity=(
+        "windows-sandbox-ticket06-result-schema:v1:sha256:"
+        "daabe8ef38f52c5580338a94f62fc3c15d710575db59e95de36f34e5dd98128e"
+    ),
+    completion_marker_contract_identity=(
+        "windows-sandbox-ticket06-completion-contract:v1:sha256:"
+        "7a6d7def1eddc7a14ae519ed87f851a0b180accaaa3e42aeab084e0a17dcc956"
+    ),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class HistoricalQualificationReportPin:
     role: ProtectedRootRole
@@ -1695,6 +1739,7 @@ class HistoricalQualificationReportPin:
     sha256: str
     report_identity: str
     current_iso03_schema: bool
+    recorded_contract: HistoricalISO03ReportContract | None = None
 
 
 _HISTORICAL_REPORT_PINS = (
@@ -1745,6 +1790,7 @@ _HISTORICAL_REPORT_PINS = (
             "5a0f35c74299c1d5f0ee1220c3fd6fadaee481d91158c949fba951871f37922e"
         ),
         current_iso03_schema=True,
+        recorded_contract=_PRIOR_QUALIFIED_TICKET06_REPORT_CONTRACT,
     ),
     HistoricalQualificationReportPin(
         role=ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
@@ -1772,8 +1818,90 @@ _HISTORICAL_REPORT_PINS = (
             "6a7a9a594a0968dcbaf32a61b86c27b5dda524362bf8a8a0b36c3168ffba2077"
         ),
         current_iso03_schema=True,
+        recorded_contract=_PRIOR_QUALIFIED_TICKET06_REPORT_CONTRACT,
     ),
 )
+
+
+def load_historical_iso03_qualification_report(
+    raw: bytes,
+    *,
+    recorded_contract: HistoricalISO03ReportContract,
+) -> ISO03HostQualificationReport:
+    """Read immutable ISO-03 evidence under its explicitly pinned contract."""
+
+    try:
+        report = validate_recorded_iso03_report_json(
+            raw,
+            command_ledger_identity=recorded_contract.command_ledger_identity,
+            result_schema_identity=recorded_contract.result_schema_identity,
+            completion_marker_contract_identity=(
+                recorded_contract.completion_marker_contract_identity
+            ),
+        )
+        static = report.static_bindings
+        guest = report.guest_result
+        if static is None or guest is None:
+            raise ValueError("historical ISO-03 structural evidence is incomplete")
+        structure = static.acceptance_runner_structure
+        if (
+            report.contract_version != recorded_contract.report_contract_version
+            or structure.contract_version
+            != recorded_contract.acceptance_structure_contract_version
+            or structure.command_ledger_identity
+            != recorded_contract.command_ledger_identity
+            or structure.result_schema_identity
+            != recorded_contract.result_schema_identity
+            or structure.completion_marker_contract_identity
+            != recorded_contract.completion_marker_contract_identity
+        ):
+            raise ValueError("historical ISO-03 recorded contract mismatch")
+        host_harness = report.host_harness
+        host_acceptance_module = (
+            next(
+                (
+                    item
+                    for item in host_harness.files
+                    if item.relative_path
+                    == "tradingagents/windows_sandbox_qualification.py"
+                ),
+                None,
+            )
+            if host_harness is not None
+            else None
+        )
+        if (
+            structure.boundary_runner_identity != static.runner_identity
+            or structure.wsb_config_identity != static.wsb_config_identity
+            or structure.mapping_manifest_identity
+            != static.mapping_manifest_identity
+            or report.runner_input_identity != structure.runner_input_identity
+            or static.platform_qualification_identity
+            != report.platform_qualification.qualification_identity
+            or static.host_before_inventory_identity
+            != report.host_before_inventory_identity
+            or host_harness is None
+            or host_acceptance_module is None
+            or structure.host_harness_manifest_identity
+            != host_harness.manifest_identity
+            or structure.host_acceptance_module_sha256
+            != host_acceptance_module.sha256
+        ):
+            raise ValueError("historical ISO-03 material identities disagree")
+        static_payload = static.model_dump(mode="json")
+        guest_static_payload = guest.model_dump(
+            mode="json",
+            include=set(QualificationStaticBindings.model_fields),
+        )
+        if guest_static_payload != static_payload:
+            raise ValueError("historical ISO-03 static/result bindings disagree")
+        if raw != _canonical_json_bytes(report.model_dump(mode="json")) + b"\n":
+            raise ValueError("historical ISO-03 report is not canonical")
+        return report
+    except (TypeError, ValueError) as exc:
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+        ) from exc
 
 
 def _validate_historical_report_pins(
@@ -1814,17 +1942,21 @@ def _validate_historical_report_pins(
                 ):
                     raise ValueError("historical evidence report pin mismatch")
                 if pin.current_iso03_schema:
-                    report = ISO03HostQualificationReport.model_validate_json(raw)
+                    if pin.recorded_contract is None:
+                        raise ValueError("historical report contract pin is missing")
+                    report = load_historical_iso03_qualification_report(
+                        raw,
+                        recorded_contract=pin.recorded_contract,
+                    )
                     if (
                         report.run_id != pin.run_id
                         or report.report_identity != pin.report_identity
-                        or raw
-                        != _canonical_json_bytes(report.model_dump(mode="json"))
-                        + b"\n"
                     ):
                         raise ValueError(
                             "historical evidence closed report mismatch"
                         )
+                elif pin.recorded_contract is not None:
+                    raise ValueError("legacy report has a structural contract pin")
     except (SandboxContractError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SandboxContractError(
             SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
@@ -3803,6 +3935,147 @@ class ISO03QualificationStatus(str, Enum):
     NEEDS_INFO = "needs-info"
 
 
+ISO03_PRECONSTRUCTION_FAILURE_RECEIPT_PREFIX = (
+    "iso03-preconstruction-failure-"
+)
+
+
+class ISO03PreconstructionFailureReceipt(BaseModel):
+    """Durable facts available when ISO-03 fails before HOST BEFORE."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "iso03-preconstruction-failure-receipt-v1"
+    ] = "iso03-preconstruction-failure-receipt-v1"
+    run_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{7,63}$")
+    stage: Literal["historical_evidence_validation"] = (
+        "historical_evidence_validation"
+    )
+    failure_reason: SandboxFailureReason
+    implementation_repository_path_identity: str = Field(
+        pattern=r"^host-path:sha256:[0-9a-f]{64}$"
+    )
+    reviewed_source_repository_path_identity: str = Field(
+        pattern=r"^host-path:sha256:[0-9a-f]{64}$"
+    )
+    runtime_bundle_root_path_identity: str = Field(
+        pattern=r"^host-path:sha256:[0-9a-f]{64}$"
+    )
+    platform_qualification_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-host-platform-qualification:v1:sha256:"
+            r"[0-9a-f]{64}$"
+        )
+    )
+    minimal_launch_evidence_identity: str = Field(min_length=1, max_length=180)
+    minimal_sandbox_launch_succeeded: bool
+    minimal_sandbox_process_ids: tuple[int, ...]
+    implementation_base_commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    candidate_tree_hash: str = Field(pattern=r"^[0-9a-f]{40}$")
+    host_harness_manifest_identity: str = Field(
+        pattern=r"^iso03-reviewed-host-harness:v1:sha256:[0-9a-f]{64}$"
+    )
+    protected_root_manifest_identity: str = Field(
+        pattern=r"^windows-sandbox-protected-roots:v[1-3]:sha256:[0-9a-f]{64}$"
+    )
+    protected_writer_quiescence_contract_identity: str = Field(
+        pattern=(
+            r"^windows-sandbox-protected-writer-quiescence:v1:sha256:"
+            r"[0-9a-f]{64}$"
+        )
+    )
+    reviewed_source_input_identity: None = None
+    runtime_bundle_identity: None = None
+    runner_input_identity: None = None
+    host_before_inventory_identity: None = None
+    host_before_inventory_materialized: Literal[False] = False
+    boundary_sandbox_constructed: Literal[False] = False
+    boundary_sandbox_launched: Literal[False] = False
+    receipt_identity: str = Field(
+        pattern=(
+            r"^iso03-preconstruction-failure-receipt:v1:sha256:"
+            r"[0-9a-f]{64}$"
+        )
+    )
+
+    @model_validator(mode="after")
+    def _validate_receipt(self) -> ISO03PreconstructionFailureReceipt:
+        if self.minimal_sandbox_launch_succeeded != bool(
+            self.minimal_sandbox_process_ids
+        ):
+            raise ValueError("minimal Sandbox status is inconsistent")
+        payload = self.model_dump(mode="json", exclude={"receipt_identity"})
+        if self.receipt_identity != _identity(
+            "iso03-preconstruction-failure-receipt:v1",
+            payload,
+        ):
+            raise ValueError("preconstruction failure receipt identity mismatch")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        failure_reason: SandboxFailureReason,
+        implementation_repository: Path,
+        reviewed_source_repository: Path,
+        runtime_bundle_root: Path,
+        platform_qualification: WindowsHostPlatformQualification,
+        minimal_launch: MinimalSandboxLaunchEvidence,
+        implementation_base_commit_id: str,
+        candidate_tree_hash: str,
+        host_harness: ReviewedHostHarnessManifest,
+        protected_roots: ResolvedProtectedRootManifest,
+        protected_writer_quiescence: ProtectedWriterQuiescenceContract,
+    ) -> ISO03PreconstructionFailureReceipt:
+        payload = {
+            "contract_version": "iso03-preconstruction-failure-receipt-v1",
+            "run_id": run_id,
+            "stage": "historical_evidence_validation",
+            "failure_reason": failure_reason.value,
+            "implementation_repository_path_identity": host_path_identity(
+                implementation_repository
+            ),
+            "reviewed_source_repository_path_identity": host_path_identity(
+                reviewed_source_repository
+            ),
+            "runtime_bundle_root_path_identity": host_path_identity(
+                runtime_bundle_root
+            ),
+            "platform_qualification_identity": (
+                platform_qualification.qualification_identity
+            ),
+            "minimal_launch_evidence_identity": minimal_launch.evidence_identity,
+            "minimal_sandbox_launch_succeeded": minimal_launch.succeeded,
+            "minimal_sandbox_process_ids": list(
+                minimal_launch.launched_process_ids
+            ),
+            "implementation_base_commit_id": implementation_base_commit_id,
+            "candidate_tree_hash": candidate_tree_hash,
+            "host_harness_manifest_identity": host_harness.manifest_identity,
+            "protected_root_manifest_identity": protected_roots.manifest_identity,
+            "protected_writer_quiescence_contract_identity": (
+                protected_writer_quiescence.contract_identity
+            ),
+            "reviewed_source_input_identity": None,
+            "runtime_bundle_identity": None,
+            "runner_input_identity": None,
+            "host_before_inventory_identity": None,
+            "host_before_inventory_materialized": False,
+            "boundary_sandbox_constructed": False,
+            "boundary_sandbox_launched": False,
+        }
+        return cls(
+            **payload,
+            receipt_identity=_identity(
+                "iso03-preconstruction-failure-receipt:v1",
+                payload,
+            ),
+        )
+
+
 class ISO03HostQualificationReport(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -4222,7 +4495,28 @@ def execute_iso03_boundary_qualification(
             ),
         )
     )
-    validate_iso03_historical_evidence_root_coverage(protected)
+    try:
+        validate_iso03_historical_evidence_root_coverage(protected)
+    except SandboxContractError as exc:
+        receipt = ISO03PreconstructionFailureReceipt.create(
+            run_id=run_id,
+            failure_reason=exc.reason,
+            implementation_repository=implementation_repository,
+            reviewed_source_repository=reviewed_source_repository_root,
+            runtime_bundle_root=runtime_bundle_root,
+            platform_qualification=platform_qualification,
+            minimal_launch=minimal,
+            implementation_base_commit_id=implementation_base_commit_id,
+            candidate_tree_hash=candidate_tree_hash,
+            host_harness=host_harness,
+            protected_roots=protected,
+            protected_writer_quiescence=quiescence_contract,
+        )
+        receipt_path = runs_root / (
+            f"{ISO03_PRECONSTRUCTION_FAILURE_RECEIPT_PREFIX}{run_id}.json"
+        )
+        _write_host_audit(receipt_path, receipt)
+        raise
     verifier_path = (
         implementation_repository
         / "scripts"

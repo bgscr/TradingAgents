@@ -9,19 +9,24 @@ from pathlib import Path
 
 import pytest
 
+import tradingagents.windows_sandbox_qualification as qualification_module
 from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_SOURCE_FILES,
     QUALIFIED_RUNNER_TARGET_FILES,
     TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+    TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY,
     TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
     Ticket06AcceptanceStructuralQualification,
     qualify_ticket06_acceptance_runner_structure,
 )
 from tradingagents.windows_sandbox_qualification import (
+    ISO03_PRECONSTRUCTION_FAILURE_RECEIPT_PREFIX,
     AdversarialProbeResult,
     AdversarialProbeTarget,
     GuestQualificationResult,
+    HistoricalISO03ReportContract,
     HistoricalQualificationReportPin,
+    ISO03PreconstructionFailureReceipt,
     ISO03QualificationStatus,
     LocalWriteResult,
     LocalWriteTarget,
@@ -31,6 +36,8 @@ from tradingagents.windows_sandbox_qualification import (
     ProbeMechanism,
     ProbeObservation,
     QualificationStaticBindings,
+    ReviewedHostHarnessFile,
+    ReviewedHostHarnessManifest,
     WindowsHostPlatformFacts,
     WindowsHostQualificationState,
     _validate_historical_report_pins,
@@ -45,6 +52,7 @@ from tradingagents.windows_sandbox_qualification import (
     compare_protected_host_inventories,
     execute_iso03_boundary_qualification,
     host_path_identity,
+    load_historical_iso03_qualification_report,
     qualify_windows_sandbox_host,
     run_minimal_sandbox_launch,
     select_adversarial_probe_targets,
@@ -99,6 +107,31 @@ _HISTORICAL_EVIDENCE_ROLES = (
     ProtectedRootRole.FAILED_ISO04_TICKET06_ACCEPTANCE,
     ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
 )
+
+_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY = (
+    "ticket06-sandbox-command-ledger:v1:sha256:"
+    "5444477692f8a4a517d6e78719c5d21d97550c6a08610bd88596ca76cb68ea23"
+)
+
+
+def _prior_historical_report_contract() -> HistoricalISO03ReportContract:
+    return HistoricalISO03ReportContract(
+        command_ledger_identity=_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+        result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+        completion_marker_contract_identity=(
+            TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+        ),
+    )
+
+
+def _current_historical_report_contract() -> HistoricalISO03ReportContract:
+    return HistoricalISO03ReportContract(
+        command_ledger_identity=TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+        result_schema_identity=TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
+        completion_marker_contract_identity=(
+            TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+        ),
+    )
 
 
 def _test_identity(namespace: str, value: object) -> str:
@@ -471,6 +504,39 @@ def _static_bindings() -> QualificationStaticBindings:
     )
 
 
+def _reviewed_host_harness(
+    *,
+    implementation_base_commit_id: str,
+    candidate_tree_hash: str,
+) -> ReviewedHostHarnessManifest:
+    paths = (
+        "scripts/run_iso03_windows_sandbox_qualification.py",
+        "tradingagents/offline_runtime_bundle.py",
+        "tradingagents/windows_sandbox_acceptance.py",
+        "tradingagents/windows_sandbox_qualification.py",
+        "tradingagents/windows_sandbox_runner.py",
+    )
+    files = tuple(
+        ReviewedHostHarnessFile(
+            relative_path=path,
+            byte_length=index + 1,
+            sha256=f"{index + 1:x}" * 64,
+        )
+        for index, path in enumerate(paths)
+    )
+    payload = {
+        "contract_version": "iso03-reviewed-host-harness-v1",
+        "implementation_base_commit_id": implementation_base_commit_id,
+        "candidate_tree_hash": candidate_tree_hash,
+        "source_mode": "reviewed_index",
+        "files": [item.model_dump(mode="json") for item in files],
+    }
+    return ReviewedHostHarnessManifest(
+        **payload,
+        manifest_identity=_test_identity("iso03-reviewed-host-harness:v1", payload),
+    )
+
+
 def _passing_guest_result() -> GuestQualificationResult:
     probes = tuple(
         AdversarialProbeResult(
@@ -512,6 +578,203 @@ def _passing_guest_result() -> GuestQualificationResult:
         ),
         probes=probes,
         local_writes=writes,
+    )
+
+
+_RECORDED_SOURCE_INPUT_IDENTITY = (
+    "windows-sandbox-reviewed-source:v1:sha256:" + ("1" * 64)
+)
+_RECORDED_RUNTIME_BUNDLE_IDENTITY = (
+    "windows-offline-runtime-bundle:v1:sha256:" + ("2" * 64)
+)
+_RECORDED_RUNNER_IDENTITY = (
+    "iso01-windows-sandbox-runner:v1:sha256:" + ("3" * 64)
+)
+_RECORDED_WSB_CONFIG_IDENTITY = (
+    "windows-sandbox-config:v1:sha256:" + ("4" * 64)
+)
+
+
+def _bind_recorded_structure(
+    payload: dict[str, object],
+    *,
+    command_ledger_identity: str,
+    host_harness: ReviewedHostHarnessManifest,
+) -> None:
+    structure = dict(payload["acceptance_runner_structure"])
+    host_acceptance_module = next(
+        item
+        for item in host_harness.files
+        if item.relative_path == "tradingagents/windows_sandbox_qualification.py"
+    )
+    structure.update(
+        command_ledger_identity=command_ledger_identity,
+        boundary_runner_identity=_RECORDED_RUNNER_IDENTITY,
+        wsb_config_identity=_RECORDED_WSB_CONFIG_IDENTITY,
+        host_harness_manifest_identity=host_harness.manifest_identity,
+        host_acceptance_module_sha256=host_acceptance_module.sha256,
+    )
+    structure["qualification_identity"] = _test_identity(
+        "ticket06-acceptance-runner-structure:v2",
+        {
+            key: value
+            for key, value in structure.items()
+            if key != "qualification_identity"
+        },
+    )
+    payload.update(
+        source_input_identity=_RECORDED_SOURCE_INPUT_IDENTITY,
+        runtime_bundle_identity=_RECORDED_RUNTIME_BUNDLE_IDENTITY,
+        runner_identity=_RECORDED_RUNNER_IDENTITY,
+        wsb_config_identity=_RECORDED_WSB_CONFIG_IDENTITY,
+        acceptance_runner_structure=structure,
+    )
+
+
+def _safe_historical_report_bytes(
+    *,
+    run_id: str,
+    command_ledger_identity: str,
+    mismatch: str | None = None,
+) -> bytes:
+    platform_report = SandboxPlatformReport.available(
+        protected_client_supported=True
+    )
+    platform_qualification = qualify_windows_sandbox_host(
+        platform_report=platform_report,
+        facts=_supported_platform_facts(),
+        minimal_launch=_minimal_launch(),
+    )
+    host_harness = _reviewed_host_harness(
+        implementation_base_commit_id="a" * 40,
+        candidate_tree_hash="b" * 40,
+    )
+    static = _static_bindings().model_dump(mode="json")
+    _bind_recorded_structure(
+        static,
+        command_ledger_identity=command_ledger_identity,
+        host_harness=host_harness,
+    )
+    static["platform_qualification_identity"] = (
+        platform_qualification.qualification_identity
+    )
+    guest = _passing_guest_result().model_dump(mode="json")
+    _bind_recorded_structure(
+        guest,
+        command_ledger_identity=(
+            TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+            if mismatch == "ledger"
+            else command_ledger_identity
+        ),
+        host_harness=host_harness,
+    )
+    guest["platform_qualification_identity"] = (
+        platform_qualification.qualification_identity
+    )
+    if mismatch == "nested_runner_binding":
+        mismatched_runner = (
+            "iso01-windows-sandbox-runner:v1:sha256:" + ("8" * 64)
+        )
+        static["runner_identity"] = mismatched_runner
+        guest["runner_identity"] = mismatched_runner
+    guest_structure = dict(guest["acceptance_runner_structure"])
+    if mismatch == "structure_identity":
+        guest_structure["qualification_identity"] = (
+            "ticket06-acceptance-runner-structure:v2:sha256:" + ("0" * 64)
+        )
+        guest["acceptance_runner_structure"] = guest_structure
+    elif mismatch == "static_binding":
+        guest["source_input_identity"] = (
+            "windows-sandbox-reviewed-source:v1:sha256:" + ("9" * 64)
+        )
+    guest["result_identity"] = _test_identity(
+        "windows-sandbox-boundary-qualification-result:v1",
+        {
+            key: value
+            for key, value in guest.items()
+            if key != "result_identity"
+        },
+    )
+    if mismatch == "result_identity":
+        guest["result_identity"] = (
+            "windows-sandbox-boundary-qualification-result:v1:sha256:"
+            + ("0" * 64)
+        )
+
+    static_structure = dict(static["acceptance_runner_structure"])
+    payload: dict[str, object] = {
+        "contract_version": "iso03-host-qualification-report-v1",
+        "status": "fail",
+        "run_id": run_id,
+        "platform_report": platform_report.model_dump(mode="json"),
+        "platform_qualification": platform_qualification.model_dump(mode="json"),
+        "static_bindings": static,
+        "runner_input_identity": static_structure["runner_input_identity"],
+        "implementation_base_commit_id": (
+            host_harness.implementation_base_commit_id
+        ),
+        "candidate_tree_hash": host_harness.candidate_tree_hash,
+        "host_harness": host_harness.model_dump(mode="json"),
+        "protected_writer_quiescence": None,
+        "actual_sandbox_launch": False,
+        "sandbox_returncode": None,
+        "sandbox_timed_out": False,
+        "sandbox_termination_confirmed": False,
+        "sandbox_process_ids": [],
+        "sandbox_process_before": [],
+        "sandbox_process_observed": [],
+        "sandbox_process_after": [],
+        "guest_result": guest,
+        "guest_export_identity": None,
+        "host_before_inventory_identity": static[
+            "host_before_inventory_identity"
+        ],
+        "host_after_inventory_identity": None,
+        "host_delta": None,
+        "semantic_before": None,
+        "semantic_after": None,
+        "failure_reason": "safe-historical-fixture",
+        "ticket06_executed": False,
+        "ticket07_executed": False,
+        "provider_model_io": False,
+        "calendar_refresh_executed": False,
+        "baseline_frozen": False,
+        "qualified_v1_enabled": False,
+    }
+    payload["report_identity"] = _test_identity(
+        "iso03-host-qualification-report:v1",
+        payload,
+    )
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+
+
+def _write_historical_report_pin(
+    root: Path,
+    *,
+    role: ProtectedRootRole,
+    run_id: str,
+    raw: bytes,
+    recorded_contract: HistoricalISO03ReportContract,
+) -> HistoricalQualificationReportPin:
+    marker = root / run_id / "host-audit" / "iso03-report.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(raw)
+    payload = json.loads(raw)
+    return HistoricalQualificationReportPin(
+        role=role,
+        run_id=run_id,
+        relative_path=f"{run_id}/host-audit/iso03-report.json",
+        byte_length=len(raw),
+        sha256=sha256(raw).hexdigest(),
+        report_identity=payload["report_identity"],
+        current_iso03_schema=True,
+        recorded_contract=recorded_contract,
     )
 
 
@@ -1105,6 +1368,242 @@ def test_iso_03_historical_evidence_roots_require_identity_bound_reports(
     _validate_historical_report_pins(manifest, pins)
 
 
+def test_iso_03_historical_current_schema_report_uses_recorded_prior_ledger(
+    tmp_path: Path,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    historical_root = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role
+        is ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION
+    )
+    raw = _safe_historical_report_bytes(
+        run_id="iso03-prior-ledger",
+        command_ledger_identity=_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+    )
+    before_sha256 = sha256(raw).hexdigest()
+    pin = _write_historical_report_pin(
+        historical_root,
+        role=ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        run_id="iso03-prior-ledger",
+        raw=raw,
+        recorded_contract=_prior_historical_report_contract(),
+    )
+
+    assert (
+        _PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY
+        != TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+    )
+    _validate_historical_report_pins(manifest, (pin,))
+    report = load_historical_iso03_qualification_report(
+        raw,
+        recorded_contract=_prior_historical_report_contract(),
+    )
+
+    assert report.static_bindings is not None
+    assert report.guest_result is not None
+    assert (
+        report.static_bindings.acceptance_runner_structure.command_ledger_identity
+        == _PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY
+    )
+    assert report.static_bindings.source_input_identity == (
+        _RECORDED_SOURCE_INPUT_IDENTITY
+    )
+    assert report.static_bindings.runtime_bundle_identity == (
+        _RECORDED_RUNTIME_BUNDLE_IDENTITY
+    )
+    assert report.static_bindings.runner_identity == _RECORDED_RUNNER_IDENTITY
+    assert report.static_bindings.wsb_config_identity == (
+        _RECORDED_WSB_CONFIG_IDENTITY
+    )
+    marker = historical_root / pin.relative_path
+    assert marker.read_bytes() == raw
+    assert sha256(marker.read_bytes()).hexdigest() == before_sha256
+
+
+def test_iso_03_historical_reader_rejects_tampered_ledger_identity(
+    tmp_path: Path,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    historical_root = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role
+        is ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION
+    )
+    raw = _safe_historical_report_bytes(
+        run_id="iso03-tampered-ledger",
+        command_ledger_identity=(
+            "ticket06-sandbox-command-ledger:v1:sha256:" + ("5" * 64)
+        ),
+    )
+    pin = _write_historical_report_pin(
+        historical_root,
+        role=ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        run_id="iso03-tampered-ledger",
+        raw=raw,
+        recorded_contract=_prior_historical_report_contract(),
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins(manifest, (pin,))
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "ledger",
+        "structure_identity",
+        "result_identity",
+        "static_binding",
+        "nested_runner_binding",
+    ),
+)
+def test_iso_03_historical_reader_rejects_internal_identity_disagreement(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    historical_root = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role
+        is ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION
+    )
+    run_id = f"iso03-mismatch-{mismatch}"
+    raw = _safe_historical_report_bytes(
+        run_id=run_id,
+        command_ledger_identity=_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+        mismatch=mismatch,
+    )
+    pin = _write_historical_report_pin(
+        historical_root,
+        role=ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION,
+        run_id=run_id,
+        raw=raw,
+        recorded_contract=_prior_historical_report_contract(),
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        _validate_historical_report_pins(manifest, (pin,))
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+def test_iso_03_historical_reader_rejects_unsupported_report_contract() -> None:
+    raw = _safe_historical_report_bytes(
+        run_id="iso03-unsupported-version",
+        command_ledger_identity=_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+    )
+    unsupported = _prior_historical_report_contract().model_copy(
+        update={"report_contract_version": "iso03-host-qualification-report-v2"}
+    )
+
+    with pytest.raises(SandboxContractError) as captured:
+        load_historical_iso03_qualification_report(
+            raw,
+            recorded_contract=unsupported,
+        )
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+
+
+@pytest.mark.parametrize(
+    ("command_ledger_identity", "valid"),
+    (
+        (_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY, False),
+        (TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY, True),
+    ),
+)
+def test_iso_03_current_structural_candidate_requires_current_ledger(
+    command_ledger_identity: str,
+    valid: bool,
+) -> None:
+    current = _static_bindings().acceptance_runner_structure
+    values = {
+        "runner_input_identity": current.runner_input_identity,
+        "environment_policy_identity": current.environment_policy_identity,
+        "host_harness_manifest_identity": current.host_harness_manifest_identity,
+        "host_acceptance_module_sha256": current.host_acceptance_module_sha256,
+        "boundary_runner_identity": current.boundary_runner_identity,
+        "wsb_config_identity": current.wsb_config_identity,
+        "wsb_config_policy_identity": current.wsb_config_policy_identity,
+        "mapping_manifest_identity": current.mapping_manifest_identity,
+        "command_ledger_identity": command_ledger_identity,
+        "result_schema_identity": current.result_schema_identity,
+    }
+
+    if valid:
+        candidate = Ticket06AcceptanceStructuralQualification.create(**values)
+        assert (
+            candidate.command_ledger_identity
+            == TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+        )
+    else:
+        with pytest.raises(
+            ValueError,
+            match="qualified Ticket 06 command ledger identity mismatch",
+        ):
+            Ticket06AcceptanceStructuralQualification.create(**values)
+
+
+def test_iso_03_historical_inventory_supports_multiple_ledger_generations(
+    tmp_path: Path,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    by_role = {binding.role: binding.path for binding in manifest.bindings}
+    old_run_id = "iso03-old-generation"
+    current_run_id = "iso03-current-generation"
+    pins = (
+        _write_historical_report_pin(
+            by_role[
+                ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION
+            ],
+            role=(
+                ProtectedRootRole.QUALIFIED_REPLACEMENT_SANDBOX_QUALIFICATION
+            ),
+            run_id=old_run_id,
+            raw=_safe_historical_report_bytes(
+                run_id=old_run_id,
+                command_ledger_identity=_PRIOR_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+            ),
+            recorded_contract=_prior_historical_report_contract(),
+        ),
+        _write_historical_report_pin(
+            by_role[
+                ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION
+            ],
+            role=ProtectedRootRole.REVIEW_INVALIDATED_SANDBOX_QUALIFICATION,
+            run_id=current_run_id,
+            raw=_safe_historical_report_bytes(
+                run_id=current_run_id,
+                command_ledger_identity=TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
+            ),
+            recorded_contract=_current_historical_report_contract(),
+        ),
+    )
+
+    _validate_historical_report_pins(manifest, pins)
+    sentinel = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=lambda: {},
+        immutable_verifier_identity="test-verifier",
+    )
+    _validate_historical_report_pins_in_inventory(sentinel, pins)
+
+
 def test_iso_03_current_report_markers_require_the_closed_report_schema(
     tmp_path: Path,
 ) -> None:
@@ -1296,6 +1795,140 @@ class _MinimalLaunchPlatform:
             launched_processes=_successful_process_topology(),
             termination_confirmed=self.termination_confirmed,
         )
+
+
+def test_iso_03_fatal_preconstruction_failure_writes_closed_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    protected_state = tmp_path / "protected-state"
+    protected_state.mkdir()
+    protected = _protected_manifest(tmp_path / "protected")
+    implementation_commit = "a" * 40
+    candidate_tree = "b" * 40
+    host_harness = _reviewed_host_harness(
+        implementation_base_commit_id=implementation_commit,
+        candidate_tree_hash=candidate_tree,
+    )
+
+    monkeypatch.setattr(
+        qualification_module,
+        "_committed_git_hex",
+        lambda *_args: implementation_commit,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "_reviewed_index_tree_hash",
+        lambda *_args: candidate_tree,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "build_reviewed_host_harness_manifest",
+        lambda *_args, **_kwargs: host_harness,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "build_protected_root_manifest",
+        lambda _bindings: protected,
+    )
+
+    def fail_historical_evidence(_manifest: object) -> None:
+        raise SandboxContractError(
+            SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+        )
+
+    def forbidden_host_before(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("HOST BEFORE must not run after historical failure")
+
+    def forbidden_construction(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("boundary construction must not run")
+
+    monkeypatch.setattr(
+        qualification_module,
+        "validate_iso03_historical_evidence_root_coverage",
+        fail_historical_evidence,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "capture_protected_host_inventory",
+        forbidden_host_before,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "WindowsSandboxBoundaryQualificationRunnerService",
+        forbidden_construction,
+    )
+
+    reviewed_source = tmp_path / "reviewed-source"
+    runtime_bundle = tmp_path / "runtime-bundle"
+    run_id = "iso03min"
+    platform = _MinimalLaunchPlatform(evidence_root=runs_root)
+    with pytest.raises(SandboxContractError) as captured:
+        execute_iso03_boundary_qualification(
+            implementation_repository_root=Path(__file__).resolve().parents[1],
+            reviewed_source_repository_root=reviewed_source,
+            protected_state_repository_root=protected_state,
+            historical_qualification_runs_root=tmp_path / "history",
+            replacement_qualification_run_root=tmp_path / "replacement",
+            qualified_replacement_qualification_root=tmp_path / "qualified",
+            failed_iso04_ticket06_acceptance_root=tmp_path / "failed-iso04",
+            review_invalidated_qualification_root=tmp_path / "invalidated",
+            runs_root=runs_root,
+            runtime_bundle_root=runtime_bundle,
+            run_id=run_id,
+            user_profile=tmp_path / "profile",
+            host_temp=tmp_path / "temp",
+            host_venv=tmp_path / "venv",
+            host_entrypoint_path=tmp_path / "entrypoint.py",
+            minimal_timeout_seconds=30,
+            protected_writers_quiesced=True,
+            platform=platform,
+            host_fact_capture=_supported_platform_facts,
+        )
+
+    assert (
+        captured.value.reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+    receipt_path = runs_root / (
+        f"{ISO03_PRECONSTRUCTION_FAILURE_RECEIPT_PREFIX}{run_id}.json"
+    )
+    raw = receipt_path.read_bytes()
+    receipt = ISO03PreconstructionFailureReceipt.model_validate_json(raw)
+    assert raw == json.dumps(
+        receipt.model_dump(mode="json"),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    assert receipt.run_id == run_id
+    assert receipt.stage == "historical_evidence_validation"
+    assert (
+        receipt.failure_reason
+        is SandboxFailureReason.PROTECTED_ROOT_EVIDENCE_INVALID
+    )
+    assert receipt.reviewed_source_repository_path_identity == (
+        host_path_identity(reviewed_source)
+    )
+    assert receipt.runtime_bundle_root_path_identity == host_path_identity(
+        runtime_bundle
+    )
+    assert receipt.minimal_sandbox_launch_succeeded is True
+    assert receipt.minimal_sandbox_process_ids == (101, 102)
+    assert receipt.reviewed_source_input_identity is None
+    assert receipt.runtime_bundle_identity is None
+    assert receipt.runner_input_identity is None
+    assert receipt.protected_writer_quiescence_contract_identity.startswith(
+        "windows-sandbox-protected-writer-quiescence:v1:sha256:"
+    )
+    assert receipt.host_before_inventory_identity is None
+    assert receipt.host_before_inventory_materialized is False
+    assert receipt.boundary_sandbox_constructed is False
+    assert receipt.boundary_sandbox_launched is False
+    assert not (runs_root / run_id).exists()
 
 
 @pytest.mark.parametrize("write_marker", (True, False))

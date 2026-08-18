@@ -16,9 +16,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 if TYPE_CHECKING:
+    from tradingagents.windows_sandbox_qualification import (
+        ISO03HostQualificationReport,
+    )
     from tradingagents.windows_sandbox_runner import (
         ResolvedSandboxMappingManifest,
         WsbConfiguration,
@@ -94,6 +97,40 @@ TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY = content_identity(
         "write_order": "last",
     },
 )
+_RECORDED_STRUCTURAL_VALIDATION_TOKEN = object()
+
+
+def validate_recorded_iso03_report_json(
+    raw: bytes,
+    *,
+    command_ledger_identity: str,
+    result_schema_identity: str,
+    completion_marker_contract_identity: str,
+) -> ISO03HostQualificationReport:
+    """Validate only the historical ISO-03 envelope under its pinned structure."""
+
+    expected = (
+        command_ledger_identity,
+        result_schema_identity,
+        completion_marker_contract_identity,
+    )
+    if any(re.fullmatch(_IDENTITY_PATTERN, item) is None for item in expected):
+        raise ValueError("recorded Ticket 06 structural identity is invalid")
+    context = {
+        "recorded_ticket06_structural_validation_token": (
+            _RECORDED_STRUCTURAL_VALIDATION_TOKEN
+        ),
+        "recorded_ticket06_command_ledger_identity": command_ledger_identity,
+        "recorded_ticket06_result_schema_identity": result_schema_identity,
+        "recorded_ticket06_completion_marker_contract_identity": (
+            completion_marker_contract_identity
+        ),
+    }
+    from tradingagents.windows_sandbox_qualification import (
+        ISO03HostQualificationReport,
+    )
+
+    return ISO03HostQualificationReport.model_validate_json(raw, context=context)
 
 
 QUALIFIED_RUNNER_SOURCE_FILES = (
@@ -195,7 +232,34 @@ class Ticket06AcceptanceStructuralQualification(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_qualification(self) -> Self:
+    def _validate_qualification(self, info: ValidationInfo) -> Self:
+        expected_command_ledger_identity = (
+            TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY
+        )
+        expected_result_schema_identity = TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY
+        expected_completion_marker_contract_identity = (
+            TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+        )
+        context = info.context
+        if (
+            isinstance(context, dict)
+            and context.get("recorded_ticket06_structural_validation_token")
+            is _RECORDED_STRUCTURAL_VALIDATION_TOKEN
+        ):
+            recorded_identities = (
+                context.get("recorded_ticket06_command_ledger_identity"),
+                context.get("recorded_ticket06_result_schema_identity"),
+                context.get(
+                    "recorded_ticket06_completion_marker_contract_identity"
+                ),
+            )
+            if not all(isinstance(item, str) for item in recorded_identities):
+                raise ValueError("recorded Ticket 06 structural context is invalid")
+            (
+                expected_command_ledger_identity,
+                expected_result_schema_identity,
+                expected_completion_marker_contract_identity,
+            ) = recorded_identities
         if self.runner_files != QUALIFIED_RUNNER_TARGET_FILES:
             raise ValueError("qualified runner structural file inventory mismatch")
         if self.mapping_roles != (
@@ -206,13 +270,13 @@ class Ticket06AcceptanceStructuralQualification(BaseModel):
             "results_export",
         ):
             raise ValueError("qualified acceptance mapping roles are not closed")
-        if self.command_ledger_identity != TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY:
+        if self.command_ledger_identity != expected_command_ledger_identity:
             raise ValueError("qualified Ticket 06 command ledger identity mismatch")
-        if self.result_schema_identity != TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY:
+        if self.result_schema_identity != expected_result_schema_identity:
             raise ValueError("qualified Ticket 06 result schema identity mismatch")
         if (
             self.completion_marker_contract_identity
-            != TICKET06_COMPLETION_MARKER_CONTRACT_IDENTITY
+            != expected_completion_marker_contract_identity
         ):
             raise ValueError("qualified Ticket 06 completion contract mismatch")
         payload = self.model_dump(mode="json", exclude={"qualification_identity"})
