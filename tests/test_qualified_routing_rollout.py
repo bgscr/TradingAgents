@@ -228,7 +228,11 @@ def test_rollout_fixture_resolves_identity_with_dotenv_disabled(tmp_path: Path) 
     assert probe.returncode == 0, probe.stdout + probe.stderr
 
 
-def test_default_rollout_remains_byte_compatible_legacy() -> None:
+def test_default_rollout_remains_byte_compatible_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
+
     result = preflight_mainland_capability_routing(
         _asset(),
         config=copy.deepcopy(DEFAULT_CONFIG),
@@ -360,6 +364,7 @@ def test_each_v2_policy_binding_is_material_to_the_plan_signature(
 def test_authoritative_qualified_v1_preflight_remains_disabled_without_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     provider_calls = 0
     model_calls = 0

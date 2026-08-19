@@ -177,6 +177,21 @@ python -m cli.main     # alternative: run directly from source
 ```
 You will see a screen where you can select your desired tickers, analysis date, LLM provider, research depth, and more.
 
+#### CLI startup announcements
+
+The CLI checks for project announcements during startup by default. To prevent
+that startup network access for one process, disable the check explicitly:
+
+```bash
+TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED=false tradingagents
+```
+
+`TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED` accepts `true`, `1`, `yes`, or `on`
+to enable the check and `false`, `0`, `no`, or `off` to disable it. Values are
+case-insensitive after trimming. An unset or empty value defaults to enabled.
+The setting is read from the explicit process environment and applies only to
+CLI startup.
+
 #### Refresh authoritative mainland identities
 
 Before analyzing a new Shanghai or Shenzhen A-share, add it to the digest-pinned
