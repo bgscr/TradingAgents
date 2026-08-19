@@ -31,6 +31,7 @@ from tradingagents.windows_sandbox_qualification import (
     LocalWriteResult,
     LocalWriteTarget,
     MappingVerification,
+    MinimalSandboxLaunchContract,
     MinimalSandboxLaunchEvidence,
     NetworkVerification,
     ProbeMechanism,
@@ -43,6 +44,7 @@ from tradingagents.windows_sandbox_qualification import (
     _validate_historical_report_pins,
     _validate_historical_report_pins_in_inventory,
     build_guest_qualification_result,
+    build_minimal_sandbox_launch_contract,
     build_protected_writer_quiescence_contract,
     build_protected_writer_quiescence_evidence,
     build_qualification_completion_marker,
@@ -50,8 +52,10 @@ from tradingagents.windows_sandbox_qualification import (
     capture_protected_host_inventory,
     capture_windows_host_platform_facts,
     compare_protected_host_inventories,
+    construct_minimal_sandbox_launch,
     execute_iso03_boundary_qualification,
     host_path_identity,
+    launch_minimal_sandbox,
     load_historical_iso03_qualification_report,
     qualify_windows_sandbox_host,
     run_minimal_sandbox_launch,
@@ -862,6 +866,46 @@ def _minimal_launch(*, succeeded: bool = True) -> MinimalSandboxLaunchEvidence:
         marker_sha256="5" * 64 if succeeded else None,
         launched_processes=_successful_process_topology() if succeeded else (),
     )
+
+
+def test_iso_03_minimal_launch_contract_is_complete_deterministic_and_immutable(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+
+    first = build_minimal_sandbox_launch_contract(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    second = build_minimal_sandbox_launch_contract(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    assert isinstance(first, MinimalSandboxLaunchContract)
+    assert first == second
+    assert first.run_root == evidence_root / "minimal-iso03min"
+    assert first.results_export_path == first.run_root / "results-export"
+    assert first.config_path == first.run_root / "minimal.wsb"
+    assert first.marker_path == first.results_export_path / "minimal-launch.json"
+    assert first.marker_bytes == (
+        b'{"contract_version":"windows-sandbox-minimal-launch-marker-v1",'
+        b'"run_id":"iso03min","status":"pass"}'
+    )
+    assert first.marker_sha256 == sha256(first.marker_bytes).hexdigest()
+    assert len(first.mappings) == 1
+    assert first.mappings[0].role == SandboxMappingRole.RESULTS_EXPORT
+    assert first.mappings[0].host_path == first.results_export_path
+    assert first.mappings[0].guest_path == r"C:\QCF17\Minimal"
+    assert first.mappings[0].read_only is False
+    assert first.mappings[0].fresh_empty is True
+    assert first.mapping_bytes == second.mapping_bytes
+    assert first.mapping_identity == second.mapping_identity
+    assert first.wsb_bytes == second.wsb_bytes
+    assert first.config_identity == second.config_identity
+    assert first.contract_identity == second.contract_identity
+    with pytest.raises(ValueError, match="frozen"):
+        first.run_id = "iso03other"
 
 
 def test_iso_03_minimal_launch_pass_requires_observed_launcher_image() -> None:
@@ -1764,6 +1808,7 @@ class _MinimalLaunchPlatform:
         self.write_marker = write_marker
         self.termination_confirmed = termination_confirmed
         self.config_xml = ""
+        self.launch_calls = 0
 
     def probe(self) -> SandboxPlatformReport:
         return SandboxPlatformReport.available(protected_client_supported=True)
@@ -1771,6 +1816,7 @@ class _MinimalLaunchPlatform:
     def launch(
         self, config_path: Path, *, timeout_seconds: int
     ) -> SandboxProcessResult:
+        self.launch_calls += 1
         assert timeout_seconds == 30
         self.config_xml = config_path.read_text(encoding="utf-8")
         if self.write_marker:
@@ -1795,6 +1841,143 @@ class _MinimalLaunchPlatform:
             launched_processes=_successful_process_topology(),
             termination_confirmed=self.termination_confirmed,
         )
+
+
+def test_iso_03_minimal_launch_construction_materializes_without_launch(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    assert isinstance(contract, MinimalSandboxLaunchContract)
+    assert platform.launch_calls == 0
+    assert contract.run_root.is_dir()
+    assert contract.results_export_path.is_dir()
+    assert tuple(contract.results_export_path.iterdir()) == ()
+    assert contract.config_path.read_bytes() == contract.wsb_bytes
+    assert contract.mapping_identity.startswith(
+        "windows-sandbox-minimal-mapping:v1:sha256:"
+    )
+    assert contract.config_identity.startswith(
+        "windows-sandbox-minimal-config:v1:sha256:"
+    )
+
+
+def test_iso_03_separately_constructed_minimal_contract_launches(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    result = launch_minimal_sandbox(
+        contract=contract,
+        platform=platform,
+        timeout_seconds=30,
+    )
+
+    assert platform.launch_calls == 1
+    assert result.succeeded is True
+    assert result.config_identity == contract.config_identity
+    assert result.marker_sha256 == contract.marker_sha256
+    assert result.launched_processes == _successful_process_topology()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "contract_version",
+        "contract_wsb_bytes",
+        "mapping_identity",
+        "mapping_topology",
+        "contract_identity",
+        "results_export_path",
+    ),
+)
+def test_iso_03_minimal_launch_rejects_tampered_contract_before_launch(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    if tamper == "contract_version":
+        contract = contract.model_copy(update={"contract_version": "tampered"})
+    elif tamper == "contract_wsb_bytes":
+        contract = contract.model_copy(update={"wsb_bytes": contract.wsb_bytes + b" "})
+    elif tamper == "mapping_identity":
+        contract = contract.model_copy(
+            update={
+                "mapping_identity": (
+                    "windows-sandbox-minimal-mapping:v1:sha256:" + ("0" * 64)
+                )
+            }
+        )
+    elif tamper == "mapping_topology":
+        contract = contract.model_copy(update={"mappings": ()})
+    elif tamper == "contract_identity":
+        contract = contract.model_copy(
+            update={
+                "contract_identity": (
+                    "windows-sandbox-minimal-launch-contract:v1:sha256:"
+                    + ("0" * 64)
+                )
+            }
+        )
+    else:
+        contract = contract.model_copy(
+            update={"results_export_path": contract.run_root / "other-export"}
+        )
+
+    with pytest.raises(SandboxContractError):
+        launch_minimal_sandbox(
+            contract=contract,
+            platform=platform,
+            timeout_seconds=30,
+        )
+
+    assert platform.launch_calls == 0
+
+
+@pytest.mark.parametrize("tamper", ("config_bytes", "nonempty_export"))
+def test_iso_03_minimal_launch_rejects_tampered_artifacts_before_launch(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    if tamper == "config_bytes":
+        contract.config_path.write_bytes(contract.wsb_bytes + b" ")
+    else:
+        (contract.results_export_path / "unexpected.txt").write_bytes(b"unexpected")
+
+    with pytest.raises(SandboxContractError):
+        launch_minimal_sandbox(
+            contract=contract,
+            platform=platform,
+            timeout_seconds=30,
+        )
+
+    assert platform.launch_calls == 0
 
 
 def test_iso_03_fatal_preconstruction_failure_writes_closed_receipt(
@@ -1951,6 +2134,7 @@ def test_iso_03_minimal_launch_requires_exact_guest_marker(
     )
 
     assert result.succeeded is write_marker
+    assert platform.launch_calls == 1
     assert "<Networking>Disable</Networking>" in platform.config_xml
     assert "<ProtectedClient>Enable</ProtectedClient>" in platform.config_xml
     assert platform.config_xml.count("<MappedFolder>") == 1

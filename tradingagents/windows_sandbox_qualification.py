@@ -572,29 +572,120 @@ def _unavailable_windows_host_platform_facts() -> WindowsHostPlatformFacts:
     )
 
 
-def run_minimal_sandbox_launch(
-    *,
-    platform: SandboxPlatform,
-    evidence_root: Path,
-    run_id: str,
-    timeout_seconds: int,
-) -> MinimalSandboxLaunchEvidence:
-    """Boot a fresh Sandbox, export one fixed marker, and shut it down."""
+class MinimalSandboxMapping(BaseModel):
+    """Canonical single writable mapping used only by the minimal launch."""
 
+    model_config = _CLOSED_MODEL_CONFIG
+
+    role: SandboxMappingRole
+    host_path: Path
+    host_path_identity: str = Field(pattern=r"^host-path:sha256:[0-9a-f]{64}$")
+    guest_path: str
+    read_only: bool
+    fresh_empty: bool
+
+
+class MinimalSandboxLaunchContract(BaseModel):
+    """Complete deterministic Launch-1 input, frozen before Sandbox starts."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["windows-sandbox-minimal-launch-contract-v1"] = (
+        "windows-sandbox-minimal-launch-contract-v1"
+    )
+    run_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{7,63}$")
+    evidence_root: Path
+    run_root: Path
+    results_export_path: Path
+    marker_path: Path
+    config_path: Path
+    mappings: tuple[MinimalSandboxMapping, ...]
+    mapping_bytes: bytes = Field(max_length=4096)
+    mapping_identity: str = Field(
+        pattern=r"^windows-sandbox-minimal-mapping:v1:sha256:[0-9a-f]{64}$"
+    )
+    marker_bytes: bytes = Field(max_length=1024)
+    marker_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    wsb_bytes: bytes = Field(max_length=32_768)
+    config_identity: str = Field(
+        pattern=r"^windows-sandbox-minimal-config:v1:sha256:[0-9a-f]{64}$"
+    )
+    contract_identity: str = Field(
+        pattern=r"^windows-sandbox-minimal-launch-contract:v1:sha256:[0-9a-f]{64}$"
+    )
+
+    def _revalidate(self) -> None:
+        expected = _minimal_sandbox_launch_contract_values(
+            evidence_root=self.evidence_root,
+            run_id=self.run_id,
+        )
+        for name in (
+            "contract_version",
+            "evidence_root",
+            "run_root",
+            "results_export_path",
+            "marker_path",
+            "config_path",
+            "mappings",
+            "mapping_bytes",
+            "mapping_identity",
+            "marker_bytes",
+            "marker_sha256",
+            "wsb_bytes",
+            "config_identity",
+            "contract_identity",
+        ):
+            if getattr(self, name) != expected[name]:
+                raise ValueError("minimal Sandbox launch contract identity mismatch")
+
+    @model_validator(mode="after")
+    def _validate_contract(self) -> MinimalSandboxLaunchContract:
+        self._revalidate()
+        return self
+
+
+def _validate_minimal_sandbox_run_id(run_id: str) -> None:
     if re.fullmatch(r"[a-z0-9][a-z0-9._-]{7,63}", run_id) is None:
         raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
-    try:
-        resolved_evidence = evidence_root.resolve(strict=True)
-        metadata = resolved_evidence.lstat()
-        if not resolved_evidence.is_dir() or _is_reparse(metadata):
-            raise OSError("minimal launch evidence root is unsafe")
-        run_root = resolved_evidence / f"minimal-{run_id}"
-        run_root.mkdir(exist_ok=False)
-        export_root = run_root / "results-export"
-        export_root.mkdir()
-    except OSError as exc:
-        raise SandboxContractError(SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH) from exc
 
+
+def _minimal_sandbox_mapping_payload(
+    mappings: tuple[MinimalSandboxMapping, ...],
+) -> dict[str, object]:
+    return {
+        "contract_version": "windows-sandbox-minimal-mapping-v1",
+        "mappings": [item.model_dump(mode="json") for item in mappings],
+    }
+
+
+def _minimal_sandbox_launch_contract_values(
+    *,
+    evidence_root: Path,
+    run_id: str,
+) -> dict[str, object]:
+    root = Path(evidence_root)
+    _validate_minimal_sandbox_run_id(run_id)
+    if not root.is_absolute():
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
+    run_root = root / f"minimal-{run_id}"
+    results_export_path = run_root / "results-export"
+    marker_path = results_export_path / "minimal-launch.json"
+    config_path = run_root / "minimal.wsb"
+    mapping = MinimalSandboxMapping(
+        role=SandboxMappingRole.RESULTS_EXPORT,
+        host_path=results_export_path,
+        host_path_identity=_path_identity(results_export_path),
+        guest_path=r"C:\QCF17\Minimal",
+        read_only=False,
+        fresh_empty=True,
+    )
+    mappings = (mapping,)
+    mapping_payload = _minimal_sandbox_mapping_payload(mappings)
+    mapping_bytes = _canonical_json_bytes(mapping_payload)
+    mapping_identity = _identity(
+        "windows-sandbox-minimal-mapping:v1",
+        mapping_payload,
+    )
     marker_payload = {
         "contract_version": "windows-sandbox-minimal-launch-marker-v1",
         "run_id": run_id,
@@ -624,8 +715,8 @@ def run_minimal_sandbox_launch(
             "  <ProtectedClient>Enable</ProtectedClient>",
             "  <MappedFolders>",
             "    <MappedFolder>",
-            f"      <HostFolder>{xml_escape(str(export_root))}</HostFolder>",
-            "      <SandboxFolder>C:\\QCF17\\Minimal</SandboxFolder>",
+            f"      <HostFolder>{xml_escape(str(mapping.host_path))}</HostFolder>",
+            f"      <SandboxFolder>{mapping.guest_path}</SandboxFolder>",
             "      <ReadOnly>false</ReadOnly>",
             "    </MappedFolder>",
             "  </MappedFolders>",
@@ -636,21 +727,151 @@ def run_minimal_sandbox_launch(
             "",
         )
     )
+    wsb_bytes = xml.encode("utf-8")
     config_identity = _identity("windows-sandbox-minimal-config:v1", xml)
-    config_path = run_root / "minimal.wsb"
-    config_path.write_text(xml, encoding="utf-8", newline="\n")
-    process = platform.launch(config_path, timeout_seconds=timeout_seconds)
-    marker_path = export_root / "minimal-launch.json"
+    identity_payload = {
+        "contract_version": "windows-sandbox-minimal-launch-contract-v1",
+        "run_id": run_id,
+        "evidence_root": str(root),
+        "run_root": str(run_root),
+        "results_export_path": str(results_export_path),
+        "marker_path": str(marker_path),
+        "config_path": str(config_path),
+        "mappings": [item.model_dump(mode="json") for item in mappings],
+        "mapping_bytes": mapping_bytes.decode("utf-8"),
+        "mapping_identity": mapping_identity,
+        "marker_bytes": marker_bytes.decode("utf-8"),
+        "marker_sha256": sha256(marker_bytes).hexdigest(),
+        "wsb_bytes": wsb_bytes.decode("utf-8"),
+        "config_identity": config_identity,
+    }
+    return {
+        **identity_payload,
+        "evidence_root": root,
+        "run_root": run_root,
+        "results_export_path": results_export_path,
+        "marker_path": marker_path,
+        "config_path": config_path,
+        "mappings": mappings,
+        "mapping_bytes": mapping_bytes,
+        "marker_bytes": marker_bytes,
+        "wsb_bytes": wsb_bytes,
+        "contract_identity": _identity(
+            "windows-sandbox-minimal-launch-contract:v1",
+            identity_payload,
+        ),
+    }
+
+
+def build_minimal_sandbox_launch_contract(
+    *,
+    evidence_root: Path,
+    run_id: str,
+) -> MinimalSandboxLaunchContract:
+    """Build complete minimal-launch input without reading or writing the host."""
+
+    return MinimalSandboxLaunchContract(
+        **_minimal_sandbox_launch_contract_values(
+            evidence_root=evidence_root,
+            run_id=run_id,
+        )
+    )
+
+
+def construct_minimal_sandbox_launch(
+    *,
+    evidence_root: Path,
+    run_id: str,
+) -> MinimalSandboxLaunchContract:
+    """Materialize the fresh minimal export and WSB without launching Sandbox."""
+
+    _validate_minimal_sandbox_run_id(run_id)
+    resolved_evidence = _resolve_safe_directory(
+        evidence_root,
+        reason=SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH,
+    )
+    contract = build_minimal_sandbox_launch_contract(
+        evidence_root=resolved_evidence,
+        run_id=run_id,
+    )
+    try:
+        contract.run_root.mkdir(exist_ok=False)
+        contract.results_export_path.mkdir()
+        contract.config_path.write_bytes(contract.wsb_bytes)
+    except OSError as exc:
+        raise SandboxContractError(SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH) from exc
+    return contract
+
+
+def _validate_minimal_sandbox_launch_contract(
+    contract: MinimalSandboxLaunchContract,
+) -> None:
+    if not isinstance(contract, MinimalSandboxLaunchContract):
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
+    try:
+        contract._revalidate()
+    except (TypeError, ValueError) as exc:
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID) from exc
+
+    evidence_root = _resolve_safe_directory(
+        contract.evidence_root,
+        reason=SandboxFailureReason.MAPPING_CONTRACT_INVALID,
+    )
+    run_root = _resolve_safe_directory(
+        contract.run_root,
+        reason=SandboxFailureReason.MAPPING_CONTRACT_INVALID,
+    )
+    results_export = _resolve_safe_directory(
+        contract.results_export_path,
+        reason=SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH,
+    )
+    if (
+        evidence_root != contract.evidence_root
+        or run_root != contract.run_root
+        or results_export != contract.results_export_path
+    ):
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
+    try:
+        before = contract.config_path.lstat()
+        actual_wsb_bytes = contract.config_path.read_bytes()
+        after = contract.config_path.lstat()
+        export_entries = tuple(results_export.iterdir())
+    except OSError as exc:
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or _is_reparse(before)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or _is_reparse(after)
+        or actual_wsb_bytes != contract.wsb_bytes
+    ):
+        raise SandboxContractError(SandboxFailureReason.MAPPING_CONTRACT_INVALID)
+    if export_entries:
+        raise SandboxContractError(SandboxFailureReason.RESULTS_EXPORT_NOT_FRESH)
+
+
+def launch_minimal_sandbox(
+    *,
+    contract: MinimalSandboxLaunchContract,
+    platform: SandboxPlatform,
+    timeout_seconds: int,
+) -> MinimalSandboxLaunchEvidence:
+    """Launch exactly one already-constructed and revalidated minimal contract."""
+
+    _validate_minimal_sandbox_launch_contract(contract)
+    process = platform.launch(contract.config_path, timeout_seconds=timeout_seconds)
     marker_sha256: str | None = None
     try:
-        exported = tuple(export_root.iterdir())
-        if len(exported) == 1 and exported[0] == marker_path:
-            marker_metadata = marker_path.lstat()
-            actual = marker_path.read_bytes()
+        exported = tuple(contract.results_export_path.iterdir())
+        if len(exported) == 1 and exported[0] == contract.marker_path:
+            marker_metadata = contract.marker_path.lstat()
+            actual = contract.marker_path.read_bytes()
             if (
                 stat.S_ISREG(marker_metadata.st_mode)
                 and not _is_reparse(marker_metadata)
-                and actual == marker_bytes
+                and actual == contract.marker_bytes
             ):
                 marker_sha256 = sha256(actual).hexdigest()
     except OSError:
@@ -665,12 +886,31 @@ def run_minimal_sandbox_launch(
         succeeded=succeeded,
         returncode=process.returncode,
         timed_out=process.timed_out,
-        config_identity=config_identity,
+        config_identity=contract.config_identity,
         marker_sha256=marker_sha256,
         before_processes=process.before_processes,
         launched_processes=process.launched_processes,
         after_processes=process.after_processes,
         termination_confirmed=process.termination_confirmed,
+    )
+
+
+def run_minimal_sandbox_launch(
+    *,
+    platform: SandboxPlatform,
+    evidence_root: Path,
+    run_id: str,
+    timeout_seconds: int,
+) -> MinimalSandboxLaunchEvidence:
+    """Construct then launch through the preconstruction compatibility seam."""
+
+    return launch_minimal_sandbox(
+        contract=construct_minimal_sandbox_launch(
+            evidence_root=evidence_root,
+            run_id=run_id,
+        ),
+        platform=platform,
+        timeout_seconds=timeout_seconds,
     )
 
 
