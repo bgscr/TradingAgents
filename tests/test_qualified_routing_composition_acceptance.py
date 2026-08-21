@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -31,6 +32,7 @@ from tests.test_financial_capability_routing_selection import (
     _qualified_ratio_candidate,
     _with_raw_indicator_metadata,
 )
+from tests.test_market_session_calendar_publication import _acquisition
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
@@ -39,6 +41,7 @@ from tradingagents.capability_routing import (
     preflight_mainland_capability_routing,
     prepare_mainland_temporal_capability_routing_plan,
 )
+from tradingagents.dataflows.baostock_calendar import MainlandSessionCalendarMembership
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
@@ -74,12 +77,14 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import EvidenceState
 from tradingagents.graph.financial_tools import FinancialDispatchToolNode
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.market_history.calendar import (
-    MarketSession,
-    MarketSessionCalendarPublication,
-    MarketSessionStatus,
+from tradingagents.market_history import (
+    publication_from_baostock_session_calendar_acquisition,
 )
-from tradingagents.market_history.models import ProvenanceClass, ProviderDatasetSpec
+from tradingagents.market_history.config import (
+    MarketHistoryConfig,
+    provider_request_authority_config,
+)
+from tradingagents.market_history.store import MarketHistoryStore
 from tradingagents.qualified_routing_composition import (
     ProductionQualifiedRoutingRuntime,
     RegisteredProductionQualifiedRoutingComposition,
@@ -535,6 +540,10 @@ class _FreshRun:
     compiled_fundamentals: Any
     checkpoint_config: dict[str, object]
     deterministic_llm: MagicMock
+    primary_calendar_revision_id: str
+    sidecar_database_path: Path
+    calendar_resolved: threading.Event
+    calendar_reader_open_count: int
 
     @property
     def owner(self):
@@ -641,30 +650,28 @@ def _legacy_vendor_methods() -> dict[str, dict[str, object]]:
     }
 
 
-def _publish_pinned_temporal_calendar(store: object) -> None:
-    store.publish_session_calendar(
-        MarketSessionCalendarPublication(
-            provider=ProviderDatasetSpec(
-                upstream_service_id="upstream-service:baostock",
-                upstream_service_name="BaoStock",
-                provider_dataset_id="provider-dataset:baostock-calendar-qcf-v1",
-                provider_name="baostock",
-                dataset_name="mainland-session-calendar-v1",
-                adjustment_methodology="not-applicable",
-                strict_history_qualified=False,
-            ),
-            reference_market="mainland-cn",
-            timezone_name="Asia/Shanghai",
-            observed_at=_NOW,
-            provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
-            raw_payload=b'{"calendar":"qcf-plan-1.3-pinned"}',
-            sessions=(
-                MarketSession(date(2026, 8, 31), MarketSessionStatus.OPEN),
-                MarketSession(date(2026, 9, 1), MarketSessionStatus.OPEN),
-                MarketSession(date(2026, 9, 2), MarketSessionStatus.OPEN),
-            ),
+def _publish_pinned_temporal_calendar(store: object) -> str:
+    membership = tuple(
+        MainlandSessionCalendarMembership(
+            calendar_date=session_date,
+            is_trading_day=True,
+        )
+        for session_date in (
+            date(2026, 8, 31),
+            date(2026, 9, 1),
+            date(2026, 9, 2),
         )
     )
+    published = store.publish_session_calendar(
+        publication_from_baostock_session_calendar_acquisition(
+            _acquisition(
+                requested_start_date=membership[0].calendar_date,
+                requested_end_date=membership[-1].calendar_date,
+                membership=membership,
+            )
+        )
+    )
+    return published.calendar_revision_id
 
 
 def _fresh_builtin_run(
@@ -731,15 +738,46 @@ def _fresh_builtin_run(
         "baostock": _BaoStockProvider(symbol),
     }
     production_factories = composition_module.production_qualified_routing_runtime_factories()
+    history_config = MarketHistoryConfig.from_mapping(config)
+    with MarketHistoryStore.open(history_config) as primary_store:
+        primary_calendar_revision_id = _publish_pinned_temporal_calendar(primary_store)
+    calendar_resolved = threading.Event()
+    calendar_reader_open_count = 0
 
-    def open_coordinator_store(blueprint: object):
-        store = production_factories.open_coordinator_store(blueprint)
-        _publish_pinned_temporal_calendar(store)
-        return store
+    def open_eligibility_calendar_reader(blueprint: object):
+        nonlocal calendar_reader_open_count
+        calendar_reader_open_count += 1
+        if calendar_reader_open_count > 1:
+            return composition_module.ProductionQualifiedEligibilityCalendarReader(
+                provider_request_authority_config(history_config)
+            )
+        open_reader = production_factories.open_eligibility_calendar_reader
+        assert open_reader is not None
+        reader = open_reader(blueprint)
+        read_current = reader.read_current_session_calendar
+
+        def tracked_read_current(reference_market: str):
+            calendar = read_current(reference_market)
+            calendar_resolved.set()
+            return calendar
+
+        reader.read_current_session_calendar = tracked_read_current
+        return reader
+
+    for provider in providers.values():
+        record = provider._record
+
+        def guarded_record(endpoint, kwargs, *, record=record):
+            assert calendar_resolved.is_set(), (
+                "provider metadata acquisition preceded calendar resolution"
+            )
+            record(endpoint, kwargs)
+
+        provider._record = guarded_record
 
     deterministic_factories = replace(
         production_factories,
-        open_coordinator_store=open_coordinator_store,
+        open_eligibility_calendar_reader=open_eligibility_calendar_reader,
         build_tushare_client=lambda _blueprint, _stop: providers["tushare"],
         build_akshare_facade=lambda _blueprint, _stop: providers["akshare"],
         build_yahoo_transport=lambda _blueprint, _stop: providers["yfinance"],
@@ -768,6 +806,16 @@ def _fresh_builtin_run(
     assert composition.factory_identity == (
         cli_main.BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.identity
     )
+    calendar_preflight = (
+        composition_module.preflight_production_qualified_calendar_reader(
+            composition,
+            authorized_calendar_revision_id=primary_calendar_revision_id,
+            requested_session=_AS_OF,
+            evaluated_at=_NOW,
+        )
+    )
+    assert calendar_preflight.calendar_revision_id == primary_calendar_revision_id
+    assert calendar_reader_open_count == 1
 
     deterministic_llm = MagicMock(name="qcf4_no_io_llm")
     deterministic_client = MagicMock(name="qcf4_no_io_llm_client")
@@ -824,6 +872,12 @@ def _fresh_builtin_run(
         compiled_fundamentals=compiled_fundamentals,
         checkpoint_config=checkpoint_config,
         deterministic_llm=deterministic_llm,
+        primary_calendar_revision_id=primary_calendar_revision_id,
+        sidecar_database_path=history_config.database_path.with_name(
+            f"{history_config.database_path.name}.provider-requests.sqlite3"
+        ),
+        calendar_resolved=calendar_resolved,
+        calendar_reader_open_count=calendar_reader_open_count,
     )
 
 
@@ -837,6 +891,58 @@ def _attempt_events(shadow_ledger: dict[str, object]) -> tuple[dict[str, object]
         for entry in entries
         for event in entry["attempt_events"]
     )
+
+
+@pytest.mark.unit
+def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+    )
+
+    def calendar_row_counts(database_path: Path) -> tuple[int, int]:
+        with sqlite3.connect(database_path) as connection:
+            revision_count = connection.execute(
+                "SELECT COUNT(*) FROM market_session_calendars"
+            ).fetchone()
+            session_count = connection.execute(
+                "SELECT COUNT(*) FROM market_sessions"
+            ).fetchone()
+        assert revision_count is not None
+        assert session_count is not None
+        return int(revision_count[0]), int(session_count[0])
+
+    try:
+        assert all(provider.calls == [] for provider in fresh.providers.values())
+        assert calendar_row_counts(Path(fresh.config["market_history_database_path"])) == (
+            1,
+            3,
+        )
+        assert calendar_row_counts(fresh.sidecar_database_path) == (0, 0)
+
+        result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
+
+        assert "financial_dispatch_shadow_failure" not in result
+        context = fresh.owner.context
+        assert context is not None
+        assert context.contract_version == "financial-eligibility-acquisition-context-v2"
+        temporal = context.temporal_eligibility_binding
+        assert temporal is not None
+        assert (
+            temporal.calendar_binding.calendar_revision_id
+            == fresh.primary_calendar_revision_id
+        )
+        assert temporal.calendar_binding.binding_identity
+        assert fresh.calendar_resolved.is_set()
+        assert fresh.calendar_reader_open_count == 1
+        assert calendar_row_counts(fresh.sidecar_database_path) == (0, 0)
+    finally:
+        fresh.close()
 
 
 @pytest.mark.unit

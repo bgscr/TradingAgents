@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import subprocess
@@ -119,6 +120,125 @@ def test_analyze_startup_reaches_questionnaire_with_announcements_disabled(
     result = CliRunner().invoke(cli_main.app, ["analyze"])
 
     assert isinstance(result.exception, QuestionnaireReached)
+
+
+@pytest.mark.unit
+def test_qualified_validation_reaches_questionnaire_without_announcement_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QuestionnaireReached(RuntimeError):
+        pass
+
+    def stop_at_ticker() -> None:
+        raise QuestionnaireReached
+
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
+    monkeypatch.setattr(cli_main, "get_ticker", stop_at_ticker)
+    _forbid_announcement_network_construction(
+        monkeypatch,
+        "qualified validation constructed announcement network I/O",
+    )
+
+    result = CliRunner().invoke(
+        cli_main.app,
+        ["analyze", "--qualified-routing-validation"],
+    )
+
+    assert isinstance(result.exception, QuestionnaireReached)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", (None, "true"))
+def test_qualified_validation_requires_announcements_disabled_before_live_work(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", value)
+    questionnaire_calls = 0
+    run_allocations = 0
+    graph_constructions = 0
+
+    def forbidden_questionnaire():
+        nonlocal questionnaire_calls
+        questionnaire_calls += 1
+        pytest.fail("announcement preflight reached the CLI questionnaire")
+
+    def forbidden_run_allocation(*_args, **_kwargs):
+        nonlocal run_allocations
+        run_allocations += 1
+        pytest.fail("announcement preflight reached run allocation")
+
+    def forbidden_graph_construction(*_args, **_kwargs):
+        nonlocal graph_constructions
+        graph_constructions += 1
+        pytest.fail("announcement preflight reached provider/model construction")
+
+    monkeypatch.setattr(cli_main, "get_user_selections", forbidden_questionnaire)
+    monkeypatch.setattr(cli_main, "_prepare_run_artifacts", forbidden_run_allocation)
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", forbidden_graph_construction)
+    _forbid_announcement_network_construction(
+        monkeypatch,
+        "qualified validation constructed announcement network I/O",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="qualified_routing_validation_requires_announcements_disabled",
+    ):
+        cli_main.run_analysis(qualified_routing_validation=True)
+
+    assert questionnaire_calls == 0
+    assert run_allocations == 0
+    assert graph_constructions == 0
+
+
+@pytest.mark.unit
+def test_qualified_validation_preflight_evidence_retains_only_safe_disable_state(
+    tmp_path: Path,
+) -> None:
+    config = dict(cli_main.DEFAULT_CONFIG)
+    config["results_dir"] = str(tmp_path)
+    selections = {
+        "ticker": "601328.SS",
+        "analysis_date": "2026-08-12",
+        "asset_type": "stock",
+        "analysts": [],
+        "llm_provider": "openai",
+        "china_a_enhancement_preset": "basic",
+    }
+    calendar_receipt = cli_main.ProductionQualifiedCalendarPreflightReceipt(
+        contract_version="production-qualified-calendar-preflight-v1",
+        calendar_revision_id="market-session-calendar=sha256:" + "a" * 64,
+        requested_session="2026-08-12",
+        evaluated_at="2026-08-12T08:00:00Z",
+        latest_completed_session="2026-08-12",
+        next_open_session="2026-08-13",
+        reader_uses_primary_database=True,
+        exact_revision_verified=True,
+    )
+    preflight_evidence = {
+        "contract_version": "qualified-routing-validation-preflight-v1",
+        "cli_announcements_enabled": False,
+        "calendar_reader": calendar_receipt.model_dump(mode="json"),
+    }
+
+    artifacts = cli_main._prepare_run_artifacts(
+        config,
+        selections,
+        cli_announcements_enabled=False,
+        qualified_validation_calendar_receipt=calendar_receipt,
+    )
+    retained = json.loads(
+        Path(artifacts["status_file"]).read_text(encoding="utf-8")
+    )["qualified_validation_preflight"]
+
+    assert retained == preflight_evidence
+    assert retained["cli_announcements_enabled"] is False
+    assert "environment" not in retained
+    assert "credentials" not in retained
 
 
 @pytest.mark.unit

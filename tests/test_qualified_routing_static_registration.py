@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from tradingagents.dataflows.financial_capability_routing import (
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.financial_tools import QualifiedFinancialRoutingComposition
 from tradingagents.qualified_routing_composition import (
+    ProductionQualifiedCalendarPreflightReceipt,
     ProductionQualifiedRoutingAssemblyBinding,
     RegisteredProductionQualifiedRoutingComposition,
 )
@@ -39,6 +41,21 @@ def _valid_shadow_inputs(
 ) -> tuple[object, object, dict[str, object]]:
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
+    monkeypatch.setattr(
+        cli_main,
+        "preflight_production_qualified_calendar_reader",
+        lambda _composition, **kwargs: (
+            ProductionQualifiedCalendarPreflightReceipt(
+                calendar_revision_id=(
+                    "market-session-calendar=sha256:" + "a" * 64
+                ),
+                requested_session=kwargs["requested_session"],
+                evaluated_at=kwargs["evaluated_at"],
+                latest_completed_session=kwargs["requested_session"],
+            )
+        ),
+    )
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(
         {
@@ -694,6 +711,11 @@ def test_cli_and_programmatic_callers_resolve_same_builtin_identity_and_blueprin
     assert received.factory_identity == programmatic.factory_identity
     assert received.blueprint == programmatic.blueprint
     assert received.blueprint.routing_plan.plan_signature == plan.plan_signature
+    retained_preflight = json.loads(
+        next(tmp_path.rglob("run_status.json")).read_text(encoding="utf-8")
+    )["qualified_validation_preflight"]
+    assert retained_preflight["cli_announcements_enabled"] is False
+    assert retained_preflight["calendar_reader"]["exact_revision_verified"] is True
 
 
 @pytest.mark.parametrize("entrypoint", ["default_analysis_command", "analyze"])

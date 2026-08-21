@@ -6,7 +6,8 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date
+from dataclasses import replace
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from langgraph.graph import END, StateGraph
 import cli.main as cli_main
 import tradingagents.dataflows.config as config_module
 import tradingagents.dataflows.interface as vendor_interface
+import tradingagents.qualified_routing_composition as composition_module
 from tests.test_financial_capability_routing_selection import (
     _ANNUAL_PERIODS,
     _REPORTING_PERIODS,
@@ -29,6 +31,7 @@ from tests.test_financial_graph_dispatch import (
     _financial_vendor_methods,
 )
 from tests.test_financial_manifest_evidence_reporting import _attempt_event
+from tests.test_market_session_calendar_publication import _acquisition
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
@@ -49,6 +52,7 @@ from tradingagents.capability_routing import (
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
+from tradingagents.dataflows.baostock_calendar import MainlandSessionCalendarMembership
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialProviderPeriodResponse,
     FinancialStatementRoutingRequest,
@@ -79,6 +83,16 @@ from tradingagents.graph.financial_tools import (
 )
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.market_history import (
+    MarketHistoryConfig,
+    MarketHistoryStore,
+    publication_from_baostock_session_calendar_acquisition,
+)
+from tradingagents.market_history.config import provider_request_authority_config
+from tradingagents.qualified_routing_composition import (
+    ProductionQualifiedEligibilityCalendarReader,
+    RegisteredProductionQualifiedRoutingComposition,
+)
 from tradingagents.reporting import write_report_tree
 
 _QUALIFICATION_PROFILE = "cn-a-2000-20260729-v1"
@@ -112,6 +126,34 @@ def _rollout_config(
         }
     )
     return config
+
+
+def _publish_qualified_validation_calendar(config: dict[str, object]) -> str:
+    membership = tuple(
+        MainlandSessionCalendarMembership(
+            calendar_date=date(2026, 8, day),
+            is_trading_day=day not in {8, 9, 11},
+        )
+        for day in range(7, 15)
+    )
+    acquisition = _acquisition(
+        requested_start_date=membership[0].calendar_date,
+        requested_end_date=membership[-1].calendar_date,
+        membership=membership,
+    )
+    history_config = MarketHistoryConfig.from_mapping(config)
+    with MarketHistoryStore.open(history_config) as primary:
+        published = primary.publish_session_calendar(
+            publication_from_baostock_session_calendar_acquisition(acquisition)
+        )
+        readiness = primary.assess_mainland_session_calendar_readiness(
+            published.calendar_revision_id,
+            requested_start_date=membership[0].calendar_date,
+            requested_end_date=membership[-1].calendar_date,
+            evaluated_at=datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc),
+        )
+    assert readiness.latest_completed_session == date(2026, 8, 12)
+    return published.calendar_revision_id
 
 
 def _preflight(
@@ -860,6 +902,7 @@ def test_cli_resolves_shadow_composition_before_graph_work(
 ) -> None:
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
     config = _rollout_config("qualified_v1_shadow")
     config["results_dir"] = str(tmp_path)
     selections = {
@@ -916,6 +959,178 @@ def test_cli_resolves_shadow_composition_before_graph_work(
     assert received is resolved
 
 
+def test_live_calendar_reader_preflight_rejects_sidecar_drift_and_accepts_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
+    config = _rollout_config("qualified_v1_shadow")
+    config.update(
+        {
+            "data_cache_dir": str(tmp_path / "cache"),
+            "market_history_database_path": str(tmp_path / "history.sqlite3"),
+            "market_history_payload_root": str(tmp_path / "payloads"),
+            "market_history_backup_root": str(tmp_path / "backups"),
+            "results_dir": str(tmp_path / "results"),
+        }
+    )
+    expected_revision_id = _publish_qualified_validation_calendar(config)
+    history_config = MarketHistoryConfig.from_mapping(config)
+    sidecar_config = provider_request_authority_config(history_config)
+    with MarketHistoryStore.open_provider_request_authority(history_config) as sidecar:
+        assert sidecar._connection.execute(
+            "SELECT COUNT(*) FROM market_session_calendars"
+        ).fetchone() == (0,)
+        assert sidecar._connection.execute(
+            "SELECT COUNT(*) FROM market_sessions"
+        ).fetchone() == (0,)
+
+    asset = resolve_run_asset_configuration("601328.SS", config=config)
+    routing_preflight = preflight_mainland_capability_routing(asset, config=config)
+    assert routing_preflight.plan is not None
+    plan = prepare_mainland_temporal_capability_routing_plan(routing_preflight.plan)
+    config["asset_configuration_signature"] = asset.asset_configuration_signature
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    monkeypatch.setattr(
+        cli_main,
+        "production_qualified_routing_dependency_availability",
+        lambda: dict.fromkeys(("akshare", "baostock", "tushare", "yfinance"), True),
+    )
+    production_factories = (
+        composition_module.production_qualified_routing_runtime_factories()
+    )
+
+    def build(runtime_factories):
+        monkeypatch.setattr(
+            composition_module,
+            "production_qualified_routing_runtime_factories",
+            lambda: runtime_factories,
+        )
+        built = cli_main.build_qualified_financial_routing_composition(
+            plan=plan,
+            asset_configuration=asset,
+            config=config,
+            validation_workload=True,
+        )
+        assert isinstance(built, RegisteredProductionQualifiedRoutingComposition)
+        return built
+
+    drifted = build(
+        replace(
+            production_factories,
+            open_eligibility_calendar_reader=lambda _blueprint: (
+                ProductionQualifiedEligibilityCalendarReader(sidecar_config)
+            ),
+        )
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="qualified_routing_calendar_reader_not_primary",
+    ):
+        composition_module.preflight_production_qualified_calendar_reader(
+            drifted,
+            authorized_calendar_revision_id=expected_revision_id,
+            requested_session=date(2026, 8, 12),
+            evaluated_at=datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc),
+        )
+
+    corrected = build(production_factories)
+    receipt = composition_module.preflight_production_qualified_calendar_reader(
+        corrected,
+        authorized_calendar_revision_id=expected_revision_id,
+        requested_session=date(2026, 8, 12),
+        evaluated_at=datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc),
+    )
+
+    assert receipt.calendar_revision_id == expected_revision_id
+    assert receipt.latest_completed_session == date(2026, 8, 12)
+    assert receipt.reader_uses_primary_database is True
+    assert receipt.exact_revision_verified is True
+    with pytest.raises(
+        composition_module.ProductionQualifiedCalendarPreflightError,
+        match="qualified_routing_calendar_exact_revision_mismatch",
+    ):
+        composition_module.preflight_production_qualified_calendar_reader(
+            corrected,
+            authorized_calendar_revision_id=expected_revision_id,
+            requested_session=date(2026, 8, 12),
+            evaluated_at=datetime(2026, 8, 12, 8, 0, 1, tzinfo=timezone.utc),
+        )
+
+    selections = {
+        "ticker": "601328.SS",
+        "analysis_date": "2026-08-12",
+        "asset_type": "stock",
+        "analysts": [SimpleNamespace(value="fundamentals")],
+        "china_a_enhancement_preset": "basic",
+        "research_depth": 1,
+        "shallow_thinker": "fixture-quick",
+        "deep_thinker": "fixture-deep",
+        "backend_url": None,
+        "llm_provider": "openai",
+        "google_thinking_level": None,
+        "openai_reasoning_effort": None,
+        "anthropic_effort": None,
+        "output_language": "English",
+    }
+    run_allocations = 0
+    graph_constructions = 0
+
+    def forbidden_run_allocation(*_args, **_kwargs):
+        nonlocal run_allocations
+        run_allocations += 1
+        pytest.fail("live-reader drift reached run allocation")
+
+    def forbidden_graph_construction(*_args, **_kwargs):
+        nonlocal graph_constructions
+        graph_constructions += 1
+        pytest.fail("live-reader drift reached provider/model construction")
+
+    monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "false")
+    monkeypatch.setattr(cli_main, "get_user_selections", lambda: selections)
+    monkeypatch.setattr(cli_main, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(
+        cli_main,
+        "preflight_production_qualified_calendar_reader",
+        lambda composition, *, authorized_calendar_revision_id, requested_session, evaluated_at: (
+            composition_module.preflight_production_qualified_calendar_reader(
+                composition,
+                authorized_calendar_revision_id=authorized_calendar_revision_id,
+                requested_session=requested_session,
+                evaluated_at=datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "build_qualified_financial_routing_composition",
+        lambda **_kwargs: drifted,
+    )
+    monkeypatch.setattr(cli_main, "_prepare_run_artifacts", forbidden_run_allocation)
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", forbidden_graph_construction)
+
+    with pytest.raises(
+        composition_module.ProductionQualifiedCalendarPreflightError,
+        match="qualified_routing_calendar_reader_not_primary",
+    ):
+        cli_main.run_analysis(
+            qualified_routing_validation=True,
+            qualified_routing_calendar_revision_id=expected_revision_id,
+        )
+
+    assert run_allocations == 0
+    assert graph_constructions == 0
+    with MarketHistoryStore.open(sidecar_config) as sidecar:
+        assert sidecar._connection.execute(
+            "SELECT COUNT(*) FROM market_session_calendars"
+        ).fetchone() == (0,)
+        assert sidecar._connection.execute(
+            "SELECT COUNT(*) FROM market_sessions"
+        ).fetchone() == (0,)
+    corrected.close()
+
+
 def test_shipped_composition_builder_loads_explicit_operator_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -960,6 +1175,7 @@ def test_typer_analysis_entrypoints_forward_explicit_shadow_validation_workload(
     entrypoint: str,
 ) -> None:
     received: dict[str, object] = {}
+    calendar_revision_id = "market-session-calendar=sha256:" + "a" * 64
 
     def run_analysis_spy(**kwargs):
         received.update(kwargs)
@@ -973,6 +1189,7 @@ def test_typer_analysis_entrypoints_forward_explicit_shadow_validation_workload(
             clear_checkpoints=False,
             qualified_routing_validation=True,
             qualified_routing_composition_factory="operator_fixture:build",
+            qualified_routing_calendar_revision_id=calendar_revision_id,
         )
     else:
         command(
@@ -980,12 +1197,14 @@ def test_typer_analysis_entrypoints_forward_explicit_shadow_validation_workload(
             clear_checkpoints=False,
             qualified_routing_validation=True,
             qualified_routing_composition_factory="operator_fixture:build",
+            qualified_routing_calendar_revision_id=calendar_revision_id,
         )
 
     assert received == {
         "checkpoint": False,
         "qualified_routing_validation": True,
         "qualified_routing_composition_factory": "operator_fixture:build",
+        "qualified_routing_calendar_revision_id": calendar_revision_id,
     }
 
 

@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 from cli.announcements import display_announcements, fetch_announcements
+from cli.config import announcements_enabled
 from cli.console_encoding import configure_utf8_stdio
 from cli.run_display import create_run_display
 from cli.run_progress import StateProgressTracker, message_key
@@ -91,9 +92,11 @@ from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import CheckpointSession, TradingAgentsGraph
 from tradingagents.qualified_routing_composition import (
     PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION,
+    ProductionQualifiedCalendarPreflightReceipt,
     RegisteredProductionQualifiedRoutingComposition,
     build_production_qualified_routing_composition_blueprint,
     build_registered_production_qualified_routing_composition,
+    preflight_production_qualified_calendar_reader,
     production_qualified_routing_dependency_availability,
     production_qualified_routing_provider_source_coverage,
 )
@@ -1403,7 +1406,15 @@ def _read_run_status(status_file: Path) -> dict:
     return json.loads(status_file.read_text(encoding="utf-8"))
 
 
-def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | str]:
+def _prepare_run_artifacts(
+    config: dict,
+    selections: dict,
+    *,
+    cli_announcements_enabled: bool | None = None,
+    qualified_validation_calendar_receipt: (
+        ProductionQualifiedCalendarPreflightReceipt | None
+    ) = None,
+) -> dict[str, Path | str]:
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     config_digest = configuration_digest(config)
     results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
@@ -1425,9 +1436,7 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
 
     status_file = run_dir / "run_status.json"
     now = _now_iso()
-    _write_run_status(
-        status_file,
-        {
+    status_payload = {
             "run_id": run_id,
             "artifact_run_id": run_id,
             "canonical_run_id": None,
@@ -1465,8 +1474,24 @@ def _prepare_run_artifacts(config: dict, selections: dict) -> dict[str, Path | s
             "error_summary": None,
             "error_diagnostics": None,
             "reports_written": [],
-        },
-    )
+        }
+    if cli_announcements_enabled is not None:
+        if cli_announcements_enabled is not False:
+            raise ValueError("qualified validation announcements must be disabled")
+        qualified_validation_preflight: dict[str, object] = {
+            "contract_version": "qualified-routing-validation-preflight-v1",
+            "cli_announcements_enabled": False,
+        }
+        if qualified_validation_calendar_receipt is not None:
+            qualified_validation_preflight["calendar_reader"] = (
+                qualified_validation_calendar_receipt.model_dump(mode="json")
+            )
+        status_payload["qualified_validation_preflight"] = (
+            qualified_validation_preflight
+        )
+    elif qualified_validation_calendar_receipt is not None:
+        raise ValueError("calendar preflight receipt requires qualified validation")
+    _write_run_status(status_file, status_payload)
     return {
         "run_id": run_id,
         "results_dir": results_dir,
@@ -2091,7 +2116,15 @@ def run_analysis(
     qualified_financial_routing: Any | None = None,
     qualified_routing_validation: bool = False,
     qualified_routing_composition_factory: str | None = None,
+    qualified_routing_calendar_revision_id: str | None = None,
 ):
+    cli_announcements_enabled = None
+    if qualified_routing_validation:
+        cli_announcements_enabled = announcements_enabled()
+        if cli_announcements_enabled:
+            raise RuntimeError(
+                "qualified_routing_validation_requires_announcements_disabled"
+            )
     # First get all user selections
     selections = get_user_selections()
 
@@ -2100,6 +2133,7 @@ def run_analysis(
     asset_configuration_error = None
     capability_routing_plan: MainlandCapabilityRoutingPlan | None = None
     capability_routing_failure: MainlandCapabilityRoutingFailure | None = None
+    qualified_validation_calendar_receipt = None
     routing_configuration_requires_identity = (
         str(config.get("mainland_capability_routing_mode", "legacy")) != "legacy"
         or bool(config.get("tushare_enabled_capabilities", ()))
@@ -2266,25 +2300,60 @@ def run_analysis(
             raise MainlandCapabilityRoutingPreflightError(
                 capability_routing_failure
             )
+        if (
+            isinstance(
+                qualified_financial_routing,
+                RegisteredProductionQualifiedRoutingComposition,
+            )
+            and capability_routing_plan is not None
+            and capability_routing_plan.plan_version == "1.3"
+        ):
+            try:
+                qualified_validation_calendar_receipt = (
+                    preflight_production_qualified_calendar_reader(
+                        qualified_financial_routing,
+                        authorized_calendar_revision_id=(
+                            qualified_routing_calendar_revision_id
+                        ),
+                        requested_session=datetime.date.fromisoformat(
+                            selections["analysis_date"]
+                        ),
+                        evaluated_at=datetime.datetime.now(datetime.timezone.utc),
+                    )
+                )
+            except BaseException:
+                _close_qualified_routing_owner(qualified_financial_routing)
+                raise
 
     artifacts = None
     current_phase = "setup"
 
-    # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
-    selected_set = {analyst.value for analyst in selections["analysts"]}
-    selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
-    analyst_execution_plan = build_analyst_execution_plan(selected_analyst_keys)
-    analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
+    try:
+        # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
+        selected_set = {analyst.value for analyst in selections["analysts"]}
+        selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
+        analyst_execution_plan = build_analyst_execution_plan(selected_analyst_keys)
+        analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
-    artifacts = _prepare_run_artifacts(config, selections)
-    runtime_writer = RuntimeArtifactWriter(
-        artifact_root=artifacts["artifact_root"],
-        log_paths=[artifacts["log_file"], artifacts["latest_log_file"]],
-        metrics_path=artifacts["metrics_file"],
-    )
-    artifacts["runtime_writer"] = runtime_writer
-    stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
-    artifacts["stats_handler"] = stats_handler
+        artifacts = _prepare_run_artifacts(
+            config,
+            selections,
+            cli_announcements_enabled=cli_announcements_enabled,
+            qualified_validation_calendar_receipt=(
+                qualified_validation_calendar_receipt
+            ),
+        )
+        runtime_writer = RuntimeArtifactWriter(
+            artifact_root=artifacts["artifact_root"],
+            log_paths=[artifacts["log_file"], artifacts["latest_log_file"]],
+            metrics_path=artifacts["metrics_file"],
+        )
+        artifacts["runtime_writer"] = runtime_writer
+        stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
+        artifacts["stats_handler"] = stats_handler
+    except BaseException:
+        _close_qualified_routing_owner(qualified_financial_routing)
+        raise
     if asset_configuration_error is not None:
         try:
             return _complete_asset_configuration_failure(
@@ -2828,6 +2897,14 @@ def default_analysis_command(
             "transports for qualified routing."
         ),
     ),
+    qualified_routing_calendar_revision_id: str | None = typer.Option(
+        None,
+        "--qualified-routing-calendar-revision-id",
+        help=(
+            "Exact readiness-authorized mainland calendar revision required for "
+            "qualified routing validation."
+        ),
+    ),
 ) -> None:
     """Run the legacy default analysis when no subcommand is supplied."""
     if ctx.invoked_subcommand is not None:
@@ -2846,6 +2923,13 @@ def default_analysis_command(
     ):
         analysis_kwargs["qualified_routing_composition_factory"] = (
             qualified_routing_composition_factory
+        )
+    if (
+        isinstance(qualified_routing_calendar_revision_id, str)
+        and qualified_routing_calendar_revision_id
+    ):
+        analysis_kwargs["qualified_routing_calendar_revision_id"] = (
+            qualified_routing_calendar_revision_id
         )
     run_analysis(**analysis_kwargs)
 
@@ -3221,6 +3305,14 @@ def analyze(
             "transports for qualified routing."
         ),
     ),
+    qualified_routing_calendar_revision_id: str | None = typer.Option(
+        None,
+        "--qualified-routing-calendar-revision-id",
+        help=(
+            "Exact readiness-authorized mainland calendar revision required for "
+            "qualified routing validation."
+        ),
+    ),
 ):
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
@@ -3235,6 +3327,13 @@ def analyze(
     ):
         analysis_kwargs["qualified_routing_composition_factory"] = (
             qualified_routing_composition_factory
+        )
+    if (
+        isinstance(qualified_routing_calendar_revision_id, str)
+        and qualified_routing_calendar_revision_id
+    ):
+        analysis_kwargs["qualified_routing_calendar_revision_id"] = (
+            qualified_routing_calendar_revision_id
         )
     run_analysis(**analysis_kwargs)
 

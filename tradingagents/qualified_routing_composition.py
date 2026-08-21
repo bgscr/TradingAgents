@@ -14,6 +14,7 @@ import threading
 import time
 from calendar import monthrange
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -118,6 +119,9 @@ from tradingagents.dataflows.financial_indicator_metadata import (
 from tradingagents.dataflows.financial_request_factory import (
     build_financial_indicator_routing_request,
     build_financial_statement_routing_request,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    build_market_session_eligibility_binding,
 )
 from tradingagents.dataflows.financial_temporal_proof_projection import (
     TemporalProofProjectionUnavailable,
@@ -469,6 +473,283 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def close(self) -> None: ...
 
 
+class ProductionQualifiedEligibilityCalendarReader:
+    """Run-owned, thread-safe reader for the authoritative primary store."""
+
+    def __init__(self, config: MarketHistoryConfig) -> None:
+        self._config = config
+        self._lock = threading.RLock()
+        self._closed = False
+        self._authorized_calendar_revision_id: str | None = None
+
+    @property
+    def database_path(self) -> Path:
+        return self._config.database_path
+
+    def read_current_session_calendar(
+        self,
+        reference_market: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            with MarketHistoryStore.open(self._config) as store:
+                return store.read_current_session_calendar(reference_market)
+
+    def read_session_calendar_revision(
+        self,
+        calendar_revision_id: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            with MarketHistoryStore.open(self._config) as store:
+                return store.read_session_calendar_revision(calendar_revision_id)
+
+    def authorize_calendar_revision(self, calendar_revision_id: str) -> None:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            if self._authorized_calendar_revision_id not in {
+                None,
+                calendar_revision_id,
+            }:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            self._authorized_calendar_revision_id = calendar_revision_id
+
+    def read_eligibility_session_calendar(
+        self,
+        reference_market: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            calendar_revision_id = self._authorized_calendar_revision_id
+        if calendar_revision_id is None:
+            return self.read_current_session_calendar(reference_market)
+        calendar = self.read_session_calendar_revision(calendar_revision_id)
+        if calendar.reference_market != reference_market:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        return calendar
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+
+def _primary_market_history_config(
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+) -> MarketHistoryConfig:
+    return MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=blueprint.database_path,
+        payload_root=blueprint.provider_artifact_root_path,
+        backup_root=blueprint.backup_root_path,
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+
+
+class ProductionQualifiedCalendarPreflightFailureReason(str, Enum):
+    """Closed failures from the live eligibility-calendar reader preflight."""
+
+    READER_INVALID = "qualified_routing_calendar_reader_invalid"
+    READER_NOT_PRIMARY = "qualified_routing_calendar_reader_not_primary"
+    CALENDAR_UNAVAILABLE = "qualified_routing_calendar_unavailable"
+    EXACT_REVISION_MISMATCH = "qualified_routing_calendar_exact_revision_mismatch"
+    FRONTIER_MISMATCH = "qualified_routing_calendar_frontier_mismatch"
+
+
+class ProductionQualifiedCalendarPreflightError(RuntimeError):
+    """Payload-free failure before qualified run allocation or live I/O."""
+
+    def __init__(
+        self,
+        reason: ProductionQualifiedCalendarPreflightFailureReason,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic_code = reason.value
+        super().__init__(reason.value)
+
+
+class ProductionQualifiedCalendarPreflightReceipt(BaseModel):
+    """Safe proof that the live reader can derive the authorized frontier."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "production-qualified-calendar-preflight-v1"
+    ] = "production-qualified-calendar-preflight-v1"
+    calendar_revision_id: str = Field(
+        pattern=r"^market-session-calendar=sha256:[0-9a-f]{64}$"
+    )
+    requested_session: date
+    evaluated_at: datetime
+    latest_completed_session: date
+    next_open_session: date | None = None
+    reader_uses_primary_database: Literal[True] = True
+    exact_revision_verified: Literal[True] = True
+    primary_readiness_verified: Literal[True] = True
+
+
+def _calendar_preflight_fail(
+    reason: ProductionQualifiedCalendarPreflightFailureReason,
+) -> None:
+    raise ProductionQualifiedCalendarPreflightError(reason)
+
+
+def preflight_production_qualified_calendar_reader(
+    composition: RegisteredProductionQualifiedRoutingComposition,
+    *,
+    authorized_calendar_revision_id: str,
+    requested_session: date,
+    evaluated_at: datetime,
+) -> ProductionQualifiedCalendarPreflightReceipt:
+    """Verify the exact live primary-reader binding without provider/model I/O."""
+
+    if evaluated_at.tzinfo is None:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    if (
+        not isinstance(authorized_calendar_revision_id, str)
+        or re.fullmatch(
+            r"market-session-calendar=sha256:[0-9a-f]{64}",
+            authorized_calendar_revision_id,
+        )
+        is None
+    ):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+        )
+    if not isinstance(composition, RegisteredProductionQualifiedRoutingComposition):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        with MarketHistoryStore.open(
+            _primary_market_history_config(composition.blueprint)
+        ) as readiness_store:
+            authorized_exact = readiness_store.read_session_calendar_revision(
+                authorized_calendar_revision_id
+            )
+            authorized_current = readiness_store.read_current_session_calendar(
+                "mainland-cn"
+            )
+            requested_start_date = min(
+                session.session_date for session in authorized_exact.sessions
+            )
+            requested_end_date = max(
+                session.session_date for session in authorized_exact.sessions
+            )
+            readiness = readiness_store.assess_mainland_session_calendar_readiness(
+                authorized_exact.calendar_revision_id,
+                requested_start_date=requested_start_date,
+                requested_end_date=requested_end_date,
+                evaluated_at=evaluated_at,
+            )
+    except Exception:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.CALENDAR_UNAVAILABLE
+        )
+    if authorized_current.calendar_revision_id != authorized_calendar_revision_id:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+        )
+    factories = composition.runtime_factories
+    open_reader = (
+        factories.open_eligibility_calendar_reader
+        if isinstance(factories, ProductionQualifiedRoutingRuntimeFactories)
+        else None
+    )
+    if not callable(open_reader):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        reader = open_reader(composition.blueprint)
+    except Exception:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        if not isinstance(reader, ProductionQualifiedEligibilityCalendarReader):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+            )
+        if reader.database_path != composition.blueprint.database_path:
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_NOT_PRIMARY
+            )
+        try:
+            current = reader.read_current_session_calendar("mainland-cn")
+            exact = reader.read_session_calendar_revision(
+                authorized_exact.calendar_revision_id
+            )
+        except Exception:
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.CALENDAR_UNAVAILABLE
+            )
+        if (
+            current.calendar_revision_id != authorized_exact.calendar_revision_id
+            or exact.calendar_revision_id != authorized_exact.calendar_revision_id
+            or exact.reference_market != authorized_exact.reference_market
+            or exact.timezone_name != authorized_exact.timezone_name
+            or exact.sessions != authorized_exact.sessions
+            or exact.reference_market != current.reference_market
+            or exact.timezone_name != current.timezone_name
+            or exact.sessions != current.sessions
+        ):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+            )
+        try:
+            binding = build_market_session_eligibility_binding(
+                exact,
+                requested_session=requested_session,
+                eligibility_evaluated_at=evaluated_at,
+            )
+        except (TypeError, ValueError):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.FRONTIER_MISMATCH
+            )
+        if (
+            not binding.requested_session_open
+            or binding.latest_completed_session != requested_session
+            or readiness.latest_completed_session != requested_session
+        ):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.FRONTIER_MISMATCH
+            )
+        reader.authorize_calendar_revision(authorized_calendar_revision_id)
+        receipt = ProductionQualifiedCalendarPreflightReceipt(
+            calendar_revision_id=authorized_exact.calendar_revision_id,
+            requested_session=requested_session,
+            evaluated_at=evaluated_at,
+            latest_completed_session=requested_session,
+            next_open_session=binding.next_open_session,
+        )
+        installed_receipt = composition._install_calendar_preflight(
+            reader,
+            receipt,
+        )
+        if installed_receipt is receipt:
+            reader = None
+        return installed_receipt
+    finally:
+        close_reader = getattr(reader, "close", None)
+        if callable(close_reader):
+            with suppress(BaseException):
+                close_reader()
+
+
 def _validated_retained_financial_metadata(
     company_type_evidence: Sequence[object],
     listing_metadata: Sequence[object],
@@ -709,6 +990,11 @@ class ProductionQualifiedRoutingRuntimeFactories:
     assemble_runtime: Callable[..., ProductionQualifiedRoutingRuntimeAssembly] = field(
         repr=False
     )
+    open_eligibility_calendar_reader: Callable[[object], object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     phase_hook: Callable[[str, object], None] = field(
         default=_noop_runtime_phase_hook,
         repr=False,
@@ -728,7 +1014,10 @@ class ProductionQualifiedRoutingRuntimeFactories:
             self.assemble_runtime,
             self.phase_hook,
         )
-        if any(not callable(callback) for callback in callbacks):
+        if any(not callable(callback) for callback in callbacks) or (
+            self.open_eligibility_calendar_reader is not None
+            and not callable(self.open_eligibility_calendar_reader)
+        ):
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
@@ -747,13 +1036,7 @@ def production_qualified_routing_runtime_factories(
 
     def open_store(value: object) -> MarketHistoryStore:
         blueprint = runtime_blueprint(value)
-        config = MarketHistoryConfig(
-            mode=MarketHistoryMode.SHADOW,
-            database_path=blueprint.database_path,
-            payload_root=blueprint.provider_artifact_root_path,
-            backup_root=blueprint.backup_root_path,
-            data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
-        )
+        config = _primary_market_history_config(blueprint)
         try:
             return MarketHistoryStore.open_provider_request_authority(config)
         except ProductionQualifiedRoutingLifecycleError:
@@ -825,6 +1108,14 @@ def production_qualified_routing_runtime_factories(
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             ) from None
+
+    def open_eligibility_calendar_reader(
+        value: object,
+    ) -> ProductionQualifiedEligibilityCalendarReader:
+        blueprint = runtime_blueprint(value)
+        return ProductionQualifiedEligibilityCalendarReader(
+            _primary_market_history_config(blueprint)
+        )
 
     def build_cache(
         coordinator: object,
@@ -905,6 +1196,7 @@ def production_qualified_routing_runtime_factories(
         ),
         build_baostock_transport=build_baostock,
         assemble_runtime=_assemble_production_qualified_runtime,
+        open_eligibility_calendar_reader=open_eligibility_calendar_reader,
     )
 
 
@@ -1471,6 +1763,18 @@ class RegisteredProductionQualifiedRoutingComposition:
         compare=False,
         default=None,
     )
+    _calendar_preflight_reader: ProductionQualifiedEligibilityCalendarReader | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _calendar_preflight_receipt: ProductionQualifiedCalendarPreflightReceipt | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
     _closed: bool = field(init=False, repr=False, compare=False, default=False)
 
     def __post_init__(self) -> None:
@@ -1493,6 +1797,36 @@ class RegisteredProductionQualifiedRoutingComposition:
     @property
     def factory_identity(self) -> str:
         return self.blueprint.factory_contract_version
+
+    def _install_calendar_preflight(
+        self,
+        reader: ProductionQualifiedEligibilityCalendarReader,
+        receipt: ProductionQualifiedCalendarPreflightReceipt,
+    ) -> ProductionQualifiedCalendarPreflightReceipt:
+        """Atomically retain one exact preflight reader until run ownership binds."""
+
+        if not isinstance(
+            reader,
+            ProductionQualifiedEligibilityCalendarReader,
+        ) or not isinstance(receipt, ProductionQualifiedCalendarPreflightReceipt):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+            )
+        with self._state_lock:
+            if self._closed or self._owner is not None:
+                _calendar_preflight_fail(
+                    ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+                )
+            existing_receipt = self._calendar_preflight_receipt
+            if existing_receipt is not None:
+                if existing_receipt != receipt:
+                    _calendar_preflight_fail(
+                        ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+                    )
+                return existing_receipt
+            object.__setattr__(self, "_calendar_preflight_reader", reader)
+            object.__setattr__(self, "_calendar_preflight_receipt", receipt)
+            return receipt
 
     def bind_run(
         self,
@@ -1606,6 +1940,26 @@ class RegisteredProductionQualifiedRoutingComposition:
             "coordinator_store",
             factories.open_coordinator_store(self.blueprint),
         )
+        eligibility_calendar_reader = self._calendar_preflight_reader
+        if eligibility_calendar_reader is not None:
+            object.__setattr__(self, "_calendar_preflight_reader", None)
+            eligibility_calendar_reader = acquire(
+                "eligibility_calendar_reader",
+                eligibility_calendar_reader,
+            )
+        if (
+            self.blueprint.routing_plan.plan_version == "1.3"
+            and eligibility_calendar_reader is None
+        ):
+            open_calendar_reader = factories.open_eligibility_calendar_reader
+            if not callable(open_calendar_reader):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            eligibility_calendar_reader = acquire(
+                "eligibility_calendar_reader",
+                open_calendar_reader(self.blueprint),
+            )
         coordinator = acquire(
             "coordinator",
             factories.build_coordinator(coordinator_store, owner.stop_signal),
@@ -1705,6 +2059,7 @@ class RegisteredProductionQualifiedRoutingComposition:
             run_binding=run_binding,
             coordinator=coordinator,
             coordinator_store=coordinator_store,
+            eligibility_calendar_reader=eligibility_calendar_reader,
             artifact_store=artifact_store,
             subrequest_cache=subrequest_cache,
             provider_clients=MappingProxyType(
@@ -1836,8 +2191,13 @@ class RegisteredProductionQualifiedRoutingComposition:
                 return
             object.__setattr__(self, "_closed", True)
             owner = self._owner
+            calendar_reader = self._calendar_preflight_reader
+            object.__setattr__(self, "_calendar_preflight_reader", None)
         if owner is not None:
             owner.close()
+        if calendar_reader is not None:
+            with suppress(BaseException):
+                calendar_reader.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -4373,6 +4733,7 @@ def _assemble_production_qualified_runtime(
     run_binding: object,
     coordinator: object,
     coordinator_store: object,
+    eligibility_calendar_reader: object,
     artifact_store: object,
     subrequest_cache: object,
     provider_clients: Mapping[str, object],
@@ -4384,6 +4745,13 @@ def _assemble_production_qualified_runtime(
         or not isinstance(run_binding, ProductionQualifiedRoutingRunBinding)
         or not isinstance(coordinator, ProviderRequestCoordinator)
         or not isinstance(coordinator_store, MarketHistoryStore)
+        or (
+            blueprint.routing_plan.plan_version == "1.3"
+            and not isinstance(
+                eligibility_calendar_reader,
+                ProductionQualifiedEligibilityCalendarReader,
+            )
+        )
         or not isinstance(artifact_store, ProviderSubrequestArtifactStore)
         or not isinstance(subrequest_cache, ProviderSubrequestCache)
         or not callable(acquire_owned_resource)
@@ -4446,8 +4814,15 @@ def _assemble_production_qualified_runtime(
         dependencies=dependencies,
         eligibility_metadata_acquirer=eligibility_metadata_acquirer,
         eligibility_clock=dependencies.now,
-        eligibility_calendar_provider=lambda: coordinator.read_current_session_calendar(
-            "mainland-cn"
+        eligibility_calendar_provider=(
+            lambda: eligibility_calendar_reader.read_eligibility_session_calendar(
+                "mainland-cn"
+            )
+            if isinstance(
+                eligibility_calendar_reader,
+                ProductionQualifiedEligibilityCalendarReader,
+            )
+            else None
         ),
     )
 
@@ -4668,6 +5043,10 @@ __all__ = [
     "PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION",
     "PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION",
     "ProductionFinancialEligibilityRuntimeInputs",
+    "ProductionQualifiedCalendarPreflightError",
+    "ProductionQualifiedCalendarPreflightFailureReason",
+    "ProductionQualifiedCalendarPreflightReceipt",
+    "ProductionQualifiedEligibilityCalendarReader",
     "ProductionQualifiedBoundSource",
     "ProductionBaoStockRunTransport",
     "ProductionQualifiedRoutingCompositionBlueprint",
@@ -4693,4 +5072,5 @@ __all__ = [
     "build_registered_production_qualified_routing_composition",
     "production_qualified_routing_dependency_availability",
     "production_qualified_routing_provider_source_coverage",
+    "preflight_production_qualified_calendar_reader",
 ]
