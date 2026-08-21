@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 import tradingagents.windows_sandbox_qualification as qualification_module
+from tradingagents.market_history import (
+    DataUsageMode,
+    MarketHistoryConfig,
+    MarketHistoryMode,
+    MarketHistoryStore,
+)
 from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_SOURCE_FILES,
     QUALIFIED_RUNNER_TARGET_FILES,
@@ -36,6 +42,7 @@ from tradingagents.windows_sandbox_qualification import (
     NetworkVerification,
     ProbeMechanism,
     ProbeObservation,
+    ProtectedHostInventory,
     QualificationStaticBindings,
     ReviewedHostHarnessFile,
     ReviewedHostHarnessManifest,
@@ -69,6 +76,7 @@ from tradingagents.windows_sandbox_qualification import (
 from tradingagents.windows_sandbox_runner import (
     ProtectedObjectKind,
     ProtectedRootBinding,
+    ProtectedRootManifest,
     ProtectedRootRole,
     SandboxContractError,
     SandboxFailureReason,
@@ -163,6 +171,26 @@ def _protected_manifest(root: Path):
             kind = ProtectedObjectKind.FILE
         bindings.append(ProtectedRootBinding(role, path, kind))
     return build_protected_root_manifest(tuple(bindings))
+
+
+def _materialize_required_default_roots(
+    bindings: tuple[ProtectedRootBinding, ...],
+) -> None:
+    optional_companions = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL,
+        ProtectedRootRole.PROVIDER_LEDGER_SHM,
+        ProtectedRootRole.CALENDAR_DATABASE_WAL,
+        ProtectedRootRole.CALENDAR_DATABASE_SHM,
+    }
+    for binding in bindings:
+        if binding.role in optional_companions:
+            continue
+        if binding.object_kind is ProtectedObjectKind.DIRECTORY:
+            binding.path.mkdir(parents=True, exist_ok=True)
+        else:
+            binding.path.parent.mkdir(parents=True, exist_ok=True)
+            if not binding.path.exists():
+                binding.path.write_bytes(binding.role.value.encode("ascii"))
 
 
 def _write_report_marker(
@@ -305,6 +333,325 @@ def test_iso_03_host_inventory_is_deterministic_and_detects_rewrites(
     delta = compare_protected_host_inventories(before, after)
     assert delta.equal is False
     assert (delta.appended, delta.deleted, delta.rewritten) == (0, 0, 1)
+
+
+def test_iso_03_clean_close_keeps_absent_sqlite_companions_as_empty_protected_roots(
+    tmp_path: Path,
+) -> None:
+    user_profile = tmp_path / "profile"
+    repository_root = tmp_path / "repository"
+    history_root = user_profile / ".tradingagents" / "market_history"
+    config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    with MarketHistoryStore.open(config):
+        pass
+    with MarketHistoryStore.open_provider_request_authority(config) as authority:
+        provider_ledger = authority.config.database_path
+
+    bindings = default_protected_root_bindings(
+        user_profile=user_profile,
+        repository_root=repository_root,
+    )
+    _materialize_required_default_roots(bindings)
+    companions = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL: Path(f"{provider_ledger}-wal"),
+        ProtectedRootRole.PROVIDER_LEDGER_SHM: Path(f"{provider_ledger}-shm"),
+        ProtectedRootRole.CALENDAR_DATABASE_WAL: Path(f"{config.database_path}-wal"),
+        ProtectedRootRole.CALENDAR_DATABASE_SHM: Path(f"{config.database_path}-shm"),
+    }
+
+    assert config.database_path.is_file()
+    assert provider_ledger.is_file()
+    assert all(not path.exists() for path in companions.values())
+
+    manifest = build_protected_root_manifest(bindings)
+    inventory = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=lambda: {},
+        immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+    )
+    entries = {entry.role: entry for entry in manifest.entries}
+    roots = {root.role: root for root in inventory.roots}
+
+    assert entries[ProtectedRootRole.PROVIDER_LEDGER].concrete_object_required is True
+    assert entries[ProtectedRootRole.CALENDAR_DATABASE].concrete_object_required is True
+    for role, path in companions.items():
+        assert entries[role].concrete_object_required is False
+        assert roots[role].root_path_identity == host_path_identity(path)
+        assert (roots[role].file_count, roots[role].byte_length, roots[role].files) == (
+            0,
+            0,
+            (),
+        )
+
+
+def test_iso_03_repository_sqlite_companions_retain_full_byte_accounting(
+    tmp_path: Path,
+) -> None:
+    user_profile = tmp_path / "profile"
+    repository_root = tmp_path / "repository"
+    history_root = user_profile / ".tradingagents" / "market_history"
+    config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    with (
+        MarketHistoryStore.open(config),
+        MarketHistoryStore.open_provider_request_authority(config) as authority,
+    ):
+        bindings = default_protected_root_bindings(
+            user_profile=user_profile,
+            repository_root=repository_root,
+        )
+        _materialize_required_default_roots(bindings)
+        companion_paths = {
+            ProtectedRootRole.PROVIDER_LEDGER_WAL: Path(
+                f"{authority.config.database_path}-wal"
+            ),
+            ProtectedRootRole.PROVIDER_LEDGER_SHM: Path(
+                f"{authority.config.database_path}-shm"
+            ),
+            ProtectedRootRole.CALENDAR_DATABASE_WAL: Path(
+                f"{config.database_path}-wal"
+            ),
+            ProtectedRootRole.CALENDAR_DATABASE_SHM: Path(
+                f"{config.database_path}-shm"
+            ),
+        }
+        assert all(path.is_file() for path in companion_paths.values())
+        companion_content = {
+            role: path.read_bytes() for role, path in companion_paths.items()
+        }
+
+        manifest = build_protected_root_manifest(bindings)
+        inventory = capture_protected_host_inventory(
+            manifest,
+            semantic_capture=lambda: {},
+            immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+        )
+        entries = {entry.role: entry for entry in manifest.entries}
+        roots = {root.role: root for root in inventory.roots}
+
+        for role, content in companion_content.items():
+            root = roots[role]
+            assert entries[role].concrete_object_required is False
+            assert (root.file_count, root.byte_length) == (1, len(content))
+            assert len(root.files) == 1
+            assert root.files[0].relative_path == "."
+            assert root.files[0].sha256 == sha256(content).hexdigest()
+
+
+@pytest.mark.parametrize(
+    (
+        "initial_content",
+        "final_content",
+        "expected_equal",
+        "expected_counts",
+    ),
+    (
+        pytest.param(None, None, True, (0, 0, 0), id="absent-to-absent"),
+        pytest.param(b"stable", b"stable", True, (0, 0, 0), id="present-stable"),
+        pytest.param(None, b"created", False, (1, 0, 0), id="absent-to-present"),
+        pytest.param(b"deleted", None, False, (0, 1, 0), id="present-to-absent"),
+        pytest.param(b"before", b"after", False, (0, 0, 1), id="present-rewrite"),
+    ),
+)
+def test_iso_03_sqlite_companion_lifecycle_transitions_remain_protected(
+    tmp_path: Path,
+    initial_content: bytes | None,
+    final_content: bytes | None,
+    expected_equal: bool,
+    expected_counts: tuple[int, int, int],
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    target = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role is ProtectedRootRole.PROVIDER_LEDGER_WAL
+    )
+    if initial_content is None:
+        target.unlink()
+    else:
+        target.write_bytes(initial_content)
+    def capture():
+        return capture_protected_host_inventory(
+            manifest,
+            semantic_capture=lambda: {},
+            immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+        )
+
+    before = capture()
+
+    if final_content is None:
+        target.unlink(missing_ok=True)
+    else:
+        target.write_bytes(final_content)
+    after = capture()
+
+    delta = compare_protected_host_inventories(before, after)
+    assert delta.equal is expected_equal
+    assert (delta.appended, delta.deleted, delta.rewritten) == expected_counts
+    assert delta.changed_roles == (
+        () if expected_equal else (ProtectedRootRole.PROVIDER_LEDGER_WAL,)
+    )
+
+
+def _representative_historical_companion_contract(
+    evidence_name: str,
+) -> tuple[ProtectedRootManifest, ProtectedHostInventory]:
+    companion_content = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL: b"",
+        ProtectedRootRole.PROVIDER_LEDGER_SHM: b"p" * 32_768,
+        ProtectedRootRole.CALENDAR_DATABASE_WAL: b"",
+        ProtectedRootRole.CALENDAR_DATABASE_SHM: b"c" * 32_768,
+    }
+    root_path_identities = {
+        role: _test_identity("host-path", [evidence_name, role.value])
+        for role in ProtectedRootRole
+    }
+    recorded_entries = [
+        {
+            "role": role.value,
+            "object_kind": (
+                ProtectedObjectKind.DIRECTORY.value
+                if role in _DIRECTORY_ROLES
+                else ProtectedObjectKind.FILE.value
+            ),
+            "path_identity": root_path_identities[role],
+            "concrete_object_required": True,
+            "reparse_points_permitted": False,
+        }
+        for role in ProtectedRootRole
+    ]
+    manifest_payload = {
+        "contract_version": "windows-sandbox-protected-roots-v3",
+        "entries": recorded_entries,
+    }
+    recorded_manifest = ProtectedRootManifest(
+        **manifest_payload,
+        manifest_identity=_test_identity(
+            "windows-sandbox-protected-roots:v3",
+            manifest_payload,
+        ),
+    )
+    roots = []
+    files = []
+    for role in ProtectedRootRole:
+        content = companion_content.get(role)
+        root_files = []
+        if content is not None:
+            row = {
+                "relative_path": ".",
+                "canonical_path_identity": root_path_identities[role],
+                "byte_length": len(content),
+                "sha256": sha256(content).hexdigest(),
+            }
+            root_files.append(row)
+            files.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "relative_path"
+                }
+            )
+        root_payload = {
+            "role": role.value,
+            "object_kind": (
+                ProtectedObjectKind.DIRECTORY.value
+                if role in _DIRECTORY_ROLES
+                else ProtectedObjectKind.FILE.value
+            ),
+            "root_path_identity": root_path_identities[role],
+            "file_count": len(root_files),
+            "byte_length": sum(row["byte_length"] for row in root_files),
+            "files": root_files,
+        }
+        roots.append(
+            {
+                **root_payload,
+                "inventory_identity": _test_identity(
+                    "windows-sandbox-protected-root-inventory:v1",
+                    root_payload,
+                ),
+            }
+        )
+    files.sort(key=lambda row: row["canonical_path_identity"])
+    semantic_inventory: dict[str, object] = {}
+    inventory_payload = {
+        "contract_version": "windows-sandbox-protected-host-inventory-v1",
+        "protected_root_manifest_identity": recorded_manifest.manifest_identity,
+        "immutable_verifier_identity": (
+            "immutable-verifier:sha256:"
+            + sha256(evidence_name.encode("ascii")).hexdigest()
+        ),
+        "roots": roots,
+        "files": files,
+        "file_count": len(files),
+        "byte_length": sum(row["byte_length"] for row in files),
+        "semantic_inventory": semantic_inventory,
+        "semantic_inventory_identity": _test_identity(
+            "ticket06-immutable-semantic-inventory:v1",
+            semantic_inventory,
+        ),
+    }
+    recorded_inventory = ProtectedHostInventory(
+        **inventory_payload,
+        inventory_identity=_test_identity(
+            "windows-sandbox-protected-host-inventory:v1",
+            inventory_payload,
+        ),
+    )
+    return recorded_manifest, recorded_inventory
+
+
+def test_iso_03_run_026_and_iso04_004_historical_companion_contracts_remain_readable() -> None:
+    expected_identities = {
+        "run-026": (
+            "windows-sandbox-protected-roots:v3:sha256:"
+            "7543b6e9696069f5595599bdcfec7f10da5f93ba2f047d8694a07f0d6dcfbcb8",
+            "windows-sandbox-protected-host-inventory:v1:sha256:"
+            "6ee5e6e8474e1967793e22c8499b437d8dea5ad53626e56fce045b1681e104f0",
+        ),
+        "ISO04-004": (
+            "windows-sandbox-protected-roots:v3:sha256:"
+            "0e3ee71c2e185d6fa1456cc32c712b4c7584f83b9da406bf02f5c43e551b6ddf",
+            "windows-sandbox-protected-host-inventory:v1:sha256:"
+            "12c06e8d85d0d7a7a8ab100df1ce8e64e8931b23cda0e0026d4857c54bbac031",
+        ),
+    }
+    for evidence_name, expected in expected_identities.items():
+        recorded_manifest, recorded_inventory = (
+            _representative_historical_companion_contract(evidence_name)
+        )
+        loaded_manifest = ProtectedRootManifest.model_validate_json(
+            recorded_manifest.model_dump_json()
+        )
+        loaded_inventory = ProtectedHostInventory.model_validate_json(
+            recorded_inventory.model_dump_json()
+        )
+        loaded_roots = {root.role: root for root in loaded_inventory.roots}
+
+        assert (
+            loaded_manifest.manifest_identity,
+            loaded_inventory.inventory_identity,
+        ) == expected
+        assert all(entry.concrete_object_required for entry in loaded_manifest.entries)
+        assert (
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_WAL].file_count,
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_WAL].byte_length,
+        ) == (1, 0)
+        assert (
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_SHM].file_count,
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_SHM].byte_length,
+        ) == (1, 32_768)
 
 
 def test_iso_03_quiescence_requires_attestation_and_stable_prelaunch_inventory(

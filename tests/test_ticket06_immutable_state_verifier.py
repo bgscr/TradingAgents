@@ -416,3 +416,118 @@ def test_read_only_connection_cannot_rewrite_protected_rows(
         pytest.raises(sqlite3.OperationalError),
     ):
         connection.execute("UPDATE provider_request_sequences SET status = 'failed'")
+
+
+def test_semantic_capture_does_not_materialize_clean_close_sqlite_companions(
+    verifier_paths: _VerifierPaths,
+) -> None:
+    databases = (
+        verifier_paths.provider_ledger,
+        verifier_paths.calendar_database,
+    )
+    for database in databases:
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == (
+                "wal",
+            )
+    companions = tuple(
+        Path(f"{database}{suffix}")
+        for database in databases
+        for suffix in ("-wal", "-shm")
+    )
+    assert all(not companion.exists() for companion in companions)
+
+    inventory = verifier.capture_immutable_state(
+        provider_ledger=verifier_paths.provider_ledger,
+        calendar_database=verifier_paths.calendar_database,
+        ticket07_root=verifier_paths.ticket07_root,
+        reports_root=verifier_paths.reports_root,
+        checkpoints_root=verifier_paths.checkpoints_root,
+        enforce_expected_counts=False,
+    )
+
+    assert inventory["schema_version"] == (
+        "ticket06-post-incident-immutable-inventory-v1"
+    )
+    assert all(not companion.exists() for companion in companions)
+
+
+def test_semantic_capture_reads_committed_wal_without_materializing_absent_shm(
+    verifier_paths: _VerifierPaths,
+) -> None:
+    database = verifier_paths.provider_ledger
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    connection = sqlite3.connect(database, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == (
+            "wal",
+        )
+        connection.execute("PRAGMA wal_autocheckpoint = 0")
+        connection.execute("BEGIN IMMEDIATE")
+        _insert_provider_row(
+            connection,
+            sequence_id=_APPENDED_SEQUENCE_ID,
+            attempt_event_id="committed-wal-attempt",
+        )
+        connection.commit()
+        main_bytes = database.read_bytes()
+        wal_bytes = wal.read_bytes()
+    finally:
+        connection.close()
+    database.write_bytes(main_bytes)
+    wal.write_bytes(wal_bytes)
+    shm.unlink(missing_ok=True)
+
+    inventory = verifier.capture_immutable_state(
+        provider_ledger=database,
+        calendar_database=verifier_paths.calendar_database,
+        ticket07_root=verifier_paths.ticket07_root,
+        reports_root=verifier_paths.reports_root,
+        checkpoints_root=verifier_paths.checkpoints_root,
+        enforce_expected_counts=False,
+    )
+
+    assert inventory["provider_ledger"]["sequences"]["count"] == 6
+    assert inventory["provider_ledger"]["attempts"]["count"] == 6
+    assert wal.read_bytes() == wal_bytes
+    assert not shm.exists()
+
+
+def test_semantic_capture_does_not_rewrite_present_sqlite_companions(
+    verifier_paths: _VerifierPaths,
+) -> None:
+    database = verifier_paths.provider_ledger
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    connection = sqlite3.connect(database, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == (
+            "wal",
+        )
+        connection.execute("PRAGMA wal_autocheckpoint = 0")
+        connection.execute("BEGIN IMMEDIATE")
+        _insert_provider_row(
+            connection,
+            sequence_id=_APPENDED_SEQUENCE_ID,
+            attempt_event_id="present-companion-attempt",
+        )
+        connection.commit()
+        wal_bytes = wal.read_bytes()
+        shm_bytes = shm.read_bytes()
+
+        inventory = verifier.capture_immutable_state(
+            provider_ledger=database,
+            calendar_database=verifier_paths.calendar_database,
+            ticket07_root=verifier_paths.ticket07_root,
+            reports_root=verifier_paths.reports_root,
+            checkpoints_root=verifier_paths.checkpoints_root,
+            enforce_expected_counts=False,
+        )
+
+        assert inventory["provider_ledger"]["sequences"]["count"] == 6
+        assert inventory["provider_ledger"]["attempts"]["count"] == 6
+        assert wal.read_bytes() == wal_bytes
+        assert shm.read_bytes() == shm_bytes
+    finally:
+        connection.close()

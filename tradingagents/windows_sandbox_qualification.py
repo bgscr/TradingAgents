@@ -1722,15 +1722,26 @@ def capture_protected_host_inventory(
         raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_MANIFEST_INCOMPLETE)
     hash_cache: dict[str, ProtectedHostFile] = {}
     root_inventories: list[ProtectedRootInventory] = []
+    entries = {entry.role: entry for entry in manifest.entries}
     for binding in manifest.bindings:
+        entry = entries[binding.role]
+        root = binding.path
+        root_metadata: os.stat_result | None = None
         try:
             root = binding.path.resolve(strict=True)
             root_metadata = root.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            if entry.concrete_object_required:
+                raise SandboxContractError(
+                    SandboxFailureReason.PROTECTED_ROOT_MISSING
+                ) from exc
         except OSError as exc:
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_MISSING) from exc
-        if _is_reparse(root_metadata):
+        if root_metadata is not None and _is_reparse(root_metadata):
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_REPARSE_POINT)
-        if binding.object_kind is ProtectedObjectKind.DIRECTORY:
+        if root_metadata is None:
+            candidates = ()
+        elif binding.object_kind is ProtectedObjectKind.DIRECTORY:
             candidates = _walk_files(root)
         else:
             if not stat.S_ISREG(root_metadata.st_mode):

@@ -222,6 +222,16 @@ class ProtectedRootRole(str, Enum):
     )
 
 
+_OPTIONAL_SQLITE_COMPANION_ROLES = frozenset(
+    {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL,
+        ProtectedRootRole.PROVIDER_LEDGER_SHM,
+        ProtectedRootRole.CALENDAR_DATABASE_WAL,
+        ProtectedRootRole.CALENDAR_DATABASE_SHM,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ProtectedRootBinding:
     """Host-only path binding; absolute paths never enter safe projections."""
@@ -243,21 +253,34 @@ class ProtectedPathMetadata:
         path: Path,
         *,
         expected_kind: ProtectedObjectKind,
+        concrete_object_required: bool = True,
     ) -> ProtectedPathMetadata:
         candidate = path.expanduser().absolute()
         try:
             metadata = candidate.lstat()
-        except (FileNotFoundError, OSError) as exc:
+        except FileNotFoundError as exc:
+            if concrete_object_required:
+                raise SandboxContractError(
+                    SandboxFailureReason.PROTECTED_ROOT_MISSING
+                ) from exc
+            metadata = None
+        except OSError as exc:
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_MISSING) from exc
         actual_kind = (
             ProtectedObjectKind.DIRECTORY
-            if stat.S_ISDIR(metadata.st_mode)
+            if metadata is not None and stat.S_ISDIR(metadata.st_mode)
             else ProtectedObjectKind.FILE
-            if stat.S_ISREG(metadata.st_mode)
+            if metadata is not None and stat.S_ISREG(metadata.st_mode)
+            else expected_kind
+            if metadata is None
             else None
         )
-        is_reparse = stat.S_ISLNK(metadata.st_mode) or bool(
-            getattr(metadata, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT_ATTRIBUTE
+        is_reparse = metadata is not None and (
+            stat.S_ISLNK(metadata.st_mode)
+            or bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & _WINDOWS_REPARSE_POINT_ATTRIBUTE
+            )
         )
         ancestor = candidate.parent
         while ancestor != ancestor.parent:
@@ -277,7 +300,7 @@ class ProtectedPathMetadata:
         if actual_kind is not expected_kind:
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_KIND_MISMATCH)
         try:
-            canonical = candidate.resolve(strict=True)
+            canonical = candidate.resolve(strict=concrete_object_required)
         except OSError as exc:
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_MISSING) from exc
         return cls(
@@ -285,7 +308,6 @@ class ProtectedPathMetadata:
             object_kind=expected_kind,
             is_reparse_point=is_reparse,
         )
-
 
 class ProtectedPathInspector(Protocol):
     def inspect(
@@ -439,7 +461,20 @@ def build_protected_root_manifest(
     entries: list[ProtectedRootEntry] = []
     for role in ProtectedRootRole:
         binding = by_role[role]
-        metadata = inspector.inspect(binding.path, expected_kind=binding.object_kind)
+        concrete_object_required = role not in _OPTIONAL_SQLITE_COMPANION_ROLES
+        try:
+            metadata = inspector.inspect(binding.path, expected_kind=binding.object_kind)
+        except SandboxContractError as exc:
+            if (
+                concrete_object_required
+                or exc.reason is not SandboxFailureReason.PROTECTED_ROOT_MISSING
+            ):
+                raise
+            metadata = ProtectedPathMetadata.for_concrete(
+                binding.path,
+                expected_kind=binding.object_kind,
+                concrete_object_required=False,
+            )
         if metadata.is_reparse_point:
             raise SandboxContractError(SandboxFailureReason.PROTECTED_ROOT_REPARSE_POINT)
         resolved_binding = ProtectedRootBinding(
@@ -453,6 +488,7 @@ def build_protected_root_manifest(
                 role=role,
                 object_kind=metadata.object_kind,
                 path_identity=_safe_path_identity(metadata.canonical_path),
+                concrete_object_required=concrete_object_required,
             )
         )
     payload = {
