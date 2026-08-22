@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from dataclasses import replace
 from hashlib import sha256
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import tradingagents.windows_sandbox_qualification as qualification_module
+from scripts import verify_ticket06_immutable_state as immutable_verifier
 from tradingagents.market_history import (
     DataUsageMode,
     MarketHistoryConfig,
@@ -173,6 +175,100 @@ def _protected_manifest(root: Path):
     return build_protected_root_manifest(tuple(bindings))
 
 
+def _create_historical_provider_ledger(path: Path) -> None:
+    path.unlink()
+    fixture_sequence_ids = tuple(
+        f"fixture-sequence-{index:04d}" for index in range(1020)
+    )
+    sequence_ids = (*immutable_verifier.INCIDENT_SEQUENCE_IDS, *fixture_sequence_ids)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE provider_request_sequences (
+                sequence_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE provider_request_attempts (
+                sequence_id TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                attempt_event_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                upstream_service_name TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                PRIMARY KEY (sequence_id, attempt_index)
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_sequences VALUES (?, 'completed')",
+            ((sequence_id,) for sequence_id in sequence_ids),
+        )
+        incident_attempt_ids = dict(immutable_verifier.INCIDENT_IDENTITIES)
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 1, ?, "
+            "'market-snapshot', 'Yahoo Finance', 'available')",
+            (
+                (
+                    sequence_id,
+                    incident_attempt_ids.get(
+                        sequence_id,
+                        f"fixture-attempt-{sequence_id}-1",
+                    ),
+                )
+                for sequence_id in sequence_ids
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 2, ?, "
+            "'market-snapshot', 'Yahoo Finance', 'available')",
+            (
+                (sequence_id, f"fixture-attempt-{sequence_id}-2")
+                for sequence_id in fixture_sequence_ids[:12]
+            ),
+        )
+
+
+def _append_authorized_live_provider_rows(path: Path) -> tuple[str, ...]:
+    sequence_ids = tuple(
+        f"authorized-live-sequence-{index:02d}" for index in range(11)
+    )
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO provider_request_sequences VALUES (?, 'completed')",
+            ((sequence_id,) for sequence_id in sequence_ids),
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 1, ?, "
+            "'market-snapshot', 'BaoStock', 'available')",
+            (
+                (sequence_id, f"authorized-live-attempt-{index:02d}")
+                for index, sequence_id in enumerate(sequence_ids)
+            ),
+        )
+    return sequence_ids
+
+
+def _create_semantic_calendar(path: Path) -> None:
+    path.unlink()
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE market_session_calendars (
+                calendar_revision_id TEXT PRIMARY KEY,
+                payload_digest TEXT NOT NULL
+            );
+            CREATE TABLE market_sessions (
+                calendar_revision_id TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                session_status TEXT NOT NULL,
+                PRIMARY KEY (calendar_revision_id, session_date)
+            );
+            INSERT INTO market_session_calendars VALUES ('calendar-1', 'digest-1');
+            INSERT INTO market_sessions VALUES ('calendar-1', '2026-08-20', 'open');
+            """
+        )
+
+
 def _materialize_required_default_roots(
     bindings: tuple[ProtectedRootBinding, ...],
 ) -> None:
@@ -333,6 +429,99 @@ def test_iso_03_host_inventory_is_deterministic_and_detects_rewrites(
     delta = compare_protected_host_inventories(before, after)
     assert delta.equal is False
     assert (delta.appended, delta.deleted, delta.rewritten) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("mutation", ("append", "delete", "rewrite"))
+def test_iso_03_current_provider_ledger_capture_is_self_relative_and_detects_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    by_role = {binding.role: binding.path for binding in manifest.bindings}
+    provider_ledger = by_role[ProtectedRootRole.PROVIDER_LEDGER]
+    calendar_database = by_role[ProtectedRootRole.CALENDAR_DATABASE]
+    _create_historical_provider_ledger(provider_ledger)
+    _create_semantic_calendar(calendar_database)
+
+    with sqlite3.connect(provider_ledger) as connection:
+        historical_counts = (
+            connection.execute(
+                "SELECT COUNT(*) FROM provider_request_sequences"
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM provider_request_attempts"
+            ).fetchone()[0],
+        )
+    assert historical_counts == (1024, 1036)
+
+    authorized_sequence_ids = _append_authorized_live_provider_rows(provider_ledger)
+
+    def semantic_capture() -> dict[str, object]:
+        return qualification_module._immutable_semantic_capture(
+            manifest,
+            capture=immutable_verifier.capture_immutable_state,
+        )
+
+    current = semantic_capture()
+    sequences = current["provider_ledger"]["sequences"]
+    attempts = current["provider_ledger"]["attempts"]
+    assert (sequences["count"], attempts["count"]) == (1035, 1047)
+    assert sequences["inventory_sha256"] == (
+        "643dfdb9ac8ccc4bf4377e18451c3b931450587a38adfd71fba1a4790b438155"
+    )
+    assert attempts["inventory_sha256"] == (
+        "0e96170bb4dac96fa382aacd46e32e444075971c9813756a975c5f26c95bcbbf"
+    )
+    assert semantic_capture() == current
+
+    verifier_identity = "immutable-verifier:sha256:" + ("c" * 64)
+    sentinel = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=semantic_capture,
+        immutable_verifier_identity=verifier_identity,
+    )
+    with sqlite3.connect(provider_ledger) as connection:
+        target = authorized_sequence_ids[-1]
+        if mutation == "append":
+            connection.execute(
+                "INSERT INTO provider_request_sequences VALUES "
+                "('qualification-window-append', 'completed')"
+            )
+            connection.execute(
+                "INSERT INTO provider_request_attempts VALUES "
+                "('qualification-window-append', 1, 'qualification-window-attempt', "
+                "'market-snapshot', 'BaoStock', 'available')"
+            )
+        elif mutation == "delete":
+            connection.execute(
+                "DELETE FROM provider_request_attempts WHERE sequence_id = ?",
+                (target,),
+            )
+            connection.execute(
+                "DELETE FROM provider_request_sequences WHERE sequence_id = ?",
+                (target,),
+            )
+        else:
+            connection.execute(
+                "UPDATE provider_request_sequences SET status = 'failed' "
+                "WHERE sequence_id = ?",
+                (target,),
+            )
+            connection.execute(
+                "UPDATE provider_request_attempts SET outcome = 'provider_error' "
+                "WHERE sequence_id = ?",
+                (target,),
+            )
+
+    after = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=semantic_capture,
+        immutable_verifier_identity=verifier_identity,
+    )
+    delta = compare_protected_host_inventories(sentinel, after)
+
+    assert delta.equal is False
+    assert delta.semantic_equal is False
 
 
 def test_iso_03_clean_close_keeps_absent_sqlite_companions_as_empty_protected_roots(

@@ -4481,7 +4481,7 @@ def _immutable_semantic_capture(
             ticket07_root=by_role[ProtectedRootRole.TICKET07_EVIDENCE],
             reports_root=by_role[ProtectedRootRole.REPORTS_LOGS],
             checkpoints_root=by_role[ProtectedRootRole.CHECKPOINTS],
-            enforce_expected_counts=True,
+            enforce_expected_counts=False,
         )
     finally:
         for name, value in previous.items():
