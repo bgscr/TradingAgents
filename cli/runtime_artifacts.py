@@ -364,6 +364,7 @@ class RuntimeArtifactWriter:
                 "circuit_breaker_events": circuit_breaker_events,
                 "unavailable_reasons": dict(sorted(reasons.items())),
             },
+            "model_transport": None,
         }
         if run_telemetry is not None:
             projection = RunTelemetryProjection.model_validate(run_telemetry)
@@ -372,6 +373,10 @@ class RuntimeArtifactWriter:
                 name: stage.model_dump(mode="json")
                 for name, stage in projection.stages.items()
             }
+            if projection.model_transport is not None:
+                summary["model_transport"] = projection.model_transport.model_dump(
+                    mode="json"
+                )
         with self._metrics_lock:
             self._terminal_summary = summary
 

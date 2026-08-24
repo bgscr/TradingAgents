@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping
 from threading import Lock
 from typing import Any, Literal
@@ -21,13 +21,174 @@ from tradingagents.evidence import (
     SourceAcquisitionUnavailable,
 )
 
-RUN_TELEMETRY_CONTRACT_VERSION = "1.0"
+RUN_TELEMETRY_CONTRACT_VERSION = "1.1"
+ACQUISITION_TELEMETRY_EVENT_CONTRACT_VERSION = "1.0"
+MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION = "1.0"
+MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS = 256
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 RunTelemetryTerminalRoute = Literal[
     "trading_decision",
     "analysis_outcome",
     "operational_failure",
 ]
+ModelTransportAttemptDisposition = Literal[
+    "success",
+    "retryable_transport_failure",
+    "terminal_transport_failure",
+    "status_failure",
+]
+
+
+class ModelTransportAttempt(BaseModel):
+    """Closed safe projection of one physical OpenAI-compatible request."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
+    logical_call_id: str = Field(pattern=r"^model-call-[0-9]{6,}$")
+    attempt_ordinal: int = Field(ge=0)
+    configured_max_retries: int = Field(ge=0)
+    retry_index: int | None = Field(default=None, ge=0)
+    provider_family: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    model_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/+-]*$",
+    )
+    endpoint_host: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]*$",
+    )
+    elapsed_seconds: float = Field(ge=0)
+    disposition: ModelTransportAttemptDisposition
+    exception_class: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    )
+    exception_family: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    provider_request_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+
+    @model_validator(mode="after")
+    def _failure_fields_match_disposition(self) -> ModelTransportAttempt:
+        is_transport_failure = self.disposition in {
+            "retryable_transport_failure",
+            "terminal_transport_failure",
+        }
+        if is_transport_failure != (
+            self.exception_class is not None and self.exception_family is not None
+        ):
+            raise ValueError(
+                "transport failure disposition must match typed exception metadata"
+            )
+        if self.disposition == "status_failure":
+            if self.http_status is None or self.http_status < 400:
+                raise ValueError("status failure requires an HTTP failure status")
+        elif self.disposition == "success" and (
+            self.http_status is not None and self.http_status >= 400
+        ):
+            raise ValueError("successful transport attempt cannot carry failure status")
+        if self.attempt_ordinal > self.configured_max_retries:
+            raise ValueError("attempt ordinal exceeds configured retry budget")
+        if (
+            self.retry_index is not None
+            and self.retry_index > self.configured_max_retries
+        ):
+            raise ValueError("SDK retry index exceeds configured retry budget")
+        return self
+
+
+class ModelTransportProviderModelAttempts(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    provider_family: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    model_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/+-]*$",
+    )
+    physical_attempts: int = Field(ge=1)
+
+
+class ModelTransportAttemptSummary(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    physical_attempts: int = Field(ge=0)
+    retries_observed: int = Field(ge=0)
+    successful_attempts: int = Field(ge=0)
+    retryable_failures: int = Field(ge=0)
+    terminal_failures: int = Field(ge=0)
+    status_failures: int = Field(ge=0)
+    retained_attempt_records: int = Field(ge=0)
+    dropped_attempt_records: int = Field(ge=0)
+    by_provider_model: tuple[ModelTransportProviderModelAttempts, ...] = ()
+
+    @model_validator(mode="after")
+    def _counts_are_internally_consistent(self) -> ModelTransportAttemptSummary:
+        disposition_total = (
+            self.successful_attempts
+            + self.retryable_failures
+            + self.terminal_failures
+            + self.status_failures
+        )
+        if disposition_total != self.physical_attempts:
+            raise ValueError("transport disposition totals must equal physical attempts")
+        if (
+            self.retained_attempt_records + self.dropped_attempt_records
+            != self.physical_attempts
+        ):
+            raise ValueError("retained and dropped records must equal physical attempts")
+        if self.retries_observed > self.physical_attempts:
+            raise ValueError("observed retries cannot exceed physical attempts")
+        if sum(item.physical_attempts for item in self.by_provider_model) != (
+            self.physical_attempts
+        ):
+            raise ValueError("provider/model totals must equal physical attempts")
+        provider_model_keys = {
+            (item.provider_family, item.model_id) for item in self.by_provider_model
+        }
+        if len(provider_model_keys) != len(self.by_provider_model):
+            raise ValueError("provider/model summary keys must be unique")
+        return self
+
+
+class ModelTransportAttemptProjection(BaseModel):
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
+    retention_limit: Literal[256] = MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS
+    attempts: tuple[ModelTransportAttempt, ...] = ()
+    summary: ModelTransportAttemptSummary
+
+    @model_validator(mode="after")
+    def _retained_records_match_summary(self) -> ModelTransportAttemptProjection:
+        if len(self.attempts) != self.summary.retained_attempt_records:
+            raise ValueError("retained attempt count must match the attempt records")
+        identities = {
+            (attempt.logical_call_id, attempt.attempt_ordinal)
+            for attempt in self.attempts
+        }
+        if len(identities) != len(self.attempts):
+            raise ValueError("retained model transport attempt identities must be unique")
+        return self
 
 
 class AcquisitionTelemetryOutcome(BaseModel):
@@ -93,7 +254,7 @@ class AcquisitionTelemetryOutcome(BaseModel):
 class AcquisitionTelemetryEvent(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = RUN_TELEMETRY_CONTRACT_VERSION
+    contract_version: Literal["1.0"] = ACQUISITION_TELEMETRY_EVENT_CONTRACT_VERSION
     tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
     tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     outcome: AcquisitionTelemetryOutcome
@@ -146,10 +307,19 @@ class StageTelemetry(BaseModel):
 class RunTelemetryProjection(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = RUN_TELEMETRY_CONTRACT_VERSION
+    contract_version: Literal["1.0", "1.1"] = RUN_TELEMETRY_CONTRACT_VERSION
     terminal_route: RunTelemetryTerminalRoute | None = None
     acquisition: AcquisitionTelemetryProjection
     stages: dict[str, StageTelemetry] = Field(default_factory=dict)
+    model_transport: ModelTransportAttemptProjection | None = None
+
+    @model_validator(mode="after")
+    def _transport_matches_contract_version(self) -> RunTelemetryProjection:
+        if self.contract_version == "1.0" and self.model_transport is not None:
+            raise ValueError("run telemetry v1.0 cannot contain model transport data")
+        if self.contract_version == "1.1" and self.model_transport is None:
+            raise ValueError("run telemetry v1.1 requires model transport data")
+        return self
 
     @classmethod
     def empty(
@@ -158,6 +328,7 @@ class RunTelemetryProjection(BaseModel):
         terminal_route: RunTelemetryTerminalRoute | None = None,
     ) -> RunTelemetryProjection:
         return cls(
+            contract_version="1.0",
             terminal_route=terminal_route,
             acquisition=AcquisitionTelemetryProjection(
                 summary=AcquisitionTelemetrySummary(
@@ -180,7 +351,91 @@ class RunTelemetryLedger:
         self._events: list[AcquisitionTelemetryEvent] = []
         self._current_stage = "unassigned"
         self._stages: dict[str, dict[str, float | int]] = {}
+        self._next_model_transport_call = 1
+        self._model_transport_attempt_counts: dict[str, int] = {}
+        self._pending_model_transport_failures: dict[str, ModelTransportAttempt] = {}
+        self._model_transport_attempts: deque[ModelTransportAttempt] = deque(
+            maxlen=MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS
+        )
+        self._model_transport_dispositions: Counter[str] = Counter()
+        self._model_transport_provider_models: Counter[tuple[str, str]] = Counter()
+        self._model_transport_physical_attempts = 0
+        self._model_transport_retries_observed = 0
+        self._model_transport_dropped_records = 0
         self._lock = Lock()
+
+    def begin_model_transport_call(self) -> str:
+        """Allocate a deterministic run-local identity for one logical model call."""
+
+        with self._lock:
+            logical_call_id = f"model-call-{self._next_model_transport_call:06d}"
+            self._next_model_transport_call += 1
+            self._model_transport_attempt_counts[logical_call_id] = 0
+            return logical_call_id
+
+    def begin_model_transport_attempt(self, logical_call_id: str) -> int:
+        """Observe an actual SDK send and settle any preceding failure as retried."""
+
+        with self._lock:
+            pending = self._pending_model_transport_failures.pop(
+                logical_call_id,
+                None,
+            )
+            if pending is not None:
+                self._retain_model_transport_attempt(
+                    pending.model_copy(
+                        update={"disposition": "retryable_transport_failure"}
+                    )
+                )
+            try:
+                attempt_ordinal = self._model_transport_attempt_counts[logical_call_id]
+            except KeyError as exc:
+                raise ValueError("unknown logical model transport call") from exc
+            self._model_transport_attempt_counts[logical_call_id] = attempt_ordinal + 1
+            return attempt_ordinal
+
+    def record_model_transport_response(
+        self,
+        attempt: ModelTransportAttempt,
+    ) -> None:
+        if attempt.disposition not in {"success", "status_failure"}:
+            raise ValueError("response attempt requires a response disposition")
+        with self._lock:
+            self._retain_model_transport_attempt(attempt)
+
+    def record_model_transport_failure(
+        self,
+        attempt: ModelTransportAttempt,
+    ) -> None:
+        if attempt.disposition != "terminal_transport_failure":
+            raise ValueError("pending transport failure must use terminal disposition")
+        with self._lock:
+            if attempt.logical_call_id in self._pending_model_transport_failures:
+                raise ValueError("logical model call already has a pending failure")
+            self._pending_model_transport_failures[attempt.logical_call_id] = attempt
+
+    def finish_model_transport_call(self, logical_call_id: str) -> None:
+        """Settle the last observed physical failure without deciding SDK retries."""
+
+        with self._lock:
+            pending = self._pending_model_transport_failures.pop(
+                logical_call_id,
+                None,
+            )
+            if pending is not None:
+                self._retain_model_transport_attempt(pending)
+            self._model_transport_attempt_counts.pop(logical_call_id, None)
+
+    def _retain_model_transport_attempt(self, attempt: ModelTransportAttempt) -> None:
+        if len(self._model_transport_attempts) == MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS:
+            self._model_transport_dropped_records += 1
+        self._model_transport_attempts.append(attempt)
+        self._model_transport_physical_attempts += 1
+        self._model_transport_retries_observed += int(attempt.attempt_ordinal > 0)
+        self._model_transport_dispositions[attempt.disposition] += 1
+        self._model_transport_provider_models[
+            (attempt.provider_family, attempt.model_id)
+        ] += 1
 
     def transition_stage(self, stage: str) -> None:
         normalized = str(stage).strip()
@@ -283,6 +538,12 @@ class RunTelemetryLedger:
                 )
                 for name, values in sorted(self._stages.items())
             }
+            transport_attempts = tuple(self._model_transport_attempts)
+            transport_dispositions = self._model_transport_dispositions.copy()
+            transport_by_provider_model = self._model_transport_provider_models.copy()
+            transport_physical_attempts = self._model_transport_physical_attempts
+            transport_retries_observed = self._model_transport_retries_observed
+            transport_dropped_records = self._model_transport_dropped_records
         reasons: Counter[str] = Counter()
         maximum_attempts: dict[tuple[str, str, str, str], int] = {}
         available = 0
@@ -320,6 +581,33 @@ class RunTelemetryLedger:
             circuit_breaker_events=circuit_events,
             unavailable_reasons=dict(sorted(reasons.items())),
         )
+        model_transport = ModelTransportAttemptProjection(
+            attempts=transport_attempts,
+            summary=ModelTransportAttemptSummary(
+                physical_attempts=transport_physical_attempts,
+                retries_observed=transport_retries_observed,
+                successful_attempts=transport_dispositions["success"],
+                retryable_failures=transport_dispositions[
+                    "retryable_transport_failure"
+                ],
+                terminal_failures=transport_dispositions[
+                    "terminal_transport_failure"
+                ],
+                status_failures=transport_dispositions["status_failure"],
+                retained_attempt_records=len(transport_attempts),
+                dropped_attempt_records=transport_dropped_records,
+                by_provider_model=tuple(
+                    ModelTransportProviderModelAttempts(
+                        provider_family=provider_family,
+                        model_id=model_id,
+                        physical_attempts=count,
+                    )
+                    for (provider_family, model_id), count in sorted(
+                        transport_by_provider_model.items()
+                    )
+                ),
+            ),
+        )
         return RunTelemetryProjection(
             terminal_route=terminal_route,
             acquisition=AcquisitionTelemetryProjection(
@@ -327,6 +615,7 @@ class RunTelemetryLedger:
                 summary=summary,
             ),
             stages=stages,
+            model_transport=model_transport,
         )
 
 

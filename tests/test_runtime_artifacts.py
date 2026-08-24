@@ -252,6 +252,184 @@ def test_terminal_metrics_aggregate_calls_cost_retries_and_routing(tmp_path):
 
 
 @pytest.mark.unit
+def test_terminal_metrics_round_trip_bounded_model_transport_projection(tmp_path):
+    from cli.runtime_artifacts import RuntimeArtifactWriter
+    from tradingagents.run_telemetry import (
+        ModelTransportAttempt,
+        RunTelemetryLedger,
+    )
+
+    ledger = RunTelemetryLedger()
+    logical_call_id = ledger.begin_model_transport_call()
+    attempt_ordinal = ledger.begin_model_transport_attempt(logical_call_id)
+    ledger.record_model_transport_response(
+        ModelTransportAttempt(
+            logical_call_id=logical_call_id,
+            attempt_ordinal=attempt_ordinal,
+            configured_max_retries=2,
+            retry_index=0,
+            provider_family="deepseek",
+            model_id="deepseek-chat",
+            endpoint_host="api.deepseek.com",
+            elapsed_seconds=0.125,
+            disposition="success",
+            http_status=200,
+            provider_request_id="safe-request-1",
+        )
+    )
+    ledger.finish_model_transport_call(logical_call_id)
+    projection = ledger.finalize(terminal_route="analysis_outcome")
+    assert projection.model_transport is not None
+    assert projection.contract_version == "1.1"
+
+    metrics_path = tmp_path / "runtime_metrics.json"
+    writer = RuntimeArtifactWriter(
+        artifact_root=tmp_path / "runtime_artifacts",
+        log_paths=[tmp_path / "message_tool.log"],
+        metrics_path=metrics_path,
+    )
+    writer.record_terminal_summary(
+        terminal_route="analysis_outcome",
+        run_telemetry=projection.model_dump(mode="json"),
+    )
+    writer.close()
+
+    terminal = json.loads(metrics_path.read_text(encoding="utf-8"))["terminal"]
+    assert terminal["model_transport"] == projection.model_transport.model_dump(
+        mode="json"
+    )
+    assert terminal["model_transport"]["contract_version"] == "1.0"
+    assert terminal["model_transport"]["retention_limit"] == 256
+    assert terminal["model_transport"]["summary"]["physical_attempts"] == 1
+    assert terminal["model_transport"]["attempts"][0]["logical_call_id"] == (
+        "model-call-000001"
+    )
+
+
+@pytest.mark.unit
+def test_closed_model_transport_contract_rejects_inconsistent_counts():
+    from pydantic import ValidationError
+
+    from tradingagents.run_telemetry import (
+        ModelTransportAttemptProjection,
+        RunTelemetryProjection,
+    )
+
+    payload = {
+        "contract_version": "1.0",
+        "retention_limit": 256,
+        "attempts": [],
+        "summary": {
+            "physical_attempts": 1,
+            "retries_observed": 0,
+            "successful_attempts": 1,
+            "retryable_failures": 0,
+            "terminal_failures": 0,
+            "status_failures": 0,
+            "retained_attempt_records": 0,
+            "dropped_attempt_records": 0,
+            "by_provider_model": [],
+        },
+    }
+    with pytest.raises(ValidationError, match="retained and dropped records"):
+        ModelTransportAttemptProjection.model_validate(payload)
+
+    historical_payload = RunTelemetryProjection.empty().model_dump(mode="json")
+    historical_payload["model_transport"] = {
+        **payload,
+        "summary": {
+            **payload["summary"],
+            "physical_attempts": 0,
+            "successful_attempts": 0,
+        },
+    }
+    with pytest.raises(ValidationError, match="v1.0 cannot contain model transport"):
+        RunTelemetryProjection.model_validate(historical_payload)
+
+
+@pytest.mark.unit
+def test_model_transport_projection_reports_deterministic_retention_overflow():
+    from tradingagents.run_telemetry import (
+        MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS,
+        ModelTransportAttempt,
+        RunTelemetryLedger,
+    )
+
+    ledger = RunTelemetryLedger()
+    for _ in range(MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS + 1):
+        logical_call_id = ledger.begin_model_transport_call()
+        attempt_ordinal = ledger.begin_model_transport_attempt(logical_call_id)
+        ledger.record_model_transport_response(
+            ModelTransportAttempt(
+                logical_call_id=logical_call_id,
+                attempt_ordinal=attempt_ordinal,
+                configured_max_retries=0,
+                retry_index=0,
+                provider_family="deepseek",
+                model_id="deepseek-chat",
+                endpoint_host="api.deepseek.com",
+                elapsed_seconds=0.001,
+                disposition="success",
+                http_status=200,
+            )
+        )
+        ledger.finish_model_transport_call(logical_call_id)
+
+    model_transport = ledger.finalize().model_transport
+    assert model_transport is not None
+    assert model_transport.summary.physical_attempts == 257
+    assert model_transport.summary.retained_attempt_records == 256
+    assert model_transport.summary.dropped_attempt_records == 1
+    assert len(model_transport.attempts) == 256
+    assert model_transport.attempts[0].logical_call_id == "model-call-000002"
+    assert model_transport.attempts[-1].logical_call_id == "model-call-000257"
+
+
+@pytest.mark.unit
+def test_historical_run_telemetry_without_transport_projection_is_unavailable(
+    tmp_path,
+):
+    from cli.runtime_artifacts import RuntimeArtifactWriter
+    from tradingagents.run_telemetry import RunTelemetryProjection
+
+    historical = RunTelemetryProjection.model_validate(
+        {
+            "contract_version": "1.0",
+            "terminal_route": "operational_failure",
+            "acquisition": {
+                "events": [],
+                "summary": {
+                    "attempts": 0,
+                    "available": 0,
+                    "unavailable": 0,
+                    "retryable_unavailable": 0,
+                    "retry_events": 0,
+                    "circuit_breaker_events": 0,
+                    "unavailable_reasons": {},
+                },
+            },
+            "stages": {},
+        }
+    )
+    assert historical.model_transport is None
+
+    metrics_path = tmp_path / "runtime_metrics.json"
+    writer = RuntimeArtifactWriter(
+        artifact_root=tmp_path / "runtime_artifacts",
+        log_paths=[tmp_path / "message_tool.log"],
+        metrics_path=metrics_path,
+    )
+    writer.record_terminal_summary(
+        terminal_route="operational_failure",
+        run_telemetry=historical.model_dump(mode="json"),
+    )
+    writer.close()
+
+    terminal = json.loads(metrics_path.read_text(encoding="utf-8"))["terminal"]
+    assert terminal["model_transport"] is None
+
+
+@pytest.mark.unit
 def test_critical_event_is_synchronous_after_pending_detail(tmp_path):
     from cli.runtime_artifacts import RuntimeArtifactWriter
 
