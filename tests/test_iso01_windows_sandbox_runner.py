@@ -1583,6 +1583,11 @@ def test_iso_01_no_launch_cli_emits_bounded_safe_construction_receipt(
     (tmp_path / "cli-runs").mkdir()
     monkeypatch.setenv("USERPROFILE", str(request.user_profile))
     monkeypatch.setattr(
+        run_iso01_windows_sandbox.tempfile,
+        "gettempdir",
+        lambda: str(request.host_temp),
+    )
+    monkeypatch.setattr(
         run_iso01_windows_sandbox,
         "default_protected_root_bindings",
         lambda **_kwargs: request.protected_root_bindings,

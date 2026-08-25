@@ -38,11 +38,15 @@ from tradingagents.market_history.coordinator import (
 PROVIDER_SUBREQUEST_KEY_VERSION = "1.0"
 PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION = "1.1"
 PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION = "1.2"
+PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION = "1.3"
 FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION = (
     "financial-eligibility-acquisition-context-v1"
 )
 FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION = (
     "financial-eligibility-acquisition-context-v2"
+)
+FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION = (
+    "financial-eligibility-acquisition-context-v3"
 )
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
@@ -555,18 +559,19 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
 class ProviderSubrequestCacheCheckpoint(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1", "1.2"] = "1.0"
+    contract_version: Literal["1.0", "1.1", "1.2", "1.3"] = "1.0"
     run_scope_id: str = Field(pattern=_SAFE_ID_PATTERN)
     financial_eligibility_context_contract_version: Literal[
         "financial-eligibility-acquisition-context-v1",
         "financial-eligibility-acquisition-context-v2",
+        "financial-eligibility-acquisition-context-v3",
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     financial_eligibility_context_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$",
+        pattern=r"^financial-eligibility-acquisition-context:v[123]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
-    capability_routing_plan_version: Literal["1.3"] | None = Field(
+    capability_routing_plan_version: Literal["1.3", "1.4"] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -604,6 +609,7 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
         context_bound_version = self.contract_version in {
             PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION,
             PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION,
         }
         if context_bound_version != has_context_binding:
             raise ValueError("provider subrequest context binding is incomplete")
@@ -613,14 +619,28 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             self.financial_eligibility_metadata_binding,
             self.calendar_eligibility_binding,
         )
-        temporal = (
-            self.contract_version
-            == PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
-        )
+        temporal = self.contract_version in {
+            PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION,
+        }
         if temporal:
+            windowed = (
+                self.contract_version
+                == PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION
+            )
+            expected_context_version = (
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION
+                if windowed
+                else FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            )
+            expected_metadata_version = (
+                "financial-eligibility-metadata-binding-v3"
+                if windowed
+                else "financial-eligibility-metadata-binding-v2"
+            )
             if (
                 self.financial_eligibility_context_contract_version
-                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                != expected_context_version
                 or any(value is None for value in temporal_values)
                 or len(self.temporal_decisions) != 2
             ):
@@ -639,12 +659,18 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
                 )
             )
             if (
-                metadata_binding.contract_version
-                != "financial-eligibility-metadata-binding-v2"
+                metadata_binding.contract_version != expected_metadata_version
                 or metadata_binding.routing_plan_signature
                 != self.capability_routing_plan_signature
-                or metadata_binding.calendar_binding
-                != self.calendar_eligibility_binding
+                or (
+                    metadata_binding.calendar_binding
+                    != (
+                        self.temporal_decisions[0].acquisition_window.calendar_binding.started
+                        if windowed
+                        and self.temporal_decisions[0].acquisition_window is not None
+                        else self.calendar_eligibility_binding
+                    )
+                )
                 or self.temporal_artifact_identities != expected_artifacts
                 or tuple(
                     decision.evidence_class for decision in self.temporal_decisions
@@ -662,6 +688,7 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
                 or any(
                     decision.calendar_binding != self.calendar_eligibility_binding
                     or decision.mode != metadata_binding.temporal_mode.value
+                    or windowed != (decision.acquisition_window is not None)
                     for decision in self.temporal_decisions
                 )
             ):
@@ -671,7 +698,10 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             or self.temporal_decisions
             or self.temporal_artifact_identities
             or self.financial_eligibility_context_contract_version
-            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            in {
+                FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+            }
         ):
             raise ValueError(
                 "historical provider subrequest checkpoint carries temporal state"
@@ -768,20 +798,31 @@ class ProviderSubrequestCache:
     ) -> None:
         """Single-assign the safe context identity governing this run cache."""
 
-        temporal = (
+        temporal = context_contract_version in {
+            FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+            FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+        }
+        windowed = (
             context_contract_version
-            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            == FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION
         )
-        expected_identity_pattern = (
-            r"financial-eligibility-acquisition-context:v2:[0-9a-f]{64}"
-            if temporal
-            else r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}"
-        )
+        expected_identity_pattern = {
+            FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}"
+            ),
+            FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v2:[0-9a-f]{64}"
+            ),
+            FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v3:[0-9a-f]{64}"
+            ),
+        }.get(context_contract_version, r"(?!)")
         if (
             context_contract_version
             not in {
                 FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION,
                 FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
             }
             or re.fullmatch(expected_identity_pattern, context_identity) is None
             or _contains_reserved_secret_text(
@@ -805,10 +846,10 @@ class ProviderSubrequestCache:
                     capability_routing_plan,
                     MainlandCapabilityRoutingPlan,
                 )
-                or context.contract_version
-                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                or context.contract_version != context_contract_version
                 or context.context_identity != context_identity
-                or capability_routing_plan.plan_version != "1.3"
+                or capability_routing_plan.plan_version
+                != ("1.4" if windowed else "1.3")
                 or context.routing_plan_signature
                 != capability_routing_plan.plan_signature
                 or context.temporal_eligibility_binding is None
@@ -818,7 +859,11 @@ class ProviderSubrequestCache:
                 )
             bound = context.temporal_eligibility_binding
             metadata_binding = FinancialEligibilityMetadataBinding(
-                contract_version="financial-eligibility-metadata-binding-v2",
+                contract_version=(
+                    "financial-eligibility-metadata-binding-v3"
+                    if windowed
+                    else "financial-eligibility-metadata-binding-v2"
+                ),
                 instrument_identity=context.instrument_identity,
                 requested_session=context.requested_session,
                 availability_scope=context.availability_scope,
@@ -826,8 +871,19 @@ class ProviderSubrequestCache:
                 financial_eligibility_binding=context.financial_eligibility_binding,
                 routing_plan_signature=context.routing_plan_signature,
                 temporal_mode=bound.temporal_mode,
-                eligibility_evaluated_at=bound.eligibility_evaluated_at,
-                calendar_binding=bound.calendar_binding,
+                eligibility_evaluated_at=(
+                    None if windowed else bound.eligibility_evaluated_at
+                ),
+                eligibility_started_at=(
+                    bound.acquisition_window.eligibility_started_at
+                    if windowed and bound.acquisition_window is not None
+                    else None
+                ),
+                calendar_binding=(
+                    bound.acquisition_window.calendar_binding.started
+                    if windowed and bound.acquisition_window is not None
+                    else bound.calendar_binding
+                ),
                 strict_cutoff=bound.strict_cutoff,
             )
             decisions = (
@@ -932,12 +988,17 @@ class ProviderSubrequestCache:
             temporal_artifact_identities = self._temporal_artifact_identities
         return ProviderSubrequestCacheCheckpoint(
             contract_version=(
-                PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
-                if plan_version is not None
+                PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION
+                if context_contract_version
+                == FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION
                 else (
-                    PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
-                    if context_identity is not None
-                    else "1.0"
+                    PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
+                    if plan_version is not None
+                    else (
+                        PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
+                        if context_identity is not None
+                        else "1.0"
+                    )
                 )
             ),
             run_scope_id=self._run_scope_id,

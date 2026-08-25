@@ -18,7 +18,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingCheckpointFailureReason,
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
-    prepare_mainland_temporal_capability_routing_plan,
+    prepare_mainland_temporal_capability_routing_plan_v1,
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
@@ -145,7 +145,7 @@ def _temporal_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[object, MainlandCapabilityRoutingPlan]:
     asset, plan = _qualified_plan(monkeypatch)
-    return asset, prepare_mainland_temporal_capability_routing_plan(plan)
+    return asset, prepare_mainland_temporal_capability_routing_plan_v1(plan)
 
 
 def _stored_calendar() -> StoredSessionCalendar:
@@ -1731,7 +1731,7 @@ def test_plan_1_2_requires_typed_start_new_under_temporal_plan_1_3(
     )
     assert preflight.plan is not None
     historical_plan = preflight.plan
-    temporal_plan = prepare_mainland_temporal_capability_routing_plan(
+    temporal_plan = prepare_mainland_temporal_capability_routing_plan_v1(
         historical_plan
     )
 
@@ -1768,7 +1768,7 @@ def test_temporal_start_new_acquires_fresh_context_for_distinct_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset, historical_plan = _qualified_plan(monkeypatch)
-    temporal_plan = prepare_mainland_temporal_capability_routing_plan(
+    temporal_plan = prepare_mainland_temporal_capability_routing_plan_v1(
         historical_plan
     )
     _fixture_asset, _fixture_plan, fixture_context = _temporal_context(

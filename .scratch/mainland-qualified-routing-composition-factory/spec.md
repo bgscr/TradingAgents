@@ -57,6 +57,17 @@ prove when the evidence became effective or available. The failed run and all
 historical state remain immutable, Ticket 07 remains **BLOCKED**, and
 authoritative `qualified_v1` remains disabled.
 
+The fresh `601328.SS / 20260825_083711` attempt exposed a fifth Critical gap:
+temporal v1 samples `eligibility_evaluated_at` before physical acquisition,
+while production adapters truthfully assign `retrieved_at` after the response
+arrives, and the evaluator rejects every later retrieval. The retained run and
+checkpoint remain immutable. This is a contract time-order defect rather than
+provider unavailability: a deterministic one-second provider delay reproduces
+`temporal_eligibility_rejected` and `shadow_dispatch_failed` before BaoStock
+lifecycle work. Plan 1.3/context v2 remain historical readers only; new Ticket
+07 readiness is blocked until the forward Eligibility Acquisition Window below
+passes the complete deterministic and ISO chain.
+
 The earlier Ticket 06 post-temporal milestone was **PASS**. At that point Ticket
 07 was blocked on operational calendar authority because the production Point-
 in-Time Market History Store had no persisted mainland Market Session Calendar
@@ -167,6 +178,19 @@ evaluated in one transaction once inside the existing run-owned
 single-flight with an injected fixed `eligibility_evaluated_at`. Exact replay
 uses the recorded decision inputs and result with zero provider/model I/O; it
 does not consult today's calendar frontier or reinterpret historical evidence.
+
+For new writes, temporal v2 supersedes the impossible fresh-acquisition timing
+in v1 without reinterpreting it. One single-flight leader samples
+`eligibility_started_at` before retained/provider work and pins one exact Market
+Session Calendar revision. After the required company-type and BaoStock
+lifecycle proofs are selected, the same leader samples one terminal
+`eligibility_evaluated_at` before context binding. Fresh proof must satisfy
+`eligibility_started_at <= observed_at <= retrieved_at <= eligibility_evaluated_at`;
+the requested session must still be the pinned calendar's latest completed
+session at terminal evaluation. Crossing the next open session's close fails
+the entire context. Provider proof derivations, strict-PIT cutoffs, sequential
+routes, attempt ownership, historical replay, legacy authority, and
+`shadow_non_authoritative` remain unchanged.
 
 Use calendar-bootstrap **Design D** to close the remaining prerequisite: an
 explicit operator invokes one standalone, bounded, Instrument-neutral BaoStock
@@ -931,6 +955,46 @@ from this closed v1 vocabulary:
 No reason in this vocabulary authorizes fallback or provider ordering. Adding,
 removing, or changing a reason condition requires a new temporal policy version;
 unknown reasons fail checkpoint compatibility.
+
+### Forward fresh-acquisition temporal policy v2
+
+Temporal v1, Capability Routing Plan 1.3, and Financial Eligibility Acquisition
+Context v2 are frozen historical contracts. New writes use plan 1.4 and one
+`financial-eligibility-acquisition-window-v1` whose closed material is:
+
+| Field | Normative meaning |
+| --- | --- |
+| `transaction_binding` | One content-derived binding to the canonical run ID, routing-plan signature, mode, requested session, start instant/calendar, and strict cutoff. Every staged proof and final decision must carry this active transaction identity. |
+| `eligibility_started_at` | One aware instant sampled by the acquisition leader before retained-state inspection or provider work. It pins the transaction and exact calendar revision; it is not provider proof or the terminal decision time. |
+| `eligibility_evaluated_at` | One aware terminal instant sampled by the same leader after required proofs are selected and before context binding. It is the no-future upper bound for the terminal decision. |
+| `calendar_revision_id` | The one exact pinned Market Session Calendar revision shared by start, terminal evaluation, context, checkpoint, and replay. No second calendar acquisition/read occurs. |
+| `started_latest_completed_session` | Calendar-derived frontier at transaction start. It must equal `requested_session` before provider work. |
+| `evaluated_latest_completed_session` | Calendar-derived frontier at terminal evaluation. It must still equal `requested_session`; otherwise acquisition crossed a session-close boundary and fails closed. |
+
+Provider routing may stage only structurally and provenance-qualified evidence
+under the existing sequential plan. Staging is internal to the one transaction:
+it is not an accepted temporal decision, cannot enter a context/checkpoint, and
+cannot expose a dispatcher. Each staged binding records the active transaction
+identity and whether the exact proof is `fresh` or `retained`; raw provider
+proof remains unchanged. The transaction seals once and emits the final
+company-type and listing decisions together. Provider proof failures may
+continue normal fallback; a terminal transaction/frontier failure cannot be
+repaired by a lower provider.
+
+For fresh current-analysis proof, v2 requires
+`eligibility_started_at <= observed_at <= retrieved_at <= eligibility_evaluated_at`,
+the existing requested-session-close lower bound, complete provider-derived
+effective/publication proof, exact artifact/row/revision and active-transaction
+binding, and the terminal latest-completed-session equality. Retained proof has
+no fresh transaction-origin claim but remains bounded by the terminal instant.
+Strict PIT continues to use its independent `strict_cutoff` and exact-revision
+availability rules; membership in the acquisition window never proves past
+availability.
+
+All v2 window inputs, both final decisions, and their identities are persisted
+for zero-I/O exact replay. Historical v1 decisions are validated only by their
+recorded readers. No failed run, checkpoint, artifact, attempt, baseline, or
+decision is migrated, relabeled, or re-evaluated.
 
 ### Provider-neutral company-type resolution
 
@@ -1801,6 +1865,8 @@ transition instant.
 | Scenario | Required current / strict result and proof |
 | --- | --- |
 | Requested session day, after session close and before evaluation | `A/R` when common provider proof passes; strict remains rejected for post-cutoff observation/retrieval. |
+| Fresh provider latency between start and terminal evaluation | `A/R` when truthful observation/retrieval fall inside the same plan-1.4 acquisition window and the requested session remains latest completed. |
+| Acquisition starts before but finalizes at/after the next session close | `R/R`; terminal frontier advancement fails the entire old-session context without fallback or a grace window. |
 | Real next-calendar-day `00:48:07 Asia/Shanghai` retrieval for `2026-08-10` | `A/R` while `2026-08-10` is latest completed; proves local-date inequality has no authority. |
 | Immediately before the next open session | `A/R`; the prior session remains latest completed. |
 | During the next open session, before its close | `A/R`; session open does not advance the frontier. |

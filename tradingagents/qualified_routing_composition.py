@@ -79,6 +79,7 @@ from tradingagents.dataflows.financial_capability_routing import (
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_MANIFEST_V2,
     FINANCIAL_MANIFEST_V4,
+    FINANCIAL_MANIFEST_V5,
     FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
     FinancialConsolidationScope,
     FinancialRatioFamily,
@@ -90,6 +91,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_LEDGER_VERSION,
     FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
@@ -98,6 +100,7 @@ from tradingagents.dataflows.financial_dispatch import (
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
     FinancialCompanyTypeProviderTemporalProofBinding,
@@ -1368,14 +1371,16 @@ def _restore_checkpoint_eligibility_context(
         )
     raw_ledger_version = raw_shadow_ledger.get("contract_version")
     expected_ledger_version = (
-        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.4"
+        else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.3"
         else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.2"
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
     if raw_ledger_version != expected_ledger_version:
-        if run_binding.routing_plan.plan_version == "1.3":
+        if run_binding.routing_plan.plan_version in {"1.3", "1.4"}:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
             )
@@ -1401,14 +1406,16 @@ def _restore_checkpoint_eligibility_context(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
         )
     expected_context_version = (
-        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+        if run_binding.routing_plan.plan_version == "1.4"
+        else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
         if run_binding.routing_plan.plan_version == "1.3"
         else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
     )
     if raw_context.get("contract_version") != expected_context_version:
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if run_binding.routing_plan.plan_version == "1.3"
+            if run_binding.routing_plan.plan_version in {"1.3", "1.4"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
         )
     raw_identity = raw_context.get("context_identity")
@@ -1437,7 +1444,10 @@ def _restore_checkpoint_eligibility_context(
     context_session = (
         context.requested_session
         if context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        in {
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        }
         else context.as_of_date
     )
     if (
@@ -1602,7 +1612,9 @@ def _validated_checkpoint_restoration(
         )
     )
     expected_shadow_version = (
-        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        if plan.plan_version == "1.4"
+        else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if plan.plan_version == "1.3"
         else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if plan.plan_version == "1.2"
@@ -1618,7 +1630,9 @@ def _validated_checkpoint_restoration(
         or shadow_ledger.capability_routing_plan_signature != plan.plan_signature
         or shadow_ledger.financial_manifest_version
         != (
-            FINANCIAL_MANIFEST_V4
+            FINANCIAL_MANIFEST_V5
+            if plan.plan_version == "1.4"
+            else FINANCIAL_MANIFEST_V4
             if plan.plan_version == "1.3"
             else FINANCIAL_MANIFEST_V2
         )
@@ -1651,15 +1665,23 @@ def _validated_checkpoint_restoration(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
         )
-    if plan.plan_version == "1.3":
+    if plan.plan_version in {"1.3", "1.4"}:
         temporal = context.temporal_eligibility_binding
+        expected_context_version = (
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+            if plan.plan_version == "1.4"
+            else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        )
         if (
-            context.contract_version
-            != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+            context.contract_version != expected_context_version
             or temporal is None
-            or shadow_ledger.capability_routing_plan_version != "1.3"
+            or shadow_ledger.capability_routing_plan_version != plan.plan_version
             or shadow_ledger.financial_indicator_manifest_version
-            != FINANCIAL_MANIFEST_V4
+            != (
+                FINANCIAL_MANIFEST_V5
+                if plan.plan_version == "1.4"
+                else FINANCIAL_MANIFEST_V4
+            )
             or shadow_ledger.indicator_field_semantics_version
             != plan.indicator_field_semantics_version
             or shadow_ledger.indicator_metadata_compatibility_version
@@ -1675,7 +1697,13 @@ def _validated_checkpoint_restoration(
             )
     if (
         cache_checkpoint.contract_version
-        != ("1.2" if plan.plan_version == "1.3" else "1.1")
+        != (
+            "1.3"
+            if plan.plan_version == "1.4"
+            else "1.2"
+            if plan.plan_version == "1.3"
+            else "1.1"
+        )
         or cache_checkpoint.financial_eligibility_context_contract_version
         != context.contract_version
         or cache_checkpoint.financial_eligibility_context_identity
@@ -1683,7 +1711,7 @@ def _validated_checkpoint_restoration(
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if plan.plan_version == "1.3"
+            if plan.plan_version in {"1.3", "1.4"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
         )
 
@@ -1994,13 +2022,19 @@ class RegisteredProductionQualifiedRoutingComposition:
                     context=(
                         restoration.context
                         if restoration.context.contract_version
-                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        in {
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                        }
                         else None
                     ),
                     capability_routing_plan=(
                         run_binding.routing_plan
                         if restoration.context.contract_version
-                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        in {
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                        }
                         else None
                     ),
                 )
@@ -3296,7 +3330,10 @@ def _statement_company_type_evidence_source(
     ):
         temporal = (
             request.metadata_binding.contract_version
-            == "financial-eligibility-metadata-binding-v2"
+            in {
+                "financial-eligibility-metadata-binding-v2",
+                "financial-eligibility-metadata-binding-v3",
+            }
         )
         as_of_date = (
             request.metadata_binding.requested_session
@@ -3387,6 +3424,17 @@ def _statement_company_type_evidence_source(
             requested_session=as_of_date if temporal else None,
             temporal_evidence=temporal_evidence,
             provider_temporal_proof=provider_temporal_proof,
+            contract_version={
+                "financial-eligibility-metadata-binding-v1": (
+                    "financial-company-type-evidence-binding-v2"
+                ),
+                "financial-eligibility-metadata-binding-v2": (
+                    "financial-company-type-evidence-binding-v3"
+                ),
+                "financial-eligibility-metadata-binding-v3": (
+                    "financial-company-type-evidence-binding-v4"
+                ),
+            }[request.metadata_binding.contract_version],
             provider_id=provider_id,
             artifact_identity=candidate.artifact.artifact_identity,
             source_ref=candidate.artifact.artifact_identity,
@@ -3927,7 +3975,10 @@ def _external_request_material(
             as_of_date = (
                 binding.requested_session
                 if binding.contract_version
-                == "financial-eligibility-metadata-binding-v2"
+                in {
+                    "financial-eligibility-metadata-binding-v2",
+                    "financial-eligibility-metadata-binding-v3",
+                }
                 else binding.as_of_date
             )
         else:

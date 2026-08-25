@@ -707,7 +707,7 @@ def test_cli_and_programmatic_callers_resolve_same_builtin_identity_and_blueprin
         cli_main.run_analysis(qualified_routing_validation=True)
 
     assert isinstance(received, RegisteredProductionQualifiedRoutingComposition)
-    assert programmatic.blueprint.routing_plan.plan_version == "1.3"
+    assert programmatic.blueprint.routing_plan.plan_version == "1.4"
     assert received.factory_identity == programmatic.factory_identity
     assert received.blueprint == programmatic.blueprint
     assert received.blueprint.routing_plan.plan_signature == plan.plan_signature

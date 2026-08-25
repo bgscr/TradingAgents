@@ -16,6 +16,7 @@ from tradingagents.dataflows.financial_dispatch import FinancialToolRequest
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
     assert_safe_financial_eligibility_projection,
@@ -102,6 +103,7 @@ def _validate_context_binding(
         not in {
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
         }
         or binding.context_contract_version != context.contract_version
     ):
@@ -125,10 +127,10 @@ def _validate_context_binding(
         _fail(FinancialRequestFactoryFailureReason.INSTRUMENT_IDENTITY_MISMATCH)
     if binding.canonical_symbol != context.instrument_identity.symbol.strip().upper():
         _fail(FinancialRequestFactoryFailureReason.SYMBOL_MISMATCH)
-    temporal = (
-        context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
-    )
+    temporal = context.contract_version in {
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    }
     expected_session = context.requested_session if temporal else context.as_of_date
     if (
         (binding.requested_session if temporal else binding.as_of_date)
@@ -178,11 +180,17 @@ def _statement_identity(payload: dict[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    prefix = (
-        "financial-statement-routing-request:v4:"
-        if payload.get("contract_version") == "financial-statement-routing-request-v4"
-        else "financial-statement-routing-request:v3:"
-    )
+    prefix = {
+        "financial-statement-routing-request-v3": (
+            "financial-statement-routing-request:v3:"
+        ),
+        "financial-statement-routing-request-v4": (
+            "financial-statement-routing-request:v4:"
+        ),
+        "financial-statement-routing-request-v5": (
+            "financial-statement-routing-request:v5:"
+        ),
+    }[str(payload.get("contract_version"))]
     return prefix + sha256(encoded).hexdigest()
 
 
@@ -194,11 +202,17 @@ def _indicator_identity(payload: dict[str, object]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    prefix = (
-        "financial-indicator-routing-request:v7:"
-        if payload.get("contract_version") == "financial-indicator-routing-request-v7"
-        else "financial-indicator-routing-request:v6:"
-    )
+    prefix = {
+        "financial-indicator-routing-request-v6": (
+            "financial-indicator-routing-request:v6:"
+        ),
+        "financial-indicator-routing-request-v7": (
+            "financial-indicator-routing-request:v7:"
+        ),
+        "financial-indicator-routing-request-v8": (
+            "financial-indicator-routing-request:v8:"
+        ),
+    }[str(payload.get("contract_version"))]
     return prefix + sha256(encoded).hexdigest()
 
 
@@ -227,13 +241,19 @@ def build_financial_statement_routing_request(
             FinancialRequestFactoryFailureReason.UNSUPPORTED_CAPABILITY
         )
     material_arguments_json = _canonical_material_arguments(tool_request)
-    temporal = (
+    temporal = context.contract_version in {
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    }
+    windowed = (
         context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
     )
     payload: dict[str, object] = {
         "contract_version": (
-            "financial-statement-routing-request-v4"
+            "financial-statement-routing-request-v5"
+            if windowed
+            else "financial-statement-routing-request-v4"
             if temporal
             else "financial-statement-routing-request-v3"
         ),
@@ -299,13 +319,19 @@ def build_financial_indicator_routing_request(
             FinancialRequestFactoryFailureReason.UNSUPPORTED_CAPABILITY
         )
     material_arguments_json = _canonical_material_arguments(tool_request)
-    temporal = (
+    temporal = context.contract_version in {
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    }
+    windowed = (
         context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
     )
     payload: dict[str, object] = {
         "contract_version": (
-            "financial-indicator-routing-request-v7"
+            "financial-indicator-routing-request-v8"
+            if windowed
+            else "financial-indicator-routing-request-v7"
             if temporal
             else "financial-indicator-routing-request-v6"
         ),

@@ -27,6 +27,7 @@ import tradingagents.dataflows.financial_temporal_eligibility as temporal_module
 import tradingagents.dataflows.financial_temporal_proof_projection as temporal_projection_module
 import tradingagents.dataflows.interface as vendor_interface
 import tradingagents.qualified_routing_composition as composition_module
+import tradingagents.qualified_routing_eligibility_lifecycle as lifecycle_module
 from tests.test_financial_capability_routing_selection import (
     _indicator_response_with_compatibility,
     _qualified_ratio_candidate,
@@ -65,10 +66,18 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialToolDispatcher,
     project_financial_dispatch_ledger,
 )
+from tradingagents.dataflows.financial_eligibility_acquisition import (
+    FinancialCompanyTypeEvidenceProjection,
+    FinancialEligibilityAcquisitionFailureReason,
+    FinancialEligibilityMetadataBinding,
+)
 from tradingagents.dataflows.financial_indicator_metadata import (
     FinancialIndicatorMetadataDimension,
     FinancialIndicatorMetadataEvidenceOrigin,
     FinancialIndicatorSemanticAssessmentState,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    TemporalEligibilityRejectionReason,
 )
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
@@ -930,9 +939,55 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
         assert "financial_dispatch_shadow_failure" not in result
         context = fresh.owner.context
         assert context is not None
-        assert context.contract_version == "financial-eligibility-acquisition-context-v2"
+        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        assert context.company_type_evidence.contract_version == (
+            "financial-company-type-evidence-binding-v4"
+        )
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.context is context
         temporal = context.temporal_eligibility_binding
         assert temporal is not None
+        window = temporal.acquisition_window
+        assert window is not None
+        assert window.transaction_binding.canonical_run_id == context.run_id
+        assert (
+            window.transaction_binding.routing_plan_signature
+            == context.routing_plan_signature
+        )
+        assert all(
+            decision.evidence_acquisition_binding is not None
+            and decision.evidence_acquisition_binding.transaction_identity
+            == window.transaction_binding.transaction_identity
+            and decision.evidence_origin == "fresh"
+            for decision in (
+                temporal.company_type_temporal_decision,
+                temporal.listing_temporal_decision,
+            )
+        )
+        metadata_binding = FinancialEligibilityMetadataBinding(
+            contract_version="financial-eligibility-metadata-binding-v3",
+            instrument_identity=context.instrument_identity,
+            requested_session=temporal.requested_session,
+            availability_scope=context.availability_scope,
+            acquisition_purpose=context.acquisition_purpose,
+            financial_eligibility_binding=context.financial_eligibility_binding,
+            routing_plan_signature=context.routing_plan_signature,
+            temporal_mode=temporal.temporal_mode,
+            eligibility_started_at=window.eligibility_started_at,
+            calendar_binding=window.calendar_binding.started,
+            strict_cutoff=temporal.strict_cutoff,
+        )
+        company_projection = FinancialCompanyTypeEvidenceProjection(
+            contract_version="financial-company-type-evidence-projection-v3",
+            metadata_binding=metadata_binding,
+            evidence=context.company_type_evidence,
+            temporal_decision=temporal.company_type_temporal_decision,
+        )
+        assert FinancialCompanyTypeEvidenceProjection.model_validate(
+            company_projection.model_dump(mode="json")
+        ) == company_projection
         assert (
             temporal.calendar_binding.calendar_revision_id
             == fresh.primary_calendar_revision_id
@@ -941,6 +996,293 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
         assert fresh.calendar_resolved.is_set()
         assert fresh.calendar_reader_open_count == 1
         assert calendar_row_counts(fresh.sidecar_database_path) == (0, 0)
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_fresh_builtin_admits_truthful_provider_latency_before_context_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000001",
+    )
+    tushare = fresh.providers["tushare"]
+    original_record = tushare._record
+
+    def record_with_realistic_latency(
+        endpoint: str,
+        kwargs: dict[str, object],
+    ) -> None:
+        original_record(endpoint, kwargs)
+        if endpoint == "balancesheet":
+            _DeterministicDateTime.advance(1)
+
+    tushare._record = record_with_realistic_latency
+    try:
+        result = fresh.invoke(
+            fresh.state(
+                tool_names=("get_fundamentals",),
+                tool_call_prefix="ticket07-latency",
+            )
+        )
+
+        assert "financial_dispatch_shadow_failure" not in result
+        context = fresh.owner.context
+        assert context is not None
+        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        temporal = context.temporal_eligibility_binding
+        assert temporal is not None
+        assert temporal.contract_version == "financial-eligibility-temporal-binding-v2"
+        window = temporal.acquisition_window
+        assert window.contract_version == "financial-eligibility-acquisition-window-v1"
+        assert window.eligibility_started_at < window.eligibility_evaluated_at
+        assert window.calendar_revision_id == fresh.primary_calendar_revision_id
+        assert window.started_latest_completed_session == _AS_OF
+        assert window.evaluated_latest_completed_session == _AS_OF
+        for decision in (
+            temporal.company_type_temporal_decision,
+            temporal.listing_temporal_decision,
+        ):
+            assert (
+                window.eligibility_started_at
+                <= decision.observed_at
+                <= decision.retrieved_at
+                <= window.eligibility_evaluated_at
+            )
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_fresh_builtin_rejects_when_acquisition_crosses_next_session_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000002",
+    )
+    tushare = fresh.providers["tushare"]
+    original_record = tushare._record
+
+    def cross_frontier(endpoint: str, kwargs: dict[str, object]) -> None:
+        original_record(endpoint, kwargs)
+        if endpoint == "balancesheet":
+            _DeterministicDateTime.advance(19 * 60 * 60)
+
+    tushare._record = cross_frontier
+    try:
+        result = fresh.tool_node(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="ticket07-frontier-crossing",
+            )
+        )
+
+        assert result["financial_dispatch_shadow_failure"] == {
+            "contract_version": "1.0",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+        }
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.context is None
+        assert acquisition.failure is not None
+        assert acquisition.failure.contract_version == (
+            "financial-eligibility-acquisition-result-v3"
+        )
+        assert acquisition.failure.reason is (
+            FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
+        )
+        assert acquisition.failure.rejected_temporal_decision is not None
+        assert (
+            TemporalEligibilityRejectionReason.REQUESTED_SESSION_NOT_LATEST_COMPLETED_FRONTIER
+            in acquisition.failure.rejected_temporal_decision.reasons
+        )
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_fresh_builtin_rejects_mismatched_window_transaction_before_provider_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000003",
+    )
+    transaction_type = (
+        lifecycle_module.FinancialEligibilityTemporalEvaluationTransaction
+    )
+
+    def mismatched_transaction(**kwargs: object):
+        transaction = transaction_type(**kwargs)
+        transaction._calendar_binding = transaction.calendar_binding.model_copy(
+            update={
+                "calendar_revision_id": (
+                    "market-session-calendar=sha256:" + "0" * 64
+                )
+            }
+        )
+        return transaction
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "FinancialEligibilityTemporalEvaluationTransaction",
+        mismatched_transaction,
+    )
+    try:
+        result = fresh.tool_node(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="ticket07-transaction-mismatch",
+            )
+        )
+
+        assert result["financial_dispatch_shadow_failure"] == {
+            "contract_version": "1.0",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+        }
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.context is None
+        assert acquisition.failure is not None
+        assert acquisition.failure.contract_version == (
+            "financial-eligibility-acquisition-result-v3"
+        )
+        assert acquisition.failure.reason is (
+            FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+        )
+        assert fresh.owner.context is None
+        assert fresh.runtime.financial_routing is None
+        assert all(provider.calls == [] for provider in fresh.providers.values())
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_fresh_builtin_rejects_proof_bound_to_another_active_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000005",
+    )
+    transaction_type = (
+        lifecycle_module.FinancialEligibilityTemporalEvaluationTransaction
+    )
+    original_stage = transaction_type.stage
+    mismatched_once = False
+
+    def mismatched_stage(transaction, evidence, *, evidence_origin):
+        nonlocal mismatched_once
+        staged = original_stage(
+            transaction,
+            evidence,
+            evidence_origin=evidence_origin,
+        )
+        if mismatched_once:
+            return staged
+        mismatched_once = True
+        return temporal_module.bind_financial_temporal_evidence_to_transaction(
+            transaction_identity=(
+                "financial-eligibility-temporal-transaction:v1:" + "f" * 64
+            ),
+            evidence_origin=staged.evidence_origin,
+            evidence=evidence,
+        )
+
+    monkeypatch.setattr(transaction_type, "stage", mismatched_stage)
+    try:
+        result = fresh.tool_node(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="ticket07-proof-transaction-mismatch",
+            )
+        )
+
+        assert result["financial_dispatch_shadow_failure"] == {
+            "contract_version": "1.0",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+        }
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.context is None
+        assert acquisition.failure is not None
+        assert acquisition.failure.reason is (
+            FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+        )
+        assert fresh.owner.context is None
+        assert fresh.runtime.financial_routing is None
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_fresh_builtin_rejects_terminal_clock_regression_without_partial_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000004",
+    )
+    clock_values = iter((_NOW, _NOW - timedelta(seconds=1)))
+    fresh.owner._eligibility_clock = lambda: next(clock_values)
+    try:
+        result = fresh.tool_node(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="ticket07-clock-regression",
+            )
+        )
+
+        assert result["financial_dispatch_shadow_failure"] == {
+            "contract_version": "1.0",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+        }
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.context is None
+        assert acquisition.failure is not None
+        assert acquisition.failure.contract_version == (
+            "financial-eligibility-acquisition-result-v3"
+        )
+        assert acquisition.failure.reason is (
+            FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
+        )
+        assert acquisition.failure.rejected_temporal_decision is None
+        assert fresh.owner.context is None
+        assert fresh.runtime.financial_routing is None
+        with pytest.raises(StopIteration):
+            next(clock_values)
     finally:
         fresh.close()
 
@@ -1566,7 +1908,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
 
         ledger = FinancialDispatchCheckpointLedger.model_validate(indicator_ledger)
-        assert fresh.plan.plan_version == "1.3"
+        assert fresh.plan.plan_version == "1.4"
         assert fresh.plan.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -1577,12 +1919,12 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert fresh.plan.indicator_selection_contract_version == (
             "financial-period-selection-v3"
         )
-        assert routing.contract_version == "financial-indicator-routing-result-v4"
+        assert routing.contract_version == "financial-indicator-routing-result-v5"
         assert indicator_result.contract_version == (
-            "financial-indicator-selection-dispatch-v3"
+            "financial-indicator-selection-dispatch-v4"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-v4"
+            manifest.contract_version == "financial-manifest-v5"
             for manifest in routing.family_manifests
         )
         assert all(
@@ -1595,9 +1937,9 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             for manifest in routing.family_manifests
             for selection in manifest.selections
         )
-        assert ledger.contract_version == "1.6"
-        assert ledger.financial_manifest_version == "financial-manifest-v4"
-        assert ledger.financial_indicator_manifest_version == "financial-manifest-v4"
+        assert ledger.contract_version == "1.7"
+        assert ledger.financial_manifest_version == "financial-manifest-v5"
+        assert ledger.financial_indicator_manifest_version == "financial-manifest-v5"
         assert ledger.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -1608,7 +1950,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert len(ledger.qualified_indicator_selections) == 1
         indicator_entry = ledger.qualified_indicator_selections[0]
         assert indicator_entry.contract_version == (
-            "financial-indicator-selection-checkpoint-v3"
+            "financial-indicator-selection-checkpoint-v4"
         )
         assert indicator_entry.terminal.routing_result == routing
         assessment_identities = {
@@ -1654,17 +1996,17 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             run_scope_id=context.run_id,
         )
         assert audit is not None
-        assert audit.contract_version == "4.0"
+        assert audit.contract_version == "5.0"
         assert set(audit.metadata_assessment_identities) == assessment_identities
         indicator_audit_request = next(
             request
             for request in audit.manifest_requests
-            if request.contract_version == "financial-manifest-request-audit-v4"
+            if request.contract_version == "financial-manifest-request-audit-v5"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-audit-v4"
+            manifest.contract_version == "financial-manifest-audit-v5"
             and manifest.aggregate_completeness.contract_version
-            == "financial-aggregate-completeness-v4"
+            == "financial-aggregate-completeness-v5"
             for manifest in indicator_audit_request.manifests
         )
         indicator_completeness_rows = tuple(
@@ -1674,15 +2016,15 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
         assert indicator_completeness_rows
         assert all(
-            row.contract_version == "financial-completeness-row-v5"
+            row.contract_version == "financial-completeness-row-v6"
             for row in indicator_completeness_rows
         )
         tool_envelope = indicator_result.to_tool_message().artifact
         assert tool_envelope["contract_version"] == (
-            "financial-tool-message-envelope-v4"
+            "financial-tool-message-envelope-v5"
         )
         assert all(
-            manifest["contract_version"] == "financial-tool-manifest-v4"
+            manifest["contract_version"] == "financial-tool-manifest-v5"
             for manifest in tool_envelope["manifests"]
         )
 
@@ -2661,7 +3003,9 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
     original_acquire = acquirer_type.acquire
     original_clock = fresh.owner._eligibility_clock
     original_calendar_provider = fresh.owner._calendar_provider
-    original_transaction_factory = metadata_acquirer._temporal_transaction_factory
+    original_transaction_factory = (
+        lifecycle_module.FinancialEligibilityTemporalEvaluationTransaction
+    )
     acquisition_entered = threading.Event()
     release_acquisition = threading.Event()
     metadata_acquisitions = 0
@@ -2695,7 +3039,11 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
     monkeypatch.setattr(acquirer_type, "acquire", blocked_acquire)
     fresh.owner._eligibility_clock = counted_clock
     fresh.owner._calendar_provider = counted_calendar_provider
-    metadata_acquirer._temporal_transaction_factory = counted_transaction_factory
+    monkeypatch.setattr(
+        lifecycle_module,
+        "FinancialEligibilityTemporalEvaluationTransaction",
+        counted_transaction_factory,
+    )
     try:
         acquisition_start = threading.Barrier(33)
 
@@ -2718,7 +3066,7 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
         assert acquisition_results[0].context is fresh.owner.context
         assert acquisition_results[0].outcome == "success"
         assert metadata_acquisitions == 1
-        assert clock_samples == 1
+        assert clock_samples == 2
         assert calendar_lookups == 1
         assert len(temporal_transactions) == 1
         assert temporal_transactions[0].evaluation_count == 2

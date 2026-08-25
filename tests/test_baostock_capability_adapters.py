@@ -555,7 +555,7 @@ def test_temporal_lifecycle_projects_ipodate_without_publication_backfill(
     assert len(result.attempt_events) == 1
     assert result.listing_metadata is not None
     metadata = result.listing_metadata
-    assert metadata.contract_version == "financial-listing-metadata-v2"
+    assert metadata.contract_version == "financial-listing-metadata-v3"
     assert metadata.as_of_date is None
     assert metadata.requested_session == date(2026, 7, 30)
     assert metadata.listing_date == date(1996, 4, 22)

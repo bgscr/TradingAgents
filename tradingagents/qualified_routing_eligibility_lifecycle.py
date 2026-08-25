@@ -12,6 +12,7 @@ from hashlib import sha256
 from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.capability_routing import (
     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+    CAPABILITY_ROUTING_PLAN_VERSION_1_4,
     MainlandCapabilityRoutingPlan,
     TushareCapability,
 )
@@ -30,6 +31,7 @@ from tradingagents.dataflows.financial_dispatch import (
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityAcquisitionFailureReason,
     FinancialEligibilityAcquisitionResult,
@@ -42,6 +44,9 @@ from tradingagents.dataflows.financial_eligibility_metadata import (
 from tradingagents.dataflows.financial_temporal_eligibility import (
     TemporalEligibilityMode,
     build_market_session_eligibility_binding,
+)
+from tradingagents.dataflows.financial_temporal_proof_projection import (
+    FinancialEligibilityTemporalEvaluationTransaction,
 )
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestCache
 from tradingagents.market_history import StoredSessionCalendar
@@ -145,7 +150,11 @@ class FinancialEligibilityAcquisitionContextOwner:
             or not callable(interrupt_runtime)
             or not callable(close_runtime)
             or (
-                routing_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                routing_plan.plan_version
+                in {
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                }
                 and (
                     not callable(eligibility_clock)
                     or not callable(calendar_provider)
@@ -426,7 +435,10 @@ class FinancialEligibilityAcquisitionContextOwner:
             FinancialEligibilityAcquisitionFailureReason.INTERRUPTED_ACQUISITION,
             temporal_context=(
                 self._routing_plan.plan_version
-                == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                in {
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                }
             ),
         )
         with self._condition:
@@ -480,13 +492,19 @@ class FinancialEligibilityAcquisitionContextOwner:
                         context=(
                             context
                             if context.contract_version
-                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            in {
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            }
                             else None
                         ),
                         capability_routing_plan=(
                             self._routing_plan
                             if context.contract_version
-                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            in {
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            }
                             else None
                         ),
                     )
@@ -538,13 +556,19 @@ class FinancialEligibilityAcquisitionContextOwner:
                         context=(
                             context
                             if context.contract_version
-                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            in {
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            }
                             else None
                         ),
                         capability_routing_plan=(
                             self._routing_plan
                             if context.contract_version
-                            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                            in {
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            }
                             else None
                         ),
                     )
@@ -595,26 +619,33 @@ class FinancialEligibilityAcquisitionContextOwner:
             plan_binding = self._routing_plan.financial_eligibility_binding
             if plan_binding is None:
                 self._fail_binding()
-            temporal = (
+            temporal_v1 = (
                 self._routing_plan.plan_version
                 == CAPABILITY_ROUTING_PLAN_VERSION_1_3
             )
+            temporal_v2 = (
+                self._routing_plan.plan_version
+                == CAPABILITY_ROUTING_PLAN_VERSION_1_4
+            )
+            temporal = temporal_v1 or temporal_v2
             temporal_arguments: dict[str, object] = {}
             historical_arguments: dict[str, object] = {}
+            temporal_transaction = None
             if temporal:
                 assert self._eligibility_clock is not None
                 assert self._calendar_provider is not None
-                eligibility_evaluated_at = self._eligibility_clock()
+                eligibility_started_at = self._eligibility_clock()
                 if (
-                    not isinstance(eligibility_evaluated_at, datetime)
-                    or eligibility_evaluated_at.tzinfo is None
-                    or eligibility_evaluated_at.utcoffset() is None
+                    not isinstance(eligibility_started_at, datetime)
+                    or eligibility_started_at.tzinfo is None
+                    or eligibility_started_at.utcoffset() is None
                 ):
                     raise ValueError("eligibility clock must return an aware datetime")
+                calendar = self._calendar_provider()
                 calendar_binding = build_market_session_eligibility_binding(
-                    self._calendar_provider(),
+                    calendar,
                     requested_session=as_of_date,
-                    eligibility_evaluated_at=eligibility_evaluated_at,
+                    eligibility_evaluated_at=eligibility_started_at,
                 )
                 temporal_mode = (
                     TemporalEligibilityMode.STRICT_HISTORICAL_PIT
@@ -624,11 +655,17 @@ class FinancialEligibilityAcquisitionContextOwner:
                 )
                 temporal_arguments = {
                     "contract_version": (
-                        "financial-eligibility-metadata-acquisition-request-v2"
+                        "financial-eligibility-metadata-acquisition-request-v3"
+                        if temporal_v2
+                        else "financial-eligibility-metadata-acquisition-request-v2"
                     ),
                     "requested_session": as_of_date,
                     "temporal_mode": temporal_mode,
-                    "eligibility_evaluated_at": eligibility_evaluated_at,
+                    (
+                        "eligibility_started_at"
+                        if temporal_v2
+                        else "eligibility_evaluated_at"
+                    ): eligibility_started_at,
                     "calendar_binding": calendar_binding,
                     "strict_cutoff": (
                         calendar_binding.requested_session_close
@@ -637,6 +674,21 @@ class FinancialEligibilityAcquisitionContextOwner:
                         else None
                     ),
                 }
+                if temporal_v2:
+                    temporal_transaction = (
+                        FinancialEligibilityTemporalEvaluationTransaction(
+                            mode=temporal_mode,
+                            calendar=calendar,
+                            requested_session=as_of_date,
+                            eligibility_started_at=eligibility_started_at,
+                            clock=self._eligibility_clock,
+                            canonical_run_id=self._run_id,
+                            routing_plan_signature=(
+                                self._routing_plan.plan_signature
+                            ),
+                            strict_cutoff=temporal_arguments["strict_cutoff"],
+                        )
+                    )
             else:
                 historical_arguments = {
                     "authoritative_as_of_date": as_of_date,
@@ -666,6 +718,7 @@ class FinancialEligibilityAcquisitionContextOwner:
                     self._retained_company_type_evidence
                 ),
                 retained_listing_metadata=self._retained_listing_metadata,
+                temporal_transaction=temporal_transaction,
             )
             if not isinstance(result, FinancialEligibilityAcquisitionResult):
                 self._fail_binding()
@@ -707,7 +760,10 @@ class FinancialEligibilityAcquisitionContextOwner:
                 follower_reason,
                 temporal_context=(
                     self._routing_plan.plan_version
-                    == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                    in {
+                        CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+                        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                    }
                 ),
             )
             with self._condition:

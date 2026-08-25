@@ -21,7 +21,7 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
-    prepare_mainland_temporal_capability_routing_plan,
+    prepare_mainland_temporal_capability_routing_plan_v1 as prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
 from tradingagents.dataflows.financial_capability_routing import (

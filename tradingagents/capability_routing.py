@@ -32,6 +32,7 @@ CAPABILITY_ROUTING_PLAN_VERSION_V1 = "1.0"
 CAPABILITY_ROUTING_PLAN_VERSION_V2 = "1.1"
 CAPABILITY_ROUTING_PLAN_VERSION = "1.2"
 CAPABILITY_ROUTING_PLAN_VERSION_1_3 = "1.3"
+CAPABILITY_ROUTING_PLAN_VERSION_1_4 = "1.4"
 CAPABILITY_ROUTING_POLICY_VERSION = "mainland-capability-routing-policy-v1"
 QUALIFICATION_PROFILE = "cn-a-2000-20260729-v1"
 NORMALIZER_VERSION_V1 = "mainland-financial-normalizer-v1"
@@ -185,12 +186,117 @@ class MainlandTemporalContractBindings(BaseModel):
     ] = "financial-tool-message-envelope-v4"
 
 
+class MainlandTemporalContractBindingsV2(MainlandTemporalContractBindings):
+    """Forward fresh-acquisition window inventory pinned by plan 1.4."""
+
+    temporal_policy_version: Literal[
+        "provider-neutral-temporal-eligibility-v2"
+    ] = "provider-neutral-temporal-eligibility-v2"
+    calendar_eligibility_binding_version: Literal[
+        "market-session-eligibility-binding-v2"
+    ] = "market-session-eligibility-binding-v2"
+    acquisition_window_version: Literal[
+        "financial-eligibility-acquisition-window-v1"
+    ] = "financial-eligibility-acquisition-window-v1"
+    temporal_transaction_binding_version: Literal[
+        "financial-eligibility-temporal-transaction-binding-v1"
+    ] = "financial-eligibility-temporal-transaction-binding-v1"
+    temporal_evidence_acquisition_binding_version: Literal[
+        "financial-temporal-evidence-acquisition-binding-v1"
+    ] = "financial-temporal-evidence-acquisition-binding-v1"
+    temporal_decision_version: Literal[
+        "financial-metadata-temporal-eligibility-decision-v2"
+    ] = "financial-metadata-temporal-eligibility-decision-v2"
+    company_type_evidence_binding_version: Literal[
+        "financial-company-type-evidence-binding-v4"
+    ] = "financial-company-type-evidence-binding-v4"
+    eligibility_metadata_binding_version: Literal[
+        "financial-eligibility-metadata-binding-v3"
+    ] = "financial-eligibility-metadata-binding-v3"
+    company_type_evidence_projection_version: Literal[
+        "financial-company-type-evidence-projection-v3"
+    ] = "financial-company-type-evidence-projection-v3"
+    listing_metadata_version: Literal["financial-listing-metadata-v3"] = (
+        "financial-listing-metadata-v3"
+    )
+    listing_metadata_projection_version: Literal[
+        "financial-listing-metadata-projection-v3"
+    ] = "financial-listing-metadata-projection-v3"
+    company_type_routing_request_version: Literal[
+        "financial-company-type-evidence-routing-request-v3"
+    ] = "financial-company-type-evidence-routing-request-v3"
+    company_type_provider_response_version: Literal[
+        "financial-company-type-evidence-provider-response-v3"
+    ] = "financial-company-type-evidence-provider-response-v3"
+    financial_eligibility_context_version: Literal[
+        "financial-eligibility-acquisition-context-v3"
+    ] = "financial-eligibility-acquisition-context-v3"
+    financial_eligibility_request_binding_version: Literal[
+        "financial-eligibility-request-binding-v3"
+    ] = "financial-eligibility-request-binding-v3"
+    financial_eligibility_acquisition_result_version: Literal[
+        "financial-eligibility-acquisition-result-v3"
+    ] = "financial-eligibility-acquisition-result-v3"
+    statement_routing_request_version: Literal[
+        "financial-statement-routing-request-v5"
+    ] = "financial-statement-routing-request-v5"
+    indicator_routing_request_version: Literal[
+        "financial-indicator-routing-request-v8"
+    ] = "financial-indicator-routing-request-v8"
+    statement_routing_result_version: Literal[
+        "financial-statement-routing-result-v3"
+    ] = "financial-statement-routing-result-v3"
+    indicator_routing_result_version: Literal[
+        "financial-indicator-routing-result-v5"
+    ] = "financial-indicator-routing-result-v5"
+    statement_manifest_version: Literal["financial-manifest-v5"] = (
+        "financial-manifest-v5"
+    )
+    indicator_manifest_version: Literal["financial-manifest-v5"] = (
+        "financial-manifest-v5"
+    )
+    statement_selection_dispatch_version: Literal[
+        "financial-statement-selection-dispatch-v3"
+    ] = "financial-statement-selection-dispatch-v3"
+    statement_selection_checkpoint_version: Literal[
+        "financial-statement-selection-checkpoint-v3"
+    ] = "financial-statement-selection-checkpoint-v3"
+    indicator_selection_dispatch_version: Literal[
+        "financial-indicator-selection-dispatch-v4"
+    ] = "financial-indicator-selection-dispatch-v4"
+    indicator_selection_checkpoint_version: Literal[
+        "financial-indicator-selection-checkpoint-v4"
+    ] = "financial-indicator-selection-checkpoint-v4"
+    provider_subrequest_cache_checkpoint_version: Literal["1.3"] = "1.3"
+    financial_dispatch_ledger_version: Literal["1.7"] = "1.7"
+    completeness_row_version: Literal["financial-completeness-row-v6"] = (
+        "financial-completeness-row-v6"
+    )
+    aggregate_completeness_version: Literal[
+        "financial-aggregate-completeness-v5"
+    ] = "financial-aggregate-completeness-v5"
+    manifest_audit_version: Literal["financial-manifest-audit-v5"] = (
+        "financial-manifest-audit-v5"
+    )
+    manifest_request_audit_version: Literal[
+        "financial-manifest-request-audit-v5"
+    ] = "financial-manifest-request-audit-v5"
+    financial_dispatch_audit_projection_version: Literal["5.0"] = "5.0"
+    financial_tool_manifest_version: Literal["financial-tool-manifest-v5"] = (
+        "financial-tool-manifest-v5"
+    )
+    financial_tool_message_envelope_version: Literal[
+        "financial-tool-message-envelope-v5"
+    ] = "financial-tool-message-envelope-v5"
+
+
 def _indicator_contract_bindings_for_plan_version(
     plan_version: str,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     if plan_version in {
         CAPABILITY_ROUTING_PLAN_VERSION,
         CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
     }:
         return _CURRENT_INDICATOR_CONTRACT_BINDINGS
     return (None, None, None, None)
@@ -231,6 +337,7 @@ def _capabilities_for_plan_version(
         CAPABILITY_ROUTING_PLAN_VERSION_V2,
         CAPABILITY_ROUTING_PLAN_VERSION,
         CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
     }:
         return tuple(MainlandCapability)
     raise ValueError("Capability Routing Plan version is unsupported")
@@ -350,7 +457,7 @@ class MainlandCapabilityRoutingPlan(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    plan_version: Literal["1.0", "1.1", "1.2", "1.3"] = (
+    plan_version: Literal["1.0", "1.1", "1.2", "1.3", "1.4"] = (
         CAPABILITY_ROUTING_PLAN_VERSION
     )
     policy_version: Literal[
@@ -396,7 +503,9 @@ class MainlandCapabilityRoutingPlan(BaseModel):
     indicator_selection_contract_version: Literal[
         "financial-period-selection-v3"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
-    temporal_contract_bindings: MainlandTemporalContractBindings | None = Field(
+    temporal_contract_bindings: (
+        MainlandTemporalContractBindings | MainlandTemporalContractBindingsV2 | None
+    ) = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -454,11 +563,10 @@ class MainlandCapabilityRoutingPlan(BaseModel):
         )
         if indicator_bindings != expected_indicator_bindings:
             raise ValueError("routing plan indicator contract bindings contradict version")
-        expected_temporal_bindings = (
-            MainlandTemporalContractBindings()
-            if self.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3
-            else None
-        )
+        expected_temporal_bindings = {
+            CAPABILITY_ROUTING_PLAN_VERSION_1_3: MainlandTemporalContractBindings(),
+            CAPABILITY_ROUTING_PLAN_VERSION_1_4: MainlandTemporalContractBindingsV2(),
+        }.get(self.plan_version)
         if self.temporal_contract_bindings != expected_temporal_bindings:
             raise ValueError("routing plan temporal contract bindings contradict version")
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
@@ -565,7 +673,7 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
 
     contract_version: Literal["1.0"] = "1.0"
     mode: MainlandCapabilityRoutingMode
-    plan_version: Literal["1.0", "1.1", "1.2", "1.3"]
+    plan_version: Literal["1.0", "1.1", "1.2", "1.3", "1.4"]
     policy_version: Literal["mainland-capability-routing-policy-v1"]
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
     enabled_tushare_capabilities: tuple[TushareCapability, ...]
@@ -598,7 +706,9 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
     indicator_selection_contract_version: Literal[
         "financial-period-selection-v3"
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
-    temporal_contract_bindings: MainlandTemporalContractBindings | None = Field(
+    temporal_contract_bindings: (
+        MainlandTemporalContractBindings | MainlandTemporalContractBindingsV2 | None
+    ) = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -704,11 +814,10 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         )
         if indicator_bindings != expected_indicator_bindings:
             raise ValueError("routing rollout indicator bindings contradict version")
-        expected_temporal_bindings = (
-            MainlandTemporalContractBindings()
-            if self.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3
-            else None
-        )
+        expected_temporal_bindings = {
+            CAPABILITY_ROUTING_PLAN_VERSION_1_3: MainlandTemporalContractBindings(),
+            CAPABILITY_ROUTING_PLAN_VERSION_1_4: MainlandTemporalContractBindingsV2(),
+        }.get(self.plan_version)
         if self.temporal_contract_bindings != expected_temporal_bindings:
             raise ValueError("routing rollout temporal bindings contradict version")
         if self.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
@@ -906,9 +1015,12 @@ class MainlandCapabilityRoutingCheckpointCompatibility(BaseModel):
                 self.checkpoint is None
                 or self.checkpoint.mode is MainlandCapabilityRoutingMode.LEGACY
                 or self.active.mode is MainlandCapabilityRoutingMode.LEGACY
-                or self.active.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_3
-                or self.checkpoint.plan_version
-                == CAPABILITY_ROUTING_PLAN_VERSION_1_3
+                or self.active.plan_version
+                not in {
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                }
+                or self.checkpoint.plan_version == self.active.plan_version
                 or self.active.temporal_contract_bindings is None
                 or self.previous_run_id is None
                 or self.new_run_id is None
@@ -990,8 +1102,9 @@ def validate_mainland_capability_routing_checkpoint(
             MainlandCapabilityRoutingCheckpointFailureReason.FINANCIAL_ELIGIBILITY_POLICY_MISMATCH
         )
     if (
-        active_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3
-        and restored.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_3
+        active_plan.plan_version
+        in {CAPABILITY_ROUTING_PLAN_VERSION_1_3, CAPABILITY_ROUTING_PLAN_VERSION_1_4}
+        and restored.plan_version != active_plan.plan_version
         and restored.mode is not MainlandCapabilityRoutingMode.LEGACY
         and active_plan.mode is not MainlandCapabilityRoutingMode.LEGACY
     ):
@@ -1293,6 +1406,7 @@ def _routes(
             CAPABILITY_ROUTING_PLAN_VERSION_V2,
             CAPABILITY_ROUTING_PLAN_VERSION,
             CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+            CAPABILITY_ROUTING_PLAN_VERSION_1_4,
         }:
             providers[MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE] = (
                 "tushare",
@@ -1398,6 +1512,7 @@ def _build_plan(
     if effective_plan_version in {
         CAPABILITY_ROUTING_PLAN_VERSION,
         CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
     }:
         (
             field_semantics_version,
@@ -1411,10 +1526,16 @@ def _build_plan(
             indicator_manifest_contract_version=indicator_manifest_version,
             indicator_selection_contract_version=indicator_selection_version,
         )
-    if effective_plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_3:
-        payload["temporal_contract_bindings"] = (
-            MainlandTemporalContractBindings().model_dump(mode="json")
+    if effective_plan_version in {
+        CAPABILITY_ROUTING_PLAN_VERSION_1_3,
+        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+    }:
+        bindings = (
+            MainlandTemporalContractBindingsV2()
+            if effective_plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_4
+            else MainlandTemporalContractBindings()
         )
+        payload["temporal_contract_bindings"] = bindings.model_dump(mode="json")
     return MainlandCapabilityRoutingPlan(
         **payload,
         plan_signature=_plan_signature(payload),
@@ -1424,13 +1545,34 @@ def _build_plan(
 def prepare_mainland_temporal_capability_routing_plan(
     predecessor: MainlandCapabilityRoutingPlan,
 ) -> MainlandCapabilityRoutingPlan:
-    """Prepare plan 1.3 bindings without activating acquisition or persistence."""
+    """Prepare latest plan 1.4 bindings without acquisition or persistence."""
 
     if (
         predecessor.plan_version != CAPABILITY_ROUTING_PLAN_VERSION
         or predecessor.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
     ):
         raise ValueError("temporal plan preparation requires qualified plan 1.2")
+    payload = predecessor.signature_payload()
+    payload["plan_version"] = CAPABILITY_ROUTING_PLAN_VERSION_1_4
+    payload["temporal_contract_bindings"] = (
+        MainlandTemporalContractBindingsV2().model_dump(mode="json")
+    )
+    return MainlandCapabilityRoutingPlan(
+        **payload,
+        plan_signature=_plan_signature(payload),
+    )
+
+
+def prepare_mainland_temporal_capability_routing_plan_v1(
+    predecessor: MainlandCapabilityRoutingPlan,
+) -> MainlandCapabilityRoutingPlan:
+    """Reconstruct frozen plan 1.3 for historical contract tests/readers."""
+
+    if (
+        predecessor.plan_version != CAPABILITY_ROUTING_PLAN_VERSION
+        or predecessor.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+    ):
+        raise ValueError("temporal v1 plan preparation requires qualified plan 1.2")
     payload = predecessor.signature_payload()
     payload["plan_version"] = CAPABILITY_ROUTING_PLAN_VERSION_1_3
     payload["temporal_contract_bindings"] = (
@@ -1591,6 +1733,7 @@ __all__ = [
     "CAPABILITY_ROUTING_PLAN_VERSION_V1",
     "CAPABILITY_ROUTING_PLAN_VERSION_V2",
     "CAPABILITY_ROUTING_PLAN_VERSION_1_3",
+    "CAPABILITY_ROUTING_PLAN_VERSION_1_4",
     "MainlandCapability",
     "MainlandCapabilityRoutingCheckpointAction",
     "MainlandCapabilityRoutingCheckpointCompatibility",
@@ -1606,6 +1749,7 @@ __all__ = [
     "MainlandCapabilityRoutingRunProjection",
     "MainlandCapabilityRoutingShadowFailure",
     "MainlandTemporalContractBindings",
+    "MainlandTemporalContractBindingsV2",
     "MainlandRequestBudgetIdentity",
     "TushareCapability",
     "TushareEndpointPacingIdentity",
@@ -1614,6 +1758,7 @@ __all__ = [
     "mainland_capability_routing_failure",
     "preflight_mainland_capability_routing",
     "prepare_mainland_temporal_capability_routing_plan",
+    "prepare_mainland_temporal_capability_routing_plan_v1",
     "start_new_mainland_capability_routing_run",
     "validate_mainland_capability_routing_checkpoint",
 ]

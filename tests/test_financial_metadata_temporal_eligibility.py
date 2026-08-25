@@ -21,10 +21,14 @@ from tradingagents.dataflows.financial_temporal_eligibility import (
     PublicationDateKind,
     TemporalEligibilityMode,
     TemporalEligibilityRejectionReason,
+    TemporalEligibilityRejectionReasonV2,
     TemporalEvidenceArtifactBinding,
     TemporalEvidenceClass,
+    build_financial_eligibility_acquisition_window,
+    build_financial_eligibility_temporal_transaction_binding,
     build_market_session_eligibility_binding,
     evaluate_financial_metadata_temporal_eligibility,
+    evaluate_financial_metadata_temporal_eligibility_v2,
 )
 from tradingagents.market_history import (
     MarketSession,
@@ -41,6 +45,28 @@ def _at(day: int, hour: int, minute: int = 0) -> datetime:
 
 
 _STRICT_CUTOFF = _at(10, 15)
+
+
+def _transaction_binding(
+    *,
+    eligibility_started_at: datetime,
+    mode: TemporalEligibilityMode = TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+    strict_cutoff: datetime | None = None,
+):
+    calendar_binding = build_market_session_eligibility_binding(
+        _calendar(),
+        requested_session=date(2026, 8, 10),
+        eligibility_evaluated_at=eligibility_started_at,
+    )
+    return build_financial_eligibility_temporal_transaction_binding(
+        canonical_run_id="run:" + "1" * 64,
+        routing_plan_signature="mainland-routing-plan:v1:" + "2" * 64,
+        mode=mode,
+        requested_session=date(2026, 8, 10),
+        eligibility_started_at=eligibility_started_at,
+        calendar_binding=calendar_binding,
+        strict_cutoff=strict_cutoff,
+    )
 
 
 def _calendar() -> StoredSessionCalendar:
@@ -150,6 +176,156 @@ def test_valid_current_analysis_after_requested_session_close_is_accepted() -> N
     assert decision.decision_identity.startswith(
         "financial-metadata-temporal-eligibility-decision:v1:"
     )
+
+
+@pytest.mark.unit
+def test_windowed_current_analysis_rejects_terminal_clock_regression() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="market-session eligibility window binding is invalid",
+    ):
+        build_financial_eligibility_acquisition_window(
+            _calendar(),
+            transaction_binding=_transaction_binding(
+                eligibility_started_at=_at(10, 15, 5)
+            ),
+            requested_session=date(2026, 8, 10),
+            eligibility_started_at=_at(10, 15, 5),
+            eligibility_evaluated_at=_at(10, 15, 4),
+        )
+
+
+@pytest.mark.unit
+def test_windowed_current_analysis_rejects_truthful_future_retrieval() -> None:
+    retrieved_at = _at(10, 15, 6)
+    window = build_financial_eligibility_acquisition_window(
+        _calendar(),
+        transaction_binding=_transaction_binding(
+            eligibility_started_at=_at(10, 15)
+        ),
+        requested_session=date(2026, 8, 10),
+        eligibility_started_at=_at(10, 15),
+        eligibility_evaluated_at=_at(10, 15, 5),
+    )
+
+    decision = evaluate_financial_metadata_temporal_eligibility_v2(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=_evidence(retrieved_at=retrieved_at),
+        acquisition_window=window,
+    )
+
+    assert decision.result == "rejected"
+    assert decision.retrieved_at == retrieved_at
+    assert (
+        TemporalEligibilityRejectionReason.RETRIEVAL_AFTER_ELIGIBILITY_EVALUATION
+        in decision.reasons
+    )
+
+
+@pytest.mark.unit
+def test_windowed_retained_proof_uses_terminal_bound_without_fresh_start_claim() -> None:
+    window = build_financial_eligibility_acquisition_window(
+        _calendar(),
+        transaction_binding=_transaction_binding(
+            eligibility_started_at=_at(10, 15, 5)
+        ),
+        requested_session=date(2026, 8, 10),
+        eligibility_started_at=_at(10, 15, 5),
+        eligibility_evaluated_at=_at(10, 15, 10),
+    )
+    evidence = _evidence(retrieved_at=_at(10, 15, 1))
+
+    retained = evaluate_financial_metadata_temporal_eligibility_v2(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=evidence,
+        acquisition_window=window,
+        evidence_origin="retained",
+    )
+    fresh = evaluate_financial_metadata_temporal_eligibility_v2(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=evidence,
+        acquisition_window=window,
+        evidence_origin="fresh",
+    )
+
+    assert retained.result == "accepted"
+    assert retained.reasons == ()
+    assert retained.evidence_origin == "retained"
+    assert fresh.result == "rejected"
+    assert fresh.evidence_origin == "fresh"
+    assert {
+        TemporalEligibilityRejectionReasonV2.OBSERVATION_BEFORE_ELIGIBILITY_START,
+        TemporalEligibilityRejectionReasonV2.RETRIEVAL_BEFORE_ELIGIBILITY_START,
+    }.issubset(fresh.reasons)
+
+
+@pytest.mark.unit
+def test_windowed_strict_exact_revision_still_rejects_retrieval_after_terminal() -> None:
+    retrieved_at = _at(10, 15, 11)
+    artifact = _artifact()
+    window = build_financial_eligibility_acquisition_window(
+        _calendar(),
+        transaction_binding=_transaction_binding(
+            eligibility_started_at=_at(10, 15, 5),
+            mode=TemporalEligibilityMode.STRICT_HISTORICAL_PIT,
+            strict_cutoff=_STRICT_CUTOFF,
+        ),
+        requested_session=date(2026, 8, 10),
+        eligibility_started_at=_at(10, 15, 5),
+        eligibility_evaluated_at=_at(10, 15, 10),
+    )
+    evidence = _evidence(
+        retrieved_at=retrieved_at,
+        exact_revision_availability_proof=ExactRevisionAvailabilityProof(
+            exact_revision_authoritative_available_at=_STRICT_CUTOFF,
+            authoritative=True,
+            scope=ExactRevisionAvailabilityScope.EXACT_IMMUTABLE_REVISION,
+            proof_identity="strict-window-terminal-bound",
+            artifact=artifact,
+        ),
+    )
+
+    decision = evaluate_financial_metadata_temporal_eligibility_v2(
+        mode=TemporalEligibilityMode.STRICT_HISTORICAL_PIT,
+        evidence=evidence,
+        acquisition_window=window,
+        evidence_origin="retained",
+        strict_cutoff=_STRICT_CUTOFF,
+    )
+
+    assert decision.result == "rejected"
+    assert decision.retrieved_at == retrieved_at
+    assert decision.evidence_origin == "retained"
+    assert (
+        TemporalEligibilityRejectionReason.RETRIEVAL_AFTER_ELIGIBILITY_EVALUATION
+        in decision.reasons
+    )
+
+
+@pytest.mark.unit
+def test_windowed_decision_rejects_mode_contradicting_transaction_binding() -> None:
+    window = build_financial_eligibility_acquisition_window(
+        _calendar(),
+        transaction_binding=_transaction_binding(
+            eligibility_started_at=_at(10, 15, 5)
+        ),
+        requested_session=date(2026, 8, 10),
+        eligibility_started_at=_at(10, 15, 5),
+        eligibility_evaluated_at=_at(10, 15, 10),
+    )
+    decision = evaluate_financial_metadata_temporal_eligibility_v2(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        evidence=_evidence(retrieved_at=_at(10, 15, 6)),
+        acquisition_window=window,
+    )
+    payload = decision.model_dump(mode="python")
+    payload["mode"] = TemporalEligibilityMode.STRICT_HISTORICAL_PIT.value
+
+    with pytest.raises(
+        ValidationError,
+        match="temporal decision active transaction binding mismatch",
+    ):
+        FinancialMetadataTemporalEligibilityDecision.model_validate(payload)
 
 
 @pytest.mark.unit

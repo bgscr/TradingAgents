@@ -2197,7 +2197,7 @@ def run_analysis(
                         )
                         if qualified_financial_routing is None or (
                             direct_plan is not None
-                            and direct_plan.plan_version == "1.3"
+                            and direct_plan.plan_version in {"1.3", "1.4"}
                         ):
                             capability_routing_plan = (
                                 prepare_mainland_temporal_capability_routing_plan(
@@ -2306,7 +2306,7 @@ def run_analysis(
                 RegisteredProductionQualifiedRoutingComposition,
             )
             and capability_routing_plan is not None
-            and capability_routing_plan.plan_version == "1.3"
+            and capability_routing_plan.plan_version in {"1.3", "1.4"}
         ):
             try:
                 qualified_validation_calendar_receipt = (

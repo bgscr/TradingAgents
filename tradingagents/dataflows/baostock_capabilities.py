@@ -453,10 +453,10 @@ class BaoStockLifecycleAdapterResult(_BaoStockAdapterResultBase):
         ):
             raise ValueError("BaoStock listing metadata has no unique lifecycle candidate")
         candidate = self.candidates[0]
-        temporal = (
-            self.listing_metadata.contract_version
-            == "financial-listing-metadata-v2"
-        )
+        temporal = self.listing_metadata.contract_version in {
+            "financial-listing-metadata-v2",
+            "financial-listing-metadata-v3",
+        }
         analysis_session = (
             self.listing_metadata.requested_session
             if temporal
@@ -1066,7 +1066,8 @@ class BaoStockCapabilityAdapter:
         listing_metadata = None
         if len(candidates) == 1 and candidates[0].listing_date is not None:
             candidate = candidates[0]
-            temporal = self._plan.plan_version == "1.3"
+            temporal = self._plan.plan_version in {"1.3", "1.4"}
+            windowed = self._plan.plan_version == "1.4"
             temporal_evidence = (
                 project_baostock_listing_temporal_evidence(
                     artifact_identity=candidate.artifact_identity,
@@ -1086,9 +1087,13 @@ class BaoStockCapabilityAdapter:
             )
             listing_metadata = FinancialListingMetadata(
                 contract_version=(
-                    "financial-listing-metadata-v2"
-                    if temporal
-                    else "financial-listing-metadata-v1"
+                    "financial-listing-metadata-v3"
+                    if windowed
+                    else (
+                        "financial-listing-metadata-v2"
+                        if temporal
+                        else "financial-listing-metadata-v1"
+                    )
                 ),
                 instrument_identity=instrument_identity,
                 as_of_date=None if temporal else as_of_date,

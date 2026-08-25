@@ -927,7 +927,10 @@ def decode_yahoo_company_type_evidence_response(
         )
         if (
             request.metadata_binding.contract_version
-            == "financial-eligibility-metadata-binding-v2"
+            in {
+                "financial-eligibility-metadata-binding-v2",
+                "financial-eligibility-metadata-binding-v3",
+            }
         ):
             return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
                 provider_id="yfinance",
