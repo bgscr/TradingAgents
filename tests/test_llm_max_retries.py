@@ -400,8 +400,9 @@ def test_zero_retry_budget_retains_one_terminal_physical_attempt():
 def test_transport_failure_evidence_excludes_secrets_and_model_payloads(tmp_path):
     from cli.runtime_artifacts import RuntimeArtifactWriter
 
+    runtime_canary = "_".join(("TICKET07", "API", "KEY", "SENTINEL"))
     sentinels = {
-        "api_key": "TICKET07_API_KEY_SENTINEL",
+        "api_key": runtime_canary,
         "authorization": "TICKET07_AUTHORIZATION_SENTINEL",
         "prompt": "TICKET07_PROMPT_SENTINEL",
         "request_body": "TICKET07_REQUEST_BODY_SENTINEL",
@@ -496,7 +497,7 @@ def test_async_retry_then_success_uses_the_same_physical_attempt_contract():
             llm = OpenAIClient(
                 model="deepseek-chat",
                 provider="deepseek",
-                api_key="safe-test-key",
+                api_key="test-key",
                 max_retries=2,
                 callbacks=[RunTelemetryCallbackHandler(run.telemetry_ledger)],
                 http_async_client=http_client,
