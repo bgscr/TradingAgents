@@ -1060,9 +1060,95 @@ def _render_shadow_financial_dispatch_comparison(
         "",
     ]
     if failure is not None:
-        lines[-1:-1] = [
+        failure_lines = [
+            (
+                "- **Shadow failure diagnostic contract:** "
+                f"`{failure.contract_version}`"
+            ),
+            (
+                "- **Shadow failure diagnostic code:** "
+                f"`{failure.diagnostic_code}`"
+            ),
             f"- **Sanitized shadow failures:** {failure.failure_count}",
         ]
+        localized_failures = failure.localized_failures()
+        if failure.contract_version != "1.0":
+            retained_count = (
+                failure.retained_failure_count
+                if failure.contract_version == "2.1"
+                and failure.retained_failure_count is not None
+                else len(localized_failures)
+            )
+            dropped_count = (
+                failure.dropped_failure_count
+                if failure.contract_version == "2.1"
+                and failure.dropped_failure_count is not None
+                else failure.failure_count - len(localized_failures)
+            )
+            failure_lines.extend(
+                (
+                    (
+                        "- **Retained localized failures:** "
+                        f"{retained_count}"
+                    ),
+                    (
+                        "- **Dropped localized failures:** "
+                        f"{dropped_count}"
+                    ),
+                )
+            )
+        for index, localized in enumerate(localized_failures, start=1):
+            prefix = f"- **Failure {index}"
+            failure_lines.extend(
+                (
+                    f"{prefix} stage:** `{localized.stage.value}`",
+                    f"{prefix} kind:** `{localized.failure_kind.value}`",
+                )
+            )
+            if localized.typed_acquisition_reason is not None:
+                failure_lines.append(
+                    f"{prefix} acquisition reason:** "
+                    f"`{localized.typed_acquisition_reason.value}`"
+                )
+            if localized.temporal_rejection_reasons:
+                reasons = ", ".join(
+                    f"`{reason.value}`"
+                    for reason in localized.temporal_rejection_reasons
+                )
+                failure_lines.append(
+                    f"{prefix} temporal rejection reasons:** {reasons}"
+                )
+            if (
+                localized.exception_family is not None
+                and localized.exception_class is not None
+            ):
+                failure_lines.append(
+                    f"{prefix} exception:** "
+                    f"`{localized.exception_family.value}."
+                    f"{localized.exception_class.value}`"
+                )
+            if localized.typed_reason is not None:
+                failure_lines.append(
+                    f"{prefix} typed reason:** `{localized.typed_reason.value}`"
+                )
+            if localized.canonical_request_reference is not None:
+                failure_lines.append(
+                    f"{prefix} canonical request:** "
+                    f"`{localized.canonical_request_reference}`"
+                )
+            if localized.selection_kind is not None:
+                failure_lines.append(
+                    f"{prefix} selection kind:** `{localized.selection_kind.value}`"
+                )
+            failure_lines.extend(
+                (
+                    f"{prefix} context constructed:** "
+                    f"{str(localized.context_constructed).lower()}",
+                    f"{prefix} dispatcher constructed:** "
+                    f"{str(localized.dispatcher_constructed).lower()}",
+                )
+            )
+        lines[-1:-1] = failure_lines
     if shadow is not None:
         shadow_operations = _render_financial_dispatch_operations(
             shadow,

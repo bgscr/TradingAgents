@@ -882,14 +882,517 @@ class MainlandCapabilityRoutingRunProjection(BaseModel):
         return self
 
 
-class MainlandCapabilityRoutingShadowFailure(BaseModel):
-    """Bounded non-authoritative failure marker with no provider detail."""
+class MainlandCapabilityRoutingShadowFailureStage(str, Enum):
+    CONTEXT_RESULT = "context_result"
+    CONTEXT_EXCEPTION = "context_exception"
+    DISPATCHER_CONSTRUCTION = "dispatcher_construction"
+    REQUEST_ENRICHMENT = "request_enrichment"
+    REQUEST_FACTORY = "request_factory"
+    SELECTION_DISPATCH = "selection_dispatch"
+    CHECKPOINT_PROJECTION = "checkpoint_projection"
+
+
+class MainlandCapabilityRoutingShadowFailureKind(str, Enum):
+    TYPED_RESULT = "typed_result"
+    EXCEPTION = "exception"
+
+
+class MainlandCapabilityRoutingShadowSelectionKind(str, Enum):
+    STATEMENT = "statement"
+    INDICATOR = "indicator"
+
+
+class MainlandCapabilityRoutingShadowAcquisitionReason(str, Enum):
+    COMPANY_TYPE_EVIDENCE_UNAVAILABLE = "company_type_evidence_unavailable"
+    COMPANY_TYPE_UNRESOLVED = "company_type_unresolved"
+    COMPANY_TYPE_AMBIGUOUS = "company_type_ambiguous"
+    COMPANY_TYPE_CONTRADICTORY = "company_type_contradictory"
+    LISTING_PROVENANCE_UNAVAILABLE = "listing_provenance_unavailable"
+    TEMPORAL_PROOF_UNAVAILABLE = "temporal_proof_unavailable"
+    TEMPORAL_ELIGIBILITY_REJECTED = "temporal_eligibility_rejected"
+    CONTEXT_BINDING_MISMATCH = "context_binding_mismatch"
+    INTERRUPTED_ACQUISITION = "interrupted_acquisition"
+    UNKNOWN = "unknown"
+
+
+class MainlandCapabilityRoutingShadowTemporalRejectionReason(str, Enum):
+    REQUESTED_SESSION_NOT_OPEN_IN_PINNED_CALENDAR = (
+        "requested_session_not_open_in_pinned_calendar"
+    )
+    CALENDAR_ELIGIBILITY_BINDING_MISMATCH = (
+        "calendar_eligibility_binding_mismatch"
+    )
+    OBSERVATION_AFTER_RETRIEVAL = "observation_after_retrieval"
+    EVIDENCE_EFFECTIVE_AS_OF_UNPROVEN = "evidence_effective_as_of_unproven"
+    EVIDENCE_EFFECTIVE_AFTER_REQUESTED_SESSION = (
+        "evidence_effective_after_requested_session"
+    )
+    ANN_DATE_MISSING = "ann_date_missing"
+    ANN_DATE_AFTER_REQUESTED_SESSION = "ann_date_after_requested_session"
+    RETRIEVAL_BEFORE_REQUESTED_SESSION_COMPLETED = (
+        "retrieval_before_requested_session_completed"
+    )
+    RETRIEVAL_AFTER_ELIGIBILITY_EVALUATION = (
+        "retrieval_after_eligibility_evaluation"
+    )
+    REQUESTED_SESSION_NOT_LATEST_COMPLETED_FRONTIER = (
+        "requested_session_not_latest_completed_frontier"
+    )
+    F_ANN_DATE_MISSING_FOR_STRICT_PIT = "f_ann_date_missing_for_strict_pit"
+    F_ANN_DATE_AFTER_REQUESTED_SESSION = "f_ann_date_after_requested_session"
+    EXACT_REVISION_NOT_AVAILABLE_BY_STRICT_CUTOFF = (
+        "exact_revision_not_available_by_strict_cutoff"
+    )
+    TEMPORAL_EVIDENCE_ARTIFACT_BINDING_MISMATCH = (
+        "temporal_evidence_artifact_binding_mismatch"
+    )
+    UNKNOWN_TEMPORAL_ELIGIBILITY_MODE = "unknown_temporal_eligibility_mode"
+    ELIGIBILITY_EVALUATION_BEFORE_START = "eligibility_evaluation_before_start"
+    OBSERVATION_BEFORE_ELIGIBILITY_START = "observation_before_eligibility_start"
+    RETRIEVAL_BEFORE_ELIGIBILITY_START = "retrieval_before_eligibility_start"
+    ACQUISITION_WINDOW_BINDING_MISMATCH = "acquisition_window_binding_mismatch"
+
+
+class MainlandCapabilityRoutingShadowExceptionFamily(str, Enum):
+    BUILTINS = "builtins"
+    FINANCIAL_DISPATCH = "financial_dispatch"
+    PYDANTIC = "pydantic"
+    QUALIFIED_ROUTING_LIFECYCLE = "qualified_routing_lifecycle"
+    UNKNOWN = "unknown"
+
+
+class MainlandCapabilityRoutingShadowExceptionClass(str, Enum):
+    FINANCIAL_DISPATCH_CHECKPOINT_ERROR = "FinancialDispatchCheckpointError"
+    PRODUCTION_QUALIFIED_ROUTING_LIFECYCLE_ERROR = (
+        "ProductionQualifiedRoutingLifecycleError"
+    )
+    RUNTIME_ERROR = "RuntimeError"
+    VALUE_ERROR = "ValueError"
+    TYPE_ERROR = "TypeError"
+    ATTRIBUTE_ERROR = "AttributeError"
+    KEY_ERROR = "KeyError"
+    VALIDATION_ERROR = "ValidationError"
+    UNKNOWN = "unknown"
+
+
+class MainlandCapabilityRoutingShadowTypedReason(str, Enum):
+    FINANCIAL_DISPATCH_CHECKPOINT_MALFORMED = (
+        "financial_dispatch_checkpoint_malformed"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_UNSAFE_BOUNDARY = (
+        "financial_dispatch_checkpoint_unsafe_boundary"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_POLICY_MISMATCH = (
+        "financial_dispatch_checkpoint_policy_mismatch"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_PROVIDER_CHAIN_MISMATCH = (
+        "financial_dispatch_checkpoint_provider_chain_mismatch"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_ASSET_CONFIGURATION_MISMATCH = (
+        "financial_dispatch_checkpoint_asset_configuration_mismatch"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_CANONICAL_REQUEST_MISMATCH = (
+        "financial_dispatch_checkpoint_canonical_request_mismatch"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_ARTIFACT_REFERENCE_INVALID = (
+        "financial_dispatch_checkpoint_artifact_reference_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_BUDGET_PROGRESS_INVALID = (
+        "financial_dispatch_checkpoint_budget_progress_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_TERMINAL_OUTCOME_INVALID = (
+        "financial_dispatch_checkpoint_terminal_outcome_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_PROVIDER_SUBREQUEST_CACHE_INVALID = (
+        "financial_dispatch_checkpoint_provider_subrequest_cache_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_QUALIFIED_SELECTION_INVALID = (
+        "financial_dispatch_checkpoint_qualified_selection_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_MANIFEST_INVALID = (
+        "financial_dispatch_checkpoint_manifest_invalid"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_ROUTING_PLAN_MISMATCH = (
+        "financial_dispatch_checkpoint_routing_plan_mismatch"
+    )
+    FINANCIAL_DISPATCH_CHECKPOINT_RUN_SCOPE_MISMATCH = (
+        "financial_dispatch_checkpoint_run_scope_mismatch"
+    )
+    FINANCIAL_ELIGIBILITY_POLICY_MISMATCH = "financial_eligibility_policy_mismatch"
+    FINANCIAL_ELIGIBILITY_CONTEXT_MISSING = "financial_eligibility_context_missing"
+    FINANCIAL_ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED = (
+        "financial_eligibility_context_version_unsupported"
+    )
+    FINANCIAL_ELIGIBILITY_CONTEXT_IDENTITY_MISMATCH = (
+        "financial_eligibility_context_identity_mismatch"
+    )
+    FINANCIAL_ELIGIBILITY_CONTEXT_INVALID = "financial_eligibility_context_invalid"
+    FINANCIAL_ELIGIBILITY_CONTEXT_BINDING_MISMATCH = (
+        "financial_eligibility_context_binding_mismatch"
+    )
+    FINANCIAL_ELIGIBILITY_CONTEXT_CACHE_MISMATCH = (
+        "financial_eligibility_context_cache_mismatch"
+    )
+    FINANCIAL_ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH = (
+        "financial_eligibility_context_dispatcher_mismatch"
+    )
+    FINANCIAL_INDICATOR_METADATA_COMPATIBILITY_MISMATCH = (
+        "financial_indicator_metadata_compatibility_mismatch"
+    )
+    FINANCIAL_TEMPORAL_COMPATIBILITY_MISMATCH = (
+        "financial_temporal_compatibility_mismatch"
+    )
+    QUALIFIED_ROUTING_RUNTIME_BINDING_INVALID = (
+        "qualified_routing_runtime_binding_invalid"
+    )
+    QUALIFIED_ROUTING_RUNTIME_CLOSED = "qualified_routing_runtime_closed"
+    QUALIFIED_ROUTING_RUNTIME_DIFFERENT_RUN_ACTIVE = (
+        "qualified_routing_runtime_different_run_active"
+    )
+    QUALIFIED_ROUTING_RUNTIME_INTERRUPTED = "qualified_routing_runtime_interrupted"
+    QUALIFIED_ROUTING_ELIGIBILITY_CONTEXT_UNBOUND = (
+        "qualified_routing_eligibility_context_unbound"
+    )
+    QUALIFIED_ROUTING_ELIGIBILITY_CONTEXT_BINDING_INVALID = (
+        "qualified_routing_eligibility_context_binding_invalid"
+    )
+
+
+# Retain one slot for every closed stage. The total uses a fixed signed-64-bit
+# scalar, which bounds serialization beyond any realizable in-memory request list.
+MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND = len(
+    MainlandCapabilityRoutingShadowFailureStage
+)
+MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_COUNT_MAX = (1 << 63) - 1
+
+
+class MainlandCapabilityRoutingShadowFailureEntry(BaseModel):
+    """One closed, sanitized, independently localized shadow failure."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = "1.0"
+    stage: MainlandCapabilityRoutingShadowFailureStage
+    failure_kind: MainlandCapabilityRoutingShadowFailureKind
+    typed_acquisition_reason: (
+        MainlandCapabilityRoutingShadowAcquisitionReason | None
+    ) = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    temporal_rejection_reasons: tuple[
+        MainlandCapabilityRoutingShadowTemporalRejectionReason,
+        ...,
+    ] = Field(
+        default=(),
+        max_length=len(MainlandCapabilityRoutingShadowTemporalRejectionReason),
+        exclude_if=lambda value: not value,
+    )
+    exception_family: MainlandCapabilityRoutingShadowExceptionFamily | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    exception_class: MainlandCapabilityRoutingShadowExceptionClass | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    typed_reason: MainlandCapabilityRoutingShadowTypedReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    canonical_request_reference: str | None = Field(
+        default=None,
+        pattern=r"^financial-request:v1:[0-9a-f]{64}$",
+        max_length=85,
+        exclude_if=lambda value: value is None,
+    )
+    selection_kind: MainlandCapabilityRoutingShadowSelectionKind | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    context_constructed: bool
+    dispatcher_constructed: bool
+
+    @model_validator(mode="after")
+    def _validate_entry(self) -> MainlandCapabilityRoutingShadowFailureEntry:
+        if self.failure_kind is MainlandCapabilityRoutingShadowFailureKind.TYPED_RESULT:
+            if (
+                self.stage
+                is not MainlandCapabilityRoutingShadowFailureStage.CONTEXT_RESULT
+                or self.typed_acquisition_reason is None
+                or self.exception_family is not None
+                or self.exception_class is not None
+                or self.typed_reason is not None
+                or self.context_constructed
+                or self.dispatcher_constructed
+            ):
+                raise ValueError("typed context-result shadow failure is inconsistent")
+            canonical_temporal_reasons = tuple(
+                sorted(
+                    set(self.temporal_rejection_reasons),
+                    key=lambda reason: reason.value,
+                )
+            )
+            if self.temporal_rejection_reasons != canonical_temporal_reasons:
+                raise ValueError(
+                    "shadow temporal rejection reasons must be sorted and unique"
+                )
+            has_temporal_rejection = (
+                self.typed_acquisition_reason
+                is MainlandCapabilityRoutingShadowAcquisitionReason.TEMPORAL_ELIGIBILITY_REJECTED
+            )
+            if has_temporal_rejection != bool(self.temporal_rejection_reasons):
+                raise ValueError("shadow temporal rejection detail is inconsistent")
+            return self
+        if (
+            self.stage
+            is MainlandCapabilityRoutingShadowFailureStage.CONTEXT_RESULT
+            or self.typed_acquisition_reason is not None
+            or self.temporal_rejection_reasons
+            or self.exception_family is None
+            or self.exception_class is None
+        ):
+            raise ValueError("exception shadow failure is inconsistent")
+        expected_progress = {
+            MainlandCapabilityRoutingShadowFailureStage.CONTEXT_EXCEPTION: (
+                False,
+                False,
+            ),
+            MainlandCapabilityRoutingShadowFailureStage.DISPATCHER_CONSTRUCTION: (
+                True,
+                False,
+            ),
+        }.get(self.stage)
+        if expected_progress is not None and (
+            self.context_constructed,
+            self.dispatcher_constructed,
+        ) != expected_progress:
+            raise ValueError("shadow failure stage contradicts progress")
+        if self.stage in {
+            MainlandCapabilityRoutingShadowFailureStage.REQUEST_ENRICHMENT,
+            MainlandCapabilityRoutingShadowFailureStage.REQUEST_FACTORY,
+            MainlandCapabilityRoutingShadowFailureStage.SELECTION_DISPATCH,
+            MainlandCapabilityRoutingShadowFailureStage.CHECKPOINT_PROJECTION,
+        } and not self.dispatcher_constructed:
+            raise ValueError("post-dispatcher shadow failure requires a dispatcher")
+        allowed_exception_identities = {
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.BUILTINS,
+                MainlandCapabilityRoutingShadowExceptionClass.RUNTIME_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.BUILTINS,
+                MainlandCapabilityRoutingShadowExceptionClass.VALUE_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.BUILTINS,
+                MainlandCapabilityRoutingShadowExceptionClass.TYPE_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.BUILTINS,
+                MainlandCapabilityRoutingShadowExceptionClass.ATTRIBUTE_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.BUILTINS,
+                MainlandCapabilityRoutingShadowExceptionClass.KEY_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.PYDANTIC,
+                MainlandCapabilityRoutingShadowExceptionClass.VALIDATION_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.FINANCIAL_DISPATCH,
+                MainlandCapabilityRoutingShadowExceptionClass.FINANCIAL_DISPATCH_CHECKPOINT_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.QUALIFIED_ROUTING_LIFECYCLE,
+                MainlandCapabilityRoutingShadowExceptionClass.PRODUCTION_QUALIFIED_ROUTING_LIFECYCLE_ERROR,
+            ),
+            (
+                MainlandCapabilityRoutingShadowExceptionFamily.UNKNOWN,
+                MainlandCapabilityRoutingShadowExceptionClass.UNKNOWN,
+            ),
+        }
+        if (self.exception_family, self.exception_class) not in (
+            allowed_exception_identities
+        ):
+            raise ValueError("shadow exception family and class are inconsistent")
+        typed_exception = self.exception_family in {
+            MainlandCapabilityRoutingShadowExceptionFamily.FINANCIAL_DISPATCH,
+            MainlandCapabilityRoutingShadowExceptionFamily.QUALIFIED_ROUTING_LIFECYCLE,
+        }
+        if self.typed_reason is not None and not typed_exception:
+            raise ValueError("shadow exception typed reason is inconsistent")
+        if self.typed_reason is not None:
+            expected_family = (
+                MainlandCapabilityRoutingShadowExceptionFamily.FINANCIAL_DISPATCH
+                if self.typed_reason.value.startswith("financial_")
+                else MainlandCapabilityRoutingShadowExceptionFamily.QUALIFIED_ROUTING_LIFECYCLE
+            )
+            if self.exception_family is not expected_family:
+                raise ValueError("shadow exception typed reason family is inconsistent")
+        return self
+
+
+class MainlandCapabilityRoutingShadowFailure(BaseModel):
+    """Versioned, bounded non-authoritative shadow-failure projection."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["1.0", "2.0", "2.1"] = "2.1"
     diagnostic_code: Literal["shadow_dispatch_failed"] = "shadow_dispatch_failed"
-    failure_count: int = Field(ge=1)
+    failure_count: int = Field(
+        ge=1,
+        le=MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_COUNT_MAX,
+    )
+    retained_failure_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND,
+        exclude_if=lambda value: value is None,
+    )
+    dropped_failure_count: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_COUNT_MAX,
+        exclude_if=lambda value: value is None,
+    )
+    failures: tuple[MainlandCapabilityRoutingShadowFailureEntry, ...] = Field(
+        default=(),
+        max_length=MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND,
+        exclude_if=lambda value: not value,
+    )
+    stage: MainlandCapabilityRoutingShadowFailureStage | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    failure_kind: MainlandCapabilityRoutingShadowFailureKind | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    typed_acquisition_reason: (
+        MainlandCapabilityRoutingShadowAcquisitionReason | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    temporal_rejection_reasons: tuple[
+        MainlandCapabilityRoutingShadowTemporalRejectionReason,
+        ...,
+    ] = Field(
+        default=(),
+        max_length=len(MainlandCapabilityRoutingShadowTemporalRejectionReason),
+        exclude_if=lambda value: not value,
+    )
+    exception_family: MainlandCapabilityRoutingShadowExceptionFamily | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    exception_class: MainlandCapabilityRoutingShadowExceptionClass | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    typed_reason: MainlandCapabilityRoutingShadowTypedReason | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    canonical_request_reference: str | None = Field(
+        default=None,
+        pattern=r"^financial-request:v1:[0-9a-f]{64}$",
+        max_length=85,
+        exclude_if=lambda value: value is None,
+    )
+    selection_kind: MainlandCapabilityRoutingShadowSelectionKind | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    context_constructed: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    dispatcher_constructed: bool | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    def _legacy_entry_payload(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "failure_kind": self.failure_kind,
+            "typed_acquisition_reason": self.typed_acquisition_reason,
+            "temporal_rejection_reasons": self.temporal_rejection_reasons,
+            "exception_family": self.exception_family,
+            "exception_class": self.exception_class,
+            "typed_reason": self.typed_reason,
+            "canonical_request_reference": self.canonical_request_reference,
+            "selection_kind": self.selection_kind,
+            "context_constructed": self.context_constructed,
+            "dispatcher_constructed": self.dispatcher_constructed,
+        }
+
+    @model_validator(mode="after")
+    def _validate_versioned_projection(self) -> MainlandCapabilityRoutingShadowFailure:
+        legacy_detail = self._legacy_entry_payload()
+        has_legacy_detail = any(
+            value is not None and value != () for value in legacy_detail.values()
+        )
+        has_collection_detail = bool(self.failures) or any(
+            value is not None
+            for value in (
+                self.retained_failure_count,
+                self.dropped_failure_count,
+            )
+        )
+        if self.contract_version == "1.0":
+            if has_legacy_detail or has_collection_detail:
+                raise ValueError("shadow failure v1 cannot carry localized detail")
+            return self
+        if self.contract_version == "2.0":
+            if has_collection_detail:
+                raise ValueError("shadow failure v2.0 cannot carry a failure collection")
+            MainlandCapabilityRoutingShadowFailureEntry.model_validate(
+                legacy_detail
+            )
+            return self
+        if has_legacy_detail:
+            raise ValueError("shadow failure v2.1 cannot carry legacy single detail")
+        if (
+            self.retained_failure_count is None
+            or self.dropped_failure_count is None
+            or len(self.failures) != self.retained_failure_count
+            or self.failure_count
+            != self.retained_failure_count + self.dropped_failure_count
+        ):
+            raise ValueError("shadow failure v2.1 accounting is inconsistent")
+        return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> MainlandCapabilityRoutingShadowFailure:
+        """Preserve Pydantic's copy API while revalidating every update."""
+
+        payload = self.model_dump(mode="python")
+        if update:
+            payload.update(update)
+        if deep:
+            import copy
+
+            payload = copy.deepcopy(payload)
+        return type(self).model_validate(payload)
+
+    def localized_failures(
+        self,
+    ) -> tuple[MainlandCapabilityRoutingShadowFailureEntry, ...]:
+        """Return only versioned localized entries; never reinterpret v1."""
+
+        if self.contract_version == "2.1":
+            return self.failures
+        if self.contract_version == "2.0":
+            return (
+                MainlandCapabilityRoutingShadowFailureEntry.model_validate(
+                    self._legacy_entry_payload()
+                ),
+            )
+        return ()
 
 
 class MainlandCapabilityRoutingCheckpointAction(str, Enum):

@@ -110,6 +110,17 @@ _ENABLED_CAPABILITIES = (
 _THREAD_ID = "0600000000000004"
 
 
+def _single_localized_shadow_failure(entry: dict[str, object]) -> dict[str, object]:
+    return {
+        "contract_version": "2.1",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+        "retained_failure_count": 1,
+        "dropped_failure_count": 0,
+        "failures": [entry],
+    }
+
+
 def _patch_tushare_dependency_available(monkeypatch: pytest.MonkeyPatch) -> None:
     class _InstalledTushareProbe:
         class util:
@@ -1088,11 +1099,21 @@ def test_fresh_builtin_rejects_when_acquisition_crosses_next_session_close(
             )
         )
 
-        assert result["financial_dispatch_shadow_failure"] == {
-            "contract_version": "1.0",
-            "diagnostic_code": "shadow_dispatch_failed",
-            "failure_count": 1,
-        }
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_result",
+                    "failure_kind": "typed_result",
+                    "typed_acquisition_reason": "temporal_eligibility_rejected",
+                    "temporal_rejection_reasons": [
+                        "requested_session_not_latest_completed_frontier"
+                    ],
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
         assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
@@ -1153,11 +1174,18 @@ def test_fresh_builtin_rejects_mismatched_window_transaction_before_provider_wor
             )
         )
 
-        assert result["financial_dispatch_shadow_failure"] == {
-            "contract_version": "1.0",
-            "diagnostic_code": "shadow_dispatch_failed",
-            "failure_count": 1,
-        }
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_result",
+                    "failure_kind": "typed_result",
+                    "typed_acquisition_reason": "context_binding_mismatch",
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
         assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
@@ -1221,11 +1249,18 @@ def test_fresh_builtin_rejects_proof_bound_to_another_active_transaction(
             )
         )
 
-        assert result["financial_dispatch_shadow_failure"] == {
-            "contract_version": "1.0",
-            "diagnostic_code": "shadow_dispatch_failed",
-            "failure_count": 1,
-        }
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_result",
+                    "failure_kind": "typed_result",
+                    "typed_acquisition_reason": "context_binding_mismatch",
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
         assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
@@ -1262,11 +1297,18 @@ def test_fresh_builtin_rejects_terminal_clock_regression_without_partial_context
             )
         )
 
-        assert result["financial_dispatch_shadow_failure"] == {
-            "contract_version": "1.0",
-            "diagnostic_code": "shadow_dispatch_failed",
-            "failure_count": 1,
-        }
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_result",
+                    "failure_kind": "typed_result",
+                    "typed_acquisition_reason": "context_binding_mismatch",
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
         assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"

@@ -35,6 +35,8 @@ from tests.test_market_session_calendar_publication import _acquisition
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
+    MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_COUNT_MAX,
+    MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND,
     MainlandCapability,
     MainlandCapabilityRoutingCheckpointAction,
     MainlandCapabilityRoutingCheckpointError,
@@ -46,6 +48,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingPreflight,
     MainlandCapabilityRoutingPreflightError,
     MainlandCapabilityRoutingRunProjection,
+    MainlandCapabilityRoutingShadowFailure,
     TushareCapability,
     preflight_mainland_capability_routing,
     prepare_mainland_temporal_capability_routing_plan,
@@ -67,6 +70,7 @@ from tradingagents.dataflows.financial_contracts import (
 from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
+    FinancialToolDispatcher,
 )
 from tradingagents.decision_audit import prepare_decision_audit
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -1642,6 +1646,132 @@ def test_checkpoint_tampered_shadow_failure_fails_before_work(
     assert "must-not-survive" not in str(caught.value)
 
 
+def test_shadow_failure_v21_distinguishes_candidate_stages_and_reads_v1() -> None:
+    historical_v1 = {
+        "contract_version": "1.0",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+    }
+    candidate_stages = (
+        "context_result",
+        "context_exception",
+        "dispatcher_construction",
+    )
+
+    historical_candidate_projections = tuple(
+        MainlandCapabilityRoutingShadowFailure.model_validate(
+            copy.deepcopy(historical_v1)
+        ).model_dump(mode="json")
+        for _stage in candidate_stages
+    )
+
+    assert historical_candidate_projections == (
+        historical_v1,
+        historical_v1,
+        historical_v1,
+    )
+
+    current_entries = (
+        {
+            "stage": "context_result",
+            "failure_kind": "typed_result",
+            "typed_acquisition_reason": "temporal_eligibility_rejected",
+            "temporal_rejection_reasons": ["ann_date_missing"],
+            "selection_kind": "indicator",
+            "context_constructed": False,
+            "dispatcher_constructed": False,
+        },
+        {
+            "stage": "context_exception",
+            "failure_kind": "exception",
+            "exception_family": "builtins",
+            "exception_class": "RuntimeError",
+            "selection_kind": "indicator",
+            "context_constructed": False,
+            "dispatcher_constructed": False,
+        },
+        {
+            "stage": "dispatcher_construction",
+            "failure_kind": "exception",
+            "exception_family": "financial_dispatch",
+            "exception_class": "FinancialDispatchCheckpointError",
+            "typed_reason": "financial_dispatch_checkpoint_malformed",
+            "selection_kind": "indicator",
+            "context_constructed": True,
+            "dispatcher_constructed": False,
+        },
+    )
+    current_payloads = tuple(
+        {
+            "contract_version": "2.1",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+            "retained_failure_count": 1,
+            "dropped_failure_count": 0,
+            "failures": [entry],
+        }
+        for entry in current_entries
+    )
+    restored_v21 = tuple(
+        MainlandCapabilityRoutingShadowFailure.model_validate(
+            json.loads(json.dumps(payload, sort_keys=True))
+        ).model_dump(mode="json")
+        for payload in current_payloads
+    )
+
+    assert tuple(
+        payload["failures"][0]["stage"] for payload in restored_v21
+    ) == candidate_stages
+    assert restored_v21 == current_payloads
+
+    compatibility_v20 = {
+        "contract_version": "2.0",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+        **current_entries[1],
+    }
+    assert MainlandCapabilityRoutingShadowFailure.model_validate(
+        compatibility_v20
+    ).model_dump(mode="json") == compatibility_v20
+
+
+def test_shadow_failure_updates_and_total_count_are_strictly_validated() -> None:
+    projection = MainlandCapabilityRoutingShadowFailure.model_validate(
+        {
+            "contract_version": "2.1",
+            "diagnostic_code": "shadow_dispatch_failed",
+            "failure_count": 1,
+            "retained_failure_count": 1,
+            "dropped_failure_count": 0,
+            "failures": [
+                {
+                    "stage": "context_exception",
+                    "failure_kind": "exception",
+                    "exception_family": "builtins",
+                    "exception_class": "RuntimeError",
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="accounting is inconsistent"):
+        projection.model_copy(update={"failure_count": 2})
+    with pytest.raises(ValueError):
+        projection.model_copy(update={"failures": ()})
+    with pytest.raises(ValueError):
+        MainlandCapabilityRoutingShadowFailure.model_validate(
+            {
+                **projection.model_dump(mode="json"),
+                "failure_count": (
+                    MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_COUNT_MAX + 1
+                ),
+            }
+        )
+
+
 def test_shadow_only_checkpoint_ledger_is_validated_before_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2550,6 +2680,41 @@ def _financial_tool_state(asset, plan) -> dict[str, object]:
     return state
 
 
+def _authoritative_financial_result_bytes(result: dict[str, object]) -> bytes:
+    return json.dumps(
+        {
+            "messages": [
+                message.model_dump(mode="json") for message in result["messages"]
+            ],
+            "evidence_state": result["evidence_state"],
+            "financial_dispatch_ledger": result["financial_dispatch_ledger"],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _single_localized_shadow_failure(entry: dict[str, object]) -> dict[str, object]:
+    return {
+        "contract_version": "2.1",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+        "retained_failure_count": 1,
+        "dropped_failure_count": 0,
+        "failures": [entry],
+    }
+
+
+def _assert_shadow_authority(plan: MainlandCapabilityRoutingPlan) -> None:
+    assert plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
+    assert plan.financial_eligibility_policy is not None
+    assert plan.financial_eligibility_policy.authority_disposition == (
+        "shadow_non_authoritative"
+    )
+    assert plan.financial_eligibility_policy.qualified_v1_authority_enabled is False
+
+
 def test_shadow_mode_without_validation_composition_uses_only_legacy_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2666,12 +2831,18 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
     asset = _asset()
     plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
+    _assert_shadow_authority(plan)
+    legacy_calls = 0
+    shadow_calls = 0
+    fixed_clock = lambda: datetime(2026, 7, 30, 12, tzinfo=timezone.utc)  # noqa: E731
 
     def legacy_balance_sheet(
         symbol: str,
         frequency: str,
         current_date: str,
     ) -> str:
+        nonlocal legacy_calls
+        legacy_calls += 1
         return (
             f"# Balance Sheet data for {symbol} ({frequency})\n"
             "# Data retrieved on: 2026-07-30 12:00:00\n\n"
@@ -2679,6 +2850,8 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
         )
 
     def failing_source(_request):
+        nonlocal shadow_calls
+        shadow_calls += 1
         raise RuntimeError("raw-provider-secret-must-not-escape")
 
     config = _rollout_config("qualified_v1_shadow")
@@ -2713,19 +2886,45 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
             asset
         ),
         qualified_provider_subrequest_cache=QualifiedCache(),
+        clock=fixed_clock,
     )
 
-    result = node(_financial_tool_state(asset, plan))
+    state = _financial_tool_state(asset, plan)
+    baseline_config = dict(config)
+    baseline_config["mainland_capability_routing_mode"] = "legacy"
+    baseline_config.pop("mainland_capability_routing_plan_signature", None)
+    baseline = FinancialDispatchToolNode(
+        config=baseline_config,
+        vendor_methods=vendor_methods,
+        clock=fixed_clock,
+    )(state)
+    assert legacy_calls == 1
+    legacy_calls = 0
 
+    result = node(state)
+
+    assert legacy_calls == 1
+    assert shadow_calls == 1
+    assert _authoritative_financial_result_bytes(result) == (
+        _authoritative_financial_result_bytes(baseline)
+    )
     assert "LegacyTotal,100" in result["messages"][0].content
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
     assert "provider_subrequest_cache" not in result["financial_dispatch_ledger"]
     assert "financial_dispatch_shadow_ledger" not in result
-    assert result["financial_dispatch_shadow_failure"] == {
-        "contract_version": "1.0",
-        "diagnostic_code": "shadow_dispatch_failed",
-        "failure_count": 1,
-    }
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "selection_dispatch",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            }
+        )
+    )
     assert "raw-provider-secret-must-not-escape" not in json.dumps(
         result,
         default=str,
@@ -2753,18 +2952,136 @@ def test_shadow_dispatch_failure_cannot_change_legacy_output(
     ]
 
 
+def test_hostile_typed_reason_extraction_cannot_escape_or_change_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert plan is not None
+    _assert_shadow_authority(plan)
+    fixed_clock = lambda: datetime(2026, 7, 30, 12, tzinfo=timezone.utc)  # noqa: E731
+    baseline_calls = 0
+    observed_calls = 0
+    shadow_calls = 0
+
+    def legacy_value(symbol: str, frequency: str) -> str:
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            "# Data retrieved on: 2026-07-30 12:00:00\n\n"
+            "metric,2026-06-30\nLegacyTotal,100"
+        )
+
+    def baseline_legacy(
+        symbol: str,
+        frequency: str,
+        current_date: str,
+    ) -> str:
+        nonlocal baseline_calls
+        baseline_calls += 1
+        return legacy_value(symbol, frequency)
+
+    def observed_legacy(
+        symbol: str,
+        frequency: str,
+        current_date: str,
+    ) -> str:
+        nonlocal observed_calls
+        observed_calls += 1
+        return legacy_value(symbol, frequency)
+
+    baseline_config = _rollout_config("legacy", enabled=())
+    baseline_config["tool_vendors"] = dict.fromkeys(
+        (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        ),
+        "scripted",
+    )
+    baseline = FinancialDispatchToolNode(
+        config=baseline_config,
+        vendor_methods=_financial_vendor_methods(baseline_legacy),
+        clock=fixed_clock,
+    )(_financial_tool_state(asset, plan))
+    hostile = FinancialDispatchCheckpointError(
+        FinancialDispatchCheckpointFailureReason.MALFORMED
+    )
+    hostile.args = (
+        "token=unsafe-hostile-reason",
+        {"provider_payload": "unsafe-hostile-args"},
+    )
+
+    def raise_from_reason(_self):
+        raise SystemExit("unsafe-hostile-reason-accessor")
+
+    monkeypatch.setattr(
+        FinancialDispatchCheckpointError,
+        "reason",
+        property(raise_from_reason),
+        raising=False,
+    )
+
+    def failing_source(_request):
+        nonlocal shadow_calls
+        shadow_calls += 1
+        raise hostile
+
+    config = _rollout_config("qualified_v1_shadow")
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    config["tool_vendors"] = baseline_config["tool_vendors"]
+    observed = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods=_financial_vendor_methods(observed_legacy),
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={"tushare": failing_source},
+        ),
+        qualified_statement_request_factory=lambda _request: _statement_request(
+            asset
+        ),
+        clock=fixed_clock,
+    )(_financial_tool_state(asset, plan))
+
+    assert observed_calls == baseline_calls == 1
+    assert shadow_calls == 1
+    assert _authoritative_financial_result_bytes(observed) == (
+        _authoritative_financial_result_bytes(baseline)
+    )
+    failure = observed["financial_dispatch_shadow_failure"]
+    assert failure["failures"][0]["stage"] == "selection_dispatch"
+    assert failure["failures"][0]["exception_family"] == "financial_dispatch"
+    assert failure["failures"][0]["exception_class"] == (
+        "FinancialDispatchCheckpointError"
+    )
+    assert "typed_reason" not in failure["failures"][0]
+    serialized = json.dumps(observed, default=str, sort_keys=True)
+    for forbidden in (
+        "unsafe-hostile-reason",
+        "unsafe-hostile-args",
+        "unsafe-hostile-reason-accessor",
+    ):
+        assert forbidden not in serialized
+
+
 def test_shadow_request_factory_failure_cannot_change_legacy_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset = _asset()
     plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
     assert plan is not None
+    _assert_shadow_authority(plan)
+    legacy_calls = 0
+    factory_calls = 0
+    fixed_clock = lambda: datetime(2026, 7, 30, 12, tzinfo=timezone.utc)  # noqa: E731
 
     def legacy_balance_sheet(
         symbol: str,
         frequency: str,
         current_date: str,
     ) -> str:
+        nonlocal legacy_calls
+        legacy_calls += 1
         return (
             f"# Balance Sheet data for {symbol} ({frequency})\n"
             "# Data retrieved on: 2026-07-30 12:00:00\n\n"
@@ -2772,6 +3089,8 @@ def test_shadow_request_factory_failure_cannot_change_legacy_output(
         )
 
     def failing_factory(_request):
+        nonlocal factory_calls
+        factory_calls += 1
         raise RuntimeError("raw-shadow-factory-secret")
 
     config = _rollout_config("qualified_v1_shadow")
@@ -2785,18 +3104,37 @@ def test_shadow_request_factory_failure_cannot_change_legacy_output(
         ),
         "scripted",
     )
+    vendor_methods = _financial_vendor_methods(legacy_balance_sheet)
     node = FinancialDispatchToolNode(
         config=config,
-        vendor_methods=_financial_vendor_methods(legacy_balance_sheet),
+        vendor_methods=vendor_methods,
         qualified_statement_router=MainlandFinancialCapabilityRouter(
             routing_plan=plan,
             statement_sources={},
         ),
         qualified_statement_request_factory=failing_factory,
+        clock=fixed_clock,
     )
 
-    result = node(_financial_tool_state(asset, plan))
+    state = _financial_tool_state(asset, plan)
+    baseline_config = dict(config)
+    baseline_config["mainland_capability_routing_mode"] = "legacy"
+    baseline_config.pop("mainland_capability_routing_plan_signature", None)
+    baseline = FinancialDispatchToolNode(
+        config=baseline_config,
+        vendor_methods=vendor_methods,
+        clock=fixed_clock,
+    )(state)
+    assert legacy_calls == 1
+    legacy_calls = 0
 
+    result = node(state)
+
+    assert legacy_calls == 1
+    assert factory_calls == 1
+    assert _authoritative_financial_result_bytes(result) == (
+        _authoritative_financial_result_bytes(baseline)
+    )
     assert "LegacyTotal,100" in result["messages"][0].content
     assert result["financial_dispatch_shadow_failure"]["failure_count"] == 1
     assert "raw-shadow-factory-secret" not in json.dumps(result, default=str)
@@ -2812,8 +3150,14 @@ def test_shadow_request_enrichment_failure_cannot_change_legacy_output(
         enabled=("financial_indicators",),
     ).plan
     assert plan is not None
+    _assert_shadow_authority(plan)
+    legacy_calls = 0
+    qualified_factory_calls = 0
+    fixed_clock = lambda: datetime(2026, 7, 30, 12, tzinfo=timezone.utc)  # noqa: E731
 
     def legacy_fundamentals(*_args, **_kwargs) -> str:
+        nonlocal legacy_calls
+        legacy_calls += 1
         return (
             "# Company Fundamentals for 601328.SS\n"
             "# Data retrieved on: 2026-08-10 12:00:00\n\n"
@@ -2822,6 +3166,11 @@ def test_shadow_request_enrichment_failure_cannot_change_legacy_output(
 
     def failing_enrichment(*_args, **_kwargs):
         raise RuntimeError("raw-shadow-enrichment-secret")
+
+    def indicator_factory(_request):
+        nonlocal qualified_factory_calls
+        qualified_factory_calls += 1
+        return None
 
     config = _rollout_config(
         "qualified_v1_shadow",
@@ -2847,7 +3196,8 @@ def test_shadow_request_enrichment_failure_cannot_change_legacy_output(
             statement_sources={},
             indicator_sources={},
         ),
-        qualified_indicator_request_factory=lambda _request: None,
+        qualified_indicator_request_factory=indicator_factory,
+        clock=fixed_clock,
     )
     monkeypatch.setattr(
         node,
@@ -2873,17 +3223,414 @@ def test_shadow_request_enrichment_failure_cannot_change_legacy_output(
         )
     ]
 
+    baseline_config = dict(config)
+    baseline_config["mainland_capability_routing_mode"] = "legacy"
+    baseline_config.pop("mainland_capability_routing_plan_signature", None)
+    baseline = FinancialDispatchToolNode(
+        config=baseline_config,
+        vendor_methods=vendor_methods,
+        clock=fixed_clock,
+    )(state)
+    assert legacy_calls == 1
+    legacy_calls = 0
+
     result = node(state)
 
+    assert legacy_calls == 1
+    assert qualified_factory_calls == 0
+    assert _authoritative_financial_result_bytes(result) == (
+        _authoritative_financial_result_bytes(baseline)
+    )
     assert "LegacyMetric: 100" in result["messages"][0].content
     assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
     assert "financial_dispatch_shadow_ledger" not in result
-    assert result["financial_dispatch_shadow_failure"] == {
-        "contract_version": "1.0",
-        "diagnostic_code": "shadow_dispatch_failed",
-        "failure_count": 1,
-    }
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "request_enrichment",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "indicator",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            }
+        )
+    )
     assert "raw-shadow-enrichment-secret" not in json.dumps(result, default=str)
+
+
+def test_shadow_checkpoint_projection_failure_preserves_legacy_and_call_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert plan is not None
+    _assert_shadow_authority(plan)
+    plan = _historical_plan(plan)
+    fixed_clock = lambda: datetime(2026, 7, 30, 12, tzinfo=timezone.utc)  # noqa: E731
+    baseline_legacy_calls = 0
+    observed_legacy_calls = 0
+    baseline_qualified_calls = 0
+    observed_qualified_calls = 0
+
+    def legacy_value(symbol: str, frequency: str) -> str:
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            "# Data retrieved on: 2026-07-30 12:00:00\n\n"
+            "metric,2026-06-30\nLegacyTotal,100"
+        )
+
+    def baseline_legacy(symbol: str, frequency: str, _current_date: str) -> str:
+        nonlocal baseline_legacy_calls
+        baseline_legacy_calls += 1
+        return legacy_value(symbol, frequency)
+
+    def observed_legacy(symbol: str, frequency: str, _current_date: str) -> str:
+        nonlocal observed_legacy_calls
+        observed_legacy_calls += 1
+        return legacy_value(symbol, frequency)
+
+    def baseline_source(request):
+        nonlocal baseline_qualified_calls
+        baseline_qualified_calls += 1
+        return FinancialProviderPeriodResponse.unavailable(
+            provider_id=request.provider_id,
+            reason="no_data",
+        )
+
+    def observed_source(request):
+        nonlocal observed_qualified_calls
+        observed_qualified_calls += 1
+        return FinancialProviderPeriodResponse.unavailable(
+            provider_id=request.provider_id,
+            reason="no_data",
+        )
+
+    config = _rollout_config("qualified_v1_shadow")
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    config["tool_vendors"] = dict.fromkeys(
+        (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        ),
+        "scripted",
+    )
+    state = _financial_tool_state(asset, plan)
+    baseline = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods=_financial_vendor_methods(baseline_legacy),
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources=dict.fromkeys(
+                ("tushare", "akshare_sina", "yfinance"),
+                baseline_source,
+            ),
+        ),
+        qualified_statement_request_factory=lambda _request: _statement_request(
+            asset
+        ),
+        clock=fixed_clock,
+    )(state)
+    assert "financial_dispatch_shadow_failure" not in baseline, baseline.get(
+        "financial_dispatch_shadow_failure"
+    )
+
+    original_checkpoint_ledger = FinancialToolDispatcher.checkpoint_ledger
+    shadow_checkpoint_calls = 0
+
+    def fail_shadow_checkpoint(dispatcher):
+        nonlocal shadow_checkpoint_calls
+        ledger = original_checkpoint_ledger(dispatcher)
+        if ledger.get("capability_routing_plan_signature") == plan.plan_signature:
+            shadow_checkpoint_calls += 1
+            raise RuntimeError("unsafe-shadow-checkpoint-payload")
+        return ledger
+
+    monkeypatch.setattr(
+        FinancialToolDispatcher,
+        "checkpoint_ledger",
+        fail_shadow_checkpoint,
+    )
+    observed = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods=_financial_vendor_methods(observed_legacy),
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources=dict.fromkeys(
+                ("tushare", "akshare_sina", "yfinance"),
+                observed_source,
+            ),
+        ),
+        qualified_statement_request_factory=lambda _request: _statement_request(
+            asset
+        ),
+        clock=fixed_clock,
+    )(state)
+
+    assert baseline_legacy_calls == observed_legacy_calls == 1
+    assert baseline_qualified_calls == observed_qualified_calls
+    assert baseline_qualified_calls > 0
+    assert shadow_checkpoint_calls == 1
+    assert _authoritative_financial_result_bytes(observed) == (
+        _authoritative_financial_result_bytes(baseline)
+    )
+    assert observed["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "checkpoint_projection",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            }
+        )
+    )
+    assert "unsafe-shadow-checkpoint-payload" not in json.dumps(
+        observed,
+        default=str,
+        sort_keys=True,
+    )
+
+
+def test_multiple_shadow_failures_are_independently_localized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _asset()
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert plan is not None
+    _assert_shadow_authority(plan)
+    legacy_calls = 0
+    factory_calls = 0
+    shadow_calls = 0
+
+    def legacy_statement(
+        symbol: str,
+        frequency: str,
+        current_date: str,
+    ) -> str:
+        nonlocal legacy_calls
+        legacy_calls += 1
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            "# Data retrieved on: 2026-07-30 12:00:00\n\n"
+            "metric,2026-06-30\nLegacyTotal,100"
+        )
+
+    def request_factory(request):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            raise RuntimeError("unsafe-first-factory-payload")
+        return _statement_request(asset).model_copy(
+            update={"statement_type": request.statement_type}
+        )
+
+    def qualified_source(_request):
+        nonlocal shadow_calls
+        shadow_calls += 1
+        raise RuntimeError("unsafe-second-selection-payload")
+
+    config = _rollout_config("qualified_v1_shadow")
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    config["tool_vendors"] = dict.fromkeys(
+        (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        ),
+        "scripted",
+    )
+    node = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods={
+            tool_name: {"scripted": legacy_statement}
+            for tool_name in config["tool_vendors"]
+        },
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={"tushare": qualified_source},
+        ),
+        qualified_statement_request_factory=request_factory,
+    )
+    state = _financial_tool_state(asset, plan)
+    state["messages"] = [
+        AIMessage(
+            content="",
+            id="two-distinct-shadow-failures",
+            tool_calls=[
+                {
+                    "name": "get_balance_sheet",
+                    "args": {
+                        "ticker": asset.instrument_identity.symbol,
+                        "freq": "quarterly",
+                        "curr_date": "2026-07-30",
+                    },
+                    "id": "factory-failure",
+                    "type": "tool_call",
+                },
+                {
+                    "name": "get_income_statement",
+                    "args": {
+                        "ticker": asset.instrument_identity.symbol,
+                        "freq": "quarterly",
+                        "curr_date": "2026-07-30",
+                    },
+                    "id": "selection-failure",
+                    "type": "tool_call",
+                },
+            ],
+        )
+    ]
+
+    result = node(state)
+
+    assert legacy_calls == 2
+    assert factory_calls == 2
+    assert shadow_calls == 1
+    assert result["financial_dispatch_shadow_failure"] == {
+        "contract_version": "2.1",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 2,
+        "retained_failure_count": 2,
+        "dropped_failure_count": 0,
+        "failures": [
+            {
+                "stage": "request_factory",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            },
+            {
+                "stage": "selection_dispatch",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            },
+        ],
+    }
+    serialized = json.dumps(result, default=str, sort_keys=True)
+    assert "unsafe-first-factory-payload" not in serialized
+    assert "unsafe-second-selection-payload" not in serialized
+
+
+def test_shadow_failure_retention_is_bounded_with_exact_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND == 7
+    asset = _asset()
+    plan = _preflight(monkeypatch, "qualified_v1_shadow").plan
+    assert plan is not None
+    _assert_shadow_authority(plan)
+    legacy_calls = 0
+    shadow_calls = 0
+
+    def legacy_statement(
+        symbol: str,
+        frequency: str,
+        current_date: str,
+    ) -> str:
+        nonlocal legacy_calls
+        legacy_calls += 1
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            "# Data retrieved on: 2026-07-30 12:00:00\n\n"
+            "metric,2026-06-30\nLegacyTotal,100"
+        )
+
+    def qualified_source(_request):
+        nonlocal shadow_calls
+        shadow_calls += 1
+        raise RuntimeError("unsafe-overflow-provider-payload")
+
+    config = _rollout_config("qualified_v1_shadow")
+    config["mainland_capability_routing_plan_signature"] = plan.plan_signature
+    config["tool_vendors"] = dict.fromkeys(
+        (
+            "get_fundamentals",
+            "get_balance_sheet",
+            "get_cashflow",
+            "get_income_statement",
+        ),
+        "scripted",
+    )
+    node = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods={
+            tool_name: {"scripted": legacy_statement}
+            for tool_name in config["tool_vendors"]
+        },
+        qualified_statement_router=MainlandFinancialCapabilityRouter(
+            routing_plan=plan,
+            statement_sources={"tushare": qualified_source},
+        ),
+        qualified_statement_request_factory=lambda request: (
+            _statement_request(asset).model_copy(
+                update={
+                    "statement_type": request.statement_type,
+                    "as_of_date": request.as_of_date,
+                }
+            )
+        ),
+    )
+    total_failures = MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND + 2
+    state = _financial_tool_state(asset, plan)
+    state["messages"] = [
+        AIMessage(
+            content="",
+            id="bounded-shadow-failures",
+            tool_calls=[
+                {
+                    "name": "get_balance_sheet",
+                    "args": {
+                        "ticker": asset.instrument_identity.symbol,
+                        "freq": "quarterly",
+                        "curr_date": f"2026-07-{20 + index:02d}",
+                    },
+                    "id": f"bounded-failure-{index}",
+                    "type": "tool_call",
+                }
+                for index in range(total_failures)
+            ],
+        )
+    ]
+
+    result = node(state)
+
+    assert legacy_calls == total_failures
+    assert shadow_calls == total_failures
+    failure = result["financial_dispatch_shadow_failure"]
+    assert failure["failure_count"] == total_failures
+    assert failure["retained_failure_count"] == 7
+    assert failure["dropped_failure_count"] == 2
+    assert len(failure["failures"]) == 7
+    assert failure["failures"] == [
+        {
+            "stage": "selection_dispatch",
+            "failure_kind": "exception",
+            "exception_family": "builtins",
+            "exception_class": "RuntimeError",
+            "selection_kind": "statement",
+            "context_constructed": False,
+            "dispatcher_constructed": True,
+        }
+    ] * 7
+    assert "unsafe-overflow-provider-payload" not in json.dumps(
+        result,
+        default=str,
+        sort_keys=True,
+    )
 
 
 def test_later_shadow_failure_preserves_prior_manifest_and_legacy_authority(
@@ -3024,11 +3771,19 @@ def test_later_shadow_failure_preserves_prior_manifest_and_legacy_authority(
         "routing_result"
     ]["manifest"]
     assert manifest["selections"]
-    assert result["financial_dispatch_shadow_failure"] == {
-        "contract_version": "1.0",
-        "diagnostic_code": "shadow_dispatch_failed",
-        "failure_count": 1,
-    }
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "selection_dispatch",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": True,
+            }
+        )
+    )
     assert "raw-second-shadow-secret" not in json.dumps(result, default=str)
 
 
@@ -3527,6 +4282,7 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         tmp_path / "failed-shadow-report",
     )
     failed_shadow_report = failed_shadow_report_path.read_text(encoding="utf-8")
+    assert "Shadow failure diagnostic contract:** `1.0`" in failed_shadow_report
     assert "Sanitized shadow failures:** 1" in failed_shadow_report
     exposed_failed_surfaces = failed_shadow_report + json.dumps(
         failed_shadow_audit,
@@ -3543,3 +4299,147 @@ def test_shadow_financial_dispatch_retains_qualified_manifest_without_authority(
         raw_failure_text,
     ):
         assert forbidden not in exposed_failed_surfaces
+
+    current_failure = {
+        "contract_version": "2.1",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 9,
+        "retained_failure_count": 7,
+        "dropped_failure_count": 2,
+        "failures": [
+            {
+                "stage": "context_result",
+                "failure_kind": "typed_result",
+                "typed_acquisition_reason": "temporal_eligibility_rejected",
+                "temporal_rejection_reasons": ["ann_date_missing"],
+                "selection_kind": "indicator",
+                "context_constructed": False,
+                "dispatcher_constructed": False,
+            },
+            {
+                "stage": "context_exception",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": False,
+            },
+            {
+                "stage": "dispatcher_construction",
+                "failure_kind": "exception",
+                "exception_family": "financial_dispatch",
+                "exception_class": "FinancialDispatchCheckpointError",
+                "typed_reason": "financial_dispatch_checkpoint_malformed",
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": False,
+            },
+            {
+                "stage": "request_enrichment",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "indicator",
+                "context_constructed": True,
+                "dispatcher_constructed": True,
+            },
+            {
+                "stage": "request_factory",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": True,
+            },
+            {
+                "stage": "selection_dispatch",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "canonical_request_reference": (
+                    "financial-request:v1:" + "a" * 64
+                ),
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": True,
+            },
+            {
+                "stage": "checkpoint_projection",
+                "failure_kind": "exception",
+                "exception_family": "unknown",
+                "exception_class": "unknown",
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": True,
+            },
+        ],
+    }
+    current_failed_shadow_state = copy.deepcopy(final_state)
+    current_failed_shadow_state["financial_dispatch_shadow_failure"] = (
+        current_failure
+    )
+    current_failed_shadow_state["provider_failure_debug"] = raw_failure_text
+    current_failed_shadow_audit = prepare_decision_audit(
+        current_failed_shadow_state,
+        tmp_path / "current-failed-shadow-audit",
+        config=config,
+    )
+    repeated_failed_shadow_audit = prepare_decision_audit(
+        copy.deepcopy(current_failed_shadow_state),
+        tmp_path / "repeated-current-failed-shadow-audit",
+        config=config,
+    )
+
+    assert current_failed_shadow_audit["financial_dispatch_shadow_failure"] == (
+        current_failure
+    )
+    assert repeated_failed_shadow_audit["financial_dispatch_shadow_failure"] == (
+        current_failure
+    )
+    current_failed_shadow_report = write_report_tree(
+        current_failed_shadow_state,
+        asset.instrument_identity.symbol,
+        tmp_path / "current-failed-shadow-report",
+    ).read_text(encoding="utf-8")
+    for expected in (
+        "Shadow failure diagnostic contract:** `2.1`",
+        "Sanitized shadow failures:** 9",
+        "Retained localized failures:** 7",
+        "Dropped localized failures:** 2",
+        "Failure 1 stage:** `context_result`",
+        "Failure 1 acquisition reason:** `temporal_eligibility_rejected`",
+        "Failure 1 temporal rejection reasons:** `ann_date_missing`",
+        "Failure 2 stage:** `context_exception`",
+        "Failure 3 stage:** `dispatcher_construction`",
+        "Failure 3 typed reason:** `financial_dispatch_checkpoint_malformed`",
+        "Failure 4 stage:** `request_enrichment`",
+        "Failure 5 stage:** `request_factory`",
+        "Failure 6 stage:** `selection_dispatch`",
+        "Failure 6 canonical request:** `financial-request:v1:",
+        "Failure 7 stage:** `checkpoint_projection`",
+        "Failure 7 context constructed:** true",
+        "Failure 7 dispatcher constructed:** true",
+    ):
+        assert expected in current_failed_shadow_report
+    current_exposed_surfaces = current_failed_shadow_report + json.dumps(
+        current_failed_shadow_audit,
+        sort_keys=True,
+    )
+    for forbidden in (
+        "ProviderTransportError",
+        "provider.example.test",
+        "token=query-secret",
+        "private-payload",
+        "provider-secret",
+        r"C:\Users\operator\provider-payload.json",
+        "raw_text",
+        raw_failure_text,
+    ):
+        assert forbidden not in current_exposed_surfaces
+    assert plan.financial_eligibility_policy is not None
+    assert plan.financial_eligibility_policy.authority_disposition == (
+        "shadow_non_authoritative"
+    )
+    assert plan.financial_eligibility_policy.qualified_v1_authority_enabled is False
