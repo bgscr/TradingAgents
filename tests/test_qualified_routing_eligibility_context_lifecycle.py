@@ -1568,7 +1568,7 @@ def test_financial_tool_node_sanitizes_context_exception(
     context = _context(asset, plan, run_label="ticket-07-context-exception")
     unsafe_exception = RuntimeError(
         "token=unsafe-message https://provider.invalid/private",
-        {"credential": "unsafe-arg", "payload": "provider-body"},
+        {"credential": "test-unsafe-arg", "payload": "provider-body"},
     )
     acquirer = _TerminalAcquirer(unsafe_exception)
     owner = FinancialEligibilityAcquisitionContextOwner(
@@ -1614,7 +1614,7 @@ def test_financial_tool_node_sanitizes_context_exception(
     for forbidden in (
         "unsafe-message",
         "provider.invalid",
-        "unsafe-arg",
+        "test-unsafe-arg",
         "provider-body",
     ):
         assert forbidden not in serialized
