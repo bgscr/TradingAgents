@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import multiprocessing
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -590,6 +591,60 @@ class _FakeBaoStockSdk:
         return pd.DataFrame([{"code": "sh.601328", "year": "2025"}])
 
 
+class _PrintingBaoStockResult:
+    error_code = "0"
+    fields = ("code", "year")
+
+    def __init__(self, canary: str, *, fail_drain: bool = False) -> None:
+        self._canary = canary
+        self._fail_drain = fail_drain
+        self._rows = (("sh.601328", "2025"),)
+        self._index = -1
+
+    def next(self) -> bool:
+        print(self._canary)
+        print(self._canary, file=sys.stderr)
+        if self._fail_drain:
+            raise RuntimeError("row drain failed")
+        self._index += 1
+        return self._index < len(self._rows)
+
+    def get_row_data(self) -> tuple[str, str]:
+        print(self._canary)
+        print(self._canary, file=sys.stderr)
+        if self._fail_drain:
+            raise AssertionError("failed drain must not manufacture a row")
+        return self._rows[self._index]
+
+
+class _PrintingBaoStockSdk:
+    def __init__(self, canary: str, *, fail_drain: bool = False) -> None:
+        self._canary = canary
+        self._fail_drain = fail_drain
+        self.login_calls = 0
+        self.logout_calls = 0
+
+    def login(self):
+        self.login_calls += 1
+        print(self._canary)
+        print(self._canary, file=sys.stderr)
+        return SimpleNamespace(error_code="0")
+
+    def query_profit_data(self, **_kwargs: object):
+        print(self._canary)
+        print(self._canary, file=sys.stderr)
+        return _PrintingBaoStockResult(
+            self._canary,
+            fail_drain=self._fail_drain,
+        )
+
+    def logout(self):
+        self.logout_calls += 1
+        print(self._canary)
+        print(self._canary, file=sys.stderr)
+        return SimpleNamespace(error_code="0")
+
+
 def test_baostock_login_is_lazy_serialized_and_logged_out_exactly_once() -> None:
     sdk = _FakeBaoStockSdk()
     stop_signal = Event()
@@ -691,6 +746,109 @@ def test_baostock_worker_control_path_logs_out_while_query_is_blocked(
 
     assert sdk.login_calls == 1
     assert sdk.logout_calls == 1
+
+
+def test_baostock_worker_contains_sdk_output_and_preserves_success_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    raw_canary = "[WinError 10057] qualified worker socket is not connected"
+    sdk = _PrintingBaoStockSdk(raw_canary)
+    request_queue: Queue[object] = Queue()
+    response_queue: Queue[object] = Queue()
+    monkeypatch.setattr(
+        provider_clients_module.importlib,
+        "import_module",
+        lambda _name: sdk,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker = executor.submit(
+            provider_clients_module._baostock_run_worker,
+            request_queue,
+            response_queue,
+        )
+        request_queue.put(
+            (
+                "query",
+                "query_profit_data",
+                {"code": "sh.601328", "year": 2025, "quarter": 4},
+            )
+        )
+        assert response_queue.get(timeout=5) == (
+            "ok",
+            ("code", "year"),
+            (("sh.601328", "2025"),),
+        )
+        request_queue.put(("close",))
+        assert worker.result(timeout=5) is None
+
+    captured = capsys.readouterr()
+    assert sdk.login_calls == 1
+    assert sdk.logout_calls == 1
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
+
+
+def test_baostock_worker_contains_row_drain_output_and_retains_typed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    raw_canary = "[WinError 10057] qualified row drain socket is not connected"
+    sdk = _PrintingBaoStockSdk(raw_canary, fail_drain=True)
+    request_queue: Queue[object] = Queue()
+    response_queue: Queue[object] = Queue()
+    monkeypatch.setattr(
+        provider_clients_module.importlib,
+        "import_module",
+        lambda _name: sdk,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker = executor.submit(
+            provider_clients_module._baostock_run_worker,
+            request_queue,
+            response_queue,
+        )
+        request_queue.put(
+            (
+                "query",
+                "query_profit_data",
+                {"code": "sh.601328", "year": 2025, "quarter": 4},
+            )
+        )
+        response = response_queue.get(timeout=5)
+        assert worker.result(timeout=5) is None
+
+    captured = capsys.readouterr()
+    assert response == ("failure", "baostock_provider_error")
+    assert sdk.logout_calls == 1
+    assert raw_canary not in repr(response)
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
+
+
+def test_baostock_run_transport_contains_sdk_output_and_preserves_typed_error(
+    capsys,
+) -> None:
+    raw_canary = "[WinError 10057] qualified transport socket is not connected"
+    sdk = _PrintingBaoStockSdk(raw_canary, fail_drain=True)
+    transport = ProductionBaoStockRunTransport(
+        sdk_module=sdk,
+        stop_signal=Event(),
+    )
+
+    with pytest.raises(PhysicalAttemptFailure) as captured_failure:
+        transport.query_profit_data(code="sh.601328", year=2025, quarter=4)
+
+    captured_output = capsys.readouterr()
+    assert captured_failure.value.outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+    assert captured_failure.value.error_code == "baostock_provider_error"
+    assert sdk.login_calls == 1
+    assert sdk.logout_calls == 1
+    assert raw_canary not in repr(captured_failure.value)
+    assert raw_canary not in captured_output.out
+    assert raw_canary not in captured_output.err
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt(), SystemExit()])

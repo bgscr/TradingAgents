@@ -135,7 +135,11 @@ def _validate_context_binding(
     if (
         (binding.requested_session if temporal else binding.as_of_date)
         != expected_session
-        or tool_request.as_of_date != expected_session
+        or (
+            tool_request.as_of_date > expected_session
+            if temporal
+            else tool_request.as_of_date != expected_session
+        )
     ):
         _fail(FinancialRequestFactoryFailureReason.AS_OF_MISMATCH)
     if binding.availability_scope is not context.availability_scope:
@@ -283,6 +287,8 @@ def build_financial_statement_routing_request(
         "material_arguments_json": material_arguments_json,
         "financial_eligibility_context_binding": binding,
     }
+    if temporal and tool_request.as_of_date != context.requested_session:
+        payload["as_of_date"] = tool_request.as_of_date
     identity_payload = FinancialStatementRoutingRequest.model_construct(
         **payload,
         request_identity=None,
@@ -365,6 +371,8 @@ def build_financial_indicator_routing_request(
         "material_arguments_json": material_arguments_json,
         "financial_eligibility_context_binding": binding,
     }
+    if temporal and tool_request.as_of_date != context.requested_session:
+        payload["as_of_date"] = tool_request.as_of_date
     identity_payload = FinancialIndicatorRoutingRequest.model_construct(
         **payload,
         request_identity=None,

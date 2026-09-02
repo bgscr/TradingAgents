@@ -712,13 +712,17 @@ class FinancialStatementRoutingRequest(BaseModel):
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
         )
-        temporal_shape = (
-            self.as_of_date is None and self.requested_session is not None
-        )
+        temporal_shape = self.requested_session is not None
         if (temporal_contract and not temporal_shape) or (
             not temporal_contract and not historical_shape
         ):
             raise ValueError("statement routing requested-session shape mismatch")
+        if (
+            temporal_contract
+            and self.as_of_date is not None
+            and self.as_of_date > self.requested_session
+        ):
+            raise ValueError("statement routing as-of date exceeds its requested session")
         if self.statement_type not in _STATEMENT_CAPABILITY:
             raise ValueError("statement routing requires one full statement")
         if self.company_type is FinancialCompanyType.UNKNOWN:
@@ -965,13 +969,17 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
         )
-        temporal_shape = (
-            self.as_of_date is None and self.requested_session is not None
-        )
+        temporal_shape = self.requested_session is not None
         if (temporal_contract and not temporal_shape) or (
             not temporal_contract and not historical_shape
         ):
             raise ValueError("indicator routing requested-session shape mismatch")
+        if (
+            temporal_contract
+            and self.as_of_date is not None
+            and self.as_of_date > self.requested_session
+        ):
+            raise ValueError("indicator routing as-of date exceeds its requested session")
         canonical = tuple(
             family for family in FinancialRatioFamily if family in self.ratio_families
         )
@@ -1969,6 +1977,14 @@ def _financial_routing_request_session(
     return session
 
 
+def _financial_routing_request_as_of_date(
+    request: FinancialStatementRoutingRequest | FinancialIndicatorRoutingRequest,
+) -> date:
+    """Return the financial provider date without changing the bound run session."""
+
+    return request.as_of_date or _financial_routing_request_session(request)
+
+
 def _validate_indicator_metadata_compatibility_binding(
     *,
     candidate: FinancialPeriodCandidate,
@@ -1992,7 +2008,7 @@ def _validate_indicator_metadata_compatibility_binding(
         or compatibility.requested_filing_consolidation_scope
         is not request.consolidation_scope
         or compatibility.pit_as_of_date
-        != _financial_routing_request_session(request)
+        != _financial_routing_request_as_of_date(request)
     ):
         raise ValueError("indicator metadata compatibility request binding mismatch")
     if (
@@ -2986,7 +3002,7 @@ class MainlandFinancialCapabilityRouter:
         self,
         request: FinancialStatementRoutingRequest,
     ) -> FinancialStatementRoutingResult:
-        analysis_session = _financial_routing_request_session(request)
+        provider_as_of_date = _financial_routing_request_as_of_date(request)
         capability = _STATEMENT_CAPABILITY[request.statement_type]
         route = self._routing_plan.route_for(capability)
         publication_aware = request.eligibility_policy_version is not None
@@ -3008,10 +3024,14 @@ class MainlandFinancialCapabilityRouter:
         ):
             raise ValueError("statement target construction policy mismatch")
         acquisition_annual = tuple(
-            sorted(set(request.eligible_annual_period_ends), reverse=True)
+            period
+            for period in sorted(set(request.eligible_annual_period_ends), reverse=True)
+            if period <= provider_as_of_date
         )
         acquisition_reporting = tuple(
-            sorted(set(request.eligible_reporting_period_ends), reverse=True)
+            period
+            for period in sorted(set(request.eligible_reporting_period_ends), reverse=True)
+            if period <= provider_as_of_date
         )
         target_annual = (
             acquisition_annual if publication_aware else acquisition_annual[:5]
@@ -3051,7 +3071,7 @@ class MainlandFinancialCapabilityRouter:
                 return target_annual, target_reporting
             assert self._routing_plan.financial_eligibility_policy is not None
             common = {
-                "run_as_of_date": analysis_session,
+                "run_as_of_date": provider_as_of_date,
                 "expected_instrument_identity": request.instrument_identity,
                 "expected_company_type": request.company_type,
                 "expected_consolidation_scope": request.consolidation_scope,
@@ -3183,7 +3203,7 @@ class MainlandFinancialCapabilityRouter:
                     expected_frequency=expected_frequency,
                     expected_currency=request.currency,
                     expected_consolidation_scope=request.consolidation_scope,
-                    pit_as_of_date=analysis_session,
+                    pit_as_of_date=provider_as_of_date,
                 )
                 if (
                     assessment.usable_for_current_analysis
@@ -3372,17 +3392,17 @@ class MainlandFinancialCapabilityRouter:
             assert self._routing_plan.financial_eligibility_policy is not None
             publication_target_construction = (
                 construct_mainland_financial_period_targets(
-                    run_as_of_date=analysis_session,
+                    run_as_of_date=provider_as_of_date,
                     expected_instrument_identity=request.instrument_identity,
                     expected_company_type=request.company_type,
                     expected_consolidation_scope=request.consolidation_scope,
                     candidates=tuple(publication_candidates.values()),
                     qualified_provider_ids=qualified_publication_providers,
                     acquisition_annual_period_ends=(
-                        request.eligible_annual_period_ends
+                        acquisition_annual
                     ),
                     acquisition_reporting_period_ends=(
-                        request.eligible_reporting_period_ends
+                        acquisition_reporting
                     ),
                     listing_date=request.listing_date,
                     listing_provenance=request.listing_provenance,
@@ -3505,7 +3525,7 @@ class MainlandFinancialCapabilityRouter:
     ) -> FinancialIndicatorRoutingResult:
         """Select ratio periods per family and request only unresolved gaps."""
 
-        analysis_session = _financial_routing_request_session(request)
+        provider_as_of_date = _financial_routing_request_as_of_date(request)
         route = self._routing_plan.route_for(
             MainlandCapability.FINANCIAL_INDICATORS
         )
@@ -3533,7 +3553,9 @@ class MainlandFinancialCapabilityRouter:
         ):
             raise ValueError("indicator target construction policy mismatch")
         acquisition_periods = tuple(
-            sorted(set(request.eligible_reporting_period_ends), reverse=True)
+            period
+            for period in sorted(set(request.eligible_reporting_period_ends), reverse=True)
+            if period <= provider_as_of_date
         )
         target_periods = (
             acquisition_periods if publication_aware else acquisition_periods[:8]
@@ -3587,7 +3609,7 @@ class MainlandFinancialCapabilityRouter:
             assert self._routing_plan.financial_eligibility_policy is not None
             return filter_mainland_financial_acquisition_periods(
                 period_ends=acquisition_periods,
-                run_as_of_date=analysis_session,
+                run_as_of_date=provider_as_of_date,
                 expected_instrument_identity=request.instrument_identity,
                 expected_company_type=request.company_type,
                 expected_consolidation_scope=request.consolidation_scope,
@@ -3609,7 +3631,7 @@ class MainlandFinancialCapabilityRouter:
             gap_request = FinancialIndicatorProviderGapRequest(
                 provider_id=provider_id,
                 instrument_identity=request.instrument_identity,
-                as_of_date=analysis_session,
+                as_of_date=provider_as_of_date,
                 company_type=request.company_type,
                 company_type_resolution=request.company_type_resolution,
                 consolidation_scope=request.consolidation_scope,
@@ -3742,7 +3764,7 @@ class MainlandFinancialCapabilityRouter:
                     expected_frequency=FinancialReportingFrequency.QUARTERLY,
                     expected_currency=expected_currency,
                     expected_consolidation_scope=expected_scope,
-                    pit_as_of_date=analysis_session,
+                    pit_as_of_date=provider_as_of_date,
                     ratio_declaration_version=declaration_version,
                     eligibility_policy_version=availability_policy_version,
                 )
@@ -3952,7 +3974,7 @@ class MainlandFinancialCapabilityRouter:
             assert self._routing_plan.financial_eligibility_policy is not None
             publication_target_construction = (
                 construct_mainland_financial_period_targets(
-                    run_as_of_date=analysis_session,
+                    run_as_of_date=provider_as_of_date,
                     expected_instrument_identity=request.instrument_identity,
                     expected_company_type=request.company_type,
                     expected_consolidation_scope=request.consolidation_scope,
@@ -3960,7 +3982,7 @@ class MainlandFinancialCapabilityRouter:
                     qualified_provider_ids=qualified_publication_providers,
                     acquisition_annual_period_ends=(),
                     acquisition_reporting_period_ends=(
-                        request.eligible_reporting_period_ends
+                        acquisition_periods
                     ),
                     listing_date=request.listing_date,
                     listing_provenance=request.listing_provenance,
@@ -4408,7 +4430,7 @@ def _statement_gap_request(
         provider_id=provider_id,
         instrument_identity=request.instrument_identity,
         statement_type=request.statement_type,
-        as_of_date=_financial_routing_request_session(request),
+        as_of_date=_financial_routing_request_as_of_date(request),
         missing_annual_period_ends=tuple(
             period for period in target_annual if ("annual", period) not in selections
         ),

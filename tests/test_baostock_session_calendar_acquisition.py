@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from inspect import signature
@@ -176,6 +177,63 @@ def test_valid_bounded_calendar_request_has_exact_three_attempt_workflow(tmp_pat
     )
     assert calendar_count == (0,)
     assert session_count == (0,)
+
+
+@pytest.mark.unit
+def test_calendar_acquisition_contains_sdk_output_through_complete_row_drain(
+    tmp_path,
+    capsys,
+) -> None:
+    raw_canary = "[WinError 10057] calendar socket is not connected"
+
+    class PrintingResult(_ProviderResult):
+        def next(self) -> bool:
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().next()
+
+        def get_row_data(self) -> list[object]:
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().get_row_data()
+
+    class PrintingTransport(_FakeBaoStockTransport):
+        def login(self) -> object:
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().login()
+
+        def query_trade_dates(self, *, start_date: str, end_date: str) -> object:
+            with self._lock:
+                self.calls.append(("query_trade_dates", start_date, end_date))
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return PrintingResult(self._rows)
+
+        def logout(self) -> object:
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().logout()
+
+    transport = PrintingTransport()
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        result = acquire_mainland_session_calendar(
+            _request(),
+            coordinator=_coordinator(store),
+            transport_factory=lambda: transport,
+            owner_id="ticket07-calendar-output",
+            now=lambda: _NOW,
+            sleep=lambda _seconds: None,
+            lease_duration=timedelta(seconds=30),
+        )
+
+    captured = capsys.readouterr()
+    assert [(item.calendar_date, item.is_trading_day) for item in result.membership] == [
+        (date(2026, 8, 10), True),
+        (date(2026, 8, 11), False),
+    ]
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
 
 
 @pytest.mark.unit

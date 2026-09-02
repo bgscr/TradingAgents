@@ -8,6 +8,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import suppress
 
+from tradingagents.dataflows.baostock_output import contain_baostock_output
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptFailure,
     PhysicalAttemptOutcome,
@@ -218,7 +219,8 @@ def _execute_baostock_worker_query(
     try:
         if not callable(method):  # pragma: no cover - worker validates before spawn
             raise TypeError("baostock endpoint is unavailable")
-        fields, rows = _baostock_result_rows(method(**dict(kwargs)))
+        with contain_baostock_output():
+            fields, rows = _baostock_result_rows(method(**dict(kwargs)))
         query_result.put(("ok", fields, rows))
     except BaseException:
         query_result.put(("failure", "baostock_provider_error"))
@@ -242,7 +244,8 @@ def _baostock_run_worker(request_queue: object, response_queue: object) -> None:
         try:
             logout = getattr(sdk_module, "logout", None)
             if callable(logout):
-                logout()
+                with contain_baostock_output():
+                    logout()
         finally:
             logged_in = False
 
@@ -264,7 +267,8 @@ def _baostock_run_worker(request_queue: object, response_queue: object) -> None:
                 if not callable(login):
                     response_queue.put(("failure", "baostock_login_unavailable"))
                     break
-                login_result = login()
+                with contain_baostock_output():
+                    login_result = login()
                 login_code = str(getattr(login_result, "error_code", "0"))
                 if login_code not in {"0", "00", ""}:
                     response_queue.put(("failure", "baostock_login_failed"))
@@ -543,7 +547,8 @@ class ProductionBaoStockRunTransport(_BaoStockEndpointFacade):
         try:
             logout = getattr(self._sdk_module, "logout", None)
             if callable(logout):
-                logout()
+                with contain_baostock_output():
+                    logout()
         finally:
             self._logged_in = False
 
@@ -565,7 +570,8 @@ class ProductionBaoStockRunTransport(_BaoStockEndpointFacade):
         if not callable(login):
             self._terminal_failure_locked("baostock_login_unavailable")
         try:
-            result = login()
+            with contain_baostock_output():
+                result = login()
         except Exception:
             self._terminal_failure_locked("baostock_login_failed")
         error_code = str(getattr(result, "error_code", "0"))
@@ -586,7 +592,8 @@ class ProductionBaoStockRunTransport(_BaoStockEndpointFacade):
             if not callable(method):
                 self._terminal_failure_locked("baostock_endpoint_unavailable")
             try:
-                fields, rows = _baostock_result_rows(method(**kwargs))
+                with contain_baostock_output():
+                    fields, rows = _baostock_result_rows(method(**kwargs))
                 frame = pd.DataFrame(rows, columns=fields)
             except PhysicalAttemptFailure:
                 raise

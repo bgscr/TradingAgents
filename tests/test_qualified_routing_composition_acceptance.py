@@ -580,12 +580,13 @@ class _FreshRun:
         indicator_families: tuple[FinancialRatioFamily, ...] | None = None,
         include_indicator_arguments: bool = True,
         tool_call_prefix: str = "qcf",
+        request_as_of_date: date = _AS_OF,
     ) -> dict[str, object]:
         tool_calls = []
         for index, tool_name in enumerate(tool_names):
             arguments = {
                 "ticker": self.symbol,
-                "curr_date": _AS_OF.isoformat(),
+                "curr_date": request_as_of_date.isoformat(),
             }
             if tool_name != "get_fundamentals":
                 arguments["freq"] = "quarterly"
@@ -677,9 +678,9 @@ def _publish_pinned_temporal_calendar(store: object) -> str:
             is_trading_day=True,
         )
         for session_date in (
-            date(2026, 8, 31),
-            date(2026, 9, 1),
-            date(2026, 9, 2),
+            _AS_OF - timedelta(days=1),
+            _AS_OF,
+            _AS_OF + timedelta(days=1),
         )
     )
     published = store.publish_session_calendar(
@@ -948,6 +949,11 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
         result = fresh.invoke(fresh.state(tool_names=("get_balance_sheet",)))
 
         assert "financial_dispatch_shadow_failure" not in result
+        selection_request = result["financial_dispatch_shadow_ledger"][
+            "qualified_statement_selections"
+        ][0]["terminal"]["selection_request"]
+        assert selection_request["requested_session"] == _AS_OF.isoformat()
+        assert "as_of_date" not in selection_request
         context = fresh.owner.context
         assert context is not None
         assert context.contract_version == "financial-eligibility-acquisition-context-v3"
@@ -1007,6 +1013,8 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
         assert fresh.calendar_resolved.is_set()
         assert fresh.calendar_reader_open_count == 1
         assert calendar_row_counts(fresh.sidecar_database_path) == (0, 0)
+        with pytest.raises(lifecycle_module.ProductionQualifiedRoutingLifecycleError):
+            fresh.owner.acquire_context(as_of_date=_AS_OF - timedelta(days=1))
     finally:
         fresh.close()
 
@@ -1066,6 +1074,229 @@ def test_fresh_builtin_admits_truthful_provider_latency_before_context_binding(
                 <= decision.retrieved_at
                 <= window.eligibility_evaluated_at
             )
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    (
+        "tool_name",
+        "selection_key",
+        "provider_endpoint",
+        "expected_provider_end_dates",
+        "checkpoint_thread_id",
+    ),
+    (
+        (
+            "get_fundamentals",
+            "qualified_indicator_selections",
+            "fina_indicator",
+            ("20260630",),
+            "0700000000000001",
+        ),
+        (
+            "get_balance_sheet",
+            "qualified_statement_selections",
+            "balancesheet",
+            ("20260902", "20260630"),
+            "0700000000000002",
+        ),
+    ),
+)
+def test_fresh_financial_dispatch_separates_run_session_from_historical_tool_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    selection_key: str,
+    provider_endpoint: str,
+    expected_provider_end_dates: tuple[str, ...],
+    checkpoint_thread_id: str,
+) -> None:
+    run_session = date(2026, 9, 2)
+    historical_request_date = date(2026, 6, 30)
+    monkeypatch.setitem(globals(), "_AS_OF", run_session)
+    monkeypatch.setitem(
+        globals(),
+        "_NOW",
+        datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc),
+    )
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id=checkpoint_thread_id,
+    )
+    try:
+        state = fresh.state(
+            tool_names=(tool_name,),
+            request_as_of_date=historical_request_date,
+            tool_call_prefix="ticket07-v12-replay",
+        )
+        legacy_config = dict(fresh.config)
+        legacy_result = FinancialDispatchToolNode(
+            config=legacy_config,
+            vendor_methods=_legacy_vendor_methods(),
+        )(copy.deepcopy(state))
+
+        result = fresh.invoke(state)
+
+        context = fresh.owner.context
+        assert context is not None
+        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        assert context.requested_session == run_session
+        shadow_failure = result.get("financial_dispatch_shadow_failure")
+        assert shadow_failure is None, json.dumps(shadow_failure, sort_keys=True)
+        shadow_ledger = result["financial_dispatch_shadow_ledger"]
+        terminal = shadow_ledger[selection_key][0]["terminal"]
+        selection_request = terminal["selection_request"]
+        assert selection_request["requested_session"] == run_session.isoformat()
+        assert selection_request["as_of_date"] == historical_request_date.isoformat()
+        assert selection_request["financial_eligibility_context_binding"][
+            "requested_session"
+        ] == run_session.isoformat()
+        assert json.loads(result["messages"][-1].content)["reason"] == json.loads(
+            legacy_result["messages"][0].content
+        )["reason"]
+        assert result["financial_dispatch_ledger"]["entries"][0][
+            "canonical_request_key"
+        ]["as_of_date"] == historical_request_date.isoformat()
+        assert legacy_result["financial_dispatch_ledger"]["entries"][0][
+            "canonical_request_key"
+        ]["as_of_date"] == historical_request_date.isoformat()
+        provider_calls = [
+            kwargs
+            for endpoint, kwargs in fresh.providers["tushare"].calls
+            if endpoint == provider_endpoint
+        ]
+        assert provider_calls
+        assert tuple(call["end_date"] for call in provider_calls) == (
+            expected_provider_end_dates
+        )
+        target_construction = terminal["routing_result"][
+            "publication_target_construction"
+        ]
+        assert target_construction["run_as_of_date"] == (
+            historical_request_date.isoformat()
+        )
+        assert all(
+            date.fromisoformat(period) <= historical_request_date
+            for key in ("annual_target_period_ends", "reporting_target_period_ends")
+            for period in target_construction[key]
+        )
+        assert result["financial_dispatch_ledger"]["contract_version"] == "1.0"
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_future_financial_tool_date_fails_before_qualified_provider_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="0700000000000003",
+    )
+    future_request_date = _AS_OF + timedelta(days=1)
+    try:
+        result = fresh.invoke(
+            fresh.state(
+                tool_names=("get_fundamentals",),
+                request_as_of_date=future_request_date,
+                tool_call_prefix="ticket07-future-date",
+            )
+        )
+
+        context = fresh.owner.context
+        assert context is not None
+        assert context.requested_session == _AS_OF
+        shadow_failure = result["financial_dispatch_shadow_failure"]
+        assert shadow_failure["failure_count"] == 2
+        assert shadow_failure["failures"][0] == {
+            "stage": "request_factory",
+            "failure_kind": "exception",
+            "exception_family": "builtins",
+            "exception_class": "ValueError",
+            "selection_kind": "indicator",
+            "context_constructed": True,
+            "dispatcher_constructed": True,
+        }
+        assert shadow_failure["failures"][1] == {
+            "stage": "checkpoint_projection",
+            "failure_kind": "exception",
+            "exception_family": "financial_dispatch",
+            "exception_class": "FinancialDispatchCheckpointError",
+            "typed_reason": "financial_dispatch_checkpoint_qualified_selection_invalid",
+            "selection_kind": "indicator",
+            "context_constructed": True,
+            "dispatcher_constructed": True,
+        }
+        assert not any(
+            endpoint == "fina_indicator"
+            for endpoint, _kwargs in fresh.providers["tushare"].calls
+        )
+        assert result["financial_dispatch_ledger"]["entries"][0][
+            "canonical_request_key"
+        ]["as_of_date"] == future_request_date.isoformat()
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("graph_date_state", ("missing", "malformed"))
+def test_invalid_graph_trade_date_never_falls_back_to_financial_tool_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    graph_date_state: str,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="601328.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id=(
+            "0700000000000004"
+            if graph_date_state == "missing"
+            else "0700000000000005"
+        ),
+    )
+    historical_request_date = date(2026, 6, 30)
+    try:
+        state = fresh.state(
+            tool_names=("get_fundamentals",),
+            request_as_of_date=historical_request_date,
+            tool_call_prefix=f"ticket07-{graph_date_state}-graph-date",
+        )
+        if graph_date_state == "missing":
+            state.pop("trade_date")
+        else:
+            state["trade_date"] = "not-an-iso-date"
+
+        result = fresh.invoke(state)
+
+        assert fresh.owner.context is None
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_exception",
+                    "failure_kind": "exception",
+                    "exception_family": "builtins",
+                    "exception_class": "ValueError",
+                    "selection_kind": "indicator",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
+        assert all(provider.calls == [] for provider in fresh.providers.values())
+        assert result["financial_dispatch_ledger"]["entries"][0][
+            "canonical_request_key"
+        ]["as_of_date"] == historical_request_date.isoformat()
     finally:
         fresh.close()
 

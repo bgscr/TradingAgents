@@ -584,6 +584,17 @@ class FinancialDispatchResult(BaseModel):
         )
 
 
+def _financial_selection_as_of_date(
+    request: FinancialStatementRoutingRequest | FinancialIndicatorRoutingRequest,
+) -> date:
+    """Return the provider-period date while retaining any bound run session."""
+
+    as_of_date = request.as_of_date or request.requested_session
+    if as_of_date is None:  # pragma: no cover - closed request models enforce the shape
+        raise ValueError("financial selection as-of date is unavailable")
+    return as_of_date
+
+
 class FinancialStatementSelectionDispatchResult(BaseModel):
     """Qualified-v1 terminal selection owned by the dispatcher single-flight."""
 
@@ -605,15 +616,10 @@ class FinancialStatementSelectionDispatchResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialStatementSelectionDispatchResult:
-        selection_session = (
-            self.selection_request.requested_session
-            if self.selection_request.contract_version
-            in {"financial-statement-routing-request-v4", "financial-statement-routing-request-v5"}
-            else self.selection_request.as_of_date
-        )
+        selection_as_of_date = _financial_selection_as_of_date(self.selection_request)
         if (
             self.request_key.statement_type is not self.selection_request.statement_type
-            or self.request_key.as_of_date != selection_session
+            or self.request_key.as_of_date != selection_as_of_date
             or self.routing_result.manifest.instrument_identity
             != self.selection_request.instrument_identity
             or self.request_key.capability_routing_plan_signature
@@ -729,12 +735,7 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialIndicatorSelectionDispatchResult:
-        selection_session = (
-            self.selection_request.requested_session
-            if self.selection_request.contract_version
-            in {"financial-indicator-routing-request-v7", "financial-indicator-routing-request-v8"}
-            else self.selection_request.as_of_date
-        )
+        selection_as_of_date = _financial_selection_as_of_date(self.selection_request)
         expected_eligibility_policy = (
             self.selection_request.eligibility_policy_version
             if self.selection_request.requested_analysis_scope is not None
@@ -771,7 +772,7 @@ class FinancialIndicatorSelectionDispatchResult(BaseModel):
         if (
             self.request_key.statement_type
             is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
-            or self.request_key.as_of_date != selection_session
+            or self.request_key.as_of_date != selection_as_of_date
             or any(
                 manifest.instrument_identity
                 != self.selection_request.instrument_identity
@@ -3621,13 +3622,7 @@ class FinancialToolDispatcher:
         if (
             request.statement_type is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
             or request.statement_type is not selection_request.statement_type
-            or request.as_of_date
-            != (
-                selection_request.requested_session
-                if selection_request.contract_version
-                in {"financial-statement-routing-request-v4", "financial-statement-routing-request-v5"}
-                else selection_request.as_of_date
-            )
+            or request.as_of_date != _financial_selection_as_of_date(selection_request)
             or selection_request.instrument_identity != self._instrument_identity
         ):
             raise ValueError("financial tool and statement selection requests contradict")
@@ -3780,13 +3775,7 @@ class FinancialToolDispatcher:
         if (
             request.statement_type
             is not FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
-            or request.as_of_date
-            != (
-                selection_request.requested_session
-                if selection_request.contract_version
-                in {"financial-indicator-routing-request-v7", "financial-indicator-routing-request-v8"}
-                else selection_request.as_of_date
-            )
+            or request.as_of_date != _financial_selection_as_of_date(selection_request)
             or selection_request.instrument_identity != self._instrument_identity
         ):
             raise ValueError("financial tool and indicator selection requests contradict")

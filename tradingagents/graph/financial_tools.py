@@ -386,7 +386,7 @@ class FinancialDispatchToolNode:
                 )
                 try:
                     acquisition = context_owner.acquire_context(
-                        as_of_date=qualified_request.as_of_date
+                        as_of_date=date.fromisoformat(str(state.get("trade_date") or ""))
                     )
                 except Exception as exc:  # noqa: BLE001 - shadow cannot affect authority
                     exception_family, exception_class, typed_reason = (

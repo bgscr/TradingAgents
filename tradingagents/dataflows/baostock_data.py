@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import logging
 import threading
@@ -28,6 +26,7 @@ from tradingagents.market_history.models import (
 )
 
 from .akshare_data import INDICATOR_DESCRIPTIONS
+from .baostock_output import contain_baostock_output
 from .errors import NoMarketDataError, VendorNotConfiguredError, VendorRateLimitError
 from .market_snapshot import validate_ohlcv_frame
 from .stockstats_utils import _assert_ohlcv_not_stale
@@ -82,7 +81,7 @@ def _session():
         raise TimeoutError(message)
 
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with contain_baostock_output():
             login = bs.login()
         if getattr(login, "error_code", "0") == "10001005":
             raise VendorRateLimitError(
@@ -94,10 +93,7 @@ def _session():
         try:
             yield
         finally:
-            with (
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
-            ):
+            with contain_baostock_output():
                 bs.logout()
     finally:
         _BAOSTOCK_SESSION_LOCK.release()
@@ -134,19 +130,20 @@ def load_ohlcv_range(
     with _session():
         if before_physical_request is not None:
             before_physical_request("adjusted-history")
-        rs = bs.query_history_k_data_plus(
-            instrument.baostock_code,
-            FIELDS,
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",
-        )
-        if getattr(rs, "error_code", "0") != "0":
-            raise NoMarketDataError(symbol, instrument.yahoo_symbol, rs.error_msg)
-        rows = []
-        while rs.next():
-            rows.append(rs.get_row_data())
+        with contain_baostock_output():
+            rs = bs.query_history_k_data_plus(
+                instrument.baostock_code,
+                FIELDS,
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",
+            )
+            if getattr(rs, "error_code", "0") != "0":
+                raise NoMarketDataError(symbol, instrument.yahoo_symbol, rs.error_msg)
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
 
     frame = _rows_to_frame(rows, symbol, instrument.yahoo_symbol)
     frame = validate_ohlcv_frame(frame, end_date)
@@ -178,15 +175,16 @@ def load_current_snapshot(
     with _session():
         if before_physical_request is not None:
             before_physical_request("adjusted-history-status")
-        result = bs.query_history_k_data_plus(
-            instrument.baostock_code,
-            CURRENT_SNAPSHOT_FIELDS,
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",
-        )
-        raw_rows = _named_query_rows(result, "current adjusted history status")
+        with contain_baostock_output():
+            result = bs.query_history_k_data_plus(
+                instrument.baostock_code,
+                CURRENT_SNAPSHOT_FIELDS,
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",
+            )
+            raw_rows = _named_query_rows(result, "current adjusted history status")
     if not raw_rows:
         raise NoMarketDataError(
             symbol,
@@ -372,30 +370,34 @@ def load_snapshot_with_history(
     with _session():
         if before_physical_request is not None:
             before_physical_request("raw-history")
-        raw_result = bs.query_history_k_data_plus(
-            instrument.baostock_code,
-            RAW_HISTORY_FIELDS,
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="3",
-        )
+        with contain_baostock_output():
+            raw_result = bs.query_history_k_data_plus(
+                instrument.baostock_code,
+                RAW_HISTORY_FIELDS,
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3",
+            )
         if before_physical_request is not None:
             before_physical_request("adjustment-factors")
-        factor_result = bs.query_adjust_factor(
-            instrument.baostock_code,
-            end_date=end_date,
-        )
+        with contain_baostock_output():
+            factor_result = bs.query_adjust_factor(
+                instrument.baostock_code,
+                end_date=end_date,
+            )
         if before_physical_request is not None:
             before_physical_request("session-calendar")
-        calendar_result = bs.query_trade_dates(
-            start_date=start_date,
-            end_date=end_date,
-        )
+        with contain_baostock_output():
+            calendar_result = bs.query_trade_dates(
+                start_date=start_date,
+                end_date=end_date,
+            )
 
-        raw_rows = _named_query_rows(raw_result, "raw history")
-        factor_rows = _named_query_rows(factor_result, "adjustment factors")
-        calendar_rows = _named_query_rows(calendar_result, "session calendar")
+        with contain_baostock_output():
+            raw_rows = _named_query_rows(raw_result, "raw history")
+            factor_rows = _named_query_rows(factor_result, "adjustment factors")
+            calendar_rows = _named_query_rows(calendar_result, "session calendar")
 
     normalized_sessions = []
     for row in raw_rows:
@@ -680,7 +682,7 @@ def _load_ohlcv_cached(symbol: str, curr_date: str, years: int) -> pd.DataFrame:
     if instrument is None:
         raise NoMarketDataError(symbol, symbol, "Baostock supports China A-share symbols only")
 
-    with _session():
+    with _session(), contain_baostock_output():
         rs = bs.query_history_k_data_plus(
             instrument.baostock_code,
             FIELDS,
