@@ -41,6 +41,11 @@ from tradingagents.dataflows.financial_temporal_eligibility import (
     evaluate_financial_metadata_temporal_eligibility_v2,
     qualify_financial_metadata_temporal_evidence_for_acquisition,
 )
+from tradingagents.dataflows.listing_publication_evidence import (
+    ListingEffectiveEvidence,
+    ListingEvidenceArtifactBinding,
+)
+from tradingagents.evidence import InstrumentIdentityEvidence
 from tradingagents.market_history import StoredSessionCalendar
 
 
@@ -313,6 +318,41 @@ def project_baostock_listing_temporal_evidence(
     )
 
 
+def project_baostock_listing_effective_evidence(
+    *,
+    instrument_identity: InstrumentIdentityEvidence,
+    artifact_identity: str,
+    artifact_sha256: str,
+    artifact_byte_length: int,
+    artifact_media_type: str,
+    row_identity: str,
+    listing_date: date,
+    lifecycle_status: str,
+    observed_at: datetime,
+    retrieved_at: datetime,
+) -> ListingEffectiveEvidence:
+    """Project only BaoStock's lifecycle-effective fact for composite proof v2."""
+
+    return ListingEffectiveEvidence(
+        instrument_identity=instrument_identity,
+        provider_id="baostock",
+        venue=instrument_identity.venue,
+        listing_effective_date=listing_date,
+        lifecycle_status=lifecycle_status,
+        source_field="ipoDate",
+        artifact=ListingEvidenceArtifactBinding(
+            artifact_identity=artifact_identity,
+            artifact_sha256=artifact_sha256,
+            revision_identity=artifact_identity,
+            row_identity=row_identity,
+            byte_length=artifact_byte_length,
+            media_type=artifact_media_type,
+        ),
+        observed_at=observed_at,
+        retrieved_at=retrieved_at,
+    )
+
+
 class FinancialEligibilityTemporalEvaluationTransaction:
     """One run-owned transaction delegating every decision to Ticket 02G."""
 
@@ -525,6 +565,7 @@ __all__ = [
     "TemporalProofProjectionUnavailableReason",
     "project_akshare_sina_company_type_temporal_evidence",
     "project_baostock_listing_temporal_evidence",
+    "project_baostock_listing_effective_evidence",
     "project_tushare_company_type_temporal_evidence",
     "project_yahoo_current_profile_temporal_evidence",
 ]

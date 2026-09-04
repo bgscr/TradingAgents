@@ -33,6 +33,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialListingMetadata,
 )
 from tradingagents.dataflows.financial_temporal_proof_projection import (
+    project_baostock_listing_effective_evidence,
     project_baostock_listing_temporal_evidence,
 )
 from tradingagents.dataflows.provider_subrequests import (
@@ -72,11 +73,6 @@ _RAW_SCOPE = "raw_daily"
 _FACTOR_SCOPE = "forward_adjustment_factors"
 _STATUS_SCOPE = "session_status"
 _LIFECYCLE_SCOPE = "issuer_lifecycle"
-_LIFECYCLE_ANNOUNCEMENT_DATE_FIELDS = (
-    "announcement_date",
-    "publication_date",
-)
-_LIFECYCLE_FIRST_PUBLICATION_DATE_FIELDS = ("first_publication_date",)
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 _CREDENTIAL_FIELD_MARKERS = (
     "api-key",
@@ -457,12 +453,16 @@ class BaoStockLifecycleAdapterResult(_BaoStockAdapterResultBase):
             "financial-listing-metadata-v2",
             "financial-listing-metadata-v3",
         }
+        composite = (
+            self.listing_metadata.contract_version == "financial-listing-metadata-v4"
+        )
         analysis_session = (
             self.listing_metadata.requested_session
-            if temporal
+            if temporal or composite
             else self.listing_metadata.as_of_date
         )
         proof = self.listing_metadata.temporal_evidence
+        effective = self.listing_metadata.listing_effective_evidence
         if (
             ProviderSubrequestInstrumentIdentity.from_authoritative(
                 self.listing_metadata.instrument_identity
@@ -488,6 +488,19 @@ class BaoStockLifecycleAdapterResult(_BaoStockAdapterResultBase):
                     or proof.f_ann_date != candidate.first_publication_date
                     or getattr(proof.f_ann_date_derivation, "source_field", None)
                     != candidate.first_publication_date_source_field
+                )
+            )
+            or (
+                composite
+                and (
+                    effective is None
+                    or effective.artifact.artifact_identity
+                    != candidate.artifact_identity
+                    or effective.artifact.revision_identity
+                    != candidate.artifact_identity
+                    or effective.artifact.row_identity
+                    != candidate.row_artifact_identities[0]
+                    or effective.listing_effective_date != candidate.listing_date
                 )
             )
         ):
@@ -746,23 +759,6 @@ def _optional_decimal(value: object) -> tuple[Decimal | None, str]:
 
 def _provider_date(value: object) -> date:
     return date.fromisoformat(str(value).strip())
-
-
-def _provider_publication_date(
-    value: Mapping[str, object],
-    fields: tuple[str, ...],
-) -> tuple[date | None, str | None]:
-    populated = tuple(
-        (field, str(value.get(field) or "").strip())
-        for field in fields
-        if str(value.get(field) or "").strip()
-    )
-    if not populated:
-        return None, None
-    parsed = tuple((field, date.fromisoformat(raw)) for field, raw in populated)
-    if len({item[1] for item in parsed}) != 1:
-        raise ValueError("BaoStock publication fields contradict each other")
-    return parsed[0][1], parsed[0][0]
 
 
 def _transport_capability_outcome(
@@ -1068,6 +1064,7 @@ class BaoStockCapabilityAdapter:
             candidate = candidates[0]
             temporal = self._plan.plan_version in {"1.3", "1.4"}
             windowed = self._plan.plan_version == "1.4"
+            composite = self._plan.plan_version == "1.5"
             temporal_evidence = (
                 project_baostock_listing_temporal_evidence(
                     artifact_identity=candidate.artifact_identity,
@@ -1085,22 +1082,43 @@ class BaoStockCapabilityAdapter:
                 if temporal
                 else None
             )
+            listing_effective_evidence = (
+                project_baostock_listing_effective_evidence(
+                    instrument_identity=instrument_identity,
+                    artifact_identity=candidate.artifact_identity,
+                    artifact_sha256=artifact.raw_artifact.artifact_sha256,
+                    artifact_byte_length=artifact.raw_artifact.byte_length,
+                    artifact_media_type=artifact.raw_artifact.media_type,
+                    row_identity=candidate.row_artifact_identities[0],
+                    listing_date=candidate.listing_date,
+                    lifecycle_status=candidate.listing_status.value,
+                    observed_at=candidate.observed_at,
+                    retrieved_at=candidate.retrieved_at,
+                )
+                if composite
+                else None
+            )
             listing_metadata = FinancialListingMetadata(
                 contract_version=(
-                    "financial-listing-metadata-v3"
-                    if windowed
+                    "financial-listing-metadata-v4"
+                    if composite
                     else (
-                        "financial-listing-metadata-v2"
-                        if temporal
-                        else "financial-listing-metadata-v1"
+                        "financial-listing-metadata-v3"
+                        if windowed
+                        else (
+                            "financial-listing-metadata-v2"
+                            if temporal
+                            else "financial-listing-metadata-v1"
+                        )
                     )
                 ),
                 instrument_identity=instrument_identity,
-                as_of_date=None if temporal else as_of_date,
-                requested_session=as_of_date if temporal else None,
+                as_of_date=None if temporal or composite else as_of_date,
+                requested_session=as_of_date if temporal or composite else None,
                 listing_date=candidate.listing_date,
                 listing_provenance=candidate.financial_listing_provenance(),
                 temporal_evidence=temporal_evidence,
+                listing_effective_evidence=listing_effective_evidence,
             )
         return BaoStockLifecycleAdapterResult(
             request=key,
@@ -1551,18 +1569,6 @@ def _lifecycle_candidates(
                 raise LookupError
             if original_status not in {"", "0", "1"}:
                 raise ValueError
-            announcement_date, announcement_date_source_field = (
-                _provider_publication_date(
-                    value,
-                    _LIFECYCLE_ANNOUNCEMENT_DATE_FIELDS,
-                )
-            )
-            first_publication_date, first_publication_date_source_field = (
-                _provider_publication_date(
-                    value,
-                    _LIFECYCLE_FIRST_PUBLICATION_DATE_FIELDS,
-                )
-            )
             ipo_date = date.fromisoformat(original_ipo) if original_ipo else None
             out_date = date.fromisoformat(original_out) if original_out else None
             if ipo_date is not None and ipo_date > as_of_date:
@@ -1594,14 +1600,6 @@ def _lifecycle_candidates(
                     original_out_date=original_out,
                     original_type=original_type,
                     original_status=original_status,
-                    announcement_date=announcement_date,
-                    announcement_date_source_field=(
-                        announcement_date_source_field
-                    ),
-                    first_publication_date=first_publication_date,
-                    first_publication_date_source_field=(
-                        first_publication_date_source_field
-                    ),
                     observed_name=(
                         str(value.get("code_name")).strip()
                         if value.get("code_name") is not None

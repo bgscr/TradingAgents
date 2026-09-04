@@ -627,6 +627,7 @@ class FinancialStatementRoutingRequest(BaseModel):
         "financial-statement-routing-request-v3",
         "financial-statement-routing-request-v4",
         "financial-statement-routing-request-v5",
+        "financial-statement-routing-request-v6",
     ] = (
         "financial-statement-routing-request-v1"
     )
@@ -691,7 +692,7 @@ class FinancialStatementRoutingRequest(BaseModel):
     ) = Field(default=None, exclude_if=lambda value: value is None)
     request_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-statement-routing-request:v[345]:[0-9a-f]{64}$",
+        pattern=r"^financial-statement-routing-request:v[3456]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
 
@@ -707,8 +708,13 @@ class FinancialStatementRoutingRequest(BaseModel):
         temporal_contract = self.contract_version in {
             "financial-statement-routing-request-v4",
             "financial-statement-routing-request-v5",
+            "financial-statement-routing-request-v6",
         }
-        windowed = self.contract_version == "financial-statement-routing-request-v5"
+        windowed = self.contract_version in {
+            "financial-statement-routing-request-v5",
+            "financial-statement-routing-request-v6",
+        }
+        composite = self.contract_version == "financial-statement-routing-request-v6"
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
         )
@@ -734,6 +740,7 @@ class FinancialStatementRoutingRequest(BaseModel):
             "financial-statement-routing-request-v3",
             "financial-statement-routing-request-v4",
             "financial-statement-routing-request-v5",
+            "financial-statement-routing-request-v6",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -750,6 +757,7 @@ class FinancialStatementRoutingRequest(BaseModel):
             "financial-statement-routing-request-v3",
             "financial-statement-routing-request-v4",
             "financial-statement-routing-request-v5",
+            "financial-statement-routing-request-v6",
         }
         new_fields = (
             self.requested_capability,
@@ -772,7 +780,9 @@ class FinancialStatementRoutingRequest(BaseModel):
             assert binding is not None
             temporal_bound = temporal_contract
             expected_binding_version = (
-                "financial-eligibility-request-binding-v3"
+                "financial-eligibility-request-binding-v4"
+                if composite
+                else "financial-eligibility-request-binding-v3"
                 if windowed
                 else (
                     "financial-eligibility-request-binding-v2"
@@ -840,6 +850,9 @@ class FinancialStatementRoutingRequest(BaseModel):
                     "financial-statement-routing-request-v5": (
                         "financial-statement-routing-request:v5:"
                     ),
+                    "financial-statement-routing-request-v6": (
+                        "financial-statement-routing-request:v6:"
+                    ),
                 }[self.contract_version]
                 + sha256(
                     json.dumps(
@@ -873,6 +886,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         "financial-indicator-routing-request-v6",
         "financial-indicator-routing-request-v7",
         "financial-indicator-routing-request-v8",
+        "financial-indicator-routing-request-v9",
     ] = (
         "financial-indicator-routing-request-v1"
     )
@@ -948,7 +962,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
     ) = Field(default=None, exclude_if=lambda value: value is None)
     request_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-indicator-routing-request:v[678]:[0-9a-f]{64}$",
+        pattern=r"^financial-indicator-routing-request:v[6789]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
 
@@ -964,8 +978,13 @@ class FinancialIndicatorRoutingRequest(BaseModel):
         temporal_contract = self.contract_version in {
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }
-        windowed = self.contract_version == "financial-indicator-routing-request-v8"
+        windowed = self.contract_version in {
+            "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
+        }
+        composite = self.contract_version == "financial-indicator-routing-request-v9"
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
         )
@@ -989,6 +1008,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v6",
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }
         provenance_bound = (
             self.contract_version
@@ -997,6 +1017,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 "financial-indicator-routing-request-v6",
                 "financial-indicator-routing-request-v7",
                 "financial-indicator-routing-request-v8",
+                "financial-indicator-routing-request-v9",
             }
         )
         if not canonical or len(self.ratio_families) != len(canonical):
@@ -1026,6 +1047,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v6",
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }
         if policy_bound != (
             self.eligibility_policy_version
@@ -1047,6 +1069,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                 "financial-indicator-routing-request-v6",
                 "financial-indicator-routing-request-v7",
                 "financial-indicator-routing-request-v8",
+                "financial-indicator-routing-request-v9",
             }
         )
         if availability_bound and self.requested_analysis_scope is None:
@@ -1071,6 +1094,7 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             "financial-indicator-routing-request-v6",
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }
         new_fields = (
             self.eligible_annual_period_ends,
@@ -1092,7 +1116,9 @@ class FinancialIndicatorRoutingRequest(BaseModel):
             assert binding is not None
             temporal_bound = temporal_contract
             expected_binding_version = (
-                "financial-eligibility-request-binding-v3"
+                "financial-eligibility-request-binding-v4"
+                if composite
+                else "financial-eligibility-request-binding-v3"
                 if windowed
                 else (
                     "financial-eligibility-request-binding-v2"
@@ -1155,6 +1181,9 @@ class FinancialIndicatorRoutingRequest(BaseModel):
                     "financial-indicator-routing-request-v8": (
                         "financial-indicator-routing-request:v8:"
                     ),
+                    "financial-indicator-routing-request-v9": (
+                        "financial-indicator-routing-request:v9:"
+                    ),
                 }[self.contract_version]
                 + sha256(
                     json.dumps(
@@ -1211,6 +1240,7 @@ class FinancialCompanyTypeEvidenceRoutingRequest(BaseModel):
         "financial-company-type-evidence-routing-request-v1",
         "financial-company-type-evidence-routing-request-v2",
         "financial-company-type-evidence-routing-request-v3",
+        "financial-company-type-evidence-routing-request-v4",
     ] = "financial-company-type-evidence-routing-request-v1"
     metadata_binding: FinancialEligibilityMetadataBinding
 
@@ -1225,6 +1255,9 @@ class FinancialCompanyTypeEvidenceRoutingRequest(BaseModel):
             ),
             "financial-company-type-evidence-routing-request-v3": (
                 "financial-eligibility-metadata-binding-v3"
+            ),
+            "financial-company-type-evidence-routing-request-v4": (
+                "financial-eligibility-metadata-binding-v4"
             ),
         }[self.contract_version]
         if self.metadata_binding.contract_version != expected:
@@ -1274,12 +1307,16 @@ class FinancialCompanyTypeEvidenceProviderProjection(BaseModel):
             "financial-eligibility-metadata-binding-v3": (
                 "financial-company-type-evidence-binding-v4"
             ),
+            "financial-eligibility-metadata-binding-v4": (
+                "financial-company-type-evidence-binding-v4"
+            ),
         }.get(self.metadata_binding.contract_version)
         if (
             self.metadata_binding.contract_version
             not in {
                 "financial-eligibility-metadata-binding-v2",
                 "financial-eligibility-metadata-binding-v3",
+                "financial-eligibility-metadata-binding-v4",
             }
             or self.evidence.contract_version != expected_evidence_version
             or self.evidence.temporal_evidence is None
@@ -1307,6 +1344,7 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
         "financial-company-type-evidence-provider-response-v1",
         "financial-company-type-evidence-provider-response-v2",
         "financial-company-type-evidence-provider-response-v3",
+        "financial-company-type-evidence-provider-response-v4",
     ] = "financial-company-type-evidence-provider-response-v1"
     provider_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     metadata_binding: FinancialEligibilityMetadataBinding
@@ -1351,6 +1389,9 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
                 "financial-eligibility-metadata-binding-v3": (
                     "financial-company-type-evidence-provider-response-v3"
                 ),
+                "financial-eligibility-metadata-binding-v4": (
+                    "financial-company-type-evidence-provider-response-v4"
+                ),
             }[metadata_binding.contract_version],
             provider_id=provider_id,
             metadata_binding=metadata_binding,
@@ -1386,6 +1427,9 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
                 "financial-eligibility-metadata-binding-v3": (
                     "financial-company-type-evidence-provider-response-v3"
                 ),
+                "financial-eligibility-metadata-binding-v4": (
+                    "financial-company-type-evidence-provider-response-v4"
+                ),
             }[metadata_binding.contract_version],
             provider_id=provider_id,
             metadata_binding=metadata_binding,
@@ -1397,8 +1441,8 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
 
     @model_validator(mode="after")
     def _validate_response(self) -> FinancialCompanyTypeEvidenceProviderResponse:
-        temporal = self.contract_version.endswith(("-v2", "-v3"))
-        staged = self.contract_version.endswith("-v3")
+        temporal = self.contract_version.endswith(("-v2", "-v3", "-v4"))
+        staged = self.contract_version.endswith(("-v3", "-v4"))
         expected_binding = {
             "financial-company-type-evidence-provider-response-v1": (
                 "financial-eligibility-metadata-binding-v1"
@@ -1409,6 +1453,9 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
             "financial-company-type-evidence-provider-response-v3": (
                 "financial-eligibility-metadata-binding-v3"
             ),
+            "financial-company-type-evidence-provider-response-v4": (
+                "financial-eligibility-metadata-binding-v4"
+            ),
         }[self.contract_version]
         expected_evidence_version = {
             "financial-company-type-evidence-provider-response-v1": (
@@ -1418,6 +1465,9 @@ class FinancialCompanyTypeEvidenceProviderResponse(BaseModel):
                 "financial-company-type-evidence-binding-v3"
             ),
             "financial-company-type-evidence-provider-response-v3": (
+                "financial-company-type-evidence-binding-v4"
+            ),
+            "financial-company-type-evidence-provider-response-v4": (
                 "financial-company-type-evidence-binding-v4"
             ),
         }[self.contract_version]
@@ -1518,6 +1568,7 @@ class FinancialCompanyTypeEvidenceRoutingResult(BaseModel):
         "financial-company-type-evidence-routing-result-v1",
         "financial-company-type-evidence-routing-result-v2",
         "financial-company-type-evidence-routing-result-v3",
+        "financial-company-type-evidence-routing-result-v4",
     ] = "financial-company-type-evidence-routing-result-v1"
     route: tuple[str, ...]
     provider_calls: tuple[FinancialCompanyTypeEvidenceProviderResponse, ...]
@@ -1565,10 +1616,10 @@ class FinancialCompanyTypeEvidenceRoutingResult(BaseModel):
                 if item.kind
                 is FinancialCompanyTypeEvidenceProviderResponseKind.AVAILABLE
                 and (
-                    not item.contract_version.endswith(("-v2", "-v3"))
+                    not item.contract_version.endswith(("-v2", "-v3", "-v4"))
                     or (
                         item.proof_qualified is True
-                        if item.contract_version.endswith("-v3")
+                        if item.contract_version.endswith(("-v3", "-v4"))
                         else (
                             item.temporal_decision is not None
                             and item.temporal_decision.result == "accepted"
@@ -1605,6 +1656,7 @@ class FinancialCapabilityProviderResponse(BaseModel):
     contract_version: Literal[
         "financial-capability-provider-response-v1",
         "financial-capability-provider-response-v2",
+        "financial-capability-provider-response-v3",
     ] = "financial-capability-provider-response-v1"
     provider_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     capability: MainlandCapability
@@ -1648,11 +1700,21 @@ class FinancialCapabilityProviderResponse(BaseModel):
         temporal_listing = (
             listing_metadata is not None
             and listing_metadata.contract_version
-            in {"financial-listing-metadata-v2", "financial-listing-metadata-v3"}
+            in {
+                "financial-listing-metadata-v2",
+                "financial-listing-metadata-v3",
+                "financial-listing-metadata-v4",
+            }
+        )
+        composite_listing = (
+            listing_metadata is not None
+            and listing_metadata.contract_version == "financial-listing-metadata-v4"
         )
         return cls(
             contract_version=(
-                "financial-capability-provider-response-v2"
+                "financial-capability-provider-response-v3"
+                if composite_listing
+                else "financial-capability-provider-response-v2"
                 if temporal_listing
                 else "financial-capability-provider-response-v1"
             ),
@@ -1718,9 +1780,24 @@ class FinancialCapabilityProviderResponse(BaseModel):
         temporal_listing = (
             self.listing_metadata is not None
             and self.listing_metadata.contract_version
-            in {"financial-listing-metadata-v2", "financial-listing-metadata-v3"}
+            in {
+                "financial-listing-metadata-v2",
+                "financial-listing-metadata-v3",
+                "financial-listing-metadata-v4",
+            }
         )
-        if self.contract_version.endswith("-v2") != temporal_listing:
+        composite_listing = (
+            self.listing_metadata is not None
+            and self.listing_metadata.contract_version == "financial-listing-metadata-v4"
+        )
+        expected_contract_version = (
+            "financial-capability-provider-response-v3"
+            if composite_listing
+            else "financial-capability-provider-response-v2"
+            if temporal_listing
+            else "financial-capability-provider-response-v1"
+        )
+        if self.contract_version != expected_contract_version:
             raise ValueError("capability response version mismatch")
         if self.capability not in _ROUTABLE_DATASET_CAPABILITIES:
             raise ValueError("provider response has an unsupported capability")
@@ -2588,6 +2665,7 @@ class FinancialCapabilityRoutingResult(BaseModel):
     contract_version: Literal[
         "financial-capability-routing-result-v1",
         "financial-capability-routing-result-v2",
+        "financial-capability-routing-result-v3",
     ] = "financial-capability-routing-result-v1"
     capability: MainlandCapability
     route: tuple[str, ...]
@@ -2612,15 +2690,26 @@ class FinancialCapabilityRoutingResult(BaseModel):
 
     @model_validator(mode="after")
     def _validate_result(self) -> FinancialCapabilityRoutingResult:
-        temporal = self.contract_version.endswith("-v2")
+        temporal = self.contract_version.endswith(("-v2", "-v3"))
+        composite = self.contract_version.endswith("-v3")
         nested_temporal = any(
             call.contract_version.endswith("-v2") for call in self.provider_calls
         ) or (
             self.listing_metadata is not None
             and self.listing_metadata.contract_version
-            in {"financial-listing-metadata-v2", "financial-listing-metadata-v3"}
+            in {
+                "financial-listing-metadata-v2",
+                "financial-listing-metadata-v3",
+                "financial-listing-metadata-v4",
+            }
         )
-        if temporal != nested_temporal:
+        nested_composite = any(
+            call.contract_version.endswith("-v3") for call in self.provider_calls
+        ) or (
+            self.listing_metadata is not None
+            and self.listing_metadata.contract_version == "financial-listing-metadata-v4"
+        )
+        if temporal != nested_temporal or composite != nested_composite:
             raise ValueError("capability routing result version mismatch")
         if self.capability not in _ROUTABLE_DATASET_CAPABILITIES:
             raise ValueError("capability result has an unsupported capability")
@@ -2737,8 +2826,8 @@ class MainlandFinancialCapabilityRouter:
     ) -> FinancialCompanyTypeEvidenceRoutingResult:
         """Traverse only the prerequisite route declared by the immutable plan."""
 
-        temporal = request.contract_version.endswith(("-v2", "-v3"))
-        staged = request.contract_version.endswith("-v3")
+        temporal = request.contract_version.endswith(("-v2", "-v3", "-v4"))
+        staged = request.contract_version.endswith(("-v3", "-v4"))
         binding = request.metadata_binding
         if temporal:
             if (
@@ -2852,6 +2941,9 @@ class MainlandFinancialCapabilityRouter:
                 "financial-company-type-evidence-routing-request-v3": (
                     "financial-company-type-evidence-routing-result-v3"
                 ),
+                "financial-company-type-evidence-routing-request-v4": (
+                    "financial-company-type-evidence-routing-result-v4"
+                ),
             }[request.contract_version],
             route=route,
             provider_calls=tuple(provider_calls),
@@ -2934,7 +3026,11 @@ class MainlandFinancialCapabilityRouter:
                 or (
                     response.listing_metadata.requested_session
                     if response.listing_metadata.contract_version
-                    in {"financial-listing-metadata-v2", "financial-listing-metadata-v3"}
+                    in {
+                        "financial-listing-metadata-v2",
+                        "financial-listing-metadata-v3",
+                        "financial-listing-metadata-v4",
+                    }
                     else response.listing_metadata.as_of_date
                 )
                 != request.as_of_date
@@ -2958,7 +3054,10 @@ class MainlandFinancialCapabilityRouter:
 
         return FinancialCapabilityRoutingResult(
             contract_version=(
-                "financial-capability-routing-result-v2"
+                "financial-capability-routing-result-v3"
+                if selected is not None
+                and selected.contract_version.endswith("-v3")
+                else "financial-capability-routing-result-v2"
                 if selected is not None
                 and selected.contract_version.endswith("-v2")
                 else "financial-capability-routing-result-v1"
@@ -4251,6 +4350,7 @@ class MainlandFinancialCapabilityRouter:
             "financial-indicator-routing-request-v6",
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }:
             (
                 family_assessments,
@@ -4842,6 +4942,7 @@ def assess_financial_indicator_family_outcomes(
             "financial-indicator-routing-request-v6",
             "financial-indicator-routing-request-v7",
             "financial-indicator-routing-request-v8",
+            "financial-indicator-routing-request-v9",
         }
         or requirements is None
         or request.requested_analysis_scope is None

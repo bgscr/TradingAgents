@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from threading import Event
 from typing import Literal
 
@@ -14,9 +14,18 @@ from tradingagents.capability_routing import (
     CAPABILITY_ROUTING_PLAN_VERSION,
     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
     CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
     MainlandCapability,
     MainlandCapabilityRoutingMode,
     MainlandCapabilityRoutingPlan,
+)
+from tradingagents.dataflows.cninfo_listing_publication import (
+    CNINFO_LISTING_QUERY_LOOKBACK_DAYS,
+    CninfoFailureReason,
+    CninfoListingBoard,
+    CninfoListingPublicationRequest,
+    CninfoListingPublicationResult,
+    CninfoListingPublicationResultKind,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
@@ -54,6 +63,10 @@ from tradingagents.dataflows.financial_temporal_eligibility import (
 from tradingagents.dataflows.financial_temporal_proof_projection import (
     FinancialEligibilityTemporalEvaluationTransaction,
 )
+from tradingagents.dataflows.listing_publication_evidence import (
+    ListingCompositeEvidenceOrigins,
+    evaluate_composite_listing_temporal_proof,
+)
 from tradingagents.evidence import InstrumentIdentityEvidence
 
 _CLOSED_MODEL_CONFIG = ConfigDict(
@@ -72,6 +85,7 @@ class FinancialEligibilityMetadataAcquisitionRequest(BaseModel):
         "financial-eligibility-metadata-acquisition-request-v1",
         "financial-eligibility-metadata-acquisition-request-v2",
         "financial-eligibility-metadata-acquisition-request-v3",
+        "financial-eligibility-metadata-acquisition-request-v4",
     ] = "financial-eligibility-metadata-acquisition-request-v1"
     canonical_run_id: str
     run_id: str
@@ -111,11 +125,16 @@ class FinancialEligibilityMetadataAcquisitionRequest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    authoritative_listing_board: CninfoListingBoard | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_request_shape(self) -> FinancialEligibilityMetadataAcquisitionRequest:
-        temporal = self.contract_version.endswith(("-v2", "-v3"))
-        windowed = self.contract_version.endswith("-v3")
+        temporal = self.contract_version.endswith(("-v2", "-v3", "-v4"))
+        windowed = self.contract_version.endswith(("-v3", "-v4"))
+        composite = self.contract_version.endswith("-v4")
         historical_shape = (
             self.authoritative_as_of_date is not None
             and self.as_of_date is not None
@@ -149,6 +168,7 @@ class FinancialEligibilityMetadataAcquisitionRequest(BaseModel):
                     )
                 )
             )
+            or composite != (self.authoritative_listing_board is not None)
         ):
             raise ValueError("metadata acquisition request temporal shape mismatch")
         if temporal:
@@ -182,6 +202,8 @@ def _failed(
     temporal_proof_unavailable: bool = False,
     temporal_context: bool = False,
     windowed_context: bool = False,
+    composite_context: bool = False,
+    listing_publication_failure_reason: str | None = None,
 ) -> FinancialEligibilityAcquisitionResult:
     return FinancialEligibilityAcquisitionResult.failed(
         reason,
@@ -190,6 +212,8 @@ def _failed(
         temporal_proof_unavailable=temporal_proof_unavailable,
         temporal_context=temporal_context,
         windowed_context=windowed_context,
+        composite_context=composite_context,
+        listing_publication_failure_reason=listing_publication_failure_reason,
     )
 
 
@@ -263,14 +287,40 @@ class FinancialEligibilityMetadataAcquirer:
         temporal_transaction_factory: Callable[..., FinancialEligibilityTemporalEvaluationTransaction] = (
             FinancialEligibilityTemporalEvaluationTransaction
         ),
+        listing_publication_source: (
+            Callable[
+                [CninfoListingPublicationRequest],
+                CninfoListingPublicationResult,
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._routing_plan = routing_plan
         self._router = router
         self._stop_signal = stop_signal
         self._temporal_transaction_factory = temporal_transaction_factory
+        self._listing_publication_source = listing_publication_source
 
     def __repr__(self) -> str:
         return "FinancialEligibilityMetadataAcquirer(plan_bound=True)"
+
+    def bind_listing_publication_source(
+        self,
+        source: Callable[
+            [CninfoListingPublicationRequest],
+            CninfoListingPublicationResult,
+        ],
+    ) -> None:
+        """Single-assign the unqualified plan-1.5 source before acquisition."""
+
+        if (
+            self._routing_plan.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_5
+            or self._listing_publication_source is not None
+            or not callable(source)
+            or self._stop_signal.is_set()
+        ):
+            raise ValueError("listing-publication candidate source binding is invalid")
+        self._listing_publication_source = source
 
     def _interrupted(self) -> bool:
         return self._stop_signal.is_set()
@@ -292,6 +342,21 @@ class FinancialEligibilityMetadataAcquirer:
                 eligibility_started_at=request.eligibility_started_at,
                 calendar_binding=request.calendar_binding,
                 strict_cutoff=request.strict_cutoff,
+            )
+        if request.contract_version.endswith("-v4"):
+            return FinancialEligibilityMetadataBinding(
+                contract_version="financial-eligibility-metadata-binding-v4",
+                instrument_identity=request.instrument_identity,
+                requested_session=request.requested_session,
+                availability_scope=request.availability_scope,
+                acquisition_purpose=request.acquisition_purpose,
+                financial_eligibility_binding=request.financial_eligibility_binding,
+                routing_plan_signature=request.routing_plan_signature,
+                temporal_mode=request.temporal_mode,
+                eligibility_started_at=request.eligibility_started_at,
+                calendar_binding=request.calendar_binding,
+                strict_cutoff=request.strict_cutoff,
+                authoritative_listing_board=request.authoritative_listing_board,
             )
         if request.contract_version.endswith("-v2"):
             return FinancialEligibilityMetadataBinding(
@@ -329,6 +394,7 @@ class FinancialEligibilityMetadataAcquirer:
             in {
                 "financial-eligibility-metadata-binding-v2",
                 "financial-eligibility-metadata-binding-v3",
+                "financial-eligibility-metadata-binding-v4",
             }
             and retained.instrument_identity == current.instrument_identity
             and retained.requested_session == current.requested_session
@@ -339,6 +405,8 @@ class FinancialEligibilityMetadataAcquirer:
             and retained.routing_plan_signature == current.routing_plan_signature
             and retained.temporal_mode is current.temporal_mode
             and retained.strict_cutoff == current.strict_cutoff
+            and retained.authoritative_listing_board
+            == current.authoritative_listing_board
         )
 
     def _retained_company_type_evidence(
@@ -368,7 +436,10 @@ class FinancialEligibilityMetadataAcquirer:
             temporal = transaction is not None
             windowed = temporal and transaction.is_v2
             expected_projection_version = (
-                "financial-company-type-evidence-projection-v3"
+                "financial-company-type-evidence-projection-v4"
+                if projection.metadata_binding.contract_version
+                == "financial-eligibility-metadata-binding-v4"
+                else "financial-company-type-evidence-projection-v3"
                 if windowed
                 else "financial-company-type-evidence-projection-v2"
                 if temporal
@@ -481,8 +552,9 @@ class FinancialEligibilityMetadataAcquirer:
     ) -> FinancialEligibilityAcquisitionResult:
         """Return exactly one complete context or one bounded typed failure."""
 
-        temporal = request.contract_version.endswith(("-v2", "-v3"))
-        windowed = request.contract_version.endswith("-v3")
+        temporal = request.contract_version.endswith(("-v2", "-v3", "-v4"))
+        windowed = request.contract_version.endswith(("-v3", "-v4"))
+        composite = request.contract_version.endswith("-v4")
 
         def fail(
             reason: FinancialEligibilityAcquisitionFailureReason,
@@ -493,6 +565,7 @@ class FinancialEligibilityMetadataAcquirer:
             ) = None,
             temporal_proof_unavailable: bool = False,
             temporal_context: bool = False,
+            listing_publication_failure_reason: str | None = None,
         ) -> FinancialEligibilityAcquisitionResult:
             return _failed(
                 reason,
@@ -501,6 +574,10 @@ class FinancialEligibilityMetadataAcquirer:
                 temporal_proof_unavailable=temporal_proof_unavailable,
                 temporal_context=temporal or temporal_context,
                 windowed_context=windowed,
+                composite_context=composite,
+                listing_publication_failure_reason=(
+                    listing_publication_failure_reason
+                ),
             )
 
         if self._interrupted():
@@ -510,7 +587,11 @@ class FinancialEligibilityMetadataAcquirer:
             )
         try:
             expected_plan_version = (
-                CAPABILITY_ROUTING_PLAN_VERSION_1_4
+                (
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_5
+                    if composite
+                    else CAPABILITY_ROUTING_PLAN_VERSION_1_4
+                )
                 if windowed
                 else (
                     CAPABILITY_ROUTING_PLAN_VERSION_1_3
@@ -536,6 +617,14 @@ class FinancialEligibilityMetadataAcquirer:
                 != self._routing_plan.financial_eligibility_binding
                 or request.routing_plan_signature != self._routing_plan.plan_signature
                 or request.currency != request.instrument_identity.currency
+                or composite
+                != (
+                    self._listing_publication_source is not None
+                    and self._routing_plan.route_for(
+                        MainlandCapability.LISTING_PUBLICATION_EVIDENCE
+                    )
+                    == ("cninfo",)
+                )
             ):
                 raise ValueError("metadata acquisition plan binding mismatch")
             binding = self._binding(request)
@@ -597,7 +686,11 @@ class FinancialEligibilityMetadataAcquirer:
                 routed = self._router.route_company_type_evidence(
                     FinancialCompanyTypeEvidenceRoutingRequest(
                         contract_version=(
-                            "financial-company-type-evidence-routing-request-v3"
+                            (
+                                "financial-company-type-evidence-routing-request-v4"
+                                if composite
+                                else "financial-company-type-evidence-routing-request-v3"
+                            )
                             if windowed
                             else (
                                 "financial-company-type-evidence-routing-request-v2"
@@ -771,7 +864,64 @@ class FinancialEligibilityMetadataAcquirer:
                 temporal_context=temporal,
             )
         assert listing is not None
-        if temporal and not windowed and listing_temporal_decision is None:
+        composite_proof = None
+        listing_publication_result = None
+        if composite:
+            if request.temporal_mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT:
+                return fail(
+                    FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE,
+                    temporal_proof_unavailable=True,
+                    temporal_context=True,
+                )
+            effective_evidence = listing.listing_effective_evidence
+            source = self._listing_publication_source
+            board = request.authoritative_listing_board
+            if effective_evidence is None or source is None or board is None:
+                return fail(
+                    FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE,
+                    temporal_proof_unavailable=True,
+                    temporal_context=True,
+                )
+            try:
+                listing_publication_result = source(
+                    CninfoListingPublicationRequest(
+                        instrument_identity=request.instrument_identity,
+                        effective_evidence=effective_evidence,
+                        authoritative_board=board,
+                        requested_session=request.requested_session,
+                        window_start=(
+                            effective_evidence.listing_effective_date
+                            - timedelta(days=CNINFO_LISTING_QUERY_LOOKBACK_DAYS)
+                        ),
+                        window_end=effective_evidence.listing_effective_date,
+                    )
+                )
+                listing_publication_result = (
+                    CninfoListingPublicationResult.model_validate(
+                        listing_publication_result.model_dump(mode="json")
+                    )
+                )
+            except (AttributeError, TypeError, ValueError):
+                listing_publication_result = None
+            if (
+                listing_publication_result is None
+                or listing_publication_result.kind
+                is not CninfoListingPublicationResultKind.AVAILABLE
+                or listing_publication_result.composite_proof is None
+            ):
+                failure_reason = (
+                    listing_publication_result.reason.value
+                    if listing_publication_result is not None
+                    and listing_publication_result.reason is not None
+                    else CninfoFailureReason.TRANSPORT_UNAVAILABLE.value
+                )
+                return fail(
+                    FinancialEligibilityAcquisitionFailureReason.LISTING_PUBLICATION_EVIDENCE_UNAVAILABLE,
+                    temporal_context=True,
+                    listing_publication_failure_reason=failure_reason,
+                )
+            composite_proof = listing_publication_result.composite_proof
+        if temporal and not windowed and not composite and listing_temporal_decision is None:
             proof = listing.temporal_evidence
             if proof is None:
                 return fail(
@@ -802,7 +952,7 @@ class FinancialEligibilityMetadataAcquirer:
             assert transaction is not None
             company_proof = evidence.temporal_evidence
             listing_proof = listing.temporal_evidence
-            if company_proof is None or listing_proof is None:
+            if company_proof is None or (not composite and listing_proof is None):
                 return fail(
                     FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE,
                     temporal_proof_unavailable=True,
@@ -813,9 +963,13 @@ class FinancialEligibilityMetadataAcquirer:
                     company_proof,
                     evidence_origin=company_evidence_origin,
                 )
-                staged_listing = transaction.stage(
-                    listing_proof,
-                    evidence_origin=listing_evidence_origin,
+                staged_listing = (
+                    None
+                    if composite
+                    else transaction.stage(
+                        listing_proof,
+                        evidence_origin=listing_evidence_origin,
+                    )
                 )
             except (TypeError, ValueError):
                 return fail(
@@ -824,10 +978,16 @@ class FinancialEligibilityMetadataAcquirer:
                     temporal_context=True,
                 )
             try:
-                (
-                    company_temporal_decision,
-                    listing_temporal_decision,
-                ) = transaction.finalize((staged_company, staged_listing))
+                if composite:
+                    (company_temporal_decision,) = transaction.finalize(
+                        (staged_company,)
+                    )
+                else:
+                    assert staged_listing is not None
+                    (
+                        company_temporal_decision,
+                        listing_temporal_decision,
+                    ) = transaction.finalize((staged_company, staged_listing))
             except (TypeError, ValueError):
                 return fail(
                     FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH,
@@ -840,7 +1000,7 @@ class FinancialEligibilityMetadataAcquirer:
                         company_temporal_decision,
                         listing_temporal_decision,
                     )
-                    if decision.result != "accepted"
+                    if decision is not None and decision.result != "accepted"
                 ),
                 None,
             )
@@ -856,6 +1016,42 @@ class FinancialEligibilityMetadataAcquirer:
                     FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH,
                     temporal_context=True,
                 )
+            if composite:
+                assert composite_proof is not None
+                assert listing_publication_result is not None
+                document_origin = (
+                    TemporalEvidenceAcquisitionOrigin.FRESH
+                    if listing_publication_result.document_evidence is not None
+                    else None
+                )
+                try:
+                    listing_temporal_decision = (
+                        evaluate_composite_listing_temporal_proof(
+                            composite_proof,
+                            acquisition_window=acquisition_window,
+                            evidence_origins=ListingCompositeEvidenceOrigins(
+                                effective=listing_evidence_origin,
+                                publication=TemporalEvidenceAcquisitionOrigin.FRESH,
+                                document=document_origin,
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    return fail(
+                        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE,
+                        temporal_proof_unavailable=True,
+                        temporal_context=True,
+                    )
+                if listing_temporal_decision.result != "accepted":
+                    return fail(
+                        FinancialEligibilityAcquisitionFailureReason.LISTING_PUBLICATION_EVIDENCE_UNAVAILABLE,
+                        temporal_context=True,
+                        listing_publication_failure_reason=(
+                            listing_temporal_decision.reasons[0].value
+                            if listing_temporal_decision.reasons
+                            else CninfoFailureReason.TEMPORAL_PROOF_CONFLICT.value
+                        ),
+                    )
         try:
             if self._routing_plan.financial_eligibility_policy is None:
                 raise ValueError("financial eligibility policy is unavailable")
@@ -906,6 +1102,7 @@ class FinancialEligibilityMetadataAcquirer:
             company_type_temporal_decision=company_temporal_decision,
             listing_temporal_decision=listing_temporal_decision,
             listing_temporal_evidence=listing.temporal_evidence,
+            listing_composite_temporal_proof=composite_proof,
             acquisition_window=acquisition_window,
             strict_cutoff=request.strict_cutoff,
             currency=request.currency,

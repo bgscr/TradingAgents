@@ -19,6 +19,7 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchAuditProjection,
     FinancialDispatchAuditProjectionV2,
     FinancialDispatchAuditProjectionV3,
+    FinancialDispatchAuditProjectionV6,
 )
 from tradingagents.decision_audit import write_immutable_decision_audit
 from tradingagents.decision_policy import TradingDecisionContract
@@ -330,6 +331,38 @@ def _render_financial_dispatch_operations(
                 (
                     "- **Indicator metadata-compatibility version:** "
                     f"`{financial_dispatch.indicator_metadata_compatibility_version}`"
+                ),
+            ]
+        if isinstance(financial_dispatch, FinancialDispatchAuditProjectionV6):
+            lines[4:4] = [
+                (
+                    "- **Financial indicator manifest version:** "
+                    f"{financial_dispatch.financial_indicator_manifest_version}"
+                ),
+                (
+                    "- **Composite listing temporal proof:** "
+                    f"`{financial_dispatch.listing_temporal_proof_identity}`"
+                ),
+                (
+                    "- **Listing effective artifact/row:** "
+                    f"`{financial_dispatch.effective_artifact_identity}` / "
+                    f"`{financial_dispatch.effective_row_identity}`"
+                ),
+                (
+                    "- **CNINFO security-lookup artifact:** "
+                    f"`{financial_dispatch.security_lookup_artifact_identity}`"
+                ),
+                (
+                    "- **Listing publication artifact/announcement:** "
+                    f"`{financial_dispatch.publication_artifact_identity}` / "
+                    f"`{financial_dispatch.publication_announcement_identity}`"
+                ),
+                (
+                    "- **Listing document artifact/request:** "
+                    f"`{financial_dispatch.document_artifact_identity}` / "
+                    f"`{financial_dispatch.document_request_identity}`"
+                    if financial_dispatch.document_artifact_identity is not None
+                    else "- **Listing document artifact/request:** not required"
                 ),
             ]
         binding = financial_dispatch.financial_eligibility_binding

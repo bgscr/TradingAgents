@@ -544,10 +544,14 @@ def test_empty_enablement_activates_no_ordinary_tushare_provider_route(
     assert result.plan is not None
     assert result.plan.enabled_tushare_capabilities == ()
     assert "tushare" not in {
-        provider
-        for capability in MainlandCapability
-        if capability is not MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
-        for provider in result.plan.route_for(capability)
+            provider
+            for capability in MainlandCapability
+            if capability
+            not in {
+                MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE,
+                MainlandCapability.LISTING_PUBLICATION_EVIDENCE,
+            }
+            for provider in result.plan.route_for(capability)
     }
     assert result.plan.route_for(
         MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE

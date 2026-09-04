@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import sqlite3
@@ -40,10 +41,17 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
+    prepare_mainland_listing_publication_candidate_plan,
     prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_calendar import MainlandSessionCalendarMembership
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
+from tradingagents.dataflows.cninfo_listing_publication import (
+    CninfoHttpResponse,
+    CninfoListingBoard,
+    CninfoListingPublicationAdapter,
+    CninfoSourcePolicy,
+)
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
     FinancialIndicatorRoutingRequest,
@@ -90,8 +98,13 @@ from tradingagents.market_history import (
     publication_from_baostock_session_calendar_acquisition,
 )
 from tradingagents.market_history.config import (
+    DataUsageMode,
     MarketHistoryConfig,
     provider_request_authority_config,
+)
+from tradingagents.market_history.coordinator import (
+    record_active_physical_attempt_io,
+    upstream_service_identity_for_provider,
 )
 from tradingagents.market_history.store import MarketHistoryStore
 from tradingagents.qualified_routing_composition import (
@@ -108,6 +121,7 @@ _ENABLED_CAPABILITIES = (
     "name_events",
 )
 _THREAD_ID = "0600000000000004"
+_CNINFO_FIXTURES = Path(__file__).parent / "fixtures" / "cninfo"
 
 
 def _single_localized_shadow_failure(entry: dict[str, object]) -> dict[str, object]:
@@ -502,8 +516,6 @@ class _BaoStockProvider(_OwnedFakeProvider):
                 "code_name": ["fixture issuer"],
                 "ipoDate": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
                 "outDate": [""],
-                "publication_date": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
-                "first_publication_date": ["2007-05-15" if self.symbol == "601328.SS" else "1996-04-22"],
                 "type": ["1"],
                 "status": ["1"],
             }
@@ -544,6 +556,58 @@ class _BaoStockProvider(_OwnedFakeProvider):
     def query_dupont_data(self, **kwargs: object) -> pd.DataFrame:
         self._record("query_dupont_data", kwargs)
         return pd.DataFrame()
+
+
+class _CninfoProvider(_OwnedFakeProvider):
+    def __init__(self, symbol: str) -> None:
+        super().__init__()
+        self.symbol = symbol
+
+    def post_form(
+        self,
+        url: str,
+        *,
+        form: dict[str, str],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> CninfoHttpResponse:
+        record_active_physical_attempt_io()
+        self._record("post_form", {"url": url, "form": dict(form)})
+        code = self.symbol.partition(".")[0]
+        fixture = (
+            f"{code}-security-lookup.json"
+            if url.endswith("/new/information/topSearch/query")
+            else f"{code}-announcement-query.json"
+        )
+        return CninfoHttpResponse(
+            status_code=200,
+            content_type="application/json; charset=UTF-8",
+            final_url=url,
+            body=(_CNINFO_FIXTURES / fixture).read_bytes(),
+        )
+
+    def get_document(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> CninfoHttpResponse:
+        record_active_physical_attempt_io()
+        self._record("get_document", {"url": url})
+        if self.symbol != "600895.SS":
+            raise AssertionError("unambiguous metadata must not fetch a document")
+        body = base64.b64decode(
+            (_CNINFO_FIXTURES / "141828-legacy-gb2312.html.b64").read_text(
+                encoding="ascii"
+            )
+        )
+        return CninfoHttpResponse(
+            status_code=200,
+            content_type="text/html; charset=gb2312",
+            final_url=url,
+            body=body,
+        )
 
 
 @dataclass
@@ -636,6 +700,10 @@ class _FreshRun:
 
     def close(self) -> None:
         self.host.close_qualified_routing_runtime()
+        cninfo = self.providers.get("cninfo")
+        if cninfo is not None:
+            cninfo.interrupt()
+            cninfo.close()
 
     def invoke(self, state: dict[str, object]) -> dict[str, object]:
         return self.compiled_fundamentals.invoke(
@@ -740,7 +808,9 @@ def _fresh_builtin_run(
     asset = resolve_run_asset_configuration(symbol, config=config)
     preflight = preflight_mainland_capability_routing(asset, config=config)
     assert preflight.plan is not None
-    plan = prepare_mainland_temporal_capability_routing_plan(preflight.plan)
+    plan = prepare_mainland_listing_publication_candidate_plan(
+        prepare_mainland_temporal_capability_routing_plan(preflight.plan)
+    )
     config["asset_configuration_signature"] = asset.asset_configuration_signature
     config["mainland_capability_routing_plan_signature"] = plan.plan_signature
     vendor_methods = _legacy_vendor_methods()
@@ -757,6 +827,7 @@ def _fresh_builtin_run(
         ),
         "yfinance": _YahooProvider(),
         "baostock": _BaoStockProvider(symbol),
+        "cninfo": _CninfoProvider(symbol),
     }
     production_factories = composition_module.production_qualified_routing_runtime_factories()
     history_config = MarketHistoryConfig.from_mapping(config)
@@ -865,8 +936,40 @@ def _fresh_builtin_run(
         checkpoint_compatibility_known=True,
         checkpoint_thread_id=checkpoint_thread_id,
         analysis_as_of_date=_AS_OF,
+        authoritative_listing_board=CninfoListingBoard.XSHG_MAIN,
     )
     assert runtime is not None
+    owner = host.financial_eligibility_context_owner
+    assert owner is not None
+    cache = owner._unbound_financial_routing.provider_subrequest_cache
+    assert cache is not None
+    coordinator = cache._coordinator
+    for provider_id in ("cninfo_metadata", "cninfo_documents"):
+        upstream_id, service_name = upstream_service_identity_for_provider(provider_id)
+        coordinator.register_upstream_service(
+            upstream_id,
+            service_name,
+        )
+        coordinator.configure_operator_ceiling(
+            upstream_service_id=upstream_id,
+            minimum_interval=timedelta(seconds=1),
+            allow_prewarming=False,
+            configured_at=_NOW,
+        )
+    owner._metadata_acquirer.bind_listing_publication_source(
+        CninfoListingPublicationAdapter(
+            subrequest_cache=cache,
+            transport=providers["cninfo"],
+            source_policy=CninfoSourcePolicy(
+                data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+                operator_minimum_interval_seconds=1,
+            ),
+            owner_id=run_id,
+            now=lambda: _DeterministicDateTime.now(timezone.utc),
+            sleep=_DeterministicDateTime.advance,
+            lease_duration=timedelta(seconds=30),
+        ).acquire
+    )
     financial_node = host.tool_nodes["fundamentals"]
     assert isinstance(financial_node, FinancialDispatchToolNode)
     assert financial_node._qualified_context_owner is (
@@ -956,13 +1059,13 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
         assert "as_of_date" not in selection_request
         context = fresh.owner.context
         assert context is not None
-        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        assert context.contract_version == "financial-eligibility-acquisition-context-v4"
         assert context.company_type_evidence.contract_version == (
             "financial-company-type-evidence-binding-v4"
         )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
-        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v4"
         assert acquisition.context is context
         temporal = context.temporal_eligibility_binding
         assert temporal is not None
@@ -973,18 +1076,20 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
             window.transaction_binding.routing_plan_signature
             == context.routing_plan_signature
         )
-        assert all(
-            decision.evidence_acquisition_binding is not None
-            and decision.evidence_acquisition_binding.transaction_identity
+        assert temporal.company_type_temporal_decision.evidence_acquisition_binding is not None
+        assert (
+            temporal.company_type_temporal_decision.evidence_acquisition_binding.transaction_identity
             == window.transaction_binding.transaction_identity
-            and decision.evidence_origin == "fresh"
-            for decision in (
-                temporal.company_type_temporal_decision,
-                temporal.listing_temporal_decision,
-            )
+        )
+        assert temporal.company_type_temporal_decision.evidence_origin == "fresh"
+        assert temporal.listing_temporal_decision.evidence_origins.effective == "fresh"
+        assert temporal.listing_temporal_decision.evidence_origins.publication == "fresh"
+        assert (
+            temporal.composite_listing_temporal_proof
+            == context.listing_composite_temporal_proof
         )
         metadata_binding = FinancialEligibilityMetadataBinding(
-            contract_version="financial-eligibility-metadata-binding-v3",
+            contract_version="financial-eligibility-metadata-binding-v4",
             instrument_identity=context.instrument_identity,
             requested_session=temporal.requested_session,
             availability_scope=context.availability_scope,
@@ -995,9 +1100,10 @@ def test_production_runtime_reads_primary_calendar_with_empty_coordinator_sideca
             eligibility_started_at=window.eligibility_started_at,
             calendar_binding=window.calendar_binding.started,
             strict_cutoff=temporal.strict_cutoff,
+            authoritative_listing_board=CninfoListingBoard.XSHG_MAIN,
         )
         company_projection = FinancialCompanyTypeEvidenceProjection(
-            contract_version="financial-company-type-evidence-projection-v3",
+            contract_version="financial-company-type-evidence-projection-v4",
             metadata_binding=metadata_binding,
             evidence=context.company_type_evidence,
             temporal_decision=temporal.company_type_temporal_decision,
@@ -1044,34 +1150,45 @@ def test_fresh_builtin_admits_truthful_provider_latency_before_context_binding(
 
     tushare._record = record_with_realistic_latency
     try:
-        result = fresh.invoke(
-            fresh.state(
-                tool_names=("get_fundamentals",),
-                tool_call_prefix="ticket07-latency",
-            )
+        state = fresh.state(
+            tool_names=("get_fundamentals",),
+            tool_call_prefix="ticket07-latency",
         )
+        result = fresh.invoke(state)
 
         assert "financial_dispatch_shadow_failure" not in result
         context = fresh.owner.context
         assert context is not None
-        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        assert context.contract_version == "financial-eligibility-acquisition-context-v4"
         temporal = context.temporal_eligibility_binding
         assert temporal is not None
-        assert temporal.contract_version == "financial-eligibility-temporal-binding-v2"
+        assert temporal.contract_version == "financial-eligibility-temporal-binding-v3"
         window = temporal.acquisition_window
         assert window.contract_version == "financial-eligibility-acquisition-window-v1"
         assert window.eligibility_started_at < window.eligibility_evaluated_at
         assert window.calendar_revision_id == fresh.primary_calendar_revision_id
         assert window.started_latest_completed_session == _AS_OF
         assert window.evaluated_latest_completed_session == _AS_OF
-        for decision in (
-            temporal.company_type_temporal_decision,
-            temporal.listing_temporal_decision,
+        proof = temporal.composite_listing_temporal_proof
+        assert proof is not None
+        for observed_at, retrieved_at in (
+            (
+                temporal.company_type_temporal_decision.observed_at,
+                temporal.company_type_temporal_decision.retrieved_at,
+            ),
+            (
+                proof.effective_evidence.observed_at,
+                proof.effective_evidence.retrieved_at,
+            ),
+            (
+                proof.publication_evidence.observed_at,
+                proof.publication_evidence.retrieved_at,
+            ),
         ):
             assert (
                 window.eligibility_started_at
-                <= decision.observed_at
-                <= decision.retrieved_at
+                <= observed_at
+                <= retrieved_at
                 <= window.eligibility_evaluated_at
             )
     finally:
@@ -1144,7 +1261,7 @@ def test_fresh_financial_dispatch_separates_run_session_from_historical_tool_dat
 
         context = fresh.owner.context
         assert context is not None
-        assert context.contract_version == "financial-eligibility-acquisition-context-v3"
+        assert context.contract_version == "financial-eligibility-acquisition-context-v4"
         assert context.requested_session == run_session
         shadow_failure = result.get("financial_dispatch_shadow_failure")
         assert shadow_failure is None, json.dumps(shadow_failure, sort_keys=True)
@@ -1216,22 +1333,12 @@ def test_future_financial_tool_date_fails_before_qualified_provider_io(
         assert context is not None
         assert context.requested_session == _AS_OF
         shadow_failure = result["financial_dispatch_shadow_failure"]
-        assert shadow_failure["failure_count"] == 2
+        assert shadow_failure["failure_count"] == 1
         assert shadow_failure["failures"][0] == {
             "stage": "request_factory",
             "failure_kind": "exception",
             "exception_family": "builtins",
             "exception_class": "ValueError",
-            "selection_kind": "indicator",
-            "context_constructed": True,
-            "dispatcher_constructed": True,
-        }
-        assert shadow_failure["failures"][1] == {
-            "stage": "checkpoint_projection",
-            "failure_kind": "exception",
-            "exception_family": "financial_dispatch",
-            "exception_class": "FinancialDispatchCheckpointError",
-            "typed_reason": "financial_dispatch_checkpoint_qualified_selection_invalid",
             "selection_kind": "indicator",
             "context_constructed": True,
             "dispatcher_constructed": True,
@@ -1347,11 +1454,11 @@ def test_fresh_builtin_rejects_when_acquisition_crosses_next_session_close(
         )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
-        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v4"
         assert acquisition.context is None
         assert acquisition.failure is not None
         assert acquisition.failure.contract_version == (
-            "financial-eligibility-acquisition-result-v3"
+            "financial-eligibility-acquisition-result-v4"
         )
         assert acquisition.failure.reason is (
             FinancialEligibilityAcquisitionFailureReason.TEMPORAL_ELIGIBILITY_REJECTED
@@ -1361,6 +1468,75 @@ def test_fresh_builtin_rejects_when_acquisition_crosses_next_session_close(
             TemporalEligibilityRejectionReason.REQUESTED_SESSION_NOT_LATEST_COMPLETED_FRONTIER
             in acquisition.failure.rejected_temporal_decision.reasons
         )
+    finally:
+        fresh.close()
+
+
+@pytest.mark.unit
+def test_v13_like_legacy_html_effective_date_mismatch_fails_before_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = _fresh_builtin_run(
+        tmp_path,
+        monkeypatch,
+        symbol="600895.SS",
+        reverse_input_order=False,
+        checkpoint_thread_id="1400000000000006",
+    )
+    cninfo = fresh.providers["cninfo"]
+    assert isinstance(cninfo, _CninfoProvider)
+    original_get_document = cninfo.get_document
+
+    def mismatched_document(*args: object, **kwargs: object) -> CninfoHttpResponse:
+        response = original_get_document(*args, **kwargs)
+        body = response.body.decode("gb2312").replace(
+            "1996年4月22日",
+            "1996年4月23日",
+        ).encode("gb2312")
+        return response.model_copy(update={"body": body})
+
+    monkeypatch.setattr(cninfo, "get_document", mismatched_document)
+    try:
+        result = fresh.invoke(
+            fresh.state(
+                tool_names=("get_balance_sheet",),
+                tool_call_prefix="v13-like-listing-effective-mismatch",
+            )
+        )
+
+        assert result["financial_dispatch_shadow_failure"] == (
+            _single_localized_shadow_failure(
+                {
+                    "stage": "context_result",
+                    "failure_kind": "typed_result",
+                    "typed_acquisition_reason": (
+                        "listing_publication_evidence_unavailable"
+                    ),
+                    "selection_kind": "statement",
+                    "context_constructed": False,
+                    "dispatcher_constructed": False,
+                }
+            )
+        )
+        acquisition = fresh.owner._acquisition_result
+        assert acquisition is not None
+        assert acquisition.context is None
+        assert acquisition.failure is not None
+        assert acquisition.failure.reason is (
+            FinancialEligibilityAcquisitionFailureReason.LISTING_PUBLICATION_EVIDENCE_UNAVAILABLE
+        )
+        assert acquisition.failure.listing_publication_failure_reason == (
+            "listing_effective_publication_conflict"
+        )
+        assert fresh.owner.context is None
+        assert fresh.runtime.financial_routing is None
+        assert [endpoint for endpoint, _ in cninfo.calls] == [
+            "post_form",
+            "post_form",
+            "get_document",
+        ]
+        fresh.deterministic_llm.invoke.assert_not_called()
     finally:
         fresh.close()
 
@@ -1419,11 +1595,11 @@ def test_fresh_builtin_rejects_mismatched_window_transaction_before_provider_wor
         )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
-        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v4"
         assert acquisition.context is None
         assert acquisition.failure is not None
         assert acquisition.failure.contract_version == (
-            "financial-eligibility-acquisition-result-v3"
+            "financial-eligibility-acquisition-result-v4"
         )
         assert acquisition.failure.reason is (
             FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
@@ -1494,7 +1670,7 @@ def test_fresh_builtin_rejects_proof_bound_to_another_active_transaction(
         )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
-        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v4"
         assert acquisition.context is None
         assert acquisition.failure is not None
         assert acquisition.failure.reason is (
@@ -1542,11 +1718,11 @@ def test_fresh_builtin_rejects_terminal_clock_regression_without_partial_context
         )
         acquisition = fresh.owner._acquisition_result
         assert acquisition is not None
-        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v3"
+        assert acquisition.contract_version == "financial-eligibility-acquisition-result-v4"
         assert acquisition.context is None
         assert acquisition.failure is not None
         assert acquisition.failure.contract_version == (
-            "financial-eligibility-acquisition-result-v3"
+            "financial-eligibility-acquisition-result-v4"
         )
         assert acquisition.failure.reason is (
             FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH
@@ -2181,7 +2357,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
 
         ledger = FinancialDispatchCheckpointLedger.model_validate(indicator_ledger)
-        assert fresh.plan.plan_version == "1.4"
+        assert fresh.plan.plan_version == "1.5"
         assert fresh.plan.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -2192,12 +2368,12 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert fresh.plan.indicator_selection_contract_version == (
             "financial-period-selection-v3"
         )
-        assert routing.contract_version == "financial-indicator-routing-result-v5"
+        assert routing.contract_version == "financial-indicator-routing-result-v3"
         assert indicator_result.contract_version == (
-            "financial-indicator-selection-dispatch-v4"
+            "financial-indicator-selection-dispatch-v5"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-v5"
+            manifest.contract_version == "financial-manifest-v3"
             for manifest in routing.family_manifests
         )
         assert all(
@@ -2210,9 +2386,9 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             for manifest in routing.family_manifests
             for selection in manifest.selections
         )
-        assert ledger.contract_version == "1.7"
-        assert ledger.financial_manifest_version == "financial-manifest-v5"
-        assert ledger.financial_indicator_manifest_version == "financial-manifest-v5"
+        assert ledger.contract_version == "1.8"
+        assert ledger.financial_manifest_version == "financial-manifest-v2"
+        assert ledger.financial_indicator_manifest_version == "financial-manifest-v3"
         assert ledger.indicator_field_semantics_version == (
             "financial-indicator-field-semantics-v1"
         )
@@ -2223,7 +2399,7 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert len(ledger.qualified_indicator_selections) == 1
         indicator_entry = ledger.qualified_indicator_selections[0]
         assert indicator_entry.contract_version == (
-            "financial-indicator-selection-checkpoint-v4"
+            "financial-indicator-selection-checkpoint-v5"
         )
         assert indicator_entry.terminal.routing_result == routing
         assessment_identities = {
@@ -2269,17 +2445,17 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
             run_scope_id=context.run_id,
         )
         assert audit is not None
-        assert audit.contract_version == "5.0"
+        assert audit.contract_version == "6.0"
         assert set(audit.metadata_assessment_identities) == assessment_identities
         indicator_audit_request = next(
             request
             for request in audit.manifest_requests
-            if request.contract_version == "financial-manifest-request-audit-v5"
+            if request.contract_version == "financial-manifest-request-audit-v3"
         )
         assert all(
-            manifest.contract_version == "financial-manifest-audit-v5"
+            manifest.contract_version == "financial-manifest-audit-v3"
             and manifest.aggregate_completeness.contract_version
-            == "financial-aggregate-completeness-v5"
+            == "financial-aggregate-completeness-v3"
             for manifest in indicator_audit_request.manifests
         )
         indicator_completeness_rows = tuple(
@@ -2289,15 +2465,15 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         )
         assert indicator_completeness_rows
         assert all(
-            row.contract_version == "financial-completeness-row-v6"
+            row.contract_version == "financial-completeness-row-v4"
             for row in indicator_completeness_rows
         )
         tool_envelope = indicator_result.to_tool_message().artifact
         assert tool_envelope["contract_version"] == (
-            "financial-tool-message-envelope-v5"
+            "financial-tool-message-envelope-v3"
         )
         assert all(
-            manifest["contract_version"] == "financial-tool-manifest-v5"
+            manifest["contract_version"] == "financial-tool-manifest-v3"
             for manifest in tool_envelope["manifests"]
         )
 
@@ -2340,10 +2516,18 @@ def test_qcf4_fresh_builtin_retains_incompatible_tushare_and_falls_back(
         assert len(calls_by_provider["yfinance"].physical_attempt_events) == 1
         assert len(routing.physical_attempt_events) == 51
         attempts = _attempt_events(indicator_ledger)
-        assert len(attempts) == 54
-        assert len({event["attempt_event_id"] for event in attempts}) == 54
+        expected_attempts = 57 if symbol == "600895.SS" else 56
+        assert len(attempts) == expected_attempts
+        assert len({event["attempt_event_id"] for event in attempts}) == (
+            expected_attempts
+        )
         assert all(event["attempt_index"] == 1 for event in attempts)
         assert all(event["final_physical_attempt_count"] == 1 for event in attempts)
+        assert [endpoint for endpoint, _ in fresh.providers["cninfo"].calls] == (
+            ["post_form", "post_form", "get_document"]
+            if symbol == "600895.SS"
+            else ["post_form", "post_form"]
+        )
         assert indicator_ledger["financial_eligibility_context"] == (
             context.safe_projection()
         )
@@ -3342,7 +3526,7 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
         assert clock_samples == 2
         assert calendar_lookups == 1
         assert len(temporal_transactions) == 1
-        assert temporal_transactions[0].evaluation_count == 2
+        assert temporal_transactions[0].evaluation_count == 1
         context = fresh.owner.context
         assert context is not None
         temporal = context.temporal_eligibility_binding
@@ -3819,9 +4003,58 @@ def test_qcf12_fresh_create_checkpoint_restores_with_zero_io(
     ][0] = "financial-period-candidate:v1:" + "f" * 64
     invalid_states["mismatched"] = mismatched_state
 
+    missing_cninfo_state = copy.deepcopy(checkpoint_state)
+    cache_entries = missing_cninfo_state["financial_dispatch_shadow_ledger"][
+        "provider_subrequest_cache"
+    ]["entries"]
+    cache_entries.remove(
+        next(
+            entry
+            for entry in cache_entries
+            if entry["key"]["provider_id"] == "cninfo"
+        )
+    )
+    invalid_states["missing_cninfo_entry"] = missing_cninfo_state
+
+    wrong_document_operation_state = copy.deepcopy(checkpoint_state)
+    document_entry = next(
+        entry
+        for entry in wrong_document_operation_state[
+            "financial_dispatch_shadow_ledger"
+        ]["provider_subrequest_cache"]["entries"]
+        if entry["key"]["provider_id"] == "cninfo"
+        and entry["key"]["capacity_scope"] == "cninfo.documents"
+    )
+    document_key = document_entry["key"]
+    document_key["requested_fields"] = sorted(
+        "cninfo_listing_announcement_query"
+        if field == "cninfo_listing_document_fetch"
+        else field
+        for field in document_key["requested_fields"]
+    )
+    key_material = {
+        key: value
+        for key, value in document_key.items()
+        if key != "subrequest_key"
+    }
+    document_key["subrequest_key"] = (
+        "provider-subrequest:v1:"
+        + sha256(
+            json.dumps(
+                key_material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+    )
+    document_entry["attempt_events"] = []
+    invalid_states["wrong_document_operation"] = wrong_document_operation_state
+
     accepted_failure_reasons = {
         FinancialDispatchCheckpointFailureReason.MALFORMED,
         FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH,
+        FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID,
         FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH,
     }
     resources_after_valid_restore = tuple(closed_resources)

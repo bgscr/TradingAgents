@@ -50,6 +50,7 @@ from tradingagents.capability_routing import (
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
+from tradingagents.dataflows.cninfo_listing_publication import CninfoListingBoard
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.financial_capability_routing import (
@@ -765,6 +766,7 @@ class TradingAgentsGraph:
         checkpoint_thread_id: str | None = None,
         checkpoint_state: Mapping[str, Any] | None = None,
         analysis_as_of_date: date | str | None = None,
+        authoritative_listing_board: CninfoListingBoard | None = None,
     ) -> ProductionQualifiedRoutingRuntime | None:
         """Bind and install the one managed run after checkpoint compatibility."""
 
@@ -848,6 +850,7 @@ class TradingAgentsGraph:
                 checkpoint_thread_id=checkpoint_thread_id,
                 eligibility_clock=inputs.eligibility_clock,
                 calendar_provider=inputs.eligibility_calendar_provider,
+                authoritative_listing_board=authoritative_listing_board,
                 interrupt_runtime=composition.interrupt,
                 close_runtime=composition.close,
             )

@@ -17,6 +17,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityRequestBinding,
     assert_safe_financial_eligibility_projection,
@@ -104,6 +105,7 @@ def _validate_context_binding(
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
         }
         or binding.context_contract_version != context.contract_version
     ):
@@ -130,6 +132,7 @@ def _validate_context_binding(
     temporal = context.contract_version in {
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     }
     expected_session = context.requested_session if temporal else context.as_of_date
     if (
@@ -194,6 +197,9 @@ def _statement_identity(payload: dict[str, object]) -> str:
         "financial-statement-routing-request-v5": (
             "financial-statement-routing-request:v5:"
         ),
+        "financial-statement-routing-request-v6": (
+            "financial-statement-routing-request:v6:"
+        ),
     }[str(payload.get("contract_version"))]
     return prefix + sha256(encoded).hexdigest()
 
@@ -215,6 +221,9 @@ def _indicator_identity(payload: dict[str, object]) -> str:
         ),
         "financial-indicator-routing-request-v8": (
             "financial-indicator-routing-request:v8:"
+        ),
+        "financial-indicator-routing-request-v9": (
+            "financial-indicator-routing-request:v9:"
         ),
     }[str(payload.get("contract_version"))]
     return prefix + sha256(encoded).hexdigest()
@@ -248,14 +257,21 @@ def build_financial_statement_routing_request(
     temporal = context.contract_version in {
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     }
-    windowed = (
+    windowed = context.contract_version in {
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+    }
+    composite = (
         context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
     )
     payload: dict[str, object] = {
         "contract_version": (
-            "financial-statement-routing-request-v5"
+            "financial-statement-routing-request-v6"
+            if composite
+            else "financial-statement-routing-request-v5"
             if windowed
             else "financial-statement-routing-request-v4"
             if temporal
@@ -328,14 +344,21 @@ def build_financial_indicator_routing_request(
     temporal = context.contract_version in {
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     }
-    windowed = (
+    windowed = context.contract_version in {
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+    }
+    composite = (
         context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
     )
     payload: dict[str, object] = {
         "contract_version": (
-            "financial-indicator-routing-request-v8"
+            "financial-indicator-routing-request-v9"
+            if composite
+            else "financial-indicator-routing-request-v8"
             if windowed
             else "financial-indicator-routing-request-v7"
             if temporal

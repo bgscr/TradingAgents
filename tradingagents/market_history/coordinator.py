@@ -20,6 +20,7 @@ from tradingagents.market_history.result_codec import (
 )
 
 if TYPE_CHECKING:
+    from tradingagents.market_history.config import DataUsageMode
     from tradingagents.market_history.store import MarketHistoryStore
 
 
@@ -56,6 +57,8 @@ _UPSTREAM_SERVICES = {
     "akshare": ("eastmoney-push2his", "Eastmoney push2his"),
     "akshare_sina": ("sina-company-finance", "Sina Company Finance"),
     "baostock": ("baostock-tcp", "BaoStock TCP service"),
+    "cninfo_documents": ("cninfo-static-documents", "CNINFO static documents"),
+    "cninfo_metadata": ("cninfo-public-metadata", "CNINFO public metadata"),
     "tushare": ("tushare-pro", "Tushare Pro account"),
     "yfinance": ("yahoo-finance", "Yahoo Finance"),
 }
@@ -353,6 +356,12 @@ class ProviderRequestCoordinator:
         with self._lifecycle_lock:
             return len(self._peer_connections)
 
+    @property
+    def data_usage_mode(self) -> DataUsageMode:
+        """Return the persisted run license boundary without mutating state."""
+
+        return self._store.config.data_usage_mode
+
     def _abandoned_failure(self) -> PhysicalAttemptFailure:
         return PhysicalAttemptFailure(
             outcome=PhysicalAttemptOutcome.ABANDONED,
@@ -567,6 +576,21 @@ class ProviderRequestCoordinator:
         if cursor.rowcount != 1:
             raise ValueError("upstream service must be registered before configuration")
         return ceiling
+
+    def configured_operator_ceiling(
+        self,
+        upstream_service_id: str,
+    ) -> OperatorSafetyCeiling | None:
+        """Read one configured local safety ceiling without changing scheduler state."""
+
+        row = self._database_connection().execute(
+            "SELECT operator_ceiling_json FROM upstream_services "
+            "WHERE upstream_service_id = ?",
+            (upstream_service_id,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return self._parse_operator_ceiling(upstream_service_id, row[0])
 
     @staticmethod
     def _parse_operator_ceiling(

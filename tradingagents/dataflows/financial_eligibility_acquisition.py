@@ -26,6 +26,7 @@ from tradingagents.capability_routing import (
     CAPABILITY_ROUTING_PLAN_VERSION,
     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
     CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
     MainlandCapability,
     MainlandCapabilityRoutingMode,
     MainlandCapabilityRoutingPlan,
@@ -61,6 +62,11 @@ from tradingagents.dataflows.financial_temporal_eligibility import (
     TemporalEvidenceArtifactBinding,
     TemporalEvidenceClass,
 )
+from tradingagents.dataflows.listing_publication_evidence import (
+    CompositeListingTemporalEligibilityDecision,
+    CompositeListingTemporalProof,
+    ListingEffectiveEvidence,
+)
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
 
 FINANCIAL_COMPANY_TYPE_EVIDENCE_BINDING_VERSION = (
@@ -84,6 +90,9 @@ FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2 = (
 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3 = (
     "financial-eligibility-acquisition-context-v3"
 )
+FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4 = (
+    "financial-eligibility-acquisition-context-v4"
+)
 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION = (
     "financial-eligibility-acquisition-result-v1"
 )
@@ -93,6 +102,9 @@ FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V2 = (
 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3 = (
     "financial-eligibility-acquisition-result-v3"
 )
+FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4 = (
+    "financial-eligibility-acquisition-result-v4"
+)
 FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION = (
     "financial-eligibility-request-binding-v1"
 )
@@ -101,6 +113,9 @@ FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2 = (
 )
 FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3 = (
     "financial-eligibility-request-binding-v3"
+)
+FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4 = (
+    "financial-eligibility-request-binding-v4"
 )
 
 _CLOSED_MODEL_CONFIG = ConfigDict(
@@ -119,6 +134,7 @@ _PLAN_SIGNATURE_PATTERN = r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
 _CONTEXT_IDENTITY_PREFIX = "financial-eligibility-acquisition-context:v1:"
 _CONTEXT_IDENTITY_PREFIX_V2 = "financial-eligibility-acquisition-context:v2:"
 _CONTEXT_IDENTITY_PREFIX_V3 = "financial-eligibility-acquisition-context:v3:"
+_CONTEXT_IDENTITY_PREFIX_V4 = "financial-eligibility-acquisition-context:v4:"
 _EVIDENCE_IDENTITY_PREFIX = "financial-company-type-evidence:v1:"
 _URL_QUERY = re.compile(r"https?://\S*\?", re.IGNORECASE)
 
@@ -207,6 +223,9 @@ def financial_eligibility_acquisition_context_identity(
         ),
         FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3: (
             _CONTEXT_IDENTITY_PREFIX_V3
+        ),
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4: (
+            _CONTEXT_IDENTITY_PREFIX_V4
         ),
     }.get(material.get("contract_version"), _CONTEXT_IDENTITY_PREFIX)
     return f"{prefix}{_canonical_digest(material)}"
@@ -609,6 +628,7 @@ class FinancialEligibilityMetadataBinding(BaseModel):
         "financial-eligibility-metadata-binding-v1",
         "financial-eligibility-metadata-binding-v2",
         "financial-eligibility-metadata-binding-v3",
+        "financial-eligibility-metadata-binding-v4",
     ] = "financial-eligibility-metadata-binding-v1"
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date | None = Field(
@@ -645,6 +665,11 @@ class FinancialEligibilityMetadataBinding(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    authoritative_listing_board: Literal[
+        "xshg_main",
+        "xshe_chinext",
+        "xshg_star",
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator(
         "eligibility_evaluated_at",
@@ -663,8 +688,13 @@ class FinancialEligibilityMetadataBinding(BaseModel):
         temporal = self.contract_version in {
             "financial-eligibility-metadata-binding-v2",
             "financial-eligibility-metadata-binding-v3",
+            "financial-eligibility-metadata-binding-v4",
         }
-        windowed = self.contract_version == "financial-eligibility-metadata-binding-v3"
+        windowed = self.contract_version in {
+            "financial-eligibility-metadata-binding-v3",
+            "financial-eligibility-metadata-binding-v4",
+        }
+        composite = self.contract_version == "financial-eligibility-metadata-binding-v4"
         historical_shape = self.as_of_date is not None and self.requested_session is None
         temporal_shape = self.as_of_date is None and self.requested_session is not None
         temporal_fields = (
@@ -695,6 +725,7 @@ class FinancialEligibilityMetadataBinding(BaseModel):
                     )
                 )
             )
+            or composite != (self.authoritative_listing_board is not None)
         ):
             raise ValueError("eligibility metadata requires a CNY XSHG/XSHE Equity")
         if temporal:
@@ -736,6 +767,7 @@ class FinancialCompanyTypeEvidenceProjection(BaseModel):
         "financial-company-type-evidence-projection-v1",
         "financial-company-type-evidence-projection-v2",
         "financial-company-type-evidence-projection-v3",
+        "financial-company-type-evidence-projection-v4",
     ] = "financial-company-type-evidence-projection-v1"
     metadata_binding: FinancialEligibilityMetadataBinding
     evidence: FinancialCompanyTypeAcquisitionEvidenceBinding
@@ -749,8 +781,12 @@ class FinancialCompanyTypeEvidenceProjection(BaseModel):
         temporal = self.contract_version in {
             "financial-company-type-evidence-projection-v2",
             "financial-company-type-evidence-projection-v3",
+            "financial-company-type-evidence-projection-v4",
         }
-        windowed = self.contract_version == "financial-company-type-evidence-projection-v3"
+        windowed = self.contract_version in {
+            "financial-company-type-evidence-projection-v3",
+            "financial-company-type-evidence-projection-v4",
+        }
         expected_versions = {
             "financial-company-type-evidence-projection-v1": (
                 FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION_V2,
@@ -765,6 +801,11 @@ class FinancialCompanyTypeEvidenceProjection(BaseModel):
             "financial-company-type-evidence-projection-v3": (
                 FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION_V4,
                 "financial-eligibility-metadata-binding-v3",
+                "financial-metadata-temporal-eligibility-decision-v2",
+            ),
+            "financial-company-type-evidence-projection-v4": (
+                FINANCIAL_COMPANY_TYPE_ACQUISITION_EVIDENCE_BINDING_VERSION_V4,
+                "financial-eligibility-metadata-binding-v4",
                 "financial-metadata-temporal-eligibility-decision-v2",
             ),
         }[self.contract_version]
@@ -832,6 +873,7 @@ class FinancialListingMetadata(BaseModel):
         "financial-listing-metadata-v1",
         "financial-listing-metadata-v2",
         "financial-listing-metadata-v3",
+        "financial-listing-metadata-v4",
     ] = "financial-listing-metadata-v1"
     instrument_identity: InstrumentIdentityEvidence
     as_of_date: date | None = Field(
@@ -848,6 +890,10 @@ class FinancialListingMetadata(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    listing_effective_evidence: ListingEffectiveEvidence | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_listing_metadata(self) -> Self:
@@ -861,7 +907,10 @@ class FinancialListingMetadata(BaseModel):
             "financial-listing-metadata-v2",
             "financial-listing-metadata-v3",
         }
-        analysis_session = self.requested_session if temporal else self.as_of_date
+        composite = self.contract_version == "financial-listing-metadata-v4"
+        analysis_session = (
+            self.requested_session if temporal or composite else self.as_of_date
+        )
         if (
             not identity.is_authoritative
             or identity.instrument_kind is not InstrumentKind.EQUITY
@@ -873,8 +922,10 @@ class FinancialListingMetadata(BaseModel):
             or provenance.provider_id != "baostock"
             or re.fullmatch(_LISTING_ARTIFACT_ID_PATTERN, provenance.source_ref) is None
             or temporal != (self.temporal_evidence is not None)
-            or temporal != (self.as_of_date is None and self.requested_session is not None)
-            or (not temporal and self.requested_session is not None)
+            or composite != (self.listing_effective_evidence is not None)
+            or (temporal or composite)
+            != (self.as_of_date is None and self.requested_session is not None)
+            or (not temporal and not composite and self.requested_session is not None)
         ):
             raise ValueError("listing metadata is not BaoStock authoritative")
         if temporal:
@@ -888,6 +939,17 @@ class FinancialListingMetadata(BaseModel):
                 or proof.observed_at != provenance.observed_at
             ):
                 raise ValueError("listing temporal proof binding is invalid")
+        if composite:
+            effective = self.listing_effective_evidence
+            assert effective is not None
+            if (
+                effective.instrument_identity != identity
+                or effective.provider_id != provenance.provider_id
+                or effective.artifact.artifact_identity != provenance.source_ref
+                or effective.listing_effective_date != self.listing_date
+                or effective.observed_at != provenance.observed_at
+            ):
+                raise ValueError("listing effective evidence binding is invalid")
         _assert_safe_projection(self.model_dump(mode="json"))
         return self
 
@@ -901,6 +963,7 @@ class FinancialListingMetadataProjection(BaseModel):
         "financial-listing-metadata-projection-v1",
         "financial-listing-metadata-projection-v2",
         "financial-listing-metadata-projection-v3",
+        "financial-listing-metadata-projection-v4",
     ] = "financial-listing-metadata-projection-v1"
     metadata_binding: FinancialEligibilityMetadataBinding
     metadata: FinancialListingMetadata
@@ -908,6 +971,13 @@ class FinancialListingMetadataProjection(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    composite_temporal_proof: CompositeListingTemporalProof | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    composite_temporal_decision: (
+        CompositeListingTemporalEligibilityDecision | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _validate_projection(self) -> Self:
@@ -915,6 +985,7 @@ class FinancialListingMetadataProjection(BaseModel):
             "financial-listing-metadata-projection-v2",
             "financial-listing-metadata-projection-v3",
         }
+        composite = self.contract_version == "financial-listing-metadata-projection-v4"
         expected_versions = {
             "financial-listing-metadata-projection-v1": (
                 "financial-listing-metadata-v1",
@@ -928,6 +999,10 @@ class FinancialListingMetadataProjection(BaseModel):
                 "financial-listing-metadata-v3",
                 "financial-eligibility-metadata-binding-v3",
             ),
+            "financial-listing-metadata-projection-v4": (
+                "financial-listing-metadata-v4",
+                "financial-eligibility-metadata-binding-v4",
+            ),
         }[self.contract_version]
         if (
             self.metadata.instrument_identity
@@ -935,7 +1010,7 @@ class FinancialListingMetadataProjection(BaseModel):
             or (
                 self.metadata.requested_session
                 != self.metadata_binding.requested_session
-                if temporal
+                if temporal or composite
                 else self.metadata.as_of_date != self.metadata_binding.as_of_date
             )
             or (
@@ -944,6 +1019,8 @@ class FinancialListingMetadataProjection(BaseModel):
             )
             != expected_versions
             or temporal != (self.temporal_decision is not None)
+            or composite != (self.composite_temporal_proof is not None)
+            or composite != (self.composite_temporal_decision is not None)
         ):
             raise ValueError("listing metadata acquisition binding mismatch")
         if temporal:
@@ -961,6 +1038,19 @@ class FinancialListingMetadataProjection(BaseModel):
                 or decision.strict_cutoff != self.metadata_binding.strict_cutoff
             ):
                 raise ValueError("listing temporal decision binding mismatch")
+        if composite:
+            proof = self.composite_temporal_proof
+            decision = self.composite_temporal_decision
+            effective = self.metadata.listing_effective_evidence
+            assert proof is not None and decision is not None and effective is not None
+            if (
+                proof.effective_evidence != effective
+                or proof.instrument_identity != self.metadata.instrument_identity
+                or proof.requested_session != self.metadata.requested_session
+                or decision.proof_identity != proof.proof_identity
+                or decision.result != "accepted"
+            ):
+                raise ValueError("composite listing temporal decision binding mismatch")
         _assert_safe_projection(self.model_dump(mode="json"))
         return self
 
@@ -973,8 +1063,9 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
     contract_version: Literal[
         "financial-eligibility-temporal-binding-v1",
         "financial-eligibility-temporal-binding-v2",
+        "financial-eligibility-temporal-binding-v3",
     ] = "financial-eligibility-temporal-binding-v1"
-    capability_routing_plan_version: Literal["1.3", "1.4"] = "1.3"
+    capability_routing_plan_version: Literal["1.3", "1.4", "1.5"] = "1.3"
     temporal_policy_version: Literal[
         "provider-neutral-temporal-eligibility-v1",
         "provider-neutral-temporal-eligibility-v2",
@@ -993,7 +1084,17 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
     calendar_binding: MarketSessionEligibilityBinding
     latest_completed_session: date | None = None
     company_type_temporal_decision: FinancialMetadataTemporalEligibilityDecision
-    listing_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    listing_temporal_decision: (
+        FinancialMetadataTemporalEligibilityDecision
+        | CompositeListingTemporalEligibilityDecision
+    )
+    listing_temporal_decision_version: Literal[
+        "composite-listing-temporal-eligibility-decision-v1"
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    composite_listing_temporal_proof: CompositeListingTemporalProof | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     acquisition_window: FinancialEligibilityAcquisitionWindow | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1010,10 +1111,14 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
 
     @model_validator(mode="after")
     def _validate_temporal_binding(self) -> Self:
-        windowed = self.contract_version == "financial-eligibility-temporal-binding-v2"
+        windowed = self.contract_version in {
+            "financial-eligibility-temporal-binding-v2",
+            "financial-eligibility-temporal-binding-v3",
+        }
+        composite = self.contract_version == "financial-eligibility-temporal-binding-v3"
         expected_versions = (
             (
-                "1.4",
+                "1.5" if composite else "1.4",
                 "provider-neutral-temporal-eligibility-v2",
                 "market-session-eligibility-binding-v2",
                 "financial-metadata-temporal-eligibility-decision-v2",
@@ -1025,10 +1130,6 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
                 "market-session-eligibility-binding-v1",
                 "financial-metadata-temporal-eligibility-decision-v1",
             )
-        )
-        decisions = (
-            self.company_type_temporal_decision,
-            self.listing_temporal_decision,
         )
         if (
             (
@@ -1045,25 +1146,51 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
             != self.calendar_binding.eligibility_evaluated_at
             or self.latest_completed_session
             != self.calendar_binding.latest_completed_session
-            or any(
+            or self.company_type_temporal_decision.result != "accepted"
+            or self.company_type_temporal_decision.mode != self.temporal_mode.value
+            or self.company_type_temporal_decision.calendar_binding
+            != self.calendar_binding
+            or self.company_type_temporal_decision.eligible_session
+            != self.requested_session
+            or composite
+            != isinstance(
+                self.listing_temporal_decision,
+                CompositeListingTemporalEligibilityDecision,
+            )
+            or composite != (self.composite_listing_temporal_proof is not None)
+            or composite != (self.listing_temporal_decision_version is not None)
+        ):
+            raise ValueError("financial eligibility temporal binding is inconsistent")
+        if self.company_type_temporal_decision.evidence_class not in {
+            TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+            TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
+        }:
+            raise ValueError("financial eligibility temporal evidence roles mismatch")
+        if composite:
+            proof = self.composite_listing_temporal_proof
+            decision = self.listing_temporal_decision
+            assert proof is not None
+            assert isinstance(decision, CompositeListingTemporalEligibilityDecision)
+            if (
                 decision.result != "accepted"
+                or decision.proof_identity != proof.proof_identity
+                or decision.requested_session != self.requested_session
+                or decision.acquisition_window != self.acquisition_window
+                or self.listing_temporal_decision_version != decision.contract_version
+            ):
+                raise ValueError("composite listing temporal decision is inconsistent")
+        else:
+            decision = self.listing_temporal_decision
+            if (
+                not isinstance(decision, FinancialMetadataTemporalEligibilityDecision)
+                or decision.result != "accepted"
                 or decision.mode != self.temporal_mode.value
                 or decision.calendar_binding != self.calendar_binding
                 or decision.eligible_session != self.requested_session
-                for decision in decisions
-            )
-        ):
-            raise ValueError("financial eligibility temporal binding is inconsistent")
-        if (
-            self.company_type_temporal_decision.evidence_class
-            not in {
-                TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
-                TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
-            }
-            or self.listing_temporal_decision.evidence_class
-            is not TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING
-        ):
-            raise ValueError("financial eligibility temporal evidence roles mismatch")
+                or decision.evidence_class
+                is not TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING
+            ):
+                raise ValueError("financial eligibility temporal evidence roles mismatch")
         if self.acquisition_window is not None and (
             self.calendar_binding
             != self.acquisition_window.calendar_binding.evaluated
@@ -1071,15 +1198,27 @@ class FinancialEligibilityTemporalContextBinding(BaseModel):
             != self.acquisition_window.eligibility_evaluated_at
             or self.latest_completed_session
             != self.acquisition_window.evaluated_latest_completed_session
-            or any(
-                decision.acquisition_window != self.acquisition_window
-                for decision in decisions
+            or self.company_type_temporal_decision.acquisition_window
+            != self.acquisition_window
+            or (
+                isinstance(
+                    self.listing_temporal_decision,
+                    FinancialMetadataTemporalEligibilityDecision,
+                )
+                and self.listing_temporal_decision.acquisition_window
+                != self.acquisition_window
             )
         ):
             raise ValueError("financial eligibility acquisition window is inconsistent")
         strict = self.temporal_mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
-        if strict != (self.strict_cutoff is not None) or any(
-            decision.strict_cutoff != self.strict_cutoff for decision in decisions
+        if strict != (self.strict_cutoff is not None) or (
+            self.company_type_temporal_decision.strict_cutoff != self.strict_cutoff
+        ) or (
+            isinstance(
+                self.listing_temporal_decision,
+                FinancialMetadataTemporalEligibilityDecision,
+            )
+            and self.listing_temporal_decision.strict_cutoff != self.strict_cutoff
         ):
             raise ValueError("financial eligibility strict cutoff binding is inconsistent")
         _assert_safe_projection(self.model_dump(mode="json"))
@@ -1127,9 +1266,10 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         "financial-eligibility-acquisition-context-v1",
         "financial-eligibility-acquisition-context-v2",
         "financial-eligibility-acquisition-context-v3",
+        "financial-eligibility-acquisition-context-v4",
     ] = FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
     context_identity: str = Field(
-        pattern=r"^financial-eligibility-acquisition-context:v[123]:[0-9a-f]{64}$"
+        pattern=r"^financial-eligibility-acquisition-context:v[1234]:[0-9a-f]{64}$"
     )
     run_id: str = Field(pattern=_RUN_ID_PATTERN)
     asset_configuration_signature: str = Field(pattern=_ASSET_SIGNATURE_PATTERN)
@@ -1163,6 +1303,10 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    listing_composite_temporal_proof: CompositeListingTemporalProof | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator(
         "acquisition_annual_period_ends",
@@ -1188,10 +1332,15 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
         temporal_bound = self.contract_version in {
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
         }
-        windowed = (
+        windowed = self.contract_version in {
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+        }
+        composite = (
             self.contract_version
-            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+            == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
         )
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
@@ -1205,8 +1354,11 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             raise ValueError(
                 "financial eligibility context requested-session shape mismatch"
             )
-        if temporal_bound != (self.temporal_eligibility_binding is not None) or (
-            temporal_bound != (self.listing_temporal_evidence is not None)
+        if (
+            temporal_bound != (self.temporal_eligibility_binding is not None)
+            or (temporal_bound and not composite)
+            != (self.listing_temporal_evidence is not None)
+            or composite != (self.listing_composite_temporal_proof is not None)
         ):
             raise ValueError("financial eligibility context temporal version mismatch")
         if temporal_bound and (
@@ -1214,7 +1366,15 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             or windowed
             != (
                 self.temporal_eligibility_binding.contract_version
-                == "financial-eligibility-temporal-binding-v2"
+                in {
+                    "financial-eligibility-temporal-binding-v2",
+                    "financial-eligibility-temporal-binding-v3",
+                }
+            )
+            or composite
+            != (
+                self.temporal_eligibility_binding.contract_version
+                == "financial-eligibility-temporal-binding-v3"
             )
         ):
             raise ValueError("financial eligibility context temporal binding version mismatch")
@@ -1226,7 +1386,11 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
             temporal = self.temporal_eligibility_binding
             listing_proof = self.listing_temporal_evidence
             assert temporal is not None
-            assert listing_proof is not None
+            composite_proof = self.listing_composite_temporal_proof
+            if composite:
+                assert composite_proof is not None
+            else:
+                assert listing_proof is not None
             expected_scope = (
                 FinancialAvailabilityScope.CURRENT_ONLY
                 if temporal.temporal_mode
@@ -1261,14 +1425,38 @@ class FinancialEligibilityAcquisitionContext(BaseModel):
                     temporal.company_type_temporal_decision,
                     self.company_type_evidence.temporal_evidence,
                 )
-                or not _decision_matches_temporal_evidence(
-                    temporal.listing_temporal_decision,
-                    listing_proof,
+                or (
+                    not composite
+                    and (
+                        not isinstance(
+                            temporal.listing_temporal_decision,
+                            FinancialMetadataTemporalEligibilityDecision,
+                        )
+                        or listing_proof is None
+                        or not _decision_matches_temporal_evidence(
+                            temporal.listing_temporal_decision,
+                            listing_proof,
+                        )
+                        or listing_proof.artifact.artifact_identity
+                        != self.listing_provenance.source_ref
+                        or listing_proof.evidence_effective_as_of != self.listing_date
+                        or listing_proof.observed_at
+                        != self.listing_provenance.observed_at
+                    )
                 )
-                or listing_proof.artifact.artifact_identity
-                != self.listing_provenance.source_ref
-                or listing_proof.evidence_effective_as_of != self.listing_date
-                or listing_proof.observed_at != self.listing_provenance.observed_at
+                or (
+                    composite
+                    and (
+                        composite_proof is None
+                        or composite_proof.effective_artifact_identity
+                        != self.listing_provenance.source_ref
+                        or composite_proof.listing_effective_date != self.listing_date
+                        or composite_proof.instrument_identity
+                        != self.instrument_identity
+                        or temporal.composite_listing_temporal_proof
+                        != composite_proof
+                    )
+                )
             ):
                 raise ValueError("financial eligibility context temporal binding mismatch")
         identity = InstrumentIdentityEvidence.model_validate(
@@ -1390,6 +1578,7 @@ def validate_financial_eligibility_acquisition_context_binding(
                 in {
                     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                 }
                 else context.as_of_date
             )
@@ -1421,14 +1610,16 @@ class FinancialEligibilityRequestBinding(BaseModel):
         "financial-eligibility-request-binding-v1",
         "financial-eligibility-request-binding-v2",
         "financial-eligibility-request-binding-v3",
+        "financial-eligibility-request-binding-v4",
     ] = FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION
     context_contract_version: Literal[
         "financial-eligibility-acquisition-context-v1",
         "financial-eligibility-acquisition-context-v2",
         "financial-eligibility-acquisition-context-v3",
+        "financial-eligibility-acquisition-context-v4",
     ]
     context_identity: str = Field(
-        pattern=r"^financial-eligibility-acquisition-context:v[123]:[0-9a-f]{64}$"
+        pattern=r"^financial-eligibility-acquisition-context:v[1234]:[0-9a-f]{64}$"
     )
     canonical_run_id: str = Field(pattern=_RUN_ID_PATTERN)
     asset_configuration_signature: str = Field(pattern=_ASSET_SIGNATURE_PATTERN)
@@ -1463,8 +1654,13 @@ class FinancialEligibilityRequestBinding(BaseModel):
         temporal_bound = self.contract_version in {
             FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2,
             FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4,
         }
-        windowed = self.contract_version == FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3
+        windowed = self.contract_version in {
+            FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4,
+        }
+        composite = self.contract_version == FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4
         historical_shape = (
             self.as_of_date is not None and self.requested_session is None
         )
@@ -1478,12 +1674,21 @@ class FinancialEligibilityRequestBinding(BaseModel):
                 in {
                     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                 }
             )
             or windowed
             != (
                 self.context_contract_version
-                == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+                in {
+                    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+                }
+            )
+            or composite
+            != (
+                self.context_contract_version
+                == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
             )
             or temporal_bound != (self.temporal_eligibility_binding is not None)
             or (temporal_bound and not temporal_shape)
@@ -1538,6 +1743,9 @@ class FinancialEligibilityRequestBinding(BaseModel):
                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3: (
                     FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3
                 ),
+                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4: (
+                    FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4
+                ),
             }[context.contract_version],
             context_contract_version=context.contract_version,
             context_identity=context.context_identity,
@@ -1571,6 +1779,9 @@ class FinancialEligibilityAcquisitionFailureReason(str, Enum):
     COMPANY_TYPE_AMBIGUOUS = "company_type_ambiguous"
     COMPANY_TYPE_CONTRADICTORY = "company_type_contradictory"
     LISTING_PROVENANCE_UNAVAILABLE = "listing_provenance_unavailable"
+    LISTING_PUBLICATION_EVIDENCE_UNAVAILABLE = (
+        "listing_publication_evidence_unavailable"
+    )
     TEMPORAL_PROOF_UNAVAILABLE = "temporal_proof_unavailable"
     TEMPORAL_ELIGIBILITY_REJECTED = "temporal_eligibility_rejected"
     CONTEXT_BINDING_MISMATCH = "context_binding_mismatch"
@@ -1586,6 +1797,7 @@ class FinancialEligibilityAcquisitionFailure(BaseModel):
         "financial-eligibility-acquisition-result-v1",
         "financial-eligibility-acquisition-result-v2",
         "financial-eligibility-acquisition-result-v3",
+        "financial-eligibility-acquisition-result-v4",
     ] = FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION
     reason: FinancialEligibilityAcquisitionFailureReason
     diagnostic_code: FinancialEligibilityAcquisitionFailureReason
@@ -1602,6 +1814,11 @@ class FinancialEligibilityAcquisitionFailure(BaseModel):
     ] = Field(
         default=(),
         exclude_if=lambda value: not value,
+    )
+    listing_publication_failure_reason: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,127}$",
+        exclude_if=lambda value: value is None,
     )
 
     @model_validator(mode="after")
@@ -1644,6 +1861,7 @@ class FinancialEligibilityAcquisitionFailure(BaseModel):
             not in {
                 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V2,
                 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3,
+                FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4,
             }
         ):
             raise ValueError("temporal acquisition failure version is inconsistent")
@@ -1658,16 +1876,35 @@ class FinancialEligibilityAcquisitionFailure(BaseModel):
                 or not decision.reasons
                 or self.temporal_rejection_reasons != decision.reasons
                 or self.contract_version
-                != (
-                    FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3
+                not in (
+                    {
+                        FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3,
+                        FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4,
+                    }
                     if decision.contract_version
                     == "financial-metadata-temporal-eligibility-decision-v2"
-                    else FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V2
+                    else {FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V2}
                 )
             ):
                 raise ValueError("temporal rejection failure is inconsistent")
         elif self.rejected_temporal_decision is not None or self.temporal_rejection_reasons:
             raise ValueError("non-temporal acquisition failure carries temporal material")
+        listing_publication_failure = (
+            self.reason
+            is FinancialEligibilityAcquisitionFailureReason.LISTING_PUBLICATION_EVIDENCE_UNAVAILABLE
+        )
+        if (
+            listing_publication_failure
+            and (
+                self.listing_publication_failure_reason is None
+                or self.contract_version
+                != FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4
+            )
+        ) or (
+            not listing_publication_failure
+            and self.listing_publication_failure_reason is not None
+        ):
+            raise ValueError("listing-publication acquisition failure is inconsistent")
         _assert_safe_projection(self.model_dump(mode="json"))
         return self
 
@@ -1681,6 +1918,7 @@ class FinancialEligibilityAcquisitionResult(BaseModel):
         "financial-eligibility-acquisition-result-v1",
         "financial-eligibility-acquisition-result-v2",
         "financial-eligibility-acquisition-result-v3",
+        "financial-eligibility-acquisition-result-v4",
     ] = FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION
     outcome: Literal["success", "failure"]
     context: FinancialEligibilityAcquisitionContext | None = Field(
@@ -1725,6 +1963,9 @@ class FinancialEligibilityAcquisitionResult(BaseModel):
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3: (
                 FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3
             ),
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4: (
+                FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4
+            ),
         }[context.contract_version]
         return cls(contract_version=version, outcome="success", context=context)
 
@@ -1738,6 +1979,8 @@ class FinancialEligibilityAcquisitionResult(BaseModel):
         temporal_proof_unavailable: bool = False,
         temporal_context: bool = False,
         windowed_context: bool = False,
+        composite_context: bool = False,
+        listing_publication_failure_reason: str | None = None,
     ) -> Self:
         windowed = windowed_context or (
             rejected_temporal_decision is not None
@@ -1756,7 +1999,9 @@ class FinancialEligibilityAcquisitionResult(BaseModel):
             }
         )
         version = (
-            FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3
+            FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4
+            if composite_context
+            else FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3
             if windowed
             else FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V2
             if temporal
@@ -1776,6 +2021,9 @@ class FinancialEligibilityAcquisitionResult(BaseModel):
                     if rejected_temporal_decision is not None
                     else ()
                 ),
+                listing_publication_failure_reason=(
+                    listing_publication_failure_reason
+                ),
             ),
         )
 
@@ -1786,12 +2034,14 @@ def _failure(
     company_type_resolution: FinancialCompanyTypeResolution | None = None,
     temporal_context: bool = False,
     windowed_context: bool = False,
+    composite_context: bool = False,
 ) -> FinancialEligibilityAcquisitionResult:
     return FinancialEligibilityAcquisitionResult.failed(
         reason,
         company_type_resolution=company_type_resolution,
         temporal_context=temporal_context,
         windowed_context=windowed_context,
+        composite_context=composite_context,
     )
 
 
@@ -1827,8 +2077,13 @@ def build_financial_eligibility_acquisition_context(
     eligibility_evaluated_at: datetime | None = None,
     calendar_binding: MarketSessionEligibilityBinding | None = None,
     company_type_temporal_decision: FinancialMetadataTemporalEligibilityDecision | None = None,
-    listing_temporal_decision: FinancialMetadataTemporalEligibilityDecision | None = None,
+    listing_temporal_decision: (
+        FinancialMetadataTemporalEligibilityDecision
+        | CompositeListingTemporalEligibilityDecision
+        | None
+    ) = None,
     listing_temporal_evidence: FinancialMetadataTemporalEvidence | None = None,
+    listing_composite_temporal_proof: CompositeListingTemporalProof | None = None,
     acquisition_window: FinancialEligibilityAcquisitionWindow | None = None,
     strict_cutoff: datetime | None = None,
     currency: str,
@@ -1841,11 +2096,13 @@ def build_financial_eligibility_acquisition_context(
 
     temporal_context = requested_session is not None
     windowed_context = acquisition_window is not None
+    composite_context = listing_composite_temporal_proof is not None
     if interrupted:
         return _failure(
             FinancialEligibilityAcquisitionFailureReason.INTERRUPTED_ACQUISITION,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     resolution = company_type_resolution
     if (
@@ -1858,6 +2115,7 @@ def build_financial_eligibility_acquisition_context(
             company_type_resolution=resolution,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     if bool(getattr(resolution, "contradictory", False)):
         return _failure(
@@ -1865,6 +2123,7 @@ def build_financial_eligibility_acquisition_context(
             company_type_resolution=resolution,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     if bool(getattr(resolution, "ambiguous", False)):
         return _failure(
@@ -1872,12 +2131,14 @@ def build_financial_eligibility_acquisition_context(
             company_type_resolution=resolution,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     if company_type_evidence is None:
         return _failure(
             FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     try:
         evidence_payload = _model_payload(company_type_evidence)
@@ -1897,12 +2158,14 @@ def build_financial_eligibility_acquisition_context(
             FinancialEligibilityAcquisitionFailureReason.COMPANY_TYPE_EVIDENCE_UNAVAILABLE,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     if listing_provenance is None:
         return _failure(
             FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     try:
         listing = FinancialListingProvenance.model_validate(
@@ -1919,6 +2182,7 @@ def build_financial_eligibility_acquisition_context(
             FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     try:
         temporal = requested_session is not None
@@ -1972,7 +2236,11 @@ def build_financial_eligibility_acquisition_context(
             or routing_plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
             or routing_plan.plan_version
             != (
-                CAPABILITY_ROUTING_PLAN_VERSION_1_4
+                (
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_5
+                    if composite_context
+                    else CAPABILITY_ROUTING_PLAN_VERSION_1_4
+                )
                 if acquisition_window is not None
                 else (
                     CAPABILITY_ROUTING_PLAN_VERSION_1_3
@@ -2000,17 +2268,23 @@ def build_financial_eligibility_acquisition_context(
                 or calendar_binding is None
                 or company_type_temporal_decision is None
                 or listing_temporal_decision is None
-                or listing_temporal_evidence is None
+                or (not composite_context and listing_temporal_evidence is None)
             ):
                 raise ValueError("financial eligibility temporal inputs are incomplete")
             temporal_binding = FinancialEligibilityTemporalContextBinding(
                 contract_version=(
-                    "financial-eligibility-temporal-binding-v2"
+                    (
+                        "financial-eligibility-temporal-binding-v3"
+                        if composite_context
+                        else "financial-eligibility-temporal-binding-v2"
+                    )
                     if acquisition_window is not None
                     else "financial-eligibility-temporal-binding-v1"
                 ),
                 capability_routing_plan_version=(
-                    "1.4" if acquisition_window is not None else "1.3"
+                    ("1.5" if composite_context else "1.4")
+                    if acquisition_window is not None
+                    else "1.3"
                 ),
                 temporal_policy_version=(
                     "provider-neutral-temporal-eligibility-v2"
@@ -2034,6 +2308,15 @@ def build_financial_eligibility_acquisition_context(
                 latest_completed_session=calendar_binding.latest_completed_session,
                 company_type_temporal_decision=company_type_temporal_decision,
                 listing_temporal_decision=listing_temporal_decision,
+                listing_temporal_decision_version=(
+                    listing_temporal_decision.contract_version
+                    if isinstance(
+                        listing_temporal_decision,
+                        CompositeListingTemporalEligibilityDecision,
+                    )
+                    else None
+                ),
+                composite_listing_temporal_proof=listing_composite_temporal_proof,
                 acquisition_window=acquisition_window,
                 strict_cutoff=strict_cutoff,
             )
@@ -2046,6 +2329,7 @@ def build_financial_eligibility_acquisition_context(
                 company_type_temporal_decision,
                 listing_temporal_decision,
                 listing_temporal_evidence,
+                listing_composite_temporal_proof,
                 acquisition_window,
                 strict_cutoff,
             )
@@ -2053,7 +2337,11 @@ def build_financial_eligibility_acquisition_context(
             raise ValueError("historical context cannot carry temporal inputs")
         payload: dict[str, object] = {
             "contract_version": (
-                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+                (
+                    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
+                    if composite_context
+                    else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+                )
                 if acquisition_window is not None
                 else (
                     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
@@ -2080,7 +2368,12 @@ def build_financial_eligibility_acquisition_context(
         if temporal:
             payload["requested_session"] = analysis_session
             payload["temporal_eligibility_binding"] = temporal_binding
-            payload["listing_temporal_evidence"] = listing_temporal_evidence
+            if composite_context:
+                payload["listing_composite_temporal_proof"] = (
+                    listing_composite_temporal_proof
+                )
+            else:
+                payload["listing_temporal_evidence"] = listing_temporal_evidence
         else:
             payload["as_of_date"] = as_of_date
         context = FinancialEligibilityAcquisitionContext(
@@ -2094,6 +2387,7 @@ def build_financial_eligibility_acquisition_context(
             FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH,
             temporal_context=temporal_context,
             windowed_context=windowed_context,
+            composite_context=composite_context,
         )
     return FinancialEligibilityAcquisitionResult.succeeded(context)
 
@@ -2105,11 +2399,14 @@ __all__ = [
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3",
+    "FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION",
     "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V3",
+    "FINANCIAL_ELIGIBILITY_ACQUISITION_RESULT_VERSION_V4",
     "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION",
     "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V2",
     "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V3",
+    "FINANCIAL_ELIGIBILITY_REQUEST_BINDING_VERSION_V4",
     "FinancialCompanyTypeAcquisitionEvidenceBinding",
     "FinancialCompanyTypeContextEvidence",
     "FinancialCompanyTypeEvidenceBinding",

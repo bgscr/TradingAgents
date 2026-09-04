@@ -13,9 +13,11 @@ from tradingagents.asset_configuration import RunAssetConfiguration
 from tradingagents.capability_routing import (
     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
     CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
     MainlandCapabilityRoutingPlan,
     TushareCapability,
 )
+from tradingagents.dataflows.cninfo_listing_publication import CninfoListingBoard
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialIndicatorRoutingRequest,
     FinancialStatementRoutingRequest,
@@ -32,6 +34,7 @@ from tradingagents.dataflows.financial_dispatch import (
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     FinancialEligibilityAcquisitionContext,
     FinancialEligibilityAcquisitionFailureReason,
     FinancialEligibilityAcquisitionResult,
@@ -123,6 +126,7 @@ class FinancialEligibilityAcquisitionContextOwner:
         checkpoint_thread_id: str | None = None,
         eligibility_clock: Callable[[], datetime] | None = None,
         calendar_provider: Callable[[], StoredSessionCalendar] | None = None,
+        authoritative_listing_board: CninfoListingBoard | None = None,
         interrupt_runtime: Callable[[], object],
         close_runtime: Callable[[], object],
     ) -> None:
@@ -154,11 +158,20 @@ class FinancialEligibilityAcquisitionContextOwner:
                 in {
                     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
                     CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
                 }
                 and (
                     not callable(eligibility_clock)
                     or not callable(calendar_provider)
                 )
+            )
+            or (
+                routing_plan.plan_version == CAPABILITY_ROUTING_PLAN_VERSION_1_5
+                and not isinstance(authoritative_listing_board, CninfoListingBoard)
+            )
+            or (
+                routing_plan.plan_version != CAPABILITY_ROUTING_PLAN_VERSION_1_5
+                and authoritative_listing_board is not None
             )
             or (
                 checkpoint_thread_id is not None
@@ -192,6 +205,7 @@ class FinancialEligibilityAcquisitionContextOwner:
         self._checkpoint_thread_id = checkpoint_thread_id
         self._eligibility_clock = eligibility_clock
         self._calendar_provider = calendar_provider
+        self._authoritative_listing_board = authoritative_listing_board
         self._interrupt_runtime = interrupt_runtime
         self._close_runtime = close_runtime
         self._lock = threading.RLock()
@@ -253,6 +267,7 @@ class FinancialEligibilityAcquisitionContextOwner:
         owner._checkpoint_thread_id = checkpoint_thread_id
         owner._eligibility_clock = None
         owner._calendar_provider = None
+        owner._authoritative_listing_board = None
         owner._interrupt_runtime = interrupt_runtime
         owner._close_runtime = close_runtime
         owner._lock = threading.RLock()
@@ -438,7 +453,19 @@ class FinancialEligibilityAcquisitionContextOwner:
                 in {
                     CAPABILITY_ROUTING_PLAN_VERSION_1_3,
                     CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
                 }
+            ),
+            windowed_context=(
+                self._routing_plan.plan_version
+                in {
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                    CAPABILITY_ROUTING_PLAN_VERSION_1_5,
+                }
+            ),
+            composite_context=(
+                self._routing_plan.plan_version
+                == CAPABILITY_ROUTING_PLAN_VERSION_1_5
             ),
         )
         with self._condition:
@@ -495,6 +522,7 @@ class FinancialEligibilityAcquisitionContextOwner:
                             in {
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                             }
                             else None
                         ),
@@ -504,6 +532,7 @@ class FinancialEligibilityAcquisitionContextOwner:
                             in {
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                             }
                             else None
                         ),
@@ -559,6 +588,7 @@ class FinancialEligibilityAcquisitionContextOwner:
                             in {
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                             }
                             else None
                         ),
@@ -568,6 +598,7 @@ class FinancialEligibilityAcquisitionContextOwner:
                             in {
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                                 FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                                FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                             }
                             else None
                         ),
@@ -627,7 +658,12 @@ class FinancialEligibilityAcquisitionContextOwner:
                 self._routing_plan.plan_version
                 == CAPABILITY_ROUTING_PLAN_VERSION_1_4
             )
-            temporal = temporal_v1 or temporal_v2
+            temporal_v3 = (
+                self._routing_plan.plan_version
+                == CAPABILITY_ROUTING_PLAN_VERSION_1_5
+            )
+            temporal = temporal_v1 or temporal_v2 or temporal_v3
+            windowed = temporal_v2 or temporal_v3
             temporal_arguments: dict[str, object] = {}
             historical_arguments: dict[str, object] = {}
             temporal_transaction = None
@@ -655,15 +691,19 @@ class FinancialEligibilityAcquisitionContextOwner:
                 )
                 temporal_arguments = {
                     "contract_version": (
-                        "financial-eligibility-metadata-acquisition-request-v3"
-                        if temporal_v2
+                        (
+                            "financial-eligibility-metadata-acquisition-request-v4"
+                            if temporal_v3
+                            else "financial-eligibility-metadata-acquisition-request-v3"
+                        )
+                        if windowed
                         else "financial-eligibility-metadata-acquisition-request-v2"
                     ),
                     "requested_session": as_of_date,
                     "temporal_mode": temporal_mode,
                     (
                         "eligibility_started_at"
-                        if temporal_v2
+                        if windowed
                         else "eligibility_evaluated_at"
                     ): eligibility_started_at,
                     "calendar_binding": calendar_binding,
@@ -674,7 +714,11 @@ class FinancialEligibilityAcquisitionContextOwner:
                         else None
                     ),
                 }
-                if temporal_v2:
+                if temporal_v3:
+                    temporal_arguments["authoritative_listing_board"] = (
+                        self._authoritative_listing_board
+                    )
+                if windowed:
                     temporal_transaction = (
                         FinancialEligibilityTemporalEvaluationTransaction(
                             mode=temporal_mode,
@@ -743,6 +787,8 @@ class FinancialEligibilityAcquisitionContextOwner:
                         result = FinancialEligibilityAcquisitionResult.failed(
                             FinancialEligibilityAcquisitionFailureReason.CONTEXT_BINDING_MISMATCH,
                             temporal_context=temporal,
+                            windowed_context=windowed,
+                            composite_context=temporal_v3,
                         )
                 if result.context is not None:
                     self._acquiring = False
@@ -763,7 +809,19 @@ class FinancialEligibilityAcquisitionContextOwner:
                     in {
                         CAPABILITY_ROUTING_PLAN_VERSION_1_3,
                         CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                        CAPABILITY_ROUTING_PLAN_VERSION_1_5,
                     }
+                ),
+                windowed_context=(
+                    self._routing_plan.plan_version
+                    in {
+                        CAPABILITY_ROUTING_PLAN_VERSION_1_4,
+                        CAPABILITY_ROUTING_PLAN_VERSION_1_5,
+                    }
+                ),
+                composite_context=(
+                    self._routing_plan.plan_version
+                    == CAPABILITY_ROUTING_PLAN_VERSION_1_5
                 ),
             )
             with self._condition:

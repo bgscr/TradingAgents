@@ -56,6 +56,11 @@ from tradingagents.dataflows.baostock_ratios import (
     BaoStockRatioFamilyAdapter,
     assess_baostock_ratio_family_results,
 )
+from tradingagents.dataflows.cninfo_listing_publication import (
+    CNINFO_ANNOUNCEMENT_QUERY_OPERATION,
+    CNINFO_DOCUMENT_FETCH_OPERATION,
+    CNINFO_SECURITY_LOOKUP_OPERATION,
+)
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
@@ -86,6 +91,7 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialStatementType,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION,
     FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
@@ -101,6 +107,7 @@ from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
     FinancialCompanyTypeProviderTemporalProofBinding,
@@ -1266,6 +1273,12 @@ def _cache_normalizer_is_compatible(
             BAOSTOCK_RATIO_NORMALIZER_VERSION,
             BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
         }
+    if key.provider_id == "cninfo":
+        return (
+            plan.plan_version == "1.5"
+            and key.normalizer_version
+            == "cninfo-listing-publication-normalizer-v1"
+        )
     if key.provider_id == "akshare_sina":
         external_normalizer = {
             "adjustment_factors": AKSHARE_FACTOR_NORMALIZER_VERSION,
@@ -1371,7 +1384,9 @@ def _restore_checkpoint_eligibility_context(
         )
     raw_ledger_version = raw_shadow_ledger.get("contract_version")
     expected_ledger_version = (
-        FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.5"
+        else FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.4"
         else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.3"
@@ -1380,7 +1395,7 @@ def _restore_checkpoint_eligibility_context(
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
     if raw_ledger_version != expected_ledger_version:
-        if run_binding.routing_plan.plan_version in {"1.3", "1.4"}:
+        if run_binding.routing_plan.plan_version in {"1.3", "1.4", "1.5"}:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
             )
@@ -1406,7 +1421,9 @@ def _restore_checkpoint_eligibility_context(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
         )
     expected_context_version = (
-        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
+        if run_binding.routing_plan.plan_version == "1.5"
+        else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
         if run_binding.routing_plan.plan_version == "1.4"
         else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
         if run_binding.routing_plan.plan_version == "1.3"
@@ -1415,7 +1432,7 @@ def _restore_checkpoint_eligibility_context(
     if raw_context.get("contract_version") != expected_context_version:
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if run_binding.routing_plan.plan_version in {"1.3", "1.4"}
+            if run_binding.routing_plan.plan_version in {"1.3", "1.4", "1.5"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
         )
     raw_identity = raw_context.get("context_identity")
@@ -1447,6 +1464,7 @@ def _restore_checkpoint_eligibility_context(
         in {
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
         }
         else context.as_of_date
     )
@@ -1612,7 +1630,9 @@ def _validated_checkpoint_restoration(
         )
     )
     expected_shadow_version = (
-        FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION
+        if plan.plan_version == "1.5"
+        else FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
         if plan.plan_version == "1.4"
         else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if plan.plan_version == "1.3"
@@ -1665,10 +1685,12 @@ def _validated_checkpoint_restoration(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
         )
-    if plan.plan_version in {"1.3", "1.4"}:
+    if plan.plan_version in {"1.3", "1.4", "1.5"}:
         temporal = context.temporal_eligibility_binding
         expected_context_version = (
-            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
+            if plan.plan_version == "1.5"
+            else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
             if plan.plan_version == "1.4"
             else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
         )
@@ -1678,7 +1700,9 @@ def _validated_checkpoint_restoration(
             or shadow_ledger.capability_routing_plan_version != plan.plan_version
             or shadow_ledger.financial_indicator_manifest_version
             != (
-                FINANCIAL_MANIFEST_V5
+                plan.indicator_manifest_contract_version
+                if plan.plan_version == "1.5"
+                else FINANCIAL_MANIFEST_V5
                 if plan.plan_version == "1.4"
                 else FINANCIAL_MANIFEST_V4
             )
@@ -1700,6 +1724,8 @@ def _validated_checkpoint_restoration(
         != (
             "1.3"
             if plan.plan_version == "1.4"
+            else "1.4"
+            if plan.plan_version == "1.5"
             else "1.2"
             if plan.plan_version == "1.3"
             else "1.1"
@@ -1711,13 +1737,82 @@ def _validated_checkpoint_restoration(
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if plan.plan_version in {"1.3", "1.4"}
+            if plan.plan_version in {"1.3", "1.4", "1.5"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
         )
 
     expected_identity = ProviderSubrequestInstrumentIdentity.from_authoritative(
         run_binding.asset_configuration.instrument_identity
     )
+    if plan.plan_version == "1.5":
+        proof = context.listing_composite_temporal_proof
+        if proof is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            )
+        publication = proof.publication_evidence
+        document = proof.document_evidence
+        cninfo_entries = tuple(
+            entry
+            for entry in cache_checkpoint.entries
+            if entry.key.provider_id == "cninfo"
+        )
+        expected_requests = {
+            publication.security_lookup_request_identity: (
+                publication.security_lookup_artifact.artifact_identity,
+                "cninfo.metadata",
+                CNINFO_SECURITY_LOOKUP_OPERATION,
+                "application/json",
+            ),
+            publication.announcement_query_request_identity: (
+                publication.metadata_artifact.artifact_identity,
+                "cninfo.metadata",
+                CNINFO_ANNOUNCEMENT_QUERY_OPERATION,
+                "application/json",
+            ),
+        }
+        if document is not None:
+            expected_requests[document.document_request_identity] = (
+                document.artifact.artifact_identity,
+                "cninfo.documents",
+                CNINFO_DOCUMENT_FETCH_OPERATION,
+                "text/html",
+            )
+        expected_artifacts = {
+            artifact_identity
+            for artifact_identity, _scope, _operation, _media_type in expected_requests.values()
+        }
+        entries_by_request = {
+            entry.key.subrequest_key: entry for entry in cninfo_entries
+        }
+        retained_artifacts = {
+            entry.artifact.artifact_ref
+            for entry in cninfo_entries
+            if entry.artifact is not None
+        }
+        if (
+            len(cninfo_entries) != len(expected_requests)
+            or len(entries_by_request) != len(cninfo_entries)
+            or set(entries_by_request) != set(expected_requests)
+            or retained_artifacts != expected_artifacts
+            or any(
+                entry.artifact is None
+                or entry.artifact.artifact_ref != artifact_identity
+                or entry.artifact.media_type != media_type
+                or entry.key.capacity_scope != capacity_scope
+                or operation not in entry.key.requested_fields
+                for request_identity, (
+                    artifact_identity,
+                    capacity_scope,
+                    operation,
+                    media_type,
+                ) in expected_requests.items()
+                for entry in (entries_by_request[request_identity],)
+            )
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+            )
     allowed_physical_providers = {
         _physical_provider_id(provider_id)
         for route in plan.routes
@@ -1728,12 +1823,21 @@ def _validated_checkpoint_restoration(
         expected_account_scope = (
             plan.account_scope_label
             if key.provider_id == "tushare"
+            else "cninfo-public-research"
+            if key.provider_id == "cninfo"
             else "not-applicable"
             if key.provider_id == "baostock"
             else "public"
         )
         expected_upstream_id, _ = upstream_service_identity_for_provider(
-            key.provider_id,
+            (
+                "cninfo_documents"
+                if key.provider_id == "cninfo"
+                and key.capacity_scope == "cninfo.documents"
+                else "cninfo_metadata"
+                if key.provider_id == "cninfo"
+                else key.provider_id
+            ),
             account_scope=(
                 expected_account_scope if key.provider_id == "tushare" else ""
             ),
@@ -1744,12 +1848,22 @@ def _validated_checkpoint_restoration(
             or key.canonical_symbol != expected_identity.canonical_symbol
             or key.account_scope != expected_account_scope
             or key.upstream_service_id != expected_upstream_id
-            or key.qualification_profile != plan.qualification_profile
+            or key.qualification_profile
+            != (
+                plan.listing_publication_candidate_profile
+                if key.provider_id == "cninfo"
+                else plan.qualification_profile
+            )
             or key.data_usage_mode is not blueprint.factory_contract.data_usage_mode
             or not _cache_normalizer_is_compatible(key, plan)
             or (
                 entry.artifact is not None
-                and entry.artifact.media_type != "application/json"
+                and entry.artifact.media_type
+                not in (
+                    {"application/json", "text/html"}
+                    if key.provider_id == "cninfo"
+                    else {"application/json"}
+                )
             )
         ):
             raise FinancialDispatchCheckpointError(
@@ -2025,6 +2139,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                         in {
                             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                         }
                         else None
                     ),
@@ -2034,6 +2149,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                         in {
                             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
                             FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
                         }
                         else None
                     ),
@@ -2324,6 +2440,8 @@ def _ordinary_plan_pairs(
         (route.capability, provider_id)
         for route in plan.routes
         if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        and route.capability
+        is not MainlandCapability.LISTING_PUBLICATION_EVIDENCE
         and (
             route.capability in _STATEMENT_CAPABILITIES
             or route.capability is MainlandCapability.FINANCIAL_INDICATORS
@@ -2806,7 +2924,11 @@ def _required_provider_source_ids(
     sources = {
         provider
         for route in plan.routes
-        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        if route.capability
+        not in {
+            MainlandCapability.DAILY_MARKET_SNAPSHOT,
+            MainlandCapability.LISTING_PUBLICATION_EVIDENCE,
+        }
         for provider in route.providers
     }
     return tuple(sorted(sources))
@@ -3333,6 +3455,7 @@ def _statement_company_type_evidence_source(
             in {
                 "financial-eligibility-metadata-binding-v2",
                 "financial-eligibility-metadata-binding-v3",
+                "financial-eligibility-metadata-binding-v4",
             }
         )
         as_of_date = (
@@ -3432,6 +3555,9 @@ def _statement_company_type_evidence_source(
                     "financial-company-type-evidence-binding-v3"
                 ),
                 "financial-eligibility-metadata-binding-v3": (
+                    "financial-company-type-evidence-binding-v4"
+                ),
+                "financial-eligibility-metadata-binding-v4": (
                     "financial-company-type-evidence-binding-v4"
                 ),
             }[request.metadata_binding.contract_version],
@@ -3978,6 +4104,7 @@ def _external_request_material(
                 in {
                     "financial-eligibility-metadata-binding-v2",
                     "financial-eligibility-metadata-binding-v3",
+                    "financial-eligibility-metadata-binding-v4",
                 }
                 else binding.as_of_date
             )

@@ -235,7 +235,9 @@ def test_qualified_v1_shadow_resolves_closed_versioned_routes_and_signature(
         "namechange",
     )
     assert tuple(item.capability for item in plan.request_budget_identities) == tuple(
-        MainlandCapability
+        capability
+        for capability in MainlandCapability
+        if capability is not MainlandCapability.LISTING_PUBLICATION_EVIDENCE
     )
     assert plan.plan_signature.startswith("mainland-routing-plan:v1:")
 
