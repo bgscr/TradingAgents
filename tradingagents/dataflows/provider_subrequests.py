@@ -9,13 +9,20 @@ import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from tradingagents.dataflows.financial_temporal_eligibility import (
     FinancialMetadataTemporalEligibilityDecision,
@@ -302,6 +309,24 @@ class ProviderSubrequestArtifactRef(BaseModel):
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_length: int = Field(ge=0)
     media_type: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9.+/-]{0,127}$")
+    retrieved_at: datetime | None = None
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def _validate_retrieved_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("artifact retrieval time must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        payload = handler(self)
+        if self.retrieved_at is None:
+            # Preserve historical and non-opted-in artifact/checkpoint identities.
+            payload.pop("retrieved_at", None)
+        return payload
 
     @model_validator(mode="after")
     def _validate_ref(self) -> ProviderSubrequestArtifactRef:
@@ -1319,6 +1344,7 @@ class ProviderSubrequestCache:
         operation: str,
         media_type: str,
         record_at_physical_io: bool = False,
+        capture_retrieved_at: bool = False,
         physical_request: Callable[[], bytes | PhysicalAttemptNotMade[bytes]],
     ) -> ProviderSubrequestResult:
         if (
@@ -1326,6 +1352,7 @@ class ProviderSubrequestCache:
             or isinstance(max_physical_attempts, bool)
             or max_physical_attempts < 1
             or not isinstance(record_at_physical_io, bool)
+            or not isinstance(capture_retrieved_at, bool)
         ):
             raise ProviderSubrequestCacheError(
                 ProviderSubrequestCacheFailureReason.EXECUTION_INVALID
@@ -1386,6 +1413,12 @@ class ProviderSubrequestCache:
                     value,
                     media_type=media_type,
                 )
+                if capture_retrieved_at and not no_io:
+                    # The callback consumed/validated the entire response and CAS
+                    # installation completed. Retain this receipt across replay.
+                    artifact = ProviderSubrequestArtifactRef.model_validate(
+                        {**artifact.model_dump(), "retrieved_at": now()}
+                    )
                 artifact_payload = artifact.model_dump(mode="json")
                 if no_io:
                     return PhysicalAttemptNotMade(artifact_payload)

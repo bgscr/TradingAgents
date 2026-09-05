@@ -1027,9 +1027,16 @@ def _outcome_reason(result: ProviderSubrequestResult) -> CninfoFailureReason:
 
 
 def _result_time(result: ProviderSubrequestResult) -> datetime:
-    if not result.attempt_events:
+    artifact = result.artifact
+    if (
+        not result.attempt_events
+        or artifact is None
+        or artifact.retrieved_at is None
+        or result.attempt_events[-1].attempted_at.utcoffset() is None
+        or artifact.retrieved_at < result.attempt_events[-1].attempted_at
+    ):
         raise CninfoListingPublicationError(CninfoFailureReason.TRANSPORT_UNAVAILABLE)
-    return result.attempt_events[-1].attempted_at.astimezone(timezone.utc)
+    return artifact.retrieved_at.astimezone(timezone.utc)
 
 
 def _artifact_binding(
@@ -1233,6 +1240,7 @@ class CninfoListingPublicationAdapter:
             operation=operation,
             media_type=media_type,
             record_at_physical_io=True,
+            capture_retrieved_at=True,
             physical_request=physical_request,
         )
 
@@ -1322,6 +1330,7 @@ class CninfoListingPublicationAdapter:
         assert lookup.value is not None
         try:
             match = parse_cninfo_security_lookup(lookup.value, sec_code=sec_code)
+            lookup_time = _result_time(lookup)
         except CninfoListingPublicationError as exc:
             return _unavailable_result(exc.reason, results)
 
@@ -1404,7 +1413,6 @@ class CninfoListingPublicationAdapter:
                 window_start=request.window_start,
                 window_end=request.window_end,
             )
-            lookup_time = _result_time(lookup)
             query_time = _result_time(query)
             lookup_artifact = _artifact_binding(
                 lookup,
