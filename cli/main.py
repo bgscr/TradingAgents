@@ -64,6 +64,7 @@ from tradingagents.capability_routing import (
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingPreflightError,
     TushareCapability,
+    capability_routing_configuration_is_explicit,
     is_mainland_equity_configuration,
     mainland_capability_routing_failure,
     preflight_mainland_capability_routing,
@@ -1983,7 +1984,15 @@ def build_qualified_financial_routing_composition(
     shadow traffic and tests never need live providers.
     """
 
-    if qualified_financial_routing is not None:
+    production_cninfo = plan.plan_version == "1.5"
+    if production_cninfo and (
+        validation_workload is not True
+        or config.get(_QUALIFIED_ROUTING_FACTORY_CONFIG_KEY) is not None
+    ):
+        _qualified_routing_factory_failure(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID
+        )
+    if qualified_financial_routing is not None and not production_cninfo:
         return _validate_qualified_routing_composition_output(
             qualified_financial_routing,
             plan=plan,
@@ -2021,6 +2030,22 @@ def build_qualified_financial_routing_composition(
                 BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.identity
             ),
         )
+        if qualified_financial_routing is not None:
+            if (
+                not isinstance(
+                    qualified_financial_routing,
+                    RegisteredProductionQualifiedRoutingComposition,
+                )
+                or qualified_financial_routing.blueprint != blueprint
+            ):
+                _qualified_routing_factory_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
+                )
+            return _validate_qualified_routing_composition_output(
+                qualified_financial_routing,
+                plan=plan,
+                expected_blueprint=qualified_financial_routing.blueprint,
+            )
         try:
             composition = BUILTIN_QUALIFIED_ROUTING_COMPOSITION_FACTORY.factory(
                 blueprint=blueprint,
@@ -2134,10 +2159,7 @@ def run_analysis(
     capability_routing_plan: MainlandCapabilityRoutingPlan | None = None
     capability_routing_failure: MainlandCapabilityRoutingFailure | None = None
     qualified_validation_calendar_receipt = None
-    routing_configuration_requires_identity = (
-        str(config.get("mainland_capability_routing_mode", "legacy")) != "legacy"
-        or bool(config.get("tushare_enabled_capabilities", ()))
-    )
+    routing_configuration_requires_identity = capability_routing_configuration_is_explicit(config)
     mainland_symbol_requested = (
         resolve_mainland_instrument(selections["ticker"]) is not None
     )
@@ -2195,9 +2217,12 @@ def run_analysis(
                             )
                             else None
                         )
-                        if qualified_financial_routing is None or (
-                            direct_plan is not None
-                            and direct_plan.plan_version in {"1.3", "1.4"}
+                        if capability_routing_plan.plan_version == "1.2" and (
+                            qualified_financial_routing is None
+                            or (
+                                direct_plan is not None
+                                and direct_plan.plan_version in {"1.3", "1.4"}
+                            )
                         ):
                             capability_routing_plan = (
                                 prepare_mainland_temporal_capability_routing_plan(
@@ -2306,7 +2331,7 @@ def run_analysis(
                 RegisteredProductionQualifiedRoutingComposition,
             )
             and capability_routing_plan is not None
-            and capability_routing_plan.plan_version in {"1.3", "1.4"}
+            and capability_routing_plan.plan_version in {"1.3", "1.4", "1.5"}
         ):
             try:
                 qualified_validation_calendar_receipt = (

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from inspect import signature as inspect_signature
 from pathlib import Path
 from types import MappingProxyType
@@ -42,6 +43,12 @@ from tradingagents.capability_routing import (
     TushareEndpointPacingIdentity,
     mainland_capability_routing_failure,
 )
+from tradingagents.cninfo_production_binding import (
+    CNINFO_PRODUCTION_CONFIG_KEYS,
+    CNINFO_PRODUCTION_DEPENDENCY_IDS,
+    PRODUCTION_PLAN_VERSION_CONFIG_KEY,
+    CninfoProductionBinding,
+)
 from tradingagents.dataflows.akshare_sina_statements import (
     AkshareSinaStatementAdapter,
     AkshareSinaStatementAdapterResultV2,
@@ -60,6 +67,8 @@ from tradingagents.dataflows.cninfo_listing_publication import (
     CNINFO_ANNOUNCEMENT_QUERY_OPERATION,
     CNINFO_DOCUMENT_FETCH_OPERATION,
     CNINFO_SECURITY_LOOKUP_OPERATION,
+    CninfoListingPublicationAdapter,
+    RequestsCninfoHttpTransport,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
@@ -241,6 +250,7 @@ _PRODUCTION_PROVIDER_SOURCE_IDS = frozenset(
         "akshare_sina",
         "baostock",
         "baostock_qualified_families",
+        "cninfo",
         "tushare",
         "yfinance",
         "yfinance_derived",
@@ -248,6 +258,8 @@ _PRODUCTION_PROVIDER_SOURCE_IDS = frozenset(
 )
 _CONFIG_FIELDS = (
     "mainland_capability_routing_mode",
+    PRODUCTION_PLAN_VERSION_CONFIG_KEY,
+    *CNINFO_PRODUCTION_CONFIG_KEYS,
     "mainland_capability_routing_plan_signature",
     "tushare_enabled_capabilities",
     "tushare_qualification_profile",
@@ -339,6 +351,9 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
     account_scope_label: str = Field(pattern=_SAFE_IDENTITY_PATTERN)
     endpoint_pacing_identities: tuple[TushareEndpointPacingIdentity, ...]
     runtime_root_identities: tuple[ProductionRuntimeRootIdentity, ...]
+    cninfo_binding: CninfoProductionBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_canonical_contract(
@@ -358,8 +373,22 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
             for source_id in self.required_provider_source_ids
         ):
             raise ValueError("factory provider source coverage is not canonical")
-        if self.dependency_ids != _REQUIRED_DEPENDENCY_IDS:
+        if self.dependency_ids != _required_dependency_ids(self.cninfo_binding):
             raise ValueError("factory dependency inventory is not canonical")
+        if self.cninfo_binding is not None:
+            binding = self.cninfo_binding
+            if (
+                binding.plan_signature != self.plan_signature
+                or binding.asset_configuration_signature != self.asset_configuration_signature
+                or binding.instrument_identity.symbol != self.instrument_symbol
+                or binding.instrument_identity.venue != self.reference_market
+                or binding.instrument_identity.currency != self.currency
+                or binding.instrument_identity.provenance.artifact_sha256 != self.registry_digest
+                or "cninfo" not in self.required_provider_source_ids
+            ):
+                raise ValueError("factory CNINFO binding contradicts its run authority")
+        elif "cninfo" in self.required_provider_source_ids:
+            raise ValueError("factory CNINFO source has no policy binding")
         endpoint_ids = tuple(
             identity.endpoint_id for identity in self.endpoint_pacing_identities
         )
@@ -414,6 +443,8 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
             or contract.account_scope_label != self.routing_plan.account_scope_label
             or contract.endpoint_pacing_identities
             != self.routing_plan.endpoint_pacing_identities
+            or (self.routing_plan.plan_version == "1.5")
+            != (contract.cninfo_binding is not None)
         ):
             raise ValueError("blueprint routing plan binding is invalid")
         root_paths = (
@@ -469,6 +500,132 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
     @property
     def asset_configuration_signature(self) -> str:
         return self.factory_contract.asset_configuration_signature
+
+
+class ProductionQualifiedRoutingSourceBinding(BaseModel):
+    """Exact source/qualification identities already verified by the readiness owner."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["production-qualified-routing-source-binding-v1"] = (
+        "production-qualified-routing-source-binding-v1"
+    )
+    commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tree_hash: str = Field(pattern=r"^[0-9a-f]{40}$")
+    production_inventory_identity: str = Field(
+        pattern=r"^production-python-modules:v1:sha256:[0-9a-f]{64}$"
+    )
+    qualified_source_identity: str = Field(
+        pattern=r"^qualified-source-ready-for-ticket07-preparation:v1:sha256:[0-9a-f]{64}$"
+    )
+
+
+class ProductionQualifiedRoutingPreparation(BaseModel):
+    """In-memory configuration seal; neither a qualification nor execution authority."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["production-qualified-routing-preparation-v1"]
+    plan_version: Literal["1.4", "1.5"]
+    plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
+    blueprint_identity: str = Field(
+        pattern=r"^production-qualified-routing-blueprint:v1:[0-9a-f]{64}$"
+    )
+    factory_contract: ProductionQualifiedRoutingFactoryContract
+    qualified_source: ProductionQualifiedRoutingSourceBinding
+    execution_authorized: Literal[False]
+    preparation_identity: str = Field(
+        pattern=r"^production-qualified-routing-preparation:v1:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_preparation(self) -> ProductionQualifiedRoutingPreparation:
+        if self.plan_signature != self.factory_contract.plan_signature or (
+            (self.plan_version == "1.5") != (self.factory_contract.cninfo_binding is not None)
+        ):
+            raise ValueError("preparation plan and factory contract contradict")
+        expected = "production-qualified-routing-preparation:v1:" + _canonical_digest(
+            self.model_dump(mode="json", exclude={"preparation_identity"})
+        )
+        if self.preparation_identity != expected:
+            raise ValueError("preparation identity mismatch")
+        return self
+
+    @property
+    def qualified_source_identity(self) -> str:
+        return self.qualified_source.qualified_source_identity
+
+
+def seal_production_qualified_routing_preparation(
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+    current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+) -> ProductionQualifiedRoutingPreparation:
+    """Bind a verified source chain to current configuration without I/O.
+
+    The preparation owner supplies its independently verified current source and
+    qualified chain identities. This comparison cannot perform qualification or
+    grant launch approval. No thread, packet, resource, or persisted state is created.
+    """
+
+    def source_binding(value: object) -> ProductionQualifiedRoutingSourceBinding:
+        if isinstance(value, ProductionQualifiedRoutingSourceBinding):
+            value = value.model_dump(mode="json")
+        return ProductionQualifiedRoutingSourceBinding.model_validate(value)
+
+    qualified = source_binding(qualified_source)
+    if qualified != source_binding(current_source):
+        raise ValueError("qualified source chain does not match current source")
+    if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
+        raise ValueError("production preparation requires a validated blueprint")
+    # Revalidate serialized values, including objects produced by model_copy.
+    validated = ProductionQualifiedRoutingCompositionBlueprint.model_validate(
+        {
+            **blueprint.model_dump(mode="json"),
+            "runtime_root_path": blueprint.runtime_root_path,
+            "database_path": blueprint.database_path,
+            "provider_artifact_root_path": blueprint.provider_artifact_root_path,
+            "backup_root_path": blueprint.backup_root_path,
+            "report_root_path": blueprint.report_root_path,
+        }
+    )
+    payload = {
+        "contract_version": "production-qualified-routing-preparation-v1",
+        "plan_version": validated.routing_plan.plan_version,
+        "plan_signature": validated.plan_signature,
+        "blueprint_identity": validated.blueprint_identity,
+        "factory_contract": validated.factory_contract.model_dump(mode="json"),
+        "qualified_source": qualified.model_dump(mode="json"),
+        "execution_authorized": False,
+    }
+    return ProductionQualifiedRoutingPreparation(
+        **payload,
+        preparation_identity="production-qualified-routing-preparation:v1:"
+        + _canonical_digest(payload),
+    )
+
+
+def validate_production_qualified_routing_preparation(
+    preparation: Mapping[str, Any] | ProductionQualifiedRoutingPreparation,
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+    current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+) -> ProductionQualifiedRoutingPreparation:
+    """Reject stale or mismatched preparation values before a packet can use them."""
+
+    if isinstance(preparation, ProductionQualifiedRoutingPreparation):
+        preparation = preparation.model_dump(mode="json")
+    validated = ProductionQualifiedRoutingPreparation.model_validate(preparation)
+    expected = seal_production_qualified_routing_preparation(
+        blueprint=blueprint,
+        qualified_source=qualified_source,
+        current_source=current_source,
+    )
+    if validated != expected:
+        raise ValueError("preparation does not match current production configuration")
+    return validated
 
 
 class ManagedQualifiedRoutingComposition(Protocol):
@@ -1099,6 +1256,18 @@ def production_qualified_routing_runtime_factories(
                 allow_prewarming=False,
                 configured_at=datetime.now(timezone.utc),
             )
+            if contract.cninfo_binding is not None:
+                for pacing in contract.cninfo_binding.profile.upstream_pacing:
+                    service_id, service_name = upstream_service_identity_for_provider(pacing.provider_scope)
+                    if service_id != pacing.upstream_service_id:
+                        raise ValueError("CNINFO upstream identity does not match its policy")
+                    coordinator.register_upstream_service(service_id, service_name)
+                    coordinator.configure_operator_ceiling(
+                        upstream_service_id=service_id,
+                        minimum_interval=timedelta(seconds=pacing.minimum_interval_seconds),
+                        allow_prewarming=pacing.allow_prewarming,
+                        configured_at=datetime.now(timezone.utc),
+                    )
             return coordinator
         except ProductionQualifiedRoutingLifecycleError:
             raise
@@ -2924,23 +3093,32 @@ def _required_provider_source_ids(
     sources = {
         provider
         for route in plan.routes
-        if route.capability
-        not in {
-            MainlandCapability.DAILY_MARKET_SNAPSHOT,
-            MainlandCapability.LISTING_PUBLICATION_EVIDENCE,
-        }
+        if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
         for provider in route.providers
     }
     return tuple(sorted(sources))
 
 
+def _required_dependency_ids(
+    cninfo_binding: CninfoProductionBinding | None,
+) -> tuple[str, ...]:
+    if cninfo_binding is None:
+        return _REQUIRED_DEPENDENCY_IDS
+    return tuple(sorted((*_REQUIRED_DEPENDENCY_IDS, *CNINFO_PRODUCTION_DEPENDENCY_IDS)))
+
+
 def production_qualified_routing_dependency_availability() -> dict[str, bool]:
     """Resolve the static production dependency inventory without importing it."""
 
-    return {
+    available = {
         dependency: importlib.util.find_spec(dependency) is not None
-        for dependency in _REQUIRED_DEPENDENCY_IDS
+        for dependency in (*_REQUIRED_DEPENDENCY_IDS, *CNINFO_PRODUCTION_DEPENDENCY_IDS)
     }
+    try:
+        available["lxml"] = available["lxml"] and distribution_version("lxml") == "6.1.1"
+    except PackageNotFoundError:
+        available["lxml"] = False
+    return available
 
 
 def production_qualified_routing_provider_source_coverage(
@@ -3222,13 +3400,27 @@ def build_production_qualified_routing_composition_blueprint(
         _fail(
             MainlandCapabilityRoutingFailureReason.DATA_USAGE_MODE_NOT_PERSONAL_RESEARCH
         )
+    selected_version = config_snapshot.get(PRODUCTION_PLAN_VERSION_CONFIG_KEY)
+    if selected_version is not None and selected_version != plan.plan_version:
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
+    cninfo_binding = None
+    if plan.plan_version == "1.5":
+        try:
+            cninfo_binding = CninfoProductionBinding.create(
+                plan=plan, asset_configuration=asset_configuration, config=config_snapshot,
+            )
+        except (TypeError, ValueError):
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
+    elif any(config_snapshot.get(key) is not None for key in CNINFO_PRODUCTION_CONFIG_KEYS):
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
+    required_dependency_ids = _required_dependency_ids(cninfo_binding)
     dependency_snapshot = _snapshot_mapping(
         dependency_availability,
-        _REQUIRED_DEPENDENCY_IDS,
+        required_dependency_ids,
     )
     if dependency_snapshot is None or any(
         dependency_snapshot.get(dependency) is not True
-        for dependency in _REQUIRED_DEPENDENCY_IDS
+        for dependency in required_dependency_ids
     ):
         _fail(
             MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
@@ -3301,10 +3493,11 @@ def build_production_qualified_routing_composition_blueprint(
             qualification_profile=plan.qualification_profile,
             enabled_capabilities=plan.enabled_tushare_capabilities,
             required_provider_source_ids=required_provider_source_ids,
-            dependency_ids=_REQUIRED_DEPENDENCY_IDS,
+            dependency_ids=required_dependency_ids,
             account_scope_label=plan.account_scope_label,
             endpoint_pacing_identities=plan.endpoint_pacing_identities,
             runtime_root_identities=runtime_root_identities,
+            cninfo_binding=cninfo_binding,
         )
         identity_payload = {
             "blueprint_version": PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION,
@@ -4069,11 +4262,13 @@ def _validate_run_dependencies(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     dependencies: ProductionQualifiedRoutingRunDependencies,
 ) -> None:
+    # lxml/requests are profile dependencies, not owned provider clients. The
+    # CNINFO transport is stateless and constructed by the runtime assembler.
     if (
         not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint)
         or not isinstance(dependencies, ProductionQualifiedRoutingRunDependencies)
         or tuple(dependencies.provider_clients)
-        != blueprint.factory_contract.dependency_ids
+        != _REQUIRED_DEPENDENCY_IDS
         or not dependencies.subrequest_cache.is_bound_to(
             coordinator=dependencies.coordinator,
             artifact_store=dependencies.artifact_store,
@@ -4981,10 +5176,31 @@ def _assemble_production_qualified_runtime(
             else None
         ),
     )
+    listing_publication_source = None
+    cninfo_binding = blueprint.factory_contract.cninfo_binding
+    if blueprint.routing_plan.plan_version == "1.5":
+        if cninfo_binding is None:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        listing_publication_source = CninfoListingPublicationAdapter(
+            subrequest_cache=subrequest_cache,
+            transport=RequestsCninfoHttpTransport(),
+            source_policy=cninfo_binding.profile.source_policy,
+            owner_id=dependencies.owner_id,
+            now=dependencies.now,
+            sleep=dependencies.sleep,
+            lease_duration=dependencies.lease_duration,
+        ).acquire
+    publication_arguments = (
+        {"listing_publication_source": listing_publication_source}
+        if listing_publication_source is not None else {}
+    )
     eligibility_metadata_acquirer = FinancialEligibilityMetadataAcquirer(
         routing_plan=blueprint.routing_plan,
         router=source_composition.router,
         stop_signal=stop_signal,
+        **publication_arguments,
     )
     return ProductionQualifiedRoutingRuntimeAssembly(
         financial_routing=financial_routing,
@@ -5237,6 +5453,8 @@ __all__ = [
     "ProductionQualifiedRoutingRuntimeAssembly",
     "ProductionQualifiedRoutingRuntimeFactories",
     "ProductionQualifiedRoutingRunBinding",
+    "ProductionQualifiedRoutingSourceBinding",
+    "ProductionQualifiedRoutingPreparation",
     "RegisteredProductionQualifiedRoutingComposition",
     "ProductionQualifiedRoutingRunDependencies",
     "ProductionQualifiedProviderSourceComposition",
@@ -5251,4 +5469,6 @@ __all__ = [
     "production_qualified_routing_dependency_availability",
     "production_qualified_routing_provider_source_coverage",
     "preflight_production_qualified_calendar_reader",
+    "seal_production_qualified_routing_preparation",
+    "validate_production_qualified_routing_preparation",
 ]

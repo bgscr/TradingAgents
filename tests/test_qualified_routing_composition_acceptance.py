@@ -41,16 +41,13 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingRunProjection,
     preflight_mainland_capability_routing,
-    prepare_mainland_listing_publication_candidate_plan,
-    prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_calendar import MainlandSessionCalendarMembership
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
 from tradingagents.dataflows.cninfo_listing_publication import (
     CninfoHttpResponse,
     CninfoListingBoard,
-    CninfoListingPublicationAdapter,
-    CninfoSourcePolicy,
+    RequestsCninfoHttpTransport,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityRoutingRequest,
@@ -98,13 +95,11 @@ from tradingagents.market_history import (
     publication_from_baostock_session_calendar_acquisition,
 )
 from tradingagents.market_history.config import (
-    DataUsageMode,
     MarketHistoryConfig,
     provider_request_authority_config,
 )
 from tradingagents.market_history.coordinator import (
     record_active_physical_attempt_io,
-    upstream_service_identity_for_provider,
 )
 from tradingagents.market_history.store import MarketHistoryStore
 from tradingagents.qualified_routing_composition import (
@@ -770,6 +765,7 @@ def _fresh_builtin_run(
     symbol: str,
     reverse_input_order: bool,
     checkpoint_thread_id: str = _THREAD_ID,
+    plan_version: str = "1.5",
 ) -> _FreshRun:
     _DeterministicDateTime.reset()
     monkeypatch.setenv("RUN_LIVE_DEEPSEEK_TESTS", "0")
@@ -780,7 +776,7 @@ def _fresh_builtin_run(
     monkeypatch.setattr(
         cli_main,
         "production_qualified_routing_dependency_availability",
-        lambda: dict.fromkeys(("akshare", "baostock", "tushare", "yfinance"), True),
+        lambda: dict.fromkeys(("akshare", "baostock", "lxml", "requests", "tushare", "yfinance"), True),
     )
     monkeypatch.setattr(composition_module, "datetime", _DeterministicDateTime)
     monkeypatch.setattr(financial_dispatch_module, "datetime", _DeterministicDateTime)
@@ -793,6 +789,7 @@ def _fresh_builtin_run(
     config.update(
         {
             "mainland_capability_routing_mode": "qualified_v1_shadow",
+            "mainland_capability_routing_plan_version": plan_version,
             "tushare_enabled_capabilities": list(_ENABLED_CAPABILITIES),
             "tushare_qualification_profile": "cn-a-2000-20260729-v1",
             "tushare_account_scope_label": "personal-research-primary",
@@ -805,12 +802,19 @@ def _fresh_builtin_run(
             "results_dir": str(tmp_path / "results"),
         }
     )
+    if plan_version == "1.5":
+        # Retain this qualified fixture's one-second interval as explicit input,
+        # while exercising the same source-policy selection as production.
+        config.update(
+            cninfo_listing_publication_profile="cninfo-listing-publication-candidate-v1",
+            cninfo_source_policy_version="cninfo-source-policy-v1",
+            cninfo_operator_minimum_interval_seconds=1,
+        )
     asset = resolve_run_asset_configuration(symbol, config=config)
     preflight = preflight_mainland_capability_routing(asset, config=config)
     assert preflight.plan is not None
-    plan = prepare_mainland_listing_publication_candidate_plan(
-        prepare_mainland_temporal_capability_routing_plan(preflight.plan)
-    )
+    plan = preflight.plan
+    assert plan.plan_version == plan_version
     config["asset_configuration_signature"] = asset.asset_configuration_signature
     config["mainland_capability_routing_plan_signature"] = plan.plan_signature
     vendor_methods = _legacy_vendor_methods()
@@ -829,6 +833,16 @@ def _fresh_builtin_run(
         "baostock": _BaoStockProvider(symbol),
         "cninfo": _CninfoProvider(symbol),
     }
+    monkeypatch.setattr(
+        RequestsCninfoHttpTransport,
+        "post_form",
+        lambda _self, *args, **kwargs: providers["cninfo"].post_form(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        RequestsCninfoHttpTransport,
+        "get_document",
+        lambda _self, *args, **kwargs: providers["cninfo"].get_document(*args, **kwargs),
+    )
     production_factories = composition_module.production_qualified_routing_runtime_factories()
     history_config = MarketHistoryConfig.from_mapping(config)
     with MarketHistoryStore.open(history_config) as primary_store:
@@ -936,40 +950,10 @@ def _fresh_builtin_run(
         checkpoint_compatibility_known=True,
         checkpoint_thread_id=checkpoint_thread_id,
         analysis_as_of_date=_AS_OF,
-        authoritative_listing_board=CninfoListingBoard.XSHG_MAIN,
     )
     assert runtime is not None
     owner = host.financial_eligibility_context_owner
     assert owner is not None
-    cache = owner._unbound_financial_routing.provider_subrequest_cache
-    assert cache is not None
-    coordinator = cache._coordinator
-    for provider_id in ("cninfo_metadata", "cninfo_documents"):
-        upstream_id, service_name = upstream_service_identity_for_provider(provider_id)
-        coordinator.register_upstream_service(
-            upstream_id,
-            service_name,
-        )
-        coordinator.configure_operator_ceiling(
-            upstream_service_id=upstream_id,
-            minimum_interval=timedelta(seconds=1),
-            allow_prewarming=False,
-            configured_at=_NOW,
-        )
-    owner._metadata_acquirer.bind_listing_publication_source(
-        CninfoListingPublicationAdapter(
-            subrequest_cache=cache,
-            transport=providers["cninfo"],
-            source_policy=CninfoSourcePolicy(
-                data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
-                operator_minimum_interval_seconds=1,
-            ),
-            owner_id=run_id,
-            now=lambda: _DeterministicDateTime.now(timezone.utc),
-            sleep=_DeterministicDateTime.advance,
-            lease_duration=timedelta(seconds=30),
-        ).acquire
-    )
     financial_node = host.tool_nodes["fundamentals"]
     assert isinstance(financial_node, FinancialDispatchToolNode)
     assert financial_node._qualified_context_owner is (

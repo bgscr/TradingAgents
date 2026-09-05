@@ -1923,9 +1923,18 @@ def is_mainland_equity_configuration(
 def capability_routing_configuration_is_explicit(
     config: Mapping[str, Any],
 ) -> bool:
+    from tradingagents.cninfo_production_binding import (
+        CNINFO_PRODUCTION_CONFIG_KEYS,
+        PRODUCTION_PLAN_VERSION_CONFIG_KEY,
+    )
+
     return (
         str(config.get("mainland_capability_routing_mode", "legacy")) != "legacy"
         or bool(config.get("tushare_enabled_capabilities", ()))
+        or any(
+            config.get(key) is not None
+            for key in (PRODUCTION_PLAN_VERSION_CONFIG_KEY, *CNINFO_PRODUCTION_CONFIG_KEYS)
+        )
     )
 
 
@@ -2347,6 +2356,10 @@ def preflight_mainland_capability_routing(
             MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED
         )
     if mode is MainlandCapabilityRoutingMode.LEGACY:
+        if capability_routing_configuration_is_explicit(config):
+            return _blocked(
+                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID
+            )
         return MainlandCapabilityRoutingPreflight(
             passed=True,
             plan=_build_plan(
@@ -2429,17 +2442,29 @@ def preflight_mainland_capability_routing(
         return _blocked(
             MainlandCapabilityRoutingFailureReason.TUSHARE_ACCOUNT_SCOPE_INVALID
         )
-    return MainlandCapabilityRoutingPreflight(
-        passed=True,
-        plan=_build_plan(
-            mode=mode,
-            enabled=enabled,
-            qualification_profile=qualification_profile,
-            account_scope_label=account_scope_label,
-            calls_per_minute=calls_per_minute,
-            operator_calls_per_minute=operator_calls_per_minute,
-        )
+    plan = _build_plan(
+        mode=mode,
+        enabled=enabled,
+        qualification_profile=qualification_profile,
+        account_scope_label=account_scope_label,
+        calls_per_minute=calls_per_minute,
+        operator_calls_per_minute=operator_calls_per_minute,
     )
+    from tradingagents.cninfo_production_binding import (
+        select_production_mainland_capability_routing_plan,
+    )
+
+    try:
+        plan = select_production_mainland_capability_routing_plan(
+            plan,
+            asset_configuration=asset_configuration,
+            config=config,
+        )
+    except (TypeError, ValueError):
+        return _blocked(
+            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID
+        )
+    return MainlandCapabilityRoutingPreflight(passed=True, plan=plan)
 
 
 __all__ = [
