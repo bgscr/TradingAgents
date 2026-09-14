@@ -205,6 +205,8 @@ from tradingagents.market_history.coordinator import (
     upstream_service_identity_for_provider,
 )
 from tradingagents.market_history.store import MarketHistoryStore
+from tradingagents.policy_qualified_contract import DownstreamEnvelope, canonical_bytes, strict_json
+from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 from tradingagents.qualified_routing_lifecycle import (
     ProductionQualifiedRoutingLifecycleDiagnostic,
     ProductionQualifiedRoutingLifecycleError,
@@ -556,27 +558,138 @@ class ProductionQualifiedRoutingPreparation(BaseModel):
         return self.qualified_source.qualified_source_identity
 
 
+class ConditionalProductionQualifiedRoutingSourceBinding(BaseModel):
+    """Conditional source support; always resolve the full result through its owner."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+    contract_version: Literal["production-policy-qualified-routing-source-binding-v1"]
+    commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tree_hash: str = Field(pattern=r"^[0-9a-f]{40}$")
+    production_inventory_identity: str = Field(
+        pattern=r"^production-python-modules:v1:sha256:[0-9a-f]{64}$"
+    )
+    qualified_source_identity: str = Field(
+        pattern=r"^policy-qualified-execution-result:v1:sha256:[0-9a-f]{64}$"
+    )
+    acceptance: DownstreamEnvelope
+
+    @model_validator(mode="after")
+    def _source(self) -> ConditionalProductionQualifiedRoutingSourceBinding:
+        core = self.acceptance.core
+        if (
+            self.commit_id != core.candidate.commit
+            or self.tree_hash != core.candidate.tree
+            or self.qualified_source_identity != core.result.identity
+        ):
+            raise ValueError("conditional source lost its exact result/candidate binding")
+        return self
+
+
+class ConditionalProductionQualifiedRoutingPreparation(BaseModel):
+    """Complete conditional configuration seal; unsupported by legacy native launch."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+    contract_version: Literal["production-policy-qualified-routing-preparation-v1"]
+    plan_version: Literal["1.4", "1.5"]
+    plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
+    blueprint_identity: str = Field(
+        pattern=r"^production-qualified-routing-blueprint:v1:[0-9a-f]{64}$"
+    )
+    factory_contract: ProductionQualifiedRoutingFactoryContract
+    qualified_source: ConditionalProductionQualifiedRoutingSourceBinding
+    execution_authorized: Literal[False]
+    preparation_identity: str = Field(
+        pattern=r"^production-policy-qualified-routing-preparation:v1:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _preparation(self) -> ConditionalProductionQualifiedRoutingPreparation:
+        if self.plan_signature != self.factory_contract.plan_signature or (
+            (self.plan_version == "1.5") != (self.factory_contract.cninfo_binding is not None)
+        ):
+            raise ValueError("conditional preparation plan/factory contract contradict")
+        expected = "production-policy-qualified-routing-preparation:v1:" + _canonical_digest(
+            self.model_dump(mode="json", exclude={"preparation_identity"})
+        )
+        if self.preparation_identity != expected:
+            raise ValueError("conditional preparation identity mismatch")
+        return self
+
+    @property
+    def qualified_source_identity(self) -> str:
+        return self.qualified_source.qualified_source_identity
+
+
+def _parse_production_source(
+    value: object,
+) -> ProductionQualifiedRoutingSourceBinding | ConditionalProductionQualifiedRoutingSourceBinding:
+    if isinstance(value, (bytes, str)):
+        value = strict_json(value)
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, Mapping) and value.get("contract_version") == (
+        "production-policy-qualified-routing-source-binding-v1"
+    ):
+        return ConditionalProductionQualifiedRoutingSourceBinding.model_validate_json(
+            canonical_bytes(value)
+        )
+    return ProductionQualifiedRoutingSourceBinding.model_validate(value)
+
+
+def parse_production_preparation(
+    value: object,
+) -> ProductionQualifiedRoutingPreparation | ConditionalProductionQualifiedRoutingPreparation:
+    """Structural parsing only; conditional callers must also use the verifier."""
+    if isinstance(value, (bytes, str)):
+        value = strict_json(value)
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, Mapping) and value.get("contract_version") == (
+        "production-policy-qualified-routing-preparation-v1"
+    ):
+        return ConditionalProductionQualifiedRoutingPreparation.model_validate_json(
+            canonical_bytes(value)
+        )
+    return ProductionQualifiedRoutingPreparation.model_validate(value)
+
+
+def verify_conditional_production_source(
+    source: ConditionalProductionQualifiedRoutingSourceBinding,
+    verifier: PolicyQualifiedVerifier | None,
+) -> None:
+    if not isinstance(verifier, PolicyQualifiedVerifier):
+        raise ValueError("conditional source requires the trusted readiness owner's verifier")
+    candidate, inventory = verifier.current_source(source.acceptance)
+    if (
+        source.commit_id != candidate.commit
+        or source.tree_hash != candidate.tree
+        or source.production_inventory_identity != inventory
+    ):
+        raise ValueError("conditional source is not the owner's current production source")
+
+
 def seal_production_qualified_routing_preparation(
     *,
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
     current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
-) -> ProductionQualifiedRoutingPreparation:
-    """Bind a verified source chain to current configuration without I/O.
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+) -> ProductionQualifiedRoutingPreparation | ConditionalProductionQualifiedRoutingPreparation:
+    """Bind a verified source chain to current configuration.
 
     The preparation owner supplies its independently verified current source and
     qualified chain identities. This comparison cannot perform qualification or
-    grant launch approval. No thread, packet, resource, or persisted state is created.
+    grant launch approval. No thread, packet or attempt resource is created.
+    Legacy sealing remains pure; conditional sealing checks the trusted owner's
+    retained evidence and may permanently record observed expiry/revocation.
     """
 
-    def source_binding(value: object) -> ProductionQualifiedRoutingSourceBinding:
-        if isinstance(value, ProductionQualifiedRoutingSourceBinding):
-            value = value.model_dump(mode="json")
-        return ProductionQualifiedRoutingSourceBinding.model_validate(value)
-
-    qualified = source_binding(qualified_source)
-    if qualified != source_binding(current_source):
+    qualified = _parse_production_source(qualified_source)
+    if qualified != _parse_production_source(current_source):
         raise ValueError("qualified source chain does not match current source")
+    conditional = isinstance(qualified, ConditionalProductionQualifiedRoutingSourceBinding)
+    if conditional:
+        verify_conditional_production_source(qualified, policy_verifier)
     if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
         raise ValueError("production preparation requires a validated blueprint")
     # Revalidate serialized values, including objects produced by model_copy.
@@ -591,7 +704,11 @@ def seal_production_qualified_routing_preparation(
         }
     )
     payload = {
-        "contract_version": "production-qualified-routing-preparation-v1",
+        "contract_version": (
+            "production-policy-qualified-routing-preparation-v1"
+            if conditional
+            else "production-qualified-routing-preparation-v1"
+        ),
         "plan_version": validated.routing_plan.plan_version,
         "plan_signature": validated.plan_signature,
         "blueprint_identity": validated.blueprint_identity,
@@ -599,11 +716,20 @@ def seal_production_qualified_routing_preparation(
         "qualified_source": qualified.model_dump(mode="json"),
         "execution_authorized": False,
     }
-    return ProductionQualifiedRoutingPreparation(
-        **payload,
-        preparation_identity="production-qualified-routing-preparation:v1:"
-        + _canonical_digest(payload),
+    model = (
+        ConditionalProductionQualifiedRoutingPreparation
+        if conditional
+        else ProductionQualifiedRoutingPreparation
     )
+    prefix = (
+        "production-policy-qualified-routing-preparation:v1:"
+        if conditional
+        else "production-qualified-routing-preparation:v1:"
+    )
+    payload["preparation_identity"] = prefix + _canonical_digest(payload)
+    if conditional:
+        return model.model_validate_json(canonical_bytes(payload))
+    return model.model_validate(payload)
 
 
 def validate_production_qualified_routing_preparation(
@@ -612,16 +738,16 @@ def validate_production_qualified_routing_preparation(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
     current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
-) -> ProductionQualifiedRoutingPreparation:
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+) -> ProductionQualifiedRoutingPreparation | ConditionalProductionQualifiedRoutingPreparation:
     """Reject stale or mismatched preparation values before a packet can use them."""
 
-    if isinstance(preparation, ProductionQualifiedRoutingPreparation):
-        preparation = preparation.model_dump(mode="json")
-    validated = ProductionQualifiedRoutingPreparation.model_validate(preparation)
+    validated = parse_production_preparation(preparation)
     expected = seal_production_qualified_routing_preparation(
         blueprint=blueprint,
         qualified_source=qualified_source,
         current_source=current_source,
+        policy_verifier=policy_verifier,
     )
     if validated != expected:
         raise ValueError("preparation does not match current production configuration")

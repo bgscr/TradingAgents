@@ -18,6 +18,9 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tradingagents.policy_qualified_contract import DownstreamEnvelope, strict_json
+from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
+
 _CLOSED = ConfigDict(extra="forbid", frozen=True, strict=True)
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Identity = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9:-]*:v[1-9][0-9]*:sha256:[0-9a-f]{64}$")]
@@ -57,7 +60,9 @@ class AttemptInputs(BaseModel):
     Repeating these inputs is an attempt to reuse the same claim and must fail.
     """
 
-    model_config = _CLOSED
+    # A conditional subclass must not enter a legacy consumer as an already
+    # validated base instance. Revalidate its discriminant and complete fields.
+    model_config = ConfigDict(**_CLOSED, revalidate_instances="always")
     contract_version: Literal["runtime-protection-attempt-v1"] = CONTRACT_VERSION
     namespace_root: str
     namespace_identity: str = Field(
@@ -108,8 +113,37 @@ class AttemptPaths(BaseModel):
     claim_root: str
 
 
+class ConditionalAttemptInputs(AttemptInputs):
+    """New namespace and inseparable caveat; legacy native hosts reject this."""
+
+    contract_version: Literal["policy-qualified-runtime-protection-attempt-v1"]
+    qualified_source_identity: str = Field(
+        pattern=r"^policy-qualified-execution-result:v1:sha256:[0-9a-f]{64}$"
+    )
+    production_preparation_identity: str = Field(
+        pattern=r"^production-policy-qualified-routing-preparation:v1:[0-9a-f]{64}$"
+    )
+    acceptance: DownstreamEnvelope
+
+    @model_validator(mode="after")
+    def _conditional_binding(self) -> ConditionalAttemptInputs:
+        core = self.acceptance.core
+        if (
+            self.source_commit != core.candidate.commit
+            or self.source_tree != core.candidate.tree
+            or self.qualified_source_identity != core.result.identity
+        ):
+            raise ValueError("attempt lost the conditional result/candidate binding")
+        return self
+
+
 def _paths(inputs: AttemptInputs) -> tuple[str, AttemptPaths]:
-    identity = evidence_identity("runtime-protection-attempt:v1", inputs.model_dump(mode="json"))
+    namespace_name = (
+        "policy-qualified-runtime-protection-attempt:v1"
+        if isinstance(inputs, ConditionalAttemptInputs)
+        else "runtime-protection-attempt:v1"
+    )
+    identity = evidence_identity(namespace_name, inputs.model_dump(mode="json"))
     digest = identity.rsplit(":", 1)[1]
     namespace = PureWindowsPath(inputs.namespace_root)
     root = namespace / "attempts" / digest
@@ -143,25 +177,88 @@ class ProtectionAttempt(BaseModel):
         return self
 
 
-def derive_attempt(inputs: AttemptInputs) -> ProtectionAttempt:
-    """Derive new paths without filesystem, provider, model, or random I/O."""
+class ConditionalProtectionAttempt(BaseModel):
+    model_config = _CLOSED
+    contract_version: Literal["policy-qualified-runtime-protection-attempt-v1"]
+    inputs: ConditionalAttemptInputs
+    attempt_identity: Identity
+    paths: AttemptPaths
+    execution_authorized: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _binding(self) -> ConditionalProtectionAttempt:
+        identity, paths = _paths(self.inputs)
+        if self.attempt_identity != identity or self.paths != paths:
+            raise ValueError("conditional attempt identity/path binding mismatch")
+        return self
+
+
+def derive_attempt(
+    inputs: AttemptInputs,
+    *,
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+) -> ProtectionAttempt | ConditionalProtectionAttempt:
+    """Derive paths; conditional inputs first revalidate owner-backed evidence.
+
+    Legacy derivation remains pure. Neither branch creates attempt paths or
+    launches anything; conditional expiry/revocation may invalidate its ledger.
+    """
+    if isinstance(inputs, ConditionalAttemptInputs):
+        inputs = ConditionalAttemptInputs.model_validate_json(
+            canonical_bytes(inputs.model_dump(mode="json"))
+        )
+        if not isinstance(policy_verifier, PolicyQualifiedVerifier):
+            raise ValueError("conditional attempt requires fresh trusted authority resolution")
+        policy_verifier.verify_downstream(inputs.acceptance)
+        identity, paths = _paths(inputs)
+        return ConditionalProtectionAttempt(
+            contract_version="policy-qualified-runtime-protection-attempt-v1",
+            inputs=inputs,
+            attempt_identity=identity,
+            paths=paths,
+        )
     inputs = AttemptInputs.model_validate(inputs.model_dump(mode="json"))
     identity, paths = _paths(inputs)
     return ProtectionAttempt(inputs=inputs, attempt_identity=identity, paths=paths)
 
 
-def bind_production_preparation(preparation: object, **inputs: Any) -> ProtectionAttempt:
+def bind_production_preparation(
+    preparation: object,
+    *,
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+    **inputs: Any,
+) -> ProtectionAttempt | ConditionalProtectionAttempt:
     """Add attempt identity to the existing production configuration seal.
 
     The qualified-source equality and Plan/CNINFO policy checks stay owned by
     the existing preparation interface. This adapter adds no execution grant.
     """
-    from tradingagents.qualified_routing_composition import ProductionQualifiedRoutingPreparation
+    from tradingagents.qualified_routing_composition import (
+        ConditionalProductionQualifiedRoutingPreparation,
+        parse_production_preparation,
+        verify_conditional_production_source,
+    )
 
-    if isinstance(preparation, ProductionQualifiedRoutingPreparation):
-        preparation = preparation.model_dump(mode="json")
-    prepared = ProductionQualifiedRoutingPreparation.model_validate(preparation)
+    prepared = parse_production_preparation(preparation)
     source = prepared.qualified_source
+    if isinstance(prepared, ConditionalProductionQualifiedRoutingPreparation):
+        verify_conditional_production_source(source, policy_verifier)
+        return derive_attempt(
+            ConditionalAttemptInputs.model_validate_json(
+                canonical_bytes(
+                    {
+                        **inputs,
+                        "contract_version": "policy-qualified-runtime-protection-attempt-v1",
+                        "source_commit": source.commit_id,
+                        "source_tree": source.tree_hash,
+                        "qualified_source_identity": source.qualified_source_identity,
+                        "production_preparation_identity": prepared.preparation_identity,
+                        "acceptance": source.acceptance.model_dump(mode="json"),
+                    }
+                )
+            ),
+            policy_verifier=policy_verifier,
+        )
     return derive_attempt(
         AttemptInputs(
             **inputs,
@@ -171,6 +268,23 @@ def bind_production_preparation(preparation: object, **inputs: Any) -> Protectio
             production_preparation_identity=prepared.preparation_identity,
         )
     )
+
+
+def validate_conditional_attempt(
+    value: object,
+    *,
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+) -> ConditionalProtectionAttempt:
+    """Revalidate serialized contract support; this never permits a native launch."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, (bytes, str)):
+        value = strict_json(value)
+    attempt = ConditionalProtectionAttempt.model_validate_json(canonical_bytes(value))
+    expected = derive_attempt(attempt.inputs, policy_verifier=policy_verifier)
+    if attempt != expected:
+        raise ValueError("conditional attempt does not match its complete current binding")
+    return attempt
 
 
 def _relative(value: str) -> str:

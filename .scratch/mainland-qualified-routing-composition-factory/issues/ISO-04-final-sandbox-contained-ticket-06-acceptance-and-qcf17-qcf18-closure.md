@@ -37,6 +37,14 @@ baseline freeze.
 
 ## Observable behavior
 
+Prospective source support for a distinct, inactive conditional outer result is
+specified in [policy-qualified result v1](../../../docs/contracts/policy-qualified-result-v1.md).
+Adoption/activation requires the separately evidenced specification and policy
+authorities described there. It does not alter this issue's recorded outcomes,
+current-run zero-delta/no-waiver rule, mandatory predicates or legacy FINAL PASS
+meaning. A conditional result preserves unresolved historical raw inequality and
+cannot be represented as unconditional ready-v1 or authorize Ticket 07.
+
 - One qualified Sandbox invocation executes systemic persistence isolation;
   CAL-01 through CAL-04 deterministic suites; 06B temporal acceptance;
   QCF1–QCF18; PE1–PE15; AC1–AC13; live-test isolation; non-integration; two full
