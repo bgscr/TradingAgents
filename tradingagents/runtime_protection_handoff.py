@@ -17,6 +17,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.policy_qualified_contract import DownstreamEnvelope, strict_json, utc
+from tradingagents.policy_qualified_native import (
+    NativeOwnerBinding,
+    PreparedConditionalProtectionAttempt,
+    build_conditional_inert_control,
+)
+from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 from tradingagents.runtime_protection import (
     Identity,
     PreparedProtectionAttempt,
@@ -27,7 +34,9 @@ from tradingagents.runtime_protection import (
 
 
 class HandoffContract(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, allow_inf_nan=False, revalidate_instances="always"
+    )
     contract_version: Literal["runtime-protection-handoff-v1"]
     preparation_lineage_identity: Identity
     plan_version: Literal["1.5"]
@@ -56,6 +65,18 @@ class HandoffContract(BaseModel):
             raise ValueError("handoff expiry must be explicit UTC")
         if any("\0" in value for value in self.model_dump().values() if isinstance(value, str)):
             raise ValueError("invalid handoff string")
+        return self
+
+
+class ConditionalHandoffContract(HandoffContract):
+    contract_version: Literal["policy-qualified-runtime-protection-handoff-v2"]
+    acceptance: DownstreamEnvelope
+    owner_binding: NativeOwnerBinding
+
+    @model_validator(mode="after")
+    def _conditional_expiry(self) -> ConditionalHandoffContract:
+        if utc(self.valid_before_exclusive) > utc(self.acceptance.core.expires_utc):
+            raise ValueError("conditional handoff exceeds its acceptance window")
         return self
 
 
@@ -112,12 +133,22 @@ def bind_guard_receipt(
     source_receipt: Mapping[str, Any], context: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Accept the qualified guard's zero-I/O and fail-closed history contract."""
+    gate = HandoffContract.model_validate_json(canonical_bytes(context["handoff"]))
+    body = {
+        "contract_version": "runtime-protection-guard-v1",
+        **_guard_payload(source_receipt, context, gate),
+    }
+    return {**body, "identity": evidence_identity("runtime-protection-guard:v1", body)}
+
+
+def _guard_payload(
+    source_receipt: Mapping[str, Any], context: Mapping[str, Any], gate: HandoffContract
+) -> dict[str, Any]:
     receipt = dict(source_receipt)
     identity = receipt.pop("identity", "")
     namespace, separator, _ = identity.rpartition(":sha256:")
     if not separator or evidence_identity(namespace, receipt) != identity:
         raise ValueError("qualified guard receipt identity mismatch")
-    gate = HandoffContract.model_validate_json(canonical_bytes(context["handoff"]))
     for key, expected in {
         "status": "PASS",
         "packet_identity": context["packet_identity"],
@@ -160,8 +191,7 @@ def bind_guard_receipt(
             or receipt[key] != expected
         ):
             raise ValueError(f"qualified guard scope failed: {key}")
-    body = {
-        "contract_version": "runtime-protection-guard-v1",
+    return {
         "phase": "guard",
         "attempt_identity": context["attempt_identity"],
         "prepared_identity": context["prepared_identity"],
@@ -193,7 +223,67 @@ def bind_guard_receipt(
             )
         },
     }
-    return {**body, "identity": evidence_identity("runtime-protection-guard:v1", body)}
+
+
+def build_conditional_guard_control(
+    prepared: Mapping[str, Any],
+    *,
+    guard_arguments: Sequence[str],
+    handoff: Mapping[str, Any],
+    policy_verifier: PolicyQualifiedVerifier,
+) -> dict[str, Any]:
+    """A forward guard-only control; it cannot produce a real Ticket-07 packet."""
+    value = PreparedConditionalProtectionAttempt.model_validate_json(canonical_bytes(prepared))
+    gate = ConditionalHandoffContract.model_validate_json(canonical_bytes(handoff))
+    inputs, config = value.attempt.inputs, value.mapped_configuration
+    if (
+        gate.acceptance != inputs.acceptance
+        or gate.owner_binding != value.owner_binding
+        or gate.preparation_lineage_identity != inputs.preparation_lineage_identity
+        or gate.analysis_session != inputs.completed_session
+        or config.get("cninfo_operator_minimum_interval_seconds")
+        != gate.cninfo_operator_minimum_interval_seconds
+        or config.get("output_language") != gate.output_language
+        or config.get("mainland_capability_routing_mode") != "qualified_v1_shadow"
+    ):
+        raise ValueError(
+            "conditional handoff changes history, source, owner, session or sealed configuration"
+        )
+    control = build_conditional_inert_control(
+        prepared, child_arguments=guard_arguments, policy_verifier=policy_verifier
+    )
+    control.pop("identity")
+    control.update(
+        operation="guard_only", handoff=gate.model_dump(mode="json"), live_child_arguments=None
+    )
+    return {
+        **control,
+        "identity": evidence_identity("policy-qualified-runtime-protection-control:v2", control),
+    }
+
+
+def bind_conditional_guard_receipt(
+    source_receipt: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    policy_verifier: PolicyQualifiedVerifier | None = None,
+) -> dict[str, Any]:
+    gate = ConditionalHandoffContract.model_validate_json(canonical_bytes(context["handoff"]))
+    if policy_verifier is None:
+        from tradingagents.windows_policy_owner import RegisteredWindowsPolicyVerifier
+
+        policy_verifier = RegisteredWindowsPolicyVerifier(gate.owner_binding.instance)
+    policy_verifier.verify_downstream(gate.acceptance)
+    body = {
+        "contract_version": "policy-qualified-runtime-protection-guard-v2",
+        **_guard_payload(source_receipt, context, gate),
+        "acceptance": gate.acceptance.model_dump(mode="json"),
+        "owner_binding": gate.owner_binding.model_dump(mode="json"),
+    }
+    return {
+        **body,
+        "identity": evidence_identity("policy-qualified-runtime-protection-guard:v2", body),
+    }
 
 
 def _owner_context(phase: str) -> dict[str, Any]:
@@ -255,7 +345,11 @@ def _exchange_with_owner(context: Mapping[str, Any], message: Mapping[str, Any])
         response = stream.readline(65537)
     if len(response) > 65536:
         raise ValueError("owner response exceeds bound")
-    result = json.loads(response)
+    conditional = (
+        context.get("handoff", {}).get("contract_version")
+        == "policy-qualified-runtime-protection-handoff-v2"
+    )
+    result = strict_json(response) if conditional else json.loads(response)
     if (
         result.get("attempt_identity") != context["attempt_identity"]
         or result.get("packet_identity") != context["packet_identity"]
@@ -263,6 +357,26 @@ def _exchange_with_owner(context: Mapping[str, Any], message: Mapping[str, Any])
         or result.get("accepted") is not True
     ):
         raise ValueError("native owner rejected protected phase")
+    if conditional and (
+        set(result)
+        != {
+            "phase",
+            "attempt_identity",
+            "packet_identity",
+            "accepted",
+            "acceptance",
+            "owner_binding",
+            "execution_authorized",
+        }
+        or (
+            DownstreamEnvelope.read(result["acceptance"])
+            != DownstreamEnvelope.read(context["handoff"]["acceptance"])
+            or NativeOwnerBinding.read(result["owner_binding"])
+            != NativeOwnerBinding.read(context["handoff"]["owner_binding"])
+            or result["execution_authorized"] is not False
+        )
+    ):
+        raise ValueError("native guard response lost the full conditional caveat or owner binding")
     return result
 
 
@@ -282,7 +396,13 @@ def run_bound_guard(qualified_guard: Callable[[], Mapping[str, Any]]) -> None:
     from tradingagents.default_config import DEFAULT_CONFIG
 
     context = validate_protected_configuration(DEFAULT_CONFIG, phase="guard")
-    _exchange_with_owner(context, bind_guard_receipt(qualified_guard(), context))
+    bind = (
+        bind_conditional_guard_receipt
+        if context["handoff"].get("contract_version")
+        == "policy-qualified-runtime-protection-handoff-v2"
+        else bind_guard_receipt
+    )
+    _exchange_with_owner(context, bind(qualified_guard(), context))
 
 
 def confirm_protected_step4(

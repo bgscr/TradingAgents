@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from hashlib import sha256
 from pathlib import Path
 
@@ -25,9 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def retained_root():
     # Outside pytest's retention/pruning tree. Even a later pytest invocation
     # must never attempt to reset or delete a deliberately stranded fixture.
-    parent = ROOT / "build/rp-retained"
+    external = os.environ.get("TRADINGAGENTS_NATIVE_TEST_ROOT")
+    parent = Path(external).resolve() if external else ROOT / "build/rp-retained"
+    if external and (not Path(external).is_absolute() or parent.is_relative_to(ROOT)):
+        raise ValueError("explicit native test retention must be an absolute external directory")
     parent.mkdir(parents=True, exist_ok=True)
-    root = parent / f"r{time.time_ns()}"
+    # Keep the separate CLR fixture executable below its own startup path
+    # limit; the payload tests still explicitly cover paths over MAX_PATH.
+    root = parent / ("r" + uuid.uuid4().hex[:8])
     root.mkdir()
     return root
 
@@ -111,6 +117,19 @@ def test_fresh_baseline_exact_restore_and_consumer_rejection(native_contract_hos
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "EXACT_BASELINE_RESTORED_AND_CONSUMED" in result.stdout
+
+
+def test_long_path_payload_preserves_complete_baseline(native_contract_host, tmp_path):
+    result = subprocess.run(
+        [str(native_contract_host), "long-path", str(tmp_path / "attempt")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "long-path creation, complete inventory and exact restoration" in result.stdout
 
 
 @pytest.mark.parametrize(

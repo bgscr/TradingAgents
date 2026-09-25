@@ -28,6 +28,9 @@ namespace TradingAgents.RuntimeProtection
             AppContext.SetSwitch("Switch.System.IO.UseLegacyPathHandling",false);
             AppContext.SetSwitch("Switch.System.IO.BlockLongPaths",false);
         }
+        // Force the initializer before an entrypoint's first managed path API;
+        // Framework compatibility switches are cached on their first use.
+        internal static void InitializePathRuntime() { }
         internal const uint ReadData=1, ReadAttributes=0x80, ReadControl=0x20000, WriteDac=0x40000;
         internal const uint Backup=0x02000000, Reparse=0x00200000, Dacl=4, ProtectedDacl=0x80000000;
         internal const string SealedDacl="D:P(D;;0x000D0156;;;WD)(D;;WD;;;OW)(A;;0x001200A9;;;WD)";
@@ -47,6 +50,17 @@ namespace TradingAgents.RuntimeProtection
         [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
         internal static extern SafeFileHandle CreateFileW(string path,uint access,uint share,
             IntPtr security,uint creation,uint flags,IntPtr template);
+        [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]
+        struct FindData
+        {
+            internal uint Attributes,CreationLow,CreationHigh,AccessLow,AccessHigh,WriteLow,WriteHigh,SizeHigh,SizeLow,Reserved0,Reserved1;
+            [MarshalAs(UnmanagedType.ByValTStr,SizeConst=260)] internal string Name;
+            [MarshalAs(UnmanagedType.ByValTStr,SizeConst=14)] internal string AlternateName;
+        }
+        [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetFileAttributesW(string path);
+        [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr FindFirstFileW(string pattern,out FindData data);
+        [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool FindNextFileW(IntPtr find,out FindData data);
+        [DllImport("kernel32.dll",SetLastError=true)] static extern bool FindClose(IntPtr find);
         [DllImport("ntdll.dll")]
         static extern int NtCreateFile(out SafeFileHandle handle,uint access,ref ObjectAttributes attributes,
             out IoStatusBlock status,IntPtr allocation,uint fileAttributes,uint share,uint disposition,
@@ -75,6 +89,41 @@ namespace TradingAgents.RuntimeProtection
         internal static extern bool SetDllDirectoryW(string path);
         [DllImport("kernel32.dll",SetLastError=true)]
         internal static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe,out uint processId);
+        [StructLayout(LayoutKind.Sequential)] struct TokenSidAndAttributes { internal IntPtr Sid;internal uint Attributes; }
+        [StructLayout(LayoutKind.Sequential)] struct TokenGroupFirst { internal uint Count;internal TokenSidAndAttributes First; }
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool GetTokenInformation(SafeAccessTokenHandle token,int kind,IntPtr value,uint length,out uint needed);
+        static List<KeyValuePair<string,uint>> TokenGroups(SafeAccessTokenHandle token,int informationClass=2)
+        {
+            // Query TOKEN_GROUPS directly. WindowsPrincipal may duplicate a
+            // primary token; readers must never receive TOKEN_DUPLICATE on the
+            // owner service merely to authenticate its enabled service SID.
+            uint needed;GetTokenInformation(token,informationClass,IntPtr.Zero,0,out needed);
+            if(needed==0||needed>4*1024*1024)throw new InvalidOperationException("Token group information unavailable");
+            IntPtr buffer=Marshal.AllocHGlobal((int)needed);
+            try
+            {
+                if(!GetTokenInformation(token,informationClass,buffer,needed,out needed))throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint count=unchecked((uint)Marshal.ReadInt32(buffer));int offset=Marshal.OffsetOf(typeof(TokenGroupFirst),"First").ToInt32();
+                int stride=Marshal.SizeOf(typeof(TokenSidAndAttributes));
+                if(count>4096||offset+(long)count*stride>needed)throw new InvalidOperationException("Invalid token group extent");
+                var result=new List<KeyValuePair<string,uint>>();
+                for(int index=0;index<count;index++)
+                {
+                    var group=(TokenSidAndAttributes)Marshal.PtrToStructure(IntPtr.Add(buffer,offset+index*stride),typeof(TokenSidAndAttributes));
+                    result.Add(new KeyValuePair<string,uint>(new SecurityIdentifier(group.Sid).Value,group.Attributes));
+                }
+                return result;
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+        internal static bool TokenHasEnabledSid(SafeAccessTokenHandle token,string sid)
+        {
+            foreach(var group in TokenGroups(token))if(group.Key==sid&&(group.Value&4)!=0&&(group.Value&16)==0)return true;
+            return false;
+        }
+        internal static string[] TokenRestrictingSids(SafeAccessTokenHandle token)
+        { var values=new List<string>();foreach(var entry in TokenGroups(token,11))values.Add(entry.Key);return values.ToArray(); }
 
         internal static byte[] FromSddl(string sddl)
         {
@@ -86,15 +135,15 @@ namespace TradingAgents.RuntimeProtection
         }
         internal static void CreateNewDirectory(string path,bool immutable)
         { using(var handle=CreateNewDirectoryHandle(path,immutable)) { } }
-        internal static SafeFileHandle CreateNewDirectoryHandle(string path,bool immutable)
+        internal static SafeFileHandle CreateNewDirectoryHandle(string path,bool immutable,string initialSddl=null)
         {
             LocalPath(path,false);
             string sid=WindowsIdentity.GetCurrent().User.Value;
             // The baseline is installed AT CREATION, before it is captured. Its
             // protected DACL avoids inheritance canonicalization during restoration.
-            string sddl=immutable
+            string sddl=initialSddl??(immutable
                 ? "D:P(D;;0x000D0040;;;WD)(D;;WD;;;OW)(A;;0x001200AF;;;"+sid+")(A;;0x001200AF;;;SY)"
-                : "D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)";
+                : "D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)");
             byte[] bytes=FromSddl(sddl);
             var pin=GCHandle.Alloc(bytes,GCHandleType.Pinned);
             string ntPath="\\??\\"+path;IntPtr text=Marshal.StringToHGlobalUni(ntPath);
@@ -114,6 +163,22 @@ namespace TradingAgents.RuntimeProtection
             }
             finally { Marshal.FreeHGlobal(name);Marshal.FreeHGlobal(text);pin.Free(); }
         }
+        internal static SafeFileHandle CreateNewOwnerFileHandle(string path,string sddl,bool writeThrough=false)
+        {
+            LocalPath(path,false);byte[] bytes=FromSddl(sddl);var pin=GCHandle.Alloc(bytes,GCHandleType.Pinned);
+            string ntPath="\\??\\"+path;IntPtr text=Marshal.StringToHGlobalUni(ntPath);
+            IntPtr name=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+            try
+            {
+                Marshal.StructureToPtr(new UnicodeString { Length=checked((ushort)(ntPath.Length*2)),MaximumLength=checked((ushort)(ntPath.Length*2+2)),Buffer=text },name,false);
+                var attributes=new ObjectAttributes { Length=Marshal.SizeOf(typeof(ObjectAttributes)),ObjectName=name,Attributes=0x40,SecurityDescriptor=pin.AddrOfPinnedObject() };
+                SafeFileHandle handle;IoStatusBlock status;
+                int result=NtCreateFile(out handle,ReadData|2u|ReadAttributes|ReadControl|WriteDac|0x100000,ref attributes,out status,IntPtr.Zero,0x80,1,2,0x40|0x20|Reparse|(writeThrough?2u:0u),IntPtr.Zero,0);
+                if(result<0) { if(handle!=null)handle.Dispose();throw new Win32Exception((int)RtlNtStatusToDosError(result),"Exclusive protected owner file creation failed"); }
+                return handle;
+            }
+            finally { Marshal.FreeHGlobal(name);Marshal.FreeHGlobal(text);pin.Free(); }
+        }
         internal static string LocalPath(string value,bool allowDriveRoot)
         {
             if(value==null||!Regex.IsMatch(value,"^[A-Z]:\\\\")||value.IndexOf('/')>=0||value.IndexOfAny(new char[]{'*','?','"','<','>','|'})>=0)
@@ -126,6 +191,40 @@ namespace TradingAgents.RuntimeProtection
                 if(part==""||part=="."||part==".."||part.EndsWith(".")||part.EndsWith(" ")||Regex.IsMatch(part,"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\\..*)?$",RegexOptions.IgnoreCase))
                     throw new InvalidDataException("Reserved/ambiguous path component");
             return value;
+        }
+        static bool Exists(string path,bool directory)
+        {
+            LocalPath(path,false);uint attributes=GetFileAttributesW("\\\\?\\"+path);
+            if(attributes==UInt32.MaxValue)
+            {
+                int error=Marshal.GetLastWin32Error();
+                if(error==2||error==3)return false;
+                throw new Win32Exception(error,"Cannot inspect protection object: "+path);
+            }
+            if((attributes&0x400)!=0)throw new InvalidOperationException("Reparse protection object rejected: "+path);
+            return ((attributes&0x10)!=0)==directory;
+        }
+        internal static bool DirectoryExists(string path) { return Exists(path,true); }
+        internal static bool FileExists(string path) { return Exists(path,false); }
+        internal static string[] DirectoryEntries(string path)
+        {
+            LocalPath(path,false);FindData data;IntPtr find=FindFirstFileW("\\\\?\\"+path+"\\*",out data);
+            if(find==new IntPtr(-1))
+            {
+                int error=Marshal.GetLastWin32Error();
+                if(error==2)return new string[0];
+                throw new Win32Exception(error,"Cannot enumerate protection directory: "+path);
+            }
+            var values=new List<string>();
+            try
+            {
+                do { if(data.Name!="."&&data.Name!="..")values.Add(LocalPath(path+"\\"+data.Name,false)); }
+                while(FindNextFileW(find,out data));
+                int error=Marshal.GetLastWin32Error();
+                if(error!=18)throw new Win32Exception(error,"Incomplete protection directory enumeration: "+path);
+            }
+            finally { FindClose(find); }
+            return values.ToArray();
         }
         internal static SafeFileHandle Open(string path,uint access,uint share)
         {
@@ -364,7 +463,7 @@ namespace TradingAgents.RuntimeProtection
             var anchors=Native.Anchor(root);
             try
             {
-                if(Directory.Exists(root)||File.Exists(root)||Directory.Exists(claim)||File.Exists(claim))
+                if(Native.DirectoryExists(root)||Native.FileExists(root)||Native.DirectoryExists(claim)||Native.FileExists(claim))
                     throw new InvalidOperationException("Attempt root or provenance already exists; never reusable");
                 // Atomic, permanent claim precedes object creation. A partial
                 // preparation is retained and can never become another baseline.
@@ -380,7 +479,7 @@ namespace TradingAgents.RuntimeProtection
             var anchors=Native.Anchor(root);
             try
             {
-                if(Directory.Exists(root)||File.Exists(root)||!Directory.Exists(claim))
+                if(Native.DirectoryExists(root)||Native.FileExists(root)||!Native.DirectoryExists(claim))
                     throw new InvalidOperationException("Reserved materialization is not fresh");
                 var tree=new FreshProtectionTree(root,claim,anchors);
                 try { tree.TrackCreated(root,Native.CreateNewDirectoryHandle(root,false));return tree; } catch { tree.Dispose();throw; }
@@ -391,9 +490,9 @@ namespace TradingAgents.RuntimeProtection
         {
             // This is the only existing-object entrypoint. It accepts a pinned
             // prepared baseline, never captures a replacement baseline.
-            if(!Directory.Exists(claim)||!Directory.Exists(Path.Combine(claim,"prepared-"+preparedDigest)))
+            if(!Native.DirectoryExists(claim)||!Native.DirectoryExists(Path.Combine(claim,"prepared-"+preparedDigest)))
                 throw new InvalidOperationException("Attempt provenance is missing or mismatched");
-            if(Directory.Exists(Path.Combine(claim,"consumed")))throw new InvalidOperationException("Attempt already consumed");
+            if(Native.DirectoryExists(Path.Combine(claim,"consumed")))throw new InvalidOperationException("Attempt already consumed");
             var tree=new FreshProtectionTree(root,claim,Native.Anchor(root));
             try
             {
@@ -433,7 +532,7 @@ namespace TradingAgents.RuntimeProtection
         }
         void RequirePreparing()
         {
-            if(disposed||consumed||Directory.Exists(Path.Combine(claim,"consumed")))
+            if(disposed||consumed||Native.DirectoryExists(Path.Combine(claim,"consumed")))
                 throw new InvalidOperationException("Protection attempt has been consumed");
         }
         public void WriteNewFile(string relative,byte[] content)
@@ -442,10 +541,12 @@ namespace TradingAgents.RuntimeProtection
             string directory=Path.GetDirectoryName(path);
             if(directory!=root)CreateDirectory(Native.Relative(root,directory));
             string sid=WindowsIdentity.GetCurrent().User.Value;
-            var security=new FileSecurity();
-            security.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)");
-            using(var stream=new FileStream(path,FileMode.CreateNew,FileSystemRights.Read|FileSystemRights.Write,
-                FileShare.Read,4096,FileOptions.None,security))
+            // Keep the same creation-time protected DACL and exclusive create,
+            // but pass the actual NT-created handle to FileStream. The path/
+            // FileSecurity overload applies a legacy MAX_PATH limit even when
+            // the canonical local path and its pinned parents are valid.
+            using(var created=Native.CreateNewOwnerFileHandle(path,"D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)"))
+            using(var stream=new FileStream(created,FileAccess.ReadWrite))
             {
                 stream.Write(content,0,content.Length); stream.Flush(true);
                 // Retain a read handle before closing the creation handle. The
@@ -464,7 +565,7 @@ namespace TradingAgents.RuntimeProtection
                     var information=Native.Information(handle); result.Add(path);
                     if((information.Attributes&0x10)!=0)
                     {
-                        var children=Directory.GetFileSystemEntries(path); Array.Sort(children,StringComparer.Ordinal);
+                        var children=Native.DirectoryEntries(path); Array.Sort(children,StringComparer.Ordinal);
                         foreach(string child in children)queue.Enqueue(child);
                     }
                 }
@@ -683,9 +784,9 @@ namespace TradingAgents.RuntimeProtection
         { if(!value)throw new InvalidOperationException(message); }
         internal static void WriteNew(string path,Dictionary<string,object> value)
         {
-            var security=new FileSecurity();string sid=WindowsIdentity.GetCurrent().User.Value;
-            security.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)");
-            using(var stream=new FileStream(path,FileMode.CreateNew,FileSystemRights.FullControl,FileShare.Read,4096,FileOptions.WriteThrough,security))
+            string sid=WindowsIdentity.GetCurrent().User.Value;
+            using(var created=Native.CreateNewOwnerFileHandle(path,"D:P(A;;FA;;;"+sid+")(A;;FA;;;SY)",true))
+            using(var stream=new FileStream(created,FileAccess.ReadWrite))
             {
                 byte[] bytes=Encoding.UTF8.GetBytes(Canonical(value));stream.Write(bytes,0,bytes.Length);stream.Flush(true);
                 // Permanent new evidence, not a restoration journal. No original
@@ -774,15 +875,39 @@ namespace TradingAgents.RuntimeProtection
         [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
         [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
         [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
+        [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
         [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int kind);
+        [StructLayout(LayoutKind.Sequential)] struct PrivilegeId { internal uint Low;internal int High; }
+        [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool LookupPrivilegeValueW(string system,string name,out PrivilegeId value);
+        [StructLayout(LayoutKind.Sequential)] struct PipeAttributes { internal int Length;internal IntPtr Descriptor;internal int Inherit; }
+        [DllImport("kernel32.dll",SetLastError=true)] static extern bool CreatePipe(out SafeFileHandle read,out SafeFileHandle write,ref PipeAttributes security,uint size);
+        [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(SafeFileHandle handle,uint mask,uint flags);
         [DllImport("kernel32.dll",SetLastError=true)] static extern bool DuplicateHandle(IntPtr sourceProcess,IntPtr source,IntPtr targetProcess,
             out IntPtr target,uint access,bool inherit,uint options);
         [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
         static extern bool CreateProcessW(string application,StringBuilder command,IntPtr processSecurity,IntPtr threadSecurity,
             bool inherit,uint flags,IntPtr environment,string cwd,ref Startup startup,out ProcessInformation information);
+        [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes
+        { internal IntPtr Sid;internal uint Attributes; }
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool OpenProcessToken(IntPtr process,uint access,out SafeAccessTokenHandle token);
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool CreateRestrictedToken(SafeAccessTokenHandle original,uint flags,uint disabledCount,ref SidAndAttributes disabled,
+            uint deletedPrivileges,IntPtr privileges,uint restrictedCount,IntPtr restricted,out SafeAccessTokenHandle token);
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool SetTokenInformation(SafeAccessTokenHandle token,int kind,IntPtr value,int length);
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool GetTokenInformation(SafeAccessTokenHandle token,int kind,IntPtr value,uint length,out uint needed);
+        [DllImport("advapi32.dll",SetLastError=true)]
+        static extern bool IsTokenRestricted(SafeAccessTokenHandle token);
+        [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+        static extern bool CreateProcessAsUserW(SafeAccessTokenHandle token,string application,StringBuilder command,IntPtr processSecurity,IntPtr threadSecurity,
+            bool inherit,uint flags,IntPtr environment,string cwd,ref Startup startup,out ProcessInformation information);
         [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process,int kind,out ProcessBasic value,int size,out int returned);
         IntPtr job;
+        readonly object jobLock=new object();
+        bool terminated;
         readonly Dictionary<int,IntPtr> processHandles=new Dictionary<int,IntPtr>();
         static IntPtr InheritableStandardHandle(int kind,List<IntPtr> owned)
         {
@@ -799,7 +924,102 @@ namespace TradingAgents.RuntimeProtection
             if(!SetInformationJobObject(job,9,ref limits,Marshal.SizeOf(typeof(ExtendedLimits))))
             { int error=Marshal.GetLastWin32Error();Dispose();throw new Win32Exception(error); }
         }
-        internal Process Start(ProcessStartInfo info,string quotedExecutable)
+        internal static SafeAccessTokenHandle ConditionalChildToken()
+        {
+            SafeAccessTokenHandle original;
+            // CreateRestrictedToken returns the same handle access mask as its
+            // input. ADJUST_DEFAULT is needed to lower the NEW token's integrity;
+            // ASSIGN_PRIMARY is needed to create its suspended process.
+            if(!OpenProcessToken(new IntPtr(-1),0x008b,out original))throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot open current token for restricted duplication");
+            using(original)
+            {
+                var administrator=new SecurityIdentifier("S-1-5-32-544");
+                byte[] adminBytes=new byte[administrator.BinaryLength];administrator.GetBinaryForm(adminBytes,0);
+                var adminPin=GCHandle.Alloc(adminBytes,GCHandleType.Pinned);
+                SafeAccessTokenHandle token=null;
+                try
+                {
+                    var disabled=new SidAndAttributes { Sid=adminPin.AddrOfPinnedObject() };
+                    // The owner is high integrity, the child is medium and has
+                    // administrator membership and privileged operations removed.
+                    // Durable state belongs to the distinct service SID, SYSTEM
+                    // and administrators, with only read access for this user.
+                    // No existing desktop or host-wide security policy is changed.
+                    if(!Native.TokenHasEnabledSid(original,"S-1-5-32-544"))throw new InvalidOperationException("Conditional launch requires the existing elevated native owner");
+                    RequireIntegrity(original,"S-1-16-12288");
+                    if(!CreateRestrictedToken(original,1u|4u,1,ref disabled,0,IntPtr.Zero,0,IntPtr.Zero,out token))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot create limited child token");
+                    var medium=new SecurityIdentifier("S-1-16-8192");byte[] sid=new byte[medium.BinaryLength];medium.GetBinaryForm(sid,0);
+                    int size=Marshal.SizeOf(typeof(SidAndAttributes));IntPtr label=Marshal.AllocHGlobal(size+sid.Length);
+                    try
+                    {
+                        IntPtr pointer=IntPtr.Add(label,size);Marshal.Copy(sid,0,pointer,sid.Length);
+                        Marshal.StructureToPtr(new SidAndAttributes { Sid=pointer,Attributes=0x20 },label,false);
+                        if(!SetTokenInformation(token,25,label,size+sid.Length))throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot lower restricted child integrity");
+                    }
+                    finally { Marshal.FreeHGlobal(label); }
+                    // Filtering retains the elevated token's default DACL. On
+                    // this host it grants BA/SYSTEM full access but the user only
+                    // read/execute via the logon SID. Give the NEW medium child
+                    // access to its own newly created process/thread objects.
+                    // This changes no owner process, store, or existing object.
+                    string user=WindowsIdentity.GetCurrent().User.Value;
+                    var defaults=new RawSecurityDescriptor("D:P(A;;GA;;;"+user+")(A;;GA;;;SY)(A;;GA;;;BA)");
+                    byte[] acl=new byte[defaults.DiscretionaryAcl.BinaryLength];defaults.DiscretionaryAcl.GetBinaryForm(acl,0);
+                    var aclPin=GCHandle.Alloc(acl,GCHandleType.Pinned);IntPtr defaultDacl=Marshal.AllocHGlobal(IntPtr.Size);
+                    try
+                    {
+                        Marshal.WriteIntPtr(defaultDacl,aclPin.AddrOfPinnedObject());
+                        if(!SetTokenInformation(token,6,defaultDacl,IntPtr.Size))throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot set fresh child object permissions");
+                    }
+                    finally { Marshal.FreeHGlobal(defaultDacl);aclPin.Free(); }
+                    return token;
+                }
+                catch { if(token!=null)token.Dispose();throw; }
+                finally { adminPin.Free(); }
+            }
+        }
+        static void VerifyConditionalChild(IntPtr process)
+        {
+            SafeAccessTokenHandle token;
+            if(!OpenProcessToken(process,8,out token))throw new Win32Exception(Marshal.GetLastWin32Error());
+            using(token)
+            using(var identity=new WindowsIdentity(token.DangerousGetHandle()))
+            {
+                if(Native.TokenHasEnabledSid(token,"S-1-5-32-544")
+                    ||identity.User.Value!=WindowsIdentity.GetCurrent().User.Value)
+                    throw new InvalidOperationException("Conditional child inherited owner/administrator authority");
+                RequireIntegrity(token,"S-1-16-8192");
+                uint needed;GetTokenInformation(token,3,IntPtr.Zero,0,out needed);
+                if(needed==0||needed>4096)throw new InvalidOperationException("Child privilege information unavailable");
+                IntPtr privileges=Marshal.AllocHGlobal((int)needed);
+                try
+                {
+                    if(!GetTokenInformation(token,3,privileges,needed,out needed))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    // Resolve the local LUID; numerical privilege identifiers
+                    // are not an authorization contract.
+                    PrivilegeId permitted;
+                    if(!LookupPrivilegeValueW(null,"SeChangeNotifyPrivilege",out permitted))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    int count=Marshal.ReadInt32(privileges);
+                    if(count>1||count<0||(count==1&&(unchecked((uint)Marshal.ReadInt32(privileges,4))!=permitted.Low||Marshal.ReadInt32(privileges,8)!=permitted.High)))
+                        throw new InvalidOperationException("Conditional child retained privileged operations");
+                }
+                finally { Marshal.FreeHGlobal(privileges); }
+            }
+        }
+        static void RequireIntegrity(SafeAccessTokenHandle token,string expected)
+        {
+                uint needed;GetTokenInformation(token,25,IntPtr.Zero,0,out needed);
+                if(needed==0||needed>4096)throw new InvalidOperationException("Conditional child integrity is unavailable");
+                IntPtr value=Marshal.AllocHGlobal((int)needed);
+                try
+                {
+                    if(!GetTokenInformation(token,25,value,needed,out needed))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    if(new SecurityIdentifier(Marshal.ReadIntPtr(value)).Value!=expected)throw new InvalidOperationException("Native owner/child integrity boundary mismatch");
+                }
+                finally { Marshal.FreeHGlobal(value); }
+        }
+        internal Process Start(ProcessStartInfo info,string quotedExecutable,bool conditional=false,Action beforeResume=null,IntPtr[] redirectedHandles=null)
         {
             var names=new List<string>();foreach(string name in info.EnvironmentVariables.Keys)names.Add(name);
             names.Sort(StringComparer.OrdinalIgnoreCase);var block=new StringBuilder();
@@ -810,18 +1030,43 @@ namespace TradingAgents.RuntimeProtection
             ProcessInformation created=new ProcessInformation();Process result=null;
             try
             {
-                startup.Input=InheritableStandardHandle(-10,standardHandles);
-                startup.Output=InheritableStandardHandle(-11,standardHandles);
-                startup.Error=InheritableStandardHandle(-12,standardHandles);
+                if(redirectedHandles!=null)
+                {
+                    if(redirectedHandles.Length!=3)throw new InvalidDataException("Three explicit child standard handles required");
+                    startup.Input=redirectedHandles[0];startup.Output=redirectedHandles[1];startup.Error=redirectedHandles[2];
+                }
+                else
+                {
+                    if(info.RedirectStandardInput||info.RedirectStandardOutput||info.RedirectStandardError)throw new InvalidDataException("Redirection requires explicit protected pipe handles");
+                    startup.Input=InheritableStandardHandle(-10,standardHandles);
+                    startup.Output=InheritableStandardHandle(-11,standardHandles);
+                    startup.Error=InheritableStandardHandle(-12,standardHandles);
+                }
                 // Suspension closes the redirector-spawn/assignment race. Every
                 // interpreter descendant enters this attempt's job before any
                 // application code runs, and dies if this owner disappears.
-                if(!CreateProcessW(info.FileName,new StringBuilder(quotedExecutable+" "+info.Arguments),IntPtr.Zero,IntPtr.Zero,true,
-                    4u|0x400u|(info.CreateNoWindow?0x08000000u:0u),environment,info.WorkingDirectory,ref startup,out created))throw new Win32Exception(Marshal.GetLastWin32Error());
-                if(!AssignProcessToJobObject(job,created.Process))throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot assign fresh child to protection lifetime");
+                uint flags=4u|0x400u|(info.CreateNoWindow?0x08000000u:0u);
+                if(conditional)
+                {
+                    using(var token=ConditionalChildToken())
+                        if(!CreateProcessAsUserW(token,info.FileName,new StringBuilder(quotedExecutable+" "+info.Arguments),IntPtr.Zero,IntPtr.Zero,true,
+                            flags,environment,info.WorkingDirectory,ref startup,out created))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    VerifyConditionalChild(created.Process);
+                }
+                else if(!CreateProcessW(info.FileName,new StringBuilder(quotedExecutable+" "+info.Arguments),IntPtr.Zero,IntPtr.Zero,true,
+                    flags,environment,info.WorkingDirectory,ref startup,out created))throw new Win32Exception(Marshal.GetLastWin32Error());
+                lock(jobLock)
+                {
+                    if(terminated||job==IntPtr.Zero)throw new InvalidOperationException("Protection lifetime was cancelled before assignment");
+                    if(!AssignProcessToJobObject(job,created.Process))throw new Win32Exception(Marshal.GetLastWin32Error(),"Cannot assign fresh child to protection lifetime");
+                }
                 result=Process.GetProcessById((int)created.ProcessId);
-                if(result.Handle==IntPtr.Zero)throw new InvalidOperationException("Fresh child handle unavailable");
-                if(ResumeThread(created.Thread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error());
+                if(beforeResume!=null)beforeResume();
+                lock(jobLock)
+                {
+                    if(terminated||job==IntPtr.Zero)throw new InvalidOperationException("Protection lifetime was cancelled before resume");
+                    if(ResumeThread(created.Thread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
                 processHandles.Add(result.Id,created.Process);created.Process=IntPtr.Zero;
                 return result;
             }
@@ -871,6 +1116,69 @@ namespace TradingAgents.RuntimeProtection
             } while(timer.ElapsedMilliseconds<10000);
             return false;
         }
+        internal void Terminate()
+        {
+            lock(jobLock)
+            {
+                terminated=true;
+                if(job!=IntPtr.Zero&&!TerminateJobObject(job,1))throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+        static byte[] ReadBounded(Stream stream,int maximum)
+        {
+            using(var memory=new MemoryStream())
+            {
+                byte[] buffer=new byte[65536];int count;
+                while((count=stream.Read(buffer,0,buffer.Length))!=0)
+                {
+                    if(memory.Length+count>maximum)throw new InvalidDataException("Protected worker output exceeds bound");
+                    memory.Write(buffer,0,count);
+                }
+                return memory.ToArray();
+            }
+        }
+        internal byte[] RunRedirected(ProcessStartInfo info,string quotedExecutable,byte[] request,int milliseconds)
+        {
+            if(request.Length>64*1024*1024)throw new InvalidDataException("Protected worker input exceeds bound");
+            var handles=new List<SafeFileHandle>();var streams=new List<Stream>();
+            try
+            {
+                var security=new PipeAttributes { Length=Marshal.SizeOf(typeof(PipeAttributes)),Inherit=1 };
+                var childHandles=new IntPtr[3];var childOwned=new List<SafeFileHandle>();
+                for(int index=0;index<3;index++)
+                {
+                    SafeFileHandle read,write;
+                    if(!CreatePipe(out read,out write,ref security,65536))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    handles.Add(read);handles.Add(write);
+                    var parent=index==0?write:read;var child=index==0?read:write;
+                    if(!SetHandleInformation(parent,1,0))throw new Win32Exception(Marshal.GetLastWin32Error());
+                    streams.Add(new FileStream(parent,index==0?FileAccess.Write:FileAccess.Read,4096,false));
+                    childHandles[index]=child.DangerousGetHandle();childOwned.Add(child);
+                }
+                using(var deadline=new ChildDeadline(this,milliseconds,null))
+                using(var child=Start(info,quotedExecutable,false,delegate { deadline.Check(); },childHandles))
+                {
+                    foreach(var handle in childOwned)handle.Dispose();
+                    var input=Task.Run(delegate { try { streams[0].Write(request,0,request.Length); } finally { streams[0].Dispose(); } });
+                    var output=Task.Run(delegate { return ReadBounded(streams[1],64*1024*1024); });
+                    var errors=Task.Run(delegate { return ReadBounded(streams[2],1024*1024); });
+                    if(!Task.WaitAll(new Task[]{input,output,errors},deadline.Remaining))throw new System.TimeoutException("Protected worker exceeded its complete I/O deadline");
+                    uint waited=WaitForSingleObject(processHandles[child.Id],(uint)deadline.Remaining);
+                    if(waited==0xffffffff)throw new Win32Exception(Marshal.GetLastWin32Error());
+                    if(waited!=0)throw new System.TimeoutException("Protected worker exceeded its exit deadline");
+                    deadline.Check();
+                    if(ExitCode(child)!=0)throw new InvalidDataException("Registered verifier rejected request: "+new UTF8Encoding(false,true).GetString(errors.Result));
+                    return output.Result;
+                }
+            }
+            finally
+            {
+                // The worker and every descendant must stop before any caller
+                // accepts output or permits a later owner request to mutate state.
+                try { if(!Quiesce())throw new InvalidOperationException("Protected worker descendants survived"); }
+                finally { foreach(var stream in streams)stream.Dispose();foreach(var handle in handles)handle.Dispose(); }
+            }
+        }
         internal uint ExitCode(Process child)
         {
             uint code;if(!GetExitCodeProcess(processHandles[child.Id],out code))throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -878,9 +1186,47 @@ namespace TradingAgents.RuntimeProtection
         }
         public void Dispose()
         {
-            if(job!=IntPtr.Zero) { CloseHandle(job);job=IntPtr.Zero; }
+            lock(jobLock)if(job!=IntPtr.Zero) { CloseHandle(job);job=IntPtr.Zero; }
             foreach(var handle in processHandles.Values)CloseHandle(handle);processHandles.Clear();
         }
+    }
+
+    internal sealed class ChildDeadline : IDisposable
+    {
+        readonly Stopwatch elapsed=Stopwatch.StartNew();
+        readonly int maximum;
+        readonly System.Threading.Timer timer;
+        volatile bool expired;
+        Exception terminationError;
+        internal ChildDeadline(ProtectedChildren children,int milliseconds,Action cancelIo)
+        {
+            if(milliseconds<1)throw new InvalidDataException("Positive child deadline required");maximum=milliseconds;
+            timer=new System.Threading.Timer(delegate {
+                expired=true;
+                try { children.Terminate(); } catch(Exception error) { terminationError=error; }
+                finally { if(cancelIo!=null)try { cancelIo(); } catch(ObjectDisposedException) { } catch(Exception error) { terminationError=error; } }
+            },null,milliseconds,System.Threading.Timeout.Infinite);
+        }
+        internal int Remaining { get { Check();return Math.Max(1,(int)(maximum-elapsed.ElapsedMilliseconds)); } }
+        internal void Check()
+        {
+            if(expired||elapsed.ElapsedMilliseconds>=maximum)throw new System.TimeoutException("Registered child lifetime expired",terminationError);
+        }
+        public void Dispose()
+        {
+            using(var complete=new System.Threading.ManualResetEvent(false))if(timer.Dispose(complete))complete.WaitOne();
+        }
+    }
+
+    // Supplied only by the new native entrypoint after protected Windows owner
+    // registration is verified. Serialized inputs cannot supply this interface.
+    internal interface IConditionalProtectionOwner
+    {
+        Dictionary<string,object> Binding { get; }
+        void VerifyAttempt(Dictionary<string,object> attempt);
+        void VerifyMaterialization(Dictionary<string,object> plan);
+        void RequireInertLaunch(Dictionary<string,object> prepared,Dictionary<string,object> packet);
+        int MaximumChildSeconds { get; }
     }
 
     public static class RuntimeProtectionHost
@@ -918,18 +1264,22 @@ namespace TradingAgents.RuntimeProtection
                 Require(found,"Live application lacks the build-bound Step-4 gate: "+binding.Key);
             }
         }
-        static Dictionary<string,object> ValidateAttempt(Dictionary<string,object> attempt)
+        static Dictionary<string,object> ValidateAttempt(Dictionary<string,object> attempt,IConditionalProtectionOwner owner=null)
         {
             Evidence.Closed(attempt,"contract_version","inputs","attempt_identity","paths","execution_authorized");
             var inputs=O(attempt,"inputs");
-            Evidence.Closed(inputs,"contract_version","namespace_root","namespace_identity","source_commit","source_tree","qualified_source_identity",
+            var inputKeys=new List<string>(new string[]{"contract_version","namespace_root","namespace_identity","source_commit","source_tree","qualified_source_identity",
                 "production_preparation_identity","preparation_lineage_identity","completed_session","prospective_thread","prospective_run",
                 "runtime_content_identity","app_content_identity","runtime_ancestry_identity","app_ancestry_identity",
-                "deployment_configuration_identity","environment_identity","protection_source_identity","attempt_ordinal");
-            Require(S(attempt,"contract_version")==Contract&&S(inputs,"contract_version")==Contract&&!(bool)attempt["execution_authorized"],"Protection contract version/authority mismatch");
+                "deployment_configuration_identity","environment_identity","protection_source_identity","attempt_ordinal"});
+            if(owner!=null)inputKeys.Add("acceptance");
+            Evidence.Closed(inputs,inputKeys.ToArray());
+            string version=owner==null?Contract:"policy-qualified-runtime-protection-attempt-v1";
+            Require(S(attempt,"contract_version")==version&&S(inputs,"contract_version")==version&&!(bool)attempt["execution_authorized"],"Protection contract version/authority mismatch");
             Require((inputs["attempt_ordinal"] is int||inputs["attempt_ordinal"] is long)&&Convert.ToInt64(inputs["attempt_ordinal"])>0,"Explicit positive attempt ordinal required");
             Require(S(inputs,"protection_source_identity")==SourceIdentity(),"Protection source/build identity mismatch");
-            string identity=Evidence.Identity("runtime-protection-attempt:v1",inputs);
+            if(owner!=null)owner.VerifyAttempt(attempt);
+            string identity=Evidence.Identity(owner==null?"runtime-protection-attempt:v1":"policy-qualified-runtime-protection-attempt:v1",inputs);
             Require(S(attempt,"attempt_identity")==identity,"Attempt identity mismatch");
             string space=Native.LocalPath(S(inputs,"namespace_root"),false);
             string suffix=identity.Substring(identity.LastIndexOf(':')+1);
@@ -974,7 +1324,7 @@ namespace TradingAgents.RuntimeProtection
         }
         static void EnsureContainer(string path,bool immutable)
         {
-            if(!Directory.Exists(path))Native.CreateNewDirectory(path,immutable);
+            if(!Native.DirectoryExists(path))Native.CreateNewDirectory(path,immutable);
             using(var handle=Native.Open(path,Native.ReadAttributes,3)) { }
         }
         static Dictionary<string,object> NamespaceObjects(string root)
@@ -1051,13 +1401,21 @@ namespace TradingAgents.RuntimeProtection
             foreach(object value in (IEnumerable)component["native_images"])
                 Require(native.Add(Evidence.Str(value))&&names.Contains(Evidence.Str(value)),"Unknown native dependency/image");
         }
-        static Dictionary<string,object> Prepare(Dictionary<string,object> plan)
+        internal static Dictionary<string,object> Prepare(Dictionary<string,object> plan,IConditionalProtectionOwner owner=null)
         {
-            Evidence.Closed(plan,"contract_version","attempt","runtime_content","app_content","source_locations","deployment_configuration",
-                "mapped_configuration","environment","working_directory","credential_bindings","python_version","execution_authorized","identity");
-            Evidence.CheckIdentity(plan,"runtime-protection-materialization:v1");
-            Require(S(plan,"contract_version")=="runtime-protection-materialization-v1"&&!(bool)plan["execution_authorized"],"Materialization authority mismatch");
-            var attempt=O(plan,"attempt");var inputs=O(attempt,"inputs");var paths=ValidateAttempt(attempt);
+            var planKeys=new List<string>(new string[]{"contract_version","attempt","runtime_content","app_content","source_locations","deployment_configuration",
+                "mapped_configuration","environment","working_directory","credential_bindings","python_version","execution_authorized","identity"});
+            if(owner!=null)planKeys.Add("owner_binding");
+            Evidence.Closed(plan,planKeys.ToArray());
+            Evidence.CheckIdentity(plan,owner==null?"runtime-protection-materialization:v1":"policy-qualified-runtime-protection-materialization:v2");
+            Require(S(plan,"contract_version")== (owner==null?"runtime-protection-materialization-v1":"policy-qualified-runtime-protection-materialization-v2")
+                &&!(bool)plan["execution_authorized"],"Materialization authority mismatch");
+            if(owner!=null)
+            {
+                Require(Evidence.Canonical(plan["owner_binding"])==Evidence.Canonical(owner.Binding),"Materialization has an unregistered owner binding");
+                owner.VerifyMaterialization(plan);
+            }
+            var attempt=O(plan,"attempt");var inputs=O(attempt,"inputs");var paths=ValidateAttempt(attempt,owner);
             var runtime=O(plan,"runtime_content");var app=O(plan,"app_content");ValidateComponent(runtime,"runtime",inputs);ValidateComponent(app,"app",inputs);
             var nativeClosure=new NativePayloadClosure(runtime,app);
             Require(S(runtime,"python_version")==S(plan,"python_version")&&Regex.IsMatch(S(plan,"python_version"),"^3\\.[0-9]+\\.[0-9]+$"),"pyvenv.cfg version ancestry mismatch");
@@ -1081,8 +1439,8 @@ namespace TradingAgents.RuntimeProtection
             }
             using(var registered=HoldNamespace(inputs))
             {
-                Require(!Directory.Exists(root)&&!File.Exists(root),"Attempt root exists without fresh provenance");
-                Require(!Directory.Exists(claim)&&!File.Exists(claim),"Attempt provenance already exists; consumed or incomplete attempt");
+                Require(!Native.DirectoryExists(root)&&!Native.FileExists(root),"Attempt root exists without fresh provenance");
+                Require(!Native.DirectoryExists(claim)&&!Native.FileExists(claim),"Attempt provenance already exists; consumed or incomplete attempt");
                 using(var claimHandle=Native.CreateNewDirectoryHandle(claim,true)) // Permanent allocation precedes every attempt object.
                 using(var rootHandle=Native.CreateNewDirectoryHandle(root,true))
                 using(var evidenceHandle=Native.CreateNewDirectoryHandle(S(paths,"evidence_root"),true))
@@ -1126,23 +1484,26 @@ namespace TradingAgents.RuntimeProtection
                     Require(expectedLocations.SetEquals(locations.Keys),"Unexpected materialization source location");
                     tree.CreateDirectory("anchors/current");tree.CreateDirectory("anchors/history");tree.CreateDirectory("runtime/app");
                     var historyBinding=new Dictionary<string,object> {
-                        {"contract_version","runtime-protection-history-reference-v1"},{"attempt_identity",S(attempt,"attempt_identity")},
+                        {"contract_version",owner==null?"runtime-protection-history-reference-v1":"policy-qualified-runtime-protection-history-reference-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
                         {"preparation_lineage_identity",S(inputs,"preparation_lineage_identity")},
                         {"production_preparation_identity",S(inputs,"production_preparation_identity")},
                         {"qualified_source_identity",S(inputs,"qualified_source_identity")},{"historical_objects_mutated",false} };
+                    if(owner!=null) { historyBinding.Add("acceptance",inputs["acceptance"]);historyBinding.Add("owner_binding",owner.Binding);historyBinding.Add("execution_authorized",false); }
                     tree.WriteNewFile("anchors/history/provenance.json",Encoding.UTF8.GetBytes(Evidence.Canonical(historyBinding)));
                     string runtimeRoot=S(paths,"private_runtime_root");
                     tree.WriteNewFile("runtime/venv/pyvenv.cfg",Encoding.UTF8.GetBytes("home = "+Path.Combine(runtimeRoot,"base")+"\ninclude-system-site-packages = false\nversion = "+S(plan,"python_version")+"\nexecutable = "+Path.Combine(runtimeRoot,"base","python.exe")+"\n"));
                     tree.WriteNewFile("runtime/venv/Lib/site-packages/zz_ticket07_private_app.pth",Encoding.UTF8.GetBytes(appRoot+"\n"));
                     tree.WriteNewFile("runtime/configuration.json",Encoding.UTF8.GetBytes(Evidence.Canonical(mapped)));
                     var baselines=new List<object>();foreach(var entry in tree.CaptureBaseline())baselines.Add(Evidence.Baseline(entry));
-                    var prepared=Evidence.Seal("runtime-protection-prepared:v1",new Dictionary<string,object> {
-                        {"contract_version","runtime-protection-prepared-v1"},{"attempt",attempt},{"materialization_identity",S(plan,"identity")},
+                    var preparedBody=new Dictionary<string,object> {
+                        {"contract_version",owner==null?"runtime-protection-prepared-v1":"policy-qualified-runtime-protection-prepared-v2"},{"attempt",attempt},{"materialization_identity",S(plan,"identity")},
                         {"runtime_manifest_identity",S(runtime,"identity")},{"app_manifest_identity",S(app,"identity")},
                         {"baseline",baselines},{"baseline_identity",Evidence.Identity("runtime-protection-baseline:v1",baselines)},
                         {"environment",environment},{"working_directory",S(plan,"working_directory")},{"mapped_configuration",mapped},{"protection_contract_version","protected-runtime-tree-v3"},
                         {"credential_bindings",plan["credential_bindings"]},
-                        {"state","PREPARED"},{"execution_authorized",false} });
+                        {"state","PREPARED"},{"execution_authorized",false} };
+                    if(owner!=null)preparedBody.Add("owner_binding",owner.Binding);
+                    var prepared=Evidence.Seal(owner==null?"runtime-protection-prepared:v1":"policy-qualified-runtime-protection-prepared:v2",preparedBody);
                     Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"prepared.json"),prepared);
                     Native.CreateNewDirectory(Path.Combine(claim,"prepared-"+S(prepared,"identity").Substring(S(prepared,"identity").LastIndexOf(':')+1)),true);
                     return prepared;
@@ -1161,14 +1522,16 @@ namespace TradingAgents.RuntimeProtection
             }
             return result.Append('\\',slashes*2).Append('"').ToString();
         }
-        static void ValidateHandoff(Dictionary<string,object> prepared,Dictionary<string,object> packet)
+        static void ValidateHandoff(Dictionary<string,object> prepared,Dictionary<string,object> packet,IConditionalProtectionOwner owner=null)
         {
             var gate=O(packet,"handoff");var inputs=O(O(prepared,"attempt"),"inputs");var config=O(prepared,"mapped_configuration");
-            Evidence.Closed(gate,"contract_version","preparation_lineage_identity","plan_version","plan_signature","cninfo_profile_identity",
+            var keys=new List<string>(new string[]{"contract_version","preparation_lineage_identity","plan_version","plan_signature","cninfo_profile_identity",
                 "cninfo_source_policy_identity","cninfo_operator_minimum_interval_seconds","checkpoint_identity","history_identity",
                 "calendar_revision_id","valid_before_exclusive","symbol","analysis_session","selected_analysts","output_language",
-                "legacy_authoritative","qualified_shadow_authoritative","execution_authorized");
-            Require(S(gate,"contract_version")=="runtime-protection-handoff-v1"&&S(gate,"plan_version")=="1.5"
+                "legacy_authoritative","qualified_shadow_authoritative","execution_authorized"});
+            if(owner!=null) { keys.Add("acceptance");keys.Add("owner_binding"); }
+            Evidence.Closed(gate,keys.ToArray());
+            Require(S(gate,"contract_version")== (owner==null?"runtime-protection-handoff-v1":"policy-qualified-runtime-protection-handoff-v2")&&S(gate,"plan_version")=="1.5"
                 &&S(gate,"preparation_lineage_identity")==S(inputs,"preparation_lineage_identity")
                 &&S(gate,"analysis_session")==S(inputs,"completed_session"),"Handoff preparation/session/Plan mismatch");
             object pacing=gate["cninfo_operator_minimum_interval_seconds"];
@@ -1179,6 +1542,12 @@ namespace TradingAgents.RuntimeProtection
                 &&S(config,"mainland_capability_routing_mode")=="qualified_v1_shadow"
                 &&(bool)gate["legacy_authoritative"]&&!(bool)gate["qualified_shadow_authoritative"]&&!(bool)gate["execution_authorized"],"Handoff authority/language mismatch");
             Require(Evidence.Canonical(gate["selected_analysts"])=="[\"fundamentals\"]","Step-4 analyst scope differs");
+            if(owner!=null)
+            {
+                Require(Evidence.Canonical(gate["acceptance"])==Evidence.Canonical(inputs["acceptance"])
+                    &&Evidence.Canonical(gate["owner_binding"])==Evidence.Canonical(owner.Binding),"Handoff stripped or substituted the conditional binding");
+                Require(S(packet,"operation")=="guard_only","Conditional qualification is not separate Ticket-07/live authorization");
+            }
             RequireFreshHandoff(gate);
             object expected=null;
             if(S(packet,"operation")=="guard_then_live")expected=new string[]{"-I","-B","-m","cli.main","analyze","--qualified-routing-validation",
@@ -1192,9 +1561,28 @@ namespace TradingAgents.RuntimeProtection
             expiry=DateTimeOffset.Parse(text,CultureInfo.InvariantCulture);
             Require(DateTimeOffset.UtcNow<expiry,"Protected handoff expired");
         }
-        static NamedPipeServerStream OwnerPipe(string attemptIdentity)
+        [StructLayout(LayoutKind.Sequential)] struct GuardPipeAttributes { internal int Length;internal IntPtr Descriptor;internal int Inherit; }
+        [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+        static extern SafePipeHandle CreateNamedPipeW(string name,uint mode,uint pipeMode,uint instances,uint outputSize,uint inputSize,uint timeout,ref GuardPipeAttributes security);
+        internal static NamedPipeServerStream OwnerPipe(string attemptIdentity,bool restrictedChild=false)
         {
             string name="TradingAgentsProtection-"+attemptIdentity.Substring(attemptIdentity.LastIndexOf(':')+1);
+            if(restrictedChild)
+            {
+                // Only this new pipe receives a medium label. The high owner
+                // process, protected files and legacy pipe retain their labels.
+                byte[] descriptor=Native.FromSddl("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019F;;;"
+                    +WindowsIdentity.GetCurrent().User.Value+")S:(ML;;NW;;;ME)");
+                var pin=GCHandle.Alloc(descriptor,GCHandleType.Pinned);
+                try
+                {
+                    var attributes=new GuardPipeAttributes {Length=Marshal.SizeOf(typeof(GuardPipeAttributes)),Descriptor=pin.AddrOfPinnedObject()};
+                    var handle=CreateNamedPipeW(@"\\.\pipe\"+name,0x40080003,8,1,4096,4096,10000,ref attributes);
+                    if(handle.IsInvalid) { int error=Marshal.GetLastWin32Error();handle.Dispose();throw new Win32Exception(error); }
+                    return new NamedPipeServerStream(PipeDirection.InOut,true,false,handle);
+                }
+                finally { pin.Free(); }
+            }
             var security=new PipeSecurity();
             security.SetAccessRuleProtection(true,false);
             security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User,PipeAccessRights.FullControl,AccessControlType.Allow));
@@ -1212,12 +1600,13 @@ namespace TradingAgents.RuntimeProtection
                 {"prospective_thread",S(inputs,"prospective_thread")},{"prospective_run",S(inputs,"prospective_run")},{"handoff",packet["handoff"]} };
         }
         static Dictionary<string,object> ReceivePhase(NamedPipeServerStream pipe,Process child,ProtectedChildren children,ProtectedRuntimeTreeV3 protection,
-            Dictionary<string,object> prepared,Dictionary<string,object> packet,string phase)
+            Dictionary<string,object> prepared,Dictionary<string,object> packet,string phase,IConditionalProtectionOwner owner=null,ChildDeadline deadline=null)
         {
             var connected=Task.Factory.FromAsync(pipe.BeginWaitForConnection,pipe.EndWaitForConnection,null);
             var timer=Stopwatch.StartNew();
             while(!connected.Wait(100))
             {
+                if(deadline!=null)deadline.Check();
                 Require(!child.HasExited,"Protected child exited before owner-bound phase");
                 Require(timer.ElapsedMilliseconds<600000,"Protected child phase timed out");
                 RequireFreshHandoff(O(packet,"handoff"));
@@ -1230,7 +1619,8 @@ namespace TradingAgents.RuntimeProtection
                 while(true)
                 {
                     var read=pipe.ReadAsync(one,0,1);
-                    Require(read.Wait(30000)&&read.Result==1,"Protected phase message incomplete");
+                    Require(read.Wait(deadline==null?30000:Math.Min(30000,deadline.Remaining))&&read.Result==1,"Protected phase message incomplete");
+                    if(deadline!=null)deadline.Check();
                     if(one[0]==10)break;
                     bytes.WriteByte(one[0]);Require(bytes.Length<=65536&&timer.ElapsedMilliseconds<600000,"Protected phase message exceeds bound");
                 }
@@ -1239,19 +1629,25 @@ namespace TradingAgents.RuntimeProtection
                 Require(Evidence.Canonical(message)==text,"Protected phase message must be canonical");
                 Require(S(message,"phase")==phase&&S(message,"attempt_identity")==S(packet,"attempt_identity")&&S(message,"packet_identity")==S(packet,"identity"),"Guard/Step-4 belongs to another attempt or packet");
                 var gate=O(packet,"handoff");RequireFreshHandoff(gate);protection.VerifyProtected();
+                if(owner!=null)owner.VerifyAttempt(O(prepared,"attempt"));
+                if(deadline!=null)deadline.Check();
                 if(phase=="guard")
                 {
-                    Evidence.Closed(message,"contract_version","phase","attempt_identity","prepared_identity","packet_identity","source_guard_identity",
+                    var messageKeys=new List<string>(new string[]{"contract_version","phase","attempt_identity","prepared_identity","packet_identity","source_guard_identity",
                         "checkpoint_identity","history_identity","prospective_thread","prospective_run","status","live_io",
                         "runtime_manifest_identity","app_manifest_identity","environment_identity","runtime_config_identity",
                         "plan_signature","cninfo_profile_identity","cninfo_source_policy_identity","cninfo_operator_minimum_interval_seconds",
                         "legacy_authoritative","qualified_shadow_authoritative",
-                        "checkpoint_original_exact_equal","retained_provenance_changed","run_or_thread_allocated","execution_authorized","identity");
-                    Evidence.CheckIdentity(message,"runtime-protection-guard:v1");var inputs=O(O(prepared,"attempt"),"inputs");
-                    Require(S(message,"contract_version")=="runtime-protection-guard-v1"&&S(message,"status")=="PASS"
+                        "checkpoint_original_exact_equal","retained_provenance_changed","run_or_thread_allocated","execution_authorized","identity"});
+                    if(owner!=null) { messageKeys.Add("acceptance");messageKeys.Add("owner_binding"); }
+                    Evidence.Closed(message,messageKeys.ToArray());
+                    Evidence.CheckIdentity(message,owner==null?"runtime-protection-guard:v1":"policy-qualified-runtime-protection-guard:v2");var inputs=O(O(prepared,"attempt"),"inputs");
+                    Require(S(message,"contract_version")== (owner==null?"runtime-protection-guard-v1":"policy-qualified-runtime-protection-guard-v2")&&S(message,"status")=="PASS"
                         &&S(message,"prepared_identity")==S(prepared,"identity")&&S(message,"checkpoint_identity")==S(gate,"checkpoint_identity")
                         &&S(message,"history_identity")==S(gate,"history_identity")&&S(message,"prospective_thread")==S(inputs,"prospective_thread")
                         &&S(message,"prospective_run")==S(inputs,"prospective_run"),"Guard history/lineage evidence mismatch");
+                    if(owner!=null)Require(Evidence.Canonical(message["acceptance"])==Evidence.Canonical(inputs["acceptance"])
+                        &&Evidence.Canonical(message["owner_binding"])==Evidence.Canonical(owner.Binding),"Protected guard lost the complete conditional binding");
                     Require((bool)message["checkpoint_original_exact_equal"]&&!(bool)message["retained_provenance_changed"]
                         &&!(bool)message["run_or_thread_allocated"]&&!(bool)message["execution_authorized"]
                         &&Evidence.Canonical(message["live_io"])=="{\"CNINFO\":0,\"model\":0,\"network\":0,\"provider\":0}","Guard exceeded zero-I/O/history authority");
@@ -1262,6 +1658,7 @@ namespace TradingAgents.RuntimeProtection
                         "cninfo_operator_minimum_interval_seconds","legacy_authoritative","qualified_shadow_authoritative"})
                         Require(Evidence.Canonical(message[key])==Evidence.Canonical(gate[key]),"Guard qualified plan/profile/policy differs");
                     VerifyLoadedImages(actualChild,prepared);
+                    if(deadline!=null)deadline.Check();
                     Evidence.WriteNew(Path.Combine(S(O(O(prepared,"attempt"),"paths"),"evidence_root"),"guard.json"),message);
                 }
                 else
@@ -1279,9 +1676,19 @@ namespace TradingAgents.RuntimeProtection
                         {"issued_at",DateTimeOffset.UtcNow.ToString("o")},{"reusable",false} });
                     Evidence.WriteNew(Path.Combine(S(O(O(prepared,"attempt"),"paths"),"evidence_root"),"step4.json"),receipt);
                 }
-                byte[] response=Encoding.UTF8.GetBytes(Evidence.Canonical(new Dictionary<string,object> {
-                    {"phase",phase},{"attempt_identity",S(packet,"attempt_identity")},{"packet_identity",S(packet,"identity")},{"accepted",true} })+"\n");
-                pipe.Write(response,0,response.Length);pipe.Flush();return message;
+                var responseBody=new Dictionary<string,object> {
+                    {"phase",phase},{"attempt_identity",S(packet,"attempt_identity")},{"packet_identity",S(packet,"identity")},{"accepted",true} };
+                if(owner!=null)
+                {
+                    owner.VerifyAttempt(O(prepared,"attempt"));
+                    if(deadline!=null)deadline.Check();
+                    responseBody.Add("acceptance",O(O(prepared,"attempt"),"inputs")["acceptance"]);
+                    responseBody.Add("owner_binding",owner.Binding);responseBody.Add("execution_authorized",false);
+                }
+                byte[] response=Encoding.UTF8.GetBytes(Evidence.Canonical(responseBody)+"\n");
+                if(deadline==null) { pipe.Write(response,0,response.Length);pipe.Flush(); }
+                else { Require(pipe.WriteAsync(response,0,response.Length).Wait(deadline.Remaining),"Conditional guard release exceeded child deadline");deadline.Check(); }
+                return message;
             }
         }
         static void VerifyLoadedImages(Process child,Dictionary<string,object> prepared)
@@ -1317,8 +1724,8 @@ namespace TradingAgents.RuntimeProtection
             using(var registered=HoldNamespace(inputs))
             {
                 string claim=S(paths,"claim_root"),digest=S(prepared,"identity").Substring(S(prepared,"identity").LastIndexOf(':')+1);
-                Require(Directory.Exists(Path.Combine(claim,"prepared-"+digest)),"Prepared claim provenance missing");
-                bool consumed=Directory.Exists(Path.Combine(claim,"consumed")),matches=true;
+                Require(Native.DirectoryExists(Path.Combine(claim,"prepared-"+digest)),"Prepared claim provenance missing");
+                bool consumed=Native.DirectoryExists(Path.Combine(claim,"consumed")),matches=true;
                 var expected=new Dictionary<string,BaselineEntry>(StringComparer.Ordinal);
                 foreach(var entry in Evidence.Baselines(prepared["baseline"]))expected.Add(entry.RelativePath,entry);
                 // Read-only, including stranded trees. Never call OpenPrepared,
@@ -1335,7 +1742,7 @@ namespace TradingAgents.RuntimeProtection
                 }
                 string state=consumed?"INCOMPLETE_RETAINED":"PREPARED";
                 Dictionary<string,object> completion=null;string completionPath=Path.Combine(S(paths,"evidence_root"),"completion.json");
-                if(File.Exists(completionPath))
+                if(Native.FileExists(completionPath))
                 {
                     using(var pinned=new PinnedJson(completionPath,null))completion=pinned.Value;
                     Evidence.CheckIdentity(completion,"runtime-protection-completion:v1");
@@ -1351,12 +1758,13 @@ namespace TradingAgents.RuntimeProtection
                     {"state",state},{"completion",completion} });
             }
         }
-        static Dictionary<string,object> Run(Dictionary<string,object> prepared,Dictionary<string,object> packet)
+        internal static Dictionary<string,object> Run(Dictionary<string,object> prepared,Dictionary<string,object> packet,IConditionalProtectionOwner owner=null)
         {
-            Evidence.CheckIdentity(prepared,"runtime-protection-prepared:v1");Evidence.CheckIdentity(packet,"runtime-protection-packet:v1");
-            Require(S(prepared,"contract_version")=="runtime-protection-prepared-v1"&&S(prepared,"state")=="PREPARED", "Prepared contract/state mismatch");
-            var attempt=O(prepared,"attempt");var paths=ValidateAttempt(attempt);var inputs=O(attempt,"inputs");
-            Require(S(packet,"contract_version")=="runtime-protection-packet-v1"&&S(packet,"prepared_identity")==S(prepared,"identity"),"Packet/preparation lineage mismatch");
+            Evidence.CheckIdentity(prepared,owner==null?"runtime-protection-prepared:v1":"policy-qualified-runtime-protection-prepared:v2");
+            Evidence.CheckIdentity(packet,owner==null?"runtime-protection-packet:v1":"policy-qualified-runtime-protection-control:v2");
+            Require(S(prepared,"contract_version")== (owner==null?"runtime-protection-prepared-v1":"policy-qualified-runtime-protection-prepared-v2")&&S(prepared,"state")=="PREPARED", "Prepared contract/state mismatch");
+            var attempt=O(prepared,"attempt");var paths=ValidateAttempt(attempt,owner);var inputs=O(attempt,"inputs");
+            Require(S(packet,"contract_version")== (owner==null?"runtime-protection-packet-v1":"policy-qualified-runtime-protection-control-v2")&&S(packet,"prepared_identity")==S(prepared,"identity"),"Packet/preparation lineage mismatch");
             Require(S(packet,"attempt_identity")==S(attempt,"attempt_identity")&&Evidence.Canonical(O(packet,"paths"))==Evidence.Canonical(paths),"Packet attempt/root/anchor substitution");
             foreach(string key in new string[]{"materialization_identity","runtime_manifest_identity","app_manifest_identity","baseline_identity","protection_contract_version"})
                 Require(S(packet,key)==S(prepared,key),"Packet runtime/app/baseline/protection version mismatch");
@@ -1372,12 +1780,21 @@ namespace TradingAgents.RuntimeProtection
             var packetKeys=new List<string>(new string[]{"contract_version","operation","prepared_identity","attempt_identity","paths",
                 "materialization_identity","runtime_manifest_identity","app_manifest_identity","baseline_identity","protection_contract_version",
                 "child_arguments","execution_authorized","identity"});
-            if(guarded) { packetKeys.Add("handoff");packetKeys.Add("live_child_arguments");ValidateHandoff(prepared,packet); }
+            if(owner!=null)
+            {
+                packetKeys.Add("owner_binding");packetKeys.Add("acceptance");
+                Require(Evidence.Canonical(prepared["owner_binding"])==Evidence.Canonical(owner.Binding)
+                    &&Evidence.Canonical(packet["owner_binding"])==Evidence.Canonical(owner.Binding)
+                    &&Evidence.Canonical(packet["acceptance"])==Evidence.Canonical(inputs["acceptance"]),"Native control stripped or replaced the conditional binding");
+                Require(operation=="inert"||operation=="guard_only","Conditional qualification supplies no live authorization");
+                owner.RequireInertLaunch(prepared,packet);
+            }
+            if(guarded) { packetKeys.Add("handoff");packetKeys.Add("live_child_arguments");ValidateHandoff(prepared,packet,owner); }
             Evidence.Closed(packet,packetKeys.ToArray());
             if(operation=="guard_then_live")
             {
                 ValidateLiveApplication(prepared);
-                Require(!Directory.Exists(Path.Combine(S(paths,"claim_root"),"consumed")),"Attempt already consumed");
+                Require(!Native.DirectoryExists(Path.Combine(S(paths,"claim_root"),"consumed")),"Attempt already consumed");
                 Console.Error.WriteLine("Type the exact packet identity covered by separate fresh pre-launch authorization:");
                 Require(Console.ReadLine()==S(packet,"identity"),"Fresh human pre-launch packet identity mismatch");
                 Console.Error.WriteLine("Confirm separate fresh pre-launch authorization for this packet (type YES):");
@@ -1394,14 +1811,16 @@ namespace TradingAgents.RuntimeProtection
             using(var cwd=Native.Open(S(prepared,"working_directory"),Native.ReadAttributes,3))
             using(var children=new ProtectedChildren())
             {
-                ProtectedRuntimeTreeV3 protection=null;Process child=null;NamedPipeServerStream pipe=null;
+                ProtectedRuntimeTreeV3 protection=null;Process child=null;NamedPipeServerStream pipe=null;ChildDeadline deadline=null;
                 int starts=0;var failures=new List<Exception>();bool restored=false,dllChanged=false;
                 try
                 {
                     protection=tree.Protect(baseline);
-                    var launch=Evidence.Seal("runtime-protection-launch:v1",new Dictionary<string,object> {
-                        {"contract_version","runtime-protection-launch-v1"},{"attempt_identity",S(attempt,"attempt_identity")},
-                        {"packet_identity",S(packet,"identity")},{"state","LAUNCHING"} });
+                    var launchBody=new Dictionary<string,object> {
+                        {"contract_version",owner==null?"runtime-protection-launch-v1":"policy-qualified-runtime-protection-launch-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
+                        {"packet_identity",S(packet,"identity")},{"state","LAUNCHING"} };
+                    if(owner!=null) { launchBody.Add("acceptance",inputs["acceptance"]);launchBody.Add("owner_binding",owner.Binding);launchBody.Add("execution_authorized",false); }
+                    var launch=Evidence.Seal(owner==null?"runtime-protection-launch:v1":"policy-qualified-runtime-protection-launch:v2",launchBody);
                     Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"launching.json"),launch);
                     Require(Native.SetDllDirectoryW(Path.Combine(S(paths,"private_runtime_root"),"base")),"Private native DLL search directory failed");dllChanged=true;
                     int phases=operation=="guard_then_live"?2:1;
@@ -1413,7 +1832,7 @@ namespace TradingAgents.RuntimeProtection
                             child.Dispose();child=null;
                             arguments.Clear();foreach(object argument in (IEnumerable)packet["live_child_arguments"])arguments.Add(Evidence.Str(argument));
                         }
-                        if(guarded) { RequireFreshHandoff(O(packet,"handoff"));pipe=OwnerPipe(S(packet,"attempt_identity")); }
+                        if(guarded) { RequireFreshHandoff(O(packet,"handoff"));pipe=OwnerPipe(S(packet,"attempt_identity"),owner!=null); }
                         var info=new ProcessStartInfo { FileName=executable,WorkingDirectory=S(prepared,"working_directory"),UseShellExecute=false,CreateNoWindow=phase!="step4" };
                         var quoted=new List<string>();foreach(string argument in arguments)quoted.Add(Quote(argument));info.Arguments=String.Join(" ",quoted);
                         info.EnvironmentVariables.Clear();foreach(var entry in environment)info.EnvironmentVariables[entry.Key]=Evidence.Str(entry.Value);
@@ -1430,15 +1849,23 @@ namespace TradingAgents.RuntimeProtection
                         }
                         if(guarded)info.EnvironmentVariables["TRADINGAGENTS_PROTECTION_CONTEXT"]=Convert.ToBase64String(Encoding.UTF8.GetBytes(Evidence.Canonical(ChildContext(prepared,packet,phase))));
                         protection.VerifyProtected();
-                        child=children.Start(info,Quote(executable));starts++;
-                        if(guarded) { ReceivePhase(pipe,child,children,protection,prepared,packet,phase);pipe.Dispose();pipe=null; }
-                        if(phase=="guard")Require(child.WaitForExit(10000),"Guard did not exit after owner release");else child.WaitForExit();
-                        Require(children.ExitCode(child)==0,"Protected child failed");
+                        child=children.Start(info,Quote(executable),owner!=null,owner==null?(Action)null:delegate {
+                            protection.VerifyProtected();owner.RequireInertLaunch(prepared,packet);
+                            var deadlinePipe=pipe;
+                            deadline=new ChildDeadline(children,checked(owner.MaximumChildSeconds*1000),delegate { if(deadlinePipe!=null)deadlinePipe.Dispose(); });
+                        });starts++;
+                        if(guarded) { ReceivePhase(pipe,child,children,protection,prepared,packet,phase,owner,deadline);pipe.Dispose();pipe=null; }
+                        if(deadline!=null) { Require(child.WaitForExit(deadline.Remaining),"Conditional inert child exceeded its registered test budget");deadline.Check(); }
+                        else if(phase=="guard")Require(child.WaitForExit(10000),"Guard did not exit after owner release");
+                        else child.WaitForExit();
+                        uint childExit=children.ExitCode(child);
+                        Require(childExit==0,"Protected child failed with exit code "+childExit.ToString(CultureInfo.InvariantCulture));
                     }
                 }
                 catch(Exception error) { failures.Add(error); }
                 finally
                 {
+                    if(deadline!=null)deadline.Dispose();
                     bool exited=false;
                     try { exited=children.Quiesce();if(!exited)failures.Add(new InvalidOperationException("Attempt descendants remain alive")); }
                     catch(Exception error) { failures.Add(error); }
@@ -1453,11 +1880,13 @@ namespace TradingAgents.RuntimeProtection
                 // A contender that lost exclusive consumption owns no terminal
                 // evidence. Only the successful claimant can complete this attempt.
                 if(!tree.ConsumedByThisOwner)throw new AggregateException("Protection admission failed; this owner did not consume the attempt",failures);
-                var receipt=Evidence.Seal("runtime-protection-completion:v1",new Dictionary<string,object> {
-                    {"contract_version","runtime-protection-completion-v1"},{"attempt_identity",S(attempt,"attempt_identity")},
+                var receiptBody=new Dictionary<string,object> {
+                    {"contract_version",owner==null?"runtime-protection-completion-v1":"policy-qualified-runtime-protection-completion-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
                     {"prepared_identity",S(prepared,"identity")},{"packet_identity",S(packet,"identity")},
                     {"state",restored?"COMPLETED_RESTORED":"INCOMPLETE_RETAINED"},{"child_launches",starts},
-                    {"exact_baseline_restored",restored},{"failure_count",failures.Count},{"reusable",false} });
+                    {"exact_baseline_restored",restored},{"failure_count",failures.Count},{"reusable",false} };
+                if(owner!=null) { receiptBody.Add("acceptance",inputs["acceptance"]);receiptBody.Add("owner_binding",owner.Binding);receiptBody.Add("execution_authorized",false); }
+                var receipt=Evidence.Seal(owner==null?"runtime-protection-completion:v1":"policy-qualified-runtime-protection-completion:v2",receiptBody);
                 Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"completion.json"),receipt);
                 if(failures.Count>0)throw new AggregateException("Protection attempt failed",failures);
                 return receipt;
@@ -1467,6 +1896,7 @@ namespace TradingAgents.RuntimeProtection
         {
             try
             {
+                Native.InitializePathRuntime();
                 Require(IntPtr.Size==8,"64-bit Windows protection host required");
                 Require(arguments.Length==3||arguments.Length==5,"Expected operation and pinned input paths/digests");
                 using(var input=new PinnedJson(arguments[1],arguments[2]))

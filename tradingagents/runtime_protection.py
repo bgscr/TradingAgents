@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 from hashlib import sha256
 from pathlib import PureWindowsPath
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -485,6 +485,39 @@ def seal_materialization_plan(
     three authorized deployment paths are created anew for this attempt.
     """
     attempt = ProtectionAttempt.model_validate_json(attempt.model_dump_json())
+    payload = {
+        "contract_version": "runtime-protection-materialization-v1",
+        **_materialization_payload(
+            attempt=attempt,
+            runtime_content=runtime_content,
+            app_content=app_content,
+            source_locations=source_locations,
+            deployment_configuration=deployment_configuration,
+            environment=environment,
+            working_directory=working_directory,
+            python_version=python_version,
+            credential_bindings=credential_bindings,
+        ),
+    }
+    return {
+        **payload,
+        "identity": evidence_identity("runtime-protection-materialization:v1", payload),
+    }
+
+
+def _materialization_payload(
+    *,
+    attempt: ProtectionAttempt | ConditionalProtectionAttempt,
+    runtime_content: Mapping[str, Any],
+    app_content: Mapping[str, Any],
+    source_locations: Mapping[str, str],
+    deployment_configuration: Mapping[str, Any],
+    environment: Mapping[str, str],
+    working_directory: str,
+    python_version: str,
+    credential_bindings: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    """Shared content/ancestry checks after the caller validates its own version."""
     runtime = ContentManifest.model_validate_json(canonical_bytes(runtime_content))
     app = ContentManifest.model_validate_json(canonical_bytes(app_content))
     bindings = attempt.inputs
@@ -537,8 +570,7 @@ def seal_materialization_plan(
     }
     if not set(mapped) == set(config):
         raise ValueError("deployment configuration is missing an authorized path field")
-    payload = {
-        "contract_version": "runtime-protection-materialization-v1",
+    return {
         "attempt": attempt.model_dump(mode="json"),
         "runtime_content": runtime.model_dump(mode="json"),
         "app_content": app.model_dump(mode="json"),
@@ -550,10 +582,6 @@ def seal_materialization_plan(
         "credential_bindings": child_environment["credential_bindings"],
         "python_version": python_version,
         "execution_authorized": False,
-    }
-    return {
-        **payload,
-        "identity": evidence_identity("runtime-protection-materialization:v1", payload),
     }
 
 
@@ -576,7 +604,8 @@ class SecurityBaseline(BaseModel):
 
 
 class PreparedProtectionAttempt(BaseModel):
-    model_config = _CLOSED
+    model_config = ConfigDict(**_CLOSED, revalidate_instances="always")
+    identity_namespace: ClassVar[str] = "runtime-protection-prepared:v1"
     contract_version: Literal["runtime-protection-prepared-v1"]
     attempt: ProtectionAttempt
     materialization_identity: Identity
@@ -623,7 +652,7 @@ class PreparedProtectionAttempt(BaseModel):
         ):
             raise ValueError("security baseline identity mismatch")
         if self.identity != evidence_identity(
-            "runtime-protection-prepared:v1", self.model_dump(mode="json", exclude={"identity"})
+            self.identity_namespace, self.model_dump(mode="json", exclude={"identity"})
         ):
             raise ValueError("prepared attempt identity mismatch")
         return self

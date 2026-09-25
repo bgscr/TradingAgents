@@ -32,6 +32,7 @@ public static class NativeContracts
     {
         try
         {
+            Native.InitializePathRuntime();
             if(args.Length>0 && (args[0]=="host"||args[0]=="host-dll"))
             {
                 // The Python test harness deliberately injects a persistence
@@ -123,6 +124,17 @@ public static class NativeContracts
             }
             using(var preparation=FreshProtectionTree.Create(root))
             {
+                if(args[0]=="long-path")
+                {
+                    string relative="nested-"+new string('a',80)+"/nested-"+new string('b',80)+"/payload.txt";
+                    if(Path.Combine(root,relative.Replace('/',Path.DirectorySeparatorChar)).Length<=260)
+                        throw new Exception("Fixture must exercise a path longer than MAX_PATH");
+                    preparation.WriteNewFile(relative,System.Text.Encoding.UTF8.GetBytes("INERT LONG PATH"));
+                    var longBaseline=preparation.CaptureBaseline();
+                    using(var protection=preparation.Protect(longBaseline)) { protection.VerifyProtected(); }
+                    if(!preparation.MatchesBaseline(longBaseline))throw new Exception("Long-path baseline did not restore exactly");
+                    Console.WriteLine("CONTRACT_PASS: long-path creation, complete inventory and exact restoration");return 0;
+                }
                 preparation.WriteNewFile("nested/payload.txt", System.Text.Encoding.UTF8.GetBytes("SEALED"));
                 if(args[0]=="foreign-addition"||args[0]=="prebaseline-drift")
                 {
@@ -194,17 +206,27 @@ public static class NativeContracts
     {
         // OS read-only observations, including every descendant's descriptor,
         // content and last-write metadata; never a new protection baseline.
-        var paths=new System.Collections.Generic.List<string>();paths.Add(root);
-        paths.AddRange(Directory.GetFileSystemEntries(root,"*",SearchOption.AllDirectories));
+        var paths=FreshProtectionTree.Walk(root);
         paths.Sort(StringComparer.Ordinal);
         var text=new System.Text.StringBuilder();
         foreach(string path in paths)
         {
-            bool directory=Directory.Exists(path);
-            var sd=directory?(System.Security.AccessControl.FileSystemSecurity)Directory.GetAccessControl(path):File.GetAccessControl(path);
-            text.Append(path).Append(Convert.ToBase64String(sd.GetSecurityDescriptorBinaryForm()));
-            text.Append(File.GetLastWriteTimeUtc(path).Ticks);
-            if(!directory)text.Append(Convert.ToBase64String(File.ReadAllBytes(path)));
+            // Query the same descriptor/content/last-write fields through
+            // read-only handles; path-based Framework ACL APIs reject long
+            // payload members even when the protected object itself exists.
+            using(var handle=Native.Open(path,Native.ReadData|Native.ReadAttributes|Native.ReadControl,1))
+            {
+                var info=Native.Information(handle);bool directory=(info.Attributes&0x10)!=0;
+                System.Security.AccessControl.FileSystemSecurity sd=directory
+                    ?(System.Security.AccessControl.FileSystemSecurity)new System.Security.AccessControl.DirectorySecurity()
+                    :new System.Security.AccessControl.FileSecurity();
+                sd.SetSecurityDescriptorBinaryForm(Native.Descriptor(handle));
+                text.Append(path).Append(Convert.ToBase64String(sd.GetSecurityDescriptorBinaryForm()));
+                long written=unchecked((long)(((ulong)info.WriteHigh<<32)|info.WriteLow));
+                text.Append(DateTime.FromFileTimeUtc(written).Ticks);
+                if(!directory)using(var stream=new FileStream(handle,FileAccess.Read))
+                    using(var bytes=new MemoryStream()) { stream.CopyTo(bytes);text.Append(Convert.ToBase64String(bytes.ToArray())); }
+            }
         }
         return text.ToString();
     }
