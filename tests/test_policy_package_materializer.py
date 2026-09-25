@@ -99,7 +99,18 @@ def test_exact_unsigned_policy_rebinds_successor_without_rewriting_history(mater
     registry = materializer["original_registry"](retained, b"TEST predecessor manifest")
     budgets = materializer["budget_proposal"](ledger, procedure)
     candidate = Candidate(commit="a" * 40, tree="b" * 40, parent="c" * 40)
-    arguments = dict.fromkeys(("predecessor_pin", "scope_pin", "authority_pin", "procedure_pin", "coordinator_pin", "consumer_pin", "measurement_pin"), pin)
+    arguments = dict.fromkeys(
+        (
+            "predecessor_pin",
+            "scope_pin",
+            "authority_pin",
+            "procedure_pin",
+            "coordinator_pin",
+            "consumer_pin",
+            "measurement_pin",
+        ),
+        pin,
+    )
     scope, plan, policy = materializer["policy_objects"](
         candidate, retained, registry, budgets=budgets, **arguments
     )
@@ -146,3 +157,16 @@ def test_registry_rejects_ambiguous_or_mismatched_original_provenance(materializ
     changed["collection_payloads"][0]["identity"] = changed["collection_payloads"][1]["identity"]
     with pytest.raises(ValueError, match="phase/duration"):
         materializer["original_registry"](changed, b"TEST")
+
+
+def test_source_package_preserves_checkout_bytes_and_rejects_actual_source_drift(materializer):
+    bind = materializer["source_checkout_binding"]
+    canonical = b"line one\nline two\n"
+    physical = b"line one\r\nline two\r\n"
+    assert bind(canonical, canonical)["checkout_form"] == "IDENTICAL"
+    result = bind(physical, canonical)
+    assert result["checkout_form"] == "UTF8_CRLF_CHECKOUT"
+    assert result["git_blob_pin"] == BytePin.of(canonical).model_dump(mode="json")
+    assert BytePin.of(physical) != BytePin.of(canonical)
+    with pytest.raises(ValueError, match="differs"):
+        bind(b"CHANGED\r\n", canonical)

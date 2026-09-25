@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.ServiceProcess;
@@ -53,6 +54,7 @@ namespace TradingAgents.PolicyOwner
                 "Human frontend must be the registered protected native binary");
             ExposeFrontendIdentity(anchor);
             Dictionary<string, object> result = null;
+            int requestMilliseconds=document.ContainsKey("contract_version")&&((string)document["contract_version"]).EndsWith("-v2",StringComparison.Ordinal)?360000:60000;
             using(var form = new Form())
             using(var content = new TextBox())
             using(var consent = new CheckBox())
@@ -68,6 +70,7 @@ namespace TradingAgents.PolicyOwner
                     + "Operation: " + purpose + Environment.NewLine
                     + (purpose == "ENROLL_PROJECT_ROLE" ? "Enrollment registers only the displayed role. It approves no package, starts no qualification clock and authorizes no execution."
                         : "This authentication applies to the exact document below. A policy result itself never grants Ticket-07 or live authority.")
+                    + Environment.NewLine + CompleteArtifactReview(anchor,document)
                     + Environment.NewLine + Environment.NewLine + Evidence.Canonical(document);
                 panel.Dock = DockStyle.Bottom; panel.Height = 100; panel.FlowDirection = FlowDirection.LeftToRight;
                 consent.Text = "I have reviewed this exact document and intend this specific operation."; consent.Width = 910; consent.Height = 35;
@@ -79,7 +82,7 @@ namespace TradingAgents.PolicyOwner
                     try
                     {
                         var challenge = OwnerWire.Call(anchor, new Dictionary<string, object> {{"operation", "challenge"}, {"payload", new Dictionary<string, object> {
-                            {"purpose", purpose}, {"document", document}}}});
+                            {"purpose", purpose}, {"document", document}}}},requestMilliseconds);
                         string rp = (string)challenge["rp_id"];
                         byte[] bytes = Convert.FromBase64String((string)challenge["challenge"]);
                         Dictionary<string, object> registration = null; byte[] credentialId;
@@ -93,7 +96,7 @@ namespace TradingAgents.PolicyOwner
                         else credentialId = Convert.FromBase64String((string)challenge["credential_id"]);
                         var proof = WindowsPolicyAuthentication.Authenticate(form.Handle, rp, bytes, credentialId);
                         result = OwnerWire.Call(anchor, new Dictionary<string, object> {{"operation", "complete-authentication"}, {"payload", new Dictionary<string, object> {
-                            {"challenge_id", challenge["challenge_id"]}, {"registration", registration}, {"proof", Proof(proof)}}}});
+                            {"challenge_id", challenge["challenge_id"]}, {"registration", registration}, {"proof", Proof(proof)}}}},requestMilliseconds);
                         form.DialogResult = DialogResult.OK; form.Close();
                     }
                     catch(Exception error)
@@ -108,6 +111,28 @@ namespace TradingAgents.PolicyOwner
                 return result;
             }
         }
+        static string CompleteArtifactReview(OwnerAnchor anchor,Dictionary<string,object> document)
+        {
+            object version;
+            if(!document.TryGetValue("contract_version",out version))return "";
+            var text=new System.Text.StringBuilder();
+            System.Collections.IEnumerable entries=(string)version=="policy-owner-evidence-intake-batch-v2"?(System.Collections.IEnumerable)document["entries"]:new object[]{document};
+            foreach(object item in entries)
+            {
+                var entry=Evidence.Obj(item);
+                if(!entry.TryGetValue("contract_version",out version)||(string)version!="policy-owner-evidence-intake-v2")continue;
+                if((string)entry["kind"]!="artifact-reference")continue;
+                var descriptor=Evidence.Obj(Evidence.Obj(entry["value"])["descriptor"]);
+                var pin=Evidence.Obj(Evidence.Obj(descriptor["artifact"])["pin"]);
+                string digest=(string)pin["sha256"];
+                Evidence.Require(System.Text.RegularExpressions.Regex.IsMatch(digest,"^[0-9a-f]{64}$"),"Invalid complete-artifact pin");
+                text.AppendLine("Review the COMPLETE bound artifact (the descriptor is not a content preview):");
+                text.AppendLine(Path.Combine(anchor.Root,"artifacts",digest+".blob"));
+                text.AppendLine("Bytes: "+Convert.ToString(pin["byte_length"],CultureInfo.InvariantCulture)+" SHA-256: "+digest);
+                text.AppendLine("Staging did not authenticate these bytes. This exact operation registers the displayed descriptor and complete artifact.");
+            }
+            return text.ToString();
+        }
         [STAThread]
         public static int Main(string[] args)
         {
@@ -115,12 +140,32 @@ namespace TradingAgents.PolicyOwner
             {
                 Native.InitializePathRuntime();
                 Evidence.Require(IntPtr.Size == 8, "64-bit Windows owner required");
+                if(args.Length==1&&args[0]=="evidence-capabilities")
+                {Output(EvidenceTransfer.Capabilities());return 0;}
                 if(args.Length == 1 && args[0] == "probe")
                 { Output(WindowsPolicyAuthentication.Probe()); return 0; }
                 if(args.Length == 3 && args[0] == "setup")
                 { Output(PolicyOwnerSetup.Interactive(args[1],args[2]));return 0; }
                 if(args.Length == 2 && args[0] == "service")
                 { ServiceBase.Run(new PolicyOwnerService(args[1])); return 0; }
+                if(args.Length==2&&args[0]=="transfer-worker-v2")
+                {
+                    using(var identity=WindowsIdentity.GetCurrent())
+                    {
+                        Evidence.Require(identity.User.Value.StartsWith("S-1-5-80-",StringComparison.Ordinal),"Transfer worker requires the dedicated service account");
+                        using(var anchor=new OwnerAnchor(args[1]))
+                        {
+                            Evidence.Require(identity.User.Value==anchor.ServiceSid&&String.Equals(Process.GetCurrentProcess().MainModule.FileName,anchor.NativePath,StringComparison.OrdinalIgnoreCase),"Transfer worker instance/image/token mismatch");
+                            using(var memory=new MemoryStream())
+                            {
+                                var input=Console.OpenStandardInput();byte[] buffer=new byte[65536];int read;
+                                while((read=input.Read(buffer,0,buffer.Length))>0){Evidence.Require(memory.Length+read<=2*1024*1024,"Transfer control frame too large");memory.Write(buffer,0,read);}
+                                var request=OwnerWire.Parse(memory.ToArray());Evidence.Closed(request,"operation","payload");
+                                Output(EvidenceTransfer.Dispatch(anchor.Root,anchor.Instance,(string)request["operation"],Evidence.Obj(request["payload"]),DateTime.UtcNow));return 0;
+                            }
+                        }
+                    }
+                }
                 Evidence.Require(args.Length == 2 || args.Length == 4, "Expected registered instance and explicit owner operation");
                 using(var anchor = new OwnerAnchor(args[1]))
                 {
@@ -135,7 +180,7 @@ namespace TradingAgents.PolicyOwner
                             var request = OwnerWire.Parse(memory.ToArray()); Evidence.Closed(request, "operation", "payload");
                             Evidence.Require((string)request["operation"] != "validate-authentication-document" && (string)request["operation"] != "apply-authenticated-record",
                                 "Authentication is available only through the visible Windows Hello flow");
-                            result = OwnerWire.Call(anchor, new Dictionary<string, object> {{"operation", "worker"}, {"payload", request}});
+                            result = OwnerWire.Call(anchor, new Dictionary<string, object> {{"operation", "worker"}, {"payload", request}},((string)request["operation"]).StartsWith("evidence-",StringComparison.Ordinal)?90000:60000);
                         }
                     }
                     else if(args.Length == 2 && args[0] == "status")

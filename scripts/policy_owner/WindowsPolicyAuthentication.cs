@@ -212,8 +212,7 @@ namespace TradingAgents.PolicyOwner
                 Size=(uint)credentialId.Length, Id=id.Pointer, Type="public-key"}))
             {
                 var data = new ClientData {Version=1, Size=(uint)client.Length, Json=json.Pointer, HashAlgorithm="SHA-256"};
-                var options = new GetOptions {Version=1, Timeout=120000,
-                    Credentials=new Array {Count=1, Values=credential.Pointer}, Attachment=1, Verification=1};
+                var options = new GetOptions {Version=1, Timeout=120000, Credentials=new Array {Count=1, Values=credential.Pointer}, Attachment=1, Verification=1};
                 IntPtr output;
                 int status = WebAuthNAuthenticatorGetAssertion(window, rpId, ref data, ref options, out output);
                 if(status != 0) Marshal.ThrowExceptionForHR(status);

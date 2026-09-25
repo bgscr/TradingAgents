@@ -916,11 +916,19 @@ namespace TradingAgents.RuntimeProtection
             if(!DuplicateHandle(new IntPtr(-1),source,new IntPtr(-1),out copy,0,true,2))throw new Win32Exception(Marshal.GetLastWin32Error());
             owned.Add(copy);return copy;
         }
-        internal ProtectedChildren()
+        internal ProtectedChildren(long maximumMemoryBytes=0)
         {
             job=CreateJobObjectW(IntPtr.Zero,null);
             if(job==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error());
             var limits=new ExtendedLimits();limits.Basic.Flags=0x2000; // KILL_ON_JOB_CLOSE, no breakaway permission.
+            if(maximumMemoryBytes!=0)
+            {
+                if(maximumMemoryBytes<64L*1024*1024||maximumMemoryBytes>8L*1024*1024*1024)
+                {Dispose();throw new InvalidDataException("Invalid finite worker memory bound");}
+                limits.Basic.Flags|=0x300; // PROCESS_MEMORY and JOB_MEMORY; default callers unchanged.
+                limits.ProcessMemory=new UIntPtr((ulong)maximumMemoryBytes);
+                limits.JobMemory=new UIntPtr((ulong)maximumMemoryBytes);
+            }
             if(!SetInformationJobObject(job,9,ref limits,Marshal.SizeOf(typeof(ExtendedLimits))))
             { int error=Marshal.GetLastWin32Error();Dispose();throw new Win32Exception(error); }
         }

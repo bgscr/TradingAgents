@@ -11,6 +11,7 @@ import base64
 import ctypes
 import os
 import sqlite3
+import stat
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -382,8 +383,18 @@ class LocalWindowsPolicyOwner:
         if not sources:
             raise ValueError("no current source is registered")
         current = sources[-1]
-        if set(current) != {"candidate", "lineage_plan_identity", "production_inventory_identity"}:
+        if set(current) not in (
+            {"candidate", "lineage_plan_identity", "production_inventory_identity"},
+            {
+                "candidate",
+                "lineage_plan_identity",
+                "production_inventory_identity",
+                "inventory_reference",
+            },
+        ):
             raise ValueError("current verified source registration is incomplete")
+        if self.anchor["operational"]:
+            self._verified_current_inventory(current)
         execution = proposal.execution
         permissions = [
             self._authority_artifact(
@@ -485,12 +496,41 @@ class LocalWindowsPolicyOwner:
         else:
             raise ValueError("unsupported owner authentication purpose")
 
+    def authentication_validation_window(self, purpose: str, document: dict) -> dict:
+        """Private validator result, not a human record or qualification receipt.
+
+        The native owner selects acceptance time AFTER expensive validation and
+        checks it against these exact existing bounds before journal publication.
+        This never moves a date, substitutes an earlier validation clock or renews
+        a descriptor. Signed record derivation later uses that same accepted time.
+        """
+        self.validate_authentication_document(purpose, document)
+        lower, upper = [], []
+        if purpose == "REGISTER_EVIDENCE":
+            for entry in evidence_intake_entries(document):
+                if entry["kind"] == "artifact-reference":
+                    descriptor = self._published_descriptor(entry["value"])
+                    approval, _proposal, _record = self._decision(descriptor.approval_identity)
+                    lower.extend((utc(descriptor.issued_utc), utc(approval.effective_utc)))
+                    upper.extend((utc(descriptor.expires_utc), utc(approval.expires_utc)))
+        return {
+            "contract_version": "policy-owner-authentication-validation-v2",
+            "validated": True,
+            "instance": self.anchor["instance"],
+            "purpose": purpose,
+            "document_sha256": sha256(canonical_bytes(document)).hexdigest(),
+            "valid_from_utc": max(lower).isoformat() if lower else None,
+            "valid_until_utc": min(upper).isoformat() if upper else None,
+            "execution_authorized": False,
+        }
+
     def _validate_intake(self, document: dict) -> None:
         kind, key, value = document["kind"], document["key"], document["value"]
         if (
             kind
             not in {
                 "artifact",
+                "artifact-reference",
                 "allocation",
                 "observation",
                 "executed-stage",
@@ -514,6 +554,11 @@ class LocalWindowsPolicyOwner:
             raise ValueError("new observations cannot be enrolled as retained originals")
         if any(entry["kind"] == kind and entry["key"] == key for entry in self._intakes()):
             raise ValueError("immutable owner registration already exists")
+        if kind in {"artifact", "artifact-reference"} and any(
+            entry["kind"] in {"artifact", "artifact-reference"} and entry["key"] == key
+            for entry in self._intakes()
+        ):
+            raise ValueError("artifact registration cannot be replayed through another version")
         if kind == "artifact":
             if set(value) != {"reference", "bytes_base64"}:
                 raise ValueError("artifact intake must include exact bytes and reference")
@@ -529,7 +574,91 @@ class LocalWindowsPolicyOwner:
                 raise ValueError(
                     "authenticated intake cannot rebind an existing setup or owner artifact"
                 )
+        elif kind == "artifact-reference":
+            descriptor = self._published_descriptor(value)
+            if key != descriptor.artifact.identity:
+                raise ValueError("compact artifact key differs from its semantic identity")
+            with self.connection() as connection:
+                existing = connection.execute(
+                    "SELECT reference FROM artifacts WHERE identity=?", (key,)
+                ).fetchone()
+            if existing is not None and EvidenceRef.read(existing[0]) != descriptor.artifact:
+                raise ValueError(
+                    "authenticated intake cannot rebind an existing setup or owner artifact"
+                )
+            role, _ = self._role()
+            approval, proposal, _ = self._decision(descriptor.approval_identity)
+            if (
+                descriptor.instance != self.anchor["instance"]
+                or descriptor.role_identity != role.identity
+                or descriptor.candidate != approval.candidate
+                or descriptor.lineage_plan_identity
+                != proposal.policy.lineage_plan.lineage_plan_identity
+                or descriptor.acquisition_identity
+                in {
+                    self.registry.value.before.observation_id,
+                    self.registry.value.after.observation_id,
+                }
+            ):
+                raise ValueError(
+                    "artifact descriptor instance/role/candidate/plan/acquisition mismatch"
+                )
+            if not utc(descriptor.issued_utc) <= utc(self.now_utc) < utc(descriptor.expires_utc):
+                raise ValueError("compact artifact descriptor is not currently valid")
+            if not utc(approval.effective_utc) <= utc(self.now_utc) < utc(approval.expires_utc):
+                raise ValueError("artifact descriptor decision is stale")
+            from tradingagents.policy_evidence_contract import validate_artifact
+
+            artifact = validate_artifact(
+                self.root / "artifacts" / (descriptor.artifact.pin.sha256 + ".blob"), descriptor
+            )
+            if descriptor.artifact_schema == "production-python-modules:v1":
+                from tradingagents.policy_evidence_acquisition import (
+                    ProductionInventory,
+                    validate_production_inventory,
+                )
+
+                inventory = ProductionInventory.read(artifact)
+                validate_production_inventory(inventory)
+                if inventory.candidate != descriptor.candidate or (
+                    self.anchor["operational"] and inventory.fixture_only
+                ):
+                    raise ValueError("production inventory candidate/fixture scope mismatch")
+            if descriptor.artifact_schema == "crash-protection-historical-inventory:v1":
+                from tradingagents.policy_evidence_acquisition import validate_capture_provenance
+
+                capture = validate_capture_provenance(artifact)
+                if capture.get("observation_identity") != descriptor.acquisition_identity or (
+                    self.anchor["operational"] and capture.get("fixture_only") is not False
+                ):
+                    raise ValueError(
+                        "capture acquisition/fixture scope differs from its descriptor"
+                    )
+                if capture.get("observation_identity") != content_identity(
+                    "policy-evidence-observation:v1",
+                    {
+                        name: item
+                        for name, item in capture.items()
+                        if name != "observation_identity"
+                    },
+                ):
+                    raise ValueError("capture acquisition identity is not its exact provenance")
+                if (
+                    not max(utc(approval.effective_utc), utc(proposal.execution.effective_utc))
+                    <= utc(capture["started_utc"])
+                    <= utc(capture["finished_utc"])
+                    <= utc(descriptor.issued_utc)
+                    < min(utc(approval.expires_utc), utc(proposal.execution.expires_utc))
+                ):
+                    raise ValueError(
+                        "capture is outside its actual approved execution/acquisition window"
+                    )
         elif kind == "observation":
+            if (
+                self.anchor["operational"]
+                and document["contract_version"] != "policy-owner-evidence-intake-v2"
+            ):
+                raise ValueError("operational observations require versioned producer provenance")
             if (
                 set(value) != set(ObservationResolution.__dataclass_fields__)
                 or value["observation_id"] != key
@@ -542,12 +671,39 @@ class LocalWindowsPolicyOwner:
             for name in ("lineage_plan_identity", "allocation_identity", "stage"):
                 if not isinstance(value[name], str) or not value[name]:
                     raise ValueError("new observation has an empty acquisition field")
+            if document["contract_version"] == "policy-owner-evidence-intake-v2":
+                descriptor = self._artifact_descriptor(EvidenceRef.read(value["artifact"]))
+                if (
+                    descriptor.acquisition_identity != key
+                    or descriptor.lineage_plan_identity != value["lineage_plan_identity"]
+                    or descriptor.stage != value["stage"]
+                    or descriptor.phase != value["phase"]
+                ):
+                    raise ValueError(
+                        "observation differs from its authenticated artifact descriptor"
+                    )
+                raw = strict_json(self.read_artifact(descriptor.artifact))
+                if descriptor.artifact_schema == "crash-protection-historical-inventory:v1":
+                    capture = raw.get("capture", {})
+                    if capture.get("observation_identity") != key or utc(
+                        capture["finished_utc"]
+                    ) != utc(value["observed_at_utc"]):
+                        raise ValueError("observation acquisition clock/identity mismatch")
+                elif utc(value["observed_at_utc"]) > utc(descriptor.issued_utc):
+                    raise ValueError("canonical observation postdates its artifact descriptor")
         elif kind == "current-source":
-            if set(value) != {
+            expected_fields = {
                 "candidate",
                 "lineage_plan_identity",
                 "production_inventory_identity",
-            }:
+            }
+            if document["contract_version"] == "policy-owner-evidence-intake-v2":
+                expected_fields.add("inventory_reference")
+            elif self.anchor["operational"]:
+                raise ValueError(
+                    "operational current-source requires a v2 verified production inventory"
+                )
+            if set(value) != expected_fields:
                 raise ValueError("current source intake is incomplete")
             Candidate.read(value["candidate"])
             if not all(
@@ -555,6 +711,8 @@ class LocalWindowsPolicyOwner:
                 for name in ("lineage_plan_identity", "production_inventory_identity")
             ):
                 raise ValueError("current source intake lacks exact plan/inventory identities")
+            if document["contract_version"] == "policy-owner-evidence-intake-v2":
+                self._verified_current_inventory(value)
         elif kind == "executed-stage":
             EvidenceRef.read(value)
             if "|" not in key:
@@ -609,11 +767,17 @@ class LocalWindowsPolicyOwner:
             raise ValueError("caller cannot insert its own authentication record")
         purpose, document = record["purpose"], record["document"]
         records = self.records
+        validation_time = self.now_utc
         try:
             self.records = records[:-1]
+            # Native verification proves this immutable record's actual signing
+            # time. Idempotent derivation validates historical descriptor validity
+            # at that time; it never renews consent or rewinds the durable clock.
+            self.now_utc = record["recorded_at_utc"]
             self.validate_authentication_document(purpose, document)
         finally:
             self.records = records
+            self.now_utc = validation_time
         self.put(canonical_bytes(record), record["identity"])
         if purpose == "EXACT_POLICY_DECISION":
             proposal = PolicyDecisionProposal.read(document)
@@ -697,11 +861,97 @@ class LocalWindowsPolicyOwner:
             "execution_authorized": False,
         }
 
+    def _artifact_descriptor(self, reference: EvidenceRef):
+        from tradingagents.policy_evidence_contract import ArtifactDescriptor
+
+        entry = self._registration("artifact-reference", reference.identity)
+        descriptor = ArtifactDescriptor.read(entry["descriptor"])
+        if descriptor.artifact != reference or descriptor.instance != self.anchor["instance"]:
+            raise ValueError("registered artifact descriptor/reference mismatch")
+        return descriptor
+
+    def _verified_current_inventory(self, value: dict):
+        from tradingagents.policy_evidence_acquisition import (
+            ProductionInventory,
+            validate_production_inventory,
+        )
+
+        if "inventory_reference" not in value:
+            raise ValueError("current source lacks independently verifiable inventory bytes")
+        ref = EvidenceRef.read(value["inventory_reference"])
+        descriptor = self._artifact_descriptor(ref)
+        if (
+            descriptor.artifact_schema != ProductionInventory.namespace
+            or descriptor.artifact_identity_field != "identity"
+        ):
+            raise ValueError(
+                "current source schema cannot reinterpret an opaque or unrelated artifact"
+            )
+        inventory = ProductionInventory.read(self.read_artifact(ref))
+        validate_production_inventory(inventory)
+        if (
+            ref.identity != inventory.identity
+            or ref.identity != value["production_inventory_identity"]
+            or inventory.candidate != Candidate.read(value["candidate"])
+            or descriptor.candidate != inventory.candidate
+            or descriptor.lineage_plan_identity != value["lineage_plan_identity"]
+            or descriptor.stage != "CURRENT_SOURCE"
+            or (self.anchor["operational"] and inventory.fixture_only)
+        ):
+            raise ValueError("current source/physical inventory/plan binding mismatch")
+        return inventory
+
+    def _published_descriptor(self, value: dict):
+        import re
+
+        from tradingagents.policy_evidence_contract import ArtifactDescriptor
+
+        if (
+            set(value) != {"transfer_id", "descriptor"}
+            or not isinstance(value["transfer_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["transfer_id"])
+        ):
+            raise ValueError("compact intake requires an exact completed transfer")
+        descriptor = ArtifactDescriptor.read(value["descriptor"])
+        base = self.root / "state" / "temp" / ("evidence-import-" + value["transfer_id"])
+
+        def metadata(suffix):
+            path = Path(str(base) + suffix)
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & 0x400
+                or info.st_size > 32768
+            ):
+                raise ValueError("invalid native transfer metadata")
+            return strict_json(path.read_bytes())
+
+        if Path(str(base) + ".cancelled").exists():
+            raise ValueError("cancelled transfer cannot be authenticated")
+        if metadata(".json") != {
+            "transfer_id": value["transfer_id"],
+            "descriptor": descriptor.model_dump(mode="json"),
+        } or metadata(".complete") != {
+            "transfer_id": value["transfer_id"],
+            "descriptor_identity": descriptor.identity,
+        }:
+            raise ValueError("native transfer publication is incomplete or rebound")
+        if descriptor.instance != self.anchor["instance"]:
+            raise ValueError("published descriptor belongs to another owner instance")
+        return descriptor
+
     def _apply_intake(self, document: dict) -> None:
         if document["kind"] == "artifact":
             value = document["value"]
             ref = EvidenceRef.read(value["reference"])
             self.put(base64.b64decode(value["bytes_base64"], validate=True), ref.identity)
+        elif document["kind"] == "artifact-reference":
+            # Publication precedes the genuine signed record. Replay derives only
+            # the exact registration, never an import, claim or new authentication.
+            descriptor = self._published_descriptor(document["value"])
+            raw = self._blob(descriptor.artifact.pin)
+            self.put(raw, descriptor.artifact.identity)
         elif document["kind"] == "current-source":
             current = document["value"]
             with self.connection() as connection:
@@ -826,12 +1076,27 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         # it sends anything. Python verification is not native pre-start trust.
         if sha256(self.executable.read_bytes()).hexdigest() != self.pin:
             raise ValueError("registered native owner client changed")
+        heavy = operation in {
+            "resolve",
+            "verify-envelope",
+            "verify-attempt",
+            "verify-materialization",
+            "verify-inert-launch",
+            "verify-result",
+            "eligibility",
+            "claim",
+            "begin-stage",
+            "complete-stage",
+            "finalize",
+            "issue-receipt",
+            "report",
+        }
         completed = subprocess.run(
             [str(self.executable), "request", self.instance],
             input=canonical_bytes({"operation": operation, "payload": payload}),
             capture_output=True,
             check=False,
-            timeout=65,
+            timeout=375 if heavy else (105 if operation.startswith("evidence-") else 65),
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if completed.returncode != 0:

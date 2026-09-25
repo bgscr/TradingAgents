@@ -13,6 +13,7 @@ import json
 import tarfile
 import zipfile
 from dataclasses import replace
+from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from tradingagents.policy_qualified_contract import (
     canonical_bytes,
     content_identity,
     strict_json,
+    utc,
 )
 from tradingagents.policy_qualified_results import (
     AuthorityResolution,
@@ -285,11 +287,23 @@ def raw_inventory(
             ),
         }
     ]
+    template = getattr(owner, "fixture_root_template", None)
+    if template is not None:
+        # Explicit TEST input extension for production-size/full-capture vectors.
+        # No comparator or authority method is substituted.
+        roots = [copy.deepcopy(template)]
+        roots[0]["entries"][0]["attributes"] = attributes
+        if root != r"D:\SYNTHETIC-HISTORY\build":
+            roots[0]["path"] = root
+        roots[0]["inventory_identity"] = content_identity(
+            "crash-protection-historical-root-inventory:v1", roots[0]["entries"]
+        )
+        root = roots[0]["path"]
     payload = {
         "phase": phase,
         "roots": roots,
         "elapsed_seconds": elapsed,
-        "file_count": 0,
+        "file_count": sum(item["file_count"] for item in roots),
         "unreadable_count": 0,
         "no_acl_write_or_recovery": True,
     }
@@ -299,7 +313,15 @@ def raw_inventory(
 
 
 class SyntheticCase:
-    def __init__(self, tmp_path, *, additional_historical_field=False):
+    def __init__(
+        self,
+        tmp_path,
+        *,
+        additional_historical_field=False,
+        root_template=None,
+        clock_utc=None,
+        candidate=None,
+    ):
         from tradingagents.windows_sandbox_acceptance import (
             TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
             TICKET06_QUALIFIED_COMMAND_LEDGER_IDENTITY,
@@ -307,7 +329,23 @@ class SyntheticCase:
 
         self.root = tmp_path
         self.owner = owner = SyntheticOwner()
-        self.candidate = Candidate(commit="a" * 40, tree="b" * 40, parent="c" * 40)
+        owner.fixture_root_template = root_template
+        if clock_utc is not None:
+            fixture_now = utc(clock_utc)
+            effective_utc = (fixture_now - timedelta(hours=1)).isoformat()
+            claim_by_utc = (fixture_now - timedelta(hours=1) + timedelta(days=7)).isoformat()
+            expires_utc = (fixture_now - timedelta(hours=1) + timedelta(days=30)).isoformat()
+        else:
+            effective_utc, claim_by_utc, expires_utc = (
+                "2001-01-01T00:00:00Z",
+                "2001-01-08T00:00:00Z",
+                "2001-01-31T00:00:00Z",
+            )
+        self.candidate = (
+            Candidate.read(candidate)
+            if candidate is not None
+            else Candidate(commit="a" * 40, tree="b" * 40, parent="c" * 40)
+        )
         pin = BytePin.of(b"SYNTHETIC reviewed source/procedure contract")
         owner.pinned[pin.sha256] = b"SYNTHETIC reviewed source/procedure contract"
         before = raw_inventory(owner, phase="before", attributes=0x10000010)
@@ -469,9 +507,9 @@ class SyntheticCase:
             decision_artifact_pin=BytePin.of(decision),
             channel_session_reference="SYNTHETIC-authenticated-channel",
             selection="APPROVE",
-            effective_utc="2001-01-01T00:00:00Z",
-            claim_by_utc="2001-01-08T00:00:00Z",
-            expires_utc="2001-01-31T00:00:00Z",
+            effective_utc=effective_utc,
+            claim_by_utc=claim_by_utc,
+            expires_utc=expires_utc,
         )
         self.ledger = LineageLedger.provision(
             tmp_path / "SYNTHETIC-claims.sqlite", "SYNTHETIC-ledger"
@@ -491,8 +529,8 @@ class SyntheticCase:
             qualification_execution_authority=authority_ref,
             execution_candidate=self.candidate,
             execution_lineage_plan_identity=plan.lineage_plan_identity,
-            execution_effective_utc="2001-01-01T00:00:00Z",
-            execution_expires_utc="2001-01-31T00:00:00Z",
+            execution_effective_utc=effective_utc,
+            execution_expires_utc=expires_utc,
             execution_stage_budgets=plan.stage_budgets,
             execution_finalization_maximum_seconds=plan.finalization_maximum_seconds,
             approved_policy_identity=self.policy.acceptance_policy_identity,
@@ -503,7 +541,7 @@ class SyntheticCase:
             ledger_path=self.ledger.path,
             state="ACTIVE",
             state_reference="SYNTHETIC-fresh-authority-state",
-            now_utc="2001-01-02T00:00:00Z",
+            now_utc=clock_utc or "2001-01-02T00:00:00Z",
         )
         self.allocation = LineageAllocation.seal(
             contract_version="historical-state-lineage-allocation-v1",

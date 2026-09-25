@@ -130,6 +130,25 @@ namespace TradingAgents.PolicyOwner
             Evidence.Require(now >= lastClock, "Owner clock regressed"); lastClock = now; return now;
         }
         static string Iso(DateTime value) { return value.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", CultureInfo.InvariantCulture); }
+        void ValidateTransferredDocument(OwnerAnchor anchor, Dictionary<string,object> document, DateTime now)
+        {
+            var deadline=Stopwatch.StartNew();
+            object version;
+            if(!document.TryGetValue("contract_version",out version))return;
+            IEnumerable entries=(string)version=="policy-owner-evidence-intake-batch-v2"?(IEnumerable)document["entries"]:new object[]{document};
+            foreach(object item in entries)
+            {
+                var entry=Evidence.Obj(item);
+                if(!entry.TryGetValue("contract_version",out version)||(string)version!="policy-owner-evidence-intake-v2")continue;
+                Evidence.Closed(entry,"contract_version","kind","key","value");
+                if((string)entry["kind"]!="artifact-reference")
+                {Evidence.Require((string)entry["kind"]=="current-source"||(string)entry["kind"]=="observation","Unsupported v2 artifact intake");continue;}
+                var value=Evidence.Obj(entry["value"]);Evidence.Closed(value,"transfer_id","descriptor");
+                int remaining=30000-(int)deadline.ElapsedMilliseconds;
+                Evidence.Require(remaining>0,"Complete-descriptor verification exceeded its bounded lifetime");
+                TransferWorker(anchor,"evidence-verify-complete-v2",value,remaining);
+            }
+        }
         void Serve()
         {
             using(var anchor = new OwnerAnchor(instance))
@@ -277,6 +296,10 @@ namespace TradingAgents.PolicyOwner
                         Evidence.Require(records.Count == 0 && Native.Hash(OwnerWire.Bytes(document)) == (string)anchor.Value["setup_proposal_sha256"],
                             "Role enrollment differs from operator-confirmed setup or already exists");
                     else Evidence.Require(records.Count > 0, "No human project role is enrolled");
+                    // Check the actual cumulative journal before creating a
+                    // challenge or asking the native frontend to invoke Hello.
+                    CapacityProjection(anchor.Value,records,new[]{document},Iso(Clock()));
+                    ValidateTransferredDocument(anchor,document,Clock());
                     Worker(anchor, "validate-authentication-document", new Dictionary<string, object> {{"purpose", purpose}, {"document", document}}, records);
                     byte[] nonce = new byte[32]; using(var generator = System.Security.Cryptography.RandomNumberGenerator.Create()) generator.GetBytes(nonce);
                     DateTime now = Clock(); string id = Convert.ToBase64String(nonce);
@@ -300,37 +323,43 @@ namespace TradingAgents.PolicyOwner
                 pending.Remove(challengeId); // Atomic on this single dispatch loop, before every acceptance/failure.
                 Evidence.Require(challenge.Caller == caller && Clock() < challenge.Expires, "Wrong principal or expired human challenge");
                 string rp = anchor.Operational ? WindowsPolicyAuthentication.OperationalRp : WindowsPolicyAuthentication.TestRp;
-                Dictionary<string, object> credential;
+                Dictionary<string, object> keyRecord;
                 if(challenge.Purpose == "ENROLL_PROJECT_ROLE")
                 {
                     Evidence.Require(records.Count == 0, "Project role enrollment was already consumed");
-                    credential = Evidence.Obj(payload["registration"]); Evidence.Closed(credential, "id", "authenticator_data", "public_key");
-                    byte[] key = WindowsPolicyAuthentication.RegistrationPublicKey(rp, Convert.FromBase64String((string)credential["authenticator_data"]),
-                        Convert.FromBase64String((string)credential["id"]));
-                    Evidence.Require(WindowsPolicyAuthentication.Equal(key, Convert.FromBase64String((string)credential["public_key"])), "Enrollment public key mismatch");
+                    keyRecord = Evidence.Obj(payload["registration"]); Evidence.Closed(keyRecord, "id", "authenticator_data", "public_key");
+                    byte[] key = WindowsPolicyAuthentication.RegistrationPublicKey(rp, Convert.FromBase64String((string)keyRecord["authenticator_data"]),
+                        Convert.FromBase64String((string)keyRecord["id"]));
+                    Evidence.Require(WindowsPolicyAuthentication.Equal(key, Convert.FromBase64String((string)keyRecord["public_key"])), "Enrollment public key mismatch");
                 }
                 else
                 {
                     Evidence.Require(payload["registration"] == null, "A decision cannot replace its enrolled credential");
-                    credential = Evidence.Obj(records[0]["credential"]);
+                    keyRecord = Evidence.Obj(records[0]["credential"]);
                 }
                 var proof = Proof(Evidence.Obj(payload["proof"]));
                 uint previous = records.Count == 0 ? 0 : Convert.ToUInt32(records[records.Count - 1]["authenticator_counter"]);
-                uint counter = WindowsPolicyAuthentication.Verify(rp, challenge.Bytes, Convert.FromBase64String((string)credential["id"]),
-                    Convert.FromBase64String((string)credential["public_key"]), previous, proof);
-                Worker(anchor, "validate-authentication-document", new Dictionary<string, object> {{"purpose", challenge.Purpose}, {"document", challenge.Document}}, records);
-                Evidence.Require(Clock() < challenge.Expires, "Human challenge expired during complete decision validation");
+                uint counter = WindowsPolicyAuthentication.Verify(rp, challenge.Bytes, Convert.FromBase64String((string)keyRecord["id"]),
+                    Convert.FromBase64String((string)keyRecord["public_key"]), previous, proof);
+                ValidateTransferredDocument(anchor,challenge.Document,Clock());
+                var validation=Worker(anchor, "validate-authentication-document", new Dictionary<string, object> {{"purpose", challenge.Purpose}, {"document", challenge.Document}}, records);
+                DateTime recordedAt=Clock();
+                CheckValidationWindow(validation,instance,challenge.Purpose,(string)challenge.ChallengeDocument["document_sha256"],recordedAt);
+                Evidence.Require(recordedAt < challenge.Expires, "Human challenge expired during complete decision validation");
                 var record = Evidence.Seal("policy-owner-authenticated-human-record:v1", new Dictionary<string, object> {
                     {"contract_version", "policy-owner-authenticated-human-record-v1"}, {"instance", instance}, {"operator_sid", caller},
                     {"purpose", challenge.Purpose}, {"document", challenge.Document}, {"challenge_id", challenge.Id},
-                    {"challenge", Convert.ToBase64String(challenge.Bytes)}, {"challenge_document", challenge.ChallengeDocument}, {"credential", credential}, {"proof", payload["proof"]},
-                    {"authenticator_counter", counter}, {"recorded_at_utc", Iso(Clock())},
+                    {"challenge", Convert.ToBase64String(challenge.Bytes)}, {"challenge_document", challenge.ChallengeDocument}, {"credential", keyRecord}, {"proof", payload["proof"]},
+                    {"authenticator_counter", counter}, {"recorded_at_utc", Iso(recordedAt)},
                     {"storage_binding_identity", anchor.Value["storage_binding_identity"]}, {"predecessor", records.Count == 0 ? null : records[records.Count - 1]["identity"]},
                     {"elevated_native_frontend_pin", anchor.Value["native_sha256"]}, {"execution_authorized", false}});
                 var prospectiveRecords=new List<Dictionary<string,object>>(records);prospectiveRecords.Add(record);
                 CheckAuthenticationCapacity(anchor.Value,record,prospectiveRecords,Iso(Clock()));
-                Evidence.Require(Clock()<challenge.Expires,"Human challenge expired before immutable publication");
-                WriteImmutable(Path.Combine(anchor.Root, "authentication", records.Count.ToString("D8", CultureInfo.InvariantCulture) + ".json"), OwnerWire.Bytes(record),Path.Combine(anchor.Root,"state","temp"));
+                byte[] recordBytes=OwnerWire.Bytes(record);
+                DateTime publishAt=Clock();
+                CheckValidationWindow(validation,instance,challenge.Purpose,(string)challenge.ChallengeDocument["document_sha256"],publishAt);
+                Evidence.Require(publishAt<challenge.Expires,"Human challenge expired before immutable publication");
+                WriteImmutable(Path.Combine(anchor.Root, "authentication", records.Count.ToString("D8", CultureInfo.InvariantCulture) + ".json"), recordBytes,Path.Combine(anchor.Root,"state","temp"));
                 // Authentication is retained before any derived approval. A
                 // crash cannot repeat its challenge or silently erase the proof.
                 records.Add(record);
@@ -340,6 +369,36 @@ namespace TradingAgents.PolicyOwner
             Evidence.Closed(payload, "operation", "payload");
             Evidence.Require((string)payload["operation"] != "apply-authenticated-record" && (string)payload["operation"] != "validate-authentication-document",
                 "Native authentication dispatch is not an external worker operation");
+            string workerOperation=(string)payload["operation"];
+            var workerPayload=Evidence.Obj(payload["payload"]);
+            if(workerOperation=="evidence-capacity-v2")
+            {
+                Evidence.Closed(workerPayload,"documents");
+                var documents=new List<Dictionary<string,object>>();
+                foreach(object item in (System.Collections.IEnumerable)workerPayload["documents"])
+                {Evidence.Require(documents.Count<512,"Capacity document count exceeds bound");documents.Add(Evidence.Obj(item));}
+                var capacity=CapacityProjection(anchor.Value,records,documents,Iso(Clock()));
+                capacity["instance"]=anchor.Instance;capacity["storage_binding_identity"]=anchor.Value["storage_binding_identity"];
+                capacity["ledger_object_metadata_verified"]=true;
+                return capacity; // Anchor metadata/ReadRecords only; no worker/ledger contents/challenge/write.
+            }
+            if(workerOperation.StartsWith("evidence-import-",StringComparison.Ordinal)||workerOperation=="evidence-read-chunk-v2")
+            {
+                Evidence.Require(records.Count>0,"Evidence transfer requires the enrolled instance; staging grants no role");
+                if(workerOperation=="evidence-import-begin-v2")
+                {
+                    var descriptor=Evidence.Obj(workerPayload["descriptor"]);
+                    Evidence.Require((string)descriptor["role_identity"]==(string)Evidence.Obj(records[0]["document"])["identity"],"Evidence staging role mismatch");
+                }
+                if(workerOperation=="evidence-read-chunk-v2")
+                {
+                    // Full registered-reference validation precedes bounded export.
+                    // The native reader then opens only the content-addressed object.
+                    var checkedReference=Worker(anchor,"artifact-reference-v2",new Dictionary<string,object>{{"reference",workerPayload["reference"]}},records);
+                    Evidence.Require((bool)checkedReference["registered"],"Artifact is staged but not authenticated/registered");
+                }
+                return TransferWorker(anchor,workerOperation,workerPayload,30000);
+            }
             return Worker(anchor, (string)payload["operation"], Evidence.Obj(payload["payload"]), records);
         }
         internal static WindowsPolicyAuthentication.Proof Proof(Dictionary<string, object> value)
@@ -411,7 +470,7 @@ namespace TradingAgents.PolicyOwner
         }
         Dictionary<string, object> Worker(OwnerAnchor anchor, string operation, Dictionary<string, object> payload, List<Dictionary<string, object>> records)
         {
-            var permitted = new HashSet<string>(new string[]{"validate-authentication-document", "apply-authenticated-record", "resolve", "read-artifact", "read-pin",
+            var permitted = new HashSet<string>(new string[]{"validate-authentication-document", "apply-authenticated-record", "resolve", "read-artifact", "read-pin", "artifact-reference-v2",
                 "original-acquisition", "canonical-allocation", "observation", "executed-stage", "review-principal", "registered-root", "verify-envelope", "verify-attempt",
                 "verify-materialization", "verify-inert-launch", "verify-result", "eligibility", "claim", "begin-stage", "complete-stage", "finalize", "issue-receipt", "report"}, StringComparer.Ordinal);
             Evidence.Require(permitted.Contains(operation), "No arbitrary worker or live execution operation exists");
@@ -426,15 +485,36 @@ namespace TradingAgents.PolicyOwner
             start.EnvironmentVariables["PATH"] = Path.Combine(anchor.Root, "python") + ";" + Path.Combine(windows, "System32");
             start.EnvironmentVariables["TEMP"] = Path.Combine(anchor.Root, "state", "temp");
             start.EnvironmentVariables["TMP"] = start.EnvironmentVariables["TEMP"];
-            using(var children=new ProtectedChildren())
+            using(var children=new ProtectedChildren(4L*1024*1024*1024))
             {
                 lock(workerLock)
                 {
                     Evidence.Require(!stopping && activeWorker==null,"Owner worker lifetime is unavailable");
                     activeWorker=children;
                 }
-                try { return OwnerWire.Parse(children.RunRedirected(start,"\""+start.FileName+"\"",request,45000)); }
+                try { return OwnerWire.Parse(children.RunRedirected(start,"\""+start.FileName+"\"",request,OwnerWire.WorkerMilliseconds(operation))); }
                 finally { lock(workerLock)activeWorker=null; }
+            }
+        }
+        Dictionary<string,object> TransferWorker(OwnerAnchor anchor,string operation,Dictionary<string,object> payload,int milliseconds)
+        {
+            // Potentially blocking disk operations run in an owned bounded child.
+            var start=new ProcessStartInfo(anchor.NativePath){Arguments="transfer-worker-v2 "+anchor.Instance,
+                UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,
+                WorkingDirectory=Path.Combine(anchor.Root,"state")};
+            start.EnvironmentVariables.Clear();
+            string windows=Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            start.EnvironmentVariables["SystemRoot"]=windows;
+            start.EnvironmentVariables["PATH"]=Path.Combine(windows,"System32");
+            start.EnvironmentVariables["TEMP"]=Path.Combine(anchor.Root,"state","temp");
+            start.EnvironmentVariables["TMP"]=start.EnvironmentVariables["TEMP"];
+            byte[] request=OwnerWire.Bytes(new Dictionary<string,object>{{"operation",operation},{"payload",payload}});
+            Evidence.Require(request.Length<=2*1024*1024,"Versioned evidence control frame exceeds bound");
+            using(var children=new ProtectedChildren(256L*1024*1024))
+            {
+                lock(workerLock){Evidence.Require(!stopping&&activeWorker==null,"Transfer worker unavailable");activeWorker=children;}
+                try{return OwnerWire.Parse(children.RunRedirected(start,"\""+start.FileName+"\"",request,milliseconds));}
+                finally{lock(workerLock)activeWorker=null;}
             }
         }
         internal static byte[] WorkerRequestBytes(Dictionary<string,object> anchor,string operation,Dictionary<string,object> payload,List<Dictionary<string,object>> records,string now)
@@ -445,6 +525,40 @@ namespace TradingAgents.PolicyOwner
             Evidence.Require(bytes.Length<=64*1024*1024,"Owner worker request exceeds the complete serialized transport limit");
             return bytes;
         }
+        internal static void CheckValidationWindow(Dictionary<string,object> value,string instance,string purpose,string documentSha,DateTime at)
+        {
+            Evidence.Closed(value,"contract_version","validated","instance","purpose","document_sha256","valid_from_utc","valid_until_utc","execution_authorized");
+            Evidence.Require((string)value["contract_version"]=="policy-owner-authentication-validation-v2"&&(bool)value["validated"]
+                &&!(bool)value["execution_authorized"]&&(string)value["instance"]==instance&&(string)value["purpose"]==purpose
+                &&(string)value["document_sha256"]==documentSha,"Private authentication validation binding changed");
+            foreach(string field in new[]{"valid_from_utc","valid_until_utc"})if(value[field]!=null)
+            {
+                var time=DateTimeOffset.Parse((string)value[field],CultureInfo.InvariantCulture,DateTimeStyles.RoundtripKind);
+                Evidence.Require(time.Offset==TimeSpan.Zero,"Explicit UTC validation window required");
+                Evidence.Require(field=="valid_from_utc"?at>=time.UtcDateTime:at<time.UtcDateTime,"Evidence validity expired/not yet effective before authentication publication");
+            }
+        }
+        internal const int AuthenticationEnvelopeBytes=256*1024;
+        internal static Dictionary<string,object> CapacityProjection(Dictionary<string,object> anchor,List<Dictionary<string,object>> records,IEnumerable<Dictionary<string,object>> documents,string now)
+        {
+            long journal=System.Text.Encoding.UTF8.GetByteCount(Evidence.Canonical(records));
+            long added=0,largest=0;int count=0;
+            foreach(var document in documents)
+            {
+                Evidence.Require(++count<=512,"Capacity document count exceeds bound");
+                long record=OwnerWire.Bytes(document).LongLength+AuthenticationEnvelopeBytes;
+                added+=record+1;largest=Math.Max(largest,record);
+            }
+            long projectedJournal=journal+added;
+            long projectedRequest=WorkerRequestBytes(anchor,"apply-authenticated-record",new Dictionary<string,object>(),records,now).LongLength+added+largest;
+            Evidence.Require(projectedJournal<=32L*1024*1024,"Cumulative journal capacity exhausted before human challenge");
+            Evidence.Require(projectedRequest<=64L*1024*1024,"Cumulative worker capacity exhausted before human challenge");
+            return new Dictionary<string,object>{{"contract_version","policy-owner-evidence-capacity-v2"},{"current_journal_bytes",journal},
+                {"proposed_documents",count},{"authentication_envelope_reserve_bytes",AuthenticationEnvelopeBytes},
+                {"projected_journal_bytes",projectedJournal},{"projected_worker_request_bytes",projectedRequest},
+                {"observed_utc",now},{"capacity_is_not_a_reservation",true},{"challenge_created",false},
+                {"ledger_contents_read",false},{"ledger_state_queried",false},{"execution_authorized",false}};
+        }
         internal static void CheckAuthenticationCapacity(Dictionary<string,object> anchor,Dictionary<string,object> record,List<Dictionary<string,object>> prospectiveRecords,string now)
         {
             // Reserve half of the worker channel for future policy/control
@@ -452,6 +566,9 @@ namespace TradingAgents.PolicyOwner
             // publication; it cannot erase prior proofs or renew any attempt.
             byte[] journal=System.Text.Encoding.UTF8.GetBytes(Evidence.Canonical(prospectiveRecords));
             Evidence.Require(journal.Length<=32*1024*1024,"Authenticated journal capacity exhausted before publication");
+            if(record.ContainsKey("document"))
+                Evidence.Require(OwnerWire.Bytes(record).LongLength-OwnerWire.Bytes(Evidence.Obj(record["document"])).LongLength<=AuthenticationEnvelopeBytes,
+                    "Authentication envelope exceeds its pre-challenge reserved bound");
             WorkerRequestBytes(anchor,"apply-authenticated-record",record,prospectiveRecords,now);
         }
     }

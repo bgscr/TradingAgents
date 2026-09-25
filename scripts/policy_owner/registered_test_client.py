@@ -19,7 +19,7 @@ def build_test_blueprint(root: Path, instrument_registry: Path):
         RegisteredProductionQualifiedRoutingComposition,
     )
 
-    if os.environ.get("TUSHARE_TOKEN") != "fixture-only-production-binding":
+    if os.environ.get("TUSHARE_TOKEN") != "test-token":
         raise ValueError("client builder requires the explicit non-secret TEST token")
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(

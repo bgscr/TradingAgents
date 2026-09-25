@@ -143,8 +143,7 @@ def dispatch(request: dict) -> dict:
 
     if operation == "validate-authentication-document":
         fields("purpose", "document")
-        owner.validate_authentication_document(payload["purpose"], payload["document"])
-        return {"validated": True, "execution_authorized": False}
+        return owner.authentication_validation_window(payload["purpose"], payload["document"])
     if operation == "apply-authenticated-record":
         return owner.apply_authenticated_record(payload)
     if operation == "resolve":
@@ -152,18 +151,29 @@ def dispatch(request: dict) -> dict:
         return {"authority": encode_resolution(owner.resolve(payload["approval_identity"]))}
     if operation == "read-artifact":
         fields("reference")
+        artifact_bytes = owner.read_artifact(EvidenceRef.read(payload["reference"]))
+        if len(artifact_bytes) > 32 * 1024 * 1024:
+            raise ValueError(
+                "large artifact export requires evidence-read-chunk-v2; inline downgrade rejected"
+            )
+        return {"bytes_base64": base64.b64encode(artifact_bytes).decode("ascii")}
+    if operation == "artifact-reference-v2":
+        fields("reference")
+        reference = EvidenceRef.read(payload["reference"])
+        owner.read_artifact(reference)
         return {
-            "bytes_base64": base64.b64encode(
-                owner.read_artifact(EvidenceRef.read(payload["reference"]))
-            ).decode("ascii")
+            "reference": reference.model_dump(mode="json"),
+            "registered": True,
+            "execution_authorized": False,
         }
     if operation == "read-pin":
         fields("pin")
-        return {
-            "bytes_base64": base64.b64encode(
-                owner.read_pinned_file(BytePin.read(payload["pin"]))
-            ).decode("ascii")
-        }
+        pinned_bytes = owner.read_pinned_file(BytePin.read(payload["pin"]))
+        if len(pinned_bytes) > 32 * 1024 * 1024:
+            raise ValueError(
+                "large pinned evidence requires its registered reference and v2 chunk export"
+            )
+        return {"bytes_base64": base64.b64encode(pinned_bytes).decode("ascii")}
     if operation == "original-acquisition":
         fields("observation_id")
         return {

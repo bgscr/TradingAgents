@@ -14,6 +14,10 @@ import sys
 from pathlib import Path
 
 WORKER_MODULES = (
+    "tradingagents.policy_evidence_contract",
+    "tradingagents.policy_evidence_acquisition",
+    "tradingagents.policy_evidence_client",
+    "tradingagents.policy_evidence_limits",
     "tradingagents.policy_owner_contract",
     "tradingagents.windows_policy_owner",
     "tradingagents.policy_qualification_lifecycle",

@@ -34,6 +34,7 @@ NATIVE_SOURCES = (
     "scripts/policy_owner/PolicyOwnerMain.cs",
     "scripts/policy_owner/PolicyOwnerSetup.cs",
     "scripts/policy_owner/SetupStateValidator.cs",
+    "scripts/policy_owner/EvidenceTransfer.cs",
 )
 
 
@@ -151,6 +152,7 @@ def build(output: Path, *, fixture: bool = False) -> dict:
     names = set(NATIVE_SOURCES) | set(CONSUMER_SOURCES) | {"cli/main.py"}
     if fixture:
         names.add("tests/fixtures/runtime_protection/PolicyAuthenticationContracts.cs")
+        names.add("tests/fixtures/runtime_protection/EvidenceTransferContracts.cs")
     snapshot = output / "inputs"
     with hold_build_inputs([source / name for name in sorted(names)]):
         for name in sorted(names):
@@ -209,11 +211,12 @@ def build(output: Path, *, fixture: bool = False) -> dict:
     }
     if fixture:
         targets["PolicyAuthenticationContracts.exe"] = "PolicyAuthenticationContracts"
+        targets["EvidenceTransferContracts.exe"] = "EvidenceTransferContracts"
     results = {}
     for name, entrypoint in targets.items():
         extra = (
-            [str(snapshot / "tests/fixtures/runtime_protection/PolicyAuthenticationContracts.cs")]
-            if entrypoint == "PolicyAuthenticationContracts"
+            [str(snapshot / ("tests/fixtures/runtime_protection/" + entrypoint + ".cs"))]
+            if entrypoint in {"PolicyAuthenticationContracts", "EvidenceTransferContracts"}
             else []
         )
         command = [*common, "/main:" + entrypoint, "/out:" + str(output / name), *sources, *extra]

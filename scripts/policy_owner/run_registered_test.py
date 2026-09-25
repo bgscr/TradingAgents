@@ -850,7 +850,7 @@ def prepare_or_run(args):
         PYTHON_DOTENV_DISABLED="1",
         TRADINGAGENTS_OUTPUT_LANGUAGE="English",
         TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED="0",
-        TUSHARE_TOKEN="fixture-only-production-binding",
+        TUSHARE_TOKEN="test-token",
     )
     sys.path[:0] = [str(SOURCE), str(DEPENDENCIES)]
     client = BoundedClient(root, args.run)

@@ -40,7 +40,7 @@ def main():
         PYTHON_DOTENV_DISABLED="1",
         TRADINGAGENTS_OUTPUT_LANGUAGE="English",
         TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED="0",
-        TUSHARE_TOKEN="fixture-only-production-binding",
+        TUSHARE_TOKEN="test-token",
         TRADINGAGENTS_PROJECT_ROOT=str(output / "unused-defaults"),
     )
     sys.path[:0] = [str(source), str(dependencies)]

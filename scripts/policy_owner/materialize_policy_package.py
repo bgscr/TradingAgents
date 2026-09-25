@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -260,13 +261,21 @@ def policy_objects(
     return scope, plan, policy
 
 
-def exact_candidate(source: Path):
+def exact_candidate(source: Path, expected_parent: str = BASE_COMMIT):
     from tradingagents.policy_qualified_contract import Candidate
 
     def git(*args):
         return (
             subprocess.run(
-                ["git", "-C", str(source), *args],
+                [
+                    "git",
+                    "-c",
+                    "safe.directory=" + source.as_posix(),
+                    "--no-optional-locks",
+                    "-C",
+                    str(source),
+                    *args,
+                ],
                 check=True,
                 capture_output=True,
                 timeout=15,
@@ -276,6 +285,8 @@ def exact_candidate(source: Path):
             .strip()
         )
 
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_parent):
+        raise ValueError("full explicitly authorized parent commit required")
     if git("status", "--porcelain=v1", "--untracked-files=all"):
         raise ValueError("final materialization requires a clean exact source worktree")
     value = Candidate(
@@ -283,12 +294,27 @@ def exact_candidate(source: Path):
         tree=git("rev-parse", "HEAD^{tree}"),
         parent=git("rev-parse", "HEAD^"),
     )
-    if value.parent != BASE_COMMIT or git("rev-list", "--parents", "-n", "1", "HEAD").split() != [
+    if value.parent != expected_parent or git(
+        "rev-list", "--parents", "-n", "1", "HEAD"
+    ).split() != [
         value.commit,
-        BASE_COMMIT,
+        expected_parent,
     ]:
         raise ValueError("one reviewed direct child of the exact authorized base is required")
     return value
+
+
+def source_checkout_binding(raw: bytes, committed: bytes) -> dict:
+    """Retain physical and canonical pins without obscuring CRLF checkout bytes."""
+    from tradingagents.policy_qualified_contract import BytePin
+
+    form = "IDENTICAL"
+    if raw != committed:
+        raw.decode("utf-8")
+        if b"\0" in raw or raw.replace(b"\r\n", b"\n") != committed:
+            raise ValueError("physical contract source differs from exact committed bytes")
+        form = "UTF8_CRLF_CHECKOUT"
+    return {"git_blob_pin": BytePin.of(committed).model_dump(mode="json"), "checkout_form": form}
 
 
 def materialize(args) -> dict:
@@ -304,7 +330,8 @@ def materialize(args) -> dict:
     )
 
     source = Path(__file__).resolve().parents[2]
-    candidate = exact_candidate(source)
+    expected_parent = getattr(args, "expected_parent", BASE_COMMIT)
+    candidate = exact_candidate(source, expected_parent)
     output = args.output.resolve(strict=False)
     if output.exists() or output == source or output.is_relative_to(source):
         raise ValueError("a fresh external final-package directory is required")
@@ -344,6 +371,10 @@ def materialize(args) -> dict:
         "tradingagents/policy_owner_contract.py",
         "tradingagents/windows_policy_owner.py",
         "tradingagents/policy_qualified_native.py",
+        "tradingagents/policy_evidence_contract.py",
+        "tradingagents/policy_evidence_acquisition.py",
+        "tradingagents/policy_evidence_client.py",
+        "tradingagents/policy_evidence_limits.py",
         "tradingagents/qualified_routing_composition.py",
         "tradingagents/runtime_protection.py",
         "tradingagents/runtime_protection_handoff.py",
@@ -354,6 +385,7 @@ def materialize(args) -> dict:
         "tradingagents/offline_runtime_bundle.py",
         "docs/contracts/policy-qualified-result-v1.md",
         "docs/contracts/windows-policy-owner-v1.md",
+        "docs/contracts/policy-evidence-acquisition-v2.md",
         "scripts/runtime_protection/RuntimeProtectionHost.cs",
         "scripts/verify_ticket06_immutable_state.py",
         "scripts/run_iso03_windows_sandbox_qualification.py",
@@ -367,23 +399,30 @@ def materialize(args) -> dict:
     for name in sorted(names):
         raw = (source / name).read_bytes()
         committed = subprocess.run(
-            ["git", "-C", str(source), "cat-file", "blob", candidate.commit + ":" + name],
+            [
+                "git",
+                "-c",
+                "safe.directory=" + source.as_posix(),
+                "--no-optional-locks",
+                "-C",
+                str(source),
+                "cat-file",
+                "blob",
+                candidate.commit + ":" + name,
+            ],
             capture_output=True,
             check=True,
             timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW,
         ).stdout
-        if raw != committed:
-            raise ValueError(
-                "physical contract source differs from the exact committed blob: " + name
-            )
+        checkout = source_checkout_binding(raw, committed)
         file_pin = add("source/" + name, raw)
-        source_files.append({"relative_path": name, **file_pin.model_dump(mode="json")})
+        source_files.append({"relative_path": name, **file_pin.model_dump(mode="json"), **checkout})
     schema_pin = data("contract-schema.json", contract_descriptor())
     consumer_pin = data(
         "CONTRACT-SOURCES.json",
         {
-            "contract_version": "policy-qualified-exact-source-bundle-v1",
+            "contract_version": "policy-qualified-exact-source-bundle-v2",
             "candidate": candidate.model_dump(mode="json"),
             "files": source_files,
             "contract_schema_pin": schema_pin.model_dump(mode="json"),
@@ -411,6 +450,10 @@ def materialize(args) -> dict:
             "new_comparisons_require_exact_equality": True,
             "unreadable_reparse_or_missing_evidence_is_terminal": True,
             "measurement_executed": False,
+            "additive_capture_entrypoint": "scripts/policy_owner/acquire_evidence.py capture",
+            "production_inventory_entrypoint": "scripts/policy_owner/acquire_evidence.py produce-source",
+            "evidence_intake_contract": "policy-owner-evidence-intake-v2",
+            "complete_artifact_bytes_maximum": 268435456,
             "execution_authorized": False,
         },
     )
@@ -497,7 +540,7 @@ def materialize(args) -> dict:
         "execution_authorized": False,
     }
     manifest["identity"] = content_identity("policy-owner-exact-decision-delivery:v1", manifest)
-    if exact_candidate(source) != candidate:
+    if exact_candidate(source, expected_parent) != candidate:
         raise ValueError("source changed before final package publication")
     output.mkdir()
     for name, raw in files.items():
@@ -528,7 +571,7 @@ Candidate `{candidate.commit}`, tree `{candidate.tree}`, direct parent `{candida
 Reviewed policy package `{package.identity}`.
 Policy `{policy.acceptance_policy_identity}`; exception `{policy.exception_identity}`;
 plan `{policy.lineage_plan.lineage_plan_identity}`. Exact bytes and predecessor bindings
-are listed in PACKAGE-MANIFEST.json. The prior e9c971e draft is not transferred.
+are listed in PACKAGE-MANIFEST.json. No earlier candidate's approval is transferred.
 
 The issuer must use the registered native Windows Hello flow to evidence their
 project role and explicitly adopt prospective replacement policy, campaign and
@@ -595,6 +638,11 @@ def main() -> int:
     ):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--setup-bindings", type=Path)
+    parser.add_argument(
+        "--expected-parent",
+        default=BASE_COMMIT,
+        help="Full authorized direct-parent commit; an unsigned input, never approval transfer",
+    )
     args = parser.parse_args()
     sys.path[:0] = [
         str(Path(__file__).resolve().parents[2]),

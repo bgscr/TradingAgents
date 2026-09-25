@@ -204,7 +204,10 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
     if not isinstance(document, dict):
         raise ValueError("evidence intake must be an object")
     version = document.get("contract_version")
-    if version == "policy-owner-evidence-intake-batch-v1":
+    if version in {
+        "policy-owner-evidence-intake-batch-v1",
+        "policy-owner-evidence-intake-batch-v2",
+    }:
         if (
             set(document) != {"contract_version", "entries", "execution_authorized"}
             or document["execution_authorized"] is not False
@@ -220,9 +223,26 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
         if (
             not isinstance(entry, dict)
             or set(entry) != {"contract_version", "kind", "key", "value"}
-            or entry["contract_version"] != "policy-owner-evidence-intake-v1"
+            or entry["contract_version"]
+            not in {"policy-owner-evidence-intake-v1", "policy-owner-evidence-intake-v2"}
         ):
             raise ValueError("invalid closed evidence intake entry")
+        if entry["contract_version"] == "policy-owner-evidence-intake-v2" and entry["kind"] not in {
+            "artifact-reference",
+            "current-source",
+            "observation",
+        }:
+            raise ValueError("unsupported versioned evidence intake kind")
+        if (
+            entry["kind"] == "artifact-reference"
+            and entry["contract_version"] != "policy-owner-evidence-intake-v2"
+        ):
+            raise ValueError("unsupported evidence intake version/kind downgrade")
+        if (
+            version == "policy-owner-evidence-intake-batch-v1"
+            and entry["contract_version"] != "policy-owner-evidence-intake-v1"
+        ):
+            raise ValueError("v2 descriptors require a v2 batch; no silent downgrade")
         if (
             not isinstance(entry["kind"], str)
             or not isinstance(entry["key"], str)
@@ -230,7 +250,12 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
             or not isinstance(entry["value"], dict)
         ):
             raise ValueError("evidence intake key and value types are invalid")
-        key = entry["kind"], entry["key"]
+        # Both wire versions publish into the same immutable semantic table.
+        # They cannot evade duplicate detection by naming two intake kinds.
+        key = (
+            ("artifact" if entry["kind"] in {"artifact", "artifact-reference"} else entry["kind"]),
+            entry["key"],
+        )
         if key in keys:
             raise ValueError("duplicate key within authenticated evidence intake")
         keys.add(key)

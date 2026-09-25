@@ -233,8 +233,23 @@ namespace TradingAgents.PolicyOwner
                 }
             }
         }
-        internal static Dictionary<string, object> Call(OwnerAnchor anchor, Dictionary<string, object> body)
+        internal static int WorkerMilliseconds(string operation)
         {
+            switch(operation)
+            {
+                case "validate-authentication-document":case "apply-authenticated-record":
+                case "resolve":case "verify-envelope":case "verify-attempt":case "verify-materialization":
+                case "verify-inert-launch":case "verify-result":case "eligibility":case "claim":
+                case "begin-stage":case "complete-stage":case "finalize":case "issue-receipt":case "report":
+                    return 300000;
+                default:return 45000;
+            }
+        }
+        internal static Dictionary<string, object> Call(OwnerAnchor anchor, Dictionary<string, object> body, int milliseconds=60000)
+        {
+            if((string)body["operation"]=="worker"&&WorkerMilliseconds((string)Evidence.Obj(body["payload"])["operation"])==300000)
+                milliseconds=360000;
+            Evidence.Require(milliseconds==60000||milliseconds==90000||milliseconds==360000,"Unsupported finite owner request lifetime");
             byte[] random = new byte[32]; using(var generator = System.Security.Cryptography.RandomNumberGenerator.Create()) generator.GetBytes(random);
             string nonce = Convert.ToBase64String(random);
             var request = new Dictionary<string, object> {{"contract_version", "windows-policy-owner-rpc-v1"}, {"instance", anchor.Instance},
@@ -250,7 +265,7 @@ namespace TradingAgents.PolicyOwner
                 var task = System.Threading.Tasks.Task.Run(delegate {
                     Write(pipe, request);var received=Read(pipe);Acknowledge(pipe,request,received);return received;
                 });
-                Evidence.Require(task.Wait(60000), "Owner request exceeded its bounded timeout");
+                Evidence.Require(task.Wait(milliseconds), "Owner request exceeded its bounded timeout");
                 var response = task.Result;
                 Evidence.Closed(response, "contract_version", "instance", "nonce", "request_sha256", "ok", "result", "error");
                 Evidence.Require((string)response["contract_version"] == "windows-policy-owner-response-v1"
