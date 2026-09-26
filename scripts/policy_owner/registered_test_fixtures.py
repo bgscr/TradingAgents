@@ -490,6 +490,32 @@ def _validated_export(tmp_path: Path, *, guest_pass: bool):
 
 
 def synthetic_stage_vectors(case, *, guest_pass=True):
+    # These are explicitly synthetic stage vectors, never actual ISO execution.
+    from tradingagents.policy_coverage_models import (
+        CoverageBaseline,
+        CoverageBoundEvidence,
+        CoverageClosure,
+        CoverageExecution,
+        CoverageReview,
+    )
+
+    coverage = getattr(case, "coverage", None)
+    coverage_models = {
+        QualifiedBaseline: CoverageBaseline,
+        BoundEvidence: CoverageBoundEvidence,
+        IndependentReviewRecord: CoverageReview,
+        PreResultClosureEvidence: CoverageClosure,
+    }
+
+    def seal_vector(model, **payload):
+        if coverage is not None:
+            model = coverage_models[model]
+            payload["contract_version"] = model.model_fields[
+                "contract_version"
+            ].annotation.__args__[0]
+            payload["coverage"] = coverage
+        return model.seal(**payload)
+
     from tradingagents.offline_runtime_bundle import (
         BUNDLE_MANIFEST_FILENAME,
         OfflineBundleSourceBinding,
@@ -529,7 +555,7 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
     owner.evidence_root.mkdir()
     for stage in case.claim.stages:
         Path(stage.root).mkdir()
-    for raw in tuple(owner.artifacts.values()):
+    for raw in owner.artifacts.values():
         (owner.evidence_root / (sha256(raw).hexdigest() + ".json")).write_bytes(raw)
     owner.store(case.claim, "lineage_identity")
     owner.store(case.approval, "approval_identity")
@@ -738,7 +764,8 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
     )
     iso03_ref = owner.store(iso03, "report_identity")
     binding = acceptance_binding(case.policy, case.approval, case.claim)
-    baseline = QualifiedBaseline.seal(
+    baseline = seal_vector(
+        QualifiedBaseline,
         contract_version="policy-qualified-qcf17-baseline-v1",
         binding=binding,
         candidate=case.candidate,
@@ -795,7 +822,8 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
 
     def node(kind, predecessors, artifacts):
         case.before_node(kind)
-        result = BoundEvidence.seal(
+        result = seal_vector(
+            BoundEvidence,
             contract_version="policy-qualified-pre-result-evidence-v1",
             kind=kind,
             binding=binding,
@@ -826,7 +854,8 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
     review_refs = []
     review_nodes = []
     for axis, kind in (("STANDARDS", "REVIEW_STANDARDS"), ("SPEC", "REVIEW_SPEC")):
-        review = IndependentReviewRecord.seal(
+        review = seal_vector(
+            IndependentReviewRecord,
             contract_version="policy-qualified-independent-review-v1",
             binding=binding,
             candidate=case.candidate,
@@ -874,7 +903,8 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
     owner.evidence_root = None
     owner.publication_root = Path(case.claim.stages[5].root)
     inventory_ref = owner.store(inventory)
-    closure = PreResultClosureEvidence.seal(
+    closure = seal_vector(
+        PreResultClosureEvidence,
         contract_version="policy-qualified-pre-result-closure-v1",
         binding=binding,
         candidate=case.candidate,
@@ -888,7 +918,14 @@ def synthetic_stage_vectors(case, *, guest_pass=True):
     )
     closure_ref = owner.store(closure)
     node("PRE_RESULT_CLOSURE", tuple(review_nodes), (closure_ref,))
-    return ExecutionEvidence(
+    execution_model = CoverageExecution if coverage is not None else ExecutionEvidence
+    extra = (
+        {"contract_version": "policy-coverage-execution-evidence-v2", "coverage": coverage}
+        if coverage is not None
+        else {}
+    )
+    return execution_model(
+        **extra,
         source=source_ref,
         runtime=runtime_ref,
         iso03_report=iso03_ref,

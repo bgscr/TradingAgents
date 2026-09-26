@@ -205,6 +205,7 @@ from tradingagents.market_history.coordinator import (
     upstream_service_identity_for_provider,
 )
 from tradingagents.market_history.store import MarketHistoryStore
+from tradingagents.policy_coverage_models import CoverageEnvelope
 from tradingagents.policy_qualified_contract import DownstreamEnvelope, canonical_bytes, strict_json
 from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 from tradingagents.qualified_routing_lifecycle import (
@@ -320,18 +321,14 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal[
-        "production-qualified-routing-composition-factory-v1"
-    ] = PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION
+    contract_version: Literal["production-qualified-routing-composition-factory-v1"] = (
+        PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION
+    )
     validation_intent: Literal["qualified_validation"] = "qualified_validation"
     mode: Literal[MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW]
-    disposition: Literal[
-        MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
-    ]
+    disposition: Literal[MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE]
     plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
-    asset_configuration_signature: str = Field(
-        pattern=r"^asset-config:v1:[0-9a-f]{64}$"
-    )
+    asset_configuration_signature: str = Field(pattern=r"^asset-config:v1:[0-9a-f]{64}$")
     asset_configuration_version: Literal["1.0"]
     instrument_symbol: str = Field(pattern=r"^[0-9]{6}\.(SS|SZ)$")
     reference_market: Literal["XSHG", "XSHE"]
@@ -347,14 +344,15 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
     enabled_capabilities: tuple[TushareCapability, ...] = Field(min_length=1)
     required_provider_source_ids: tuple[str, ...] = Field(min_length=1)
     dependency_ids: tuple[str, ...] = Field(min_length=1)
-    credential_boundary_identity: Literal[
+    credential_boundary_identity: Literal["tushare-environment-boundary:v1"] = (
         "tushare-environment-boundary:v1"
-    ] = "tushare-environment-boundary:v1"
+    )
     account_scope_label: str = Field(pattern=_SAFE_IDENTITY_PATTERN)
     endpoint_pacing_identities: tuple[TushareEndpointPacingIdentity, ...]
     runtime_root_identities: tuple[ProductionRuntimeRootIdentity, ...]
     cninfo_binding: CninfoProductionBinding | None = Field(
-        default=None, exclude_if=lambda value: value is None,
+        default=None,
+        exclude_if=lambda value: value is None,
     )
 
     @model_validator(mode="after")
@@ -391,16 +389,13 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
                 raise ValueError("factory CNINFO binding contradicts its run authority")
         elif "cninfo" in self.required_provider_source_ids:
             raise ValueError("factory CNINFO source has no policy binding")
-        endpoint_ids = tuple(
-            identity.endpoint_id for identity in self.endpoint_pacing_identities
-        )
+        endpoint_ids = tuple(identity.endpoint_id for identity in self.endpoint_pacing_identities)
         if endpoint_ids != tuple(sorted(set(endpoint_ids))):
             raise ValueError("factory endpoint pacing inventory is not canonical")
         expected_root_roles = tuple(role for role, *_rest in _ROOT_FIELDS)
         actual_root_roles = tuple(root.role for root in self.runtime_root_identities)
         if actual_root_roles != expected_root_roles or any(
-            re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", root.identity)
-            is None
+            re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", root.identity) is None
             for root, (_role, _key, prefix, _is_database) in zip(
                 self.runtime_root_identities,
                 _ROOT_FIELDS,
@@ -416,9 +411,9 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    blueprint_version: Literal[
-        "production-qualified-routing-composition-blueprint-v1"
-    ] = PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION
+    blueprint_version: Literal["production-qualified-routing-composition-blueprint-v1"] = (
+        PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION
+    )
     factory_contract: ProductionQualifiedRoutingFactoryContract
     routing_plan: MainlandCapabilityRoutingPlan = Field(repr=False)
     blueprint_identity: str = Field(
@@ -438,15 +433,12 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
         if (
             contract.plan_signature != self.routing_plan.plan_signature
             or contract.mode is not self.routing_plan.mode
-            or contract.enabled_capabilities
-            != self.routing_plan.enabled_tushare_capabilities
+            or contract.enabled_capabilities != self.routing_plan.enabled_tushare_capabilities
             or contract.financial_eligibility_binding
             != self.routing_plan.financial_eligibility_binding
             or contract.account_scope_label != self.routing_plan.account_scope_label
-            or contract.endpoint_pacing_identities
-            != self.routing_plan.endpoint_pacing_identities
-            or (self.routing_plan.plan_version == "1.5")
-            != (contract.cninfo_binding is not None)
+            or contract.endpoint_pacing_identities != self.routing_plan.endpoint_pacing_identities
+            or (self.routing_plan.plan_version == "1.5") != (contract.cninfo_binding is not None)
         ):
             raise ValueError("blueprint routing plan binding is invalid")
         root_paths = (
@@ -456,21 +448,22 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
             self.backup_root_path,
             self.report_root_path,
         )
-        if any(
-            not path.is_absolute()
-            or "?" in str(path)
-            or "://" in str(path)
-            or any(part == ".." for part in path.parts)
-            for path in root_paths
-        ) or self.database_path.suffix.casefold() != ".sqlite3":
+        if (
+            any(
+                not path.is_absolute()
+                or "?" in str(path)
+                or "://" in str(path)
+                or any(part == ".." for part in path.parts)
+                for path in root_paths
+            )
+            or self.database_path.suffix.casefold() != ".sqlite3"
+        ):
             raise ValueError("blueprint runtime-root binding is invalid")
         identity_payload = {
             "blueprint_version": self.blueprint_version,
             "factory_contract": contract.model_dump(mode="json"),
         }
-        expected_identity = (
-            f"{_BLUEPRINT_IDENTITY_PREFIX}{_canonical_digest(identity_payload)}"
-        )
+        expected_identity = f"{_BLUEPRINT_IDENTITY_PREFIX}{_canonical_digest(identity_payload)}"
         if self.blueprint_identity != expected_identity:
             raise ValueError("blueprint identity mismatch")
         return self
@@ -620,6 +613,39 @@ class ConditionalProductionQualifiedRoutingPreparation(BaseModel):
         return self.qualified_source.qualified_source_identity
 
 
+class CoverageProductionQualifiedRoutingSourceBinding(
+    ConditionalProductionQualifiedRoutingSourceBinding
+):
+    contract_version: Literal["production-policy-qualified-routing-source-binding-v2"]
+    qualified_source_identity: str = Field(
+        pattern=r"^policy-qualified-execution-result:v2:sha256:[0-9a-f]{64}$"
+    )
+    acceptance: CoverageEnvelope
+
+
+class CoverageProductionQualifiedRoutingPreparation(
+    ConditionalProductionQualifiedRoutingPreparation
+):
+    contract_version: Literal["production-policy-qualified-routing-preparation-v2"]
+    qualified_source: CoverageProductionQualifiedRoutingSourceBinding
+    preparation_identity: str = Field(
+        pattern=r"^production-policy-qualified-routing-preparation:v2:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _preparation(self) -> CoverageProductionQualifiedRoutingPreparation:
+        if self.plan_signature != self.factory_contract.plan_signature or (
+            (self.plan_version == "1.5") != (self.factory_contract.cninfo_binding is not None)
+        ):
+            raise ValueError("coverage preparation plan/factory contract contradict")
+        expected = "production-policy-qualified-routing-preparation:v2:" + _canonical_digest(
+            self.model_dump(mode="json", exclude={"preparation_identity"})
+        )
+        if self.preparation_identity != expected:
+            raise ValueError("coverage preparation identity mismatch")
+        return self
+
+
 def _parse_production_source(
     value: object,
 ) -> ProductionQualifiedRoutingSourceBinding | ConditionalProductionQualifiedRoutingSourceBinding:
@@ -627,6 +653,13 @@ def _parse_production_source(
         value = strict_json(value)
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
+    if (
+        isinstance(value, Mapping)
+        and value.get("contract_version") == "production-policy-qualified-routing-source-binding-v2"
+    ):
+        return CoverageProductionQualifiedRoutingSourceBinding.model_validate_json(
+            canonical_bytes(value)
+        )
     if isinstance(value, Mapping) and value.get("contract_version") == (
         "production-policy-qualified-routing-source-binding-v1"
     ):
@@ -644,6 +677,13 @@ def parse_production_preparation(
         value = strict_json(value)
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
+    if (
+        isinstance(value, Mapping)
+        and value.get("contract_version") == "production-policy-qualified-routing-preparation-v2"
+    ):
+        return CoverageProductionQualifiedRoutingPreparation.model_validate_json(
+            canonical_bytes(value)
+        )
     if isinstance(value, Mapping) and value.get("contract_version") == (
         "production-policy-qualified-routing-preparation-v1"
     ):
@@ -688,6 +728,7 @@ def seal_production_qualified_routing_preparation(
     if qualified != _parse_production_source(current_source):
         raise ValueError("qualified source chain does not match current source")
     conditional = isinstance(qualified, ConditionalProductionQualifiedRoutingSourceBinding)
+    coverage = isinstance(qualified, CoverageProductionQualifiedRoutingSourceBinding)
     if conditional:
         verify_conditional_production_source(qualified, policy_verifier)
     if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
@@ -726,6 +767,10 @@ def seal_production_qualified_routing_preparation(
         if conditional
         else "production-qualified-routing-preparation:v1:"
     )
+    if coverage:
+        model = CoverageProductionQualifiedRoutingPreparation
+        payload["contract_version"] = "production-policy-qualified-routing-preparation-v2"
+        prefix = "production-policy-qualified-routing-preparation:v2:"
     payload["preparation_identity"] = prefix + _canonical_digest(payload)
     if conditional:
         return model.model_validate_json(canonical_bytes(payload))
@@ -877,12 +922,10 @@ class ProductionQualifiedCalendarPreflightReceipt(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal[
+    contract_version: Literal["production-qualified-calendar-preflight-v1"] = (
         "production-qualified-calendar-preflight-v1"
-    ] = "production-qualified-calendar-preflight-v1"
-    calendar_revision_id: str = Field(
-        pattern=r"^market-session-calendar=sha256:[0-9a-f]{64}$"
     )
+    calendar_revision_id: str = Field(pattern=r"^market-session-calendar=sha256:[0-9a-f]{64}$")
     requested_session: date
     evaluated_at: datetime
     latest_completed_session: date
@@ -908,9 +951,7 @@ def preflight_production_qualified_calendar_reader(
     """Verify the exact live primary-reader binding without provider/model I/O."""
 
     if evaluated_at.tzinfo is None:
-        _calendar_preflight_fail(
-            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
-        )
+        _calendar_preflight_fail(ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID)
     if (
         not isinstance(authorized_calendar_revision_id, str)
         or re.fullmatch(
@@ -923,9 +964,7 @@ def preflight_production_qualified_calendar_reader(
             ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
         )
     if not isinstance(composition, RegisteredProductionQualifiedRoutingComposition):
-        _calendar_preflight_fail(
-            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
-        )
+        _calendar_preflight_fail(ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID)
     try:
         with MarketHistoryStore.open(
             _primary_market_history_config(composition.blueprint)
@@ -933,15 +972,11 @@ def preflight_production_qualified_calendar_reader(
             authorized_exact = readiness_store.read_session_calendar_revision(
                 authorized_calendar_revision_id
             )
-            authorized_current = readiness_store.read_current_session_calendar(
-                "mainland-cn"
-            )
+            authorized_current = readiness_store.read_current_session_calendar("mainland-cn")
             requested_start_date = min(
                 session.session_date for session in authorized_exact.sessions
             )
-            requested_end_date = max(
-                session.session_date for session in authorized_exact.sessions
-            )
+            requested_end_date = max(session.session_date for session in authorized_exact.sessions)
             readiness = readiness_store.assess_mainland_session_calendar_readiness(
                 authorized_exact.calendar_revision_id,
                 requested_start_date=requested_start_date,
@@ -963,15 +998,11 @@ def preflight_production_qualified_calendar_reader(
         else None
     )
     if not callable(open_reader):
-        _calendar_preflight_fail(
-            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
-        )
+        _calendar_preflight_fail(ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID)
     try:
         reader = open_reader(composition.blueprint)
     except Exception:
-        _calendar_preflight_fail(
-            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
-        )
+        _calendar_preflight_fail(ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID)
     try:
         if not isinstance(reader, ProductionQualifiedEligibilityCalendarReader):
             _calendar_preflight_fail(
@@ -983,9 +1014,7 @@ def preflight_production_qualified_calendar_reader(
             )
         try:
             current = reader.read_current_session_calendar("mainland-cn")
-            exact = reader.read_session_calendar_revision(
-                authorized_exact.calendar_revision_id
-            )
+            exact = reader.read_session_calendar_revision(authorized_exact.calendar_revision_id)
         except Exception:
             _calendar_preflight_fail(
                 ProductionQualifiedCalendarPreflightFailureReason.CALENDAR_UNAVAILABLE
@@ -1083,9 +1112,9 @@ class ProductionFinancialEligibilityRuntimeInputs:
         repr=False,
         compare=False,
     )
-    retained_company_type_evidence: tuple[
-        FinancialCompanyTypeEvidenceProjection, ...
-    ] = field(default=(), repr=False, compare=False)
+    retained_company_type_evidence: tuple[FinancialCompanyTypeEvidenceProjection, ...] = field(
+        default=(), repr=False, compare=False
+    )
     retained_listing_metadata: tuple[FinancialListingMetadataProjection, ...] = field(
         default=(),
         repr=False,
@@ -1112,11 +1141,9 @@ class ProductionFinancialEligibilityRuntimeInputs:
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
-        company_type_evidence, listing_metadata = (
-            _validated_retained_financial_metadata(
-                self.retained_company_type_evidence,
-                self.retained_listing_metadata,
-            )
+        company_type_evidence, listing_metadata = _validated_retained_financial_metadata(
+            self.retained_company_type_evidence,
+            self.retained_listing_metadata,
         )
         object.__setattr__(
             self,
@@ -1159,22 +1186,21 @@ class ProductionQualifiedRoutingRunBinding(BaseModel):
         exclude=True,
         repr=False,
     )
-    restore_financial_eligibility_context: (
-        Callable[[object], object] | None
-    ) = Field(default=None, exclude=True, repr=False)
+    restore_financial_eligibility_context: Callable[[object], object] | None = Field(
+        default=None, exclude=True, repr=False
+    )
 
     @model_validator(mode="after")
     def _validate_authoritative_bindings(self) -> ProductionQualifiedRoutingRunBinding:
         if (
-            self.asset_configuration.asset_configuration_signature
-            == ""
+            self.asset_configuration.asset_configuration_signature == ""
             or self.routing_plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW
         ):
             raise ValueError("qualified runtime binding is invalid")
         if self.checkpoint_thread_id is not None and not self.resume_from_checkpoint:
-            expected_run_id = "run:" + sha256(
-                f"checkpoint:{self.checkpoint_thread_id}".encode()
-            ).hexdigest()
+            expected_run_id = (
+                "run:" + sha256(f"checkpoint:{self.checkpoint_thread_id}".encode()).hexdigest()
+            )
             if self.run_id != expected_run_id:
                 raise ValueError("qualified checkpoint run identity is invalid")
         if self.resume_from_checkpoint:
@@ -1233,11 +1259,9 @@ class ProductionQualifiedRoutingRuntimeAssembly:
     )
 
     def __post_init__(self) -> None:
-        company_type_evidence, listing_metadata = (
-            _validated_retained_financial_metadata(
-                self.retained_company_type_evidence,
-                self.retained_listing_metadata,
-            )
+        company_type_evidence, listing_metadata = _validated_retained_financial_metadata(
+            self.retained_company_type_evidence,
+            self.retained_listing_metadata,
         )
         if any(
             not _safe_source_token(resource_kind) or resource is None
@@ -1265,24 +1289,14 @@ class ProductionQualifiedRoutingRuntimeFactories:
     open_coordinator_store: Callable[[object], object] = field(repr=False)
     build_coordinator: Callable[[object, threading.Event], object] = field(repr=False)
     build_artifact_store: Callable[[object], object] = field(repr=False)
-    build_subrequest_cache: Callable[
-        [object, object, str, threading.Event], object
-    ] = field(repr=False)
-    build_tushare_client: Callable[[object, threading.Event], object] = field(
+    build_subrequest_cache: Callable[[object, object, str, threading.Event], object] = field(
         repr=False
     )
-    build_akshare_facade: Callable[[object, threading.Event], object] = field(
-        repr=False
-    )
-    build_yahoo_transport: Callable[[object, threading.Event], object] = field(
-        repr=False
-    )
-    build_baostock_transport: Callable[[object, threading.Event], object] = field(
-        repr=False
-    )
-    assemble_runtime: Callable[..., ProductionQualifiedRoutingRuntimeAssembly] = field(
-        repr=False
-    )
+    build_tushare_client: Callable[[object, threading.Event], object] = field(repr=False)
+    build_akshare_facade: Callable[[object, threading.Event], object] = field(repr=False)
+    build_yahoo_transport: Callable[[object, threading.Event], object] = field(repr=False)
+    build_baostock_transport: Callable[[object, threading.Event], object] = field(repr=False)
+    assemble_runtime: Callable[..., ProductionQualifiedRoutingRuntimeAssembly] = field(repr=False)
     open_eligibility_calendar_reader: Callable[[object], object] | None = field(
         default=None,
         repr=False,
@@ -1316,8 +1330,7 @@ class ProductionQualifiedRoutingRuntimeFactories:
             )
 
 
-def production_qualified_routing_runtime_factories(
-) -> ProductionQualifiedRoutingRuntimeFactories:
+def production_qualified_routing_runtime_factories() -> ProductionQualifiedRoutingRuntimeFactories:
     """Return lazy production acquisitions without opening any run resource."""
 
     def runtime_blueprint(value: object) -> ProductionQualifiedRoutingCompositionBlueprint:
@@ -1384,7 +1397,9 @@ def production_qualified_routing_runtime_factories(
             )
             if contract.cninfo_binding is not None:
                 for pacing in contract.cninfo_binding.profile.upstream_pacing:
-                    service_id, service_name = upstream_service_identity_for_provider(pacing.provider_scope)
+                    service_id, service_name = upstream_service_identity_for_provider(
+                        pacing.provider_scope
+                    )
                     if service_id != pacing.upstream_service_id:
                         raise ValueError("CNINFO upstream identity does not match its policy")
                     coordinator.register_upstream_service(service_id, service_name)
@@ -1406,8 +1421,7 @@ def production_qualified_routing_runtime_factories(
         blueprint = runtime_blueprint(value)
         try:
             return ProviderSubrequestArtifactStore(
-                blueprint.provider_artifact_root_path
-                / "qualified-provider-subrequests"
+                blueprint.provider_artifact_root_path / "qualified-provider-subrequests"
             )
         except Exception:
             raise ProductionQualifiedRoutingLifecycleError(
@@ -1515,6 +1529,7 @@ class ProductionQualifiedRoutingRuntime:
     resource_kinds: tuple[str, ...]
     source_composition: object | None = field(default=None, repr=False, compare=False)
     dependencies: object | None = field(default=None, repr=False, compare=False)
+
     def _require_financial_routing(self) -> object:
         if self.financial_routing is None:
             raise ProductionQualifiedRoutingLifecycleError(
@@ -1571,8 +1586,7 @@ def _cache_normalizer_is_compatible(
     if key.provider_id == "cninfo":
         return (
             plan.plan_version == "1.5"
-            and key.normalizer_version
-            == "cninfo-listing-publication-normalizer-v1"
+            and key.normalizer_version == "cninfo-listing-publication-normalizer-v1"
         )
     if key.provider_id == "akshare_sina":
         external_normalizer = {
@@ -1591,9 +1605,7 @@ def _cache_normalizer_is_compatible(
     if key.provider_id == "yfinance":
         external_normalizer = {
             "current_financial_profile": YFINANCE_PROFILE_NORMALIZER_VERSION,
-            "derived_adjustment_factors": (
-                YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION
-            ),
+            "derived_adjustment_factors": (YFINANCE_DERIVED_FACTOR_NORMALIZER_VERSION),
             "financial_statements": YFINANCE_STATEMENT_NORMALIZER_VERSION,
         }.get(key.capacity_scope)
         return key.normalizer_version in {
@@ -1608,13 +1620,9 @@ def _validate_cache_provider_calls(
     cache_checkpoint: ProviderSubrequestCacheCheckpoint,
     plan: MainlandCapabilityRoutingPlan,
 ) -> None:
-    cache_entries = {
-        entry.key.subrequest_key: entry for entry in cache_checkpoint.entries
-    }
+    cache_entries = {entry.key.subrequest_key: entry for entry in cache_checkpoint.entries}
     allowed_logical_providers = {
-        provider_id
-        for route in plan.routes
-        for provider_id in route.providers
+        provider_id for route in plan.routes for provider_id in route.providers
     }
     selections = (
         *ledger.qualified_statement_selections,
@@ -1625,16 +1633,14 @@ def _validate_cache_provider_calls(
             if (
                 call.provider_id not in allowed_logical_providers
                 or len(call.subrequest_keys) != len(set(call.subrequest_keys))
-                or len(call.physical_attempt_ids)
-                != len(set(call.physical_attempt_ids))
+                or len(call.physical_attempt_ids) != len(set(call.physical_attempt_ids))
             ):
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
                 )
             try:
                 entries = tuple(
-                    cache_entries[subrequest_key]
-                    for subrequest_key in call.subrequest_keys
+                    cache_entries[subrequest_key] for subrequest_key in call.subrequest_keys
                 )
             except KeyError as exc:
                 raise FinancialDispatchCheckpointError(
@@ -1642,19 +1648,13 @@ def _validate_cache_provider_calls(
                 ) from exc
             expected_physical_provider = _physical_provider_id(call.provider_id)
             expected_events = {
-                event.attempt_event_id: event
-                for entry in entries
-                for event in entry.attempt_events
+                event.attempt_event_id: event for entry in entries for event in entry.attempt_events
             }
             actual_events = {
-                event.attempt_event_id: event
-                for event in call.physical_attempt_events
+                event.attempt_event_id: event for event in call.physical_attempt_events
             }
             if (
-                any(
-                    entry.key.provider_id != expected_physical_provider
-                    for entry in entries
-                )
+                any(entry.key.provider_id != expected_physical_provider for entry in entries)
                 or set(call.physical_attempt_ids) != set(expected_events)
                 or actual_events != expected_events
                 or any(
@@ -1734,9 +1734,7 @@ def _restore_checkpoint_eligibility_context(
     try:
         identity_material = dict(raw_context)
         identity_material.pop("context_identity", None)
-        expected_identity = financial_eligibility_acquisition_context_identity(
-            identity_material
-        )
+        expected_identity = financial_eligibility_acquisition_context_identity(identity_material)
     except (TypeError, ValueError) as exc:
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
@@ -1783,9 +1781,7 @@ def _restore_checkpoint_eligibility_context(
             as_of_date=context_session,
             availability_scope=context.availability_scope,
             acquisition_purpose="foreground_current_analysis",
-            financial_eligibility_binding=(
-                run_binding.routing_plan.financial_eligibility_binding
-            ),
+            financial_eligibility_binding=(run_binding.routing_plan.financial_eligibility_binding),
             routing_plan_signature=run_binding.routing_plan.plan_signature,
             consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
         )
@@ -1806,13 +1802,10 @@ def _validated_checkpoint_restoration(
         return None
     state = run_binding.checkpoint_state
     if not isinstance(state, Mapping):
-        raise FinancialDispatchCheckpointError(
-            FinancialDispatchCheckpointFailureReason.MALFORMED
-        )
+        raise FinancialDispatchCheckpointError(FinancialDispatchCheckpointFailureReason.MALFORMED)
     checkpoint_thread_id = run_binding.checkpoint_thread_id
     expected_run_id = (
-        "run:"
-        + sha256(f"checkpoint:{checkpoint_thread_id}".encode()).hexdigest()
+        "run:" + sha256(f"checkpoint:{checkpoint_thread_id}".encode()).hexdigest()
         if checkpoint_thread_id is not None
         else None
     )
@@ -1834,10 +1827,8 @@ def _validated_checkpoint_restoration(
         restored_rollout = MainlandCapabilityRoutingRunProjection.model_validate(
             state.get("capability_routing_rollout")
         )
-        restored_binding = (
-            MainlandFinancialEligibilityProjectionBinding.model_validate(
-                state.get("financial_eligibility_binding")
-            )
+        restored_binding = MainlandFinancialEligibilityProjectionBinding.model_validate(
+            state.get("financial_eligibility_binding")
         )
         evidence = EvidenceState.model_validate(state.get("evidence_state"))
         authoritative_ledger = FinancialDispatchCheckpointLedger.model_validate(
@@ -1861,12 +1852,9 @@ def _validated_checkpoint_restoration(
             FinancialDispatchCheckpointFailureReason.ASSET_CONFIGURATION_MISMATCH
         )
     if (
-        evidence.instrument_identity
-        != run_binding.asset_configuration.instrument_identity
+        evidence.instrument_identity != run_binding.asset_configuration.instrument_identity
         or evidence.instrument_identity is None
-        or ProviderSubrequestInstrumentIdentity.from_authoritative(
-            evidence.instrument_identity
-        )
+        or ProviderSubrequestInstrumentIdentity.from_authoritative(evidence.instrument_identity)
         != ProviderSubrequestInstrumentIdentity.from_authoritative(
             run_binding.asset_configuration.instrument_identity
         )
@@ -1914,9 +1902,7 @@ def _validated_checkpoint_restoration(
             FinancialDispatchCheckpointFailureReason.PROVIDER_CHAIN_MISMATCH
         )
     cache_checkpoint = shadow_ledger.provider_subrequest_cache
-    expected_context_binding = FinancialEligibilityRequestBinding.from_context(
-        context
-    )
+    expected_context_binding = FinancialEligibilityRequestBinding.from_context(context)
     selection_context_bindings = tuple(
         selection.terminal.selection_request.financial_eligibility_context_binding
         for selection in (
@@ -1936,8 +1922,7 @@ def _validated_checkpoint_restoration(
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
     if (
-        shadow_ledger.contract_version
-        != expected_shadow_version
+        shadow_ledger.contract_version != expected_shadow_version
         or shadow_ledger.run_asset_configuration_version
         != expected_asset.asset_configuration_version
         or shadow_ledger.run_asset_configuration_signature
@@ -1958,10 +1943,7 @@ def _validated_checkpoint_restoration(
         or shadow_ledger.checkpoint_thread_id != checkpoint_thread_id
         or shadow_ledger.financial_eligibility_context != context
         or not selection_context_bindings
-        or any(
-            binding != expected_context_binding
-            for binding in selection_context_bindings
-        )
+        or any(binding != expected_context_binding for binding in selection_context_bindings)
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
@@ -1970,8 +1952,7 @@ def _validated_checkpoint_restoration(
         shadow_ledger.capability_routing_plan_version != "1.2"
         or shadow_ledger.financial_indicator_manifest_version
         != plan.indicator_manifest_contract_version
-        or shadow_ledger.indicator_field_semantics_version
-        != plan.indicator_field_semantics_version
+        or shadow_ledger.indicator_field_semantics_version != plan.indicator_field_semantics_version
         or shadow_ledger.indicator_metadata_compatibility_version
         != plan.indicator_metadata_compatibility_version
         or shadow_ledger.indicator_provider_topology
@@ -2027,8 +2008,7 @@ def _validated_checkpoint_restoration(
         )
         or cache_checkpoint.financial_eligibility_context_contract_version
         != context.contract_version
-        or cache_checkpoint.financial_eligibility_context_identity
-        != context.context_identity
+        or cache_checkpoint.financial_eligibility_context_identity != context.context_identity
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
@@ -2048,9 +2028,7 @@ def _validated_checkpoint_restoration(
         publication = proof.publication_evidence
         document = proof.document_evidence
         cninfo_entries = tuple(
-            entry
-            for entry in cache_checkpoint.entries
-            if entry.key.provider_id == "cninfo"
+            entry for entry in cache_checkpoint.entries if entry.key.provider_id == "cninfo"
         )
         expected_requests = {
             publication.security_lookup_request_identity: (
@@ -2077,13 +2055,9 @@ def _validated_checkpoint_restoration(
             artifact_identity
             for artifact_identity, _scope, _operation, _media_type in expected_requests.values()
         }
-        entries_by_request = {
-            entry.key.subrequest_key: entry for entry in cninfo_entries
-        }
+        entries_by_request = {entry.key.subrequest_key: entry for entry in cninfo_entries}
         retained_artifacts = {
-            entry.artifact.artifact_ref
-            for entry in cninfo_entries
-            if entry.artifact is not None
+            entry.artifact.artifact_ref for entry in cninfo_entries if entry.artifact is not None
         }
         if (
             len(cninfo_entries) != len(expected_requests)
@@ -2127,15 +2101,12 @@ def _validated_checkpoint_restoration(
         expected_upstream_id, _ = upstream_service_identity_for_provider(
             (
                 "cninfo_documents"
-                if key.provider_id == "cninfo"
-                and key.capacity_scope == "cninfo.documents"
+                if key.provider_id == "cninfo" and key.capacity_scope == "cninfo.documents"
                 else "cninfo_metadata"
                 if key.provider_id == "cninfo"
                 else key.provider_id
             ),
-            account_scope=(
-                expected_account_scope if key.provider_id == "tushare" else ""
-            ),
+            account_scope=(expected_account_scope if key.provider_id == "tushare" else ""),
         )
         if (
             key.provider_id not in allowed_physical_providers
@@ -2219,9 +2190,7 @@ class RegisteredProductionQualifiedRoutingComposition:
             self.blueprint,
             ProductionQualifiedRoutingCompositionBlueprint,
         ):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
         factories = self.runtime_factories
         if factories is None:
             factories = production_qualified_routing_runtime_factories()
@@ -2275,9 +2244,7 @@ class RegisteredProductionQualifiedRoutingComposition:
         if isinstance(run_binding, ProductionQualifiedRoutingAssemblyBinding):
             return self._bind_injected_assembly(run_binding)
         if not isinstance(run_binding, ProductionQualifiedRoutingRunBinding):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
         self._validate_run_binding(run_binding)
         with self._state_lock:
             if self._closed:
@@ -2326,9 +2293,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                 indicator_request_factory=run_binding.indicator_request_factory,
             )
         except (AttributeError, TypeError, ValueError):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
 
     def _validate_run_binding(
         self,
@@ -2451,9 +2416,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                 )
                 subrequest_cache.restore_checkpoint(restoration.cache_checkpoint)
             except ProviderSubrequestCacheError as exc:
-                if exc.reason is (
-                    ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH
-                ):
+                if exc.reason is (ProviderSubrequestCacheFailureReason.CONTEXT_MISMATCH):
                     raise FinancialDispatchCheckpointError(
                         FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
                     ) from exc
@@ -2472,10 +2435,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                 raise ProductionQualifiedRoutingLifecycleError(
                     ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
                 )
-            if (
-                restored_shadow_dispatcher.financial_eligibility_context
-                != restoration.context
-            ):
+            if restored_shadow_dispatcher.financial_eligibility_context != restoration.context:
                 raise FinancialDispatchCheckpointError(
                     FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_DISPATCHER_MISMATCH
                 )
@@ -2535,9 +2495,7 @@ class RegisteredProductionQualifiedRoutingComposition:
             )
         financial_routing = assembly.financial_routing
         if restored_shadow_dispatcher is not None:
-            restored_shadow_dispatcher.bind_qualified_statement_router(
-                financial_routing.router
-            )
+            restored_shadow_dispatcher.bind_qualified_statement_router(financial_routing.router)
         financial_routing = QualifiedFinancialRoutingComposition(
             router=financial_routing.router,
             statement_request_factory=financial_routing.statement_request_factory,
@@ -2562,9 +2520,7 @@ class RegisteredProductionQualifiedRoutingComposition:
                 "eligibility_runtime_exposed",
                 restored_context_owner,
             )
-        install_eligibility_runtime = (
-            run_binding.install_financial_eligibility_runtime
-        )
+        install_eligibility_runtime = run_binding.install_financial_eligibility_runtime
         eligibility_runtime_installed = False
         if (
             install_eligibility_runtime is not None
@@ -2574,12 +2530,8 @@ class RegisteredProductionQualifiedRoutingComposition:
                 financial_routing=financial_routing,
                 metadata_acquirer=assembly.eligibility_metadata_acquirer,
                 eligibility_clock=assembly.eligibility_clock,
-                eligibility_calendar_provider=(
-                    assembly.eligibility_calendar_provider
-                ),
-                retained_company_type_evidence=(
-                    assembly.retained_company_type_evidence
-                ),
+                eligibility_calendar_provider=(assembly.eligibility_calendar_provider),
+                retained_company_type_evidence=(assembly.retained_company_type_evidence),
                 retained_listing_metadata=assembly.retained_listing_metadata,
             )
             installed_owner = install_eligibility_runtime(eligibility_inputs)
@@ -2592,22 +2544,19 @@ class RegisteredProductionQualifiedRoutingComposition:
             run_id=run_binding.run_id,
             financial_routing=(
                 None
-                if restored_context_owner is not None
-                or eligibility_runtime_installed
+                if restored_context_owner is not None or eligibility_runtime_installed
                 else financial_routing
             ),
             stop_signal=owner.stop_signal,
             resource_kinds=owner.resource_kinds,
             source_composition=(
                 None
-                if eligibility_runtime_installed
-                or restored_context_owner is not None
+                if eligibility_runtime_installed or restored_context_owner is not None
                 else assembly.source_composition
             ),
             dependencies=(
                 None
-                if eligibility_runtime_installed
-                or restored_context_owner is not None
+                if eligibility_runtime_installed or restored_context_owner is not None
                 else assembly.dependencies
             ),
         )
@@ -2671,9 +2620,7 @@ def build_registered_production_qualified_routing_composition(
     """Consume one validated blueprint without opening run-owned resources."""
 
     if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
     return RegisteredProductionQualifiedRoutingComposition(
         blueprint=blueprint,
         runtime_factories=runtime_factories,
@@ -2735,13 +2682,11 @@ def _ordinary_plan_pairs(
         (route.capability, provider_id)
         for route in plan.routes
         if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
-        and route.capability
-        is not MainlandCapability.LISTING_PUBLICATION_EVIDENCE
+        and route.capability is not MainlandCapability.LISTING_PUBLICATION_EVIDENCE
         and (
             route.capability in _STATEMENT_CAPABILITIES
             or route.capability is MainlandCapability.FINANCIAL_INDICATORS
-            or route.capability
-            is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
+            or route.capability is MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
             or route.capability in _ROUTABLE_CAPABILITIES
         )
         for provider_id in route.providers
@@ -2778,9 +2723,7 @@ class ProductionQualifiedSourceRegistration:
 
     def __post_init__(self) -> None:
         canonical = tuple(
-            capability
-            for capability in MainlandCapability
-            if capability in self.capabilities
+            capability for capability in MainlandCapability if capability in self.capabilities
         )
         if (
             not _safe_source_token(self.provider_id)
@@ -2821,13 +2764,9 @@ class ProductionQualifiedRoutingRunDependencies:
 
     def __post_init__(self) -> None:
         try:
-            clients = MappingProxyType(
-                dict(sorted(dict(self.provider_clients).items()))
-            )
+            clients = MappingProxyType(dict(sorted(dict(self.provider_clients).items())))
         except Exception:
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING)
         if (
             not isinstance(self.coordinator, ProviderRequestCoordinator)
             or not isinstance(self.subrequest_cache, ProviderSubrequestCache)
@@ -2842,9 +2781,7 @@ class ProductionQualifiedRoutingRunDependencies:
                 for provider_id, client in clients.items()
             )
         ):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING)
         object.__setattr__(self, "provider_clients", clients)
 
     def __repr__(self) -> str:
@@ -2860,9 +2797,9 @@ class ProductionQualifiedBoundSource:
     """One external source operation bound to the run cache and coordinator."""
 
     physical_provider_id: str
-    physical_request: Callable[
-        [object], bytes | PhysicalAttemptNotMade[bytes]
-    ] = field(repr=False, compare=False)
+    physical_request: Callable[[object], bytes | PhysicalAttemptNotMade[bytes]] = field(
+        repr=False, compare=False
+    )
     response_decoder: (
         Callable[[object, bytes], object]
         | Callable[[object, bytes, ProviderSubrequestResult], object]
@@ -2884,9 +2821,7 @@ class ProductionQualifiedBoundSource:
         *,
         dependencies: ProductionQualifiedRoutingRunDependencies,
         physical_provider_id: str,
-        physical_request: Callable[
-            [object], bytes | PhysicalAttemptNotMade[bytes]
-        ],
+        physical_request: Callable[[object], bytes | PhysicalAttemptNotMade[bytes]],
         response_decoder: (
             Callable[[object, bytes], object]
             | Callable[[object, bytes, ProviderSubrequestResult], object]
@@ -2934,9 +2869,7 @@ class ProductionQualifiedBoundSource:
                 artifact_store=self.artifact_store,
             )
         ):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
 
     def is_bound_to(
         self,
@@ -2994,9 +2927,7 @@ class ProductionQualifiedSourceUnavailableError(RuntimeError):
                 )
             )
         ):
-            raise ValueError(
-                "qualified provider source failure response is invalid"
-            ) from None
+            raise ValueError("qualified provider source failure response is invalid") from None
         self.response = response
         super().__init__("qualified_provider_source_unavailable")
 
@@ -3017,9 +2948,7 @@ class ProductionQualifiedSourceBinding:
 
     def __post_init__(self) -> None:
         canonical = tuple(
-            capability
-            for capability in MainlandCapability
-            if capability in self.capabilities
+            capability for capability in MainlandCapability if capability in self.capabilities
         )
         if (
             not _safe_source_token(self.provider_id)
@@ -3039,17 +2968,12 @@ class ProductionQualifiedSourceBinding:
                 artifact_store=self.artifact_store,
             )
         ):
-            _fail(
-                MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-            )
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
 
     @property
     def binding_id(self) -> str:
         capability_id = ".".join(capability.value for capability in self.capabilities)
-        return (
-            f"{self.source_kind.value}:{capability_id}:"
-            f"{self.provider_id}:{self.endpoint_id}"
-        )
+        return f"{self.source_kind.value}:{capability_id}:{self.provider_id}:{self.endpoint_id}"
 
     def __repr__(self) -> str:
         return f"ProductionQualifiedSourceBinding(binding_id={self.binding_id!r})"
@@ -3184,16 +3108,16 @@ def _contains_unsafe_asset_material(
         )
     if not isinstance(value, str):
         return False
-    if (
-        _credential_material_in_text(value, token_value)
-        or "?" in value
-        or "://" in value
-    ):
+    if _credential_material_in_text(value, token_value) or "?" in value or "://" in value:
         return True
-    if parent_key == "source_ref" and re.fullmatch(
-        _SAFE_IDENTITY_PATTERN,
-        value,
-    ) is None:
+    if (
+        parent_key == "source_ref"
+        and re.fullmatch(
+            _SAFE_IDENTITY_PATTERN,
+            value,
+        )
+        is None
+    ):
         return True
     try:
         return Path(value).is_absolute()
@@ -3207,10 +3131,7 @@ def _credential_material_in_text(value: str, token_value: str) -> bool:
         return True
     if len(token_value) < 8:
         return False
-    return any(
-        token_value[index : index + 8] in value
-        for index in range(len(token_value) - 7)
-    )
+    return any(token_value[index : index + 8] in value for index in range(len(token_value) - 7))
 
 
 def _required_provider_source_ids(
@@ -3295,12 +3216,7 @@ def _runtime_root_identities(
     return tuple(
         ProductionRuntimeRootIdentity(
             role=role,
-            identity=(
-                prefix
-                + sha256(
-                    os.path.normcase(str(path)).encode("utf-8")
-                ).hexdigest()
-            ),
+            identity=(prefix + sha256(os.path.normcase(str(path)).encode("utf-8")).hexdigest()),
         )
         for path, (role, _key, prefix, _is_database) in zip(
             paths,
@@ -3330,9 +3246,7 @@ def _fail(reason: MainlandCapabilityRoutingFailureReason) -> None:
 
 def _plan_is_valid(plan: MainlandCapabilityRoutingPlan) -> bool:
     try:
-        restored = MainlandCapabilityRoutingPlan.model_validate(
-            plan.model_dump(mode="json")
-        )
+        restored = MainlandCapabilityRoutingPlan.model_validate(plan.model_dump(mode="json"))
     except (AttributeError, TypeError, ValueError):
         return False
     return restored == plan
@@ -3357,8 +3271,7 @@ def _binding_is_valid(
         return False
     return (
         restored == binding
-        and restored.policy_signature
-        == plan.financial_eligibility_policy.policy_signature
+        and restored.policy_signature == plan.financial_eligibility_policy.policy_signature
     )
 
 
@@ -3411,11 +3324,7 @@ def _safe_account_scope_matches(
 
 def _exact_positive_rate(config: Mapping[str, Any], key: str) -> int | None:
     value = config.get(key)
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 1 <= value <= 200
-    ):
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 200:
         return None
     return value
 
@@ -3440,69 +3349,45 @@ def build_production_qualified_routing_composition_blueprint(
     """Validate safe construction inputs and return the resource-free blueprint."""
 
     if factory_contract_version != PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
     if validation_workload is not True:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_VALIDATION_WORKLOAD_REQUIRED
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_VALIDATION_WORKLOAD_REQUIRED)
     if not isinstance(plan, MainlandCapabilityRoutingPlan):
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
     if plan.mode is MainlandCapabilityRoutingMode.QUALIFIED_V1:
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_V1_AUTHORITY_DISABLED)
     if plan.mode is not MainlandCapabilityRoutingMode.QUALIFIED_V1_SHADOW:
         _fail(MainlandCapabilityRoutingFailureReason.INVALID_ROUTING_MODE)
-    if disposition is not (
-        MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE
-    ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DISPOSITION_INVALID
-        )
+    if disposition is not (MainlandCapabilityRoutingDisposition.SHADOW_NON_AUTHORITATIVE):
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DISPOSITION_INVALID)
     if not plan.enabled_tushare_capabilities:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_NOT_APPLICABLE
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_NOT_APPLICABLE)
     if not _plan_is_valid(plan):
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
     config_snapshot = _snapshot_mapping(config, _CONFIG_FIELDS)
     if config_snapshot is None:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
     if config_snapshot.get("mainland_capability_routing_mode") != plan.mode.value:
         _fail(MainlandCapabilityRoutingFailureReason.INVALID_ROUTING_MODE)
-    if (
-        config_snapshot.get("mainland_capability_routing_plan_signature")
-        != plan.plan_signature
-    ):
+    if config_snapshot.get("mainland_capability_routing_plan_signature") != plan.plan_signature:
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
     if (
-        _configured_capabilities(
-            config_snapshot.get("tushare_enabled_capabilities")
-        )
+        _configured_capabilities(config_snapshot.get("tushare_enabled_capabilities"))
         != plan.enabled_tushare_capabilities
     ):
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
-    if (
-        config_snapshot.get("tushare_qualification_profile")
-        != plan.qualification_profile
-    ):
+    if config_snapshot.get("tushare_qualification_profile") != plan.qualification_profile:
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFICATION_PROFILE_MISMATCH)
 
     environment_snapshot = _snapshot_mapping(environment, ("TUSHARE_TOKEN",))
     token_value = (
-        environment_snapshot.get("TUSHARE_TOKEN")
-        if environment_snapshot is not None
-        else None
+        environment_snapshot.get("TUSHARE_TOKEN") if environment_snapshot is not None else None
     )
     if not isinstance(token_value, str) or not token_value.strip():
         _fail(MainlandCapabilityRoutingFailureReason.TUSHARE_TOKEN_MISSING)
 
     if not isinstance(asset_configuration, RunAssetConfiguration):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ASSET_BINDING_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ASSET_BINDING_INVALID)
     asset_projection = _asset_projection(
         asset_configuration,
         token_value=token_value,
@@ -3512,20 +3397,11 @@ def build_production_qualified_routing_composition_blueprint(
         or config_snapshot.get("asset_configuration_signature")
         != asset_configuration.asset_configuration_signature
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ASSET_BINDING_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ASSET_BINDING_INVALID)
     if not _binding_is_valid(financial_eligibility_binding, plan):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ELIGIBILITY_BINDING_INVALID
-        )
-    if (
-        config_snapshot.get("data_usage_mode")
-        != DataUsageMode.PERSONAL_RESEARCH.value
-    ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.DATA_USAGE_MODE_NOT_PERSONAL_RESEARCH
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_ELIGIBILITY_BINDING_INVALID)
+    if config_snapshot.get("data_usage_mode") != DataUsageMode.PERSONAL_RESEARCH.value:
+        _fail(MainlandCapabilityRoutingFailureReason.DATA_USAGE_MODE_NOT_PERSONAL_RESEARCH)
     selected_version = config_snapshot.get(PRODUCTION_PLAN_VERSION_CONFIG_KEY)
     if selected_version is not None and selected_version != plan.plan_version:
         _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
@@ -3533,7 +3409,9 @@ def build_production_qualified_routing_composition_blueprint(
     if plan.plan_version == "1.5":
         try:
             cninfo_binding = CninfoProductionBinding.create(
-                plan=plan, asset_configuration=asset_configuration, config=config_snapshot,
+                plan=plan,
+                asset_configuration=asset_configuration,
+                config=config_snapshot,
             )
         except (TypeError, ValueError):
             _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
@@ -3545,12 +3423,9 @@ def build_production_qualified_routing_composition_blueprint(
         required_dependency_ids,
     )
     if dependency_snapshot is None or any(
-        dependency_snapshot.get(dependency) is not True
-        for dependency in required_dependency_ids
+        dependency_snapshot.get(dependency) is not True for dependency in required_dependency_ids
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
-    )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING)
 
     required_provider_source_ids = _required_provider_source_ids(plan)
     provider_source_snapshot = _snapshot_mapping(
@@ -3561,9 +3436,7 @@ def build_production_qualified_routing_composition_blueprint(
         provider_source_snapshot.get(source_id) is not True
         for source_id in required_provider_source_ids
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE)
     if not _safe_account_scope_matches(config_snapshot, plan, token_value):
         _fail(MainlandCapabilityRoutingFailureReason.TUSHARE_ACCOUNT_SCOPE_INVALID)
     calls_per_minute = _exact_positive_rate(
@@ -3583,14 +3456,10 @@ def build_production_qualified_routing_composition_blueprint(
         identity.operator_calls_per_minute != operator_calls_per_minute
         for identity in plan.endpoint_pacing_identities
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.TUSHARE_OPERATOR_SAFETY_CEILING_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.TUSHARE_OPERATOR_SAFETY_CEILING_INVALID)
     runtime_paths = _validated_root_paths(config_snapshot)
     if runtime_paths is None:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_RUNTIME_ROOT_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_RUNTIME_ROOT_INVALID)
     runtime_root_identities = _runtime_root_identities(runtime_paths)
     contract: ProductionQualifiedRoutingFactoryContract | None = None
     try:
@@ -3598,21 +3467,15 @@ def build_production_qualified_routing_composition_blueprint(
             mode=plan.mode,
             disposition=disposition,
             plan_signature=plan.plan_signature,
-            asset_configuration_signature=(
-                asset_configuration.asset_configuration_signature
-            ),
-            asset_configuration_version=(
-                asset_projection.asset_configuration_version
-            ),
+            asset_configuration_signature=(asset_configuration.asset_configuration_signature),
+            asset_configuration_version=(asset_projection.asset_configuration_version),
             instrument_symbol=asset_projection.instrument_identity.symbol,
             reference_market=asset_projection.reference_market,
             instrument_kind=asset_projection.instrument_kind,
             currency=asset_projection.instrument_identity.currency.upper(),
             registry_id=asset_projection.registry_id,
             registry_digest=asset_projection.registry_digest,
-            capability_profile_identity=(
-                asset_projection.capability_profile.profile_id
-            ),
+            capability_profile_identity=(asset_projection.capability_profile.profile_id),
             adjustment_basis=asset_projection.adjustment_basis,
             financial_eligibility_binding=financial_eligibility_binding,
             data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
@@ -3629,9 +3492,7 @@ def build_production_qualified_routing_composition_blueprint(
             "blueprint_version": PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION,
             "factory_contract": contract.model_dump(mode="json"),
         }
-        blueprint_identity = (
-            f"{_BLUEPRINT_IDENTITY_PREFIX}{_canonical_digest(identity_payload)}"
-        )
+        blueprint_identity = f"{_BLUEPRINT_IDENTITY_PREFIX}{_canonical_digest(identity_payload)}"
         blueprint = ProductionQualifiedRoutingCompositionBlueprint(
             factory_contract=contract,
             routing_plan=plan,
@@ -3649,9 +3510,7 @@ def build_production_qualified_routing_composition_blueprint(
         or type(contract) is not _FACTORY_CONTRACT_TYPE
         or type(blueprint) is not _BLUEPRINT_TYPE
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_OUTPUT_INVALID)
     return blueprint
 
 
@@ -3758,9 +3617,7 @@ def _statement_company_type_evidence_source(
 
     projection_kind = {
         "tushare": FinancialCompanyTypeEvidenceSourceProjectionKind.TUSHARE_STATEMENT,
-        "akshare_sina": (
-            FinancialCompanyTypeEvidenceSourceProjectionKind.AKSHARE_SINA_STATEMENT
-        ),
+        "akshare_sina": (FinancialCompanyTypeEvidenceSourceProjectionKind.AKSHARE_SINA_STATEMENT),
     }[provider_id]
 
     def source(
@@ -3769,14 +3626,11 @@ def _statement_company_type_evidence_source(
         FinancialCompanyTypeEvidenceProviderResponse
         | FinancialCompanyTypeEvidenceProviderProjection
     ):
-        temporal = (
-            request.metadata_binding.contract_version
-            in {
-                "financial-eligibility-metadata-binding-v2",
-                "financial-eligibility-metadata-binding-v3",
-                "financial-eligibility-metadata-binding-v4",
-            }
-        )
+        temporal = request.metadata_binding.contract_version in {
+            "financial-eligibility-metadata-binding-v2",
+            "financial-eligibility-metadata-binding-v3",
+            "financial-eligibility-metadata-binding-v4",
+        }
         as_of_date = (
             request.metadata_binding.requested_session
             if temporal
@@ -3798,10 +3652,7 @@ def _statement_company_type_evidence_source(
             return FinancialCompanyTypeEvidenceProviderResponse.unavailable(
                 provider_id=provider_id,
                 metadata_binding=request.metadata_binding,
-                reason=(
-                    period_response.reason
-                    or AcquisitionUnavailableReason.NO_DATA
-                ),
+                reason=(period_response.reason or AcquisitionUnavailableReason.NO_DATA),
                 subrequest_keys=period_response.subrequest_keys,
                 physical_attempt_ids=period_response.physical_attempt_ids,
             )
@@ -3818,9 +3669,7 @@ def _statement_company_type_evidence_source(
         if temporal:
             try:
                 if provider_id == "tushare":
-                    temporal_evidence = (
-                        project_tushare_company_type_temporal_evidence(candidate)
-                    )
+                    temporal_evidence = project_tushare_company_type_temporal_evidence(candidate)
                 else:
                     if not isinstance(
                         adapter_result,
@@ -3837,11 +3686,9 @@ def _statement_company_type_evidence_source(
                     )
                     if proof_source is None:
                         raise ValueError("AKShare temporal row proof is unavailable")
-                    temporal_evidence = (
-                        project_akshare_sina_company_type_temporal_evidence(
-                            candidate,
-                            proof_source,
-                        )
+                    temporal_evidence = project_akshare_sina_company_type_temporal_evidence(
+                        candidate,
+                        proof_source,
                     )
                     provider_temporal_proof = (
                         FinancialCompanyTypeProviderTemporalProofBinding.from_temporal_evidence(
@@ -3886,9 +3733,7 @@ def _statement_company_type_evidence_source(
             observed_at=candidate.filing_metadata.observed_at,
             retrieved_at=candidate.filing_metadata.retrieved_at,
             provider_declared_type=resolution.provider_declared_type,
-            provider_declaration_qualified=(
-                resolution.provider_declaration_qualified
-            ),
+            provider_declaration_qualified=(resolution.provider_declaration_qualified),
             normalized_resolver_inputs=resolution.classifier_inputs,
         )
         if temporal:
@@ -3936,9 +3781,7 @@ def _tushare_indicator_source(
         if request.provider_id != "tushare":
             raise ValueError("indicator source request provider mismatch")
         period_ends = tuple(
-            period
-            for _family, periods in request.missing_periods_by_family
-            for period in periods
+            period for _family, periods in request.missing_periods_by_family for period in periods
         )
         if not period_ends:
             raise ValueError("indicator source requires an unresolved period")
@@ -3954,9 +3797,7 @@ def _tushare_indicator_source(
             requested_consolidation_scope=request.consolidation_scope,
             range_start=min(period_ends),
             as_of_date=request.as_of_date,
-            eligible_reporting_period_ends=tuple(
-                sorted(set(period_ends), reverse=True)
-            ),
+            eligible_reporting_period_ends=tuple(sorted(set(period_ends), reverse=True)),
         )
         return financial_period_response_from_indicator_adapter(
             provider_id="tushare",
@@ -3969,10 +3810,7 @@ def _tushare_indicator_source(
 def _quarter(period_end: date) -> int:
     quarter_by_month = {3: 1, 6: 2, 9: 3, 12: 4}
     quarter = quarter_by_month.get(period_end.month)
-    if (
-        quarter is None
-        or period_end.day != monthrange(period_end.year, period_end.month)[1]
-    ):
+    if quarter is None or period_end.day != monthrange(period_end.year, period_end.month)[1]:
         raise ValueError("BaoStock ratio target is not a reporting quarter end")
     return quarter
 
@@ -4143,9 +3981,7 @@ def _baostock_factor_source(
             as_of_date=request.as_of_date,
         )
         results = tuple(
-            result
-            for result in (bundle.raw, bundle.factors, bundle.statuses)
-            if result is not None
+            result for result in (bundle.raw, bundle.factors, bundle.statuses) if result is not None
         )
         artifact_ids = _artifact_ids(results)
         common = {
@@ -4161,9 +3997,7 @@ def _baostock_factor_source(
                 **common,
                 retained_artifact_identities=artifact_ids,
                 candidate_count=len(bundle.factors.candidates),
-                provider_history_bundle_identity=(
-                    bundle.provider_history_bundle_identity
-                ),
+                provider_history_bundle_identity=(bundle.provider_history_bundle_identity),
                 strict_bundle_component_artifact_identities=artifact_ids,
             )
         if artifact_ids:
@@ -4379,9 +4213,7 @@ def _build_internal_adapter(
             )
             adapter_cache["tushare_names"] = adapter
         return adapter, _tushare_name_source(adapter)  # type: ignore[arg-type]
-    _fail(
-        MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
-    )
+    _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE)
 
 
 def _validate_run_dependencies(
@@ -4393,16 +4225,13 @@ def _validate_run_dependencies(
     if (
         not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint)
         or not isinstance(dependencies, ProductionQualifiedRoutingRunDependencies)
-        or tuple(dependencies.provider_clients)
-        != _REQUIRED_DEPENDENCY_IDS
+        or tuple(dependencies.provider_clients) != _REQUIRED_DEPENDENCY_IDS
         or not dependencies.subrequest_cache.is_bound_to(
             coordinator=dependencies.coordinator,
             artifact_store=dependencies.artifact_store,
         )
     ):
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING)
 
 
 def _external_request_material(
@@ -4504,8 +4333,8 @@ def _external_subrequest_key(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     request: object,
 ) -> ProviderSubrequestKey:
-    instrument_identity, range_start, range_end, requested_fields = (
-        _external_request_material(registration, request)
+    instrument_identity, range_start, range_end, requested_fields = _external_request_material(
+        registration, request
     )
     upstream_service_id, _service_name = upstream_service_identity_for_provider(
         bound_source.physical_provider_id
@@ -4516,8 +4345,7 @@ def _external_subrequest_key(
         account_scope="public",
         capacity_scope=(
             "current_financial_profile"
-            if registration.endpoint_id
-            == "current_profile_company_type_evidence"
+            if registration.endpoint_id == "current_profile_company_type_evidence"
             else registration.endpoint_id
         ),
         instrument_identity=instrument_identity,
@@ -4604,9 +4432,7 @@ def _external_response_with_attempts(
     if isinstance(response, FinancialProviderPeriodResponse):
         payload["physical_attempt_events"] = result.attempt_events
         payload["subrequest_outcomes"] = ()
-        payload["indicator_metadata_compatibility"] = (
-            response.indicator_metadata_compatibility
-        )
+        payload["indicator_metadata_compatibility"] = response.indicator_metadata_compatibility
         return FinancialProviderPeriodResponse.model_validate(payload)
     if isinstance(response, FinancialCompanyTypeEvidenceProviderResponse):
         return FinancialCompanyTypeEvidenceProviderResponse.model_validate(payload)
@@ -4644,9 +4470,7 @@ def _execute_external_source(
             request,
             reason=_adapter_unavailable_reason(result.outcome),
             subrequest_keys=(result.key.subrequest_key,),
-            physical_attempt_ids=tuple(
-                event.attempt_event_id for event in result.attempt_events
-            ),
+            physical_attempt_ids=tuple(event.attempt_event_id for event in result.attempt_events),
             physical_attempt_events=result.attempt_events,
         )
     try:
@@ -4692,9 +4516,7 @@ def _safe_external_source(
     def unavailable(request: object, response: object | None = None):
         subrequest_keys = tuple(getattr(response, "subrequest_keys", ()))
         physical_attempt_ids = tuple(getattr(response, "physical_attempt_ids", ()))
-        physical_attempt_events = tuple(
-            getattr(response, "physical_attempt_events", ())
-        )
+        physical_attempt_events = tuple(getattr(response, "physical_attempt_events", ()))
         return _external_unavailable_response(
             registration,
             request,
@@ -4714,10 +4536,7 @@ def _safe_external_source(
                 return unavailable(request)
         elif registration.source_kind is ProductionQualifiedSourceKind.INDICATOR:
             request_capability = MainlandCapability.FINANCIAL_INDICATORS
-        elif (
-            registration.source_kind
-            is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE
-        ):
+        elif registration.source_kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE:
             request_capability = MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE
         else:
             request_capability = getattr(request, "capability", None)
@@ -4748,17 +4567,11 @@ def _safe_external_source(
                 registration.source_kind is ProductionQualifiedSourceKind.INDICATOR
                 and registration.provider_id == "yfinance"
                 and response.kind.value == "available"
-                and (
-                    not response.degraded_current_profile
-                    or bool(response.candidates)
-                )
+                and (not response.degraded_current_profile or bool(response.candidates))
             ):
                 return unavailable(request, response)
             return response
-        if (
-            registration.source_kind
-            is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE
-        ):
+        if registration.source_kind is ProductionQualifiedSourceKind.COMPANY_TYPE_EVIDENCE:
             if (
                 not isinstance(response, FinancialCompanyTypeEvidenceProviderResponse)
                 or response.provider_id != registration.provider_id
@@ -4938,10 +4751,7 @@ def _production_executable_source_registrations(
     specifications.extend(
         specification
         for specification in candidates
-        if all(
-            (capability, specification[0]) in plan_pairs
-            for capability in specification[3]
-        )
+        if all((capability, specification[0]) in plan_pairs for capability in specification[3])
     )
 
     registrations: list[ProductionQualifiedSourceRegistration] = []
@@ -4954,6 +4764,7 @@ def _production_executable_source_registrations(
             else provider_id
         )
         client_id = "akshare" if provider_id == "akshare" else physical_provider_id
+
         def source_factory(
             dependencies: ProductionQualifiedRoutingRunDependencies,
             *,
@@ -4964,6 +4775,7 @@ def _production_executable_source_registrations(
             client = dependencies.provider_clients[_client_id]
 
             if _endpoint_id == "financial_statements":
+
                 def yahoo_statement_request(request: object) -> bytes:
                     if not isinstance(request, FinancialProviderGapRequest):
                         raise PhysicalAttemptFailure(
@@ -4996,6 +4808,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "financial_indicators":
+
                 def akshare_indicator_request(request: object) -> bytes:
                     if not isinstance(request, FinancialIndicatorProviderGapRequest):
                         raise PhysicalAttemptFailure(
@@ -5028,6 +4841,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "current_financial_profile":
+
                 def yahoo_profile_request(request: object) -> bytes:
                     if not isinstance(request, FinancialIndicatorProviderGapRequest):
                         raise PhysicalAttemptFailure(
@@ -5060,6 +4874,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "current_profile_company_type_evidence":
+
                 def yahoo_company_type_request(request: object) -> bytes:
                     if not isinstance(
                         request,
@@ -5102,6 +4917,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "adjustment_factors":
+
                 def akshare_factor_request(request: object) -> bytes:
                     if not isinstance(request, FinancialCapabilityRoutingRequest):
                         raise PhysicalAttemptFailure(
@@ -5139,6 +4955,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "derived_adjustment_factors":
+
                 def yahoo_factor_request(request: object) -> bytes:
                     if not isinstance(request, FinancialCapabilityRoutingRequest):
                         raise PhysicalAttemptFailure(
@@ -5176,6 +4993,7 @@ def _production_executable_source_registrations(
                     max_physical_attempts=1,
                 )
             if _endpoint_id == "issuer_name_events":
+
                 def akshare_name_request(request: object) -> bytes:
                     if not isinstance(request, FinancialCapabilityRoutingRequest):
                         raise PhysicalAttemptFailure(
@@ -5292,9 +5110,7 @@ def _assemble_production_qualified_runtime(
     financial_routing = QualifiedFinancialRoutingComposition(
         router=source_composition.router,
         statement_request_factory=(
-            request_factories.statement
-            if TushareCapability.STATEMENTS in enabled
-            else None
+            request_factories.statement if TushareCapability.STATEMENTS in enabled else None
         ),
         indicator_request_factory=(
             request_factories.indicator
@@ -5320,7 +5136,8 @@ def _assemble_production_qualified_runtime(
         ).acquire
     publication_arguments = (
         {"listing_publication_source": listing_publication_source}
-        if listing_publication_source is not None else {}
+        if listing_publication_source is not None
+        else {}
     )
     eligibility_metadata_acquirer = FinancialEligibilityMetadataAcquirer(
         routing_plan=blueprint.routing_plan,
@@ -5335,14 +5152,14 @@ def _assemble_production_qualified_runtime(
         eligibility_metadata_acquirer=eligibility_metadata_acquirer,
         eligibility_clock=dependencies.now,
         eligibility_calendar_provider=(
-            lambda: eligibility_calendar_reader.read_eligibility_session_calendar(
-                "mainland-cn"
+            lambda: (
+                eligibility_calendar_reader.read_eligibility_session_calendar("mainland-cn")
+                if isinstance(
+                    eligibility_calendar_reader,
+                    ProductionQualifiedEligibilityCalendarReader,
+                )
+                else None
             )
-            if isinstance(
-                eligibility_calendar_reader,
-                ProductionQualifiedEligibilityCalendarReader,
-            )
-            else None
         ),
     )
 
@@ -5357,11 +5174,7 @@ def assemble_production_qualified_provider_sources(
 
     _validate_run_dependencies(blueprint, dependencies)
     plan_pairs = _ordinary_plan_pairs(blueprint.routing_plan)
-    external_pairs = {
-        pair
-        for pair in plan_pairs
-        if _internal_source_endpoint(*pair) is None
-    }
+    external_pairs = {pair for pair in plan_pairs if _internal_source_endpoint(*pair) is None}
     registration_by_pair: dict[
         tuple[MainlandCapability, str],
         ProductionQualifiedSourceRegistration,
@@ -5370,9 +5183,7 @@ def assemble_production_qualified_provider_sources(
     try:
         registrations = tuple(source_registrations)
     except Exception:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE)
     for registration in registrations:
         if not isinstance(registration, ProductionQualifiedSourceRegistration):
             _fail(
@@ -5391,9 +5202,7 @@ def assemble_production_qualified_provider_sources(
                 )
             registration_by_pair[pair] = registration
     if set(registration_by_pair) != external_pairs:
-        _fail(
-            MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE
-        )
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_SOURCE_COVERAGE_INCOMPLETE)
 
     built_registration_sources: dict[
         int,
@@ -5476,9 +5285,7 @@ def assemble_production_qualified_provider_sources(
                 )
             )
 
-    statement_source_ids = blueprint.routing_plan.route_for(
-        MainlandCapability.BALANCE_SHEET
-    )
+    statement_source_ids = blueprint.routing_plan.route_for(MainlandCapability.BALANCE_SHEET)
 
     def statement_source(provider_id: str) -> FinancialPeriodSource:
         def dispatch(request: FinancialProviderGapRequest):
@@ -5488,19 +5295,12 @@ def assemble_production_qualified_provider_sources(
         return dispatch
 
     statement_sources = MappingProxyType(
-        {
-            provider_id: statement_source(provider_id)
-            for provider_id in statement_source_ids
-        }
+        {provider_id: statement_source(provider_id) for provider_id in statement_source_ids}
     )
-    indicator_source_ids = blueprint.routing_plan.route_for(
-        MainlandCapability.FINANCIAL_INDICATORS
-    )
+    indicator_source_ids = blueprint.routing_plan.route_for(MainlandCapability.FINANCIAL_INDICATORS)
     indicator_sources: Mapping[str, FinancialIndicatorSource] = MappingProxyType(
         {
-            provider_id: pair_sources[
-                (MainlandCapability.FINANCIAL_INDICATORS, provider_id)
-            ]
+            provider_id: pair_sources[(MainlandCapability.FINANCIAL_INDICATORS, provider_id)]
             for provider_id in indicator_source_ids
         }
     )

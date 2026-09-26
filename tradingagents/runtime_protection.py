@@ -18,6 +18,7 @@ from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tradingagents.policy_coverage_models import CoverageEnvelope
 from tradingagents.policy_qualified_contract import DownstreamEnvelope, strict_json
 from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 
@@ -137,12 +138,25 @@ class ConditionalAttemptInputs(AttemptInputs):
         return self
 
 
+class CoverageAttemptInputs(ConditionalAttemptInputs):
+    contract_version: Literal["policy-qualified-runtime-protection-attempt-v2"]
+    qualified_source_identity: str = Field(
+        pattern=r"^policy-qualified-execution-result:v2:sha256:[0-9a-f]{64}$"
+    )
+    production_preparation_identity: str = Field(
+        pattern=r"^production-policy-qualified-routing-preparation:v2:[0-9a-f]{64}$"
+    )
+    acceptance: CoverageEnvelope
+
+
 def _paths(inputs: AttemptInputs) -> tuple[str, AttemptPaths]:
     namespace_name = (
         "policy-qualified-runtime-protection-attempt:v1"
         if isinstance(inputs, ConditionalAttemptInputs)
         else "runtime-protection-attempt:v1"
     )
+    if isinstance(inputs, CoverageAttemptInputs):
+        namespace_name = "policy-qualified-runtime-protection-attempt:v2"
     identity = evidence_identity(namespace_name, inputs.model_dump(mode="json"))
     digest = identity.rsplit(":", 1)[1]
     namespace = PureWindowsPath(inputs.namespace_root)
@@ -193,6 +207,11 @@ class ConditionalProtectionAttempt(BaseModel):
         return self
 
 
+class CoverageProtectionAttempt(ConditionalProtectionAttempt):
+    contract_version: Literal["policy-qualified-runtime-protection-attempt-v2"]
+    inputs: CoverageAttemptInputs
+
+
 def derive_attempt(
     inputs: AttemptInputs,
     *,
@@ -204,15 +223,16 @@ def derive_attempt(
     launches anything; conditional expiry/revocation may invalidate its ledger.
     """
     if isinstance(inputs, ConditionalAttemptInputs):
-        inputs = ConditionalAttemptInputs.model_validate_json(
-            canonical_bytes(inputs.model_dump(mode="json"))
-        )
+        coverage = isinstance(inputs, CoverageAttemptInputs)
+        input_model = CoverageAttemptInputs if coverage else ConditionalAttemptInputs
+        inputs = input_model.model_validate_json(canonical_bytes(inputs.model_dump(mode="json")))
         if not isinstance(policy_verifier, PolicyQualifiedVerifier):
             raise ValueError("conditional attempt requires fresh trusted authority resolution")
         policy_verifier.verify_downstream(inputs.acceptance)
         identity, paths = _paths(inputs)
-        return ConditionalProtectionAttempt(
-            contract_version="policy-qualified-runtime-protection-attempt-v1",
+        attempt_model = CoverageProtectionAttempt if coverage else ConditionalProtectionAttempt
+        return attempt_model(
+            contract_version=inputs.contract_version,
             inputs=inputs,
             attempt_identity=identity,
             paths=paths,
@@ -235,6 +255,7 @@ def bind_production_preparation(
     """
     from tradingagents.qualified_routing_composition import (
         ConditionalProductionQualifiedRoutingPreparation,
+        CoverageProductionQualifiedRoutingPreparation,
         parse_production_preparation,
         verify_conditional_production_source,
     )
@@ -243,12 +264,18 @@ def bind_production_preparation(
     source = prepared.qualified_source
     if isinstance(prepared, ConditionalProductionQualifiedRoutingPreparation):
         verify_conditional_production_source(source, policy_verifier)
+        coverage = isinstance(prepared, CoverageProductionQualifiedRoutingPreparation)
+        input_model = CoverageAttemptInputs if coverage else ConditionalAttemptInputs
         return derive_attempt(
-            ConditionalAttemptInputs.model_validate_json(
+            input_model.model_validate_json(
                 canonical_bytes(
                     {
                         **inputs,
-                        "contract_version": "policy-qualified-runtime-protection-attempt-v1",
+                        "contract_version": (
+                            "policy-qualified-runtime-protection-attempt-v2"
+                            if coverage
+                            else "policy-qualified-runtime-protection-attempt-v1"
+                        ),
                         "source_commit": source.commit_id,
                         "source_tree": source.tree_hash,
                         "qualified_source_identity": source.qualified_source_identity,
@@ -280,7 +307,13 @@ def validate_conditional_attempt(
         value = value.model_dump(mode="json")
     if isinstance(value, (bytes, str)):
         value = strict_json(value)
-    attempt = ConditionalProtectionAttempt.model_validate_json(canonical_bytes(value))
+    model = (
+        CoverageProtectionAttempt
+        if isinstance(value, dict)
+        and value.get("contract_version") == "policy-qualified-runtime-protection-attempt-v2"
+        else ConditionalProtectionAttempt
+    )
+    attempt = model.model_validate_json(canonical_bytes(value))
     expected = derive_attempt(attempt.inputs, policy_verifier=policy_verifier)
     if attempt != expected:
         raise ValueError("conditional attempt does not match its complete current binding")

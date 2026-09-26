@@ -13,6 +13,7 @@ from typing import Any, ClassVar, Literal
 from pydantic import Field, model_validator
 from typing_extensions import Self
 
+from tradingagents.policy_coverage_models import CoverageEnvelope
 from tradingagents.policy_qualified_contract import (
     Candidate,
     Closed,
@@ -26,6 +27,7 @@ from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 from tradingagents.runtime_protection import (
     ConditionalProtectionAttempt,
     ContentManifest,
+    CoverageProtectionAttempt,
     PreparedProtectionAttempt,
     _materialization_payload,
     _windows_path,
@@ -105,6 +107,31 @@ class PreparedConditionalProtectionAttempt(PreparedProtectionAttempt):
     owner_binding: NativeOwnerBinding
 
 
+class PreparedCoverageProtectionAttempt(PreparedConditionalProtectionAttempt):
+    identity_namespace: ClassVar[str] = "policy-qualified-runtime-protection-prepared:v3"
+    contract_version: Literal["policy-qualified-runtime-protection-prepared-v3"]
+    attempt: CoverageProtectionAttempt
+
+
+def parse_prepared_conditional(value):
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    model = (
+        PreparedCoverageProtectionAttempt
+        if isinstance(value, dict)
+        and value.get("contract_version") == "policy-qualified-runtime-protection-prepared-v3"
+        else PreparedConditionalProtectionAttempt
+    )
+    return model.model_validate_json(canonical_bytes(value))
+
+
+def conditional_container(stem, attempt, *, identity=False):
+    if not isinstance(attempt, ConditionalProtectionAttempt):
+        raise ValueError("a validated conditional attempt is required")
+    version = "3" if isinstance(attempt, CoverageProtectionAttempt) else "2"
+    return "policy-qualified-runtime-protection-" + stem + (":v" if identity else "-v") + version
+
+
 def seal_conditional_materialization_plan(
     *,
     attempt: object,
@@ -122,7 +149,7 @@ def seal_conditional_materialization_plan(
     verified = validate_conditional_attempt(attempt, policy_verifier=policy_verifier)
     owner = NativeOwnerBinding.read(owner_binding)
     payload = {
-        "contract_version": "policy-qualified-runtime-protection-materialization-v2",
+        "contract_version": conditional_container("materialization", verified),
         "owner_binding": owner.model_dump(mode="json"),
         **_materialization_payload(
             attempt=verified,
@@ -139,7 +166,7 @@ def seal_conditional_materialization_plan(
     return {
         **payload,
         "identity": evidence_identity(
-            "policy-qualified-runtime-protection-materialization:v2", payload
+            conditional_container("materialization", verified, identity=True), payload
         ),
     }
 
@@ -147,13 +174,7 @@ def seal_conditional_materialization_plan(
 def build_conditional_inert_control(
     prepared: object, *, child_arguments: Sequence[str], policy_verifier: PolicyQualifiedVerifier
 ) -> dict[str, Any]:
-    value = PreparedConditionalProtectionAttempt.model_validate_json(
-        canonical_bytes(
-            prepared.model_dump(mode="json")
-            if isinstance(prepared, PreparedConditionalProtectionAttempt)
-            else prepared
-        )
-    )
+    value = parse_prepared_conditional(prepared)
     policy_verifier.verify_downstream(value.attempt.inputs.acceptance)
     arguments = list(child_arguments)
     if (
@@ -166,7 +187,7 @@ def build_conditional_inert_control(
     if not entry.is_relative_to(PureWindowsPath(value.attempt.paths.private_app_root)):
         raise ValueError("conditional inert entrypoint is outside the protected application")
     payload = {
-        "contract_version": "policy-qualified-runtime-protection-control-v2",
+        "contract_version": conditional_container("control", value.attempt),
         "operation": "inert",
         "prepared_identity": value.identity,
         "attempt_identity": value.attempt.attempt_identity,
@@ -183,7 +204,9 @@ def build_conditional_inert_control(
     }
     return {
         **payload,
-        "identity": evidence_identity("policy-qualified-runtime-protection-control:v2", payload),
+        "identity": evidence_identity(
+            conditional_container("control", value.attempt, identity=True), payload
+        ),
     }
 
 
@@ -211,4 +234,20 @@ class ConditionalNativeCompletion(Closed):
             self.model_dump(mode="json", exclude={"identity"}),
         ):
             raise ValueError("conditional native completion lost its complete binding")
+        return self
+
+
+class CoverageNativeCompletion(ConditionalNativeCompletion):
+    contract_version: Literal["policy-qualified-runtime-protection-completion-v3"]
+    acceptance: CoverageEnvelope
+
+    @model_validator(mode="after")
+    def _seal(self) -> Self:
+        if self.exact_baseline_restored != (
+            self.state == "COMPLETED_RESTORED"
+        ) or self.identity != evidence_identity(
+            "policy-qualified-runtime-protection-completion:v3",
+            self.model_dump(mode="json", exclude={"identity"}),
+        ):
+            raise ValueError("coverage native completion seal/restoration mismatch")
         return self

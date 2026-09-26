@@ -782,6 +782,51 @@ namespace TradingAgents.RuntimeProtection
         }
         internal static void Require(bool value,string message)
         { if(!value)throw new InvalidOperationException(message); }
+        internal static void CoverageReference(object value,string space)
+        {
+            var reference=Obj(value);Closed(reference,"identity","pin");
+            Require(Regex.IsMatch(Str(reference["identity"]),"^"+Regex.Escape(space)+":sha256:[0-9a-f]{64}$"),"Coverage reference namespace mismatch");
+            var pin=Obj(reference["pin"]);Closed(pin,"byte_length","sha256");
+            Require((pin["byte_length"] is int||pin["byte_length"] is long)&&Convert.ToInt64(pin["byte_length"])>0
+                &&Convert.ToInt64(pin["byte_length"])<=268435456&&Regex.IsMatch(Str(pin["sha256"]),"^[0-9a-f]{64}$"),"Coverage reference byte pin mismatch");
+        }
+        internal static void CoverageEnvelope(object value)
+        {
+            // Structural native enforcement is additional to the fresh protected
+            // owner verification; a digest alone is never authentication.
+            var envelope=Obj(value);Closed(envelope,"contract_version","core","receipt","execution_authorized");
+            var core=Obj(envelope["core"]);Closed(core,"contract_version","result","binding","candidate","history","lineage","expires_utc","execution_authorized");
+            var history=Obj(core["history"]);Closed(history,"contract_version","historical_claim","historical_equal","historical_cause","prior_outcome","scope","coverage","known_recorded_fields","current_window");
+            var coverage=Obj(history["coverage"]);Closed(coverage,"scope","measurement","baseline","assessment","historical_coverage","historical_object_continuity","hidden_contents");
+            CoverageReference(coverage["scope"],"historical-coverage-scope:v2");
+            CoverageReference(coverage["measurement"],"policy-coverage-measurement:v2");
+            CoverageReference(coverage["baseline"],"policy-coverage-inventory:v2");
+            CoverageReference(coverage["assessment"],"policy-coverage-assessment:v2");
+            CoverageReference(core["result"],"policy-qualified-execution-result:v2");
+            var lineage=Obj(core["lineage"]);var binding=Obj(core["binding"]);var receipt=Obj(envelope["receipt"]);
+            Closed(receipt,"contract_version","core","pre_result_closure_identity","authority_state_reference","recorded_at_utc","execution_authorized","receipt_identity");
+            Require(Str(envelope["contract_version"])=="policy-qualified-downstream-envelope-v2"
+                &&Str(core["contract_version"])=="policy-qualified-result-binding-core-v2"
+                &&Str(history["contract_version"])=="policy-coverage-historical-claim-v2"
+                &&Str(history["historical_claim"])=="UNRESOLVED_RAW_DIFFERENCE"&&!(bool)history["historical_equal"]
+                &&Str(history["historical_cause"])=="UNRESOLVED"&&Str(history["prior_outcome"])=="BLOCKED"
+                &&Str(history["known_recorded_fields"])=="MATCH"
+                &&Str(history["current_window"])=="STRICT_COMPLETE_PRESERVATION_WITHIN_DECLARED_SCOPE"
+                &&Str(coverage["historical_coverage"])=="UNKNOWN"
+                &&Str(coverage["historical_object_continuity"])=="NOT_ESTABLISHED"
+                &&Str(coverage["hidden_contents"])=="UNKNOWN_NOT_RETROACTIVELY_COMPLETED"
+                &&Str(lineage["contract_version"])=="historical-state-qualification-lineage-v2"
+                &&Canonical(lineage["coverage"])==Canonical(coverage)
+                &&Object.Equals(binding["lineage_identity"],lineage["lineage_identity"])
+                &&Canonical(core["candidate"])==Canonical(lineage["candidate"])
+                &&Regex.IsMatch(Str(binding["acceptance_policy_identity"]),"^historical-state-acceptance-policy:v2:sha256:[0-9a-f]{64}$")
+                &&Regex.IsMatch(Str(binding["approval_identity"]),"^historical-state-operator-approval:v2:sha256:[0-9a-f]{64}$")
+                &&Str(receipt["contract_version"])=="policy-qualified-acceptance-receipt-v2"
+                &&Regex.IsMatch(Str(receipt["receipt_identity"]),"^policy-qualified-acceptance-receipt:v2:sha256:[0-9a-f]{64}$")
+                &&Canonical(receipt["core"])==Canonical(core)
+                &&!(bool)envelope["execution_authorized"]&&!(bool)core["execution_authorized"]&&!(bool)receipt["execution_authorized"],
+                "Coverage consumer lost version, irreversible baseline, unknown history or authority limits");
+        }
         internal static void WriteNew(string path,Dictionary<string,object> value)
         {
             string sid=WindowsIdentity.GetCurrent().User.Value;
@@ -1272,6 +1317,14 @@ namespace TradingAgents.RuntimeProtection
                 Require(found,"Live application lacks the build-bound Step-4 gate: "+binding.Key);
             }
         }
+        static bool IsCoverageAttempt(Dictionary<string,object> attempt)
+        { return S(attempt,"contract_version")=="policy-qualified-runtime-protection-attempt-v2"; }
+        static string ConditionalKind(string stem,Dictionary<string,object> attempt,bool identity)
+        {
+            string version=S(attempt,"contract_version");
+            Require(version=="policy-qualified-runtime-protection-attempt-v1"||version=="policy-qualified-runtime-protection-attempt-v2","Unknown conditional attempt version");
+            return "policy-qualified-runtime-protection-"+stem+(identity?":v":"-v")+(IsCoverageAttempt(attempt)?"3":"2");
+        }
         static Dictionary<string,object> ValidateAttempt(Dictionary<string,object> attempt,IConditionalProtectionOwner owner=null)
         {
             Evidence.Closed(attempt,"contract_version","inputs","attempt_identity","paths","execution_authorized");
@@ -1282,12 +1335,18 @@ namespace TradingAgents.RuntimeProtection
                 "deployment_configuration_identity","environment_identity","protection_source_identity","attempt_ordinal"});
             if(owner!=null)inputKeys.Add("acceptance");
             Evidence.Closed(inputs,inputKeys.ToArray());
-            string version=owner==null?Contract:"policy-qualified-runtime-protection-attempt-v1";
+            bool coverage=owner!=null&&IsCoverageAttempt(attempt);
+            string version=owner==null?Contract:(coverage?"policy-qualified-runtime-protection-attempt-v2":"policy-qualified-runtime-protection-attempt-v1");
             Require(S(attempt,"contract_version")==version&&S(inputs,"contract_version")==version&&!(bool)attempt["execution_authorized"],"Protection contract version/authority mismatch");
             Require((inputs["attempt_ordinal"] is int||inputs["attempt_ordinal"] is long)&&Convert.ToInt64(inputs["attempt_ordinal"])>0,"Explicit positive attempt ordinal required");
             Require(S(inputs,"protection_source_identity")==SourceIdentity(),"Protection source/build identity mismatch");
-            if(owner!=null)owner.VerifyAttempt(attempt);
-            string identity=Evidence.Identity(owner==null?"runtime-protection-attempt:v1":"policy-qualified-runtime-protection-attempt:v1",inputs);
+            if(owner!=null)
+            {
+                if(coverage)Evidence.CoverageEnvelope(inputs["acceptance"]);
+                else Require(S(O(inputs,"acceptance"),"contract_version")=="policy-qualified-downstream-envelope-v1","Old native attempt cannot reinterpret new coverage");
+                owner.VerifyAttempt(attempt);
+            }
+            string identity=Evidence.Identity(owner==null?"runtime-protection-attempt:v1":(coverage?"policy-qualified-runtime-protection-attempt:v2":"policy-qualified-runtime-protection-attempt:v1"),inputs);
             Require(S(attempt,"attempt_identity")==identity,"Attempt identity mismatch");
             string space=Native.LocalPath(S(inputs,"namespace_root"),false);
             string suffix=identity.Substring(identity.LastIndexOf(':')+1);
@@ -1415,8 +1474,8 @@ namespace TradingAgents.RuntimeProtection
                 "mapped_configuration","environment","working_directory","credential_bindings","python_version","execution_authorized","identity"});
             if(owner!=null)planKeys.Add("owner_binding");
             Evidence.Closed(plan,planKeys.ToArray());
-            Evidence.CheckIdentity(plan,owner==null?"runtime-protection-materialization:v1":"policy-qualified-runtime-protection-materialization:v2");
-            Require(S(plan,"contract_version")== (owner==null?"runtime-protection-materialization-v1":"policy-qualified-runtime-protection-materialization-v2")
+            Evidence.CheckIdentity(plan,owner==null?"runtime-protection-materialization:v1":ConditionalKind("materialization",O(plan,"attempt"),true));
+            Require(S(plan,"contract_version")== (owner==null?"runtime-protection-materialization-v1":ConditionalKind("materialization",O(plan,"attempt"),false))
                 &&!(bool)plan["execution_authorized"],"Materialization authority mismatch");
             if(owner!=null)
             {
@@ -1492,7 +1551,7 @@ namespace TradingAgents.RuntimeProtection
                     Require(expectedLocations.SetEquals(locations.Keys),"Unexpected materialization source location");
                     tree.CreateDirectory("anchors/current");tree.CreateDirectory("anchors/history");tree.CreateDirectory("runtime/app");
                     var historyBinding=new Dictionary<string,object> {
-                        {"contract_version",owner==null?"runtime-protection-history-reference-v1":"policy-qualified-runtime-protection-history-reference-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
+                        {"contract_version",owner==null?"runtime-protection-history-reference-v1":ConditionalKind("history-reference",O(plan,"attempt"),false)},{"attempt_identity",S(attempt,"attempt_identity")},
                         {"preparation_lineage_identity",S(inputs,"preparation_lineage_identity")},
                         {"production_preparation_identity",S(inputs,"production_preparation_identity")},
                         {"qualified_source_identity",S(inputs,"qualified_source_identity")},{"historical_objects_mutated",false} };
@@ -1504,14 +1563,14 @@ namespace TradingAgents.RuntimeProtection
                     tree.WriteNewFile("runtime/configuration.json",Encoding.UTF8.GetBytes(Evidence.Canonical(mapped)));
                     var baselines=new List<object>();foreach(var entry in tree.CaptureBaseline())baselines.Add(Evidence.Baseline(entry));
                     var preparedBody=new Dictionary<string,object> {
-                        {"contract_version",owner==null?"runtime-protection-prepared-v1":"policy-qualified-runtime-protection-prepared-v2"},{"attempt",attempt},{"materialization_identity",S(plan,"identity")},
+                        {"contract_version",owner==null?"runtime-protection-prepared-v1":ConditionalKind("prepared",O(plan,"attempt"),false)},{"attempt",attempt},{"materialization_identity",S(plan,"identity")},
                         {"runtime_manifest_identity",S(runtime,"identity")},{"app_manifest_identity",S(app,"identity")},
                         {"baseline",baselines},{"baseline_identity",Evidence.Identity("runtime-protection-baseline:v1",baselines)},
                         {"environment",environment},{"working_directory",S(plan,"working_directory")},{"mapped_configuration",mapped},{"protection_contract_version","protected-runtime-tree-v3"},
                         {"credential_bindings",plan["credential_bindings"]},
                         {"state","PREPARED"},{"execution_authorized",false} };
                     if(owner!=null)preparedBody.Add("owner_binding",owner.Binding);
-                    var prepared=Evidence.Seal(owner==null?"runtime-protection-prepared:v1":"policy-qualified-runtime-protection-prepared:v2",preparedBody);
+                    var prepared=Evidence.Seal(owner==null?"runtime-protection-prepared:v1":ConditionalKind("prepared",O(plan,"attempt"),true),preparedBody);
                     Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"prepared.json"),prepared);
                     Native.CreateNewDirectory(Path.Combine(claim,"prepared-"+S(prepared,"identity").Substring(S(prepared,"identity").LastIndexOf(':')+1)),true);
                     return prepared;
@@ -1539,7 +1598,7 @@ namespace TradingAgents.RuntimeProtection
                 "legacy_authoritative","qualified_shadow_authoritative","execution_authorized"});
             if(owner!=null) { keys.Add("acceptance");keys.Add("owner_binding"); }
             Evidence.Closed(gate,keys.ToArray());
-            Require(S(gate,"contract_version")== (owner==null?"runtime-protection-handoff-v1":"policy-qualified-runtime-protection-handoff-v2")&&S(gate,"plan_version")=="1.5"
+            Require(S(gate,"contract_version")== (owner==null?"runtime-protection-handoff-v1":ConditionalKind("handoff",O(prepared,"attempt"),false))&&S(gate,"plan_version")=="1.5"
                 &&S(gate,"preparation_lineage_identity")==S(inputs,"preparation_lineage_identity")
                 &&S(gate,"analysis_session")==S(inputs,"completed_session"),"Handoff preparation/session/Plan mismatch");
             object pacing=gate["cninfo_operator_minimum_interval_seconds"];
@@ -1649,8 +1708,8 @@ namespace TradingAgents.RuntimeProtection
                         "checkpoint_original_exact_equal","retained_provenance_changed","run_or_thread_allocated","execution_authorized","identity"});
                     if(owner!=null) { messageKeys.Add("acceptance");messageKeys.Add("owner_binding"); }
                     Evidence.Closed(message,messageKeys.ToArray());
-                    Evidence.CheckIdentity(message,owner==null?"runtime-protection-guard:v1":"policy-qualified-runtime-protection-guard:v2");var inputs=O(O(prepared,"attempt"),"inputs");
-                    Require(S(message,"contract_version")== (owner==null?"runtime-protection-guard-v1":"policy-qualified-runtime-protection-guard-v2")&&S(message,"status")=="PASS"
+                    Evidence.CheckIdentity(message,owner==null?"runtime-protection-guard:v1":ConditionalKind("guard",O(prepared,"attempt"),true));var inputs=O(O(prepared,"attempt"),"inputs");
+                    Require(S(message,"contract_version")== (owner==null?"runtime-protection-guard-v1":ConditionalKind("guard",O(prepared,"attempt"),false))&&S(message,"status")=="PASS"
                         &&S(message,"prepared_identity")==S(prepared,"identity")&&S(message,"checkpoint_identity")==S(gate,"checkpoint_identity")
                         &&S(message,"history_identity")==S(gate,"history_identity")&&S(message,"prospective_thread")==S(inputs,"prospective_thread")
                         &&S(message,"prospective_run")==S(inputs,"prospective_run"),"Guard history/lineage evidence mismatch");
@@ -1768,11 +1827,11 @@ namespace TradingAgents.RuntimeProtection
         }
         internal static Dictionary<string,object> Run(Dictionary<string,object> prepared,Dictionary<string,object> packet,IConditionalProtectionOwner owner=null)
         {
-            Evidence.CheckIdentity(prepared,owner==null?"runtime-protection-prepared:v1":"policy-qualified-runtime-protection-prepared:v2");
-            Evidence.CheckIdentity(packet,owner==null?"runtime-protection-packet:v1":"policy-qualified-runtime-protection-control:v2");
-            Require(S(prepared,"contract_version")== (owner==null?"runtime-protection-prepared-v1":"policy-qualified-runtime-protection-prepared-v2")&&S(prepared,"state")=="PREPARED", "Prepared contract/state mismatch");
+            Evidence.CheckIdentity(prepared,owner==null?"runtime-protection-prepared:v1":ConditionalKind("prepared",O(prepared,"attempt"),true));
+            Evidence.CheckIdentity(packet,owner==null?"runtime-protection-packet:v1":ConditionalKind("control",O(prepared,"attempt"),true));
+            Require(S(prepared,"contract_version")== (owner==null?"runtime-protection-prepared-v1":ConditionalKind("prepared",O(prepared,"attempt"),false))&&S(prepared,"state")=="PREPARED", "Prepared contract/state mismatch");
             var attempt=O(prepared,"attempt");var paths=ValidateAttempt(attempt,owner);var inputs=O(attempt,"inputs");
-            Require(S(packet,"contract_version")== (owner==null?"runtime-protection-packet-v1":"policy-qualified-runtime-protection-control-v2")&&S(packet,"prepared_identity")==S(prepared,"identity"),"Packet/preparation lineage mismatch");
+            Require(S(packet,"contract_version")== (owner==null?"runtime-protection-packet-v1":ConditionalKind("control",O(prepared,"attempt"),false))&&S(packet,"prepared_identity")==S(prepared,"identity"),"Packet/preparation lineage mismatch");
             Require(S(packet,"attempt_identity")==S(attempt,"attempt_identity")&&Evidence.Canonical(O(packet,"paths"))==Evidence.Canonical(paths),"Packet attempt/root/anchor substitution");
             foreach(string key in new string[]{"materialization_identity","runtime_manifest_identity","app_manifest_identity","baseline_identity","protection_contract_version"})
                 Require(S(packet,key)==S(prepared,key),"Packet runtime/app/baseline/protection version mismatch");
@@ -1825,10 +1884,10 @@ namespace TradingAgents.RuntimeProtection
                 {
                     protection=tree.Protect(baseline);
                     var launchBody=new Dictionary<string,object> {
-                        {"contract_version",owner==null?"runtime-protection-launch-v1":"policy-qualified-runtime-protection-launch-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
+                        {"contract_version",owner==null?"runtime-protection-launch-v1":ConditionalKind("launch",O(prepared,"attempt"),false)},{"attempt_identity",S(attempt,"attempt_identity")},
                         {"packet_identity",S(packet,"identity")},{"state","LAUNCHING"} };
                     if(owner!=null) { launchBody.Add("acceptance",inputs["acceptance"]);launchBody.Add("owner_binding",owner.Binding);launchBody.Add("execution_authorized",false); }
-                    var launch=Evidence.Seal(owner==null?"runtime-protection-launch:v1":"policy-qualified-runtime-protection-launch:v2",launchBody);
+                    var launch=Evidence.Seal(owner==null?"runtime-protection-launch:v1":ConditionalKind("launch",O(prepared,"attempt"),true),launchBody);
                     Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"launching.json"),launch);
                     Require(Native.SetDllDirectoryW(Path.Combine(S(paths,"private_runtime_root"),"base")),"Private native DLL search directory failed");dllChanged=true;
                     int phases=operation=="guard_then_live"?2:1;
@@ -1889,12 +1948,12 @@ namespace TradingAgents.RuntimeProtection
                 // evidence. Only the successful claimant can complete this attempt.
                 if(!tree.ConsumedByThisOwner)throw new AggregateException("Protection admission failed; this owner did not consume the attempt",failures);
                 var receiptBody=new Dictionary<string,object> {
-                    {"contract_version",owner==null?"runtime-protection-completion-v1":"policy-qualified-runtime-protection-completion-v2"},{"attempt_identity",S(attempt,"attempt_identity")},
+                    {"contract_version",owner==null?"runtime-protection-completion-v1":ConditionalKind("completion",O(prepared,"attempt"),false)},{"attempt_identity",S(attempt,"attempt_identity")},
                     {"prepared_identity",S(prepared,"identity")},{"packet_identity",S(packet,"identity")},
                     {"state",restored?"COMPLETED_RESTORED":"INCOMPLETE_RETAINED"},{"child_launches",starts},
                     {"exact_baseline_restored",restored},{"failure_count",failures.Count},{"reusable",false} };
                 if(owner!=null) { receiptBody.Add("acceptance",inputs["acceptance"]);receiptBody.Add("owner_binding",owner.Binding);receiptBody.Add("execution_authorized",false); }
-                var receipt=Evidence.Seal(owner==null?"runtime-protection-completion:v1":"policy-qualified-runtime-protection-completion:v2",receiptBody);
+                var receipt=Evidence.Seal(owner==null?"runtime-protection-completion:v1":ConditionalKind("completion",O(prepared,"attempt"),true),receiptBody);
                 Evidence.WriteNew(Path.Combine(S(paths,"evidence_root"),"completion.json"),receipt);
                 if(failures.Count>0)throw new AggregateException("Protection attempt failed",failures);
                 return receipt;

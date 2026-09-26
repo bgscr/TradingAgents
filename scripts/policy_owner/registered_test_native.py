@@ -11,11 +11,12 @@ from scripts.policy_owner.registered_test_flow import write_new
 from tradingagents.policy_qualified_contract import canonical_bytes, content_identity
 from tradingagents.policy_qualified_native import (
     ConditionalNativeCompletion,
+    CoverageNativeCompletion,
     InertFixtureLaunch,
     NativeOwnerBinding,
     NativePayloadProvenance,
-    PreparedConditionalProtectionAttempt,
     build_conditional_inert_control,
+    parse_prepared_conditional,
     seal_conditional_materialization_plan,
 )
 from tradingagents.runtime_protection import (
@@ -27,6 +28,7 @@ from tradingagents.runtime_protection import (
 )
 from tradingagents.runtime_protection_handoff import (
     ConditionalHandoffContract,
+    CoverageHandoffContract,
     build_conditional_guard_control,
 )
 
@@ -135,6 +137,7 @@ def exercise_native(
     """No fabricated preparation identity or replacement native host is used."""
     from tradingagents.qualified_routing_composition import (
         ConditionalProductionQualifiedRoutingSourceBinding,
+        CoverageProductionQualifiedRoutingSourceBinding,
         seal_production_qualified_routing_preparation,
     )
 
@@ -142,8 +145,18 @@ def exercise_native(
     artifact_root.mkdir()
     verifier = case.verifier
     binding = NativeOwnerBinding.read(owner_binding)
-    source = ConditionalProductionQualifiedRoutingSourceBinding(
-        contract_version="production-policy-qualified-routing-source-binding-v1",
+    from tradingagents.policy_coverage_models import CoverageEnvelope
+
+    coverage = isinstance(envelope, CoverageEnvelope)
+    source_model = (
+        CoverageProductionQualifiedRoutingSourceBinding
+        if coverage
+        else ConditionalProductionQualifiedRoutingSourceBinding
+    )
+    source = source_model(
+        contract_version="production-policy-qualified-routing-source-binding-v2"
+        if coverage
+        else "production-policy-qualified-routing-source-binding-v1",
         commit_id=case.candidate.commit,
         tree_hash=case.candidate.tree,
         production_inventory_identity="production-python-modules:v1:sha256:" + "d" * 64,
@@ -180,17 +193,34 @@ def exercise_native(
             "namespace": namespace["identity"],
         },
     )
-    collection = case.owner.save(
-        "synthetic-native-payload-collection:v1",
-        {
-            "label": "ACTUAL DEPLOYED BYTES USED AS TEST PAYLOAD; SYNTHETIC QUALIFICATION ANCESTRY ONLY",
-            "registered_owner": binding.model_dump(mode="json"),
-            "runtime": manifests["runtime"],
-            "app": manifests["app"],
-            "source_locations": payload["locations"],
-            "execution_authorized": False,
-        },
-    )
+    collection_body = {
+        "label": "ACTUAL DEPLOYED BYTES USED AS TEST PAYLOAD; SYNTHETIC QUALIFICATION ANCESTRY ONLY",
+        "registered_owner": binding.model_dump(mode="json"),
+        "runtime": manifests["runtime"],
+        "app": manifests["app"],
+        "source_locations": payload["locations"],
+        "execution_authorized": False,
+    }
+    if coverage:
+        # Retain the complete labelled collection and its inner canonical ID,
+        # but authenticate large collection bytes through the existing opaque
+        # artifact descriptor rather than putting the inventory in the journal.
+        collection_raw = (
+            canonical_bytes(
+                {
+                    **collection_body,
+                    "identity": content_identity(
+                        "synthetic-native-payload-collection:v1", collection_body
+                    ),
+                }
+            )
+            + b"\n"
+        )
+        collection = case.owner.store_raw(
+            collection_raw, "policy-evidence-bytes:v1:sha256:" + sha256(collection_raw).hexdigest()
+        )
+    else:
+        collection = case.owner.save("synthetic-native-payload-collection:v1", collection_body)
     provenance = NativePayloadProvenance.seal(
         contract_version="policy-qualified-native-payload-provenance-v1",
         candidate=case.candidate,
@@ -279,8 +309,8 @@ def exercise_native(
             python_version=payload["python_version"],
             credential_bindings=[],
         )
-        prepared = PreparedConditionalProtectionAttempt.model_validate_json(
-            canonical_bytes(native_call("prepare", plan, label=operation + "-prepare"))
+        prepared = parse_prepared_conditional(
+            native_call("prepare", plan, label=operation + "-prepare")
         )
         arguments = [
             "-I",
@@ -295,8 +325,11 @@ def exercise_native(
             )
         else:
             cninfo = blueprint.factory_contract.cninfo_binding
-            gate = ConditionalHandoffContract(
-                contract_version="policy-qualified-runtime-protection-handoff-v2",
+            gate_model = CoverageHandoffContract if coverage else ConditionalHandoffContract
+            gate = gate_model(
+                contract_version="policy-qualified-runtime-protection-handoff-v3"
+                if coverage
+                else "policy-qualified-runtime-protection-handoff-v2",
                 preparation_lineage_identity=lineage_identity,
                 plan_version="1.5",
                 plan_signature=preparation.plan_signature,
@@ -358,7 +391,8 @@ def exercise_native(
                 ),
             )
         )
-        completion = ConditionalNativeCompletion.read(
+        completion_model = CoverageNativeCompletion if coverage else ConditionalNativeCompletion
+        completion = completion_model.read(
             native_call(
                 "run-inert",
                 prepared.model_dump(mode="json"),

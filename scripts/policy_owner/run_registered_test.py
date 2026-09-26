@@ -272,10 +272,11 @@ def configure_deployment(path, expected_sha, *, staging_only=False):
 
 def require_current_test_proposal(proposal, *, at=None):
     """Reject an obsolete unsigned action before any owner call or start marker."""
+    from tradingagents.policy_coverage_models import read_model
     from tradingagents.policy_owner_contract import PolicyDecisionProposal
     from tradingagents.policy_qualified_contract import utc
 
-    value = PolicyDecisionProposal.read(proposal)
+    value = read_model(PolicyDecisionProposal, proposal)
     checked = datetime.now(timezone.utc) if at is None else at
     if checked.tzinfo is None or checked.utcoffset() != timezone.utc.utcoffset(checked):
         raise ValueError("the TEST action clock must be explicit UTC")
@@ -466,6 +467,7 @@ try {
     foreach ($row in $package.file_pins) {$null=Read-HeldTestFile $row.path $row.sha256 ([long]$row.byte_length)}
     Write-Host 'Starting one TEST flow. Review each exact native document and authenticate yourself with Windows Hello. No provisioning, enrollment, ISO, Ticket-07 or live operation.'
     $runArguments=@('-I','-B','-S',$runner,'--run','--output',$outputRoot)
+    if ($package.coverage_v2 -eq $true) {$runArguments+=@('--coverage-v2')}
     if ($null -ne $deploymentPath) {$runArguments+=@('--deployment',$deploymentPath,'--deployment-sha256',$deploymentSha256)}
     & $python @runArguments
     if ($LASTEXITCODE -ne 0) {throw ('TEST flow stopped with exit '+$LASTEXITCODE+'. Do not rerun this action; preserve its evidence.')}
@@ -888,6 +890,8 @@ def prepare_or_run(args):
                 "the genuine human frontend requires the issuing operator's elevated session"
             )
         package = strict_json((root / "TEST-package.json").read_bytes())
+        if bool(package.get("coverage_v2", False)) != args.coverage_v2:
+            raise ValueError("TEST action coverage version differs from reviewed package")
         if DEPLOYMENT_PATH is not None:
             if (
                 package.get("deployment_sha256") != DEPLOYMENT_SHA256
@@ -952,6 +956,7 @@ def prepare_or_run(args):
             authenticate=client.authenticate,
             verifier=RetainedRegisteredVerifier(INSTANCE),
             artifact_reader=read_retained_artifact if args.prepare else None,
+            coverage_v2=args.coverage_v2,
         )
         if args.prepare:
             proposal = case.proposal()
@@ -1011,6 +1016,7 @@ def prepare_or_run(args):
                 "file_pins": [pin(path) for path in sorted(pins)],
                 "test_decision_identity": proposal.identity,
                 "test_policy_identity": case.policy.acceptance_policy_identity,
+                "coverage_v2": args.coverage_v2,
                 "operational": False,
                 "execution_authorized": False,
                 "no_automatic_retry": True,
@@ -1266,6 +1272,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--deployment-sha256", required=True)
+    parser.add_argument(
+        "--coverage-v2",
+        action="store_true",
+        help="Explicit versioned generated coverage TEST flow; requires its matching setup corpus",
+    )
     parser.add_argument("--namespace-request", type=Path)
     parser.add_argument("--namespace-request-sha256")
     args = parser.parse_args()

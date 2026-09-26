@@ -116,6 +116,7 @@ def bootstrap() -> tuple[Path, dict]:
 def dispatch(request: dict) -> dict:
     from dataclasses import asdict
 
+    from tradingagents.policy_coverage_models import read_model
     from tradingagents.policy_qualified_contract import (
         AcceptancePolicy,
         BoundEvidence,
@@ -124,7 +125,6 @@ def dispatch(request: dict) -> dict:
         EvidenceRef,
         OperatorApproval,
         PolicyQualifiedExecutionResult,
-        canonical_bytes,
         content_identity,
     )
     from tradingagents.policy_qualified_results import PolicyQualifiedVerifier, reference
@@ -221,7 +221,7 @@ def dispatch(request: dict) -> dict:
             InertFixtureLaunch,
             NativeOwnerBinding,
             NativePayloadProvenance,
-            PreparedConditionalProtectionAttempt,
+            parse_prepared_conditional,
             seal_conditional_materialization_plan,
         )
 
@@ -281,18 +281,16 @@ def dispatch(request: dict) -> dict:
                 raise ValueError(
                     "native materialization has an altered field, owner or complete identity"
                 )
-            from tradingagents.runtime_protection import ConditionalProtectionAttempt
+            from tradingagents.runtime_protection import validate_conditional_attempt
 
-            attempt = ConditionalProtectionAttempt.model_validate_json(
-                canonical_bytes(materialization["attempt"])
+            attempt = validate_conditional_attempt(
+                materialization["attempt"], policy_verifier=verifier
             )
             envelope = attempt.inputs.acceptance
             extra["materialization_identity"] = materialization["identity"]
         elif operation == "verify-inert-launch":
             fields("prepared", "control", "native_consumer_source_identity")
-            prepared = PreparedConditionalProtectionAttempt.model_validate_json(
-                canonical_bytes(payload["prepared"])
-            )
+            prepared = parse_prepared_conditional(payload["prepared"])
             control = payload["control"]
             if owner.anchor["operational"] or prepared.owner_binding != binding:
                 raise ValueError(
@@ -339,12 +337,16 @@ def dispatch(request: dict) -> dict:
             )
         else:
             fields("envelope")
-            envelope = verifier.verify_downstream(DownstreamEnvelope.read(payload["envelope"]))
+            envelope = verifier.verify_downstream(
+                read_model(DownstreamEnvelope, payload["envelope"])
+            )
         if native:
             ancestry = NativePayloadProvenance.read(
                 owner._registration("native-payload", attempt.inputs.preparation_lineage_identity)
             )
-            result = PolicyQualifiedExecutionResult.read(owner.read_artifact(envelope.core.result))
+            result = read_model(
+                PolicyQualifiedExecutionResult, owner.read_artifact(envelope.core.result)
+            )
             if (
                 ancestry.candidate != envelope.core.candidate
                 or ancestry.qualified_source != result.execution.source
@@ -373,7 +375,11 @@ def dispatch(request: dict) -> dict:
             envelope.core.lineage, reference(envelope.receipt, "receipt_identity")
         )
         response = {
-            "contract_version": "policy-owner-native-conditional-verification-v1",
+            "contract_version": (
+                "policy-owner-native-conditional-verification-v2"
+                if envelope.contract_version == "policy-qualified-downstream-envelope-v2"
+                else "policy-owner-native-conditional-verification-v1"
+            ),
             "instance": owner.anchor["instance"],
             "storage_binding_identity": owner.anchor["storage_binding_identity"],
             "envelope": envelope.model_dump(mode="json"),
@@ -410,8 +416,8 @@ def dispatch(request: dict) -> dict:
         return {
             "authority": encode_resolution(
                 verifier.eligibility(
-                    AcceptancePolicy.read(payload["policy"]),
-                    OperatorApproval.read(payload["approval"]),
+                    read_model(AcceptancePolicy, payload["policy"]),
+                    read_model(OperatorApproval, payload["approval"]),
                 )
             )
         }
@@ -425,7 +431,7 @@ def dispatch(request: dict) -> dict:
         return {"event_identity": verifier.begin_stage(**payload), "execution_authorized": False}
     if operation == "complete-stage":
         fields("policy", "approval", "claim", "stage", "evidence")
-        payload["evidence"] = BoundEvidence.read(payload["evidence"])
+        payload["evidence"] = read_model(BoundEvidence, payload["evidence"])
         return {"event_identity": verifier.complete_stage(**payload), "execution_authorized": False}
     if operation == "finalize":
         fields("policy", "approval", "claim", "execution")

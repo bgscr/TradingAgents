@@ -65,11 +65,96 @@ def new_evidence_output(output: Path):
         if output.exists():
             raise FileExistsError("evidence output already exists")
         partial = output.with_name(output.name + ".partial")
-        with partial.open("xb") as stream:
+        # Keep the exact created object open through publication. No closing and
+        # reopening a checked path, nor weakening the held ancestor handles.
+        import msvcrt
+
+        api, Info = _file_api()
+        handle = api.CreateFileW(str(partial), 0xC0010000, 1, None, 1, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+        except BaseException:
+            api.CloseHandle(handle)
+            raise
+        try:
+            stream = os.fdopen(fd, "w+b")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
+            info = Info()
+            if not api.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if info.attributes & (0x400 | 16) or info.links != 1:
+                raise ValueError("created publication object is aliased or not a regular file")
+            original = _ordinary(partial, False)
             yield stream
             stream.flush()
             os.fsync(stream.fileno())
-        partial.rename(output)
+            _rename_same_parent(handle, output.name)
+            observed = _ordinary(output, False)
+            if (
+                observed.st_ino != ((info.index_high << 32) | info.index_low)
+                or observed.st_dev != original.st_dev
+            ):
+                raise ValueError("published evidence does not name the held complete object")
+
+
+def _rename_same_parent(handle, name: str) -> None:
+    """NT basename-only rename, relative to the held source's existing parent.
+
+    FILE_RENAME_INFORMATION differs from the Win32 FILE_RENAME_INFO wrapper:
+    a basename with NULL RootDirectory names the existing source parent, not CWD.
+    ReplaceIfExists is false. No target-directory reopen or sharing relaxation.
+    https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    """
+    from ctypes import wintypes
+
+    if (
+        not name
+        or name in {".", ".."}
+        or name.endswith((".", " "))
+        or any(c in name for c in "\\/:\0")
+        or any(ord(c) < 32 for c in name)
+    ):
+        raise ValueError("publication rename requires one unambiguous basename")
+    encoded = name.encode("utf-16-le")
+    if len(encoded) > 65532:
+        raise ValueError("publication basename exceeds the finite native name bound")
+
+    class Rename(ctypes.Structure):
+        _fields_ = [
+            ("replace", wintypes.DWORD),
+            ("root", wintypes.HANDLE),
+            ("length", wintypes.ULONG),
+            ("name", wintypes.WCHAR * (len(encoded) // 2 + 1)),
+        ]
+
+    class Status(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    value = Rename()
+    value.root = None
+    value.length = len(encoded)
+    value.name = name
+    status = Status()
+    native = ctypes.WinDLL("ntdll", use_last_error=True)
+    rename = native.NtSetInformationFile
+    rename.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(Status),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.c_int,
+    ]
+    rename.restype = wintypes.LONG
+    code = rename(handle, ctypes.byref(status), ctypes.byref(value), ctypes.sizeof(value), 10)
+    if code != 0:
+        native.RtlNtStatusToDosError.argtypes = [wintypes.LONG]
+        native.RtlNtStatusToDosError.restype = wintypes.ULONG
+        raise ctypes.WinError(native.RtlNtStatusToDosError(code))
 
 
 def _ordinary(path: Path, directory: bool, *, pinned_tool: bool = False):
@@ -143,8 +228,8 @@ def _held(path: Path, directory: bool, *, stable_metadata: bool = True, pinned_t
     before = _ordinary(path, directory, pinned_tool=pinned_tool)
     handle = api.CreateFileW(
         str(path),
-        0x20080 if directory else 0x80000000,
-        3 if directory else 1,
+        0x80000000,
+        1,
         None,
         3,
         0x02200000,

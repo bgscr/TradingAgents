@@ -19,6 +19,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel
 
+from tradingagents.policy_coverage_models import read_model
+from tradingagents.policy_coverage_verification import coverage_operation, reset_coverage_proof
 from tradingagents.policy_qualification_lifecycle import LineageLedger
 from tradingagents.policy_qualified_contract import (
     AcceptanceBinding,
@@ -310,7 +312,9 @@ class PolicyQualifiedVerifier:
         self, ref: EvidenceRef, model: type[BaseModel], field: str = "identity"
     ) -> BaseModel:
         raw = self._bytes(ref)
-        parsed = model.model_validate_json(canonical_bytes(strict_json(raw)))
+        from tradingagents.policy_coverage_models import model_for
+
+        parsed = model_for(model, raw).model_validate_json(canonical_bytes(strict_json(raw)))
         if getattr(parsed, field) != ref.identity:
             raise ValueError("artifact semantic identity is not its bound identity")
         return parsed
@@ -338,10 +342,13 @@ class PolicyQualifiedVerifier:
     def _authority(
         self, policy: AcceptancePolicy, approval: OperatorApproval
     ) -> AuthorityResolution:
+        from tradingagents.policy_coverage_models import require_policy_pair
+
+        require_policy_pair(policy, approval)
         resolved = self.owner.resolve(approval.approval_identity)
         if not isinstance(resolved, AuthorityResolution):
             raise ValueError("unknown authentication state")
-        authenticated = OperatorApproval.read(resolved.approval_bytes)
+        authenticated = read_model(OperatorApproval, resolved.approval_bytes)
         if authenticated != approval or not resolved.state_reference:
             raise ValueError("unapproved, revoked, unauthenticated or unresolved decision")
         if (
@@ -618,7 +625,7 @@ class PolicyQualifiedVerifier:
         stage: str,
         bridge: bool = False,
     ) -> None:
-        comparison = RawComparison.read(comparison)
+        comparison = read_model(RawComparison, comparison)
         approved, authority = self._claim_authority(policy, claim)
         if not bridge and not isinstance(claim, LineageClaim):
             raise ValueError("new stage comparisons require a consumed lineage")
@@ -661,6 +668,15 @@ class PolicyQualifiedVerifier:
             )
             if not earliest <= observed <= latest:
                 raise ValueError("new observation lies outside its approval/lineage window")
+        from tradingagents.policy_coverage_models import CoveragePolicy, CoverageRawComparison
+
+        if isinstance(policy, CoveragePolicy):
+            from tradingagents.policy_coverage_verification import verify_coverage_comparison
+
+            verify_coverage_comparison(self, comparison, policy=policy, claim=claim, bridge=bridge)
+            return
+        if isinstance(comparison, CoverageRawComparison):
+            raise ValueError("old policy cannot adopt coverage comparison semantics")
         a = self._saved(comparison.before, "crash-protection-historical-inventory:v1")
         b = self._saved(comparison.after, "crash-protection-historical-inventory:v1")
         if (
@@ -673,7 +689,11 @@ class PolicyQualifiedVerifier:
             raise ValueError("new raw discrepancy; historical policy cannot waive it")
 
     def eligibility(self, policy: object, approval: object) -> AuthorityResolution:
-        policy, approval = AcceptancePolicy.read(policy), OperatorApproval.read(approval)
+        reset_coverage_proof(self)
+        policy, approval = (
+            read_model(AcceptancePolicy, policy),
+            read_model(OperatorApproval, approval),
+        )
         self._authority(policy, approval)
         from tradingagents.windows_sandbox_acceptance import (
             TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
@@ -689,19 +709,20 @@ class PolicyQualifiedVerifier:
         self._historical(policy)
         return self._authority(policy, approval)
 
+    @coverage_operation
     def claim(
         self, policy: object, approval: object, allocation: object, *, new_start_bridge: object
     ) -> LineageClaim:
         policy, approval, allocation = (
-            AcceptancePolicy.read(policy),
-            OperatorApproval.read(approval),
+            read_model(AcceptancePolicy, policy),
+            read_model(OperatorApproval, approval),
             LineageAllocation.read(allocation),
         )
         resolved = self.eligibility(policy, approval)
         self._allocation_binding(policy, approval, allocation)
         self._budget_fit(policy, approval, resolved, 0)
         self._comparison(
-            RawComparison.read(new_start_bridge),
+            read_model(RawComparison, new_start_bridge),
             policy=policy,
             claim=allocation,
             stage="ISO02",
@@ -717,8 +738,17 @@ class PolicyQualifiedVerifier:
             raise ValueError("claim clock/window expired")
         self._budget_fit(policy, approval, resolved, 0)
         payload = allocation.model_dump(mode="json")
-        payload["contract_version"] = "historical-state-qualification-lineage-v1"
-        claim = LineageClaim.seal(
+        from tradingagents.policy_coverage_models import CoverageClaim, CoveragePolicy
+
+        claim_model = CoverageClaim if isinstance(policy, CoveragePolicy) else LineageClaim
+        payload["contract_version"] = (
+            "historical-state-qualification-lineage-v2"
+            if isinstance(policy, CoveragePolicy)
+            else "historical-state-qualification-lineage-v1"
+        )
+        if isinstance(policy, CoveragePolicy):
+            payload["coverage"] = read_model(RawComparison, new_start_bridge).coverage
+        claim = claim_model.seal(
             **payload,
             claimed_at_utc=resolved.now_utc,
             state="CLAIMED_ATTEMPT_CONSUMED",
@@ -748,6 +778,10 @@ class PolicyQualifiedVerifier:
     def _claim_binding(
         self, policy: AcceptancePolicy, approval: OperatorApproval, claim: LineageClaim
     ) -> None:
+        from tradingagents.policy_coverage_models import CoverageClaim, CoveragePolicy
+
+        if isinstance(policy, CoveragePolicy) != isinstance(claim, CoverageClaim):
+            raise ValueError("claim does not bind the policy's coverage contract version")
         self._allocation_binding(policy, approval, claim.to_allocation())
         if (
             not utc(approval.effective_utc)
@@ -762,11 +796,12 @@ class PolicyQualifiedVerifier:
         response = self.owner.resolve(claim.approval_identity)
         if not isinstance(response, AuthorityResolution):
             raise ValueError("unknown current authority")
-        approved = OperatorApproval.read(response.approval_bytes)
+        approved = read_model(OperatorApproval, response.approval_bytes)
         if approved.approval_identity != claim.approval_identity:
             raise ValueError("current authority approval binding mismatch")
         return approved, self._authority(policy, approved)
 
+    @coverage_operation
     def begin_stage(
         self,
         policy: object,
@@ -777,9 +812,9 @@ class PolicyQualifiedVerifier:
         new_start_bridge: object,
     ) -> str:
         policy, approval, claim = (
-            AcceptancePolicy.read(policy),
-            OperatorApproval.read(approval),
-            LineageClaim.read(claim),
+            read_model(AcceptancePolicy, policy),
+            read_model(OperatorApproval, approval),
+            read_model(LineageClaim, claim),
         )
         try:
             resolved = self.eligibility(policy, approval)
@@ -788,7 +823,7 @@ class PolicyQualifiedVerifier:
             self._budget_fit(policy, approval, resolved, index)
             self._revalidate_completed(policy, claim)
             self._comparison(
-                RawComparison.read(new_start_bridge),
+                read_model(RawComparison, new_start_bridge),
                 policy=policy,
                 claim=claim,
                 stage="ISO02",
@@ -802,6 +837,7 @@ class PolicyQualifiedVerifier:
             self._fail_existing(claim)
             raise
 
+    @coverage_operation
     def complete_stage(
         self,
         policy: object,
@@ -812,9 +848,9 @@ class PolicyQualifiedVerifier:
         evidence: BoundEvidence,
     ) -> str:
         policy, approval, claim = (
-            AcceptancePolicy.read(policy),
-            OperatorApproval.read(approval),
-            LineageClaim.read(claim),
+            read_model(AcceptancePolicy, policy),
+            read_model(OperatorApproval, approval),
+            read_model(LineageClaim, claim),
         )
         try:
             resolved = self.eligibility(policy, approval)
@@ -822,7 +858,7 @@ class PolicyQualifiedVerifier:
             index = policy.lineage_plan.stage_slots.index(stage)
             self._budget_fit(policy, approval, resolved, index + 1)
             validated = self._revalidate_completed(policy, claim)
-            node = BoundEvidence.read(evidence)
+            node = read_model(BoundEvidence, evidence)
             if (
                 node.binding != acceptance_binding(policy, approval, claim)
                 or node.candidate != claim.candidate
@@ -878,11 +914,11 @@ class PolicyQualifiedVerifier:
 
     def _registered_stage(self, node: BoundEvidence, claim: LineageClaim) -> None:
         raw = self.owner.executed_stage(claim.lineage_identity, node.kind)
-        if BoundEvidence.read(raw) != node or BytePin.of(raw) != reference(node).pin:
+        if read_model(BoundEvidence, raw) != node or BytePin.of(raw) != reference(node).pin:
             raise ValueError("stage is not the trusted coordinator's immutable execution record")
 
     def _owned_node(self, kind: str, claim: LineageClaim) -> BoundEvidence:
-        node = BoundEvidence.read(self.owner.executed_stage(claim.lineage_identity, kind))
+        node = read_model(BoundEvidence, self.owner.executed_stage(claim.lineage_identity, kind))
         if node.kind != kind:
             raise ValueError("coordinator stage record has the wrong kind")
         return node
@@ -988,7 +1024,9 @@ class PolicyQualifiedVerifier:
             kind = {"REVIEWS": "REVIEW_SPEC", "CLOSURE_HANDOFF": "PRE_RESULT_CLOSURE"}.get(
                 stage, stage
             )
-            node = BoundEvidence.read(self.owner.executed_stage(claim.lineage_identity, kind))
+            node = read_model(
+                BoundEvidence, self.owner.executed_stage(claim.lineage_identity, kind)
+            )
             if reference(node) != EvidenceRef.read(event["payload"]):
                 raise ValueError("completed stage evidence changed after consumption")
             self._stage_payload(node, policy=policy, claim=claim, _validated=validated)
@@ -1020,6 +1058,9 @@ class PolicyQualifiedVerifier:
         )
 
         validated = set() if _validated is None else _validated
+        from tradingagents.policy_coverage_verification import require_record_coverage
+
+        require_record_coverage(policy, claim, node)
         if node.identity in validated:
             return
         self._claim_authority(policy, claim)
@@ -1171,14 +1212,22 @@ class PolicyQualifiedVerifier:
                     raise ValueError("mandatory ISO04 guest/process/export predicate failed")
             comparison = self._model(node.artifacts[-1], RawComparison)
             self._comparison(comparison, policy=policy, claim=claim, stage=node.kind)
-            original = self._saved(
-                policy.scope.after.artifact, "crash-protection-historical-inventory:v1"
-            )
-            current = self._saved(comparison.before, "crash-protection-historical-inventory:v1")
-            if self._roots(original) != self._roots(current):
-                raise ValueError("new stage baseline differs from retained history")
+            from tradingagents.policy_coverage_models import CoveragePolicy
+
+            if isinstance(policy, CoveragePolicy):
+                from tradingagents.policy_coverage_verification import require_current_baseline
+
+                require_current_baseline(self, policy, claim, comparison.before)
+            else:
+                original = self._saved(
+                    policy.scope.after.artifact, "crash-protection-historical-inventory:v1"
+                )
+                current = self._saved(comparison.before, "crash-protection-historical-inventory:v1")
+                if self._roots(original) != self._roots(current):
+                    raise ValueError("new stage baseline differs from retained history")
         elif node.kind == "QCF17":
             baseline = self._model(node.artifacts[0], QualifiedBaseline)
+            require_record_coverage(policy, claim, baseline)
             if (
                 baseline.binding != node.binding
                 or baseline.candidate != claim.candidate
@@ -1202,6 +1251,7 @@ class PolicyQualifiedVerifier:
         else:
             for ref in node.artifacts:
                 review = self._model(ref, IndependentReviewRecord)
+                require_record_coverage(policy, claim, review)
                 if (
                     review.binding != node.binding
                     or review.candidate != claim.candidate
@@ -1212,8 +1262,9 @@ class PolicyQualifiedVerifier:
                 if review.input_evidence != node.predecessors:
                     raise ValueError("qualification review does not bind all four executed stages")
             if node.kind == "REVIEW_SPEC":
-                standards = BoundEvidence.read(
-                    self.owner.executed_stage(claim.lineage_identity, "REVIEW_STANDARDS")
+                standards = read_model(
+                    BoundEvidence,
+                    self.owner.executed_stage(claim.lineage_identity, "REVIEW_STANDARDS"),
                 )
                 self._stage_payload(standards, policy=policy, claim=claim, _validated=validated)
                 if self.owner.review_principal(
@@ -1272,9 +1323,12 @@ class PolicyQualifiedVerifier:
         )
 
         closure = self._model(node.artifacts[0], PreResultClosureEvidence)
+        from tradingagents.policy_coverage_verification import require_record_coverage
+
+        require_record_coverage(policy, claim, closure)
         kinds = ("ISO02", "ISO03", "QCF17", "ISO04_TICKET06", "REVIEW_STANDARDS", "REVIEW_SPEC")
         earlier = tuple(
-            BoundEvidence.read(self.owner.executed_stage(claim.lineage_identity, kind))
+            read_model(BoundEvidence, self.owner.executed_stage(claim.lineage_identity, kind))
             for kind in kinds
         )
         review_nodes = earlier[-2:]
@@ -1329,14 +1383,21 @@ class PolicyQualifiedVerifier:
                 <= utc(closure.recorded_at_utc)
             ):
                 raise ValueError("post-review raw acquisition is outside the closure window")
-        original = self._saved(
-            policy.scope.after.artifact, "crash-protection-historical-inventory:v1"
-        )
-        current = self._saved(
-            closure.post_review_raw.before, "crash-protection-historical-inventory:v1"
-        )
-        if self._roots(original) != self._roots(current):
-            raise ValueError("post-review raw bridge has an additional discrepancy")
+        from tradingagents.policy_coverage_models import CoveragePolicy
+
+        if isinstance(policy, CoveragePolicy):
+            from tradingagents.policy_coverage_verification import require_current_baseline
+
+            require_current_baseline(self, policy, claim, closure.post_review_raw.before)
+        else:
+            original = self._saved(
+                policy.scope.after.artifact, "crash-protection-historical-inventory:v1"
+            )
+            current = self._saved(
+                closure.post_review_raw.before, "crash-protection-historical-inventory:v1"
+            )
+            if self._roots(original) != self._roots(current):
+                raise ValueError("post-review raw bridge has an additional discrepancy")
         inventory = self._model(closure.evidence_inventory, PreResultEvidenceInventory)
         roots = (
             EvidenceInventoryRoot(role="EVIDENCE", path=claim.pre_result_evidence_root),
@@ -1373,6 +1434,17 @@ class PolicyQualifiedVerifier:
             )
         )
         pins = {entry.pin.sha256: entry.pin for entry in inventory.entries if entry.pin is not None}
+        from tradingagents.policy_coverage_models import CoverageClaim
+
+        if isinstance(claim, CoverageClaim):
+            required.extend(
+                (
+                    claim.coverage.scope,
+                    claim.coverage.measurement,
+                    claim.coverage.baseline,
+                    claim.coverage.assessment,
+                )
+            )
         if any(pins.get(ref.pin.sha256) != ref.pin for ref in required):
             raise ValueError("pre-result evidence inventory omits required predecessor evidence")
         if any(
@@ -1392,7 +1464,10 @@ class PolicyQualifiedVerifier:
     ) -> None:
         from tradingagents.windows_sandbox_qualification import ISO04Ticket06AcceptanceReport
 
-        execution = ExecutionEvidence.read(execution)
+        execution = read_model(ExecutionEvidence, execution)
+        from tradingagents.policy_coverage_verification import require_record_coverage
+
+        require_record_coverage(policy, claim, execution)
         self._graph(
             execution, policy=policy, approval=approval, claim=claim, terminal_at=terminal_at
         )
@@ -1469,6 +1544,9 @@ class PolicyQualifiedVerifier:
                 raise ValueError("review record missing")
             review_ref = node.artifacts[0]
             review = self._model(review_ref, IndependentReviewRecord)
+            from tradingagents.policy_coverage_verification import require_record_coverage
+
+            require_record_coverage(policy, claim, review)
             principal = self.owner.review_principal(review_ref)
             if (
                 review.axis != axis
@@ -1490,13 +1568,14 @@ class PolicyQualifiedVerifier:
         if tuple(EvidenceRef.read(e["payload"]) for e in completed) != expected_refs:
             raise ValueError("execution evidence is not the consumed stage ledger")
 
+    @coverage_operation
     def finalize(
         self, *, policy: object, approval: object, claim: object, execution: object
     ) -> PolicyQualifiedExecutionResult:
         policy, approval, claim = (
-            AcceptancePolicy.read(policy),
-            OperatorApproval.read(approval),
-            LineageClaim.read(claim),
+            read_model(AcceptancePolicy, policy),
+            read_model(OperatorApproval, approval),
+            read_model(LineageClaim, claim),
         )
         try:
             resolved = self.eligibility(policy, approval)
@@ -1504,7 +1583,7 @@ class PolicyQualifiedVerifier:
             self.ledger.require_active(claim)
             self._budget_fit(policy, approval, resolved, len(policy.lineage_plan.stage_slots))
             validation_started = resolved.now_utc
-            execution = ExecutionEvidence.read(execution)
+            execution = read_model(ExecutionEvidence, execution)
             self._execution(
                 execution,
                 policy=policy,
@@ -1523,15 +1602,39 @@ class PolicyQualifiedVerifier:
                 raise ValueError(
                     "terminal verification exceeded its canonical budget or clock regressed"
                 )
-            result = PolicyQualifiedExecutionResult.seal(
-                contract_version="policy-qualified-execution-result-v1",
+            from tradingagents.policy_coverage_models import (
+                CoverageHistory,
+                CoveragePolicy,
+                CoverageResult,
+            )
+
+            coverage_route = isinstance(policy, CoveragePolicy)
+            result_model = CoverageResult if coverage_route else PolicyQualifiedExecutionResult
+            history_model = CoverageHistory if coverage_route else HistoricalClaim
+            extra_history = (
+                {
+                    "contract_version": "policy-coverage-historical-claim-v2",
+                    "coverage": claim.coverage,
+                    "known_recorded_fields": "MATCH",
+                    "current_window": "STRICT_COMPLETE_PRESERVATION_WITHIN_DECLARED_SCOPE",
+                }
+                if coverage_route
+                else {}
+            )
+            result = result_model.seal(
+                contract_version=(
+                    "policy-qualified-execution-result-v2"
+                    if coverage_route
+                    else "policy-qualified-execution-result-v1"
+                ),
                 status="CONDITIONALLY_ACCEPTED_UNRESOLVED_HISTORY",
                 candidate=claim.candidate,
                 binding=acceptance_binding(policy, approval, claim),
                 policy=policy,
                 approval=approval,
                 lineage=claim,
-                history=HistoricalClaim(
+                history=history_model(
+                    **extra_history,
                     historical_claim="UNRESOLVED_RAW_DIFFERENCE",
                     historical_equal=False,
                     historical_cause="UNRESOLVED",
@@ -1553,10 +1656,11 @@ class PolicyQualifiedVerifier:
             self._fail_existing(claim)
             raise
 
+    @coverage_operation
     def verify_result(
         self, raw: bytes
     ) -> tuple[PolicyQualifiedExecutionResult, ResultBindingCore, AuthorityResolution]:
-        result = PolicyQualifiedExecutionResult.read(raw)
+        result = read_model(PolicyQualifiedExecutionResult, raw)
         policy, approval, claim = result.policy, result.approval, result.lineage
         resolved = self.eligibility(policy, approval)
         self._claim_binding(policy, approval, claim)
@@ -1580,8 +1684,16 @@ class PolicyQualifiedVerifier:
             claim=claim,
             terminal_at=result.terminal_at_utc,
         )
-        core = ResultBindingCore(
-            contract_version="policy-qualified-result-binding-core-v1",
+        from tradingagents.policy_coverage_models import CoverageCore, CoverageResult
+
+        coverage_route = isinstance(result, CoverageResult)
+        core_model = CoverageCore if coverage_route else ResultBindingCore
+        core = core_model(
+            contract_version=(
+                "policy-qualified-result-binding-core-v2"
+                if coverage_route
+                else "policy-qualified-result-binding-core-v1"
+            ),
             result=ref,
             binding=binding,
             candidate=claim.candidate,
@@ -1606,8 +1718,16 @@ class PolicyQualifiedVerifier:
         self._budget_fit(
             result.policy, result.approval, resolved, len(result.policy.lineage_plan.stage_slots)
         )
-        receipt = PostResultAcceptanceReceipt.seal(
-            contract_version="policy-qualified-acceptance-receipt-v1",
+        from tradingagents.policy_coverage_models import CoverageReceipt, CoverageResult
+
+        coverage_route = isinstance(result, CoverageResult)
+        receipt_model = CoverageReceipt if coverage_route else PostResultAcceptanceReceipt
+        receipt = receipt_model.seal(
+            contract_version=(
+                "policy-qualified-acceptance-receipt-v2"
+                if coverage_route
+                else "policy-qualified-acceptance-receipt-v1"
+            ),
             core=core,
             pre_result_closure_identity=result.execution.graph[-1].identity,
             authority_state_reference=resolved.state_reference,
@@ -1620,7 +1740,7 @@ class PolicyQualifiedVerifier:
         return receipt
 
     def verify_downstream(self, value: object) -> DownstreamEnvelope:
-        envelope = DownstreamEnvelope.read(value)
+        envelope = read_model(DownstreamEnvelope, value)
         result, core, resolved = self.verify_result(self._bytes(envelope.core.result))
         receipt = envelope.receipt
         self.ledger.require_receipt(result.lineage, reference(receipt, "receipt_identity"))
@@ -1642,7 +1762,7 @@ class PolicyQualifiedVerifier:
 
     def current_source(self, envelope: object) -> tuple[Candidate, str]:
         verified = self.verify_downstream(envelope)
-        result = PolicyQualifiedExecutionResult.read(self._bytes(verified.core.result))
+        result = read_model(PolicyQualifiedExecutionResult, self._bytes(verified.core.result))
         resolved = self._authority(result.policy, result.approval)
         return Candidate.read(
             resolved.current_candidate

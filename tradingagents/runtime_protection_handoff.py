@@ -17,11 +17,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.policy_coverage_models import CoverageEnvelope, read_model
 from tradingagents.policy_qualified_contract import DownstreamEnvelope, strict_json, utc
 from tradingagents.policy_qualified_native import (
     NativeOwnerBinding,
-    PreparedConditionalProtectionAttempt,
     build_conditional_inert_control,
+    conditional_container,
+    parse_prepared_conditional,
 )
 from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 from tradingagents.runtime_protection import (
@@ -78,6 +80,20 @@ class ConditionalHandoffContract(HandoffContract):
         if utc(self.valid_before_exclusive) > utc(self.acceptance.core.expires_utc):
             raise ValueError("conditional handoff exceeds its acceptance window")
         return self
+
+
+class CoverageHandoffContract(ConditionalHandoffContract):
+    contract_version: Literal["policy-qualified-runtime-protection-handoff-v3"]
+    acceptance: CoverageEnvelope
+
+
+def parse_conditional_handoff(value):
+    model = (
+        CoverageHandoffContract
+        if value.get("contract_version") == "policy-qualified-runtime-protection-handoff-v3"
+        else ConditionalHandoffContract
+    )
+    return model.model_validate_json(canonical_bytes(value))
 
 
 def build_guarded_launch_packet(
@@ -233,8 +249,8 @@ def build_conditional_guard_control(
     policy_verifier: PolicyQualifiedVerifier,
 ) -> dict[str, Any]:
     """A forward guard-only control; it cannot produce a real Ticket-07 packet."""
-    value = PreparedConditionalProtectionAttempt.model_validate_json(canonical_bytes(prepared))
-    gate = ConditionalHandoffContract.model_validate_json(canonical_bytes(handoff))
+    value = parse_prepared_conditional(prepared)
+    gate = parse_conditional_handoff(handoff)
     inputs, config = value.attempt.inputs, value.mapped_configuration
     if (
         gate.acceptance != inputs.acceptance
@@ -258,7 +274,9 @@ def build_conditional_guard_control(
     )
     return {
         **control,
-        "identity": evidence_identity("policy-qualified-runtime-protection-control:v2", control),
+        "identity": evidence_identity(
+            conditional_container("control", value.attempt, identity=True), control
+        ),
     }
 
 
@@ -268,21 +286,30 @@ def bind_conditional_guard_receipt(
     *,
     policy_verifier: PolicyQualifiedVerifier | None = None,
 ) -> dict[str, Any]:
-    gate = ConditionalHandoffContract.model_validate_json(canonical_bytes(context["handoff"]))
+    gate = parse_conditional_handoff(context["handoff"])
     if policy_verifier is None:
         from tradingagents.windows_policy_owner import RegisteredWindowsPolicyVerifier
 
         policy_verifier = RegisteredWindowsPolicyVerifier(gate.owner_binding.instance)
     policy_verifier.verify_downstream(gate.acceptance)
     body = {
-        "contract_version": "policy-qualified-runtime-protection-guard-v2",
+        "contract_version": (
+            "policy-qualified-runtime-protection-guard-v3"
+            if isinstance(gate, CoverageHandoffContract)
+            else "policy-qualified-runtime-protection-guard-v2"
+        ),
         **_guard_payload(source_receipt, context, gate),
         "acceptance": gate.acceptance.model_dump(mode="json"),
         "owner_binding": gate.owner_binding.model_dump(mode="json"),
     }
     return {
         **body,
-        "identity": evidence_identity("policy-qualified-runtime-protection-guard:v2", body),
+        "identity": evidence_identity(
+            "policy-qualified-runtime-protection-guard:v3"
+            if isinstance(gate, CoverageHandoffContract)
+            else "policy-qualified-runtime-protection-guard:v2",
+            body,
+        ),
     }
 
 
@@ -345,10 +372,10 @@ def _exchange_with_owner(context: Mapping[str, Any], message: Mapping[str, Any])
         response = stream.readline(65537)
     if len(response) > 65536:
         raise ValueError("owner response exceeds bound")
-    conditional = (
-        context.get("handoff", {}).get("contract_version")
-        == "policy-qualified-runtime-protection-handoff-v2"
-    )
+    conditional = context.get("handoff", {}).get("contract_version") in {
+        "policy-qualified-runtime-protection-handoff-v2",
+        "policy-qualified-runtime-protection-handoff-v3",
+    }
     result = strict_json(response) if conditional else json.loads(response)
     if (
         result.get("attempt_identity") != context["attempt_identity"]
@@ -369,8 +396,8 @@ def _exchange_with_owner(context: Mapping[str, Any], message: Mapping[str, Any])
             "execution_authorized",
         }
         or (
-            DownstreamEnvelope.read(result["acceptance"])
-            != DownstreamEnvelope.read(context["handoff"]["acceptance"])
+            read_model(DownstreamEnvelope, result["acceptance"])
+            != read_model(DownstreamEnvelope, context["handoff"]["acceptance"])
             or NativeOwnerBinding.read(result["owner_binding"])
             != NativeOwnerBinding.read(context["handoff"]["owner_binding"])
             or result["execution_authorized"] is not False
@@ -399,7 +426,10 @@ def run_bound_guard(qualified_guard: Callable[[], Mapping[str, Any]]) -> None:
     bind = (
         bind_conditional_guard_receipt
         if context["handoff"].get("contract_version")
-        == "policy-qualified-runtime-protection-handoff-v2"
+        in {
+            "policy-qualified-runtime-protection-handoff-v2",
+            "policy-qualified-runtime-protection-handoff-v3",
+        }
         else bind_guard_receipt
     )
     _exchange_with_owner(context, bind(qualified_guard(), context))

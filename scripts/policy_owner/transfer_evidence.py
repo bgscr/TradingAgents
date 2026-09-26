@@ -15,11 +15,18 @@ def main() -> int:
     parser.add_argument("--development-dependencies", type=Path)
     parser.add_argument("--fixture-native", type=Path)
     parser.add_argument("--fixture-store", type=Path)
+    parser.add_argument("--coverage-scope", type=Path)
+    parser.add_argument("--coverage-measurement", type=Path)
     sub = parser.add_subparsers(dest="command", required=True)
     stage = sub.add_parser("stage")
     stage.add_argument("--artifact", type=Path, required=True)
     stage.add_argument("--descriptor", type=Path, required=True)
     stage.add_argument("--output", type=Path, required=True)
+    stage.add_argument(
+        "--acquisition-registration",
+        action="store_true",
+        help="Explicit v3 fresh acquisition descriptor; requires a coverage-policy decision at later authentication",
+    )
     export = sub.add_parser("export")
     export.add_argument("--reference", type=Path, required=True)
     export.add_argument("--output", type=Path, required=True)
@@ -49,6 +56,19 @@ def main() -> int:
     from tradingagents.policy_qualified_contract import EvidenceRef, canonical_bytes, strict_json
 
     bound_evidence_process(seconds=3660)
+    coverage_context = None
+    if bool(args.coverage_scope) != bool(args.coverage_measurement):
+        raise ValueError("complete coverage scope and measurement context required")
+    if args.coverage_scope:
+        from tradingagents.policy_coverage_contract import (
+            CoverageMeasurement,
+            HistoricalCoverageScope,
+        )
+
+        coverage_context = (
+            HistoricalCoverageScope.read(args.coverage_scope.read_bytes()),
+            CoverageMeasurement.read(args.coverage_measurement.read_bytes()),
+        )
 
     if fixture:
         if (
@@ -83,7 +103,7 @@ def main() -> int:
         if descriptor.instance != args.instance:
             raise ValueError("descriptor instance mismatch")
         if args.command == "validate":
-            validate_artifact(args.artifact, descriptor)
+            validate_artifact(args.artifact, descriptor, coverage_context=coverage_context)
             print(
                 json.dumps(
                     {
@@ -106,7 +126,14 @@ def main() -> int:
                 log.write(canonical_bytes(record) + b"\n")
                 log.flush()
 
-            result = stage_artifact(call, args.artifact, descriptor, progress=progress)
+            result = stage_artifact(
+                call,
+                args.artifact,
+                descriptor,
+                progress=progress,
+                coverage_context=coverage_context,
+                acquisition_registration=args.acquisition_registration,
+            )
         with args.output.open("xb") as stream:
             stream.write(canonical_bytes(result))
         print(

@@ -34,6 +34,13 @@ internal static class EvidenceTransferContracts
             Evidence.Closed(request,"operation","payload");
             string operation=(string)request["operation"];
             var payload=Evidence.Obj(request["payload"]);
+            if(operation=="fixture-transferred-document")
+            {
+                Evidence.Closed(payload,"document");var document=Evidence.Obj(payload["document"]);
+                var transfers=EvidenceTransfer.TransferredArtifacts(document);
+                foreach(var value in transfers)EvidenceTransfer.RequireComplete(root,args[1],(string)value["transfer_id"],Evidence.Obj(value["descriptor"]),DateTime.UtcNow);
+                Console.Write(Evidence.Canonical(new Dictionary<string,object>{{"complete_descriptors",transfers.Count},{"review_text",EvidenceTransfer.CompleteArtifactReview(root,document)},{"human_authenticated",false},{"execution_authorized",false}}));return 0;
+            }
             if(operation=="fixture-validation-window")
             {
                 Evidence.Closed(payload,"validation","purpose","document_sha256","at_utc");

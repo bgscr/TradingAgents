@@ -248,6 +248,7 @@ class RegisteredTestCase:
         authenticate,
         verifier=None,
         artifact_reader=None,
+        coverage_v2=False,
     ):
         role = RoleProposal.read(role)
         if not re.fullmatch(r"test-[0-9]{8}-[0-9]{3}", instance) or role.instance != instance:
@@ -266,6 +267,7 @@ class RegisteredTestCase:
             raise ValueError("TEST flow requires the actual registered successor adapter")
         self.authenticate = authenticate
         self.owner = SyntheticCatalog()
+        self.coverage_enabled = coverage_v2
         self.claim = None
         self.registry = OriginalAcquisitionRegistry.read(registry)
         for ref in (
@@ -299,6 +301,10 @@ class RegisteredTestCase:
             },
         )
         self.policy = build_test_policy(self.registry, self.owner.read_artifact, self.contract.pin)
+        if coverage_v2:
+            from scripts.policy_owner.registered_coverage_test import configure
+
+            configure(self)
         self.candidate = self.policy.scope.candidate
         self.owner.store(self.policy, "acceptance_policy_identity")
         self.package = ReviewedPolicyPackage.seal(
@@ -309,6 +315,10 @@ class RegisteredTestCase:
         )
 
     def flush(self, additional=()):
+        if self.coverage_enabled and hasattr(self, "approval"):
+            from scripts.policy_owner.registered_coverage_test import flush
+
+            return flush(self, additional)
         entries = self.owner.pending(self.claim) + list(additional)
         if not entries:
             return
@@ -328,8 +338,22 @@ class RegisteredTestCase:
 
     def proposal(self):
         effective = datetime.now(timezone.utc)
-        return PolicyDecisionProposal.seal(
-            contract_version="policy-owner-exact-decision-proposal-v1",
+        from tradingagents.policy_coverage_models import CoverageDecisionProposal
+
+        model = CoverageDecisionProposal if self.coverage_enabled else PolicyDecisionProposal
+        extra = (
+            {
+                "coverage_adoption": "PROSPECTIVE_ONLY_UNKNOWN_HISTORY_RETAINED",
+                "coverage_risk_selection": "ACCEPT_PERSISTENT_HISTORICAL_COVERAGE_UNKNOWN",
+            }
+            if self.coverage_enabled
+            else {}
+        )
+        return model.seal(
+            contract_version="policy-owner-exact-decision-proposal-v2"
+            if self.coverage_enabled
+            else "policy-owner-exact-decision-proposal-v1",
+            **extra,
             instance=self.instance,
             registered_role_identity=self.role.identity,
             storage_binding_identity=self.storage_identity,
@@ -374,8 +398,14 @@ class RegisteredTestCase:
             )
         )
         result = self.authenticate("decide", proposal.model_dump(mode="json"))
-        self.approval = OperatorApproval.read(result["approval"])
+        from tradingagents.policy_coverage_models import read_model
+
+        self.approval = read_model(OperatorApproval, result["approval"])
         self.owner.store(self.approval, "approval_identity", already_registered=True)
+        if self.coverage_enabled:
+            from scripts.policy_owner.registered_coverage_test import verify_bootstrap_artifacts
+
+            verify_bootstrap_artifacts(self)
         self.verifier.eligibility(self.policy, self.approval)
         self.allocation = LineageAllocation.seal(
             contract_version="historical-state-lineage-allocation-v1",
@@ -414,6 +444,10 @@ class RegisteredTestCase:
         self.owner.refresh_time()
 
     def raw_comparison(self, stage, *, bridge=False):
+        if self.coverage_enabled:
+            from scripts.policy_owner.registered_coverage_test import raw_comparison
+
+            return raw_comparison(self, stage, bridge=bridge)
         self.owner.refresh_time()
         refs, names = [], []
         for phase in ("before", "after"):
@@ -465,6 +499,8 @@ class RegisteredTestCase:
         }.get(kind, kind)
 
     def before_node(self, kind):
+        if self.coverage_enabled:
+            self.coverage_stage = self.stage(kind)
         if kind != "REVIEW_SPEC":
             self.verifier.begin_stage(
                 self.policy,
@@ -513,8 +549,13 @@ class RegisteredTestCase:
             policy=self.policy, approval=self.approval, claim=self.claim, execution=execution
         )
         receipt = self.verifier.issue_receipt(result.to_bytes())
-        envelope = DownstreamEnvelope(
-            contract_version="policy-qualified-downstream-envelope-v1",
+        from tradingagents.policy_coverage_models import CoverageEnvelope
+
+        model = CoverageEnvelope if self.coverage_enabled else DownstreamEnvelope
+        envelope = model(
+            contract_version="policy-qualified-downstream-envelope-v2"
+            if self.coverage_enabled
+            else "policy-qualified-downstream-envelope-v1",
             core=receipt.core,
             receipt=receipt,
             execution_authorized=False,

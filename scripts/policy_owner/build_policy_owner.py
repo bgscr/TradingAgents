@@ -23,6 +23,16 @@ CONSUMER_SOURCES = (
     "tradingagents/runtime_protection.py",
     "tradingagents/runtime_protection_handoff.py",
     "tradingagents/policy_qualified_native.py",
+    "tradingagents/policy_coverage_contract.py",
+    "tradingagents/policy_coverage_models.py",
+    "tradingagents/policy_coverage_verification.py",
+    "tradingagents/policy_coverage_native.py",
+    "tradingagents/policy_coverage_schema.py",
+    "tradingagents/policy_evidence_acquisition.py",
+    "tradingagents/policy_evidence_contract.py",
+    "tradingagents/policy_qualified_results.py",
+    "tradingagents/windows_policy_owner.py",
+    "scripts/policy_owner/owner_worker.py",
     "scripts/policy_owner/build_policy_owner.py",
 )
 NATIVE_SOURCES = (
@@ -153,6 +163,7 @@ def build(output: Path, *, fixture: bool = False) -> dict:
     if fixture:
         names.add("tests/fixtures/runtime_protection/PolicyAuthenticationContracts.cs")
         names.add("tests/fixtures/runtime_protection/EvidenceTransferContracts.cs")
+        names.add("tests/fixtures/runtime_protection/CoverageEvidenceContracts.cs")
     snapshot = output / "inputs"
     with hold_build_inputs([source / name for name in sorted(names)]):
         for name in sorted(names):
@@ -212,11 +223,17 @@ def build(output: Path, *, fixture: bool = False) -> dict:
     if fixture:
         targets["PolicyAuthenticationContracts.exe"] = "PolicyAuthenticationContracts"
         targets["EvidenceTransferContracts.exe"] = "EvidenceTransferContracts"
+        targets["CoverageEvidenceContracts.exe"] = "CoverageEvidenceContracts"
     results = {}
     for name, entrypoint in targets.items():
         extra = (
             [str(snapshot / ("tests/fixtures/runtime_protection/" + entrypoint + ".cs"))]
-            if entrypoint in {"PolicyAuthenticationContracts", "EvidenceTransferContracts"}
+            if entrypoint
+            in {
+                "PolicyAuthenticationContracts",
+                "EvidenceTransferContracts",
+                "CoverageEvidenceContracts",
+            }
             else []
         )
         command = [*common, "/main:" + entrypoint, "/out:" + str(output / name), *sources, *extra]

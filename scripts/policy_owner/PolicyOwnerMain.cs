@@ -113,25 +113,7 @@ namespace TradingAgents.PolicyOwner
         }
         static string CompleteArtifactReview(OwnerAnchor anchor,Dictionary<string,object> document)
         {
-            object version;
-            if(!document.TryGetValue("contract_version",out version))return "";
-            var text=new System.Text.StringBuilder();
-            System.Collections.IEnumerable entries=(string)version=="policy-owner-evidence-intake-batch-v2"?(System.Collections.IEnumerable)document["entries"]:new object[]{document};
-            foreach(object item in entries)
-            {
-                var entry=Evidence.Obj(item);
-                if(!entry.TryGetValue("contract_version",out version)||(string)version!="policy-owner-evidence-intake-v2")continue;
-                if((string)entry["kind"]!="artifact-reference")continue;
-                var descriptor=Evidence.Obj(Evidence.Obj(entry["value"])["descriptor"]);
-                var pin=Evidence.Obj(Evidence.Obj(descriptor["artifact"])["pin"]);
-                string digest=(string)pin["sha256"];
-                Evidence.Require(System.Text.RegularExpressions.Regex.IsMatch(digest,"^[0-9a-f]{64}$"),"Invalid complete-artifact pin");
-                text.AppendLine("Review the COMPLETE bound artifact (the descriptor is not a content preview):");
-                text.AppendLine(Path.Combine(anchor.Root,"artifacts",digest+".blob"));
-                text.AppendLine("Bytes: "+Convert.ToString(pin["byte_length"],CultureInfo.InvariantCulture)+" SHA-256: "+digest);
-                text.AppendLine("Staging did not authenticate these bytes. This exact operation registers the displayed descriptor and complete artifact.");
-            }
-            return text.ToString();
+            return EvidenceTransfer.CompleteArtifactReview(anchor.Root,document);
         }
         [STAThread]
         public static int Main(string[] args)

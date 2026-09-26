@@ -55,8 +55,10 @@ namespace TradingAgents.PolicyOwner
             var inputs = Evidence.Obj(attempt["inputs"]); var envelope = Evidence.Obj(inputs["acceptance"]);
             var core = Evidence.Obj(envelope["core"]); var receipt = Evidence.Obj(envelope["receipt"]); var history = Evidence.Obj(core["history"]);
             var candidate = Evidence.Obj(core["candidate"]);
+            bool coverage=(string)attempt["contract_version"]=="policy-qualified-runtime-protection-attempt-v2";
+            if(coverage)Evidence.CoverageEnvelope(envelope);
             DateTimeOffset now = DateTimeOffset.UtcNow, checkedAt = Utc(response["checked_at_utc"]);
-            Evidence.Require((string)response["contract_version"] == "policy-owner-native-conditional-verification-v1"
+            Evidence.Require((string)response["contract_version"] == (coverage?"policy-owner-native-conditional-verification-v2":"policy-owner-native-conditional-verification-v1")
                 && (string)response["instance"] == anchor.Instance && Object.Equals(response["storage_binding_identity"], anchor.Value["storage_binding_identity"])
                 && (string)response["status"] == "CONDITIONALLY_ACCEPTED_UNRESOLVED_HISTORY" && (string)response["authority_state"] == "ACTIVE"
                 && !String.IsNullOrEmpty((string)response["authority_state_reference"])

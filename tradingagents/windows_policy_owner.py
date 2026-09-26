@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
+from tradingagents.policy_coverage_models import read_model
 from tradingagents.policy_owner_contract import (
     OriginalAcquisitionRegistry,
     PolicyDecisionProposal,
@@ -276,6 +277,17 @@ class LocalWindowsPolicyOwner:
         }:
             raise ValueError("original acquisition cannot impersonate a new observation")
         value = dict(self._registration("observation", observation_id))
+        if "artifact_descriptor_identity" in value:
+            descriptor = self._acquisition_descriptor(
+                value.pop("artifact_descriptor_identity"), EvidenceRef.read(value["artifact"])
+            )
+            if (
+                descriptor.acquisition_identity != observation_id
+                or descriptor.stage != value["stage"]
+                or descriptor.phase != value["phase"]
+                or descriptor.lineage_plan_identity != value["lineage_plan_identity"]
+            ):
+                raise ValueError("v3 observation lost its exact authenticated acquisition binding")
         if set(value) != set(ObservationResolution.__dataclass_fields__):
             raise ValueError("new observation registration has an unknown field set")
         value["artifact"] = EvidenceRef.read(value["artifact"])
@@ -322,6 +334,29 @@ class LocalWindowsPolicyOwner:
             raise ValueError("enrolled project role does not match the registered operator")
         return role, record
 
+    def coverage_instance(self) -> str:
+        return self.anchor["instance"]
+
+    def _coverage_objects(self, policy):
+        """Derive the complete scope from immutable originals, never caller paths.
+
+        The small measurement is embedded in the exact decision. Neither scope
+        preparation nor this verification authenticates a decision or observation.
+        """
+        from tradingagents.policy_coverage_contract import artifact_ref, build_scope
+        from tradingagents.policy_coverage_models import CoveragePolicy
+
+        if not isinstance(policy, CoveragePolicy):
+            raise ValueError("coverage requires a distinct policy version")
+        scope = build_scope(
+            self.read_artifact(policy.scope.before.artifact),
+            self.read_artifact(policy.scope.after.artifact),
+            fixture_only=not self.anchor["operational"],
+        )
+        if artifact_ref(scope) != policy.coverage_scope:
+            raise ValueError("policy coverage scope differs from complete immutable originals")
+        return scope, policy.coverage_measurement
+
     def _decision(
         self, approval_identity: str
     ) -> tuple[OperatorApproval, PolicyDecisionProposal, dict]:
@@ -332,11 +367,11 @@ class LocalWindowsPolicyOwner:
             ).fetchone()
         if row is None:
             raise ValueError("exact package decision is missing or unregistered")
-        approval = OperatorApproval.read(row[0])
+        approval = read_model(OperatorApproval, row[0])
         records = [record for record in self.records if record["identity"] == row[1]]
         if len(records) != 1 or records[0]["purpose"] != "EXACT_POLICY_DECISION":
             raise ValueError("approval has no freshly verified Windows authentication record")
-        proposal = PolicyDecisionProposal.read(records[0]["document"])
+        proposal = read_model(PolicyDecisionProposal, records[0]["document"])
         role, _ = self._role()
         if (
             proposal.selection != "APPROVE"
@@ -350,6 +385,9 @@ class LocalWindowsPolicyOwner:
             or proposal.project_contract_adoption != role.project_contract_scope
         ):
             raise ValueError("decision exceeds the enrolled project authority scopes")
+        from tradingagents.policy_coverage_models import require_policy_pair
+
+        require_policy_pair(proposal.policy, approval)
         return approval, proposal, records[0]
 
     def _authority_artifact(self, record: dict, scope: str, body: dict) -> EvidenceRef:
@@ -465,7 +503,7 @@ class LocalWindowsPolicyOwner:
             return
         role, _ = self._role()
         if purpose == "EXACT_POLICY_DECISION":
-            proposal = PolicyDecisionProposal.read(document)
+            proposal = read_model(PolicyDecisionProposal, document)
             if (
                 proposal.instance != self.anchor["instance"]
                 or proposal.registered_role_identity != role.identity
@@ -482,6 +520,10 @@ class LocalWindowsPolicyOwner:
                 )
             self.registry.value.validate_policy(proposal.policy)
             self.read_artifact(proposal.reviewed_package.policy)
+            from tradingagents.policy_coverage_models import CoveragePolicy
+
+            if isinstance(proposal.policy, CoveragePolicy):
+                self._coverage_objects(proposal.policy)
         elif purpose == "REVOKE_DECISION":
             if (
                 set(document) != {"contract_version", "approval_identity", "reason"}
@@ -508,7 +550,7 @@ class LocalWindowsPolicyOwner:
         lower, upper = [], []
         if purpose == "REGISTER_EVIDENCE":
             for entry in evidence_intake_entries(document):
-                if entry["kind"] == "artifact-reference":
+                if entry["kind"] in {"artifact-reference", "artifact-acquisition"}:
                     descriptor = self._published_descriptor(entry["value"])
                     approval, _proposal, _record = self._decision(descriptor.approval_identity)
                     lower.extend((utc(descriptor.issued_utc), utc(approval.effective_utc)))
@@ -531,6 +573,7 @@ class LocalWindowsPolicyOwner:
             not in {
                 "artifact",
                 "artifact-reference",
+                "artifact-acquisition",
                 "allocation",
                 "observation",
                 "executed-stage",
@@ -574,13 +617,15 @@ class LocalWindowsPolicyOwner:
                 raise ValueError(
                     "authenticated intake cannot rebind an existing setup or owner artifact"
                 )
-        elif kind == "artifact-reference":
+        elif kind in {"artifact-reference", "artifact-acquisition"}:
             descriptor = self._published_descriptor(value)
-            if key != descriptor.artifact.identity:
+            acquisition = kind == "artifact-acquisition"
+            if key != (descriptor.identity if acquisition else descriptor.artifact.identity):
                 raise ValueError("compact artifact key differs from its semantic identity")
             with self.connection() as connection:
                 existing = connection.execute(
-                    "SELECT reference FROM artifacts WHERE identity=?", (key,)
+                    "SELECT reference FROM artifacts WHERE identity=?",
+                    (descriptor.artifact.identity,),
                 ).fetchone()
             if existing is not None and EvidenceRef.read(existing[0]) != descriptor.artifact:
                 raise ValueError(
@@ -588,6 +633,21 @@ class LocalWindowsPolicyOwner:
                 )
             role, _ = self._role()
             approval, proposal, _ = self._decision(descriptor.approval_identity)
+            if acquisition:
+                from tradingagents.policy_coverage_models import CoveragePolicy
+
+                if not isinstance(proposal.policy, CoveragePolicy):
+                    raise ValueError("v3 acquisition requires a distinct coverage policy decision")
+            for prior in self._intakes():
+                if (
+                    prior["kind"] in {"artifact-reference", "artifact-acquisition"}
+                    and (acquisition or prior["kind"] == "artifact-acquisition")
+                    and prior["value"]["descriptor"]["acquisition_identity"]
+                    == descriptor.acquisition_identity
+                ):
+                    raise ValueError(
+                        "acquisition identity already authenticated; no renewal/replay"
+                    )
             if (
                 descriptor.instance != self.anchor["instance"]
                 or descriptor.role_identity != role.identity
@@ -607,11 +667,89 @@ class LocalWindowsPolicyOwner:
                 raise ValueError("compact artifact descriptor is not currently valid")
             if not utc(approval.effective_utc) <= utc(self.now_utc) < utc(approval.expires_utc):
                 raise ValueError("artifact descriptor decision is stale")
+            from tradingagents import policy_coverage_models
+            from tradingagents.policy_coverage_contract import (
+                CURRENT_NAMESPACE,
+                CoverageAssessment,
+                CoverageMeasurement,
+                HistoricalCoverageScope,
+            )
+            from tradingagents.policy_coverage_models import CoveragePolicy
             from tradingagents.policy_evidence_contract import validate_artifact
 
-            artifact = validate_artifact(
-                self.root / "artifacts" / (descriptor.artifact.pin.sha256 + ".blob"), descriptor
+            changed_models = [
+                pair
+                for pair in policy_coverage_models._MODELS.items()
+                if hasattr(pair[0], "namespace") and hasattr(pair[1], "namespace")
+            ]
+            old_schemas = {pair[0].namespace for pair in changed_models}
+            new_schemas = {pair[1].namespace for pair in changed_models} | {
+                CURRENT_NAMESPACE,
+                CoverageAssessment.namespace,
+                CoverageMeasurement.namespace,
+                HistoricalCoverageScope.namespace,
+            }
+            if (
+                isinstance(proposal.policy, CoveragePolicy)
+                and descriptor.artifact_schema in old_schemas
+            ) or (
+                not isinstance(proposal.policy, CoveragePolicy)
+                and descriptor.artifact_schema in new_schemas
+            ):
+                raise ValueError(
+                    "artifact schema cannot reinterpret a different policy coverage version"
+                )
+            coverage_context = (
+                self._coverage_objects(proposal.policy)
+                if isinstance(proposal.policy, CoveragePolicy)
+                else None
             )
+            artifact = validate_artifact(
+                self.root / "artifacts" / (descriptor.artifact.pin.sha256 + ".blob"),
+                descriptor,
+                coverage_context=coverage_context,
+            )
+            if descriptor.artifact_schema == "policy-coverage-inventory:v2":
+                import sys
+
+                from tradingagents import policy_coverage_native
+                from tradingagents.policy_coverage_contract import compare_known_fields
+
+                capture = artifact["capture"]
+                generated = capture["origin"] == "GENERATED_FIXTURE_NOT_AN_OBSERVATION"
+                if (
+                    coverage_context is None
+                    or artifact["fixture_only"] == self.anchor["operational"]
+                    or (generated and self.anchor["operational"])
+                    or (
+                        not generated
+                        and (
+                            BytePin.read(capture["collector_pin"])
+                            != BytePin.of(Path(policy_coverage_native.__file__).read_bytes())
+                            or BytePin.read(capture["runtime_pin"])
+                            != BytePin.of(Path(sys.executable).read_bytes())
+                        )
+                    )
+                ):
+                    raise ValueError("coverage collector/runtime/fixture provenance mismatch")
+                if (
+                    not max(utc(approval.effective_utc), utc(proposal.execution.effective_utc))
+                    <= utc(capture["started_utc"])
+                    <= utc(capture["finished_utc"])
+                    <= utc(descriptor.issued_utc)
+                    < min(utc(approval.expires_utc), utc(proposal.execution.expires_utc))
+                ):
+                    raise ValueError(
+                        "coverage acquisition lies outside its approved execution window"
+                    )
+                if artifact["phase"] == "before":
+                    compare_known_fields(
+                        coverage_context[0],
+                        self.read_artifact(proposal.policy.scope.before.artifact),
+                        self.read_artifact(proposal.policy.scope.after.artifact),
+                        artifact,
+                        coverage_context[1],
+                    )
             if descriptor.artifact_schema == "production-python-modules:v1":
                 from tradingagents.policy_evidence_acquisition import (
                     ProductionInventory,
@@ -654,13 +792,17 @@ class LocalWindowsPolicyOwner:
                         "capture is outside its actual approved execution/acquisition window"
                     )
         elif kind == "observation":
-            if (
-                self.anchor["operational"]
-                and document["contract_version"] != "policy-owner-evidence-intake-v2"
-            ):
+            if self.anchor["operational"] and document["contract_version"] not in {
+                "policy-owner-evidence-intake-v2",
+                "policy-owner-evidence-intake-v3",
+            }:
                 raise ValueError("operational observations require versioned producer provenance")
+            acquisition = document["contract_version"] == "policy-owner-evidence-intake-v3"
+            expected_fields = set(ObservationResolution.__dataclass_fields__) | (
+                {"artifact_descriptor_identity"} if acquisition else set()
+            )
             if (
-                set(value) != set(ObservationResolution.__dataclass_fields__)
+                set(value) != expected_fields
                 or value["observation_id"] != key
                 or value["phase"] not in {"before", "after"}
             ):
@@ -671,8 +813,17 @@ class LocalWindowsPolicyOwner:
             for name in ("lineage_plan_identity", "allocation_identity", "stage"):
                 if not isinstance(value[name], str) or not value[name]:
                     raise ValueError("new observation has an empty acquisition field")
-            if document["contract_version"] == "policy-owner-evidence-intake-v2":
-                descriptor = self._artifact_descriptor(EvidenceRef.read(value["artifact"]))
+            if document["contract_version"] in {
+                "policy-owner-evidence-intake-v2",
+                "policy-owner-evidence-intake-v3",
+            }:
+                descriptor = (
+                    self._acquisition_descriptor(
+                        value["artifact_descriptor_identity"], EvidenceRef.read(value["artifact"])
+                    )
+                    if acquisition
+                    else self._artifact_descriptor(EvidenceRef.read(value["artifact"]))
+                )
                 if (
                     descriptor.acquisition_identity != key
                     or descriptor.lineage_plan_identity != value["lineage_plan_identity"]
@@ -683,7 +834,10 @@ class LocalWindowsPolicyOwner:
                         "observation differs from its authenticated artifact descriptor"
                     )
                 raw = strict_json(self.read_artifact(descriptor.artifact))
-                if descriptor.artifact_schema == "crash-protection-historical-inventory:v1":
+                if descriptor.artifact_schema in {
+                    "crash-protection-historical-inventory:v1",
+                    "policy-coverage-inventory:v2",
+                }:
                     capture = raw.get("capture", {})
                     if capture.get("observation_identity") != key or utc(
                         capture["finished_utc"]
@@ -780,7 +934,7 @@ class LocalWindowsPolicyOwner:
             self.now_utc = validation_time
         self.put(canonical_bytes(record), record["identity"])
         if purpose == "EXACT_POLICY_DECISION":
-            proposal = PolicyDecisionProposal.read(document)
+            proposal = read_model(PolicyDecisionProposal, document)
             if proposal.selection == "REJECT":
                 return {
                     "status": "REJECTED",
@@ -790,8 +944,28 @@ class LocalWindowsPolicyOwner:
             role, enrollment = self._role()
             effective = utc(record["recorded_at_utc"])
             policy = proposal.policy
-            approval = OperatorApproval.seal(
-                contract_version="historical-state-operator-approval-v1",
+            from tradingagents.policy_coverage_contract import artifact_ref
+            from tradingagents.policy_coverage_models import CoverageApproval, CoveragePolicy
+
+            coverage_route = isinstance(policy, CoveragePolicy)
+            approval_model = CoverageApproval if coverage_route else OperatorApproval
+            extra = {}
+            if coverage_route:
+                scope, measurement = self._coverage_objects(policy)
+                self.put(scope.to_bytes(), scope.identity)
+                self.put(measurement.to_bytes(), measurement.identity)
+                extra = {
+                    "coverage_scope": artifact_ref(scope),
+                    "coverage_measurement": artifact_ref(measurement),
+                    "historical_coverage": "UNKNOWN",
+                }
+            approval = approval_model.seal(
+                **extra,
+                contract_version=(
+                    "historical-state-operator-approval-v2"
+                    if coverage_route
+                    else "historical-state-operator-approval-v1"
+                ),
                 acceptance_policy_identity=policy.acceptance_policy_identity,
                 exception_identity=policy.exception_identity,
                 lineage_plan_identity=policy.lineage_plan.lineage_plan_identity,
@@ -870,6 +1044,23 @@ class LocalWindowsPolicyOwner:
             raise ValueError("registered artifact descriptor/reference mismatch")
         return descriptor
 
+    def _acquisition_descriptor(self, identity: str, reference: EvidenceRef):
+        from tradingagents.policy_coverage_models import CoveragePolicy
+        from tradingagents.policy_evidence_contract import ArtifactDescriptor
+
+        entry = self._registration("artifact-acquisition", identity)
+        descriptor = ArtifactDescriptor.read(entry["descriptor"])
+        if (
+            descriptor.identity != identity
+            or descriptor.artifact != reference
+            or descriptor.instance != self.anchor["instance"]
+        ):
+            raise ValueError("v3 acquisition descriptor identity/content/instance mismatch")
+        _, proposal, _ = self._decision(descriptor.approval_identity)
+        if not isinstance(proposal.policy, CoveragePolicy):
+            raise ValueError("v3 acquisition cannot reinterpret an old policy")
+        return descriptor
+
     def _verified_current_inventory(self, value: dict):
         from tradingagents.policy_evidence_acquisition import (
             ProductionInventory,
@@ -946,7 +1137,7 @@ class LocalWindowsPolicyOwner:
             value = document["value"]
             ref = EvidenceRef.read(value["reference"])
             self.put(base64.b64decode(value["bytes_base64"], validate=True), ref.identity)
-        elif document["kind"] == "artifact-reference":
+        elif document["kind"] in {"artifact-reference", "artifact-acquisition"}:
             # Publication precedes the genuine signed record. Replay derives only
             # the exact registration, never an import, claim or new authentication.
             descriptor = self._published_descriptor(document["value"])
@@ -957,7 +1148,7 @@ class LocalWindowsPolicyOwner:
             with self.connection() as connection:
                 approvals = connection.execute("SELECT approval FROM approvals").fetchall()
             for row in approvals:
-                approval = OperatorApproval.read(row[0])
+                approval = read_model(OperatorApproval, row[0])
                 if (
                     approval.candidate != Candidate.read(current["candidate"])
                     or approval.lineage_plan_identity != current["lineage_plan_identity"]
@@ -1107,17 +1298,17 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         return strict_json(completed.stdout)
 
     def verify_downstream(self, value: object) -> DownstreamEnvelope:
-        envelope = DownstreamEnvelope.read(value)
+        envelope = read_model(DownstreamEnvelope, value)
         result = self.call("verify-envelope", {"envelope": envelope.model_dump(mode="json")})
-        verified = DownstreamEnvelope.read(result["envelope"])
+        verified = read_model(DownstreamEnvelope, result["envelope"])
         if verified != envelope:
             raise ValueError("native owner changed the complete conditional envelope")
         return verified
 
     def current_source(self, envelope: object) -> tuple[Candidate, str]:
-        value = DownstreamEnvelope.read(envelope)
+        value = read_model(DownstreamEnvelope, envelope)
         result = self.call("verify-envelope", {"envelope": value.model_dump(mode="json")})
-        if DownstreamEnvelope.read(result["envelope"]) != value:
+        if read_model(DownstreamEnvelope, result["envelope"]) != value:
             raise ValueError("current-source response lost the conditional envelope")
         return Candidate.read(result["current_candidate"]), result[
             "current_production_inventory_identity"
@@ -1135,8 +1326,8 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         result = self.call(
             "eligibility",
             {
-                "policy": AcceptancePolicy.read(policy).model_dump(mode="json"),
-                "approval": OperatorApproval.read(approval).model_dump(mode="json"),
+                "policy": read_model(AcceptancePolicy, policy).model_dump(mode="json"),
+                "approval": read_model(OperatorApproval, approval).model_dump(mode="json"),
             },
         )
         return decode_resolution(result["authority"])
@@ -1145,12 +1336,12 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         self, policy: object, approval: object, allocation: object, *, new_start_bridge: object
     ) -> LineageClaim:
         payload = {
-            "policy": AcceptancePolicy.read(policy).model_dump(mode="json"),
-            "approval": OperatorApproval.read(approval).model_dump(mode="json"),
+            "policy": read_model(AcceptancePolicy, policy).model_dump(mode="json"),
+            "approval": read_model(OperatorApproval, approval).model_dump(mode="json"),
             "allocation": LineageAllocation.read(allocation).model_dump(mode="json"),
-            "new_start_bridge": RawComparison.read(new_start_bridge).model_dump(mode="json"),
+            "new_start_bridge": read_model(RawComparison, new_start_bridge).model_dump(mode="json"),
         }
-        return LineageClaim.read(self.call("claim", payload)["claim"])
+        return read_model(LineageClaim, self.call("claim", payload)["claim"])
 
     def begin_stage(
         self,
@@ -1164,11 +1355,13 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         return self.call(
             "begin-stage",
             {
-                "policy": AcceptancePolicy.read(policy).model_dump(mode="json"),
-                "approval": OperatorApproval.read(approval).model_dump(mode="json"),
-                "claim": LineageClaim.read(claim).model_dump(mode="json"),
+                "policy": read_model(AcceptancePolicy, policy).model_dump(mode="json"),
+                "approval": read_model(OperatorApproval, approval).model_dump(mode="json"),
+                "claim": read_model(LineageClaim, claim).model_dump(mode="json"),
                 "stage": stage,
-                "new_start_bridge": RawComparison.read(new_start_bridge).model_dump(mode="json"),
+                "new_start_bridge": read_model(RawComparison, new_start_bridge).model_dump(
+                    mode="json"
+                ),
             },
         )["event_identity"]
 
@@ -1184,11 +1377,11 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         return self.call(
             "complete-stage",
             {
-                "policy": AcceptancePolicy.read(policy).model_dump(mode="json"),
-                "approval": OperatorApproval.read(approval).model_dump(mode="json"),
-                "claim": LineageClaim.read(claim).model_dump(mode="json"),
+                "policy": read_model(AcceptancePolicy, policy).model_dump(mode="json"),
+                "approval": read_model(OperatorApproval, approval).model_dump(mode="json"),
+                "claim": read_model(LineageClaim, claim).model_dump(mode="json"),
                 "stage": stage,
-                "evidence": BoundEvidence.read(evidence).model_dump(mode="json"),
+                "evidence": read_model(BoundEvidence, evidence).model_dump(mode="json"),
             },
         )["event_identity"]
 
@@ -1198,21 +1391,21 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         result = self.call(
             "finalize",
             {
-                "policy": AcceptancePolicy.read(policy).model_dump(mode="json"),
-                "approval": OperatorApproval.read(approval).model_dump(mode="json"),
-                "claim": LineageClaim.read(claim).model_dump(mode="json"),
-                "execution": ExecutionEvidence.read(execution).model_dump(mode="json"),
+                "policy": read_model(AcceptancePolicy, policy).model_dump(mode="json"),
+                "approval": read_model(OperatorApproval, approval).model_dump(mode="json"),
+                "claim": read_model(LineageClaim, claim).model_dump(mode="json"),
+                "execution": read_model(ExecutionEvidence, execution).model_dump(mode="json"),
             },
         )
-        return PolicyQualifiedExecutionResult.read(result["result"])
+        return read_model(PolicyQualifiedExecutionResult, result["result"])
 
     def verify_result(self, raw: bytes):
         result = self.call(
             "verify-result", {"result_base64": base64.b64encode(raw).decode("ascii")}
         )
         return (
-            PolicyQualifiedExecutionResult.read(result["result"]),
-            ResultBindingCore.read(result["core"]),
+            read_model(PolicyQualifiedExecutionResult, result["result"]),
+            read_model(ResultBindingCore, result["core"]),
             decode_resolution(result["authority"]),
         )
 
@@ -1220,4 +1413,4 @@ class RegisteredWindowsPolicyVerifier(PolicyQualifiedVerifier):
         value = self.call(
             "issue-receipt", {"result_base64": base64.b64encode(result_bytes).decode("ascii")}
         )
-        return PostResultAcceptanceReceipt.read(value["receipt"])
+        return read_model(PostResultAcceptanceReceipt, value["receipt"])

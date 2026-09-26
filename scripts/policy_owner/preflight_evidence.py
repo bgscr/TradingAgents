@@ -10,6 +10,156 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+_COVERAGE_PROOF_REQUIRED = frozenset(
+    {
+        "tradingagents/policy_coverage_contract.py",
+        "tradingagents/policy_coverage_models.py",
+        "tradingagents/policy_coverage_verification.py",
+        "tradingagents/policy_qualified_results.py",
+        "tradingagents/policy_qualified_contract.py",
+        "tradingagents/policy_qualification_lifecycle.py",
+        "tradingagents/policy_evidence_contract.py",
+        "tradingagents/policy_evidence_client.py",
+        "tradingagents/policy_qualified_native.py",
+        "tradingagents/runtime_protection.py",
+        "tradingagents/qualified_routing_composition.py",
+        "scripts/policy_owner/predeployment_fixtures.py",
+        "scripts/policy_owner/registered_test_fixtures.py",
+        "scripts/policy_owner/test_coverage_scale.py",
+        "tests/fixtures/policy_coverage_fixture.py",
+        "tests/fixtures/coverage_case.py",
+    }
+)
+
+
+_COVERAGE_INTAKE_REQUIRED = frozenset(
+    {
+        "tradingagents/policy_owner_contract.py",
+        "tradingagents/windows_policy_owner.py",
+        "tradingagents/policy_evidence_contract.py",
+        "tradingagents/policy_evidence_client.py",
+        "scripts/policy_owner/owner_worker.py",
+        "scripts/policy_owner/registered_test_flow.py",
+        "scripts/policy_owner/registered_coverage_test.py",
+        "scripts/policy_owner/coverage_test_vectors.py",
+        "scripts/policy_owner/test_registered_coverage_flow.py",
+        "scripts/policy_owner/registered_test_native.py",
+        "scripts/policy_owner/registered_test_client.py",
+        "tests/fixtures/policy_owner/local_owner_fixture.py",
+    }
+)
+
+
+def verify_coverage_source_proof(
+    *, policy, witness, contract_path, depot, digest, required=_COVERAGE_PROOF_REQUIRED
+):
+    """Check the complete retained execution-proof set against the exact bundle.
+
+    A reviewed fixture report remains implementation evidence, never approval.
+    Test-only source is checked in the package and never silently skipped.
+    """
+    from tradingagents.policy_qualified_contract import strict_json
+
+    raw = contract_path.read_bytes()
+    policy.lineage_plan.consumer_contract_pin.check(raw)
+    contract = strict_json(raw)
+    if (
+        contract.get("contract_version") != "policy-qualified-exact-source-bundle-v2"
+        or contract.get("candidate") != policy.scope.candidate.model_dump(mode="json")
+        or contract.get("execution_authorized") is not False
+    ):
+        raise ValueError("coverage proposed candidate differs from exact source bundle")
+    entries = {row["relative_path"]: row for row in contract["files"]}
+    if len(entries) != len(contract["files"]):
+        raise ValueError("duplicate exact-source member")
+    pins = witness.get("source_pins", {})
+    if not required.issubset(pins):
+        raise ValueError("coverage fixture proof omitted a required executed source pin")
+    for relative, expected in pins.items():
+        name = PurePosixPath(relative)
+        if name.is_absolute() or ".." in name.parts or "\\" in relative:
+            raise ValueError("invalid proof source member path")
+        entry = entries.get(relative)
+        if entry is None or {k: entry[k] for k in ("byte_length", "sha256")} != expected:
+            raise ValueError("coverage proof is not bound to exact packaged source: " + relative)
+        package_member = contract_path.parent / "source" / relative
+        if digest(package_member) != (expected["byte_length"], expected["sha256"]):
+            raise ValueError("packaged fixture/source proof bytes changed: " + relative)
+        if not relative.startswith("tests/") and digest(depot / "source" / relative) != (
+            expected["byte_length"],
+            expected["sha256"],
+        ):
+            raise ValueError("coverage witness does not cover delivered source: " + relative)
+    return contract
+
+
+def verify_coverage_native_proof(*, proof, witness_pin, contract, depot, digest):
+    """Link retained native fixture executions to unchanged compiled source.
+
+    Final build metadata may change with the frozen source inventory; every
+    executable input and the final deployed binaries are independently pinned.
+    """
+    from tradingagents.policy_qualified_contract import strict_json
+
+    if (
+        proof.get("contract_version") != "coverage-native-fixture-correspondence-v1"
+        or proof.get("scale_result_sha256") != witness_pin
+        or proof.get("execution_authorized") is not False
+    ):
+        raise ValueError("native fixture proof does not bind this scale result")
+
+    def read(reference):
+        path = Path(reference["path"])
+        if digest(path) != (reference["byte_length"], reference["sha256"]):
+            raise ValueError("retained native proof input changed")
+        return strict_json(path.read_bytes())
+
+    tested = read(proof["tested_build"])
+    final = read(proof["delivered_build"])
+    command = read(proof["scale_command"])
+    result = read(proof["scale_completion"])
+    if (
+        result.get("status") != "PASS"
+        or result.get("exit_code") != 0
+        or command["arguments"] != result["arguments"]
+    ):
+        raise ValueError("full scale native fixture execution did not complete")
+    old = {row["relative_path"]: row for row in tested["source_files"]}
+    new = {row["relative_path"]: row for row in final["source_files"]}
+    bundle = {row["relative_path"]: row for row in contract["files"]}
+    native_names = {name for name in new if name.endswith(".cs")}
+    if (
+        native_names != {name for name in old if name.endswith(".cs")}
+        or tested["compiler"] != final["compiler"]
+    ):
+        raise ValueError("native fixture/compiler source closure changed")
+    for name in native_names:
+        if (
+            old[name] != new[name]
+            or name not in bundle
+            or any(new[name][k] != bundle[name][k] for k in ("byte_length", "sha256"))
+        ):
+            raise ValueError("native fixture no longer covers final source: " + name)
+    for name in ("EvidenceTransferContracts.exe", "CoverageEvidenceContracts.exe"):
+        reference = proof["executed_binaries"][name]
+        expected = tested["executables"][name]
+        if digest(Path(reference["path"])) != (expected["byte_length"], expected["sha256"]):
+            raise ValueError("executed native fixture binary changed")
+        if {k: reference[k] for k in ("byte_length", "sha256")} != expected:
+            raise ValueError("native fixture executable/build binding mismatch")
+    arguments = command["arguments"]
+    position = arguments.index("--native-fixture")
+    if (
+        arguments[position + 1]
+        != proof["executed_binaries"]["EvidenceTransferContracts.exe"]["path"]
+    ):
+        raise ValueError("scale command executed a different native fixture")
+    for name in ("PolicyOwner.exe", "ConditionalRuntimeProtectionHost.exe"):
+        expected = final["executables"][name]
+        if digest(depot / "bin" / name) != (expected["byte_length"], expected["sha256"]):
+            raise ValueError("delivered native image differs from final build")
+    return final
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -24,6 +174,17 @@ def main():
     parser.add_argument("--documents", type=Path, nargs="*", default=[])
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--descriptor", type=Path)
+    parser.add_argument("--coverage-policy", type=Path)
+    parser.add_argument("--coverage-scope", type=Path)
+    parser.add_argument("--coverage-before", type=Path)
+    parser.add_argument("--coverage-after", type=Path)
+    parser.add_argument("--coverage-witness", type=Path)
+    parser.add_argument("--coverage-witness-sha256")
+    parser.add_argument("--coverage-contract-sources", type=Path)
+    parser.add_argument("--coverage-native-proof", type=Path)
+    parser.add_argument("--coverage-native-proof-sha256")
+    parser.add_argument("--coverage-intake-witness", type=Path)
+    parser.add_argument("--coverage-intake-witness-sha256")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--check-registered-capacity",
@@ -213,13 +374,129 @@ def main():
             or capacity_snapshot.get("execution_authorized") is not False
         ):
             raise ValueError("registered capacity response lost its non-consuming binding")
+    coverage_report = None
+    coverage_context = None
+    coverage_inputs = (
+        args.coverage_policy,
+        args.coverage_scope,
+        args.coverage_before,
+        args.coverage_after,
+        args.coverage_witness,
+        args.coverage_witness_sha256,
+        args.coverage_contract_sources,
+        args.coverage_native_proof,
+        args.coverage_native_proof_sha256,
+        args.coverage_intake_witness,
+        args.coverage_intake_witness_sha256,
+    )
+    if any(coverage_inputs):
+        if not all(coverage_inputs):
+            raise ValueError(
+                "complete fixed coverage policy/scope/originals/fixture proof required"
+            )
+        if digest(args.coverage_witness)[1] != args.coverage_witness_sha256:
+            raise ValueError("coverage witness byte pin mismatch")
+        from tradingagents.policy_coverage_contract import (
+            HistoricalCoverageScope,
+            artifact_ref,
+            validate_scope,
+        )
+        from tradingagents.policy_coverage_models import CoveragePolicy
+
+        policy = CoveragePolicy.read(args.coverage_policy.read_bytes())
+        scope_raw = args.coverage_scope.read_bytes()
+        policy.coverage_scope.pin.check(scope_raw)
+        scope = HistoricalCoverageScope.read(scope_raw)
+        validate_scope(scope, args.coverage_before.read_bytes(), args.coverage_after.read_bytes())
+        if (
+            artifact_ref(scope) != policy.coverage_scope
+            or scope.before != policy.scope.before.artifact
+            or scope.after != policy.scope.after.artifact
+        ):
+            raise ValueError("coverage policy changed exact historical acquisition/scope bindings")
+        witness = strict_json(args.coverage_witness.read_bytes())
+        if (
+            witness.get("status") != "FIXTURE_FEASIBILITY_PASS"
+            or witness.get("generated_records_not_native_objects") is not True
+            or witness.get("gap_markers") != 7
+            or witness.get("historical_reparse_records") != 5322
+            or witness.get("baseline_bytes", 0) < 78489473
+            or witness.get("qualification") is not False
+            or witness.get("execution_authorized") is not False
+            or not witness.get("source_pins")
+        ):
+            raise ValueError("complete retained-scale fixture proof is unavailable")
+        contract = verify_coverage_source_proof(
+            policy=policy,
+            witness=witness,
+            contract_path=args.coverage_contract_sources,
+            depot=depot,
+            digest=digest,
+        )
+        if digest(args.coverage_native_proof)[1] != args.coverage_native_proof_sha256:
+            raise ValueError("native fixture correspondence pin mismatch")
+        delivered_build = verify_coverage_native_proof(
+            proof=strict_json(args.coverage_native_proof.read_bytes()),
+            witness_pin=args.coverage_witness_sha256,
+            contract=contract,
+            depot=depot,
+            digest=digest,
+        )
+        if digest(args.coverage_intake_witness)[1] != args.coverage_intake_witness_sha256:
+            raise ValueError("coverage intake witness byte pin mismatch")
+        intake = strict_json(args.coverage_intake_witness.read_bytes())
+        if (
+            intake.get("status") != "FIXTURE_FEASIBILITY_PASS"
+            or intake.get("authentication_is_genuine") is not False
+            or intake.get("historical_coverage") != "UNKNOWN"
+            or intake.get("gap_markers") != 7
+            or intake.get("reparse_records") != 5322
+            or intake.get("operational_owner_contacted") is not False
+            or intake.get("execution_authorized") is not False
+            or not intake.get("document_count")
+            or intake.get("native_input_producer_and_intake_passed") is not True
+            or intake.get("native_gate") != "BEFORE_REGISTERED_NATIVE_VERIFY_NO_NAMESPACE_CREATED"
+        ):
+            raise ValueError("complete versioned intake fixture proof unavailable")
+        verify_coverage_source_proof(
+            policy=policy,
+            witness=intake,
+            contract_path=args.coverage_contract_sources,
+            depot=depot,
+            digest=digest,
+            required=_COVERAGE_INTAKE_REQUIRED,
+        )
+        intake_native = intake.get("native_fixture_pin", {})
+        expected_native = delivered_build["executables"]["EvidenceTransferContracts.exe"]
+        if {
+            key: intake_native.get(key) for key in ("byte_length", "sha256")
+        } != expected_native or digest(Path(intake_native["path"])) != (
+            expected_native["byte_length"],
+            expected_native["sha256"],
+        ):
+            raise ValueError("intake fixture did not exercise the final native transfer build")
+        coverage_context = (scope, policy.coverage_measurement)
+        coverage_report = {
+            "IMPLEMENTATION_PASS": "FIXED_SOURCE_SCOPE_POLICY_MEASUREMENT_AND_NATIVE_BINDINGS",
+            "FIXTURE_FEASIBILITY_PASS": True,
+            "REAL_ENVIRONMENT_NOT_MEASURED": True,
+            "HUMAN_AUTHENTICATION_PENDING": True,
+            "QUALIFICATION_NOT_AUTHORIZED": True,
+            "policy_identity": policy.acceptance_policy_identity,
+            "candidate": policy.scope.candidate.model_dump(mode="json"),
+            "scope": policy.coverage_scope.model_dump(mode="json"),
+            "measurement": artifact_ref(policy.coverage_measurement).model_dump(mode="json"),
+            "fixture_proof_sha256": args.coverage_witness_sha256,
+            "intake_fixture_proof_sha256": args.coverage_intake_witness_sha256,
+            "actual_historical_targets_inspected": False,
+        }
     if (args.artifact is None) != (args.descriptor is None):
         raise ValueError("artifact and descriptor must be provided together")
     if args.descriptor:
         descriptor = ArtifactDescriptor.read(args.descriptor.read_bytes())
         if descriptor.instance != args.instance:
             raise ValueError("preflight exact instance mismatch")
-        validate_artifact(args.artifact, descriptor)
+        validate_artifact(args.artifact, descriptor, coverage_context=coverage_context)
     origins = []
     for name, module in sorted(sys.modules.items()):
         path = getattr(module, "__file__", None)
@@ -248,6 +525,7 @@ def main():
         if capacity_snapshot is not None
         else "NOT_QUERIED_UNKNOWN",
         "namespace_initialized": False,
+        "coverage": coverage_report,
         "claim_created": False,
         "human_authentication_requested": False,
         "remaining": [

@@ -119,7 +119,7 @@ def read_complete_artifact(path: Path, descriptor: ArtifactDescriptor) -> bytes:
     return b"".join(chunks)
 
 
-def validate_artifact(path: Path, descriptor: ArtifactDescriptor) -> dict:
+def validate_artifact(path: Path, descriptor: ArtifactDescriptor, *, coverage_context=None) -> dict:
     """Validate the full logical JSON and raw root identities, without admission."""
     descriptor = ArtifactDescriptor.read(descriptor)
     raw = read_complete_artifact(path, descriptor)
@@ -148,6 +148,19 @@ def validate_artifact(path: Path, descriptor: ArtifactDescriptor) -> dict:
         or binding.get("lineage_plan_identity") != descriptor.lineage_plan_identity
     ):
         raise ValueError("artifact acceptance binding differs from descriptor approval/plan")
+    if descriptor.artifact_schema == "policy-coverage-inventory:v2":
+        from tradingagents.policy_coverage_contract import validate_current_inventory
+
+        if coverage_context is None:
+            raise ValueError("coverage inventory requires exact scope and measurement context")
+        validate_current_inventory(value, *coverage_context)
+        if (
+            value["phase"] != descriptor.phase
+            or value["instance"] != descriptor.instance
+            or value["capture"]["observation_identity"] != descriptor.acquisition_identity
+        ):
+            raise ValueError("coverage acquisition differs from its exact descriptor")
+        return value
     if descriptor.artifact_schema == "crash-protection-historical-inventory:v1":
         from tradingagents.policy_qualified_results import PolicyQualifiedVerifier
 
@@ -233,6 +246,14 @@ def _validate_canonical_model(raw: bytes, descriptor: ArtifactDescriptor) -> Non
     )
 
     sealed = [ProductionInventory]
+    from tradingagents import policy_coverage_contract, policy_coverage_models
+
+    for module in (policy_coverage_contract, policy_coverage_models):
+        sealed.extend(
+            model
+            for model in vars(module).values()
+            if isinstance(model, type) and issubclass(model, Sealed) and hasattr(model, "namespace")
+        )
     sealed.extend(
         model
         for model in vars(contract).values()

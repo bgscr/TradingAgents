@@ -133,17 +133,8 @@ namespace TradingAgents.PolicyOwner
         void ValidateTransferredDocument(OwnerAnchor anchor, Dictionary<string,object> document, DateTime now)
         {
             var deadline=Stopwatch.StartNew();
-            object version;
-            if(!document.TryGetValue("contract_version",out version))return;
-            IEnumerable entries=(string)version=="policy-owner-evidence-intake-batch-v2"?(IEnumerable)document["entries"]:new object[]{document};
-            foreach(object item in entries)
+            foreach(var value in EvidenceTransfer.TransferredArtifacts(document))
             {
-                var entry=Evidence.Obj(item);
-                if(!entry.TryGetValue("contract_version",out version)||(string)version!="policy-owner-evidence-intake-v2")continue;
-                Evidence.Closed(entry,"contract_version","kind","key","value");
-                if((string)entry["kind"]!="artifact-reference")
-                {Evidence.Require((string)entry["kind"]=="current-source"||(string)entry["kind"]=="observation","Unsupported v2 artifact intake");continue;}
-                var value=Evidence.Obj(entry["value"]);Evidence.Closed(value,"transfer_id","descriptor");
                 int remaining=30000-(int)deadline.ElapsedMilliseconds;
                 Evidence.Require(remaining>0,"Complete-descriptor verification exceeded its bounded lifetime");
                 TransferWorker(anchor,"evidence-verify-complete-v2",value,remaining);

@@ -17,6 +17,45 @@ namespace TradingAgents.PolicyOwner
     {
         internal const int ChunkBytes=1024*1024, DescriptorBytes=16*1024, MaximumPending=8, MaximumRecords=4096;
         internal const long ArtifactBytes=256L*1024*1024, StoreBytes=8L*1024*1024*1024;
+        internal static List<Dictionary<string,object>> TransferredArtifacts(Dictionary<string,object> document)
+        {
+            var result=new List<Dictionary<string,object>>();object outer;
+            if(!document.TryGetValue("contract_version",out outer))return result;
+            string wrapper=(string)outer;
+            bool batch=wrapper=="policy-owner-evidence-intake-batch-v1"||wrapper=="policy-owner-evidence-intake-batch-v2"||wrapper=="policy-owner-evidence-intake-batch-v3";
+            var entries=batch?(System.Collections.IEnumerable)document["entries"]:new object[]{document};
+            foreach(object item in entries)
+            {
+                var entry=Evidence.Obj(item);object version;
+                if(!entry.TryGetValue("contract_version",out version))continue;
+                string v=(string)version;
+                if(v!="policy-owner-evidence-intake-v2"&&v!="policy-owner-evidence-intake-v3")continue;
+                Evidence.Require(wrapper!="policy-owner-evidence-intake-batch-v1"&&(v!="policy-owner-evidence-intake-v3"||wrapper!="policy-owner-evidence-intake-batch-v2"),"Acquisition intake wrapper downgrade");
+                Evidence.Closed(entry,"contract_version","kind","key","value");string kind=(string)entry["kind"];
+                if(kind!="artifact-reference"&&kind!="artifact-acquisition")
+                {Evidence.Require(kind=="observation"||(v=="policy-owner-evidence-intake-v2"&&kind=="current-source"),"Unsupported versioned artifact intake");continue;}
+                Evidence.Require((kind=="artifact-acquisition")== (v=="policy-owner-evidence-intake-v3"),"Acquisition kind/version mismatch");
+                var value=Evidence.Obj(entry["value"]);Evidence.Closed(value,"transfer_id","descriptor");
+                var descriptor=Evidence.Obj(value["descriptor"]);
+                string expected=kind=="artifact-acquisition"?(string)descriptor["identity"]:(string)Evidence.Obj(descriptor["artifact"])["identity"];
+                Evidence.Require((string)entry["key"]==expected,"Acquisition registration key mismatch");result.Add(value);
+            }
+            return result;
+        }
+        internal static string CompleteArtifactReview(string root,Dictionary<string,object> document)
+        {
+            var text=new System.Text.StringBuilder();
+            foreach(var value in TransferredArtifacts(document))
+            {
+                var descriptor=Evidence.Obj(value["descriptor"]);var pin=Pin(Evidence.Obj(descriptor["artifact"]));
+                text.AppendLine("Review the COMPLETE bound artifact (the descriptor is not a content preview):");
+                text.AppendLine(Path.Combine(root,"artifacts",(string)pin["sha256"]+".blob"));
+                text.AppendLine("Bytes: "+Convert.ToString(pin["byte_length"],CultureInfo.InvariantCulture)+" SHA-256: "+(string)pin["sha256"]);
+                text.AppendLine("Acquisition: "+(string)descriptor["acquisition_identity"]+" Stage: "+(string)descriptor["stage"]+" Phase: "+(string)descriptor["phase"]);
+                text.AppendLine("Staging did not authenticate these bytes. Matching content does not reuse an earlier acquisition or consent.");
+            }
+            return text.ToString();
+        }
         internal static Dictionary<string,object> Capabilities()
         {
             return new Dictionary<string,object>{{"contract_version","policy-owner-evidence-capabilities-v2"},

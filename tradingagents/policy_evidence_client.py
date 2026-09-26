@@ -19,10 +19,16 @@ from tradingagents.policy_qualified_contract import EvidenceRef
 
 
 def stage_artifact(
-    call: Callable[[str, dict], dict], path: Path, descriptor: ArtifactDescriptor, *, progress=None
+    call: Callable[[str, dict], dict],
+    path: Path,
+    descriptor: ArtifactDescriptor,
+    *,
+    progress=None,
+    coverage_context=None,
+    acquisition_registration=False,
 ) -> dict:
     descriptor = ArtifactDescriptor.read(descriptor)
-    validate_artifact(path, descriptor)
+    validate_artifact(path, descriptor, coverage_context=coverage_context)
     started = time.monotonic()
     response = call("evidence-import-begin-v2", {"descriptor": descriptor.model_dump(mode="json")})
     transfer = response["transfer_id"]
@@ -74,9 +80,11 @@ def stage_artifact(
     ):
         raise ValueError("native publication was not confirmed")
     return {
-        "contract_version": "policy-owner-evidence-intake-v2",
-        "kind": "artifact-reference",
-        "key": descriptor.artifact.identity,
+        "contract_version": "policy-owner-evidence-intake-v3"
+        if acquisition_registration
+        else "policy-owner-evidence-intake-v2",
+        "kind": "artifact-acquisition" if acquisition_registration else "artifact-reference",
+        "key": descriptor.identity if acquisition_registration else descriptor.artifact.identity,
         "value": {"transfer_id": transfer, "descriptor": descriptor.model_dump(mode="json")},
     }
 

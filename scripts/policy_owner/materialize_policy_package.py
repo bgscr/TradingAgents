@@ -184,6 +184,8 @@ def policy_objects(
     consumer_pin,
     measurement_pin,
     budgets,
+    coverage_scope=None,
+    coverage_measurement=None,
 ):
     from tradingagents.policy_qualified_contract import (
         STAGES,
@@ -241,8 +243,25 @@ def policy_objects(
         measurement_contract_pin=measurement_pin,
         pre_result_inventory_scope="complete-evidence-and-pre-result-stage-roots-v1",
     )
-    policy = AcceptancePolicy.seal(
-        contract_version="historical-state-acceptance-policy-v1",
+    policy_model = AcceptancePolicy
+    extra = {}
+    if coverage_scope is not None:
+        from tradingagents.policy_coverage_contract import artifact_ref
+        from tradingagents.policy_coverage_models import CoveragePolicy
+
+        policy_model = CoveragePolicy
+        extra = {
+            "coverage_scope": artifact_ref(coverage_scope),
+            "coverage_measurement": coverage_measurement,
+            "coverage_rule": "KNOWN_RECORDED_FIELDS_UNKNOWN_HISTORY_STRICT_CURRENT_WINDOW",
+        }
+    policy = policy_model.seal(
+        **extra,
+        contract_version=(
+            "historical-state-acceptance-policy-v2"
+            if extra
+            else "historical-state-acceptance-policy-v1"
+        ),
         scope=scope,
         exception_identity=scope.exception_identity,
         lineage_plan=plan,
@@ -341,6 +360,8 @@ def materialize(args) -> dict:
     ledger_raw = Path(retained_files["canonical-ticket06-ledger.json"]["path"]).read_bytes()
     procedure_raw = Path(retained_files["procedure-discovery.json"]["path"]).read_bytes()
     budgets = budget_proposal(strict_json(ledger_raw), strict_json(procedure_raw))
+    coverage_version = getattr(args, "coverage_v2", False)
+    coverage_scope = coverage_measurement = None
     files: dict[str, bytes] = {}
 
     def add(name, raw):
@@ -390,6 +411,34 @@ def materialize(args) -> dict:
         "scripts/verify_ticket06_immutable_state.py",
         "scripts/run_iso03_windows_sandbox_qualification.py",
     }
+    if coverage_version:
+        names.update(
+            {
+                "tradingagents/policy_coverage_contract.py",
+                "tradingagents/policy_coverage_native.py",
+                "tradingagents/policy_coverage_models.py",
+                "tradingagents/policy_coverage_verification.py",
+                "tradingagents/policy_coverage_schema.py",
+                "docs/contracts/policy-coverage-v2.md",
+            }
+        )
+        names.update(
+            path.relative_to(source).as_posix()
+            for path in (source / "tradingagents").glob("policy_*.py")
+        )
+        names.update(
+            path.relative_to(source).as_posix()
+            for path in (source / "tests/fixtures").glob("*coverage*.py")
+        )
+        names.add("tests/fixtures/policy_owner/local_owner_fixture.py")
+        names.update(
+            "tests/fixtures/runtime_protection/" + name + ".cs"
+            for name in (
+                "CoverageEvidenceContracts",
+                "EvidenceTransferContracts",
+                "PolicyAuthenticationContracts",
+            )
+        )
     names.update(
         path.relative_to(source).as_posix()
         for path in (source / "scripts/policy_owner").iterdir()
@@ -418,7 +467,13 @@ def materialize(args) -> dict:
         checkout = source_checkout_binding(raw, committed)
         file_pin = add("source/" + name, raw)
         source_files.append({"relative_path": name, **file_pin.model_dump(mode="json"), **checkout})
-    schema_pin = data("contract-schema.json", contract_descriptor())
+    if coverage_version:
+        from tradingagents.policy_coverage_schema import coverage_contract_descriptor
+
+        schema = coverage_contract_descriptor()
+    else:
+        schema = contract_descriptor()
+    schema_pin = data("contract-schema.json", schema)
     consumer_pin = data(
         "CONTRACT-SOURCES.json",
         {
@@ -457,6 +512,35 @@ def materialize(args) -> dict:
             "execution_authorized": False,
         },
     )
+    if coverage_version:
+        from tradingagents.policy_coverage_contract import (
+            CoverageMeasurement,
+            artifact_ref,
+            build_scope,
+        )
+
+        before_raw = Path(registry.before.original_path).read_bytes()
+        after_raw = Path(registry.after.original_path).read_bytes()
+        registry.before.artifact.pin.check(before_raw)
+        registry.after.artifact.pin.check(after_raw)
+        coverage_scope = build_scope(before_raw, after_raw, fixture_only=False)
+        add("COVERAGE-SCOPE.json", coverage_scope.to_bytes())
+        coverage_measurement = CoverageMeasurement.seal(
+            contract_version="policy-coverage-measurement-v2",
+            scope=artifact_ref(coverage_scope),
+            candidate=candidate,
+            supported_reparse_tags=(0xA0000003,),
+            security_required=True,
+            maximum_entries=2_000_000,
+            maximum_read_bytes=64 * 1024**3,
+            maximum_seconds=600,
+            maximum_depth=128,
+            maximum_reparse_bytes=16384,
+            maximum_indirect_link_depth=0,
+            target_coverage="SEPARATE_ORDINARY_ROOT_WALK",
+            known_fields_required=True,
+        )
+        measurement_pin = add("MEASUREMENT-CONTRACT.json", coverage_measurement.to_bytes())
     procedure_pin = data(
         "PROCEDURE-PROPOSAL.json",
         {
@@ -472,7 +556,12 @@ def materialize(args) -> dict:
     )
     authority_pin = add(
         "AUTHORITY-CONTRACT-PROPOSAL.md",
-        (source / "docs/contracts/windows-policy-owner-v1.md").read_bytes(),
+        (source / "docs/contracts/windows-policy-owner-v1.md").read_bytes()
+        + (
+            b"\n\n" + (source / "docs/contracts/policy-coverage-v2.md").read_bytes()
+            if coverage_version
+            else b""
+        ),
     )
     scope, plan, policy = policy_objects(
         candidate,
@@ -486,6 +575,8 @@ def materialize(args) -> dict:
         consumer_pin=consumer_pin,
         measurement_pin=measurement_pin,
         budgets=budgets,
+        coverage_scope=coverage_scope,
+        coverage_measurement=coverage_measurement,
     )
     add("HISTORICAL-EXCEPTION.json", scope.to_bytes())
     add("LINEAGE-PLAN.json", plan.to_bytes())
@@ -559,6 +650,35 @@ def materialize(args) -> dict:
 
 
 def decision_document(candidate, policy, package, budgets, has_storage: bool) -> str:
+    from tradingagents.policy_coverage_models import CoveragePolicy
+
+    coverage_text = ""
+    if isinstance(policy, CoveragePolicy):
+        coverage_text = f"""
+This is the DISTINCT v2 coverage proposal, not the old original-root-equality policy.
+Exact coverage scope: `{policy.coverage_scope.identity}`; its complete bytes/pin
+are COVERAGE-SCOPE.json and PACKAGE-MANIFEST.json. Measurement:
+`{policy.coverage_measurement.identity}`. All seven enumeration-failure markers,
+their separate directory rows and all 5,322 retained reparse records stay visible.
+
+The proposed human design/risk decision must separately adopt known-recorded-field
+matching, permanently UNKNOWN historical coverage and strict preservation within
+a genuinely new complete B0 window. This does not prove historical completeness,
+object identity continuity, unchanged hidden contents or historical link targets.
+It cannot retroactively complete the original acquisition or erase any BLOCKED
+outcome. The 2,571-row attributes exception supplies none of this different authority.
+
+Only exact declared, supported mount-point/junction objects are measurable under
+the proposed bounded no-follow/contained-target contract. Current unreadability,
+missing security data, changed known fields, unsupported/escaping/cyclic/undeclared
+links and missing required target coverage remain blocking. Actual historical
+roots have NOT been measured by this development campaign. Their readability,
+current tags, containment and preservation remain unknown.
+
+B0, its assessment, acquisition IDs and future irreversible claim remain
+UNMATERIALIZED. No test fixture can supply these real inputs. Operational mode
+rejects generated fixture observations. No prior approval or dates transfer.
+"""
     rows = "\n".join(
         f"| {item['stage']} | {item['maximum_execution_seconds']} | {item['maximum_cleanup_seconds']} |"
         for item in budgets["stage_budgets"]
@@ -584,6 +704,7 @@ The exact original pair retains 2571 raw attribute differences
 cause UNRESOLVED, historical Important unresolved, and every old BLOCKED outcome.
 Only the registered original acquisitions can qualify for the proposed exception.
 New discrepancies and unchanged mandatory predicate failures remain terminal.
+{coverage_text}
 
 One lineage and one permanently consumed claim are proposed, with a seven-day
 claim window and thirty-day terminal window after authentic effectiveness.
@@ -638,6 +759,11 @@ def main() -> int:
     ):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--setup-bindings", type=Path)
+    parser.add_argument(
+        "--coverage-v2",
+        action="store_true",
+        help="Prepare the distinct unsigned coverage contract; no adoption or authority",
+    )
     parser.add_argument(
         "--expected-parent",
         default=BASE_COMMIT,

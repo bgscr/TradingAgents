@@ -52,7 +52,9 @@ class OriginalAcquisitionRegistry(Sealed):
         return self
 
     def validate_policy(self, policy: AcceptancePolicy) -> None:
-        scope = AcceptancePolicy.read(policy).scope
+        from tradingagents.policy_coverage_models import read_model
+
+        scope = read_model(AcceptancePolicy, policy).scope
         if (
             scope.before != self.before
             or scope.after != self.after
@@ -207,6 +209,7 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
     if version in {
         "policy-owner-evidence-intake-batch-v1",
         "policy-owner-evidence-intake-batch-v2",
+        "policy-owner-evidence-intake-batch-v3",
     }:
         if (
             set(document) != {"contract_version", "entries", "execution_authorized"}
@@ -224,7 +227,11 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
             not isinstance(entry, dict)
             or set(entry) != {"contract_version", "kind", "key", "value"}
             or entry["contract_version"]
-            not in {"policy-owner-evidence-intake-v1", "policy-owner-evidence-intake-v2"}
+            not in {
+                "policy-owner-evidence-intake-v1",
+                "policy-owner-evidence-intake-v2",
+                "policy-owner-evidence-intake-v3",
+            }
         ):
             raise ValueError("invalid closed evidence intake entry")
         if entry["contract_version"] == "policy-owner-evidence-intake-v2" and entry["kind"] not in {
@@ -233,6 +240,21 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
             "observation",
         }:
             raise ValueError("unsupported versioned evidence intake kind")
+        if entry["contract_version"] == "policy-owner-evidence-intake-v3" and entry["kind"] not in {
+            "artifact-acquisition",
+            "observation",
+        }:
+            raise ValueError("unsupported v3 acquisition intake kind")
+        if (
+            entry["kind"] == "artifact-acquisition"
+            and entry["contract_version"] != "policy-owner-evidence-intake-v3"
+        ):
+            raise ValueError("acquisition descriptor requires explicit v3 intake")
+        if (
+            version == "policy-owner-evidence-intake-batch-v2"
+            and entry["contract_version"] == "policy-owner-evidence-intake-v3"
+        ):
+            raise ValueError("v3 acquisition cannot be reinterpreted under a v2 batch")
         if (
             entry["kind"] == "artifact-reference"
             and entry["contract_version"] != "policy-owner-evidence-intake-v2"
@@ -259,4 +281,20 @@ def evidence_intake_entries(document: dict) -> tuple[dict, ...]:
         if key in keys:
             raise ValueError("duplicate key within authenticated evidence intake")
         keys.add(key)
+    # V3 explicitly separates an immutable payload from a single fresh
+    # acquisition. It may not renew an acquisition by changing descriptor dates.
+    acquisitions = {}
+    for entry in entries:
+        if entry["kind"] not in {"artifact-reference", "artifact-acquisition"}:
+            continue
+        descriptor = entry["value"].get("descriptor")
+        if not isinstance(descriptor, dict):
+            raise ValueError("compact intake has no descriptor")
+        acquisition = descriptor.get("acquisition_identity")
+        if not isinstance(acquisition, str) or not acquisition:
+            raise ValueError("compact intake has no acquisition identity")
+        prior = acquisitions.get(acquisition)
+        if prior is not None and "artifact-acquisition" in {prior, entry["kind"]}:
+            raise ValueError("duplicate v3 acquisition within authenticated batch")
+        acquisitions[acquisition] = entry["kind"]
     return tuple(entries)

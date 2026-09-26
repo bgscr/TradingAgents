@@ -63,12 +63,17 @@ def prepare(args):
                 "descriptor_sha256": "f" * 64,
             }
         ]
+        if getattr(args, "coverage_v2", False):
+            from scripts.policy_owner.coverage_test_vectors import historical_rows
+
+            entries.extend(historical_rows())
+            entries.sort(key=lambda row: (row["path"].casefold(), row["kind"]))
         roots = [
             {
                 "path": root,
                 "entries": entries,
                 "file_count": 0,
-                "unreadable_count": 0,
+                "unreadable_count": 7 if getattr(args, "coverage_v2", False) else 0,
                 "security_descriptors_requested": True,
                 "inventory_identity": content_identity(
                     "crash-protection-historical-root-inventory:v1", entries
@@ -80,7 +85,7 @@ def prepare(args):
             "roots": roots,
             "elapsed_seconds": 1.0,
             "file_count": 0,
-            "unreadable_count": 0,
+            "unreadable_count": 7 if getattr(args, "coverage_v2", False) else 0,
             "no_acl_write_or_recovery": True,
         }
         if phase == "after":
@@ -204,6 +209,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dependencies", required=True, type=Path)
+    parser.add_argument(
+        "--coverage-v2",
+        action="store_true",
+        help="Distinct generated seven-gap/5322-link TEST corpus; no real measurements",
+    )
     for name in ("instance", "operator-sid", "account-name"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()

@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from tradingagents.policy_coverage_models import read_model
 from tradingagents.policy_qualified_contract import (
     STAGES,
     EvidenceRef,
@@ -125,7 +126,7 @@ class LineageLedger:
         row = connection.execute(
             "SELECT payload FROM claims WHERE lineage=?", (claim.lineage_identity,)
         ).fetchone()
-        if row is None or LineageClaim.read(row[0]) != claim:
+        if row is None or read_model(LineageClaim, row[0]) != claim:
             raise ValueError("missing or conflicting consumed lineage")
         records = []
         previous = claim.lineage_identity
@@ -191,7 +192,7 @@ class LineageLedger:
         return identity
 
     def claim(self, value: LineageClaim) -> None:
-        claim = LineageClaim.read(value)
+        claim = read_model(LineageClaim, value)
         with self._connection() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             self._not_invalidated(
@@ -235,13 +236,13 @@ class LineageLedger:
 
     def events(self, claim: LineageClaim) -> tuple[dict, ...]:
         with self._connection() as connection:
-            return tuple(self._events(connection, LineageClaim.read(claim)))
+            return tuple(self._events(connection, read_model(LineageClaim, claim)))
 
     def transition(
         self, claim: LineageClaim, *, kind: str, at: str, evidence: EvidenceRef | None = None
     ) -> str:
         """Atomic compare-and-append. A started stage can never be started twice."""
-        claim = LineageClaim.read(claim)
+        claim = read_model(LineageClaim, claim)
         with self._connection() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             if kind not in {"FAILED", "EXPIRED", "REVOKED"}:

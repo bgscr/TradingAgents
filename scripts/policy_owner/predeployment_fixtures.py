@@ -12,6 +12,7 @@ import io
 import json
 import tarfile
 import zipfile
+from collections.abc import MutableMapping
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
@@ -25,6 +26,7 @@ from tradingagents.offline_runtime_bundle import (
     build_offline_runtime_bundle,
     verify_offline_runtime_bundle,
 )
+from tradingagents.policy_coverage_models import read_model
 from tradingagents.policy_qualification_lifecycle import LineageLedger
 from tradingagents.policy_qualified_contract import (
     STAGES,
@@ -153,11 +155,46 @@ def first_stage(root: Path) -> dict:
     return {"case": case, "source": binding, "manifest": verified, "completion_event": event}
 
 
+class DiskFixtureArtifacts(MutableMapping):
+    """Complete immutable fixture bytes on disk, not a mocked evidence reader."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.root.mkdir(exist_ok=False)
+        self.index = {}
+
+    def __getitem__(self, key):
+        return self.index[key].read_bytes()
+
+    def __setitem__(self, key, value):
+        if sha256(value).hexdigest() != key[1]:
+            raise ValueError("fixture byte pin mismatch")
+        path = self.root / (key[1] + ".blob")
+        if path.exists():
+            if path.read_bytes() != value:
+                raise ValueError("immutable fixture conflict")
+        else:
+            with path.open("xb") as stream:
+                stream.write(value)
+        self.index[key] = path
+
+    def __delitem__(self, key):
+        raise ValueError("fixture artifacts are preserved")
+
+    def __iter__(self):
+        return iter(self.index)
+
+    def __len__(self):
+        return len(self.index)
+
+
 class SyntheticOwner:
     """Deliberately fake authenticated owner; never imported by production code."""
 
-    def __init__(self):
-        self.artifacts = {}
+    def __init__(self, artifact_directory=None):
+        self.artifacts = (
+            {} if artifact_directory is None else DiskFixtureArtifacts(artifact_directory)
+        )
         self.pinned = {}
         self.originals = {}
         self.observations = {}
@@ -205,7 +242,7 @@ class SyntheticOwner:
         self.resolutions += 1
         if (
             self.resolution is None
-            or OperatorApproval.read(self.resolution.approval_bytes).approval_identity
+            or read_model(OperatorApproval, self.resolution.approval_bytes).approval_identity
             != approval_identity
         ):
             raise ValueError("SYNTHETIC unauthenticated approval")
@@ -241,16 +278,23 @@ class SyntheticOwner:
         return self.principals.get(ref.identity, "")
 
     def guest_export_root(self, lineage_identity):
-        assert lineage_identity.startswith("historical-state-qualification-lineage:v1:")
+        self._fixture_lineage(lineage_identity)
         return self.export_root
 
     def source_input_root(self, lineage_identity):
-        assert lineage_identity.startswith("historical-state-qualification-lineage:v1:")
+        self._fixture_lineage(lineage_identity)
         return self.source_root
 
     def runtime_bundle_root(self, lineage_identity):
-        assert lineage_identity.startswith("historical-state-qualification-lineage:v1:")
+        self._fixture_lineage(lineage_identity)
         return self.bundle_root
+
+    def _fixture_lineage(self, lineage_identity):
+        expected = getattr(self, "coverage_lineage", None)
+        if expected is not None:
+            assert lineage_identity == expected
+        else:
+            assert lineage_identity.startswith("historical-state-qualification-lineage:v1:")
 
 
 def raw_inventory(
@@ -304,7 +348,7 @@ def raw_inventory(
         "roots": roots,
         "elapsed_seconds": elapsed,
         "file_count": sum(item["file_count"] for item in roots),
-        "unreadable_count": 0,
+        "unreadable_count": sum(item["unreadable_count"] for item in roots),
         "no_acl_write_or_recovery": True,
     }
     if phase == "after":
@@ -321,6 +365,7 @@ class SyntheticCase:
         root_template=None,
         clock_utc=None,
         candidate=None,
+        artifact_directory=None,
     ):
         from tradingagents.windows_sandbox_acceptance import (
             TICKET06_ACCEPTANCE_RESULT_SCHEMA_IDENTITY,
@@ -328,7 +373,7 @@ class SyntheticCase:
         )
 
         self.root = tmp_path
-        self.owner = owner = SyntheticOwner()
+        self.owner = owner = SyntheticOwner(artifact_directory)
         owner.fixture_root_template = root_template
         if clock_utc is not None:
             fixture_now = utc(clock_utc)
