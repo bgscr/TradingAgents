@@ -583,6 +583,7 @@ class BoundedClient:
         self.denied = []
         self.read_files = set()
         self.sequence = 0
+        self.child_probe_arguments = None
         self.executables = {
             str(OWNER / "bin/PolicyOwner.exe").casefold(),
             str(POWERSHELL).casefold(),
@@ -627,7 +628,11 @@ class BoundedClient:
             finally:
                 self.local_free(parsed)
             executable = str(Path(args[0] or arguments[0]).resolve(strict=True)).casefold()
-            if executable not in self.executables:
+            child_probe = (
+                arguments == self.child_probe_arguments
+                and executable == str(CLIENT_PYTHON.resolve(strict=True)).casefold()
+            )
+            if executable not in self.executables and not child_probe:
                 self.denied.append(event)
                 raise ValueError("TEST client refuses an unreviewed child executable")
             if not self.run:
@@ -637,7 +642,11 @@ class BoundedClient:
                     if NAMESPACE_BINDING is not None and not DEPLOYMENT_STAGING_ONLY
                     else None
                 )
-                if arguments != status_arguments and arguments != validation_arguments:
+                if (
+                    arguments != status_arguments
+                    and arguments != validation_arguments
+                    and not child_probe
+                ):
                     raise ValueError(
                         "preparation permits only exact read-only native status or namespace ValidateOnly"
                     )
@@ -736,6 +745,31 @@ class BoundedClient:
             args += [control_path, sha256(raw_control).hexdigest()]
         return self.execute(args, label=label)
 
+    def child_compatibility_preflight(self):
+        from scripts.policy_owner.registered_child_preflight import child_probe_arguments
+
+        self.child_probe_arguments = child_probe_arguments(
+            CLIENT_PYTHON, SOURCE / "scripts/policy_owner/registered_test_child.py", INSTANCE
+        )
+        try:
+            return child_compatibility_preflight(cwd=self.root)
+        finally:
+            self.child_probe_arguments = None
+
+
+def child_compatibility_preflight(*, cwd):
+    from scripts.policy_owner.registered_child_preflight import verify_child_compatibility
+
+    child = SOURCE / "scripts/policy_owner/registered_test_child.py"
+    child_pin = pin(child)
+    return verify_child_compatibility(
+        CLIENT_PYTHON,
+        child,
+        INSTANCE,
+        cwd=cwd,
+        expected_child_pin={key: child_pin[key] for key in ("byte_length", "sha256")},
+    )
+
 
 def anchor_and_enrollment(client):
     global AUTHENTICATION_ID
@@ -773,6 +807,11 @@ def anchor_and_enrollment(client):
         if pin(path)["sha256"] != digest:
             raise ValueError("immutable registered file drift: " + str(path))
     require_deployed_source_consistency()
+    if not client.run:
+        write_new(
+            client.root / "TEST-child-compatibility-preflight.json",
+            canonical(client.child_compatibility_preflight()),
+        )
     status = client.execute(
         [OWNER / "bin/PolicyOwner.exe", "status", INSTANCE], label="registered-status"
     )
@@ -1306,12 +1345,15 @@ def main():
             raise ValueError("staged deployment check requires -I -B -S")
         if Path(sys.executable).resolve() != CLIENT_PYTHON.resolve():
             raise ValueError("use the exact staged interpreter")
+        os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+        sys.path[:0] = [str(SOURCE), str(DEPENDENCIES)]
         print(
             json.dumps(
                 {
                     "status": "STAGED_DEPLOYMENT_INPUTS_VERIFIED",
                     "instance": INSTANCE,
                     "input_count": len(DEPLOYMENT_INPUTS),
+                    "child_compatibility": child_compatibility_preflight(cwd=Path.cwd()),
                     "owner_contacted": False,
                     "authentication_executed": False,
                     "operational": False,

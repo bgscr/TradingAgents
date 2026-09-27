@@ -21,7 +21,55 @@ def check_environment():
         raise ValueError("native fixture cannot have a live-test flag")
 
 
-def enforce_no_workload(instance):
+def conditional_test_pipe(encoded, instance):
+    """Recognize the two committed conditional families before enabling I/O.
+
+    Attempt v1 uses prepared/control/handoff v2 and envelope v1. Coverage
+    attempt v2 uses those containers at v3 and envelope v2. Full seals,
+    coverage, owner process and guard bindings remain checked by the existing
+    guard adapter and native supervisor; this check supplies no authority.
+    """
+    context = json.loads(base64.b64decode(encoded, validate=True))
+    identity = context.get("attempt_identity") if isinstance(context, dict) else None
+    match = re.fullmatch(
+        r"policy-qualified-runtime-protection-attempt:v(1|2):sha256:([0-9a-f]{64})",
+        identity if isinstance(identity, str) else "",
+    )
+    if match is None:
+        raise ValueError("TEST child has an invalid conditional attempt context")
+    version, digest = match.groups()
+    container = {"1": "2", "2": "3"}[version]
+    gate = context.get("handoff")
+    gate = gate if isinstance(gate, dict) else {}
+    owner = gate.get("owner_binding")
+    owner = owner if isinstance(owner, dict) else {}
+    acceptance = gate.get("acceptance")
+    acceptance = acceptance if isinstance(acceptance, dict) else {}
+    if (
+        context.get("phase") != "guard"
+        or any(
+            not isinstance(context.get(field), str)
+            or re.fullmatch(
+                rf"policy-qualified-runtime-protection-{kind}:v{container}:sha256:[0-9a-f]{{64}}",
+                context[field],
+            )
+            is None
+            for field, kind in (("packet_identity", "control"), ("prepared_identity", "prepared"))
+        )
+        or gate.get("contract_version")
+        != f"policy-qualified-runtime-protection-handoff-v{container}"
+        or gate.get("execution_authorized") is not False
+        or owner.get("contract_version") != "policy-qualified-native-owner-binding-v1"
+        or owner.get("instance") != instance
+        or owner.get("execution_authorized") is not False
+        or acceptance.get("contract_version") != f"policy-qualified-downstream-envelope-v{version}"
+        or acceptance.get("execution_authorized") is not False
+    ):
+        raise ValueError("TEST child has incompatible conditional context bindings")
+    return r"\\.\pipe\TradingAgentsProtection-" + digest
+
+
+def enforce_no_workload(instance, operation):
     """Enforce actual zero-workload behavior in this disposable child."""
     if not re.fullmatch(r"test-[0-9]{8}-[0-9]{3}", instance):
         raise ValueError("native fixture requires an exact TEST instance")
@@ -29,15 +77,10 @@ def enforce_no_workload(instance):
     allowed_command = subprocess.list2cmdline([owner, "request", instance])
     encoded = os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT")
     pipe = None
+    if operation == "guard_only" and encoded is None:
+        raise ValueError("TEST guard requires an exact conditional context")
     if encoded is not None:
-        context = json.loads(base64.b64decode(encoded, validate=True))
-        match = re.fullmatch(
-            r"policy-qualified-runtime-protection-attempt:v1:sha256:([0-9a-f]{64})",
-            context["attempt_identity"],
-        )
-        if match is None:
-            raise ValueError("TEST child has an invalid conditional attempt context")
-        pipe = r"\\.\pipe\TradingAgentsProtection-" + match.group(1)
+        pipe = conditional_test_pipe(encoded, instance)
 
     def audit(event, args):
         if event.startswith("socket.") and event not in {"socket.__new__", "socket.gethostname"}:
@@ -86,10 +129,7 @@ def synthetic_guard_receipt(instance):
 
     context = json.loads(base64.b64decode(os.environ["TRADINGAGENTS_PROTECTION_CONTEXT"]))
     gate = context["handoff"]
-    if (
-        gate["symbol"] != "DISPOSABLE_FIXTURE"
-        or gate["owner_binding"]["instance"] != instance
-    ):
+    if gate["symbol"] != "DISPOSABLE_FIXTURE" or gate["owner_binding"]["instance"] != instance:
         raise ValueError("native child refuses a non-TEST handoff")
     body = {
         "label": "SYNTHETIC GUARD INPUT ONLY; NOT A REAL CHECKPOINT OR QUALIFICATION GUARD",
@@ -136,7 +176,7 @@ def main():
     if len(sys.argv) != 3:
         raise ValueError("exact TEST operation and instance arguments required")
     operation, instance = sys.argv[1:]
-    enforce_no_workload(instance)
+    enforce_no_workload(instance, operation)
     if operation == "inert":
         if "TRADINGAGENTS_PROTECTION_CONTEXT" in os.environ:
             raise ValueError("plain inert mode cannot process a handoff")
