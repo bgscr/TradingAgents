@@ -343,7 +343,11 @@ class LocalWindowsPolicyOwner:
         The small measurement is embedded in the exact decision. Neither scope
         preparation nor this verification authenticates a decision or observation.
         """
-        from tradingagents.policy_coverage_contract import artifact_ref, build_scope
+        from tradingagents.policy_coverage_contract import (
+            RootTypedCoverageMeasurement,
+            artifact_ref,
+            build_scope,
+        )
         from tradingagents.policy_coverage_models import CoveragePolicy
 
         if not isinstance(policy, CoveragePolicy):
@@ -352,6 +356,7 @@ class LocalWindowsPolicyOwner:
             self.read_artifact(policy.scope.before.artifact),
             self.read_artifact(policy.scope.after.artifact),
             fixture_only=not self.anchor["operational"],
+            mixed_roots=isinstance(policy.coverage_measurement, RootTypedCoverageMeasurement),
         )
         if artifact_ref(scope) != policy.coverage_scope:
             raise ValueError("policy coverage scope differs from complete immutable originals")
@@ -673,6 +678,8 @@ class LocalWindowsPolicyOwner:
                 CoverageAssessment,
                 CoverageMeasurement,
                 HistoricalCoverageScope,
+                RootTypedCoverageMeasurement,
+                RootTypedCoverageScope,
             )
             from tradingagents.policy_coverage_models import CoveragePolicy
             from tradingagents.policy_evidence_contract import validate_artifact
@@ -688,6 +695,8 @@ class LocalWindowsPolicyOwner:
                 CoverageAssessment.namespace,
                 CoverageMeasurement.namespace,
                 HistoricalCoverageScope.namespace,
+                RootTypedCoverageMeasurement.namespace,
+                RootTypedCoverageScope.namespace,
             }
             if (
                 isinstance(proposal.policy, CoveragePolicy)

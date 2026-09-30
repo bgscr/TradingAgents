@@ -361,6 +361,9 @@ def materialize(args) -> dict:
     procedure_raw = Path(retained_files["procedure-discovery.json"]["path"]).read_bytes()
     budgets = budget_proposal(strict_json(ledger_raw), strict_json(procedure_raw))
     coverage_version = getattr(args, "coverage_v2", False)
+    mixed_roots = getattr(args, "mixed_roots", False)
+    if mixed_roots and not coverage_version:
+        raise ValueError("mixed ordinary roots require the distinct coverage policy")
     coverage_scope = coverage_measurement = None
     files: dict[str, bytes] = {}
 
@@ -515,6 +518,7 @@ def materialize(args) -> dict:
     if coverage_version:
         from tradingagents.policy_coverage_contract import (
             CoverageMeasurement,
+            RootTypedCoverageMeasurement,
             artifact_ref,
             build_scope,
         )
@@ -523,10 +527,16 @@ def materialize(args) -> dict:
         after_raw = Path(registry.after.original_path).read_bytes()
         registry.before.artifact.pin.check(before_raw)
         registry.after.artifact.pin.check(after_raw)
-        coverage_scope = build_scope(before_raw, after_raw, fixture_only=False)
+        coverage_scope = build_scope(
+            before_raw, after_raw, fixture_only=False, mixed_roots=mixed_roots
+        )
         add("COVERAGE-SCOPE.json", coverage_scope.to_bytes())
-        coverage_measurement = CoverageMeasurement.seal(
-            contract_version="policy-coverage-measurement-v2",
+        measurement_model = RootTypedCoverageMeasurement if mixed_roots else CoverageMeasurement
+        coverage_measurement = measurement_model.seal(
+            contract_version="policy-coverage-measurement-v3"
+            if mixed_roots
+            else "policy-coverage-measurement-v2",
+            **({"root_kind_policy": "EXACT_SAVED_ROOT_KINDS"} if mixed_roots else {}),
             scope=artifact_ref(coverage_scope),
             candidate=candidate,
             supported_reparse_tags=(0xA0000003,),
@@ -759,6 +769,11 @@ def main() -> int:
     ):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--setup-bindings", type=Path)
+    parser.add_argument(
+        "--mixed-roots",
+        action="store_true",
+        help="Opt in to exact saved ordinary root kinds with scope/measurement v3",
+    )
     parser.add_argument(
         "--coverage-v2",
         action="store_true",

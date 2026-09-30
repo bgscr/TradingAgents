@@ -60,14 +60,11 @@ def main() -> int:
     if bool(args.coverage_scope) != bool(args.coverage_measurement):
         raise ValueError("complete coverage scope and measurement context required")
     if args.coverage_scope:
-        from tradingagents.policy_coverage_contract import (
-            CoverageMeasurement,
-            HistoricalCoverageScope,
-        )
+        from tradingagents.policy_coverage_contract import read_coverage_context
 
-        coverage_context = (
-            HistoricalCoverageScope.read(args.coverage_scope.read_bytes()),
-            CoverageMeasurement.read(args.coverage_measurement.read_bytes()),
+        coverage_context = read_coverage_context(
+            args.coverage_scope.read_bytes(),
+            args.coverage_measurement.read_bytes(),
         )
 
     if fixture:

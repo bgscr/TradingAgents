@@ -1,4 +1,4 @@
-"""No-follow local object acquisition for the explicit coverage-v2 contract.
+"""No-follow local object acquisition for explicit directory/mixed-root contracts.
 
 No service, credential, backup privilege or repair APIs are used. Link support
 is deliberately confined to measurement, not executable/artifact path admission.
@@ -18,11 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tradingagents.policy_coverage_contract import (
-    CoverageMeasurement,
-    HistoricalCoverageScope,
     artifact_ref,
+    coverage_capture_method,
+    expected_root_kind,
     local_path,
     parse_mount_point,
+    read_coverage_context,
     relative_parts,
     validate_current_inventory,
 )
@@ -288,7 +289,7 @@ def capture_coverage(
     """Capture fresh explicit roots once; failed observations remain unadmitted."""
     import sys
 
-    scope, measurement = HistoricalCoverageScope.read(scope), CoverageMeasurement.read(measurement)
+    scope, measurement = read_coverage_context(scope, measurement)
     if (
         measurement.scope != artifact_ref(scope)
         or scope.fixture_only != fixture_only
@@ -350,7 +351,7 @@ def capture_coverage(
                     found.append(Path(entry.path))
             return sorted(found, key=lambda item: item.name.casefold())
 
-        def walk(path, depth=0, *, root=root, rows=rows):
+        def walk(path, depth=0, *, root=root, rows=rows, root_index=root_index):
             nonlocal count, read_bytes
             budget()
             if depth > measurement.maximum_depth:
@@ -358,6 +359,12 @@ def capture_coverage(
             relative = "." if path == root else path.relative_to(root).as_posix()
             try:
                 info = _available_local(path)
+                if depth == 0 and (
+                    info.st_file_attributes & 0x400
+                    or ("directory" if stat.S_ISDIR(info.st_mode) else "file")
+                    != expected_root_kind(scope, root_index)
+                ):
+                    raise ValueError("actual ordinary root type differs from trusted scope")
                 if info.st_file_attributes & 0x400:
                     if (str(root), relative) not in declared:
                         raise ValueError("new or undeclared reparse object")
@@ -438,7 +445,7 @@ def capture_coverage(
         "finished_utc": datetime.now(timezone.utc).isoformat(),
         "collector_pin": collector.model_dump(mode="json"),
         "runtime_pin": runtime.model_dump(mode="json"),
-        "method": "held-local-objects-and-contained-mount-point-v2",
+        "method": coverage_capture_method(scope),
         "complete": not errors,
         "errors": errors,
         "observed_entries": count,

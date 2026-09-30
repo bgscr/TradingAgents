@@ -29,6 +29,47 @@ requested coverage and identity values are accounted for as acquisition metadata
 old and new hashes stay distinct. Original missing object IDs, security descriptors,
 descendants and link tag/target data are permanently UNKNOWN, never backfilled.
 
+## Explicit ordinary file-root capability
+
+The coverage policy/result/receipt remain v2. Exact ordinary file roots require
+the paired `historical-coverage-scope-v3` and `policy-coverage-measurement-v3`
+artifacts. The scope records one ordered `root_kinds` value for every original
+root; derivation checks the ordinary `.` row in BOTH exact saved acquisitions.
+The measurement binds `root_kind_policy=EXACT_SAVED_ROOT_KINDS`. Mixed version
+pairs reject. These references change the exact policy and approval identities;
+an earlier approval cannot acquire this capability by reinterpretation.
+
+The scope command opts in with `scope --mixed-roots`; package preparation uses
+`--coverage-v2 --mixed-roots`. Without that opt-in, the existing scope-v2 and
+measurement-v2 bytes and directory-only acceptance remain unchanged. Directory
+roots in v3 retain every existing descendant, security and reparse predicate.
+Neither version permits omitted roots or substitution of a parent directory.
+
+A file root has exactly one ordinary `.` file row and no descendants. The dot is
+an inventory identifier, never a suffix appended to the physical file path.
+Native acquisition checks the no-follow root type against the trusted scope
+before enumerating a directory or reading file contents. It retains the ordinary
+held handle, native identity, security descriptor, complete length/hash, raw
+attributes, timestamps and before/after change checks. Reparse objects, aliases
+and non-regular files cannot enter the file branch. Legal attributes such as
+ARCHIVE are not required to equal NORMAL; all recorded bits, including
+`0x10000000`, remain part of the known-field and current-window comparisons.
+
+The native method for scope-v3 is
+`held-exact-root-objects-and-contained-mount-point-v3`. Its generated test-only
+counterpart is `generated-mixed-root-coverage-schema-vector-v3`. Both retain the
+current inventory/acquisition envelopes v2, whose exact scope, measurement,
+candidate and collector/runtime references bind the capability. The existing
+descriptor/intake, claim, result and receipt protocols do not gain new authority.
+
+The native consumer accepts only paired scope/measurement references v2/v2 or
+v3/v3 and preserves every existing caveat. Its source change requires a new
+pinned native build. Python source manifests, native consumer/build identities,
+delivery manifests and any bound grants/storage context must be reviewed for the
+new candidate. This does not authorize replacing an installed owner or modifying
+its immutable registry, mode, storage or approvals in place. Registered native
+validation remains pending until separately authorized and actually performed.
+
 ## Bounded native link-object measurement
 
 The initial implementation supports explicitly declared Windows mount-point

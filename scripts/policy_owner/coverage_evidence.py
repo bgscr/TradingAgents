@@ -19,6 +19,7 @@ def main():
     scope_cmd = sub.add_parser("scope")
     scope_cmd.add_argument("--before", type=Path, required=True)
     scope_cmd.add_argument("--after", type=Path, required=True)
+    scope_cmd.add_argument("--mixed-roots", action="store_true")
     measure_cmd = sub.add_parser("measurement")
     measure_cmd.add_argument("--scope", type=Path, required=True)
     measure_cmd.add_argument("--candidate", type=Path, required=True)
@@ -61,11 +62,14 @@ def main():
     from tradingagents.policy_coverage_contract import (
         MAX_INVENTORY_BYTES,
         CoverageMeasurement,
-        HistoricalCoverageScope,
+        RootTypedCoverageMeasurement,
+        RootTypedCoverageScope,
         artifact_ref,
         build_scope,
         compare_current_inventories,
         compare_known_fields,
+        read_coverage_context,
+        read_scope,
         validate_scope,
     )
     from tradingagents.policy_evidence_acquisition import new_evidence_output
@@ -99,14 +103,24 @@ def main():
     if args.output.exists():
         raise FileExistsError("fresh additive output required")
     if args.command == "scope":
-        result = build_scope(raw(args.before), raw(args.after), fixture_only=args.fixture_only)
+        result = build_scope(
+            raw(args.before),
+            raw(args.after),
+            fixture_only=args.fixture_only,
+            mixed_roots=args.mixed_roots,
+        )
     else:
-        scope = HistoricalCoverageScope.read(read(args.scope))
+        scope = read_scope(read(args.scope))
         if scope.fixture_only != args.fixture_only:
             raise ValueError("explicit fixture scope mismatch")
         if args.command == "measurement":
-            result = CoverageMeasurement.seal(
-                contract_version="policy-coverage-measurement-v2",
+            mixed = isinstance(scope, RootTypedCoverageScope)
+            model = RootTypedCoverageMeasurement if mixed else CoverageMeasurement
+            result = model.seal(
+                contract_version="policy-coverage-measurement-v3"
+                if mixed
+                else "policy-coverage-measurement-v2",
+                **({"root_kind_policy": "EXACT_SAVED_ROOT_KINDS"} if mixed else {}),
                 scope=artifact_ref(scope),
                 candidate=Candidate.read(read(args.candidate)),
                 supported_reparse_tags=(0xA0000003,),
@@ -121,9 +135,7 @@ def main():
                 known_fields_required=True,
             )
         else:
-            measurement = CoverageMeasurement.read(read(args.measurement))
-            if measurement.scope != artifact_ref(scope):
-                raise ValueError("scope/measurement exact binding mismatch")
+            scope, measurement = read_coverage_context(scope, read(args.measurement))
             if args.command == "capture":
                 from tradingagents.policy_coverage_native import capture_coverage
 

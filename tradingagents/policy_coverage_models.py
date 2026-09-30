@@ -8,7 +8,11 @@ from pydantic import BaseModel, Field, model_validator
 from typing_extensions import Self
 
 from tradingagents import policy_qualified_contract as v1
-from tradingagents.policy_coverage_contract import CoverageMeasurement, artifact_ref
+from tradingagents.policy_coverage_contract import (
+    CoverageMeasurement,
+    RootTypedCoverageMeasurement,
+    artifact_ref,
+)
 from tradingagents.policy_owner_contract import PolicyDecisionProposal
 
 
@@ -26,7 +30,9 @@ class CoveragePolicy(v1.AcceptancePolicy):
     namespace = "historical-state-acceptance-policy:v2"
     contract_version: Literal["historical-state-acceptance-policy-v2"]
     coverage_scope: v1.EvidenceRef
-    coverage_measurement: CoverageMeasurement
+    coverage_measurement: CoverageMeasurement | RootTypedCoverageMeasurement = Field(
+        discriminator="contract_version"
+    )
     coverage_rule: Literal["KNOWN_RECORDED_FIELDS_UNKNOWN_HISTORY_STRICT_CURRENT_WINDOW"]
 
     @model_validator(mode="after")
@@ -36,6 +42,11 @@ class CoveragePolicy(v1.AcceptancePolicy):
             or self.coverage_measurement.candidate != self.scope.candidate
             or self.lineage_plan.measurement_contract_pin
             != v1.BytePin.of(self.coverage_measurement.to_bytes())
+            or not self.coverage_scope.identity.startswith(
+                "historical-coverage-scope:v3:sha256:"
+                if isinstance(self.coverage_measurement, RootTypedCoverageMeasurement)
+                else "historical-coverage-scope:v2:sha256:"
+            )
         ):
             raise ValueError("versioned coverage policy/measurement/scope/candidate mismatch")
         return self

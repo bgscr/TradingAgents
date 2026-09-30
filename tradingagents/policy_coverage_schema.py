@@ -19,6 +19,8 @@ def coverage_contract_descriptor():
     models = [
         evidence.HistoricalCoverageScope,
         evidence.CoverageMeasurement,
+        evidence.RootTypedCoverageScope,
+        evidence.RootTypedCoverageMeasurement,
         evidence.CoverageAssessment,
         *qualified._MODELS.values(),
         CoverageProductionQualifiedRoutingSourceBinding,
@@ -58,6 +60,15 @@ def coverage_contract_descriptor():
             "old_v1_v2_semantics_unchanged": True,
         },
         "historical_coverage": "UNKNOWN",
+        "ordinary_root_capabilities": {
+            "directory_only": ["historical-coverage-scope-v2", "policy-coverage-measurement-v2"],
+            "exact_saved_root_kinds": [
+                "historical-coverage-scope-v3",
+                "policy-coverage-measurement-v3",
+            ],
+            "cross_version_pairs_allowed": False,
+            "new_exact_policy_and_approval_required": True,
+        },
         "execution_authorized": False,
     }
     return {

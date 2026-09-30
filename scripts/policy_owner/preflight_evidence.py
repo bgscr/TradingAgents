@@ -397,8 +397,8 @@ def main():
         if digest(args.coverage_witness)[1] != args.coverage_witness_sha256:
             raise ValueError("coverage witness byte pin mismatch")
         from tradingagents.policy_coverage_contract import (
-            HistoricalCoverageScope,
             artifact_ref,
+            read_coverage_context,
             validate_scope,
         )
         from tradingagents.policy_coverage_models import CoveragePolicy
@@ -406,7 +406,7 @@ def main():
         policy = CoveragePolicy.read(args.coverage_policy.read_bytes())
         scope_raw = args.coverage_scope.read_bytes()
         policy.coverage_scope.pin.check(scope_raw)
-        scope = HistoricalCoverageScope.read(scope_raw)
+        scope, _ = read_coverage_context(scope_raw, policy.coverage_measurement)
         validate_scope(scope, args.coverage_before.read_bytes(), args.coverage_after.read_bytes())
         if (
             artifact_ref(scope) != policy.coverage_scope

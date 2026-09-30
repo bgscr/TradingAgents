@@ -92,6 +92,48 @@ class HistoricalCoverageScope(Sealed):
         return self
 
 
+class RootTypedCoverageScope(HistoricalCoverageScope):
+    """Explicit opt-in: root types are derived from the exact original pair."""
+
+    namespace = "historical-coverage-scope:v3"
+    contract_version: Literal["historical-coverage-scope-v3"]
+    root_kinds: tuple[Literal["directory", "file"], ...]
+
+    @model_validator(mode="after")
+    def _root_types(self) -> Self:
+        if len(self.root_kinds) != len(self.roots) or any(
+            self.root_kinds[row.root_index] != "directory" for row in (*self.gaps, *self.links)
+        ):
+            raise ValueError("exact root kinds must cover every root and exceptional row")
+        return self
+
+
+def read_scope(value: object) -> HistoricalCoverageScope:
+    if isinstance(value, Sealed):
+        value = value.model_dump(mode="json")
+    if isinstance(value, (bytes, str)):
+        value = strict_json(value)
+    model = (
+        RootTypedCoverageScope
+        if isinstance(value, dict)
+        and value.get("contract_version") == "historical-coverage-scope-v3"
+        else HistoricalCoverageScope
+    )
+    return model.read(value)
+
+
+def expected_root_kind(scope: HistoricalCoverageScope, index: int) -> str:
+    return scope.root_kinds[index] if isinstance(scope, RootTypedCoverageScope) else "directory"
+
+
+def _saved_root_kind(root: dict) -> str:
+    rows = root["entries"]
+    ordinary = [row for row in rows if row["path"] == "." and row["kind"] in {"file", "directory"}]
+    if len(ordinary) != 1 or (ordinary[0]["kind"] == "file" and len(rows) != 1):
+        raise ValueError("saved exact ordinary root required; file roots cannot have descendants")
+    return ordinary[0]["kind"]
+
+
 def read_historical(raw: bytes) -> tuple[dict, EvidenceRef]:
     if not 0 < len(raw) <= MAX_INVENTORY_BYTES:
         raise ValueError("historical artifact exceeds bounded evidence capacity")
@@ -109,7 +151,7 @@ def read_historical(raw: bytes) -> tuple[dict, EvidenceRef]:
 
 
 def build_scope(
-    before_bytes: bytes, after_bytes: bytes, *, fixture_only: bool
+    before_bytes: bytes, after_bytes: bytes, *, fixture_only: bool, mixed_roots: bool = False
 ) -> HistoricalCoverageScope:
     """Derive ALL saved exceptional records, with no caller-selected subset."""
     before, before_ref = read_historical(before_bytes)
@@ -118,8 +160,13 @@ def build_scope(
         raise ValueError("original before/after acquisition phases required")
     if [x["path"] for x in before["roots"]] != [x["path"] for x in after["roots"]]:
         raise ValueError("original root scopes differ")
-    gaps, links = [], []
+    gaps, links, root_kinds = [], [], []
     for ri, root in enumerate(after["roots"]):
+        if mixed_roots:
+            kind = _saved_root_kind(root)
+            if _saved_root_kind(before["roots"][ri]) != kind:
+                raise ValueError("original root kind changed within original pair")
+            root_kinds.append(kind)
         rows = root["entries"]
         indexed = {(r["path"], r["kind"]): (i, r) for i, r in enumerate(rows)}
         old_indexed = {(r["path"], r["kind"]): r for r in before["roots"][ri]["entries"]}
@@ -150,8 +197,12 @@ def build_scope(
                 links.append(item)
             if old_indexed.get((row["path"], row["kind"])) != row:
                 raise ValueError("coverage marker/link changed within original pair")
-    return HistoricalCoverageScope.seal(
-        contract_version="historical-coverage-scope-v2",
+    model = RootTypedCoverageScope if mixed_roots else HistoricalCoverageScope
+    return model.seal(
+        contract_version="historical-coverage-scope-v3"
+        if mixed_roots
+        else "historical-coverage-scope-v2",
+        **({"root_kinds": tuple(root_kinds)} if mixed_roots else {}),
         before=before_ref,
         after=after_ref,
         roots=tuple(root["path"] for root in after["roots"]),
@@ -183,8 +234,16 @@ def build_scope(
 def validate_scope(
     scope: object, before_bytes: bytes, after_bytes: bytes
 ) -> HistoricalCoverageScope:
-    scope = HistoricalCoverageScope.read(scope)
-    if build_scope(before_bytes, after_bytes, fixture_only=scope.fixture_only) != scope:
+    scope = read_scope(scope)
+    if (
+        build_scope(
+            before_bytes,
+            after_bytes,
+            fixture_only=scope.fixture_only,
+            mixed_roots=isinstance(scope, RootTypedCoverageScope),
+        )
+        != scope
+    ):
         raise ValueError("coverage scope does not preserve the complete exact original record set")
     return scope
 
@@ -211,6 +270,49 @@ class CoverageMeasurement(Sealed):
     target_coverage: Literal["SEPARATE_ORDINARY_ROOT_WALK"]
     known_fields_required: Literal[True]
     identity: Identity
+
+
+class RootTypedCoverageMeasurement(CoverageMeasurement):
+    namespace = "policy-coverage-measurement:v3"
+    contract_version: Literal["policy-coverage-measurement-v3"]
+    root_kind_policy: Literal["EXACT_SAVED_ROOT_KINDS"]
+
+
+def read_measurement(value: object) -> CoverageMeasurement:
+    if isinstance(value, Sealed):
+        value = value.model_dump(mode="json")
+    if isinstance(value, (bytes, str)):
+        value = strict_json(value)
+    model = (
+        RootTypedCoverageMeasurement
+        if isinstance(value, dict)
+        and value.get("contract_version") == "policy-coverage-measurement-v3"
+        else CoverageMeasurement
+    )
+    return model.read(value)
+
+
+def read_coverage_context(scope: object, measurement: object):
+    scope, measurement = read_scope(scope), read_measurement(measurement)
+    if isinstance(scope, RootTypedCoverageScope) != isinstance(
+        measurement, RootTypedCoverageMeasurement
+    ) or measurement.scope != artifact_ref(scope):
+        raise ValueError("scope/measurement exact version and capability binding mismatch")
+    return scope, measurement
+
+
+def coverage_capture_method(scope: HistoricalCoverageScope, *, generated: bool = False) -> str:
+    if generated:
+        return (
+            "generated-mixed-root-coverage-schema-vector-v3"
+            if isinstance(scope, RootTypedCoverageScope)
+            else "generated-coverage-schema-vector-v2"
+        )
+    return (
+        "held-exact-root-objects-and-contained-mount-point-v3"
+        if isinstance(scope, RootTypedCoverageScope)
+        else "held-local-objects-and-contained-mount-point-v2"
+    )
 
 
 class CoverageAssessment(Sealed):
@@ -347,7 +449,7 @@ def _acyclic_directory_graph(rows):
 
 def validate_current_inventory(value: dict, scope: object, measurement: object) -> dict:
     """Independent full schema/coverage checks; physical authenticity is separate."""
-    scope, measurement = HistoricalCoverageScope.read(scope), CoverageMeasurement.read(measurement)
+    scope, measurement = read_coverage_context(scope, measurement)
     if (
         measurement.scope != artifact_ref(scope)
         or not isinstance(value, dict)
@@ -391,7 +493,7 @@ def validate_current_inventory(value: dict, scope: object, measurement: object) 
         "descriptor_sha256",
         "object_identity",
     }
-    for root in value["roots"]:
+    for root_index, root in enumerate(value["roots"]):
         root_path = local_path(root["path"])
         if (
             set(root)
@@ -421,8 +523,11 @@ def validate_current_inventory(value: dict, scope: object, measurement: object) 
             raise ValueError("current paths duplicated, aliased, missing or unordered")
         by_path = {r["path"]: r for r in rows}
         object_keys = []
-        if by_path.get(".", {}).get("kind") != "directory":
+        root_kind = expected_root_kind(scope, root_index)
+        if by_path.get(".", {}).get("kind") != root_kind:
             raise ValueError("complete ordinary root row required")
+        if root_kind == "file" and names != ["."]:
+            raise ValueError("exact file root must contain only its ordinary root row")
         for row in rows:
             parts = relative_parts(row["path"])
             if len(parts) > measurement.maximum_depth:
@@ -531,12 +636,12 @@ def validate_current_inventory(value: dict, scope: object, measurement: object) 
         value["fixture_only"] is True
         and isinstance(capture, dict)
         and capture.get("origin") == "GENERATED_FIXTURE_NOT_AN_OBSERVATION"
-        and capture.get("method") == "generated-coverage-schema-vector-v2"
+        and capture.get("method") == coverage_capture_method(scope, generated=True)
     )
     native = (
         isinstance(capture, dict)
         and capture.get("origin") == "NEW_OBSERVATION"
-        and capture.get("method") == "held-local-objects-and-contained-mount-point-v2"
+        and capture.get("method") == coverage_capture_method(scope)
     )
     if (
         not isinstance(capture, dict)
@@ -575,7 +680,7 @@ def compare_known_fields(
     scope, before_bytes: bytes, after_bytes: bytes, baseline: dict, measurement
 ) -> CoverageAssessment:
     scope = validate_scope(scope, before_bytes, after_bytes)
-    measurement = CoverageMeasurement.read(measurement)
+    measurement = read_measurement(measurement)
     baseline = validate_current_inventory(baseline, scope, measurement)
     after, _ = read_historical(after_bytes)
     if baseline["phase"] != "before":

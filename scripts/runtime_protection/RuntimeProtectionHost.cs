@@ -798,8 +798,9 @@ namespace TradingAgents.RuntimeProtection
             var core=Obj(envelope["core"]);Closed(core,"contract_version","result","binding","candidate","history","lineage","expires_utc","execution_authorized");
             var history=Obj(core["history"]);Closed(history,"contract_version","historical_claim","historical_equal","historical_cause","prior_outcome","scope","coverage","known_recorded_fields","current_window");
             var coverage=Obj(history["coverage"]);Closed(coverage,"scope","measurement","baseline","assessment","historical_coverage","historical_object_continuity","hidden_contents");
-            CoverageReference(coverage["scope"],"historical-coverage-scope:v2");
-            CoverageReference(coverage["measurement"],"policy-coverage-measurement:v2");
+            bool typedRoots=Str(Obj(coverage["scope"])["identity"]).StartsWith("historical-coverage-scope:v3:sha256:",StringComparison.Ordinal);
+            CoverageReference(coverage["scope"],typedRoots?"historical-coverage-scope:v3":"historical-coverage-scope:v2");
+            CoverageReference(coverage["measurement"],typedRoots?"policy-coverage-measurement:v3":"policy-coverage-measurement:v2");
             CoverageReference(coverage["baseline"],"policy-coverage-inventory:v2");
             CoverageReference(coverage["assessment"],"policy-coverage-assessment:v2");
             CoverageReference(core["result"],"policy-qualified-execution-result:v2");

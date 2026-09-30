@@ -7,6 +7,7 @@ from tradingagents.policy_coverage_contract import (
     CURRENT_NAMESPACE,
     CoverageAssessment,
     HistoricalCoverageScope,
+    RootTypedCoverageScope,
     artifact_ref,
     compare_current_inventories,
     compare_known_fields,
@@ -126,7 +127,12 @@ def resolve_coverage(verifier, policy, binding, *, claim=None):
         return scope, baseline
     if context is not None:
         context["entry"] = None
-    scope = verifier._model(binding.scope, HistoricalCoverageScope)
+    scope_model = (
+        RootTypedCoverageScope
+        if binding.scope.identity.startswith(RootTypedCoverageScope.namespace + ":sha256:")
+        else HistoricalCoverageScope
+    )
+    scope = verifier._model(binding.scope, scope_model)
     if scope.before != policy.scope.before.artifact or scope.after != policy.scope.after.artifact:
         raise ValueError("coverage scope differs from exact original acquisitions")
     verifier._bytes(binding.measurement)
