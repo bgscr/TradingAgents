@@ -220,17 +220,21 @@ def batch(plan_path: Path) -> int:
                 finally:
                     record["controller_handle_close_monotonic_after"] = time.monotonic()
             try:
+                require(time.monotonic() < active_deadline, "chain active budget exhausted before Job creation")
                 job = api.CreateJobObjectW(None, None); api.check(job, "create new TEST outer Job")
                 limits = helper._Extended(); limits.limits.flags = 0x2000
                 api.check(api.SetInformationJobObject(job, 9, c.byref(limits), c.sizeof(limits)), "TEST Job kill-on-close")
+                require(time.monotonic() < active_deadline, "chain active budget exhausted before controller launch")
                 process = subprocess.Popen([sys.executable, "-I", "-B", "-S", str(Path(__file__).absolute()), "--controller", str(reservation_path)],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, cwd=case_root, env=environment,
                     creationflags=subprocess.CREATE_NO_WINDOW)
                 record["created"] = True
                 api.check(api.AssignProcessToJobObject(job, int(process._handle)), "assign GO-blocked TEST controller")
                 record["job_assigned"] = True; record["identity"] = helper._controller_identity(api, process, sys.executable)
+                remaining = active_deadline - time.monotonic()
+                require(remaining > 0, "chain active budget exhausted before GO")
                 record["go_sent"] = True
-                stdout, stderr = process.communicate(input=GO, timeout=max(0.001, active_deadline - time.monotonic()))
+                stdout, stderr = process.communicate(input=GO, timeout=remaining)
                 cleanup_started = time.monotonic(); record["controller_exit"] = process.returncode; record["controller_exit_confirmed"] = True
                 record["output_pins"] = {"stdout": write_new(case_root / "controller.stdout", stdout), "stderr": write_new(case_root / "controller.stderr", stderr)}
                 require(len(stdout) <= 2 * 1024 * 1024 and len(stderr) <= 2 * 1024 * 1024, "TEST diagnostic output bound")
