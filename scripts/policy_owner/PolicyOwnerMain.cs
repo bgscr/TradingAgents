@@ -16,6 +16,7 @@ namespace TradingAgents.PolicyOwner
 {
     public static class PolicyOwnerMain
     {
+#if !OWNER_ADMISSION_V2
         [DllImport("advapi32.dll", SetLastError=true)]
         static extern bool SetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor);
         [DllImport("advapi32.dll", SetLastError=true)]
@@ -115,9 +116,15 @@ namespace TradingAgents.PolicyOwner
         {
             return EvidenceTransfer.CompleteArtifactReview(anchor.Root,document);
         }
+#endif
         [STAThread]
         public static int Main(string[] args)
         {
+#if OWNER_ADMISSION_V2
+            // Compile-time routing precedes path initialization, anchor loading,
+            // every v1 RPC and every WebAuthn call. No runtime downgrade switch.
+            return AdmissionV2.Entry(args);
+#else
             try
             {
                 Native.InitializePathRuntime();
@@ -179,6 +186,7 @@ namespace TradingAgents.PolicyOwner
                 }
             }
             catch(Exception error) { Console.Error.WriteLine(error.GetType().Name + ": " + error.Message); return 2; }
+#endif
         }
     }
 }

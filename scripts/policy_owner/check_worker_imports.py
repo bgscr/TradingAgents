@@ -8,39 +8,30 @@ inside this fresh interpreter before importing the fixed validation modules.
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 WORKER_MODULES = (
-    "tradingagents.policy_coverage_contract",
-    "tradingagents.policy_coverage_models",
-    "tradingagents.policy_coverage_verification",
-    "tradingagents.policy_coverage_native",
-    "tradingagents.policy_coverage_schema",
-    "tradingagents.policy_evidence_contract",
-    "tradingagents.policy_evidence_acquisition",
-    "tradingagents.policy_evidence_client",
-    "tradingagents.policy_evidence_limits",
-    "tradingagents.policy_owner_contract",
-    "tradingagents.windows_policy_owner",
-    "tradingagents.policy_qualification_lifecycle",
-    "tradingagents.policy_qualified_results",
-    "tradingagents.policy_qualified_native",
-    "tradingagents.runtime_protection",
-    "tradingagents.runtime_protection_handoff",
-    "tradingagents.offline_runtime_bundle",
-    "tradingagents.windows_sandbox_runner",
-    "tradingagents.windows_sandbox_acceptance",
-    "tradingagents.windows_sandbox_qualification",
+    "tradingagents.policy_owner_admission_crypto",
+    "tradingagents.policy_owner_admission_v2",
+    "tradingagents.policy_owner_admission_windows",
+    "tradingagents.policy_owner_admission_migration",
 )
 
 
 def check(root: Path) -> dict:
     root = root.resolve(strict=True)
-    sys.path[:0] = [str(root / "source"), str(root / "dependencies")]
-    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+    if "tradingagents" in sys.modules:
+        raise ValueError("namespace was already initialized")
+    package = types.ModuleType("tradingagents")
+    package.__path__ = [str(root / "source" / "tradingagents")]
+    package.__package__ = "tradingagents"
+    package.__spec__ = importlib.machinery.ModuleSpec("tradingagents", None, is_package=True)
+    sys.modules["tradingagents"] = package
 
     def audit(event: str, values: tuple) -> None:
         if event in {
@@ -73,7 +64,14 @@ def check(root: Path) -> dict:
     observations = []
     for name in WORKER_MODULES:
         try:
-            module = importlib.import_module(name)
+            origin = root / "source" / "tradingagents" / (name.rsplit(".", 1)[1] + ".py")
+            raw = origin.read_bytes()
+            module = types.ModuleType(name)
+            module.__file__ = str(origin)
+            module.__package__ = "tradingagents"
+            module.__spec__ = importlib.machinery.ModuleSpec(name, None, origin=str(origin))
+            sys.modules[name] = module
+            exec(compile(raw, str(origin), "exec", dont_inherit=True), module.__dict__)
             origin = Path(module.__file__).resolve(strict=True)
             if not origin.is_relative_to(root / "source"):
                 raise ValueError("validation module escaped the exact worker depot")
@@ -88,7 +86,7 @@ def check(root: Path) -> dict:
                 }
             )
     return {
-        "contract_version": "policy-owner-worker-import-check-v1",
+        "contract_version": "policy-owner-admission-worker-import-check-v2",
         "interpreter": sys.executable,
         "depot": str(root),
         "modules": observations,

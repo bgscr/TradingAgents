@@ -10,6 +10,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -40,12 +41,20 @@ NATIVE_SOURCES = (
     "scripts/policy_owner/OwnerTransport.cs",
     "scripts/policy_owner/ConditionalRuntimeProtectionHost.cs",
     "scripts/policy_owner/WindowsPolicyAuthentication.cs",
-    "scripts/policy_owner/PolicyOwnerService.cs",
     "scripts/policy_owner/PolicyOwnerMain.cs",
-    "scripts/policy_owner/PolicyOwnerSetup.cs",
-    "scripts/policy_owner/SetupStateValidator.cs",
-    "scripts/policy_owner/EvidenceTransfer.cs",
+    "scripts/policy_owner/AdmissionV2.cs",
+    "scripts/policy_owner/AdmissionV2Platform.cs",
 )
+ADMISSION_SOURCES = (
+    "tradingagents/policy_owner_admission_v2.py",
+    "tradingagents/policy_owner_admission_crypto.py",
+    "tradingagents/policy_owner_admission_windows.py",
+    "tradingagents/policy_owner_admission_migration.py",
+    "scripts/policy_owner/migrate_admission_v2.py",
+    "scripts/policy_owner/build_admission_depot.py",
+    "scripts/policy_owner/check_worker_imports.py",
+)
+CONSUMER_SOURCES = tuple(sorted(set(CONSUMER_SOURCES) | set(NATIVE_SOURCES) | set(ADMISSION_SOURCES)))
 
 
 def canonical(value: object) -> bytes:
@@ -144,12 +153,20 @@ def write_new(path: Path, raw: bytes) -> None:
         os.fsync(stream.fileno())
 
 
-def build(output: Path, *, fixture: bool = False) -> dict:
+def build(output: Path, *, fixture: bool = False, source_commit: str | None = None) -> dict:
     if os.name != "nt" or not (
         sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
     ):
         raise ValueError("build requires an existing Windows interpreter with -I -B -S")
     source = Path(__file__).resolve().parents[2]
+    if source_commit is not None:
+        if re.fullmatch("[0-9a-f]{40}", source_commit) is None or source_commit == "0" * 40:
+            raise ValueError("exact committed source identity required")
+        for arguments, expected in ((["rev-parse", "HEAD"], source_commit), (["status", "--porcelain"], "")):
+            result = subprocess.run(["git", "-C", str(source), *arguments], capture_output=True, text=True, check=True, timeout=10,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.stdout.strip() != expected:
+                raise ValueError("source commit/worktree differs from the declared final build")
     output = output.resolve(strict=False)
     if output == source or output.is_relative_to(source) or output.exists():
         raise ValueError(
@@ -161,9 +178,7 @@ def build(output: Path, *, fixture: bool = False) -> dict:
         raise ValueError("existing Windows .NET Framework x64 compiler is unavailable")
     names = set(NATIVE_SOURCES) | set(CONSUMER_SOURCES) | {"cli/main.py"}
     if fixture:
-        names.add("tests/fixtures/runtime_protection/PolicyAuthenticationContracts.cs")
-        names.add("tests/fixtures/runtime_protection/EvidenceTransferContracts.cs")
-        names.add("tests/fixtures/runtime_protection/CoverageEvidenceContracts.cs")
+        names.add("tests/fixtures/policy_owner_admission_v2/AdmissionV2Contracts.cs")
     snapshot = output / "inputs"
     with hold_build_inputs([source / name for name in sorted(names)]):
         for name in sorted(names):
@@ -172,13 +187,13 @@ def build(output: Path, *, fixture: bool = False) -> dict:
             write_new(destination, (source / name).read_bytes())
     source_pins = {name: pin(snapshot / name) for name in sorted(names)}
     consumer = {
-        "contract_version": "policy-qualified-native-consumer-source-v1",
+        "contract_version": "policy-owner-admission-consumer-source-v2",
         "files": [
             {"relative_path": name, **source_pins[name]} for name in sorted(CONSUMER_SOURCES)
         ],
     }
     consumer["identity"] = (
-        "policy-qualified-native-consumer-source:v1:sha256:"
+        "policy-owner-admission-consumer-source:v2:sha256:"
         + sha256(canonical(consumer)).hexdigest()
     )
     write_new(output / "native-consumer-source.json", canonical(consumer))
@@ -192,6 +207,8 @@ def build(output: Path, *, fixture: bool = False) -> dict:
             "tradingagents/runtime_protection_handoff.py"
         ]["sha256"],
         "PolicyQualifiedNativeConsumerSourceIdentity": consumer["identity"],
+        "PolicyOwnerAdmissionSourceCommit": source_commit or "DEVELOPMENT_UNCOMMITTED_NOT_DEPLOYABLE",
+        "PolicyOwnerAdmissionMode": "ENROLLMENT_ONLY",
     }
     stamp_path = output / "BuildIdentity.cs"
     write_new(
@@ -221,22 +238,16 @@ def build(output: Path, *, fixture: bool = False) -> dict:
         "ConditionalRuntimeProtectionHost.exe": "TradingAgents.PolicyOwner.ConditionalRuntimeProtectionHost",
     }
     if fixture:
-        targets["PolicyAuthenticationContracts.exe"] = "PolicyAuthenticationContracts"
-        targets["EvidenceTransferContracts.exe"] = "EvidenceTransferContracts"
-        targets["CoverageEvidenceContracts.exe"] = "CoverageEvidenceContracts"
+        targets["AdmissionV2Contracts.TEST.exe"] = "AdmissionV2Contracts"
     results = {}
     for name, entrypoint in targets.items():
         extra = (
-            [str(snapshot / ("tests/fixtures/runtime_protection/" + entrypoint + ".cs"))]
-            if entrypoint
-            in {
-                "PolicyAuthenticationContracts",
-                "EvidenceTransferContracts",
-                "CoverageEvidenceContracts",
-            }
+            [str(snapshot / "tests/fixtures/policy_owner_admission_v2/AdmissionV2Contracts.cs")]
+            if entrypoint == "AdmissionV2Contracts"
             else []
         )
-        command = [*common, "/main:" + entrypoint, "/out:" + str(output / name), *sources, *extra]
+        defines = "OWNER_ADMISSION_V2;OWNER_ADMISSION_V2_TEST" if entrypoint == "AdmissionV2Contracts" else "OWNER_ADMISSION_V2"
+        command = [*common, "/define:" + defines, "/main:" + entrypoint, "/out:" + str(output / name), *sources, *extra]
         # Windows services its existing compiler through a WinSxS hard link.
         # The open file still denies writes/replacement through either name.
         with hold_build_inputs(
@@ -262,7 +273,10 @@ def build(output: Path, *, fixture: bool = False) -> dict:
             )
         results[name] = pin(output / name)
     manifest = {
-        "contract_version": "policy-owner-native-build-v1",
+        "contract_version": "policy-owner-admission-native-build-v2",
+        "source_commit": source_commit,
+        "development_build_not_deployable": source_commit is None,
+        "mode": "ENROLLMENT_ONLY",
         "source_root": str(source),
         "source_files": [{"relative_path": name, **value} for name, value in source_pins.items()],
         "compiler": {"path": str(compiler), **pin(compiler)},
@@ -285,8 +299,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--include-inert-fixture", action="store_true")
+    parser.add_argument("--source-commit")
     args = parser.parse_args()
-    result = build(args.output, fixture=args.include_inert_fixture)
+    result = build(args.output, fixture=args.include_inert_fixture, source_commit=args.source_commit)
     print(
         json.dumps(
             {

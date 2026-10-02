@@ -49,6 +49,7 @@ namespace TradingAgents.PolicyOwner
             }
             Evidence.Require(ownerRights, "Service-owner implicit DACL rights are not suppressed");
         }
+#if !OWNER_ADMISSION_V2
         internal OwnerAnchor(string instance)
         {
             Instance = instance;
@@ -126,6 +127,9 @@ namespace TradingAgents.PolicyOwner
             Evidence.Require(Native.HashFile(file) == sha256, "Registered owner file bytes changed");
         }
         public void Dispose() { foreach(var handle in Held) handle.Dispose(); Held.Clear(); }
+#else
+        public void Dispose() { }
+#endif
     }
 
     internal static class OwnerWire
@@ -245,6 +249,7 @@ namespace TradingAgents.PolicyOwner
                 default:return 45000;
             }
         }
+#if !OWNER_ADMISSION_V2
         internal static Dictionary<string, object> Call(OwnerAnchor anchor, Dictionary<string, object> body, int milliseconds=60000)
         {
             if((string)body["operation"]=="worker"&&WorkerMilliseconds((string)Evidence.Obj(body["payload"])["operation"])==300000)
@@ -275,5 +280,6 @@ namespace TradingAgents.PolicyOwner
                 return Evidence.Obj(response["result"]);
             }
         }
+#endif
     }
 }

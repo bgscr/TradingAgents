@@ -10,6 +10,7 @@ using TradingAgents.RuntimeProtection;
 
 namespace TradingAgents.PolicyOwner
 {
+#if !OWNER_ADMISSION_V2
     internal sealed class NativeConditionalOwner : IConditionalProtectionOwner, IDisposable
     {
         readonly OwnerAnchor anchor;
@@ -102,10 +103,15 @@ namespace TradingAgents.PolicyOwner
         public void Dispose() { anchor.Dispose(); }
     }
 
+#endif
     public static class ConditionalRuntimeProtectionHost
     {
         public static int Main(string[] args)
         {
+#if OWNER_ADMISSION_V2
+            Console.Error.WriteLine("ENROLLMENT_ONLY: conditional execution is unavailable in this build");
+            return 2;
+#else
             try
             {
                 Native.InitializePathRuntime();
@@ -124,6 +130,7 @@ namespace TradingAgents.PolicyOwner
                 }
             }
             catch(Exception error) { Console.Error.WriteLine(error); return 2; }
+#endif
         }
     }
 }

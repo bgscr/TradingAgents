@@ -1285,6 +1285,7 @@ namespace TradingAgents.RuntimeProtection
 
     public static class RuntimeProtectionHost
     {
+#if !OWNER_ADMISSION_V2
         const string Contract="runtime-protection-attempt-v1";
         static readonly string[] ForbiddenEnvironment={"PYTHONHOME","PYTHONPATH","PYTHONPYCACHEPREFIX","PYTHONUSERBASE","PYTHONSTARTUP",
             "PYTHONINSPECT","PYTHONEXECUTABLE","PYTHONPLATLIBDIR","__PYVENV_LAUNCHER__","_PYTHON_HOST_PLATFORM","LD_LIBRARY_PATH",
@@ -1960,8 +1961,13 @@ namespace TradingAgents.RuntimeProtection
                 return receipt;
             }
         }
+#endif
         public static int Main(string[] arguments)
         {
+#if OWNER_ADMISSION_V2
+            Console.Error.WriteLine("ENROLLMENT_ONLY: runtime execution is unavailable in this build");
+            return 2;
+#else
             try
             {
                 Native.InitializePathRuntime();
@@ -1980,6 +1986,7 @@ namespace TradingAgents.RuntimeProtection
                 }
             }
             catch(Exception error) { Console.Error.WriteLine(error);return 1; }
+#endif
         }
     }
 }

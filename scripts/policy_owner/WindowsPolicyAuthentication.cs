@@ -84,6 +84,7 @@ namespace TradingAgents.PolicyOwner
         [DllImport("webauthn.dll", ExactSpelling=true)]
         static extern void WebAuthNFreeAssertion(IntPtr value);
 
+#if !OWNER_ADMISSION_V2
         internal static Dictionary<string, object> Probe()
         {
             bool available;
@@ -99,6 +100,7 @@ namespace TradingAgents.PolicyOwner
             };
         }
 
+#endif
         sealed class Buffer : IDisposable
         {
             internal readonly IntPtr Pointer;
@@ -168,14 +170,34 @@ namespace TradingAgents.PolicyOwner
             // credential. Bind new enrollment to this exact instance instead.
             return Hash(Encoding.UTF8.GetBytes("policy-owner-user-handle-v1\n"+rpId+"\n"+expectedSid+"\n"+instance));
         }
+#if !OWNER_ADMISSION_V2
         internal static Registration Create(IntPtr window, string rpId, byte[] challenge, string expectedSid,string instance)
         {
             // Only an interactive, operator-invoked frontend calls this method.
             // SID equality is a scope check; it is never the human proof itself.
             Require(window != IntPtr.Zero, "A visible operator window is required");
             Require(WindowsIdentity.GetCurrent().User.Value == expectedSid, "Observed principal differs from proposed enrollment");
-            byte[] client = ClientJson(rpId, challenge, true);
             byte[] userId = RegistrationUserHandle(rpId,expectedSid,instance);
+            return CreateAtBoundary(window,rpId,challenge,expectedSid,userId,null);
+        }
+#endif
+        internal static Registration CreateV2(IntPtr window,string rpId,byte[] challenge,string expectedSid,byte[] userId,Action<Dictionary<string,object>> boundary)
+        {
+            Require(window!=IntPtr.Zero,"A visible operator window is required");
+            Require(WindowsIdentity.GetCurrent().User.Value==expectedSid,"Observed principal differs from enrollment");
+            Require(userId!=null&&userId.Length==32,"v2 requires a 32-byte durable generation handle");
+            Require(boundary!=null,"v2 actual marshalled parameter observer required");
+            return CreateAtBoundary(window,rpId,challenge,expectedSid,userId,boundary);
+        }
+#if OWNER_ADMISSION_V2_TEST
+        internal static Action<Dictionary<string,object>> TestMakeBoundary;
+        internal static Registration TestCreateAtBoundary(IntPtr window,string rp,byte[] challenge,string sid,byte[] handle)
+        { return CreateAtBoundary(window,rp,challenge,sid,handle,null); }
+#endif
+        static Registration CreateAtBoundary(IntPtr window,string rpId,byte[] challenge,string expectedSid,byte[] userId,Action<Dictionary<string,object>> boundary)
+        {
+            Require(window!=IntPtr.Zero&&userId.Length==32,"Invalid creation boundary parameters");
+            byte[] client = ClientJson(rpId, challenge, true);
             using(var userBuffer = new Buffer(userId))
             using(var json = new Buffer(client))
             using(var parameter = new Structure<Parameter>(new Parameter {Version=1, Type="public-key", Algorithm=-7}))
@@ -187,6 +209,19 @@ namespace TradingAgents.PolicyOwner
                 var data = new ClientData {Version=1, Size=(uint)client.Length, Json=json.Pointer, HashAlgorithm="SHA-256"};
                 var options = new MakeOptions {Version=1, Timeout=120000, Attachment=1,
                     Verification=1, Attestation=1}; // PLATFORM, REQUIRED, NONE
+                var observed=new Dictionary<string,object>{{"rp",rp.Id},{"user_id",Convert.ToBase64String(Copy(user.Id,user.Size))},
+                    {"user_size",user.Size},{"name",user.Name},{"client_data",Convert.ToBase64String(Copy(data.Json,data.Size))},
+                    {"attachment",options.Attachment},{"verification",options.Verification},{"attestation",options.Attestation},
+                    {"algorithm",-7},{"window_nonzero",window!=IntPtr.Zero},{"boundary","MARSHALLED_BEFORE_CALL"}};
+                // Read back actual unmanaged buffers after struct construction.
+                // The durable RPC acknowledgement precedes the native call; it
+                // does not claim the authenticator has created a credential.
+                if(boundary!=null)boundary(observed);
+#if OWNER_ADMISSION_V2_TEST
+                Require(TestMakeBoundary!=null,"TEST build has no native WebAuthn fallback");
+                TestMakeBoundary(observed);
+                throw new InvalidOperationException("EXPECTED_TEST_BOUNDARY_STOP");
+#else
                 IntPtr output;
                 int status = WebAuthNAuthenticatorMakeCredential(window, ref rp, ref user, ref parameters, ref data, ref options, out output);
                 if(status != 0) Marshal.ThrowExceptionForHR(status);
@@ -199,10 +234,14 @@ namespace TradingAgents.PolicyOwner
                         PublicKey=RegistrationPublicKey(rpId, auth, credential)};
                 }
                 finally { WebAuthNFreeCredentialAttestation(output); }
+#endif
             }
         }
         internal static Proof Authenticate(IntPtr window, string rpId, byte[] challenge, byte[] credentialId)
         {
+#if OWNER_ADMISSION_V2_TEST
+            throw new InvalidOperationException("TEST assembly cannot call a real authenticator");
+#else
             Require(window != IntPtr.Zero, "A visible operator window is required");
             Require(credentialId.Length > 0 && credentialId.Length <= 4096, "Invalid credential ID");
             byte[] client = ClientJson(rpId, challenge, false);
@@ -224,6 +263,7 @@ namespace TradingAgents.PolicyOwner
                 }
                 finally { WebAuthNFreeAssertion(output); }
             }
+#endif
         }
 
         static byte[] Slice(byte[] bytes, int offset, int length)
