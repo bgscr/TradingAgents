@@ -5,8 +5,12 @@ import base64
 import json
 import os
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from hashlib import sha256
 from pathlib import Path
+from shutil import copyfile
+from tempfile import TemporaryDirectory
 from typing import Any
 
 EXPECTED_SEQUENCE_COUNT = 1024
@@ -80,14 +84,27 @@ def _typed_value(value: object) -> dict[str, object]:
     raise TypeError(f"unsupported SQLite value type: {type(value).__name__}")
 
 
-def _open_read_only(path: Path) -> sqlite3.Connection:
+@contextmanager
+def _open_read_only(path: Path) -> Iterator[sqlite3.Connection]:
     resolved = path.expanduser().resolve(strict=True)
-    connection = sqlite3.connect(
-        f"file:{resolved.as_posix()}?mode=ro",
-        uri=True,
+    companions = tuple(
+        (suffix, Path(f"{resolved}{suffix}"))
+        for suffix in ("-wal", "-shm")
     )
-    connection.execute("PRAGMA query_only = ON")
-    return connection
+    with TemporaryDirectory(prefix="ticket06-sqlite-") as temporary_root:
+        read_path = Path(temporary_root) / resolved.name
+        copyfile(resolved, read_path)
+        for suffix, companion in companions:
+            if companion.exists():
+                copyfile(companion, Path(f"{read_path}{suffix}"))
+        with closing(
+            sqlite3.connect(
+                f"file:{read_path.as_posix()}?mode=ro",
+                uri=True,
+            )
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            yield connection
 
 
 def _table_inventory(

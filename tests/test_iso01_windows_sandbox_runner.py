@@ -186,7 +186,9 @@ def test_iso_01_historical_protected_manifests_remain_readable(
 ) -> None:
     forward = build_protected_root_manifest(_protected_bindings(tmp_path / "protected"))
     entries = tuple(
-        entry for entry in forward.entries if entry.role not in forward_only_roles
+        entry.model_copy(update={"concrete_object_required": True})
+        for entry in forward.entries
+        if entry.role not in forward_only_roles
     )
     payload = {
         "contract_version": contract_version,
@@ -210,6 +212,7 @@ def test_iso_01_historical_protected_manifests_remain_readable(
     assert ProtectedRootManifest.model_validate_json(
         historical.model_dump_json()
     ) == historical
+    assert all(entry.concrete_object_required for entry in historical.entries)
 
 
 def test_iso_01_missing_required_protected_root_fails_closed(tmp_path: Path) -> None:
@@ -1579,6 +1582,11 @@ def test_iso_01_no_launch_cli_emits_bounded_safe_construction_receipt(
     request = _construction_request(tmp_path)
     (tmp_path / "cli-runs").mkdir()
     monkeypatch.setenv("USERPROFILE", str(request.user_profile))
+    monkeypatch.setattr(
+        run_iso01_windows_sandbox.tempfile,
+        "gettempdir",
+        lambda: str(request.host_temp),
+    )
     monkeypatch.setattr(
         run_iso01_windows_sandbox,
         "default_protected_root_bindings",

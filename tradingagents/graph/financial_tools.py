@@ -7,18 +7,26 @@ from contextlib import suppress
 from datetime import date, datetime
 from typing import Any
 
+from pydantic import ValidationError
+
 from tradingagents.asset_configuration import (
     RunAssetConfiguration,
     RunAssetConfigurationProjection,
 )
 from tradingagents.capability_routing import (
+    MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND,
     MainlandCapabilityRoutingCheckpointAction,
     MainlandCapabilityRoutingCheckpointCompatibility,
     MainlandCapabilityRoutingCheckpointError,
     MainlandCapabilityRoutingCheckpointFailureReason,
     MainlandCapabilityRoutingPlan,
     MainlandCapabilityRoutingRunProjection,
+    MainlandCapabilityRoutingShadowAcquisitionReason,
+    MainlandCapabilityRoutingShadowExceptionFamily,
     MainlandCapabilityRoutingShadowFailure,
+    MainlandCapabilityRoutingShadowFailureEntry,
+    MainlandCapabilityRoutingShadowTemporalRejectionReason,
+    MainlandCapabilityRoutingShadowTypedReason,
     TushareCapability,
     validate_mainland_capability_routing_checkpoint,
 )
@@ -79,6 +87,105 @@ _QUALIFIED_INDICATOR_CANONICAL_EVIDENCE_CONTRACT_ID = (
 _QUALIFIED_INDICATOR_STRATEGY_RULES_ID = (
     "mainland-equity-strategy-rules.v1"
 )
+
+
+def _safe_shadow_typed_reason(
+    exc: Exception,
+    *,
+    family: MainlandCapabilityRoutingShadowExceptionFamily,
+) -> str | None:
+    try:
+        reason = exc.reason
+        raw_value = reason.value
+    except BaseException:
+        return None
+    if type(raw_value) is not str:
+        return None
+    try:
+        typed_reason = MainlandCapabilityRoutingShadowTypedReason(raw_value)
+    except ValueError:
+        return None
+    expected_family = (
+        MainlandCapabilityRoutingShadowExceptionFamily.FINANCIAL_DISPATCH
+        if typed_reason.value.startswith("financial_")
+        else MainlandCapabilityRoutingShadowExceptionFamily.QUALIFIED_ROUTING_LIFECYCLE
+    )
+    return typed_reason.value if family is expected_family else None
+
+
+def _safe_shadow_acquisition_detail(
+    acquisition: object,
+) -> tuple[str, tuple[str, ...]]:
+    try:
+        failure = acquisition.failure
+        reason_value = failure.reason.value
+    except BaseException:
+        return MainlandCapabilityRoutingShadowAcquisitionReason.UNKNOWN.value, ()
+    if type(reason_value) is not str:
+        return MainlandCapabilityRoutingShadowAcquisitionReason.UNKNOWN.value, ()
+    try:
+        reason = MainlandCapabilityRoutingShadowAcquisitionReason(reason_value)
+    except ValueError:
+        return MainlandCapabilityRoutingShadowAcquisitionReason.UNKNOWN.value, ()
+    if (
+        reason
+        is not MainlandCapabilityRoutingShadowAcquisitionReason.TEMPORAL_ELIGIBILITY_REJECTED
+    ):
+        return reason.value, ()
+    try:
+        raw_reasons = failure.temporal_rejection_reasons
+        if type(raw_reasons) is not tuple:
+            raise TypeError
+        temporal_reasons = tuple(
+            MainlandCapabilityRoutingShadowTemporalRejectionReason(item.value)
+            for item in raw_reasons[
+                : len(MainlandCapabilityRoutingShadowTemporalRejectionReason)
+            ]
+            if type(item.value) is str
+        )
+        temporal_reasons = tuple(
+            sorted(set(temporal_reasons), key=lambda item: item.value)
+        )
+    except BaseException:
+        temporal_reasons = ()
+    if not temporal_reasons:
+        return MainlandCapabilityRoutingShadowAcquisitionReason.UNKNOWN.value, ()
+    return reason.value, tuple(item.value for item in temporal_reasons)
+
+
+def _shadow_exception_identity(exc: Exception) -> tuple[str, str, str | None]:
+    """Return only explicit safe exception identities; never inspect text or args."""
+
+    if isinstance(exc, FinancialDispatchCheckpointError):
+        family = MainlandCapabilityRoutingShadowExceptionFamily.FINANCIAL_DISPATCH
+        return (
+            family.value,
+            "FinancialDispatchCheckpointError",
+            _safe_shadow_typed_reason(exc, family=family),
+        )
+    if isinstance(exc, ProductionQualifiedRoutingLifecycleError):
+        family = (
+            MainlandCapabilityRoutingShadowExceptionFamily.QUALIFIED_ROUTING_LIFECYCLE
+        )
+        return (
+            family.value,
+            "ProductionQualifiedRoutingLifecycleError",
+            _safe_shadow_typed_reason(exc, family=family),
+        )
+    if isinstance(exc, ValidationError):
+        return "pydantic", "ValidationError", None
+    if isinstance(exc, RuntimeError):
+        return "builtins", "RuntimeError", None
+    if isinstance(exc, ValueError):
+        return "builtins", "ValueError", None
+    if isinstance(exc, TypeError):
+        return "builtins", "TypeError", None
+    if isinstance(exc, AttributeError):
+        return "builtins", "AttributeError", None
+    if isinstance(exc, KeyError):
+        return "builtins", "KeyError", None
+    return "unknown", "unknown", None
+
 
 class FinancialDispatchToolNode:
     """Execute one fundamentals tool turn through a checkpoint-aware dispatcher."""
@@ -252,6 +359,18 @@ class FinancialDispatchToolNode:
         tool_messages = []
         shadow_executed = False
         shadow_failure_count = 0
+        shadow_failures: list[MainlandCapabilityRoutingShadowFailureEntry] = []
+
+        def record_shadow_failure(
+            failure: MainlandCapabilityRoutingShadowFailureEntry,
+        ) -> None:
+            nonlocal shadow_failure_count
+            shadow_failure_count += 1
+            if (
+                len(shadow_failures)
+                < MAINLAND_CAPABILITY_ROUTING_SHADOW_FAILURE_RETENTION_BOUND
+            ):
+                shadow_failures.append(failure)
         if rollout_mode == "qualified_v1_shadow":
             context_owner = self._qualified_context_owner
             qualified_request = next(
@@ -259,25 +378,78 @@ class FinancialDispatchToolNode:
                 None,
             )
             if context_owner is not None and qualified_request is not None:
+                selection_kind = (
+                    "indicator"
+                    if qualified_request.statement_type
+                    is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                    else "statement"
+                )
                 try:
                     acquisition = context_owner.acquire_context(
-                        as_of_date=qualified_request.as_of_date
+                        as_of_date=date.fromisoformat(str(state.get("trade_date") or ""))
                     )
+                except Exception as exc:  # noqa: BLE001 - shadow cannot affect authority
+                    exception_family, exception_class, typed_reason = (
+                        _shadow_exception_identity(exc)
+                    )
+                    record_shadow_failure(
+                        MainlandCapabilityRoutingShadowFailureEntry(
+                            stage="context_exception",
+                            failure_kind="exception",
+                            exception_family=exception_family,
+                            exception_class=exception_class,
+                            typed_reason=typed_reason,
+                            selection_kind=selection_kind,
+                            context_constructed=False,
+                            dispatcher_constructed=False,
+                        )
+                    )
+                else:
                     if acquisition.context is None:
-                        shadow_failure_count += 1
+                        acquisition_reason, temporal_rejection_reasons = (
+                            _safe_shadow_acquisition_detail(acquisition)
+                        )
+                        record_shadow_failure(
+                            MainlandCapabilityRoutingShadowFailureEntry(
+                                stage="context_result",
+                                failure_kind="typed_result",
+                                typed_acquisition_reason=acquisition_reason,
+                                temporal_rejection_reasons=(
+                                    temporal_rejection_reasons
+                                ),
+                                selection_kind=selection_kind,
+                                context_constructed=False,
+                                dispatcher_constructed=False,
+                            )
+                        )
                     else:
-                        qualified_routing = context_owner.financial_routing
-                        shadow_dispatcher = self._dispatcher_from_state(
-                            state,
-                            shadow=True,
-                            qualified_router_override=qualified_routing.router,
-                            provider_subrequest_cache_override=(
-                                qualified_routing.provider_subrequest_cache
-                            ),
-                        )[0]
-                        shadow_checkpoint_dispatcher = shadow_dispatcher
-                except Exception:  # noqa: BLE001 - shadow cannot affect authority
-                    shadow_failure_count += 1
+                        try:
+                            qualified_routing = context_owner.financial_routing
+                            shadow_dispatcher = self._dispatcher_from_state(
+                                state,
+                                shadow=True,
+                                qualified_router_override=qualified_routing.router,
+                                provider_subrequest_cache_override=(
+                                    qualified_routing.provider_subrequest_cache
+                                ),
+                            )[0]
+                            shadow_checkpoint_dispatcher = shadow_dispatcher
+                        except Exception as exc:  # noqa: BLE001 - shadow cannot affect authority
+                            exception_family, exception_class, typed_reason = (
+                                _shadow_exception_identity(exc)
+                            )
+                            record_shadow_failure(
+                                MainlandCapabilityRoutingShadowFailureEntry(
+                                    stage="dispatcher_construction",
+                                    failure_kind="exception",
+                                    exception_family=exception_family,
+                                    exception_class=exception_class,
+                                    typed_reason=typed_reason,
+                                    selection_kind=selection_kind,
+                                    context_constructed=True,
+                                    dispatcher_constructed=False,
+                                )
+                            )
             elif context_owner is None:
                 shadow_dispatcher = self._dispatcher_from_state(
                     state,
@@ -300,11 +472,19 @@ class FinancialDispatchToolNode:
                 if self._qualified_route_enabled(request) and shadow_dispatcher is not None:
                     qualified_dispatch_request = None
                     qualified_selection_started = False
+                    shadow_failure_stage = "request_enrichment"
+                    selection_kind = (
+                        "indicator"
+                        if request.statement_type
+                        is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                        else "statement"
+                    )
                     try:
                         qualified_dispatch_request = self._qualified_dispatch_request(
                             request,
                             asset_configuration=asset_configuration,
                         )
+                        shadow_failure_stage = "request_factory"
                         if (
                             request.statement_type
                             is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
@@ -318,6 +498,7 @@ class FinancialDispatchToolNode:
                                     qualified_dispatch_request
                                 )
                             )
+                            shadow_failure_stage = "selection_dispatch"
                             qualified_selection_started = True
                             shadow_dispatcher.dispatch_indicator_selection(
                                 qualified_dispatch_request,
@@ -333,14 +514,29 @@ class FinancialDispatchToolNode:
                                     qualified_dispatch_request
                                 )
                             )
+                            shadow_failure_stage = "selection_dispatch"
                             qualified_selection_started = True
                             shadow_dispatcher.dispatch_statement_selection(
                                 qualified_dispatch_request,
                                 selection_request,
                             )
                             shadow_executed = True
-                    except Exception:  # noqa: BLE001 - shadow cannot affect authority
-                        shadow_failure_count += 1
+                    except Exception as exc:  # noqa: BLE001 - shadow cannot affect authority
+                        exception_family, exception_class, typed_reason = (
+                            _shadow_exception_identity(exc)
+                        )
+                        record_shadow_failure(
+                            MainlandCapabilityRoutingShadowFailureEntry(
+                                stage=shadow_failure_stage,
+                                failure_kind="exception",
+                                exception_family=exception_family,
+                                exception_class=exception_class,
+                                typed_reason=typed_reason,
+                                selection_kind=selection_kind,
+                                context_constructed=(qualified_routing is not None),
+                                dispatcher_constructed=True,
+                            )
+                        )
                         if (
                             qualified_dispatch_request is not None
                             and qualified_selection_started
@@ -402,17 +598,45 @@ class FinancialDispatchToolNode:
         if shadow_checkpoint_dispatcher is not None:
             try:
                 shadow_ledger = shadow_checkpoint_dispatcher.checkpoint_ledger()
-            except Exception:  # noqa: BLE001 - shadow cannot affect authority
-                shadow_failure_count += 1
+            except Exception as exc:  # noqa: BLE001 - shadow cannot affect authority
+                exception_family, exception_class, typed_reason = (
+                    _shadow_exception_identity(exc)
+                )
+                record_shadow_failure(
+                    MainlandCapabilityRoutingShadowFailureEntry(
+                        stage="checkpoint_projection",
+                        failure_kind="exception",
+                        exception_family=exception_family,
+                        exception_class=exception_class,
+                        typed_reason=typed_reason,
+                        selection_kind=(
+                            "indicator"
+                            if qualified_request is not None
+                            and qualified_request.statement_type
+                            is FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS
+                            else "statement"
+                            if qualified_request is not None
+                            else None
+                        ),
+                        context_constructed=(qualified_routing is not None),
+                        dispatcher_constructed=True,
+                    )
+                )
             else:
                 if shadow_executed or state.get("financial_dispatch_shadow_ledger"):
                     result["financial_dispatch_shadow_ledger"] = shadow_ledger
         if shadow_failure_count:
-            result["financial_dispatch_shadow_failure"] = {
-                "contract_version": "1.0",
-                "diagnostic_code": "shadow_dispatch_failed",
-                "failure_count": shadow_failure_count,
-            }
+            result["financial_dispatch_shadow_failure"] = (
+                MainlandCapabilityRoutingShadowFailure(
+                    contract_version="2.1",
+                    failure_count=shadow_failure_count,
+                    retained_failure_count=len(shadow_failures),
+                    dropped_failure_count=(
+                        shadow_failure_count - len(shadow_failures)
+                    ),
+                    failures=tuple(shadow_failures),
+                ).model_dump(mode="json")
+            )
         return result
 
     @staticmethod

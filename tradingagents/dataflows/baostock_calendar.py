@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import math
 import re
@@ -13,6 +11,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.dataflows.baostock_output import contain_baostock_output
 from tradingagents.market_history.config import DataUsageMode
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptBudgetExhausted,
@@ -283,10 +282,7 @@ class _BaoStockSdkTransport:
         return baostock
 
     def login(self) -> object:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-            io.StringIO()
-        ):
-            return self._sdk().login()
+        return self._sdk().login()
 
     def query_trade_dates(self, *, start_date: str, end_date: str) -> object:
         return self._sdk().query_trade_dates(
@@ -295,10 +291,7 @@ class _BaoStockSdkTransport:
         )
 
     def logout(self) -> object:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-            io.StringIO()
-        ):
-            return self._sdk().logout()
+        return self._sdk().logout()
 
 
 def acquire_mainland_session_calendar(
@@ -506,7 +499,8 @@ def _validate_request(
 def _login(transport: BaoStockSessionCalendarTransport) -> bool:
     record_active_physical_attempt_io()
     try:
-        result = transport.login()
+        with contain_baostock_output():
+            result = transport.login()
     except PhysicalAttemptFailure:
         raise
     except Exception as exc:
@@ -538,15 +532,16 @@ def _query_and_normalize(
 ) -> dict[str, object]:
     record_active_physical_attempt_io()
     try:
-        result = transport.query_trade_dates(
-            start_date=start_date.isoformat(),
-            end_date=end_date.isoformat(),
-        )
-        membership = _normalize_provider_rows(
-            result,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        with contain_baostock_output():
+            result = transport.query_trade_dates(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+            )
+            membership = _normalize_provider_rows(
+                result,
+                start_date=start_date,
+                end_date=end_date,
+            )
         observed_at = _utc(now())
     except PhysicalAttemptFailure:
         raise
@@ -578,7 +573,8 @@ def _query_and_normalize(
 def _logout(transport: BaoStockSessionCalendarTransport) -> bool:
     record_active_physical_attempt_io()
     try:
-        result = transport.logout()
+        with contain_baostock_output():
+            result = transport.logout()
     except PhysicalAttemptFailure:
         raise
     except Exception as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
@@ -232,6 +233,7 @@ def _raw_routing(
     plan,
     *,
     provider_subrequest_cache: ProviderSubrequestCache | None = None,
+    statement_request_factory=build_financial_statement_routing_request,
 ) -> QualifiedFinancialRoutingComposition:
     def unavailable(request):
         return FinancialProviderPeriodResponse.unavailable(
@@ -244,7 +246,7 @@ def _raw_routing(
             routing_plan=plan,
             statement_sources=dict.fromkeys(("tushare", "akshare_sina", "yfinance"), unavailable),
         ),
-        statement_request_factory=build_financial_statement_routing_request,
+        statement_request_factory=statement_request_factory,
         indicator_request_factory=build_financial_indicator_routing_request,
         provider_subrequest_cache=provider_subrequest_cache,
     )
@@ -266,9 +268,7 @@ def _indicator_request() -> FinancialToolRequest:
     requirements = FinancialIndicatorEvidenceRequirements.create(
         requested_families=families,
         canonical_evidence_contract_id="canonical-evidence-contract.v1",
-        canonical_evidence_contract_required_families=(
-            FinancialRatioFamily.PROFIT,
-        ),
+        canonical_evidence_contract_required_families=(FinancialRatioFamily.PROFIT,),
         capability_profile_id="equity.v1",
         capability_profile_required_families=(FinancialRatioFamily.OPERATION,),
         strategy_rules_id="mainland-equity-strategy-rules.v1",
@@ -285,6 +285,130 @@ def _indicator_request() -> FinancialToolRequest:
             family_evidence_requirements=requirements,
         ),
     )
+
+
+def _context_owned_shadow_node(
+    *,
+    asset,
+    plan,
+    owner: FinancialEligibilityAcquisitionContextOwner,
+    run_id: str,
+) -> tuple[FinancialDispatchToolNode, dict[str, object], list[int], bytes]:
+    assert plan.financial_eligibility_policy is not None
+    assert plan.financial_eligibility_policy.authority_disposition == (
+        "shadow_non_authoritative"
+    )
+    assert plan.financial_eligibility_policy.qualified_v1_authority_enabled is False
+    legacy_calls = [0]
+
+    def balance_sheet(symbol: str, frequency: str, current_date: str) -> str:
+        legacy_calls[0] += 1
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            f"# Data retrieved on: {current_date} 12:00:00\n\n"
+            "metric,2026-06-30\nTotal,100"
+        )
+
+    unused = lambda *_args, **_kwargs: "unused"  # noqa: E731
+    vendor_methods = {
+        "get_fundamentals": {"scripted": unused},
+        "get_balance_sheet": {"scripted": balance_sheet},
+        "get_cashflow": {"scripted": unused},
+        "get_income_statement": {"scripted": unused},
+    }
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config.update(
+        {
+            "mainland_capability_routing_mode": "qualified_v1_shadow",
+            "mainland_capability_routing_plan_signature": plan.plan_signature,
+            "tool_vendors": dict.fromkeys(vendor_methods, "scripted"),
+        }
+    )
+    fixed_clock = lambda: datetime(2026, 8, 8, 12, tzinfo=timezone.utc)  # noqa: E731
+    node = FinancialDispatchToolNode(
+        config=config,
+        vendor_methods=vendor_methods,
+        qualified_context_owner=owner,
+        clock=fixed_clock,
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_balance_sheet",
+                        "args": {
+                            "ticker": asset.instrument_identity.symbol,
+                            "freq": "quarterly",
+                            "curr_date": _AS_OF.isoformat(),
+                        },
+                        "id": "node-context-first-use",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ],
+        "run_id": run_id,
+        "trade_date": _AS_OF.isoformat(),
+        "asset_configuration": asset.model_dump(mode="json"),
+        "financial_eligibility_binding": (
+            plan.financial_eligibility_binding.model_dump(mode="json")
+        ),
+        "evidence_state": EvidenceState(
+            instrument_identity=asset.instrument_identity,
+            financial_eligibility_binding=plan.financial_eligibility_binding,
+        ).model_dump(mode="json"),
+    }
+    baseline_config = dict(config)
+    baseline_config["mainland_capability_routing_mode"] = "legacy"
+    baseline_config.pop("mainland_capability_routing_plan_signature", None)
+    baseline = FinancialDispatchToolNode(
+        config=baseline_config,
+        vendor_methods=vendor_methods,
+        clock=fixed_clock,
+    )(state)
+    assert legacy_calls == [1]
+    baseline_bytes = json.dumps(
+        {
+            "messages": [
+                message.model_dump(mode="json") for message in baseline["messages"]
+            ],
+            "evidence_state": baseline["evidence_state"],
+            "financial_dispatch_ledger": baseline["financial_dispatch_ledger"],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    legacy_calls[0] = 0
+    return node, state, legacy_calls, baseline_bytes
+
+
+def _authoritative_result_bytes(result: dict[str, object]) -> bytes:
+    return json.dumps(
+        {
+            "messages": [
+                message.model_dump(mode="json") for message in result["messages"]
+            ],
+            "evidence_state": result["evidence_state"],
+            "financial_dispatch_ledger": result["financial_dispatch_ledger"],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _single_localized_shadow_failure(entry: dict[str, object]) -> dict[str, object]:
+    return {
+        "contract_version": "2.1",
+        "diagnostic_code": "shadow_dispatch_failed",
+        "failure_count": 1,
+        "retained_failure_count": 1,
+        "dropped_failure_count": 0,
+        "failures": [entry],
+    }
 
 
 @pytest.mark.unit
@@ -442,11 +566,7 @@ def test_context_binding_is_idempotent_and_rejects_every_material_mismatch(
     mismatches = (
         {"context_identity": "financial-eligibility-acquisition-context:v1:" + "9" * 64},
         {"run_id": "run:" + "8" * 64},
-        {
-            "asset_configuration_signature": (
-                context.asset_configuration_signature[:-1] + "8"
-            )
-        },
+        {"asset_configuration_signature": (context.asset_configuration_signature[:-1] + "8")},
         {"routing_plan_signature": context.routing_plan_signature[:-1] + "8"},
         {"financial_eligibility_binding": None},
         {"as_of_date": context.as_of_date + timedelta(days=1)},
@@ -480,11 +600,7 @@ def test_first_bind_revalidates_the_complete_context_identity(
         close_runtime=lambda: None,
     )
     malformed = context.model_copy(
-        update={
-            "context_identity": (
-                "financial-eligibility-acquisition-context:v1:" + "9" * 64
-            )
-        }
+        update={"context_identity": ("financial-eligibility-acquisition-context:v1:" + "9" * 64)}
     )
 
     with pytest.raises(ProductionQualifiedRoutingLifecycleError) as raised:
@@ -510,9 +626,7 @@ def test_runtime_assembly_rejects_unvalidated_retained_metadata(
             retained_company_type_evidence=("opaque raw_text",),
         )
 
-    assert raised.value.reason is (
-        ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
-    )
+    assert raised.value.reason is (ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID)
 
 
 @pytest.mark.unit
@@ -858,11 +972,12 @@ def test_concurrent_retained_metadata_path_resolves_once_with_zero_provider_call
     router = MainlandFinancialCapabilityRouter(
         routing_plan=plan,
         statement_sources={},
-        company_type_evidence_sources=dict.fromkeys(plan.route_for(metadata_module.MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE), provider_call),
+        company_type_evidence_sources=dict.fromkeys(
+            plan.route_for(metadata_module.MainlandCapability.FINANCIAL_COMPANY_TYPE_EVIDENCE),
+            provider_call,
+        ),
         capability_sources={
-            metadata_module.MainlandCapability.ISSUER_LIFECYCLE: {
-                "baostock": provider_call
-            }
+            metadata_module.MainlandCapability.ISSUER_LIFECYCLE: {"baostock": provider_call}
         },
     )
     resolver_calls = 0
@@ -945,9 +1060,7 @@ def test_concurrent_first_use_resolves_once_and_acquires_listing_once(
             retained_artifact_identities=(listing.listing_provenance.source_ref,),
             candidate_count=1,
             subrequest_keys=("provider-subrequest:v1:" + "4" * 64,),
-            physical_attempt_ids=(
-                "provider-physical-attempt=sha256:" + "5" * 64,
-            ),
+            physical_attempt_ids=("provider-physical-attempt=sha256:" + "5" * 64,),
             listing_metadata=listing,
         )
 
@@ -1102,10 +1215,7 @@ def test_graph_host_binds_slot_without_acquiring_until_financial_first_use(
 
     assert acquirer.calls == 1
     assert result.context is owner.context
-    assert (
-        TradingAgentsGraph.financial_eligibility_acquisition_context.fget(host)
-        is owner.context
-    )
+    assert TradingAgentsGraph.financial_eligibility_acquisition_context.fget(host) is owner.context
     assert owner.statement_request_factory(_statement_request())
     bound_context = owner.context
 
@@ -1393,7 +1503,236 @@ def test_financial_tool_node_creates_shadow_dispatcher_only_after_context_bind(
     assert owner.context is not None
     assert "financial_dispatch_shadow_failure" not in result
     shadow_ledger = result["financial_dispatch_shadow_ledger"]
-    binding = shadow_ledger["qualified_statement_selections"][0]["terminal"][
-        "selection_request"
-    ]["financial_eligibility_context_binding"]
+    binding = shadow_ledger["qualified_statement_selections"][0]["terminal"]["selection_request"][
+        "financial_eligibility_context_binding"
+    ]
     assert binding["context_identity"] == context.context_identity
+
+
+@pytest.mark.unit
+def test_financial_tool_node_projects_typed_context_acquisition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset, plan = _qualified_asset_and_plan(monkeypatch)
+    context = _context(asset, plan, run_label="ticket-07-context-result")
+    failure = FinancialEligibilityAcquisitionResult.failed(
+        FinancialEligibilityAcquisitionFailureReason.LISTING_PROVENANCE_UNAVAILABLE
+    )
+    acquirer = _TerminalAcquirer(failure)
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=context.run_id,
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=acquirer,
+        unbound_financial_routing=_raw_routing(plan),
+        expected_as_of_date=_AS_OF,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    node, state, legacy_calls, baseline_bytes = _context_owned_shadow_node(
+        asset=asset,
+        plan=plan,
+        owner=owner,
+        run_id=context.run_id,
+    )
+
+    result = node(state)
+
+    assert legacy_calls == [1]
+    assert acquirer.calls == 1
+    assert owner.context is None
+    assert "Total,100" in result["messages"][0].content
+    assert _authoritative_result_bytes(result) == baseline_bytes
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "context_result",
+                "failure_kind": "typed_result",
+                "typed_acquisition_reason": "listing_provenance_unavailable",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": False,
+            }
+        )
+    )
+    assert "financial_dispatch_shadow_ledger" not in result
+
+
+@pytest.mark.unit
+def test_financial_tool_node_sanitizes_context_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset, plan = _qualified_asset_and_plan(monkeypatch)
+    context = _context(asset, plan, run_label="ticket-07-context-exception")
+    unsafe_exception = RuntimeError(
+        "token=unsafe-message https://provider.invalid/private",
+        {"credential": "test-unsafe-arg", "payload": "provider-body"},
+    )
+    acquirer = _TerminalAcquirer(unsafe_exception)
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=context.run_id,
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=acquirer,
+        unbound_financial_routing=_raw_routing(plan),
+        expected_as_of_date=_AS_OF,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    node, state, legacy_calls, baseline_bytes = _context_owned_shadow_node(
+        asset=asset,
+        plan=plan,
+        owner=owner,
+        run_id=context.run_id,
+    )
+
+    result = node(state)
+
+    assert legacy_calls == [1]
+    assert acquirer.calls == 1
+    assert owner.context is None
+    assert "Total,100" in result["messages"][0].content
+    assert _authoritative_result_bytes(result) == baseline_bytes
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "context_exception",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": False,
+                "dispatcher_constructed": False,
+            }
+        )
+    )
+    serialized = json.dumps(result, default=str, sort_keys=True)
+    for forbidden in (
+        "unsafe-message",
+        "provider.invalid",
+        "test-unsafe-arg",
+        "provider-body",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.unit
+def test_financial_tool_node_distinguishes_context_owned_request_factory_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset, plan = _qualified_asset_and_plan(monkeypatch)
+    context = _context(asset, plan, run_label="ticket-07-request-factory")
+    acquirer = _SuccessfulAcquirer(context)
+
+    def failing_factory(_request, _context):
+        raise RuntimeError(
+            "credential=unsafe-factory-message",
+            {"provider_payload": "unsafe-factory-arg"},
+        )
+
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=context.run_id,
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=acquirer,
+        unbound_financial_routing=_raw_routing(
+            plan,
+            statement_request_factory=failing_factory,
+        ),
+        expected_as_of_date=_AS_OF,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    node, state, legacy_calls, baseline_bytes = _context_owned_shadow_node(
+        asset=asset,
+        plan=plan,
+        owner=owner,
+        run_id=context.run_id,
+    )
+
+    result = node(state)
+
+    assert legacy_calls == [1]
+    assert acquirer.calls == 1
+    assert owner.context == context
+    assert "Total,100" in result["messages"][0].content
+    assert _authoritative_result_bytes(result) == baseline_bytes
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "request_factory",
+                "failure_kind": "exception",
+                "exception_family": "builtins",
+                "exception_class": "RuntimeError",
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": True,
+            }
+        )
+    )
+    assert "financial_dispatch_shadow_ledger" not in result
+    serialized = json.dumps(result, default=str, sort_keys=True)
+    assert "unsafe-factory-message" not in serialized
+    assert "unsafe-factory-arg" not in serialized
+
+
+@pytest.mark.unit
+def test_financial_tool_node_distinguishes_dispatcher_construction_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset, plan = _qualified_asset_and_plan(monkeypatch)
+    context = _context(asset, plan, run_label="ticket-07-dispatcher-construction")
+    acquirer = _SuccessfulAcquirer(context)
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=context.run_id,
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=acquirer,
+        unbound_financial_routing=_raw_routing(plan),
+        expected_as_of_date=_AS_OF,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    node, state, legacy_calls, baseline_bytes = _context_owned_shadow_node(
+        asset=asset,
+        plan=plan,
+        owner=owner,
+        run_id=context.run_id,
+    )
+    state["financial_dispatch_shadow_ledger"] = {
+        "contract_version": "unsafe-fake-version",
+        "provider_payload": "must-not-survive",
+    }
+
+    result = node(state)
+
+    assert legacy_calls == [1]
+    assert acquirer.calls == 1
+    assert owner.context == context
+    assert "Total,100" in result["messages"][0].content
+    assert _authoritative_result_bytes(result) == baseline_bytes
+    assert result["financial_dispatch_shadow_failure"] == (
+        _single_localized_shadow_failure(
+            {
+                "stage": "dispatcher_construction",
+                "failure_kind": "exception",
+                "exception_family": "financial_dispatch",
+                "exception_class": "FinancialDispatchCheckpointError",
+                "typed_reason": "financial_eligibility_policy_mismatch",
+                "selection_kind": "statement",
+                "context_constructed": True,
+                "dispatcher_constructed": False,
+            }
+        )
+    )
+    serialized = json.dumps(result, default=str, sort_keys=True)
+    assert "unsafe-fake-version" not in serialized
+    assert "must-not-survive" not in serialized

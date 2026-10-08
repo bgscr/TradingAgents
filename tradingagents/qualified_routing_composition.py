@@ -14,10 +14,12 @@ import threading
 import time
 from calendar import monthrange
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from inspect import signature as inspect_signature
 from pathlib import Path
 from types import MappingProxyType
@@ -41,6 +43,12 @@ from tradingagents.capability_routing import (
     TushareEndpointPacingIdentity,
     mainland_capability_routing_failure,
 )
+from tradingagents.cninfo_production_binding import (
+    CNINFO_PRODUCTION_CONFIG_KEYS,
+    CNINFO_PRODUCTION_DEPENDENCY_IDS,
+    PRODUCTION_PLAN_VERSION_CONFIG_KEY,
+    CninfoProductionBinding,
+)
 from tradingagents.dataflows.akshare_sina_statements import (
     AkshareSinaStatementAdapter,
     AkshareSinaStatementAdapterResultV2,
@@ -54,6 +62,13 @@ from tradingagents.dataflows.baostock_ratios import (
     BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
     BaoStockRatioFamilyAdapter,
     assess_baostock_ratio_family_results,
+)
+from tradingagents.dataflows.cninfo_listing_publication import (
+    CNINFO_ANNOUNCEMENT_QUERY_OPERATION,
+    CNINFO_DOCUMENT_FETCH_OPERATION,
+    CNINFO_SECURITY_LOOKUP_OPERATION,
+    CninfoListingPublicationAdapter,
+    RequestsCninfoHttpTransport,
 )
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
@@ -78,17 +93,20 @@ from tradingagents.dataflows.financial_capability_routing import (
 from tradingagents.dataflows.financial_contracts import (
     FINANCIAL_MANIFEST_V2,
     FINANCIAL_MANIFEST_V4,
+    FINANCIAL_MANIFEST_V5,
     FINANCIAL_RATIO_DECLARATION_BAOSTOCK_V1,
     FinancialConsolidationScope,
     FinancialRatioFamily,
     FinancialStatementType,
 )
 from tradingagents.dataflows.financial_dispatch import (
+    FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION,
     FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION,
     FINANCIAL_DISPATCH_ELIGIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION,
     FINANCIAL_DISPATCH_LEDGER_VERSION,
     FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION,
+    FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION,
     FinancialDispatchCheckpointError,
     FinancialDispatchCheckpointFailureReason,
     FinancialDispatchCheckpointLedger,
@@ -97,6 +115,8 @@ from tradingagents.dataflows.financial_dispatch import (
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION,
     FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+    FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
     FinancialCompanyTypeAcquisitionEvidenceBinding,
     FinancialCompanyTypeEvidenceProjection,
     FinancialCompanyTypeProviderTemporalProofBinding,
@@ -118,6 +138,9 @@ from tradingagents.dataflows.financial_indicator_metadata import (
 from tradingagents.dataflows.financial_request_factory import (
     build_financial_indicator_routing_request,
     build_financial_statement_routing_request,
+)
+from tradingagents.dataflows.financial_temporal_eligibility import (
+    build_market_session_eligibility_binding,
 )
 from tradingagents.dataflows.financial_temporal_proof_projection import (
     TemporalProofProjectionUnavailable,
@@ -227,6 +250,7 @@ _PRODUCTION_PROVIDER_SOURCE_IDS = frozenset(
         "akshare_sina",
         "baostock",
         "baostock_qualified_families",
+        "cninfo",
         "tushare",
         "yfinance",
         "yfinance_derived",
@@ -234,6 +258,8 @@ _PRODUCTION_PROVIDER_SOURCE_IDS = frozenset(
 )
 _CONFIG_FIELDS = (
     "mainland_capability_routing_mode",
+    PRODUCTION_PLAN_VERSION_CONFIG_KEY,
+    *CNINFO_PRODUCTION_CONFIG_KEYS,
     "mainland_capability_routing_plan_signature",
     "tushare_enabled_capabilities",
     "tushare_qualification_profile",
@@ -325,6 +351,9 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
     account_scope_label: str = Field(pattern=_SAFE_IDENTITY_PATTERN)
     endpoint_pacing_identities: tuple[TushareEndpointPacingIdentity, ...]
     runtime_root_identities: tuple[ProductionRuntimeRootIdentity, ...]
+    cninfo_binding: CninfoProductionBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_canonical_contract(
@@ -344,8 +373,22 @@ class ProductionQualifiedRoutingFactoryContract(BaseModel):
             for source_id in self.required_provider_source_ids
         ):
             raise ValueError("factory provider source coverage is not canonical")
-        if self.dependency_ids != _REQUIRED_DEPENDENCY_IDS:
+        if self.dependency_ids != _required_dependency_ids(self.cninfo_binding):
             raise ValueError("factory dependency inventory is not canonical")
+        if self.cninfo_binding is not None:
+            binding = self.cninfo_binding
+            if (
+                binding.plan_signature != self.plan_signature
+                or binding.asset_configuration_signature != self.asset_configuration_signature
+                or binding.instrument_identity.symbol != self.instrument_symbol
+                or binding.instrument_identity.venue != self.reference_market
+                or binding.instrument_identity.currency != self.currency
+                or binding.instrument_identity.provenance.artifact_sha256 != self.registry_digest
+                or "cninfo" not in self.required_provider_source_ids
+            ):
+                raise ValueError("factory CNINFO binding contradicts its run authority")
+        elif "cninfo" in self.required_provider_source_ids:
+            raise ValueError("factory CNINFO source has no policy binding")
         endpoint_ids = tuple(
             identity.endpoint_id for identity in self.endpoint_pacing_identities
         )
@@ -400,6 +443,8 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
             or contract.account_scope_label != self.routing_plan.account_scope_label
             or contract.endpoint_pacing_identities
             != self.routing_plan.endpoint_pacing_identities
+            or (self.routing_plan.plan_version == "1.5")
+            != (contract.cninfo_binding is not None)
         ):
             raise ValueError("blueprint routing plan binding is invalid")
         root_paths = (
@@ -457,6 +502,132 @@ class ProductionQualifiedRoutingCompositionBlueprint(BaseModel):
         return self.factory_contract.asset_configuration_signature
 
 
+class ProductionQualifiedRoutingSourceBinding(BaseModel):
+    """Exact source/qualification identities already verified by the readiness owner."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["production-qualified-routing-source-binding-v1"] = (
+        "production-qualified-routing-source-binding-v1"
+    )
+    commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tree_hash: str = Field(pattern=r"^[0-9a-f]{40}$")
+    production_inventory_identity: str = Field(
+        pattern=r"^production-python-modules:v1:sha256:[0-9a-f]{64}$"
+    )
+    qualified_source_identity: str = Field(
+        pattern=r"^qualified-source-ready-for-ticket07-preparation:v1:sha256:[0-9a-f]{64}$"
+    )
+
+
+class ProductionQualifiedRoutingPreparation(BaseModel):
+    """In-memory configuration seal; neither a qualification nor execution authority."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["production-qualified-routing-preparation-v1"]
+    plan_version: Literal["1.4", "1.5"]
+    plan_signature: str = Field(pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$")
+    blueprint_identity: str = Field(
+        pattern=r"^production-qualified-routing-blueprint:v1:[0-9a-f]{64}$"
+    )
+    factory_contract: ProductionQualifiedRoutingFactoryContract
+    qualified_source: ProductionQualifiedRoutingSourceBinding
+    execution_authorized: Literal[False]
+    preparation_identity: str = Field(
+        pattern=r"^production-qualified-routing-preparation:v1:[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def _validate_preparation(self) -> ProductionQualifiedRoutingPreparation:
+        if self.plan_signature != self.factory_contract.plan_signature or (
+            (self.plan_version == "1.5") != (self.factory_contract.cninfo_binding is not None)
+        ):
+            raise ValueError("preparation plan and factory contract contradict")
+        expected = "production-qualified-routing-preparation:v1:" + _canonical_digest(
+            self.model_dump(mode="json", exclude={"preparation_identity"})
+        )
+        if self.preparation_identity != expected:
+            raise ValueError("preparation identity mismatch")
+        return self
+
+    @property
+    def qualified_source_identity(self) -> str:
+        return self.qualified_source.qualified_source_identity
+
+
+def seal_production_qualified_routing_preparation(
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+    current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+) -> ProductionQualifiedRoutingPreparation:
+    """Bind a verified source chain to current configuration without I/O.
+
+    The preparation owner supplies its independently verified current source and
+    qualified chain identities. This comparison cannot perform qualification or
+    grant launch approval. No thread, packet, resource, or persisted state is created.
+    """
+
+    def source_binding(value: object) -> ProductionQualifiedRoutingSourceBinding:
+        if isinstance(value, ProductionQualifiedRoutingSourceBinding):
+            value = value.model_dump(mode="json")
+        return ProductionQualifiedRoutingSourceBinding.model_validate(value)
+
+    qualified = source_binding(qualified_source)
+    if qualified != source_binding(current_source):
+        raise ValueError("qualified source chain does not match current source")
+    if not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint):
+        raise ValueError("production preparation requires a validated blueprint")
+    # Revalidate serialized values, including objects produced by model_copy.
+    validated = ProductionQualifiedRoutingCompositionBlueprint.model_validate(
+        {
+            **blueprint.model_dump(mode="json"),
+            "runtime_root_path": blueprint.runtime_root_path,
+            "database_path": blueprint.database_path,
+            "provider_artifact_root_path": blueprint.provider_artifact_root_path,
+            "backup_root_path": blueprint.backup_root_path,
+            "report_root_path": blueprint.report_root_path,
+        }
+    )
+    payload = {
+        "contract_version": "production-qualified-routing-preparation-v1",
+        "plan_version": validated.routing_plan.plan_version,
+        "plan_signature": validated.plan_signature,
+        "blueprint_identity": validated.blueprint_identity,
+        "factory_contract": validated.factory_contract.model_dump(mode="json"),
+        "qualified_source": qualified.model_dump(mode="json"),
+        "execution_authorized": False,
+    }
+    return ProductionQualifiedRoutingPreparation(
+        **payload,
+        preparation_identity="production-qualified-routing-preparation:v1:"
+        + _canonical_digest(payload),
+    )
+
+
+def validate_production_qualified_routing_preparation(
+    preparation: Mapping[str, Any] | ProductionQualifiedRoutingPreparation,
+    *,
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+    qualified_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+    current_source: Mapping[str, Any] | ProductionQualifiedRoutingSourceBinding,
+) -> ProductionQualifiedRoutingPreparation:
+    """Reject stale or mismatched preparation values before a packet can use them."""
+
+    if isinstance(preparation, ProductionQualifiedRoutingPreparation):
+        preparation = preparation.model_dump(mode="json")
+    validated = ProductionQualifiedRoutingPreparation.model_validate(preparation)
+    expected = seal_production_qualified_routing_preparation(
+        blueprint=blueprint,
+        qualified_source=qualified_source,
+        current_source=current_source,
+    )
+    if validated != expected:
+        raise ValueError("preparation does not match current production configuration")
+    return validated
+
+
 class ManagedQualifiedRoutingComposition(Protocol):
     """Single owner-capable boundary for one qualified analysis lifetime."""
 
@@ -467,6 +638,283 @@ class ManagedQualifiedRoutingComposition(Protocol):
     def interrupt(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+class ProductionQualifiedEligibilityCalendarReader:
+    """Run-owned, thread-safe reader for the authoritative primary store."""
+
+    def __init__(self, config: MarketHistoryConfig) -> None:
+        self._config = config
+        self._lock = threading.RLock()
+        self._closed = False
+        self._authorized_calendar_revision_id: str | None = None
+
+    @property
+    def database_path(self) -> Path:
+        return self._config.database_path
+
+    def read_current_session_calendar(
+        self,
+        reference_market: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            with MarketHistoryStore.open(self._config) as store:
+                return store.read_current_session_calendar(reference_market)
+
+    def read_session_calendar_revision(
+        self,
+        calendar_revision_id: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            with MarketHistoryStore.open(self._config) as store:
+                return store.read_session_calendar_revision(calendar_revision_id)
+
+    def authorize_calendar_revision(self, calendar_revision_id: str) -> None:
+        with self._lock:
+            if self._closed:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.CLOSED
+                )
+            if self._authorized_calendar_revision_id not in {
+                None,
+                calendar_revision_id,
+            }:
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            self._authorized_calendar_revision_id = calendar_revision_id
+
+    def read_eligibility_session_calendar(
+        self,
+        reference_market: str,
+    ) -> StoredSessionCalendar:
+        with self._lock:
+            calendar_revision_id = self._authorized_calendar_revision_id
+        if calendar_revision_id is None:
+            return self.read_current_session_calendar(reference_market)
+        calendar = self.read_session_calendar_revision(calendar_revision_id)
+        if calendar.reference_market != reference_market:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        return calendar
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+
+def _primary_market_history_config(
+    blueprint: ProductionQualifiedRoutingCompositionBlueprint,
+) -> MarketHistoryConfig:
+    return MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=blueprint.database_path,
+        payload_root=blueprint.provider_artifact_root_path,
+        backup_root=blueprint.backup_root_path,
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+
+
+class ProductionQualifiedCalendarPreflightFailureReason(str, Enum):
+    """Closed failures from the live eligibility-calendar reader preflight."""
+
+    READER_INVALID = "qualified_routing_calendar_reader_invalid"
+    READER_NOT_PRIMARY = "qualified_routing_calendar_reader_not_primary"
+    CALENDAR_UNAVAILABLE = "qualified_routing_calendar_unavailable"
+    EXACT_REVISION_MISMATCH = "qualified_routing_calendar_exact_revision_mismatch"
+    FRONTIER_MISMATCH = "qualified_routing_calendar_frontier_mismatch"
+
+
+class ProductionQualifiedCalendarPreflightError(RuntimeError):
+    """Payload-free failure before qualified run allocation or live I/O."""
+
+    def __init__(
+        self,
+        reason: ProductionQualifiedCalendarPreflightFailureReason,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic_code = reason.value
+        super().__init__(reason.value)
+
+
+class ProductionQualifiedCalendarPreflightReceipt(BaseModel):
+    """Safe proof that the live reader can derive the authorized frontier."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "production-qualified-calendar-preflight-v1"
+    ] = "production-qualified-calendar-preflight-v1"
+    calendar_revision_id: str = Field(
+        pattern=r"^market-session-calendar=sha256:[0-9a-f]{64}$"
+    )
+    requested_session: date
+    evaluated_at: datetime
+    latest_completed_session: date
+    next_open_session: date | None = None
+    reader_uses_primary_database: Literal[True] = True
+    exact_revision_verified: Literal[True] = True
+    primary_readiness_verified: Literal[True] = True
+
+
+def _calendar_preflight_fail(
+    reason: ProductionQualifiedCalendarPreflightFailureReason,
+) -> None:
+    raise ProductionQualifiedCalendarPreflightError(reason)
+
+
+def preflight_production_qualified_calendar_reader(
+    composition: RegisteredProductionQualifiedRoutingComposition,
+    *,
+    authorized_calendar_revision_id: str,
+    requested_session: date,
+    evaluated_at: datetime,
+) -> ProductionQualifiedCalendarPreflightReceipt:
+    """Verify the exact live primary-reader binding without provider/model I/O."""
+
+    if evaluated_at.tzinfo is None:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    if (
+        not isinstance(authorized_calendar_revision_id, str)
+        or re.fullmatch(
+            r"market-session-calendar=sha256:[0-9a-f]{64}",
+            authorized_calendar_revision_id,
+        )
+        is None
+    ):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+        )
+    if not isinstance(composition, RegisteredProductionQualifiedRoutingComposition):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        with MarketHistoryStore.open(
+            _primary_market_history_config(composition.blueprint)
+        ) as readiness_store:
+            authorized_exact = readiness_store.read_session_calendar_revision(
+                authorized_calendar_revision_id
+            )
+            authorized_current = readiness_store.read_current_session_calendar(
+                "mainland-cn"
+            )
+            requested_start_date = min(
+                session.session_date for session in authorized_exact.sessions
+            )
+            requested_end_date = max(
+                session.session_date for session in authorized_exact.sessions
+            )
+            readiness = readiness_store.assess_mainland_session_calendar_readiness(
+                authorized_exact.calendar_revision_id,
+                requested_start_date=requested_start_date,
+                requested_end_date=requested_end_date,
+                evaluated_at=evaluated_at,
+            )
+    except Exception:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.CALENDAR_UNAVAILABLE
+        )
+    if authorized_current.calendar_revision_id != authorized_calendar_revision_id:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+        )
+    factories = composition.runtime_factories
+    open_reader = (
+        factories.open_eligibility_calendar_reader
+        if isinstance(factories, ProductionQualifiedRoutingRuntimeFactories)
+        else None
+    )
+    if not callable(open_reader):
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        reader = open_reader(composition.blueprint)
+    except Exception:
+        _calendar_preflight_fail(
+            ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+        )
+    try:
+        if not isinstance(reader, ProductionQualifiedEligibilityCalendarReader):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+            )
+        if reader.database_path != composition.blueprint.database_path:
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_NOT_PRIMARY
+            )
+        try:
+            current = reader.read_current_session_calendar("mainland-cn")
+            exact = reader.read_session_calendar_revision(
+                authorized_exact.calendar_revision_id
+            )
+        except Exception:
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.CALENDAR_UNAVAILABLE
+            )
+        if (
+            current.calendar_revision_id != authorized_exact.calendar_revision_id
+            or exact.calendar_revision_id != authorized_exact.calendar_revision_id
+            or exact.reference_market != authorized_exact.reference_market
+            or exact.timezone_name != authorized_exact.timezone_name
+            or exact.sessions != authorized_exact.sessions
+            or exact.reference_market != current.reference_market
+            or exact.timezone_name != current.timezone_name
+            or exact.sessions != current.sessions
+        ):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+            )
+        try:
+            binding = build_market_session_eligibility_binding(
+                exact,
+                requested_session=requested_session,
+                eligibility_evaluated_at=evaluated_at,
+            )
+        except (TypeError, ValueError):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.FRONTIER_MISMATCH
+            )
+        if (
+            not binding.requested_session_open
+            or binding.latest_completed_session != requested_session
+            or readiness.latest_completed_session != requested_session
+        ):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.FRONTIER_MISMATCH
+            )
+        reader.authorize_calendar_revision(authorized_calendar_revision_id)
+        receipt = ProductionQualifiedCalendarPreflightReceipt(
+            calendar_revision_id=authorized_exact.calendar_revision_id,
+            requested_session=requested_session,
+            evaluated_at=evaluated_at,
+            latest_completed_session=requested_session,
+            next_open_session=binding.next_open_session,
+        )
+        installed_receipt = composition._install_calendar_preflight(
+            reader,
+            receipt,
+        )
+        if installed_receipt is receipt:
+            reader = None
+        return installed_receipt
+    finally:
+        close_reader = getattr(reader, "close", None)
+        if callable(close_reader):
+            with suppress(BaseException):
+                close_reader()
 
 
 def _validated_retained_financial_metadata(
@@ -709,6 +1157,11 @@ class ProductionQualifiedRoutingRuntimeFactories:
     assemble_runtime: Callable[..., ProductionQualifiedRoutingRuntimeAssembly] = field(
         repr=False
     )
+    open_eligibility_calendar_reader: Callable[[object], object] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     phase_hook: Callable[[str, object], None] = field(
         default=_noop_runtime_phase_hook,
         repr=False,
@@ -728,7 +1181,10 @@ class ProductionQualifiedRoutingRuntimeFactories:
             self.assemble_runtime,
             self.phase_hook,
         )
-        if any(not callable(callback) for callback in callbacks):
+        if any(not callable(callback) for callback in callbacks) or (
+            self.open_eligibility_calendar_reader is not None
+            and not callable(self.open_eligibility_calendar_reader)
+        ):
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
@@ -747,13 +1203,7 @@ def production_qualified_routing_runtime_factories(
 
     def open_store(value: object) -> MarketHistoryStore:
         blueprint = runtime_blueprint(value)
-        config = MarketHistoryConfig(
-            mode=MarketHistoryMode.SHADOW,
-            database_path=blueprint.database_path,
-            payload_root=blueprint.provider_artifact_root_path,
-            backup_root=blueprint.backup_root_path,
-            data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
-        )
+        config = _primary_market_history_config(blueprint)
         try:
             return MarketHistoryStore.open_provider_request_authority(config)
         except ProductionQualifiedRoutingLifecycleError:
@@ -806,6 +1256,18 @@ def production_qualified_routing_runtime_factories(
                 allow_prewarming=False,
                 configured_at=datetime.now(timezone.utc),
             )
+            if contract.cninfo_binding is not None:
+                for pacing in contract.cninfo_binding.profile.upstream_pacing:
+                    service_id, service_name = upstream_service_identity_for_provider(pacing.provider_scope)
+                    if service_id != pacing.upstream_service_id:
+                        raise ValueError("CNINFO upstream identity does not match its policy")
+                    coordinator.register_upstream_service(service_id, service_name)
+                    coordinator.configure_operator_ceiling(
+                        upstream_service_id=service_id,
+                        minimum_interval=timedelta(seconds=pacing.minimum_interval_seconds),
+                        allow_prewarming=pacing.allow_prewarming,
+                        configured_at=datetime.now(timezone.utc),
+                    )
             return coordinator
         except ProductionQualifiedRoutingLifecycleError:
             raise
@@ -825,6 +1287,14 @@ def production_qualified_routing_runtime_factories(
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             ) from None
+
+    def open_eligibility_calendar_reader(
+        value: object,
+    ) -> ProductionQualifiedEligibilityCalendarReader:
+        blueprint = runtime_blueprint(value)
+        return ProductionQualifiedEligibilityCalendarReader(
+            _primary_market_history_config(blueprint)
+        )
 
     def build_cache(
         coordinator: object,
@@ -905,6 +1375,7 @@ def production_qualified_routing_runtime_factories(
         ),
         build_baostock_transport=build_baostock,
         assemble_runtime=_assemble_production_qualified_runtime,
+        open_eligibility_calendar_reader=open_eligibility_calendar_reader,
     )
 
 
@@ -971,6 +1442,12 @@ def _cache_normalizer_is_compatible(
             BAOSTOCK_RATIO_NORMALIZER_VERSION,
             BAOSTOCK_RATIO_NORMALIZER_VERSION_V1,
         }
+    if key.provider_id == "cninfo":
+        return (
+            plan.plan_version == "1.5"
+            and key.normalizer_version
+            == "cninfo-listing-publication-normalizer-v1"
+        )
     if key.provider_id == "akshare_sina":
         external_normalizer = {
             "adjustment_factors": AKSHARE_FACTOR_NORMALIZER_VERSION,
@@ -1076,14 +1553,18 @@ def _restore_checkpoint_eligibility_context(
         )
     raw_ledger_version = raw_shadow_ledger.get("contract_version")
     expected_ledger_version = (
-        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.5"
+        else FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        if run_binding.routing_plan.plan_version == "1.4"
+        else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.3"
         else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if run_binding.routing_plan.plan_version == "1.2"
         else FINANCIAL_DISPATCH_CONTEXT_LEDGER_VERSION
     )
     if raw_ledger_version != expected_ledger_version:
-        if run_binding.routing_plan.plan_version == "1.3":
+        if run_binding.routing_plan.plan_version in {"1.3", "1.4", "1.5"}:
             raise FinancialDispatchCheckpointError(
                 FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
             )
@@ -1109,14 +1590,18 @@ def _restore_checkpoint_eligibility_context(
             FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_INVALID
         )
     expected_context_version = (
-        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
+        if run_binding.routing_plan.plan_version == "1.5"
+        else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+        if run_binding.routing_plan.plan_version == "1.4"
+        else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
         if run_binding.routing_plan.plan_version == "1.3"
         else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION
     )
     if raw_context.get("contract_version") != expected_context_version:
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if run_binding.routing_plan.plan_version == "1.3"
+            if run_binding.routing_plan.plan_version in {"1.3", "1.4", "1.5"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_VERSION_UNSUPPORTED
         )
     raw_identity = raw_context.get("context_identity")
@@ -1145,7 +1630,11 @@ def _restore_checkpoint_eligibility_context(
     context_session = (
         context.requested_session
         if context.contract_version
-        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        in {
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+        }
         else context.as_of_date
     )
     if (
@@ -1310,7 +1799,11 @@ def _validated_checkpoint_restoration(
         )
     )
     expected_shadow_version = (
-        FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
+        FINANCIAL_DISPATCH_COMPOSITE_LEDGER_VERSION
+        if plan.plan_version == "1.5"
+        else FINANCIAL_DISPATCH_WINDOWED_LEDGER_VERSION
+        if plan.plan_version == "1.4"
+        else FINANCIAL_DISPATCH_TEMPORAL_LEDGER_VERSION
         if plan.plan_version == "1.3"
         else FINANCIAL_DISPATCH_INDICATOR_COMPATIBILITY_LEDGER_VERSION
         if plan.plan_version == "1.2"
@@ -1326,7 +1819,9 @@ def _validated_checkpoint_restoration(
         or shadow_ledger.capability_routing_plan_signature != plan.plan_signature
         or shadow_ledger.financial_manifest_version
         != (
-            FINANCIAL_MANIFEST_V4
+            FINANCIAL_MANIFEST_V5
+            if plan.plan_version == "1.4"
+            else FINANCIAL_MANIFEST_V4
             if plan.plan_version == "1.3"
             else FINANCIAL_MANIFEST_V2
         )
@@ -1359,15 +1854,27 @@ def _validated_checkpoint_restoration(
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.INDICATOR_METADATA_COMPATIBILITY_MISMATCH
         )
-    if plan.plan_version == "1.3":
+    if plan.plan_version in {"1.3", "1.4", "1.5"}:
         temporal = context.temporal_eligibility_binding
+        expected_context_version = (
+            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4
+            if plan.plan_version == "1.5"
+            else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3
+            if plan.plan_version == "1.4"
+            else FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+        )
         if (
-            context.contract_version
-            != FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+            context.contract_version != expected_context_version
             or temporal is None
-            or shadow_ledger.capability_routing_plan_version != "1.3"
+            or shadow_ledger.capability_routing_plan_version != plan.plan_version
             or shadow_ledger.financial_indicator_manifest_version
-            != FINANCIAL_MANIFEST_V4
+            != (
+                plan.indicator_manifest_contract_version
+                if plan.plan_version == "1.5"
+                else FINANCIAL_MANIFEST_V5
+                if plan.plan_version == "1.4"
+                else FINANCIAL_MANIFEST_V4
+            )
             or shadow_ledger.indicator_field_semantics_version
             != plan.indicator_field_semantics_version
             or shadow_ledger.indicator_metadata_compatibility_version
@@ -1383,7 +1890,15 @@ def _validated_checkpoint_restoration(
             )
     if (
         cache_checkpoint.contract_version
-        != ("1.2" if plan.plan_version == "1.3" else "1.1")
+        != (
+            "1.3"
+            if plan.plan_version == "1.4"
+            else "1.4"
+            if plan.plan_version == "1.5"
+            else "1.2"
+            if plan.plan_version == "1.3"
+            else "1.1"
+        )
         or cache_checkpoint.financial_eligibility_context_contract_version
         != context.contract_version
         or cache_checkpoint.financial_eligibility_context_identity
@@ -1391,13 +1906,82 @@ def _validated_checkpoint_restoration(
     ):
         raise FinancialDispatchCheckpointError(
             FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
-            if plan.plan_version == "1.3"
+            if plan.plan_version in {"1.3", "1.4", "1.5"}
             else FinancialDispatchCheckpointFailureReason.ELIGIBILITY_CONTEXT_CACHE_MISMATCH
         )
 
     expected_identity = ProviderSubrequestInstrumentIdentity.from_authoritative(
         run_binding.asset_configuration.instrument_identity
     )
+    if plan.plan_version == "1.5":
+        proof = context.listing_composite_temporal_proof
+        if proof is None:
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.TEMPORAL_COMPATIBILITY_MISMATCH
+            )
+        publication = proof.publication_evidence
+        document = proof.document_evidence
+        cninfo_entries = tuple(
+            entry
+            for entry in cache_checkpoint.entries
+            if entry.key.provider_id == "cninfo"
+        )
+        expected_requests = {
+            publication.security_lookup_request_identity: (
+                publication.security_lookup_artifact.artifact_identity,
+                "cninfo.metadata",
+                CNINFO_SECURITY_LOOKUP_OPERATION,
+                "application/json",
+            ),
+            publication.announcement_query_request_identity: (
+                publication.metadata_artifact.artifact_identity,
+                "cninfo.metadata",
+                CNINFO_ANNOUNCEMENT_QUERY_OPERATION,
+                "application/json",
+            ),
+        }
+        if document is not None:
+            expected_requests[document.document_request_identity] = (
+                document.artifact.artifact_identity,
+                "cninfo.documents",
+                CNINFO_DOCUMENT_FETCH_OPERATION,
+                "text/html",
+            )
+        expected_artifacts = {
+            artifact_identity
+            for artifact_identity, _scope, _operation, _media_type in expected_requests.values()
+        }
+        entries_by_request = {
+            entry.key.subrequest_key: entry for entry in cninfo_entries
+        }
+        retained_artifacts = {
+            entry.artifact.artifact_ref
+            for entry in cninfo_entries
+            if entry.artifact is not None
+        }
+        if (
+            len(cninfo_entries) != len(expected_requests)
+            or len(entries_by_request) != len(cninfo_entries)
+            or set(entries_by_request) != set(expected_requests)
+            or retained_artifacts != expected_artifacts
+            or any(
+                entry.artifact is None
+                or entry.artifact.artifact_ref != artifact_identity
+                or entry.artifact.media_type != media_type
+                or entry.key.capacity_scope != capacity_scope
+                or operation not in entry.key.requested_fields
+                for request_identity, (
+                    artifact_identity,
+                    capacity_scope,
+                    operation,
+                    media_type,
+                ) in expected_requests.items()
+                for entry in (entries_by_request[request_identity],)
+            )
+        ):
+            raise FinancialDispatchCheckpointError(
+                FinancialDispatchCheckpointFailureReason.PROVIDER_SUBREQUEST_CACHE_INVALID
+            )
     allowed_physical_providers = {
         _physical_provider_id(provider_id)
         for route in plan.routes
@@ -1408,12 +1992,21 @@ def _validated_checkpoint_restoration(
         expected_account_scope = (
             plan.account_scope_label
             if key.provider_id == "tushare"
+            else "cninfo-public-research"
+            if key.provider_id == "cninfo"
             else "not-applicable"
             if key.provider_id == "baostock"
             else "public"
         )
         expected_upstream_id, _ = upstream_service_identity_for_provider(
-            key.provider_id,
+            (
+                "cninfo_documents"
+                if key.provider_id == "cninfo"
+                and key.capacity_scope == "cninfo.documents"
+                else "cninfo_metadata"
+                if key.provider_id == "cninfo"
+                else key.provider_id
+            ),
             account_scope=(
                 expected_account_scope if key.provider_id == "tushare" else ""
             ),
@@ -1424,12 +2017,22 @@ def _validated_checkpoint_restoration(
             or key.canonical_symbol != expected_identity.canonical_symbol
             or key.account_scope != expected_account_scope
             or key.upstream_service_id != expected_upstream_id
-            or key.qualification_profile != plan.qualification_profile
+            or key.qualification_profile
+            != (
+                plan.listing_publication_candidate_profile
+                if key.provider_id == "cninfo"
+                else plan.qualification_profile
+            )
             or key.data_usage_mode is not blueprint.factory_contract.data_usage_mode
             or not _cache_normalizer_is_compatible(key, plan)
             or (
                 entry.artifact is not None
-                and entry.artifact.media_type != "application/json"
+                and entry.artifact.media_type
+                not in (
+                    {"application/json", "text/html"}
+                    if key.provider_id == "cninfo"
+                    else {"application/json"}
+                )
             )
         ):
             raise FinancialDispatchCheckpointError(
@@ -1471,6 +2074,18 @@ class RegisteredProductionQualifiedRoutingComposition:
         compare=False,
         default=None,
     )
+    _calendar_preflight_reader: ProductionQualifiedEligibilityCalendarReader | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _calendar_preflight_receipt: ProductionQualifiedCalendarPreflightReceipt | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
     _closed: bool = field(init=False, repr=False, compare=False, default=False)
 
     def __post_init__(self) -> None:
@@ -1493,6 +2108,36 @@ class RegisteredProductionQualifiedRoutingComposition:
     @property
     def factory_identity(self) -> str:
         return self.blueprint.factory_contract_version
+
+    def _install_calendar_preflight(
+        self,
+        reader: ProductionQualifiedEligibilityCalendarReader,
+        receipt: ProductionQualifiedCalendarPreflightReceipt,
+    ) -> ProductionQualifiedCalendarPreflightReceipt:
+        """Atomically retain one exact preflight reader until run ownership binds."""
+
+        if not isinstance(
+            reader,
+            ProductionQualifiedEligibilityCalendarReader,
+        ) or not isinstance(receipt, ProductionQualifiedCalendarPreflightReceipt):
+            _calendar_preflight_fail(
+                ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+            )
+        with self._state_lock:
+            if self._closed or self._owner is not None:
+                _calendar_preflight_fail(
+                    ProductionQualifiedCalendarPreflightFailureReason.READER_INVALID
+                )
+            existing_receipt = self._calendar_preflight_receipt
+            if existing_receipt is not None:
+                if existing_receipt != receipt:
+                    _calendar_preflight_fail(
+                        ProductionQualifiedCalendarPreflightFailureReason.EXACT_REVISION_MISMATCH
+                    )
+                return existing_receipt
+            object.__setattr__(self, "_calendar_preflight_reader", reader)
+            object.__setattr__(self, "_calendar_preflight_receipt", receipt)
+            return receipt
 
     def bind_run(
         self,
@@ -1606,6 +2251,26 @@ class RegisteredProductionQualifiedRoutingComposition:
             "coordinator_store",
             factories.open_coordinator_store(self.blueprint),
         )
+        eligibility_calendar_reader = self._calendar_preflight_reader
+        if eligibility_calendar_reader is not None:
+            object.__setattr__(self, "_calendar_preflight_reader", None)
+            eligibility_calendar_reader = acquire(
+                "eligibility_calendar_reader",
+                eligibility_calendar_reader,
+            )
+        if (
+            self.blueprint.routing_plan.plan_version == "1.3"
+            and eligibility_calendar_reader is None
+        ):
+            open_calendar_reader = factories.open_eligibility_calendar_reader
+            if not callable(open_calendar_reader):
+                raise ProductionQualifiedRoutingLifecycleError(
+                    ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+                )
+            eligibility_calendar_reader = acquire(
+                "eligibility_calendar_reader",
+                open_calendar_reader(self.blueprint),
+            )
         coordinator = acquire(
             "coordinator",
             factories.build_coordinator(coordinator_store, owner.stop_signal),
@@ -1640,13 +2305,21 @@ class RegisteredProductionQualifiedRoutingComposition:
                     context=(
                         restoration.context
                         if restoration.context.contract_version
-                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        in {
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+                        }
                         else None
                     ),
                     capability_routing_plan=(
                         run_binding.routing_plan
                         if restoration.context.contract_version
-                        == FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2
+                        in {
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V2,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V3,
+                            FINANCIAL_ELIGIBILITY_ACQUISITION_CONTEXT_VERSION_V4,
+                        }
                         else None
                     ),
                 )
@@ -1705,6 +2378,7 @@ class RegisteredProductionQualifiedRoutingComposition:
             run_binding=run_binding,
             coordinator=coordinator,
             coordinator_store=coordinator_store,
+            eligibility_calendar_reader=eligibility_calendar_reader,
             artifact_store=artifact_store,
             subrequest_cache=subrequest_cache,
             provider_clients=MappingProxyType(
@@ -1836,8 +2510,13 @@ class RegisteredProductionQualifiedRoutingComposition:
                 return
             object.__setattr__(self, "_closed", True)
             owner = self._owner
+            calendar_reader = self._calendar_preflight_reader
+            object.__setattr__(self, "_calendar_preflight_reader", None)
         if owner is not None:
             owner.close()
+        if calendar_reader is not None:
+            with suppress(BaseException):
+                calendar_reader.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1930,6 +2609,8 @@ def _ordinary_plan_pairs(
         (route.capability, provider_id)
         for route in plan.routes
         if route.capability is not MainlandCapability.DAILY_MARKET_SNAPSHOT
+        and route.capability
+        is not MainlandCapability.LISTING_PUBLICATION_EVIDENCE
         and (
             route.capability in _STATEMENT_CAPABILITIES
             or route.capability is MainlandCapability.FINANCIAL_INDICATORS
@@ -2418,13 +3099,26 @@ def _required_provider_source_ids(
     return tuple(sorted(sources))
 
 
+def _required_dependency_ids(
+    cninfo_binding: CninfoProductionBinding | None,
+) -> tuple[str, ...]:
+    if cninfo_binding is None:
+        return _REQUIRED_DEPENDENCY_IDS
+    return tuple(sorted((*_REQUIRED_DEPENDENCY_IDS, *CNINFO_PRODUCTION_DEPENDENCY_IDS)))
+
+
 def production_qualified_routing_dependency_availability() -> dict[str, bool]:
     """Resolve the static production dependency inventory without importing it."""
 
-    return {
+    available = {
         dependency: importlib.util.find_spec(dependency) is not None
-        for dependency in _REQUIRED_DEPENDENCY_IDS
+        for dependency in (*_REQUIRED_DEPENDENCY_IDS, *CNINFO_PRODUCTION_DEPENDENCY_IDS)
     }
+    try:
+        available["lxml"] = available["lxml"] and distribution_version("lxml") == "6.1.1"
+    except PackageNotFoundError:
+        available["lxml"] = False
+    return available
 
 
 def production_qualified_routing_provider_source_coverage(
@@ -2706,13 +3400,27 @@ def build_production_qualified_routing_composition_blueprint(
         _fail(
             MainlandCapabilityRoutingFailureReason.DATA_USAGE_MODE_NOT_PERSONAL_RESEARCH
         )
+    selected_version = config_snapshot.get(PRODUCTION_PLAN_VERSION_CONFIG_KEY)
+    if selected_version is not None and selected_version != plan.plan_version:
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_PLAN_INVALID)
+    cninfo_binding = None
+    if plan.plan_version == "1.5":
+        try:
+            cninfo_binding = CninfoProductionBinding.create(
+                plan=plan, asset_configuration=asset_configuration, config=config_snapshot,
+            )
+        except (TypeError, ValueError):
+            _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
+    elif any(config_snapshot.get(key) is not None for key in CNINFO_PRODUCTION_CONFIG_KEYS):
+        _fail(MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID)
+    required_dependency_ids = _required_dependency_ids(cninfo_binding)
     dependency_snapshot = _snapshot_mapping(
         dependency_availability,
-        _REQUIRED_DEPENDENCY_IDS,
+        required_dependency_ids,
     )
     if dependency_snapshot is None or any(
         dependency_snapshot.get(dependency) is not True
-        for dependency in _REQUIRED_DEPENDENCY_IDS
+        for dependency in required_dependency_ids
     ):
         _fail(
             MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_DEPENDENCY_MISSING
@@ -2785,10 +3493,11 @@ def build_production_qualified_routing_composition_blueprint(
             qualification_profile=plan.qualification_profile,
             enabled_capabilities=plan.enabled_tushare_capabilities,
             required_provider_source_ids=required_provider_source_ids,
-            dependency_ids=_REQUIRED_DEPENDENCY_IDS,
+            dependency_ids=required_dependency_ids,
             account_scope_label=plan.account_scope_label,
             endpoint_pacing_identities=plan.endpoint_pacing_identities,
             runtime_root_identities=runtime_root_identities,
+            cninfo_binding=cninfo_binding,
         )
         identity_payload = {
             "blueprint_version": PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION,
@@ -2936,7 +3645,11 @@ def _statement_company_type_evidence_source(
     ):
         temporal = (
             request.metadata_binding.contract_version
-            == "financial-eligibility-metadata-binding-v2"
+            in {
+                "financial-eligibility-metadata-binding-v2",
+                "financial-eligibility-metadata-binding-v3",
+                "financial-eligibility-metadata-binding-v4",
+            }
         )
         as_of_date = (
             request.metadata_binding.requested_session
@@ -3027,6 +3740,20 @@ def _statement_company_type_evidence_source(
             requested_session=as_of_date if temporal else None,
             temporal_evidence=temporal_evidence,
             provider_temporal_proof=provider_temporal_proof,
+            contract_version={
+                "financial-eligibility-metadata-binding-v1": (
+                    "financial-company-type-evidence-binding-v2"
+                ),
+                "financial-eligibility-metadata-binding-v2": (
+                    "financial-company-type-evidence-binding-v3"
+                ),
+                "financial-eligibility-metadata-binding-v3": (
+                    "financial-company-type-evidence-binding-v4"
+                ),
+                "financial-eligibility-metadata-binding-v4": (
+                    "financial-company-type-evidence-binding-v4"
+                ),
+            }[request.metadata_binding.contract_version],
             provider_id=provider_id,
             artifact_identity=candidate.artifact.artifact_identity,
             source_ref=candidate.artifact.artifact_identity,
@@ -3535,11 +4262,13 @@ def _validate_run_dependencies(
     blueprint: ProductionQualifiedRoutingCompositionBlueprint,
     dependencies: ProductionQualifiedRoutingRunDependencies,
 ) -> None:
+    # lxml/requests are profile dependencies, not owned provider clients. The
+    # CNINFO transport is stateless and constructed by the runtime assembler.
     if (
         not isinstance(blueprint, ProductionQualifiedRoutingCompositionBlueprint)
         or not isinstance(dependencies, ProductionQualifiedRoutingRunDependencies)
         or tuple(dependencies.provider_clients)
-        != blueprint.factory_contract.dependency_ids
+        != _REQUIRED_DEPENDENCY_IDS
         or not dependencies.subrequest_cache.is_bound_to(
             coordinator=dependencies.coordinator,
             artifact_store=dependencies.artifact_store,
@@ -3567,7 +4296,11 @@ def _external_request_material(
             as_of_date = (
                 binding.requested_session
                 if binding.contract_version
-                == "financial-eligibility-metadata-binding-v2"
+                in {
+                    "financial-eligibility-metadata-binding-v2",
+                    "financial-eligibility-metadata-binding-v3",
+                    "financial-eligibility-metadata-binding-v4",
+                }
                 else binding.as_of_date
             )
         else:
@@ -4373,6 +5106,7 @@ def _assemble_production_qualified_runtime(
     run_binding: object,
     coordinator: object,
     coordinator_store: object,
+    eligibility_calendar_reader: object,
     artifact_store: object,
     subrequest_cache: object,
     provider_clients: Mapping[str, object],
@@ -4384,6 +5118,13 @@ def _assemble_production_qualified_runtime(
         or not isinstance(run_binding, ProductionQualifiedRoutingRunBinding)
         or not isinstance(coordinator, ProviderRequestCoordinator)
         or not isinstance(coordinator_store, MarketHistoryStore)
+        or (
+            blueprint.routing_plan.plan_version == "1.3"
+            and not isinstance(
+                eligibility_calendar_reader,
+                ProductionQualifiedEligibilityCalendarReader,
+            )
+        )
         or not isinstance(artifact_store, ProviderSubrequestArtifactStore)
         or not isinstance(subrequest_cache, ProviderSubrequestCache)
         or not callable(acquire_owned_resource)
@@ -4435,10 +5176,31 @@ def _assemble_production_qualified_runtime(
             else None
         ),
     )
+    listing_publication_source = None
+    cninfo_binding = blueprint.factory_contract.cninfo_binding
+    if blueprint.routing_plan.plan_version == "1.5":
+        if cninfo_binding is None:
+            raise ProductionQualifiedRoutingLifecycleError(
+                ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+            )
+        listing_publication_source = CninfoListingPublicationAdapter(
+            subrequest_cache=subrequest_cache,
+            transport=RequestsCninfoHttpTransport(),
+            source_policy=cninfo_binding.profile.source_policy,
+            owner_id=dependencies.owner_id,
+            now=dependencies.now,
+            sleep=dependencies.sleep,
+            lease_duration=dependencies.lease_duration,
+        ).acquire
+    publication_arguments = (
+        {"listing_publication_source": listing_publication_source}
+        if listing_publication_source is not None else {}
+    )
     eligibility_metadata_acquirer = FinancialEligibilityMetadataAcquirer(
         routing_plan=blueprint.routing_plan,
         router=source_composition.router,
         stop_signal=stop_signal,
+        **publication_arguments,
     )
     return ProductionQualifiedRoutingRuntimeAssembly(
         financial_routing=financial_routing,
@@ -4446,8 +5208,15 @@ def _assemble_production_qualified_runtime(
         dependencies=dependencies,
         eligibility_metadata_acquirer=eligibility_metadata_acquirer,
         eligibility_clock=dependencies.now,
-        eligibility_calendar_provider=lambda: coordinator.read_current_session_calendar(
-            "mainland-cn"
+        eligibility_calendar_provider=(
+            lambda: eligibility_calendar_reader.read_eligibility_session_calendar(
+                "mainland-cn"
+            )
+            if isinstance(
+                eligibility_calendar_reader,
+                ProductionQualifiedEligibilityCalendarReader,
+            )
+            else None
         ),
     )
 
@@ -4668,6 +5437,10 @@ __all__ = [
     "PRODUCTION_QUALIFIED_ROUTING_BLUEPRINT_VERSION",
     "PRODUCTION_QUALIFIED_ROUTING_FACTORY_CONTRACT_VERSION",
     "ProductionFinancialEligibilityRuntimeInputs",
+    "ProductionQualifiedCalendarPreflightError",
+    "ProductionQualifiedCalendarPreflightFailureReason",
+    "ProductionQualifiedCalendarPreflightReceipt",
+    "ProductionQualifiedEligibilityCalendarReader",
     "ProductionQualifiedBoundSource",
     "ProductionBaoStockRunTransport",
     "ProductionQualifiedRoutingCompositionBlueprint",
@@ -4680,6 +5453,8 @@ __all__ = [
     "ProductionQualifiedRoutingRuntimeAssembly",
     "ProductionQualifiedRoutingRuntimeFactories",
     "ProductionQualifiedRoutingRunBinding",
+    "ProductionQualifiedRoutingSourceBinding",
+    "ProductionQualifiedRoutingPreparation",
     "RegisteredProductionQualifiedRoutingComposition",
     "ProductionQualifiedRoutingRunDependencies",
     "ProductionQualifiedProviderSourceComposition",
@@ -4693,4 +5468,7 @@ __all__ = [
     "build_registered_production_qualified_routing_composition",
     "production_qualified_routing_dependency_availability",
     "production_qualified_routing_provider_source_coverage",
+    "preflight_production_qualified_calendar_reader",
+    "seal_production_qualified_routing_preparation",
+    "validate_production_qualified_routing_preparation",
 ]

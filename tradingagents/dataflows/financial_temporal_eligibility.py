@@ -22,14 +22,39 @@ from tradingagents.market_history import (
 )
 
 PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION = "provider-neutral-temporal-eligibility-v1"
+PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION_V2 = (
+    "provider-neutral-temporal-eligibility-v2"
+)
 MARKET_SESSION_ELIGIBILITY_BINDING_VERSION = "market-session-eligibility-binding-v1"
+MARKET_SESSION_ELIGIBILITY_BINDING_VERSION_V2 = "market-session-eligibility-binding-v2"
+FINANCIAL_ELIGIBILITY_ACQUISITION_WINDOW_VERSION = (
+    "financial-eligibility-acquisition-window-v1"
+)
+FINANCIAL_ELIGIBILITY_TEMPORAL_TRANSACTION_BINDING_VERSION = (
+    "financial-eligibility-temporal-transaction-binding-v1"
+)
+FINANCIAL_TEMPORAL_EVIDENCE_ACQUISITION_BINDING_VERSION = (
+    "financial-temporal-evidence-acquisition-binding-v1"
+)
 FINANCIAL_METADATA_TEMPORAL_EVIDENCE_VERSION = "financial-metadata-temporal-evidence-v1"
 FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION = (
     "financial-metadata-temporal-eligibility-decision-v1"
 )
+FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION_V2 = (
+    "financial-metadata-temporal-eligibility-decision-v2"
+)
 
 _CALENDAR_IDENTITY_PREFIX = "market-session-eligibility-binding:v1:"
+_CALENDAR_V2_IDENTITY_PREFIX = "market-session-eligibility-binding:v2:"
+_ACQUISITION_WINDOW_IDENTITY_PREFIX = "financial-eligibility-acquisition-window:v1:"
+_TEMPORAL_TRANSACTION_IDENTITY_PREFIX = (
+    "financial-eligibility-temporal-transaction:v1:"
+)
+_TEMPORAL_EVIDENCE_ACQUISITION_IDENTITY_PREFIX = (
+    "financial-temporal-evidence-acquisition:v1:"
+)
 _DECISION_IDENTITY_PREFIX = "financial-metadata-temporal-eligibility-decision:v1:"
+_DECISION_V2_IDENTITY_PREFIX = "financial-metadata-temporal-eligibility-decision:v2:"
 _SAFE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 _CALENDAR_REVISION_ID_PATTERN = (
     r"^(?:market-session-calendar=sha256:|market-session-calendar:v1:)[0-9a-f]{64}$"
@@ -94,6 +119,22 @@ class TemporalEligibilityRejectionReason(str, Enum):
     EXACT_REVISION_NOT_AVAILABLE_BY_STRICT_CUTOFF = "exact_revision_not_available_by_strict_cutoff"
     TEMPORAL_EVIDENCE_ARTIFACT_BINDING_MISMATCH = "temporal_evidence_artifact_binding_mismatch"
     UNKNOWN_TEMPORAL_ELIGIBILITY_MODE = "unknown_temporal_eligibility_mode"
+
+
+class TemporalEligibilityRejectionReasonV2(str, Enum):
+    """Additive acquisition-window reasons; v1 vocabulary stays frozen."""
+
+    ELIGIBILITY_EVALUATION_BEFORE_START = "eligibility_evaluation_before_start"
+    OBSERVATION_BEFORE_ELIGIBILITY_START = "observation_before_eligibility_start"
+    RETRIEVAL_BEFORE_ELIGIBILITY_START = "retrieval_before_eligibility_start"
+    ACQUISITION_WINDOW_BINDING_MISMATCH = "acquisition_window_binding_mismatch"
+
+
+class TemporalEvidenceAcquisitionOrigin(str, Enum):
+    """Whether proof was acquired inside or before the active transaction."""
+
+    FRESH = "fresh"
+    RETAINED = "retained"
 
 
 def _aware(value: datetime, *, field_name: str) -> datetime:
@@ -393,20 +434,314 @@ def build_market_session_eligibility_binding(
     )
 
 
+class FinancialEligibilityTemporalTransactionBinding(BaseModel):
+    """Run-owned start binding for one open fresh-acquisition transaction."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "financial-eligibility-temporal-transaction-binding-v1"
+    ] = FINANCIAL_ELIGIBILITY_TEMPORAL_TRANSACTION_BINDING_VERSION
+    transaction_identity: str = Field(
+        pattern=r"^financial-eligibility-temporal-transaction:v1:[0-9a-f]{64}$"
+    )
+    canonical_run_id: str = Field(pattern=r"^run:[0-9a-f]{64}$")
+    routing_plan_signature: str = Field(
+        pattern=r"^mainland-routing-plan:v1:[0-9a-f]{64}$"
+    )
+    mode: TemporalEligibilityMode
+    requested_session: date
+    eligibility_started_at: datetime
+    calendar_binding: MarketSessionEligibilityBinding
+    strict_cutoff: datetime | None = None
+
+    @field_validator("eligibility_started_at", "strict_cutoff")
+    @classmethod
+    def _validate_transaction_time(
+        cls,
+        value: datetime | None,
+        info: Any,
+    ) -> datetime | None:
+        return None if value is None else _aware(value, field_name=info.field_name)
+
+    def identity_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="python", exclude={"transaction_identity"})
+
+    @model_validator(mode="after")
+    def _validate_transaction_binding(self) -> Self:
+        strict = self.mode is TemporalEligibilityMode.STRICT_HISTORICAL_PIT
+        if (
+            not self.calendar_binding.has_valid_identity()
+            or self.requested_session != self.calendar_binding.requested_session
+            or self.eligibility_started_at
+            != self.calendar_binding.eligibility_evaluated_at
+            or strict != (self.strict_cutoff is not None)
+            or self.transaction_identity
+            != _identity(
+                _TEMPORAL_TRANSACTION_IDENTITY_PREFIX,
+                self.identity_payload(),
+            )
+        ):
+            raise ValueError("temporal transaction binding is inconsistent")
+        return self
+
+
+def build_financial_eligibility_temporal_transaction_binding(
+    *,
+    canonical_run_id: str,
+    routing_plan_signature: str,
+    mode: TemporalEligibilityMode,
+    requested_session: date,
+    eligibility_started_at: datetime,
+    calendar_binding: MarketSessionEligibilityBinding,
+    strict_cutoff: datetime | None = None,
+) -> FinancialEligibilityTemporalTransactionBinding:
+    payload = {
+        "contract_version": (
+            FINANCIAL_ELIGIBILITY_TEMPORAL_TRANSACTION_BINDING_VERSION
+        ),
+        "canonical_run_id": canonical_run_id,
+        "routing_plan_signature": routing_plan_signature,
+        "mode": mode,
+        "requested_session": requested_session,
+        "eligibility_started_at": eligibility_started_at,
+        "calendar_binding": calendar_binding,
+        "strict_cutoff": strict_cutoff,
+    }
+    return FinancialEligibilityTemporalTransactionBinding(
+        **payload,
+        transaction_identity=_identity(
+            _TEMPORAL_TRANSACTION_IDENTITY_PREFIX,
+            payload,
+        ),
+    )
+
+
+class FinancialTemporalEvidenceAcquisitionBinding(BaseModel):
+    """Proof staged under one active transaction with explicit origin."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal[
+        "financial-temporal-evidence-acquisition-binding-v1"
+    ] = FINANCIAL_TEMPORAL_EVIDENCE_ACQUISITION_BINDING_VERSION
+    binding_identity: str = Field(
+        pattern=r"^financial-temporal-evidence-acquisition:v1:[0-9a-f]{64}$"
+    )
+    transaction_identity: str = Field(
+        pattern=r"^financial-eligibility-temporal-transaction:v1:[0-9a-f]{64}$"
+    )
+    evidence_origin: TemporalEvidenceAcquisitionOrigin
+    evidence: FinancialMetadataTemporalEvidence
+
+    def identity_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="python", exclude={"binding_identity"})
+
+    @model_validator(mode="after")
+    def _validate_acquisition_binding(self) -> Self:
+        if self.binding_identity != _identity(
+            _TEMPORAL_EVIDENCE_ACQUISITION_IDENTITY_PREFIX,
+            self.identity_payload(),
+        ):
+            raise ValueError("temporal evidence acquisition identity mismatch")
+        return self
+
+
+def bind_financial_temporal_evidence_to_transaction(
+    *,
+    transaction_identity: str,
+    evidence_origin: TemporalEvidenceAcquisitionOrigin,
+    evidence: FinancialMetadataTemporalEvidence,
+) -> FinancialTemporalEvidenceAcquisitionBinding:
+    payload = {
+        "contract_version": FINANCIAL_TEMPORAL_EVIDENCE_ACQUISITION_BINDING_VERSION,
+        "transaction_identity": transaction_identity,
+        "evidence_origin": evidence_origin,
+        "evidence": evidence,
+    }
+    return FinancialTemporalEvidenceAcquisitionBinding(
+        **payload,
+        binding_identity=_identity(
+            _TEMPORAL_EVIDENCE_ACQUISITION_IDENTITY_PREFIX,
+            payload,
+        ),
+    )
+
+
+class MarketSessionEligibilityBindingV2(BaseModel):
+    """Start and terminal frontiers from one pinned calendar revision."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["market-session-eligibility-binding-v2"] = (
+        MARKET_SESSION_ELIGIBILITY_BINDING_VERSION_V2
+    )
+    binding_identity: str = Field(
+        pattern=r"^market-session-eligibility-binding:v2:[0-9a-f]{64}$"
+    )
+    started: MarketSessionEligibilityBinding
+    evaluated: MarketSessionEligibilityBinding
+
+    @model_validator(mode="after")
+    def _validate_window_frontiers(self) -> Self:
+        if (
+            not self.started.has_valid_identity()
+            or not self.evaluated.has_valid_identity()
+            or self.started.calendar_revision_id
+            != self.evaluated.calendar_revision_id
+            or self.started.reference_market != self.evaluated.reference_market
+            or self.started.timezone_name != self.evaluated.timezone_name
+            or self.started.requested_session != self.evaluated.requested_session
+            or self.started.requested_session_open
+            != self.evaluated.requested_session_open
+            or self.started.requested_session_close
+            != self.evaluated.requested_session_close
+            or self.started.next_open_session != self.evaluated.next_open_session
+            or self.started.next_session_close != self.evaluated.next_session_close
+            or self.started.eligibility_evaluated_at
+            > self.evaluated.eligibility_evaluated_at
+        ):
+            raise ValueError("market-session eligibility window binding is invalid")
+        if self.binding_identity != _identity(
+            _CALENDAR_V2_IDENTITY_PREFIX,
+            self.identity_payload(),
+        ):
+            raise ValueError("market-session eligibility v2 identity mismatch")
+        return self
+
+    def identity_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="python", exclude={"binding_identity"})
+
+
+def build_market_session_eligibility_binding_v2(
+    calendar: StoredSessionCalendar,
+    *,
+    requested_session: date,
+    eligibility_started_at: datetime,
+    eligibility_evaluated_at: datetime,
+) -> MarketSessionEligibilityBindingV2:
+    """Bind the pre-I/O and terminal frontiers to one calendar revision."""
+
+    started = build_market_session_eligibility_binding(
+        calendar,
+        requested_session=requested_session,
+        eligibility_evaluated_at=eligibility_started_at,
+    )
+    evaluated = build_market_session_eligibility_binding(
+        calendar,
+        requested_session=requested_session,
+        eligibility_evaluated_at=eligibility_evaluated_at,
+    )
+    payload = {
+        "contract_version": MARKET_SESSION_ELIGIBILITY_BINDING_VERSION_V2,
+        "started": started,
+        "evaluated": evaluated,
+    }
+    return MarketSessionEligibilityBindingV2(
+        **payload,
+        binding_identity=_identity(_CALENDAR_V2_IDENTITY_PREFIX, payload),
+    )
+
+
+class FinancialEligibilityAcquisitionWindow(BaseModel):
+    """One fresh-metadata interval sealed before context binding."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+
+    contract_version: Literal["financial-eligibility-acquisition-window-v1"] = (
+        FINANCIAL_ELIGIBILITY_ACQUISITION_WINDOW_VERSION
+    )
+    window_identity: str = Field(
+        pattern=r"^financial-eligibility-acquisition-window:v1:[0-9a-f]{64}$"
+    )
+    transaction_binding: FinancialEligibilityTemporalTransactionBinding
+    calendar_binding: MarketSessionEligibilityBindingV2
+
+    @model_validator(mode="after")
+    def _validate_window_identity(self) -> Self:
+        if (
+            self.transaction_binding.calendar_binding
+            != self.calendar_binding.started
+            or self.transaction_binding.requested_session
+            != self.calendar_binding.evaluated.requested_session
+            or self.window_identity
+            != _identity(
+                _ACQUISITION_WINDOW_IDENTITY_PREFIX,
+                self.identity_payload(),
+            )
+        ):
+            raise ValueError("eligibility acquisition window identity mismatch")
+        return self
+
+    def identity_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="python", exclude={"window_identity"})
+
+    @property
+    def eligibility_started_at(self) -> datetime:
+        return self.calendar_binding.started.eligibility_evaluated_at
+
+    @property
+    def eligibility_evaluated_at(self) -> datetime:
+        return self.calendar_binding.evaluated.eligibility_evaluated_at
+
+    @property
+    def calendar_revision_id(self) -> str:
+        return self.calendar_binding.evaluated.calendar_revision_id
+
+    @property
+    def requested_session(self) -> date:
+        return self.calendar_binding.evaluated.requested_session
+
+    @property
+    def started_latest_completed_session(self) -> date | None:
+        return self.calendar_binding.started.latest_completed_session
+
+    @property
+    def evaluated_latest_completed_session(self) -> date | None:
+        return self.calendar_binding.evaluated.latest_completed_session
+
+
+def build_financial_eligibility_acquisition_window(
+    calendar: StoredSessionCalendar,
+    *,
+    transaction_binding: FinancialEligibilityTemporalTransactionBinding,
+    requested_session: date,
+    eligibility_started_at: datetime,
+    eligibility_evaluated_at: datetime,
+) -> FinancialEligibilityAcquisitionWindow:
+    calendar_binding = build_market_session_eligibility_binding_v2(
+        calendar,
+        requested_session=requested_session,
+        eligibility_started_at=eligibility_started_at,
+        eligibility_evaluated_at=eligibility_evaluated_at,
+    )
+    payload = {
+        "contract_version": FINANCIAL_ELIGIBILITY_ACQUISITION_WINDOW_VERSION,
+        "transaction_binding": transaction_binding,
+        "calendar_binding": calendar_binding,
+    }
+    return FinancialEligibilityAcquisitionWindow(
+        **payload,
+        window_identity=_identity(_ACQUISITION_WINDOW_IDENTITY_PREFIX, payload),
+    )
+
+
 class FinancialMetadataTemporalEligibilityDecision(BaseModel):
     """Immutable accepted/rejected temporal decision and exact safe reasons."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-metadata-temporal-eligibility-decision-v1"] = (
-        FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION
-    )
+    contract_version: Literal[
+        "financial-metadata-temporal-eligibility-decision-v1",
+        "financial-metadata-temporal-eligibility-decision-v2",
+    ] = FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION
     decision_identity: str = Field(
-        pattern=(r"^financial-metadata-temporal-eligibility-decision:v1:[0-9a-f]{64}$")
+        pattern=(r"^financial-metadata-temporal-eligibility-decision:v[12]:[0-9a-f]{64}$")
     )
-    temporal_policy_version: Literal["provider-neutral-temporal-eligibility-v1"] = (
-        PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION
-    )
+    temporal_policy_version: Literal[
+        "provider-neutral-temporal-eligibility-v1",
+        "provider-neutral-temporal-eligibility-v2",
+    ] = PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION
     mode: str = Field(pattern=r"^[a-z][a-z0-9_]{0,78}$")
     immutable_artifact_identity: str = Field(pattern=_SAFE_ID_PATTERN)
     immutable_revision_identity: str = Field(pattern=_SAFE_ID_PATTERN)
@@ -424,8 +759,22 @@ class FinancialMetadataTemporalEligibilityDecision(BaseModel):
     exact_revision_authoritative_available_at: datetime | None = None
     exact_revision_availability_proof: ExactRevisionAvailabilityProof | None = None
     calendar_binding: MarketSessionEligibilityBinding
+    evidence_origin: TemporalEvidenceAcquisitionOrigin | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    evidence_acquisition_binding: (
+        FinancialTemporalEvidenceAcquisitionBinding | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)
+    acquisition_window: FinancialEligibilityAcquisitionWindow | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     result: Literal["accepted", "rejected"]
-    reasons: tuple[TemporalEligibilityRejectionReason, ...]
+    reasons: tuple[
+        TemporalEligibilityRejectionReason | TemporalEligibilityRejectionReasonV2,
+        ...,
+    ]
     eligible_session: date | None = None
 
     @field_validator(
@@ -443,7 +792,13 @@ class FinancialMetadataTemporalEligibilityDecision(BaseModel):
     def _canonical_reasons(cls, value: object) -> object:
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             return value
-        parsed = tuple(TemporalEligibilityRejectionReason(item) for item in value)
+        def parse_reason(item: object):
+            try:
+                return TemporalEligibilityRejectionReason(item)
+            except ValueError:
+                return TemporalEligibilityRejectionReasonV2(item)
+
+        parsed = tuple(parse_reason(item) for item in value)
         canonical = tuple(sorted(set(parsed), key=lambda reason: reason.value))
         if parsed != canonical:
             raise ValueError("temporal eligibility reasons must be sorted and unique")
@@ -472,11 +827,80 @@ class FinancialMetadataTemporalEligibilityDecision(BaseModel):
             retrieved_at=self.retrieved_at,
             exact_revision_availability_proof=(self.exact_revision_availability_proof),
         )
-        expected_reasons = _canonical_temporal_eligibility_reasons(
-            mode_value=self.mode,
-            evidence=evidence,
-            calendar_binding=self.calendar_binding,
-            strict_cutoff=self.strict_cutoff,
+        v2 = (
+            self.contract_version
+            == FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION_V2
+        )
+        if (
+            v2
+            != (
+                self.temporal_policy_version
+                == PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION_V2
+            )
+            or v2 != (self.acquisition_window is not None)
+            or v2 != (self.evidence_origin is not None)
+            or v2 != (self.evidence_acquisition_binding is not None)
+        ):
+            raise ValueError("temporal decision version bindings are inconsistent")
+        if self.acquisition_window is not None and (
+            self.calendar_binding
+            != self.acquisition_window.calendar_binding.evaluated
+        ):
+            raise ValueError("temporal decision terminal binding mismatch")
+        if self.acquisition_window is not None and (
+            self.mode != self.acquisition_window.transaction_binding.mode.value
+            or self.strict_cutoff
+            != self.acquisition_window.transaction_binding.strict_cutoff
+        ):
+            raise ValueError("temporal decision active transaction binding mismatch")
+        if self.evidence_acquisition_binding is not None and (
+            self.acquisition_window is None
+            or self.evidence_origin
+            is not self.evidence_acquisition_binding.evidence_origin
+            or self.evidence_acquisition_binding.transaction_identity
+            != self.acquisition_window.transaction_binding.transaction_identity
+        ):
+            raise ValueError("temporal decision active transaction binding mismatch")
+        if self.evidence_acquisition_binding is not None:
+            bound_evidence = self.evidence_acquisition_binding.evidence
+            eligibility_exclusions = {
+                "retrieval_local_date",
+                "exact_revision_availability_proof",
+            }
+            if (
+                evidence.model_dump(
+                    mode="python",
+                    exclude=eligibility_exclusions,
+                )
+                != bound_evidence.model_dump(
+                    mode="python",
+                    exclude=eligibility_exclusions,
+                )
+                or (
+                    self.mode
+                    == TemporalEligibilityMode.STRICT_HISTORICAL_PIT.value
+                    and evidence.exact_revision_availability_proof
+                    != bound_evidence.exact_revision_availability_proof
+                )
+            ):
+                raise ValueError(
+                    "temporal decision staged evidence binding mismatch"
+                )
+        expected_reasons = (
+            _canonical_temporal_eligibility_reasons_v2(
+                mode_value=self.mode,
+                evidence=evidence,
+                acquisition_window=self.acquisition_window,
+                evidence_origin=self.evidence_origin,
+                strict_cutoff=self.strict_cutoff,
+            )
+            if self.acquisition_window is not None
+            else _canonical_temporal_eligibility_reasons(
+                mode_value=self.mode,
+                evidence=evidence,
+                calendar_binding=self.calendar_binding,
+                strict_cutoff=self.strict_cutoff,
+            )
         )
         expected_result = "accepted" if not expected_reasons else "rejected"
         expected_eligible_session = (
@@ -495,7 +919,11 @@ class FinancialMetadataTemporalEligibilityDecision(BaseModel):
         ):
             raise ValueError("temporal eligibility predicate mismatch")
         if self.decision_identity != _identity(
-            _DECISION_IDENTITY_PREFIX,
+            (
+                _DECISION_V2_IDENTITY_PREFIX
+                if v2
+                else _DECISION_IDENTITY_PREFIX
+            ),
             self.identity_payload(),
         ):
             raise ValueError("temporal eligibility decision identity mismatch")
@@ -507,18 +935,22 @@ class FinancialTemporalEligibilityCheckpointProjection(BaseModel):
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["financial-eligibility-temporal-binding-v1"] = (
-        "financial-eligibility-temporal-binding-v1"
-    )
-    capability_routing_plan_version: Literal["1.3"] = "1.3"
+    contract_version: Literal[
+        "financial-eligibility-temporal-binding-v1",
+        "financial-eligibility-temporal-binding-v2",
+    ] = "financial-eligibility-temporal-binding-v1"
+    capability_routing_plan_version: Literal["1.3", "1.4"] = "1.3"
     temporal_policy_version: Literal[
-        "provider-neutral-temporal-eligibility-v1"
+        "provider-neutral-temporal-eligibility-v1",
+        "provider-neutral-temporal-eligibility-v2",
     ] = PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION
     calendar_eligibility_binding_version: Literal[
-        "market-session-eligibility-binding-v1"
+        "market-session-eligibility-binding-v1",
+        "market-session-eligibility-binding-v2",
     ] = MARKET_SESSION_ELIGIBILITY_BINDING_VERSION
     temporal_decision_version: Literal[
-        "financial-metadata-temporal-eligibility-decision-v1"
+        "financial-metadata-temporal-eligibility-decision-v1",
+        "financial-metadata-temporal-eligibility-decision-v2",
     ] = FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION
     requested_session: date
     temporal_mode: TemporalEligibilityMode
@@ -527,6 +959,10 @@ class FinancialTemporalEligibilityCheckpointProjection(BaseModel):
     latest_completed_session: date | None = None
     company_type_temporal_decision: FinancialMetadataTemporalEligibilityDecision
     listing_temporal_decision: FinancialMetadataTemporalEligibilityDecision
+    acquisition_window: FinancialEligibilityAcquisitionWindow | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     strict_cutoff: datetime | None = None
 
     @field_validator("eligibility_evaluated_at", "strict_cutoff")
@@ -539,12 +975,47 @@ class FinancialTemporalEligibilityCheckpointProjection(BaseModel):
 
     @model_validator(mode="after")
     def _validate_checkpoint_projection(self) -> Self:
+        windowed = self.contract_version == "financial-eligibility-temporal-binding-v2"
+        expected_versions = (
+            (
+                "1.4",
+                PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION_V2,
+                MARKET_SESSION_ELIGIBILITY_BINDING_VERSION_V2,
+                FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION_V2,
+            )
+            if windowed
+            else (
+                "1.3",
+                PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION,
+                MARKET_SESSION_ELIGIBILITY_BINDING_VERSION,
+                FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION,
+            )
+        )
         decisions = (
             self.company_type_temporal_decision,
             self.listing_temporal_decision,
         )
         if (
-            not self.calendar_binding.has_valid_identity()
+            (
+                self.capability_routing_plan_version,
+                self.temporal_policy_version,
+                self.calendar_eligibility_binding_version,
+                self.temporal_decision_version,
+            )
+            != expected_versions
+            or windowed != (self.acquisition_window is not None)
+            or (
+                self.acquisition_window is not None
+                and (
+                    self.calendar_binding
+                    != self.acquisition_window.calendar_binding.evaluated
+                    or any(
+                        decision.acquisition_window != self.acquisition_window
+                        for decision in decisions
+                    )
+                )
+            )
+            or not self.calendar_binding.has_valid_identity()
             or self.requested_session != self.calendar_binding.requested_session
             or self.eligibility_evaluated_at
             != self.calendar_binding.eligibility_evaluated_at
@@ -709,12 +1180,128 @@ def _canonical_temporal_eligibility_reasons(
     return tuple(sorted(reasons, key=lambda reason: reason.value))
 
 
-def evaluate_financial_metadata_temporal_eligibility(
+def _canonical_temporal_eligibility_reasons_v2(
+    *,
+    mode_value: str,
+    evidence: FinancialMetadataTemporalEvidence,
+    acquisition_window: FinancialEligibilityAcquisitionWindow,
+    evidence_origin: TemporalEvidenceAcquisitionOrigin,
+    strict_cutoff: datetime | None,
+) -> tuple[
+    TemporalEligibilityRejectionReason | TemporalEligibilityRejectionReasonV2,
+    ...,
+]:
+    terminal_binding = acquisition_window.calendar_binding.evaluated
+    reasons = set(
+        _canonical_temporal_eligibility_reasons(
+            mode_value=mode_value,
+            evidence=evidence,
+            calendar_binding=terminal_binding,
+            strict_cutoff=strict_cutoff,
+        )
+    )
+    if (
+        acquisition_window.eligibility_evaluated_at
+        < acquisition_window.eligibility_started_at
+    ):
+        reasons.add(
+            TemporalEligibilityRejectionReasonV2.ELIGIBILITY_EVALUATION_BEFORE_START
+        )
+    if acquisition_window.calendar_binding.started.requested_session != (
+        terminal_binding.requested_session
+    ) or acquisition_window.calendar_binding.started.calendar_revision_id != (
+        terminal_binding.calendar_revision_id
+    ):
+        reasons.add(
+            TemporalEligibilityRejectionReasonV2.ACQUISITION_WINDOW_BINDING_MISMATCH
+        )
+    if evidence.retrieved_at > acquisition_window.eligibility_evaluated_at:
+        reasons.add(
+            TemporalEligibilityRejectionReason.RETRIEVAL_AFTER_ELIGIBILITY_EVALUATION
+        )
+    if (
+        evidence_origin is TemporalEvidenceAcquisitionOrigin.FRESH
+        and evidence.observed_at < acquisition_window.eligibility_started_at
+    ):
+        reasons.add(
+            TemporalEligibilityRejectionReasonV2.OBSERVATION_BEFORE_ELIGIBILITY_START
+        )
+    if (
+        evidence_origin is TemporalEvidenceAcquisitionOrigin.FRESH
+        and evidence.retrieved_at < acquisition_window.eligibility_started_at
+    ):
+        reasons.add(
+            TemporalEligibilityRejectionReasonV2.RETRIEVAL_BEFORE_ELIGIBILITY_START
+        )
+    if (
+        mode_value == TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY.value
+        and acquisition_window.started_latest_completed_session
+        != terminal_binding.requested_session
+    ):
+        reasons.add(
+            TemporalEligibilityRejectionReason.REQUESTED_SESSION_NOT_LATEST_COMPLETED_FRONTIER
+        )
+    return tuple(sorted(reasons, key=lambda reason: reason.value))
+
+
+def qualify_financial_metadata_temporal_evidence_for_acquisition(
+    *,
+    mode: TemporalEligibilityMode,
+    evidence: FinancialMetadataTemporalEvidence,
+    started_calendar_binding: MarketSessionEligibilityBinding,
+    evidence_origin: TemporalEvidenceAcquisitionOrigin = (
+        TemporalEvidenceAcquisitionOrigin.FRESH
+    ),
+    strict_cutoff: datetime | None = None,
+) -> tuple[
+    TemporalEligibilityRejectionReason | TemporalEligibilityRejectionReasonV2,
+    ...,
+]:
+    """Qualify provider proof while deferring only the terminal upper bound."""
+
+    reasons = list(
+        _canonical_temporal_eligibility_reasons(
+            mode_value=mode.value,
+            evidence=evidence,
+            calendar_binding=started_calendar_binding,
+            strict_cutoff=strict_cutoff,
+        )
+    )
+    if mode is TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY:
+        reasons = [
+            reason
+            for reason in reasons
+            if reason
+            is not TemporalEligibilityRejectionReason.RETRIEVAL_AFTER_ELIGIBILITY_EVALUATION
+        ]
+    if (
+        evidence_origin is TemporalEvidenceAcquisitionOrigin.FRESH
+        and evidence.observed_at < started_calendar_binding.eligibility_evaluated_at
+    ):
+        reasons.append(
+            TemporalEligibilityRejectionReasonV2.OBSERVATION_BEFORE_ELIGIBILITY_START
+        )
+    if (
+        evidence_origin is TemporalEvidenceAcquisitionOrigin.FRESH
+        and evidence.retrieved_at < started_calendar_binding.eligibility_evaluated_at
+    ):
+        reasons.append(
+            TemporalEligibilityRejectionReasonV2.RETRIEVAL_BEFORE_ELIGIBILITY_START
+        )
+    return tuple(sorted(set(reasons), key=lambda reason: reason.value))
+
+
+def _evaluate_financial_metadata_temporal_eligibility(
     *,
     mode: TemporalEligibilityMode | str,
     evidence: FinancialMetadataTemporalEvidence,
     calendar_binding: MarketSessionEligibilityBinding,
     strict_cutoff: datetime | None = None,
+    acquisition_window: FinancialEligibilityAcquisitionWindow | None = None,
+    evidence_origin: TemporalEvidenceAcquisitionOrigin | None = None,
+    evidence_acquisition_binding: (
+        FinancialTemporalEvidenceAcquisitionBinding | None
+    ) = None,
 ) -> FinancialMetadataTemporalEligibilityDecision:
     """Evaluate immutable proof with no provider, clock, calendar, or model I/O."""
 
@@ -734,11 +1321,29 @@ def evaluate_financial_metadata_temporal_eligibility(
     )
     if effective_strict_cutoff is not None:
         _aware(effective_strict_cutoff, field_name="strict_cutoff")
-    canonical_reasons = _canonical_temporal_eligibility_reasons(
-        mode_value=mode_value,
-        evidence=evidence,
-        calendar_binding=calendar_binding,
-        strict_cutoff=effective_strict_cutoff,
+    if acquisition_window is not None and (
+        calendar_binding != acquisition_window.calendar_binding.evaluated
+    ):
+        raise ValueError("terminal calendar binding contradicts acquisition window")
+    if (acquisition_window is not None) != (evidence_origin is not None) or (
+        acquisition_window is not None
+    ) != (evidence_acquisition_binding is not None):
+        raise ValueError("terminal evidence acquisition binding is incomplete")
+    canonical_reasons = (
+        _canonical_temporal_eligibility_reasons_v2(
+            mode_value=mode_value,
+            evidence=evidence,
+            acquisition_window=acquisition_window,
+            evidence_origin=evidence_origin,
+            strict_cutoff=effective_strict_cutoff,
+        )
+        if acquisition_window is not None
+        else _canonical_temporal_eligibility_reasons(
+            mode_value=mode_value,
+            evidence=evidence,
+            calendar_binding=calendar_binding,
+            strict_cutoff=effective_strict_cutoff,
+        )
     )
     accepted = not canonical_reasons
     proof_available_at = (
@@ -747,8 +1352,16 @@ def evaluate_financial_metadata_temporal_eligibility(
         else None
     )
     payload: dict[str, object] = {
-        "contract_version": (FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION),
-        "temporal_policy_version": PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION,
+        "contract_version": (
+            FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION_V2
+            if acquisition_window is not None
+            else FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION
+        ),
+        "temporal_policy_version": (
+            PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION_V2
+            if acquisition_window is not None
+            else PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION
+        ),
         "mode": mode_value,
         "immutable_artifact_identity": evidence.artifact.artifact_identity,
         "immutable_revision_identity": evidence.artifact.revision_identity,
@@ -770,32 +1383,114 @@ def evaluate_financial_metadata_temporal_eligibility(
         "reasons": canonical_reasons,
         "eligible_session": (calendar_binding.requested_session if accepted else None),
     }
+    if acquisition_window is not None:
+        payload["acquisition_window"] = acquisition_window
+        payload["evidence_origin"] = evidence_origin
+        payload["evidence_acquisition_binding"] = evidence_acquisition_binding
     return FinancialMetadataTemporalEligibilityDecision(
         **payload,
-        decision_identity=_identity(_DECISION_IDENTITY_PREFIX, payload),
+        decision_identity=_identity(
+            (
+                _DECISION_V2_IDENTITY_PREFIX
+                if acquisition_window is not None
+                else _DECISION_IDENTITY_PREFIX
+            ),
+            payload,
+        ),
+    )
+
+
+def evaluate_financial_metadata_temporal_eligibility(
+    *,
+    mode: TemporalEligibilityMode | str,
+    evidence: FinancialMetadataTemporalEvidence,
+    calendar_binding: MarketSessionEligibilityBinding,
+    strict_cutoff: datetime | None = None,
+) -> FinancialMetadataTemporalEligibilityDecision:
+    """Evaluate the frozen v1 temporal policy without I/O or clock access."""
+
+    return _evaluate_financial_metadata_temporal_eligibility(
+        mode=mode,
+        evidence=evidence,
+        calendar_binding=calendar_binding,
+        strict_cutoff=strict_cutoff,
+    )
+
+
+def evaluate_financial_metadata_temporal_eligibility_v2(
+    *,
+    mode: TemporalEligibilityMode | str,
+    evidence: FinancialMetadataTemporalEvidence,
+    acquisition_window: FinancialEligibilityAcquisitionWindow,
+    evidence_origin: TemporalEvidenceAcquisitionOrigin | str = (
+        TemporalEvidenceAcquisitionOrigin.FRESH
+    ),
+    evidence_acquisition_binding: (
+        FinancialTemporalEvidenceAcquisitionBinding | None
+    ) = None,
+    strict_cutoff: datetime | None = None,
+) -> FinancialMetadataTemporalEligibilityDecision:
+    """Evaluate proof at the terminal instant of one acquisition window."""
+
+    parsed_origin = TemporalEvidenceAcquisitionOrigin(evidence_origin)
+    binding = evidence_acquisition_binding or (
+        bind_financial_temporal_evidence_to_transaction(
+            transaction_identity=(
+                acquisition_window.transaction_binding.transaction_identity
+            ),
+            evidence_origin=parsed_origin,
+            evidence=evidence,
+        )
+    )
+    return _evaluate_financial_metadata_temporal_eligibility(
+        mode=mode,
+        evidence=evidence,
+        calendar_binding=acquisition_window.calendar_binding.evaluated,
+        strict_cutoff=strict_cutoff,
+        acquisition_window=acquisition_window,
+        evidence_origin=parsed_origin,
+        evidence_acquisition_binding=binding,
     )
 
 
 __all__ = [
     "FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION",
+    "FINANCIAL_METADATA_TEMPORAL_ELIGIBILITY_DECISION_VERSION_V2",
     "FINANCIAL_METADATA_TEMPORAL_EVIDENCE_VERSION",
+    "FINANCIAL_ELIGIBILITY_ACQUISITION_WINDOW_VERSION",
+    "FINANCIAL_ELIGIBILITY_TEMPORAL_TRANSACTION_BINDING_VERSION",
+    "FINANCIAL_TEMPORAL_EVIDENCE_ACQUISITION_BINDING_VERSION",
     "MARKET_SESSION_ELIGIBILITY_BINDING_VERSION",
+    "MARKET_SESSION_ELIGIBILITY_BINDING_VERSION_V2",
     "PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION",
+    "PROVIDER_NEUTRAL_TEMPORAL_ELIGIBILITY_VERSION_V2",
     "EvidenceEffectiveAsOfDerivation",
     "EvidenceEffectiveAsOfSemantics",
     "ExactRevisionAvailabilityProof",
     "ExactRevisionAvailabilityScope",
     "FinancialMetadataTemporalEligibilityDecision",
     "FinancialMetadataTemporalEvidence",
+    "FinancialEligibilityAcquisitionWindow",
+    "FinancialEligibilityTemporalTransactionBinding",
+    "FinancialTemporalEvidenceAcquisitionBinding",
     "FinancialTemporalEligibilityCheckpointProjection",
     "MarketSessionEligibilityBinding",
+    "MarketSessionEligibilityBindingV2",
     "ProviderPublicationDateDerivation",
     "ProviderPublicationDateSemantics",
     "PublicationDateKind",
     "TemporalEligibilityMode",
     "TemporalEligibilityRejectionReason",
+    "TemporalEligibilityRejectionReasonV2",
+    "TemporalEvidenceAcquisitionOrigin",
     "TemporalEvidenceArtifactBinding",
     "TemporalEvidenceClass",
+    "bind_financial_temporal_evidence_to_transaction",
+    "build_financial_eligibility_temporal_transaction_binding",
     "build_market_session_eligibility_binding",
+    "build_market_session_eligibility_binding_v2",
+    "build_financial_eligibility_acquisition_window",
     "evaluate_financial_metadata_temporal_eligibility",
+    "evaluate_financial_metadata_temporal_eligibility_v2",
+    "qualify_financial_metadata_temporal_evidence_for_acquisition",
 ]

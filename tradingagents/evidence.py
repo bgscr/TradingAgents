@@ -276,6 +276,7 @@ class EvidenceCapability(str, Enum):
     HOLDINGS_EXPOSURE = "holdings_exposure"
     TRACKING_ERROR = "tracking_error"
     LIQUIDITY = "liquidity"
+    LISTING_PUBLICATION_EVIDENCE = "listing_publication_evidence"
 
 
 class IdentityProvenance(BaseModel):

@@ -178,6 +178,80 @@ def test_compiled_financial_graph_suppresses_duplicate_calls_with_distinct_ids(
     assert len(result["financial_dispatch_ledger"]["entries"]) == 1
 
 
+@pytest.mark.parametrize(
+    ("model_symbol", "accepted"),
+    (
+        ("601328.SS", True),
+        ("601328", False),
+        ("601328.SH", False),
+    ),
+)
+def test_financial_model_boundary_requires_canonical_instrument_symbol(
+    model_symbol: str,
+    accepted: bool,
+) -> None:
+    asset_configuration = resolve_run_asset_configuration(
+        "601328.SS",
+        config=copy.deepcopy(DEFAULT_CONFIG),
+    )
+    provider_calls = 0
+
+    def balance_sheet_provider(symbol: str, frequency: str, current_date: str) -> str:
+        nonlocal provider_calls
+        provider_calls += 1
+        return (
+            f"# Balance Sheet data for {symbol} ({frequency})\n"
+            f"# Data retrieved on: {current_date} 12:00:00\n\n"
+            "metric,2026-06-30\nTotal,100"
+        )
+
+    runtime_config = copy.deepcopy(DEFAULT_CONFIG)
+    runtime_config["tool_vendors"] = dict.fromkeys(
+        ("get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement"),
+        "scripted",
+    )
+    node = FinancialDispatchToolNode(
+        config=runtime_config,
+        vendor_methods=_financial_vendor_methods(balance_sheet_provider),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_balance_sheet",
+                        "args": {
+                            "ticker": model_symbol,
+                            "freq": "quarterly",
+                            "curr_date": "2026-06-30",
+                        },
+                        "id": "canonical-financial-symbol",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ],
+        "evidence_state": EvidenceState(
+            instrument_identity=asset_configuration.instrument_identity
+        ).model_dump(mode="json"),
+        "asset_configuration": asset_configuration.model_dump(mode="json"),
+        "trade_date": "2026-09-02",
+    }
+
+    if accepted:
+        result = node(state)
+        assert isinstance(result["messages"][0], ToolMessage)
+        assert provider_calls == 1
+    else:
+        with pytest.raises(
+            ValueError,
+            match="financial tool symbol contradicts Instrument Identity",
+        ):
+            node(state)
+        assert provider_calls == 0
+
+
 def test_compiled_financial_graph_admits_one_artifact_for_duplicate_wrappers(
     monkeypatch,
 ) -> None:

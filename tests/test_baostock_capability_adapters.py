@@ -15,6 +15,7 @@ import pytest
 from tradingagents.asset_configuration import resolve_run_asset_configuration
 from tradingagents.capability_routing import (
     preflight_mainland_capability_routing,
+    prepare_mainland_listing_publication_candidate_plan,
     prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_capabilities import (
@@ -555,7 +556,7 @@ def test_temporal_lifecycle_projects_ipodate_without_publication_backfill(
     assert len(result.attempt_events) == 1
     assert result.listing_metadata is not None
     metadata = result.listing_metadata
-    assert metadata.contract_version == "financial-listing-metadata-v2"
+    assert metadata.contract_version == "financial-listing-metadata-v3"
     assert metadata.as_of_date is None
     assert metadata.requested_session == date(2026, 7, 30)
     assert metadata.listing_date == date(1996, 4, 22)
@@ -593,7 +594,42 @@ def test_temporal_lifecycle_projects_ipodate_without_publication_backfill(
 
 
 @pytest.mark.unit
-def test_temporal_lifecycle_projects_explicit_provider_publication_fields(
+def test_composite_lifecycle_projects_effective_evidence_from_real_six_field_row(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = prepare_mainland_listing_publication_candidate_plan(
+        _temporal_plan(monkeypatch)
+    )
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        harness = _build_harness(
+            tmp_path=tmp_path,
+            store=store,
+            transport=_FakeTransport(),
+            run_scope_id="listing-publication-effective-evidence",
+            routing_plan=plan,
+        )
+        result = harness.adapter.acquire_lifecycle(
+            instrument_identity=_identity(),
+            as_of_date=date(2026, 7, 30),
+        )
+
+    assert result.listing_metadata is not None
+    metadata = result.listing_metadata
+    assert metadata.contract_version == "financial-listing-metadata-v4"
+    assert metadata.temporal_evidence is None
+    assert metadata.listing_effective_evidence is not None
+    assert metadata.listing_effective_evidence.provider_id == "baostock"
+    assert metadata.listing_effective_evidence.source_field == "ipoDate"
+    assert metadata.listing_effective_evidence.listing_effective_date == date(
+        1996, 4, 22
+    )
+    assert result.candidates[0].announcement_date is None
+    assert result.candidates[0].first_publication_date is None
+
+
+@pytest.mark.unit
+def test_temporal_lifecycle_does_not_admit_non_schema_publication_fields(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -614,19 +650,17 @@ def test_temporal_lifecycle_projects_explicit_provider_publication_fields(
         )
 
     candidate = result.candidates[0]
-    assert candidate.announcement_date == date(1996, 4, 23)
-    assert candidate.announcement_date_source_field == "publication_date"
-    assert candidate.first_publication_date == date(1996, 4, 22)
-    assert candidate.first_publication_date_source_field == "first_publication_date"
+    assert candidate.announcement_date is None
+    assert candidate.announcement_date_source_field is None
+    assert candidate.first_publication_date is None
+    assert candidate.first_publication_date_source_field is None
     assert result.listing_metadata is not None
     proof = result.listing_metadata.temporal_evidence
     assert proof is not None
-    assert proof.ann_date == date(1996, 4, 23)
-    assert proof.ann_date_derivation is not None
-    assert proof.ann_date_derivation.source_field == "publication_date"
-    assert proof.f_ann_date == date(1996, 4, 22)
-    assert proof.f_ann_date_derivation is not None
-    assert proof.f_ann_date_derivation.source_field == "first_publication_date"
+    assert proof.ann_date is None
+    assert proof.ann_date_derivation is None
+    assert proof.f_ann_date is None
+    assert proof.f_ann_date_derivation is None
     assert proof.artifact.artifact_identity == candidate.artifact_identity
     assert proof.artifact.row_identity == candidate.row_artifact_identities[0]
 

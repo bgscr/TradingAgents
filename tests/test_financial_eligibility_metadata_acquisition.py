@@ -21,9 +21,16 @@ from tradingagents.capability_routing import (
     MainlandCapability,
     MainlandCapabilityRoutingPlan,
     preflight_mainland_capability_routing,
-    prepare_mainland_temporal_capability_routing_plan,
+    prepare_mainland_listing_publication_candidate_plan,
+    prepare_mainland_temporal_capability_routing_plan as prepare_latest_temporal_capability_routing_plan,
+    prepare_mainland_temporal_capability_routing_plan_v1 as prepare_mainland_temporal_capability_routing_plan,
 )
 from tradingagents.dataflows.baostock_capabilities import BaoStockCapabilityAdapter
+from tradingagents.dataflows.cninfo_listing_publication import (
+    CninfoListingBoard,
+    CninfoListingPublicationResult,
+    CninfoListingPublicationResultKind,
+)
 from tradingagents.dataflows.financial_capability_routing import (
     FinancialCapabilityProviderResponse,
     FinancialCapabilityRoutingRequest,
@@ -39,6 +46,11 @@ from tradingagents.dataflows.financial_contracts import (
     FinancialCompanyTypeClassifierInput,
     FinancialConsolidationScope,
     FinancialListingProvenance,
+)
+from tradingagents.dataflows.financial_dispatch import (
+    FinancialDispatchAuditProjectionV6,
+    FinancialToolDispatcher,
+    project_financial_dispatch_ledger,
 )
 from tradingagents.dataflows.financial_eligibility_acquisition import (
     FinancialCompanyTypeAcquisitionEvidenceBinding,
@@ -73,8 +85,16 @@ from tradingagents.dataflows.financial_temporal_eligibility import (
 from tradingagents.dataflows.financial_temporal_proof_projection import (
     FinancialEligibilityTemporalEvaluationTransaction,
 )
+from tradingagents.dataflows.listing_publication_evidence import (
+    ListingDocumentEvidence,
+    ListingEffectiveEvidence,
+    ListingEvidenceArtifactBinding,
+    ListingPublicationEvidence,
+    build_composite_listing_temporal_proof,
+)
 from tradingagents.dataflows.provider_subrequests import (
     ProviderSubrequestArtifactStore,
+    ProviderSubrequestAttemptEvent,
     ProviderSubrequestCache,
     ProviderSubrequestKey,
     ProviderSubrequestOutcomeKind,
@@ -2211,6 +2231,544 @@ def test_temporal_acquirer_preserves_route_order_rejection_when_no_source_accept
     assert result.failure.rejected_temporal_decision.result == "rejected"
     assert len(transactions) == 1
     assert transactions[0].evaluation_count == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "case",
+    (
+        {
+            "symbol": "601328.SS",
+            "effective_date": date(2007, 5, 15),
+            "sec_code": "601328",
+            "org_id": "dynamic-bank-org",
+            "announcement_id": "23418766",
+            "publication_timestamp": datetime(2007, 5, 14, 2, tzinfo=timezone.utc),
+            "publication_date": date(2007, 5, 14),
+            "title": "首次公开发行A股股票上市公告书",
+            "adjunct_url": "finalpage/2007-05-14/23418766.PDF",
+            "classification": "initial_listing",
+            "company_type": FinancialCompanyType.BANK,
+            "industry": "bank",
+            "present_field": "customer_deposits",
+            "document": False,
+        },
+        {
+            "symbol": "600895.SS",
+            "effective_date": date(1996, 4, 22),
+            "sec_code": "600895",
+            "org_id": "dynamic-legacy-org",
+            "announcement_id": "141828",
+            "publication_timestamp": datetime(1996, 4, 17, 16, tzinfo=timezone.utc),
+            "publication_date": date(1996, 4, 18),
+            "title": "上海张江高科技园区开发股份有限公司股票上市公告书",
+            "adjunct_url": "finalpage/1996-04-18/141828.html",
+            "classification": "ambiguous",
+            "company_type": FinancialCompanyType.INDUSTRIAL_NON_BANK,
+            "industry": "industrial",
+            "present_field": "inventory",
+            "document": True,
+        },
+    ),
+    ids=("601328-metadata", "600895-qualified-html"),
+)
+def test_plan_1_5_builds_context_from_independent_effective_and_publication_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    case: dict[str, object],
+) -> None:
+    asset = _asset(str(case["symbol"]))
+    plan = prepare_mainland_listing_publication_candidate_plan(
+        prepare_latest_temporal_capability_routing_plan(
+            _qualified_plan(monkeypatch, asset)
+        )
+    )
+    requested_session = date(2026, 9, 3)
+    started_at = datetime(2026, 9, 4, 0, 0, tzinfo=timezone.utc)
+    acquired_at = datetime(2026, 9, 4, 0, 1, tzinfo=timezone.utc)
+    evaluated_at = datetime(2026, 9, 4, 0, 5, tzinfo=timezone.utc)
+    calendar = StoredSessionCalendar(
+        calendar_revision_id="market-session-calendar:v1:" + "c" * 64,
+        reference_market="mainland-cn",
+        timezone_name="Asia/Shanghai",
+        provider_dataset_id="provider-dataset:cninfo-composite-fixture",
+        observed_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
+        sessions=(
+            MarketSession(requested_session, MarketSessionStatus.OPEN),
+            MarketSession(date(2026, 9, 4), MarketSessionStatus.OPEN),
+        ),
+    )
+    start_binding = build_market_session_eligibility_binding(
+        calendar,
+        requested_session=requested_session,
+        eligibility_evaluated_at=started_at,
+    )
+    company_artifact = TemporalEvidenceArtifactBinding(
+        artifact_identity="financial-provider-artifact:v1:" + "1" * 64,
+        revision_identity="financial-provider-artifact:v1:" + "1" * 64,
+        row_identity="financial-period-candidate:v1:" + "2" * 64,
+    )
+    company_proof = FinancialMetadataTemporalEvidence(
+        evidence_class=TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
+        artifact=company_artifact,
+        evidence_effective_as_of=date(2026, 6, 30),
+        evidence_effective_as_of_derivation=EvidenceEffectiveAsOfDerivation(
+            semantics=EvidenceEffectiveAsOfSemantics.TUSHARE_STATEMENT_PERIOD_END,
+            source_field="end_date",
+            artifact=company_artifact,
+        ),
+        ann_date=requested_session,
+        ann_date_derivation=ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.ANN_DATE,
+            semantics=ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS,
+            source_field="ann_date",
+            artifact=company_artifact,
+        ),
+        f_ann_date=requested_session,
+        f_ann_date_derivation=ProviderPublicationDateDerivation(
+            date_kind=PublicationDateKind.F_ANN_DATE,
+            semantics=ProviderPublicationDateSemantics.TUSHARE_STATEMENT_PUBLICATION_FIELDS,
+            source_field="f_ann_date",
+            artifact=company_artifact,
+        ),
+        observed_at=acquired_at,
+        retrieved_at=acquired_at,
+    )
+    company_evidence = FinancialCompanyTypeAcquisitionEvidenceBinding.create(
+        contract_version="financial-company-type-evidence-binding-v4",
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        temporal_evidence=company_proof,
+        provider_id="tushare",
+        artifact_identity=company_artifact.artifact_identity,
+        source_ref=company_artifact.artifact_identity,
+        observed_at=acquired_at,
+        retrieved_at=acquired_at,
+        provider_declared_type=case["company_type"],
+        provider_declaration_qualified=True,
+        normalized_resolver_inputs=(
+            FinancialCompanyTypeClassifierInput(
+                key="metadata:industry",
+                value=str(case["industry"]),
+            ),
+            FinancialCompanyTypeClassifierInput(
+                key="present_field",
+                value=str(case["present_field"]),
+            ),
+        ),
+    )
+
+    def company_source(request):
+        return FinancialCompanyTypeEvidenceProviderProjection(
+            provider_id="tushare",
+            metadata_binding=request.metadata_binding,
+            source_projection_kind="tushare_statement",
+            evidence=company_evidence,
+        )
+
+    effective_digest = "3" * 64
+    effective = ListingEffectiveEvidence(
+        instrument_identity=asset.instrument_identity,
+        provider_id="baostock",
+        venue="XSHG",
+        listing_effective_date=case["effective_date"],
+        lifecycle_status="active",
+        source_field="ipoDate",
+        artifact=ListingEvidenceArtifactBinding(
+            artifact_identity="provider-artifact:v1:" + effective_digest,
+            artifact_sha256="4" * 64,
+            revision_identity="provider-artifact:v1:" + effective_digest,
+            row_identity="provider-row-artifact:v1:" + "5" * 64,
+            byte_length=128,
+            media_type="application/json",
+        ),
+        observed_at=acquired_at,
+        retrieved_at=acquired_at,
+    )
+    listing_metadata = FinancialListingMetadata(
+        contract_version="financial-listing-metadata-v4",
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        listing_date=effective.listing_effective_date,
+        listing_provenance=FinancialListingProvenance(
+            provider_id="baostock",
+            source_ref=effective.artifact.artifact_identity,
+            observed_at=acquired_at,
+        ),
+        listing_effective_evidence=effective,
+    )
+
+    def lifecycle_source(_request):
+        return FinancialCapabilityProviderResponse.available(
+            provider_id="baostock",
+            capability=MainlandCapability.ISSUER_LIFECYCLE,
+            retained_artifact_identities=(effective.artifact.artifact_identity,),
+            candidate_count=1,
+            subrequest_keys=(),
+            physical_attempt_ids=(),
+            listing_metadata=listing_metadata,
+        )
+
+    def listing_publication_source(request):
+        lookup_digest = "6" * 64
+        metadata_digest = "7" * 64
+        publication = ListingPublicationEvidence(
+            instrument_identity=asset.instrument_identity,
+            sec_code=case["sec_code"],
+            org_id=case["org_id"],
+            venue="XSHG",
+            authoritative_board="xshg_main",
+            page_column="SHZB",
+            announcement_id=case["announcement_id"],
+            publication_timestamp=case["publication_timestamp"],
+            publication_date=case["publication_date"],
+            exact_title=case["title"],
+            normalized_title=case["title"],
+            adjunct_url=case["adjunct_url"],
+            classification=case["classification"],
+            security_lookup_artifact=ListingEvidenceArtifactBinding(
+                artifact_identity=(
+                    "provider-subrequest-artifact=sha256:" + lookup_digest
+                ),
+                artifact_sha256=lookup_digest,
+                revision_identity=(
+                    "provider-subrequest-artifact=sha256:" + lookup_digest
+                ),
+                row_identity="cninfo-security-row:v1:" + "8" * 64,
+                byte_length=100,
+                media_type="application/json",
+            ),
+            metadata_artifact=ListingEvidenceArtifactBinding(
+                artifact_identity=(
+                    "provider-subrequest-artifact=sha256:" + metadata_digest
+                ),
+                artifact_sha256=metadata_digest,
+                revision_identity=(
+                    "provider-subrequest-artifact=sha256:" + metadata_digest
+                ),
+                row_identity="cninfo-announcement-row:v1:" + "9" * 64,
+                byte_length=300,
+                media_type="application/json",
+            ),
+            security_lookup_request_identity="provider-subrequest:v1:" + "a" * 64,
+            announcement_query_request_identity="provider-subrequest:v1:" + "b" * 64,
+            observed_at=acquired_at,
+            retrieved_at=acquired_at,
+        )
+        document_request_identity = "provider-subrequest:v1:" + "c" * 64
+        document = (
+            ListingDocumentEvidence(
+                instrument_identity=asset.instrument_identity,
+                sec_code=str(case["sec_code"]),
+                issuer=str(case["title"]).removesuffix("股票上市公告书"),
+                venue="XSHG",
+                announcement_id=str(case["announcement_id"]),
+                document_request_identity=document_request_identity,
+                exact_title=str(case["title"]),
+                original_url="https://static.cninfo.com.cn/"
+                + str(case["adjunct_url"]),
+                listing_effective_date=case["effective_date"],
+                publication_date=case["publication_date"],
+                parser_version="cninfo_legacy_html_v1+lxml-6.1.1",
+                artifact=ListingEvidenceArtifactBinding(
+                    artifact_identity=(
+                        "provider-subrequest-artifact=sha256:" + "d" * 64
+                    ),
+                    artifact_sha256="d" * 64,
+                    revision_identity=(
+                        "provider-subrequest-artifact=sha256:" + "d" * 64
+                    ),
+                    row_identity="cninfo-document-row:v1:" + "e" * 64,
+                    byte_length=37_841,
+                    media_type="text/html",
+                ),
+                structured_evidence_sha256="f" * 64,
+                observed_at=acquired_at,
+                retrieved_at=acquired_at,
+            )
+            if case["document"]
+            else None
+        )
+        proof = build_composite_listing_temporal_proof(
+            instrument_identity=asset.instrument_identity,
+            requested_session=requested_session,
+            effective_evidence=request.effective_evidence,
+            publication_evidence=publication,
+            document_evidence=document,
+        )
+        operation_bindings = (
+            (
+                publication.security_lookup_request_identity,
+                "cninfo-public-metadata",
+                "cninfo.metadata",
+                "1",
+            ),
+            (
+                publication.announcement_query_request_identity,
+                "cninfo-public-metadata",
+                "cninfo.metadata",
+                "2",
+            ),
+            *(
+                ()
+                if document is None
+                else (
+                    (
+                        document_request_identity,
+                        "cninfo-static-documents",
+                        "cninfo.documents",
+                        "3",
+                    ),
+                )
+            ),
+        )
+        attempts = tuple(
+            ProviderSubrequestAttemptEvent(
+                attempt_event_id="provider-physical-attempt=sha256:" + marker * 64,
+                sequence_id="provider-request-sequence=sha256:" + marker * 64,
+                request_key=request_identity,
+                upstream_service_id=upstream_service_id,
+                capacity_scope=capacity_scope,
+                attempt_index=1,
+                attempted_at=acquired_at,
+                pacing_event="permit_acquired",
+                pacing_wait_seconds=0,
+                outcome=ProviderSubrequestOutcomeKind.AVAILABLE,
+                retryable=False,
+                cooldown_changed=False,
+                cooldown_until=None,
+                final_physical_attempt_count=1,
+            )
+            for request_identity, upstream_service_id, capacity_scope, marker in operation_bindings
+        )
+        return CninfoListingPublicationResult(
+            kind=CninfoListingPublicationResultKind.AVAILABLE,
+            publication_evidence=publication,
+            document_evidence=document,
+            composite_proof=proof,
+            retained_artifact_identities=(
+                publication.security_lookup_artifact.artifact_identity,
+                publication.metadata_artifact.artifact_identity,
+                *(() if document is None else (document.artifact.artifact_identity,)),
+            ),
+            subrequest_keys=(
+                publication.security_lookup_request_identity,
+                publication.announcement_query_request_identity,
+                *(() if document is None else (document_request_identity,)),
+            ),
+            physical_attempt_ids=tuple(
+                attempt.attempt_event_id for attempt in attempts
+            ),
+            attempt_events=attempts,
+        )
+
+    router = MainlandFinancialCapabilityRouter(
+        routing_plan=plan,
+        statement_sources={},
+        capability_sources={
+            MainlandCapability.ISSUER_LIFECYCLE: {
+                "baostock": lifecycle_source,
+            }
+        },
+        company_type_evidence_sources={"tushare": company_source},
+    )
+    checkpoint_thread_id = "1234567890abcdef"
+    run_id = "run:" + sha256(
+        f"checkpoint:{checkpoint_thread_id}".encode()
+    ).hexdigest()
+    request = FinancialEligibilityMetadataAcquisitionRequest(
+        contract_version="financial-eligibility-metadata-acquisition-request-v4",
+        canonical_run_id=run_id,
+        run_id=run_id,
+        asset_configuration=asset,
+        asset_configuration_signature=asset.asset_configuration_signature,
+        instrument_identity=asset.instrument_identity,
+        requested_session=requested_session,
+        authoritative_availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        financial_eligibility_binding=plan.financial_eligibility_binding,
+        routing_plan_signature=plan.plan_signature,
+        currency="CNY",
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        temporal_mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        eligibility_started_at=started_at,
+        calendar_binding=start_binding,
+        authoritative_listing_board=CninfoListingBoard.XSHG_MAIN,
+    )
+    transaction = FinancialEligibilityTemporalEvaluationTransaction(
+        mode=TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        calendar=calendar,
+        requested_session=requested_session,
+        eligibility_started_at=started_at,
+        clock=lambda: evaluated_at,
+        canonical_run_id=run_id,
+        routing_plan_signature=plan.plan_signature,
+    )
+
+    result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=router,
+        stop_signal=Event(),
+        listing_publication_source=listing_publication_source,
+    ).acquire(request, temporal_transaction=transaction)
+
+    assert result.outcome == "success", result.failure
+    assert result.context is not None
+    assert result.context.contract_version == "financial-eligibility-acquisition-context-v4"
+    assert result.context.listing_date == case["effective_date"]
+    assert result.context.listing_composite_temporal_proof is not None
+    temporal = result.context.temporal_eligibility_binding
+    assert temporal is not None
+    assert temporal.contract_version == "financial-eligibility-temporal-binding-v3"
+    assert temporal.listing_temporal_decision.result == "accepted"
+    strict_source_calls = 0
+
+    def forbidden_strict_publication_source(_request):
+        nonlocal strict_source_calls
+        strict_source_calls += 1
+        raise AssertionError("strict PIT must fail before CNINFO acquisition")
+
+    strict_cutoff = start_binding.requested_session_close
+    assert strict_cutoff is not None
+    strict_request = request.model_copy(
+        update={
+            "authoritative_availability_scope": (
+                FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE
+            ),
+            "availability_scope": FinancialAvailabilityScope.STRICT_PIT_ELIGIBLE,
+            "temporal_mode": TemporalEligibilityMode.STRICT_HISTORICAL_PIT,
+            "strict_cutoff": strict_cutoff,
+        }
+    )
+    strict_transaction = FinancialEligibilityTemporalEvaluationTransaction(
+        mode=TemporalEligibilityMode.STRICT_HISTORICAL_PIT,
+        calendar=calendar,
+        requested_session=requested_session,
+        eligibility_started_at=started_at,
+        clock=lambda: evaluated_at,
+        canonical_run_id=run_id,
+        routing_plan_signature=plan.plan_signature,
+        strict_cutoff=strict_cutoff,
+    )
+    strict_result = FinancialEligibilityMetadataAcquirer(
+        routing_plan=plan,
+        router=router,
+        stop_signal=Event(),
+        listing_publication_source=forbidden_strict_publication_source,
+    ).acquire(strict_request, temporal_transaction=strict_transaction)
+
+    assert strict_result.context is None
+    assert strict_result.failure is not None
+    assert strict_result.failure.reason is (
+        FinancialEligibilityAcquisitionFailureReason.TEMPORAL_PROOF_UNAVAILABLE
+    )
+    assert strict_source_calls == 0
+    clock_values = iter((started_at, evaluated_at))
+    owner = FinancialEligibilityAcquisitionContextOwner(
+        run_id=run_id,
+        asset_configuration=asset,
+        routing_plan=plan,
+        metadata_acquirer=FinancialEligibilityMetadataAcquirer(
+            routing_plan=plan,
+            router=router,
+            stop_signal=Event(),
+            listing_publication_source=listing_publication_source,
+        ),
+        unbound_financial_routing=QualifiedFinancialRoutingComposition(
+            router=router,
+            statement_request_factory=lambda _request: None,
+        ),
+        expected_as_of_date=requested_session,
+        availability_scope=FinancialAvailabilityScope.CURRENT_ONLY,
+        consolidation_scope=FinancialConsolidationScope.CONSOLIDATED,
+        checkpoint_thread_id=checkpoint_thread_id,
+        eligibility_clock=lambda: next(clock_values),
+        calendar_provider=lambda: calendar,
+        authoritative_listing_board=CninfoListingBoard.XSHG_MAIN,
+        interrupt_runtime=lambda: None,
+        close_runtime=lambda: None,
+    )
+    owned_result = owner.acquire_context(as_of_date=requested_session)
+
+    assert owned_result.outcome == "success", owned_result.failure
+    assert owner.context == result.context
+    with MarketHistoryStore.open(_history_config(tmp_path)) as store:
+        artifact_store = ProviderSubrequestArtifactStore(
+            tmp_path / "dispatcher-artifacts"
+        )
+        cache = ProviderSubrequestCache(
+            coordinator=ProviderRequestCoordinator(store),
+            artifact_store=artifact_store,
+            run_scope_id=run_id,
+        )
+        dispatcher = FinancialToolDispatcher(
+            instrument_identity=asset.instrument_identity,
+            run_asset_configuration=asset,
+            provider_chains={},
+            capability_routing_plan_signature=plan.plan_signature,
+            provider_subrequest_cache=cache,
+            qualified_statement_router=router,
+            run_scope_id=run_id,
+            financial_eligibility_context=result.context,
+            checkpoint_thread_id=checkpoint_thread_id,
+        )
+        cache_checkpoint = cache.checkpoint()
+        dispatcher_checkpoint = dispatcher.checkpoint_ledger()
+        replay_cache = ProviderSubrequestCache(
+            coordinator=ProviderRequestCoordinator(store),
+            artifact_store=artifact_store,
+            run_scope_id=run_id,
+        )
+        replay_cache.bind_financial_eligibility_context(
+            context_contract_version=result.context.contract_version,
+            context_identity=result.context.context_identity,
+            context=result.context,
+            capability_routing_plan=plan,
+        )
+        replay_cache.restore_checkpoint(
+            dispatcher_checkpoint["provider_subrequest_cache"]
+        )
+        replayed_dispatcher = FinancialToolDispatcher(
+            instrument_identity=asset.instrument_identity,
+            run_asset_configuration=asset,
+            provider_chains={},
+            capability_routing_plan_signature=plan.plan_signature,
+            checkpoint_ledger=dispatcher_checkpoint,
+            provider_subrequest_cache=replay_cache,
+            qualified_statement_router=router,
+            run_scope_id=run_id,
+            financial_eligibility_context=result.context,
+            checkpoint_thread_id=checkpoint_thread_id,
+        )
+        audit = project_financial_dispatch_ledger(
+            dispatcher_checkpoint,
+            run_asset_configuration=asset,
+            capability_routing_plan=plan,
+            run_scope_id=run_id,
+        )
+
+    assert dispatcher.financial_eligibility_context is result.context
+    assert cache_checkpoint["contract_version"] == "1.4"
+    assert cache_checkpoint["capability_routing_plan_version"] == "1.5"
+    assert len(cache_checkpoint["temporal_decisions"]) == 2
+    assert len(cache_checkpoint["temporal_artifact_identities"]) == (
+        5 if case["document"] else 4
+    )
+    assert dispatcher_checkpoint["contract_version"] == "1.8"
+    assert dispatcher_checkpoint["financial_eligibility_context"] == (
+        result.context.model_dump(mode="json")
+    )
+    assert replayed_dispatcher.financial_eligibility_context == result.context
+    assert isinstance(audit, FinancialDispatchAuditProjectionV6)
+    assert audit.contract_version == "6.0"
+    assert audit.listing_temporal_proof_identity == (
+        result.context.listing_composite_temporal_proof.proof_identity
+    )
+    assert audit.security_lookup_artifact_identity == (
+        result.context.listing_composite_temporal_proof.publication_evidence.security_lookup_artifact.artifact_identity
+    )
+    assert (audit.document_artifact_identity is not None) is bool(case["document"])
 
 
 @pytest.mark.unit

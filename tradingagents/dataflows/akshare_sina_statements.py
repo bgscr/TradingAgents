@@ -174,7 +174,7 @@ class AkshareSinaStatementAdapterResult(BaseModel):
 
 
 class AkshareSinaStatementAdapterResultV2(AkshareSinaStatementAdapterResult):
-    """Plan-1.3 result retaining exact temporal provider-field aliases."""
+    """Temporal result retaining exact provider-field aliases."""
 
     contract_version: Literal["akshare-sina-statement-adapter-v2"] = (
         "akshare-sina-statement-adapter-v2"
@@ -327,7 +327,7 @@ class AkshareSinaStatementAdapter:
         return AkshareSinaStatementBatchResult(
             contract_version=(
                 "akshare-sina-statement-batch-v2"
-                if self._routing_plan.plan_version == "1.3"
+                if self._routing_plan.plan_version in {"1.3", "1.4"}
                 else "akshare-sina-statement-batch-v1"
             ),
             results=tuple(
@@ -423,7 +423,7 @@ class AkshareSinaStatementAdapter:
         )
         result_type = (
             AkshareSinaStatementAdapterResultV2
-            if self._routing_plan.plan_version == "1.3"
+            if self._routing_plan.plan_version in {"1.3", "1.4"}
             else AkshareSinaStatementAdapterResult
         )
         common = {

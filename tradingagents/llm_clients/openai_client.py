@@ -1,16 +1,316 @@
 import os
 import re
+import time
+from contextlib import suppress
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
+from openai import DEFAULT_MAX_RETRIES
+from pydantic import PrivateAttr
+
+from tradingagents.run_telemetry import ModelTransportAttempt, RunTelemetryLedger
 
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
 from .validators import validate_model
+
+_SAFE_PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]*$")
+_SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
+_SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_RESPONSE_METADATA_EXTENSION = "tradingagents.model_transport_response"
+_OBSERVED_CLIENT_ATTRIBUTE = "_tradingagents_model_transport_observed"
+
+
+@dataclass(frozen=True)
+class _ModelTransportCallContext:
+    ledger: RunTelemetryLedger
+    logical_call_id: str
+    provider_family: str
+    model_id: str
+    configured_max_retries: int
+
+
+_ACTIVE_MODEL_TRANSPORT_CALL: ContextVar[_ModelTransportCallContext | None] = (
+    ContextVar("active_model_transport_call", default=None)
+)
+
+
+def _safe_transport_value(
+    value: Any,
+    *,
+    pattern: re.Pattern[str],
+    maximum_chars: int,
+) -> str:
+    normalized = str(value or "").strip()
+    if len(normalized) <= maximum_chars and pattern.fullmatch(normalized):
+        return normalized
+    return "unavailable"
+
+
+def _safe_provider_request_id(value: Any) -> str | None:
+    normalized = str(value or "").strip()
+    if (
+        normalized
+        and len(normalized) <= 128
+        and _SAFE_REQUEST_ID_RE.fullmatch(normalized)
+    ):
+        return normalized
+    return None
+
+
+def _retry_index(request: httpx.Request) -> int | None:
+    raw_value = request.headers.get("x-stainless-retry-count")
+    try:
+        value = int(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if value is not None and value >= 0 else None
+
+
+def _transport_exception_family(exc: Exception) -> str:
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return "remote_protocol"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection"
+    if isinstance(exc, httpx.TransportError):
+        return "transport"
+    return "client"
+
+
+def _capture_response_metadata(response: httpx.Response) -> None:
+    """Attach only status/request-id allowlist fields for send-error handling."""
+
+    with suppress(Exception):
+        response.request.extensions[_RESPONSE_METADATA_EXTENSION] = (
+            int(response.status_code),
+            _safe_provider_request_id(response.headers.get("x-request-id")),
+        )
+
+
+async def _capture_async_response_metadata(response: httpx.Response) -> None:
+    _capture_response_metadata(response)
+
+
+def _model_transport_attempt(
+    *,
+    context: _ModelTransportCallContext,
+    request: httpx.Request,
+    attempt_ordinal: int,
+    elapsed_seconds: float,
+    disposition: str,
+    response: httpx.Response | None = None,
+    exception: Exception | None = None,
+) -> ModelTransportAttempt:
+    response_metadata = request.extensions.get(_RESPONSE_METADATA_EXTENSION)
+    http_status: int | None = None
+    provider_request_id: str | None = None
+    if response is not None:
+        http_status = int(response.status_code)
+        provider_request_id = _safe_provider_request_id(
+            response.headers.get("x-request-id")
+        )
+    elif (
+        isinstance(response_metadata, tuple)
+        and len(response_metadata) == 2
+        and isinstance(response_metadata[0], int)
+    ):
+        http_status = response_metadata[0]
+        provider_request_id = _safe_provider_request_id(response_metadata[1])
+    exception_class = None
+    exception_family = None
+    if exception is not None:
+        exception_class = _safe_transport_value(
+            type(exception).__name__,
+            pattern=re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$"),
+            maximum_chars=128,
+        )
+        exception_family = _transport_exception_family(exception)
+    return ModelTransportAttempt(
+        logical_call_id=context.logical_call_id,
+        attempt_ordinal=attempt_ordinal,
+        configured_max_retries=context.configured_max_retries,
+        retry_index=_retry_index(request),
+        provider_family=context.provider_family,
+        model_id=context.model_id,
+        endpoint_host=_safe_transport_value(
+            request.url.host,
+            pattern=_SAFE_HOST_RE,
+            maximum_chars=253,
+        ),
+        elapsed_seconds=max(0.0, round(elapsed_seconds, 6)),
+        disposition=disposition,
+        exception_class=exception_class,
+        exception_family=exception_family,
+        http_status=http_status,
+        provider_request_id=provider_request_id,
+    )
+
+
+def _record_sync_transport_send(
+    original_send: Any,
+    request: httpx.Request,
+    *args: Any,
+    **kwargs: Any,
+) -> httpx.Response:
+    context = _ACTIVE_MODEL_TRANSPORT_CALL.get()
+    if context is None:
+        return original_send(request, *args, **kwargs)
+    attempt_ordinal = _begin_transport_attempt(context)
+    if attempt_ordinal is None:
+        return original_send(request, *args, **kwargs)
+    started_at = time.monotonic()
+    try:
+        response = original_send(request, *args, **kwargs)
+    except Exception as exc:
+        _settle_transport_failure(
+            context,
+            request,
+            attempt_ordinal,
+            started_at,
+            exc,
+        )
+        raise
+    _settle_transport_response(
+        context,
+        request,
+        attempt_ordinal,
+        started_at,
+        response,
+    )
+    return response
+
+
+async def _record_async_transport_send(
+    original_send: Any,
+    request: httpx.Request,
+    *args: Any,
+    **kwargs: Any,
+) -> httpx.Response:
+    context = _ACTIVE_MODEL_TRANSPORT_CALL.get()
+    if context is None:
+        return await original_send(request, *args, **kwargs)
+    attempt_ordinal = _begin_transport_attempt(context)
+    if attempt_ordinal is None:
+        return await original_send(request, *args, **kwargs)
+    started_at = time.monotonic()
+    try:
+        response = await original_send(request, *args, **kwargs)
+    except Exception as exc:
+        _settle_transport_failure(
+            context,
+            request,
+            attempt_ordinal,
+            started_at,
+            exc,
+        )
+        raise
+    _settle_transport_response(
+        context,
+        request,
+        attempt_ordinal,
+        started_at,
+        response,
+    )
+    return response
+
+
+def _begin_transport_attempt(context: _ModelTransportCallContext) -> int | None:
+    try:
+        return context.ledger.begin_model_transport_attempt(context.logical_call_id)
+    except Exception:
+        return None
+
+
+def _settle_transport_failure(
+    context: _ModelTransportCallContext,
+    request: httpx.Request,
+    attempt_ordinal: int,
+    started_at: float,
+    exc: Exception,
+) -> None:
+    with suppress(Exception):
+        context.ledger.record_model_transport_failure(
+            _model_transport_attempt(
+                context=context,
+                request=request,
+                attempt_ordinal=attempt_ordinal,
+                elapsed_seconds=time.monotonic() - started_at,
+                disposition="terminal_transport_failure",
+                exception=exc,
+            )
+        )
+
+
+def _settle_transport_response(
+    context: _ModelTransportCallContext,
+    request: httpx.Request,
+    attempt_ordinal: int,
+    started_at: float,
+    response: httpx.Response,
+) -> None:
+    disposition = "status_failure" if response.status_code >= 400 else "success"
+    with suppress(Exception):
+        context.ledger.record_model_transport_response(
+            _model_transport_attempt(
+                context=context,
+                request=request,
+                attempt_ordinal=attempt_ordinal,
+                elapsed_seconds=time.monotonic() - started_at,
+                disposition=disposition,
+                response=response,
+            )
+        )
+
+
+def _instrument_http_client(client: httpx.Client | httpx.AsyncClient) -> None:
+    """Wrap the existing client send boundary without replacing its pool."""
+
+    if getattr(client, _OBSERVED_CLIENT_ATTRIBUTE, False):
+        return
+    if isinstance(client, httpx.AsyncClient):
+        client.event_hooks["response"].append(_capture_async_response_metadata)
+        original_send = client.send
+
+        async def observed_async_send(
+            request: httpx.Request,
+            *args: Any,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            return await _record_async_transport_send(
+                original_send,
+                request,
+                *args,
+                **kwargs,
+            )
+
+        client.send = observed_async_send  # type: ignore[method-assign]
+    else:
+        client.event_hooks["response"].append(_capture_response_metadata)
+        original_send = client.send
+
+        def observed_sync_send(
+            request: httpx.Request,
+            *args: Any,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            return _record_sync_transport_send(
+                original_send,
+                request,
+                *args,
+                **kwargs,
+            )
+
+        client.send = observed_sync_send  # type: ignore[method-assign]
+    setattr(client, _OBSERVED_CLIENT_ATTRIBUTE, True)
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
@@ -31,6 +331,72 @@ class NormalizedChatOpenAI(ChatOpenAI):
     reasoning_content roundtrip) live in subclasses so this base class
     stays small.
     """
+
+    _model_transport_provider_family: str = PrivateAttr(default="unavailable")
+    _model_transport_configured_max_retries: int = PrivateAttr(
+        default=DEFAULT_MAX_RETRIES
+    )
+
+    def _activate_model_transport_call(
+        self,
+    ) -> tuple[_ModelTransportCallContext, Token] | None:
+        try:
+            from tradingagents.dataflows.market_snapshot import (
+                get_active_run_telemetry,
+            )
+
+            ledger = get_active_run_telemetry()
+            if ledger is None:
+                return None
+            context = _ModelTransportCallContext(
+                ledger=ledger,
+                logical_call_id=ledger.begin_model_transport_call(),
+                provider_family=_safe_transport_value(
+                    self._model_transport_provider_family,
+                    pattern=_SAFE_PROVIDER_RE,
+                    maximum_chars=64,
+                ),
+                model_id=_safe_transport_value(
+                    self.model_name,
+                    pattern=_SAFE_MODEL_RE,
+                    maximum_chars=200,
+                ),
+                configured_max_retries=self._model_transport_configured_max_retries,
+            )
+            return context, _ACTIVE_MODEL_TRANSPORT_CALL.set(context)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _deactivate_model_transport_call(
+        activation: tuple[_ModelTransportCallContext, Token] | None,
+    ) -> None:
+        if activation is None:
+            return
+        context, token = activation
+        with suppress(Exception):
+            context.ledger.finish_model_transport_call(context.logical_call_id)
+        _ACTIVE_MODEL_TRANSPORT_CALL.reset(token)
+
+    def _generate(self, *args: Any, **kwargs: Any):
+        activation = self._activate_model_transport_call()
+        try:
+            return super()._generate(*args, **kwargs)
+        finally:
+            self._deactivate_model_transport_call(activation)
+
+    async def _agenerate(self, *args: Any, **kwargs: Any):
+        activation = self._activate_model_transport_call()
+        try:
+            return await super()._agenerate(*args, **kwargs)
+        finally:
+            self._deactivate_model_transport_call(activation)
+
+    def _instrument_model_transport_clients(self) -> None:
+        """Attach observation to the SDK-owned clients without replacing pools."""
+
+        _instrument_http_client(self.root_client._client)
+        _instrument_http_client(self.root_async_client._client)
 
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
@@ -351,7 +717,16 @@ class OpenAIClient(BaseLLMClient):
             llm_kwargs[key] = self.kwargs[key]
 
         # The subclass (provider quirks) comes from the registry spec.
-        return chat_cls(**llm_kwargs)
+        llm = chat_cls(**llm_kwargs)
+        llm._instrument_model_transport_clients()
+        llm._model_transport_provider_family = self.provider
+        configured_max_retries = llm_kwargs.get("max_retries")
+        llm._model_transport_configured_max_retries = (
+            DEFAULT_MAX_RETRIES
+            if configured_max_retries is None
+            else int(configured_max_retries)
+        )
+        return llm
 
     def validate_model(self) -> bool:
         """Validate model for the provider."""

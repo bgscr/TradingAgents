@@ -1012,6 +1012,7 @@ def test_bank_company_type_and_since_listing_exception_are_period_local(
     missing = router.route_statement(
         request.model_copy(
             update={
+                "as_of_date": date(2026, 9, 30),
                 "eligible_reporting_period_ends": (
                     *reporting,
                     date(2026, 9, 30),

@@ -50,6 +50,8 @@ from tradingagents.capability_routing import (
     start_new_mainland_capability_routing_run,
     validate_mainland_capability_routing_checkpoint,
 )
+from tradingagents.cninfo_production_binding import CninfoProductionBinding
+from tradingagents.dataflows.cninfo_listing_publication import CninfoListingBoard
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.financial_capability_routing import (
@@ -266,6 +268,7 @@ class TradingAgentsGraph:
                     capability_routing_plan is not None
                     and capability_routing_plan.mode.value
                     == "qualified_v1_shadow"
+                    and capability_routing_plan.plan_version == "1.2"
                 ):
                     capability_routing_plan = (
                         prepare_mainland_temporal_capability_routing_plan(
@@ -413,6 +416,7 @@ class TradingAgentsGraph:
             )
             else None
         )
+        self._validated_cninfo_production_binding()
         self._financial_eligibility_context_owner: (
             FinancialEligibilityAcquisitionContextOwner | None
         ) = None
@@ -756,6 +760,37 @@ class TradingAgentsGraph:
             ),
         }
 
+    def _validated_cninfo_production_binding(self) -> CninfoProductionBinding | None:
+        plan = self.capability_routing_plan
+        if plan is None or plan.plan_version != "1.5":
+            return None
+        composition = self._managed_qualified_routing_composition
+        if composition is None or self.asset_configuration is None:
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_COMPOSITION_MISSING
+                )
+            )
+        try:
+            expected = CninfoProductionBinding.create(
+                plan=plan,
+                asset_configuration=self.asset_configuration,
+                config=self.config,
+            )
+        except (TypeError, ValueError):
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID
+                )
+            ) from None
+        if expected != composition.blueprint.factory_contract.cninfo_binding:
+            raise MainlandCapabilityRoutingPreflightError(
+                mainland_capability_routing_failure(
+                    MainlandCapabilityRoutingFailureReason.QUALIFIED_ROUTING_FACTORY_CONTRACT_INVALID
+                )
+            )
+        return expected
+
     def bind_qualified_routing_runtime(
         self,
         *,
@@ -765,6 +800,7 @@ class TradingAgentsGraph:
         checkpoint_thread_id: str | None = None,
         checkpoint_state: Mapping[str, Any] | None = None,
         analysis_as_of_date: date | str | None = None,
+        authoritative_listing_board: CninfoListingBoard | None = None,
     ) -> ProductionQualifiedRoutingRuntime | None:
         """Bind and install the one managed run after checkpoint compatibility."""
 
@@ -781,6 +817,18 @@ class TradingAgentsGraph:
         routing_plan = self.capability_routing_plan
         if asset_configuration is None or routing_plan is None:
             raise ValueError("qualified runtime requires authoritative run bindings")
+        cninfo_binding = (
+            self._validated_cninfo_production_binding()
+            if routing_plan.plan_version == "1.5"
+            else None
+        )
+        if cninfo_binding is not None:
+            if (
+                authoritative_listing_board is not None
+                and authoritative_listing_board is not cninfo_binding.authoritative_listing_board
+            ):
+                raise ValueError("runtime listing board contradicts Instrument Identity")
+            authoritative_listing_board = cninfo_binding.authoritative_listing_board
         financial_tool_node = getattr(self, "tool_nodes", {}).get("fundamentals")
         restore_financial_dispatcher = (
             financial_tool_node.restore_shadow_dispatcher
@@ -848,6 +896,7 @@ class TradingAgentsGraph:
                 checkpoint_thread_id=checkpoint_thread_id,
                 eligibility_clock=inputs.eligibility_clock,
                 calendar_provider=inputs.eligibility_calendar_provider,
+                authoritative_listing_board=authoritative_listing_board,
                 interrupt_runtime=composition.interrupt,
                 close_runtime=composition.close,
             )
@@ -1326,6 +1375,12 @@ class TradingAgentsGraph:
                     + capability_routing_plan.plan_signature,
                 )
             )
+        if capability_routing_plan is not None and capability_routing_plan.plan_version == "1.5":
+            binding = self._validated_cninfo_production_binding()
+            assert binding is not None
+            # Keep policy identity in the routing-neutral identity too: a
+            # different policy must not match an existing checkpoint/run.
+            signature_fields.append("cninfo_profile=" + binding.profile.profile_identity)
         return "|".join(signature_fields)
 
     @contextmanager

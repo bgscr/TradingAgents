@@ -9,18 +9,28 @@ import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from tradingagents.dataflows.financial_temporal_eligibility import (
     FinancialMetadataTemporalEligibilityDecision,
     MarketSessionEligibilityBinding,
     TemporalEvidenceClass,
+)
+from tradingagents.dataflows.listing_publication_evidence import (
+    CompositeListingTemporalEligibilityDecision,
 )
 from tradingagents.evidence import InstrumentIdentityEvidence, InstrumentKind
 from tradingagents.market_history.config import DataUsageMode
@@ -38,11 +48,19 @@ from tradingagents.market_history.coordinator import (
 PROVIDER_SUBREQUEST_KEY_VERSION = "1.0"
 PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION = "1.1"
 PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION = "1.2"
+PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION = "1.3"
+PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION = "1.4"
 FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION = (
     "financial-eligibility-acquisition-context-v1"
 )
 FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION = (
     "financial-eligibility-acquisition-context-v2"
+)
+FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION = (
+    "financial-eligibility-acquisition-context-v3"
+)
+FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION = (
+    "financial-eligibility-acquisition-context-v4"
 )
 
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True)
@@ -291,6 +309,24 @@ class ProviderSubrequestArtifactRef(BaseModel):
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_length: int = Field(ge=0)
     media_type: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9.+/-]{0,127}$")
+    retrieved_at: datetime | None = None
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def _validate_retrieved_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("artifact retrieval time must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        payload = handler(self)
+        if self.retrieved_at is None:
+            # Preserve historical and non-opted-in artifact/checkpoint identities.
+            payload.pop("retrieved_at", None)
+        return payload
 
     @model_validator(mode="after")
     def _validate_ref(self) -> ProviderSubrequestArtifactRef:
@@ -555,18 +591,20 @@ class ProviderSubrequestCheckpointEntry(BaseModel):
 class ProviderSubrequestCacheCheckpoint(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0", "1.1", "1.2"] = "1.0"
+    contract_version: Literal["1.0", "1.1", "1.2", "1.3", "1.4"] = "1.0"
     run_scope_id: str = Field(pattern=_SAFE_ID_PATTERN)
     financial_eligibility_context_contract_version: Literal[
         "financial-eligibility-acquisition-context-v1",
         "financial-eligibility-acquisition-context-v2",
+        "financial-eligibility-acquisition-context-v3",
+        "financial-eligibility-acquisition-context-v4",
     ] | None = Field(default=None, exclude_if=lambda value: value is None)
     financial_eligibility_context_identity: str | None = Field(
         default=None,
-        pattern=r"^financial-eligibility-acquisition-context:v[12]:[0-9a-f]{64}$",
+        pattern=r"^financial-eligibility-acquisition-context:v[1234]:[0-9a-f]{64}$",
         exclude_if=lambda value: value is None,
     )
-    capability_routing_plan_version: Literal["1.3"] | None = Field(
+    capability_routing_plan_version: Literal["1.3", "1.4", "1.5"] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )
@@ -584,7 +622,8 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
         exclude_if=lambda value: value is None,
     )
     temporal_decisions: tuple[
-        FinancialMetadataTemporalEligibilityDecision,
+        FinancialMetadataTemporalEligibilityDecision
+        | CompositeListingTemporalEligibilityDecision,
         ...,
     ] = Field(default=(), exclude_if=lambda value: not value)
     temporal_artifact_identities: tuple[str, ...] = Field(
@@ -604,6 +643,8 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
         context_bound_version = self.contract_version in {
             PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION,
             PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION,
         }
         if context_bound_version != has_context_binding:
             raise ValueError("provider subrequest context binding is incomplete")
@@ -613,14 +654,40 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             self.financial_eligibility_metadata_binding,
             self.calendar_eligibility_binding,
         )
-        temporal = (
-            self.contract_version
-            == PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
-        )
+        temporal = self.contract_version in {
+            PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION,
+            PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION,
+        }
         if temporal:
+            windowed = (
+                self.contract_version
+                in {
+                    PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION,
+                    PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION,
+                }
+            )
+            composite = (
+                self.contract_version
+                == PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION
+            )
+            expected_context_version = (
+                FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION
+                if composite
+                else FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION
+                if windowed
+                else FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            )
+            expected_metadata_version = (
+                "financial-eligibility-metadata-binding-v4"
+                if composite
+                else "financial-eligibility-metadata-binding-v3"
+                if windowed
+                else "financial-eligibility-metadata-binding-v2"
+            )
             if (
                 self.financial_eligibility_context_contract_version
-                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                != expected_context_version
                 or any(value is None for value in temporal_values)
                 or len(self.temporal_decisions) != 2
             ):
@@ -632,24 +699,70 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             metadata_binding = FinancialEligibilityMetadataBinding.model_validate(
                 self.financial_eligibility_metadata_binding
             )
-            expected_artifacts = tuple(
-                sorted(
-                    decision.immutable_artifact_identity
-                    for decision in self.temporal_decisions
+            if composite:
+                company_decision, listing_decision = self.temporal_decisions
+                if (
+                    not isinstance(
+                        company_decision,
+                        FinancialMetadataTemporalEligibilityDecision,
+                    )
+                    or not isinstance(
+                        listing_decision,
+                        CompositeListingTemporalEligibilityDecision,
+                    )
+                ):
+                    raise ValueError("provider subrequest composite decision roles mismatch")
+                expected_artifacts = tuple(
+                    sorted(
+                        (
+                            company_decision.immutable_artifact_identity,
+                            listing_decision.effective_artifact_identity,
+                            listing_decision.security_lookup_artifact_identity,
+                            listing_decision.publication_artifact_identity,
+                            *(
+                                ()
+                                if listing_decision.document_artifact_identity is None
+                                else (listing_decision.document_artifact_identity,)
+                            ),
+                        )
+                    )
                 )
-            )
+            else:
+                expected_artifacts = tuple(
+                    sorted(
+                        decision.immutable_artifact_identity
+                        for decision in self.temporal_decisions
+                        if isinstance(
+                            decision,
+                            FinancialMetadataTemporalEligibilityDecision,
+                        )
+                    )
+                )
             if (
-                metadata_binding.contract_version
-                != "financial-eligibility-metadata-binding-v2"
+                metadata_binding.contract_version != expected_metadata_version
                 or metadata_binding.routing_plan_signature
                 != self.capability_routing_plan_signature
-                or metadata_binding.calendar_binding
-                != self.calendar_eligibility_binding
-                or self.temporal_artifact_identities != expected_artifacts
-                or tuple(
-                    decision.evidence_class for decision in self.temporal_decisions
+                or (
+                    metadata_binding.calendar_binding
+                    != (
+                        self.temporal_decisions[0].acquisition_window.calendar_binding.started
+                        if windowed
+                        and self.temporal_decisions[0].acquisition_window is not None
+                        else self.calendar_eligibility_binding
+                    )
                 )
-                not in {
+                or self.temporal_artifact_identities != expected_artifacts
+                or (
+                    not composite
+                    and tuple(
+                        decision.evidence_class
+                        for decision in self.temporal_decisions
+                        if isinstance(
+                            decision,
+                            FinancialMetadataTemporalEligibilityDecision,
+                        )
+                    )
+                    not in {
                     (
                         TemporalEvidenceClass.TUSHARE_STATEMENT_COMPANY_TYPE,
                         TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
@@ -658,11 +771,17 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
                         TemporalEvidenceClass.AKSHARE_SINA_STATEMENT_COMPANY_TYPE,
                         TemporalEvidenceClass.BAOSTOCK_ISSUER_LIFECYCLE_LISTING,
                     ),
-                }
+                    }
+                )
                 or any(
                     decision.calendar_binding != self.calendar_eligibility_binding
                     or decision.mode != metadata_binding.temporal_mode.value
+                    or windowed != (decision.acquisition_window is not None)
                     for decision in self.temporal_decisions
+                    if isinstance(
+                        decision,
+                        FinancialMetadataTemporalEligibilityDecision,
+                    )
                 )
             ):
                 raise ValueError("provider subrequest temporal binding is inconsistent")
@@ -671,7 +790,11 @@ class ProviderSubrequestCacheCheckpoint(BaseModel):
             or self.temporal_decisions
             or self.temporal_artifact_identities
             or self.financial_eligibility_context_contract_version
-            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            in {
+                FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION,
+            }
         ):
             raise ValueError(
                 "historical provider subrequest checkpoint carries temporal state"
@@ -736,7 +859,8 @@ class ProviderSubrequestCache:
         self._financial_eligibility_metadata_binding: dict[str, Any] | None = None
         self._calendar_eligibility_binding: MarketSessionEligibilityBinding | None = None
         self._temporal_decisions: tuple[
-            FinancialMetadataTemporalEligibilityDecision,
+            FinancialMetadataTemporalEligibilityDecision
+            | CompositeListingTemporalEligibilityDecision,
             ...,
         ] = ()
         self._temporal_artifact_identities: tuple[str, ...] = ()
@@ -758,6 +882,34 @@ class ProviderSubrequestCache:
             and self._artifact_store is artifact_store
         )
 
+    def has_operator_safety_ceiling(
+        self,
+        *,
+        upstream_service_ids: tuple[str, ...],
+        minimum_interval: timedelta,
+        allow_prewarming: bool,
+    ) -> bool:
+        """Verify required coordinator policy without exposing database state."""
+
+        if not upstream_service_ids or minimum_interval <= timedelta(0):
+            return False
+        ceilings = tuple(
+            self._coordinator.configured_operator_ceiling(upstream_id)
+            for upstream_id in upstream_service_ids
+        )
+        return all(
+            ceiling is not None
+            and ceiling.minimum_interval >= minimum_interval
+            and ceiling.allow_prewarming is allow_prewarming
+            for ceiling in ceilings
+        )
+
+    @property
+    def data_usage_mode(self) -> DataUsageMode:
+        """Expose the persisted run license boundary to bounded adapters."""
+
+        return self._coordinator.data_usage_mode
+
     def bind_financial_eligibility_context(
         self,
         *,
@@ -768,20 +920,43 @@ class ProviderSubrequestCache:
     ) -> None:
         """Single-assign the safe context identity governing this run cache."""
 
-        temporal = (
+        temporal = context_contract_version in {
+            FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+            FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+            FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION,
+        }
+        windowed = (
             context_contract_version
-            == FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+            in {
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION,
+            }
         )
-        expected_identity_pattern = (
-            r"financial-eligibility-acquisition-context:v2:[0-9a-f]{64}"
-            if temporal
-            else r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}"
+        composite = (
+            context_contract_version
+            == FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION
         )
+        expected_identity_pattern = {
+            FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v1:[0-9a-f]{64}"
+            ),
+            FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v2:[0-9a-f]{64}"
+            ),
+            FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v3:[0-9a-f]{64}"
+            ),
+            FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION: (
+                r"financial-eligibility-acquisition-context:v4:[0-9a-f]{64}"
+            ),
+        }.get(context_contract_version, r"(?!)")
         if (
             context_contract_version
             not in {
                 FINANCIAL_ELIGIBILITY_CONTEXT_CONTRACT_VERSION,
                 FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION,
+                FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION,
             }
             or re.fullmatch(expected_identity_pattern, context_identity) is None
             or _contains_reserved_secret_text(
@@ -805,10 +980,10 @@ class ProviderSubrequestCache:
                     capability_routing_plan,
                     MainlandCapabilityRoutingPlan,
                 )
-                or context.contract_version
-                != FINANCIAL_ELIGIBILITY_TEMPORAL_CONTEXT_CONTRACT_VERSION
+                or context.contract_version != context_contract_version
                 or context.context_identity != context_identity
-                or capability_routing_plan.plan_version != "1.3"
+                or capability_routing_plan.plan_version
+                != ("1.5" if composite else "1.4" if windowed else "1.3")
                 or context.routing_plan_signature
                 != capability_routing_plan.plan_signature
                 or context.temporal_eligibility_binding is None
@@ -818,7 +993,13 @@ class ProviderSubrequestCache:
                 )
             bound = context.temporal_eligibility_binding
             metadata_binding = FinancialEligibilityMetadataBinding(
-                contract_version="financial-eligibility-metadata-binding-v2",
+                contract_version=(
+                    "financial-eligibility-metadata-binding-v4"
+                    if composite
+                    else "financial-eligibility-metadata-binding-v3"
+                    if windowed
+                    else "financial-eligibility-metadata-binding-v2"
+                ),
                 instrument_identity=context.instrument_identity,
                 requested_session=context.requested_session,
                 availability_scope=context.availability_scope,
@@ -826,9 +1007,26 @@ class ProviderSubrequestCache:
                 financial_eligibility_binding=context.financial_eligibility_binding,
                 routing_plan_signature=context.routing_plan_signature,
                 temporal_mode=bound.temporal_mode,
-                eligibility_evaluated_at=bound.eligibility_evaluated_at,
-                calendar_binding=bound.calendar_binding,
+                eligibility_evaluated_at=(
+                    None if windowed else bound.eligibility_evaluated_at
+                ),
+                eligibility_started_at=(
+                    bound.acquisition_window.eligibility_started_at
+                    if windowed and bound.acquisition_window is not None
+                    else None
+                ),
+                calendar_binding=(
+                    bound.acquisition_window.calendar_binding.started
+                    if windowed and bound.acquisition_window is not None
+                    else bound.calendar_binding
+                ),
                 strict_cutoff=bound.strict_cutoff,
+                authoritative_listing_board=(
+                    context.listing_composite_temporal_proof.publication_evidence.authoritative_board
+                    if composite
+                    and context.listing_composite_temporal_proof is not None
+                    else None
+                ),
             )
             decisions = (
                 bound.company_type_temporal_decision,
@@ -846,10 +1044,40 @@ class ProviderSubrequestCache:
                 ),
                 "calendar_eligibility_binding": bound.calendar_binding,
                 "temporal_decisions": decisions,
-                "temporal_artifact_identities": tuple(
-                    sorted(
-                        decision.immutable_artifact_identity
-                        for decision in decisions
+                "temporal_artifact_identities": (
+                    tuple(
+                        sorted(
+                            (
+                                decisions[0].immutable_artifact_identity,
+                                decisions[1].effective_artifact_identity,
+                                decisions[1].security_lookup_artifact_identity,
+                                decisions[1].publication_artifact_identity,
+                                *(
+                                    ()
+                                    if decisions[1].document_artifact_identity is None
+                                    else (decisions[1].document_artifact_identity,)
+                                ),
+                            )
+                        )
+                    )
+                    if composite
+                    and isinstance(
+                        decisions[0],
+                        FinancialMetadataTemporalEligibilityDecision,
+                    )
+                    and isinstance(
+                        decisions[1],
+                        CompositeListingTemporalEligibilityDecision,
+                    )
+                    else tuple(
+                        sorted(
+                            decision.immutable_artifact_identity
+                            for decision in decisions
+                            if isinstance(
+                                decision,
+                                FinancialMetadataTemporalEligibilityDecision,
+                            )
+                        )
                     )
                 ),
             }
@@ -932,12 +1160,20 @@ class ProviderSubrequestCache:
             temporal_artifact_identities = self._temporal_artifact_identities
         return ProviderSubrequestCacheCheckpoint(
             contract_version=(
-                PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
-                if plan_version is not None
+                PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION
+                if context_contract_version
+                == FINANCIAL_ELIGIBILITY_COMPOSITE_CONTEXT_CONTRACT_VERSION
+                else PROVIDER_SUBREQUEST_CACHE_WINDOWED_CONTEXT_VERSION
+                if context_contract_version
+                == FINANCIAL_ELIGIBILITY_WINDOWED_CONTEXT_CONTRACT_VERSION
                 else (
-                    PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
-                    if context_identity is not None
-                    else "1.0"
+                    PROVIDER_SUBREQUEST_CACHE_TEMPORAL_CONTEXT_VERSION
+                    if plan_version is not None
+                    else (
+                        PROVIDER_SUBREQUEST_CACHE_CONTEXT_VERSION
+                        if context_identity is not None
+                        else "1.0"
+                    )
                 )
             ),
             run_scope_id=self._run_scope_id,
@@ -1107,12 +1343,16 @@ class ProviderSubrequestCache:
         max_physical_attempts: int = 1,
         operation: str,
         media_type: str,
+        record_at_physical_io: bool = False,
+        capture_retrieved_at: bool = False,
         physical_request: Callable[[], bytes | PhysicalAttemptNotMade[bytes]],
     ) -> ProviderSubrequestResult:
         if (
             not isinstance(max_physical_attempts, int)
             or isinstance(max_physical_attempts, bool)
             or max_physical_attempts < 1
+            or not isinstance(record_at_physical_io, bool)
+            or not isinstance(capture_retrieved_at, bool)
         ):
             raise ProviderSubrequestCacheError(
                 ProviderSubrequestCacheFailureReason.EXECUTION_INVALID
@@ -1173,6 +1413,12 @@ class ProviderSubrequestCache:
                     value,
                     media_type=media_type,
                 )
+                if capture_retrieved_at and not no_io:
+                    # The callback consumed/validated the entire response and CAS
+                    # installation completed. Retain this receipt across replay.
+                    artifact = ProviderSubrequestArtifactRef.model_validate(
+                        {**artifact.model_dump(), "retrieved_at": now()}
+                    )
                 artifact_payload = artifact.model_dump(mode="json")
                 if no_io:
                     return PhysicalAttemptNotMade(artifact_payload)
@@ -1190,6 +1436,7 @@ class ProviderSubrequestCache:
                 operation=operation,
                 physical_attempt=lambda _attempt_index: typed_physical_request(),
                 cooldown_scope=key.capacity_scope,
+                record_at_physical_io=record_at_physical_io,
                 _wait_for_initial_pacing=True,
             )
             artifact = ProviderSubrequestArtifactRef.model_validate(
@@ -1246,6 +1493,7 @@ class ProviderSubrequestCache:
 
 
 __all__ = [
+    "PROVIDER_SUBREQUEST_CACHE_COMPOSITE_CONTEXT_VERSION",
     "PROVIDER_SUBREQUEST_KEY_VERSION",
     "ProviderSubrequestArtifactRef",
     "ProviderSubrequestArtifactStore",

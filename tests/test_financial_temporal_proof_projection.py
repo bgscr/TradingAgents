@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 
@@ -304,3 +304,27 @@ def test_same_0048_evidence_rejects_strict_after_session_cutoff() -> None:
         TemporalEligibilityRejectionReason.EXACT_REVISION_NOT_AVAILABLE_BY_STRICT_CUTOFF
         in decision.reasons
     )
+
+
+@pytest.mark.unit
+def test_windowed_transaction_rejects_proof_staged_by_another_run() -> None:
+    common = {
+        "mode": TemporalEligibilityMode.CURRENT_ANALYSIS_ONLY,
+        "calendar": _calendar(),
+        "requested_session": _SESSION,
+        "eligibility_started_at": _RETRIEVED,
+        "clock": lambda: _RETRIEVED + timedelta(seconds=1),
+        "routing_plan_signature": "mainland-routing-plan:v1:" + "d" * 64,
+    }
+    first = FinancialEligibilityTemporalEvaluationTransaction(
+        **common,
+        canonical_run_id="run:" + "1" * 64,
+    )
+    second = FinancialEligibilityTemporalEvaluationTransaction(
+        **common,
+        canonical_run_id="run:" + "2" * 64,
+    )
+    staged = first.stage(_qualified_company_evidence(), evidence_origin="fresh")
+
+    with pytest.raises(ValueError, match="active temporal transaction"):
+        second.finalize((staged,))

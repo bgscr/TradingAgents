@@ -1,3 +1,4 @@
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -401,6 +402,204 @@ def test_baostock_login_logout_output_is_suppressed(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "login success!" not in captured.out
     assert "logout success!" not in captured.out
+
+
+@pytest.mark.unit
+def test_baostock_sdk_output_is_contained_across_query_and_row_drain(
+    monkeypatch,
+    capsys,
+):
+    raw_canary = "[WinError 10057] socket is not connected"
+
+    class PrintingQuery(FakeQuery):
+        def next(self):
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().next()
+
+        def get_row_data(self):
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().get_row_data()
+
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "login",
+        lambda: print(raw_canary) or FakeLogin(),
+    )
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "query_history_k_data_plus",
+        lambda *args, **kwargs: print(raw_canary, file=sys.stderr)
+        or PrintingQuery(
+            [
+                [
+                    "2026-06-30",
+                    "sh.601328",
+                    "7.1",
+                    "7.3",
+                    "7.0",
+                    "7.2",
+                    "1000",
+                    "7200",
+                ]
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "logout",
+        lambda: print(raw_canary, file=sys.stderr),
+    )
+
+    frame = baostock_data.load_ohlcv_range(
+        "601328.SS",
+        "2026-06-30",
+        "2026-06-30",
+    )
+
+    captured = capsys.readouterr()
+    assert frame["Close"].tolist() == [7.2]
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
+
+
+@pytest.mark.unit
+def test_baostock_current_snapshot_contains_named_query_and_drain_output(
+    monkeypatch,
+    capsys,
+):
+    raw_canary = "[WinError 10057] named query socket is not connected"
+
+    class PrintingNamedQuery(FakeNamedQuery):
+        def next(self):
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().next()
+
+        def get_row_data(self):
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return super().get_row_data()
+
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: FakeLogin())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "query_history_k_data_plus",
+        lambda *args, **kwargs: print(raw_canary)
+        or PrintingNamedQuery(
+            baostock_data.CURRENT_SNAPSHOT_FIELDS.split(","),
+            [
+                [
+                    "2026-06-30",
+                    "sh.601328",
+                    "7.1",
+                    "7.3",
+                    "7.0",
+                    "7.2",
+                    "7.0",
+                    "1000",
+                    "7200",
+                    "1",
+                ]
+            ],
+        ),
+    )
+
+    candidate = baostock_data.load_current_snapshot(
+        "601328.SS",
+        "2026-06-30",
+        "2026-06-30",
+    )
+
+    captured = capsys.readouterr()
+    assert candidate.frame["Close"].tolist() == [7.2]
+    assert candidate.current_tradeability == "tradeable"
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
+
+
+@pytest.mark.unit
+def test_baostock_containment_preserves_typed_no_data_failure(monkeypatch, capsys):
+    raw_canary = "[WinError 10057] empty result socket is not connected"
+
+    class PrintingEmptyQuery(FakeQuery):
+        def next(self):
+            print(raw_canary)
+            print(raw_canary, file=sys.stderr)
+            return False
+
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: FakeLogin())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(
+        baostock_data.bs,
+        "query_history_k_data_plus",
+        lambda *args, **kwargs: print(raw_canary) or PrintingEmptyQuery([]),
+    )
+
+    with pytest.raises(baostock_data.NoMarketDataError, match="returned no rows"):
+        baostock_data.load_ohlcv_range(
+            "601328.SS",
+            "2026-06-30",
+            "2026-06-30",
+        )
+
+    captured = capsys.readouterr()
+    assert raw_canary not in captured.out
+    assert raw_canary not in captured.err
+
+
+@pytest.mark.unit
+def test_baostock_containment_forwards_other_thread_application_output(
+    monkeypatch,
+    capsys,
+):
+    raw_canary = "[WinError 10057] blocked query socket is not connected"
+    application_message = "application diagnostic remains visible"
+    query_entered = threading.Event()
+    release_query = threading.Event()
+
+    def query(*args, **kwargs):
+        query_entered.set()
+        assert release_query.wait(timeout=5)
+        print(raw_canary)
+        return FakeQuery(
+            [
+                [
+                    "2026-06-30",
+                    "sh.601328",
+                    "7.1",
+                    "7.3",
+                    "7.0",
+                    "7.2",
+                    "1000",
+                    "7200",
+                ]
+            ]
+        )
+
+    monkeypatch.setattr(baostock_data.bs, "login", lambda: FakeLogin())
+    monkeypatch.setattr(baostock_data.bs, "logout", lambda: None)
+    monkeypatch.setattr(baostock_data.bs, "query_history_k_data_plus", query)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            baostock_data.load_ohlcv_range,
+            "601328.SS",
+            "2026-06-30",
+            "2026-06-30",
+        )
+        assert query_entered.wait(timeout=5)
+        print(application_message)
+        print(application_message, file=sys.stderr)
+        release_query.set()
+        assert future.result(timeout=5)["Close"].tolist() == [7.2]
+
+    captured = capsys.readouterr()
+    assert raw_canary not in captured.out
+    assert application_message in captured.out
+    assert application_message in captured.err
 
 
 @pytest.mark.unit

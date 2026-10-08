@@ -78,6 +78,12 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MARKET_HISTORY_BACKUP_ROOT": "market_history_backup_root",
     "TRADINGAGENTS_DATA_USAGE_MODE":      "data_usage_mode",
     "TRADINGAGENTS_MAINLAND_CAPABILITY_ROUTING_MODE": "mainland_capability_routing_mode",
+    # Explicit forward selection only: deliberately absent from DEFAULT_CONFIG
+    # so installed source and historical configuration cannot activate CNINFO.
+    "TRADINGAGENTS_MAINLAND_CAPABILITY_ROUTING_PLAN_VERSION": "mainland_capability_routing_plan_version",
+    "TRADINGAGENTS_CNINFO_LISTING_PUBLICATION_PROFILE": "cninfo_listing_publication_profile",
+    "TRADINGAGENTS_CNINFO_SOURCE_POLICY_VERSION": "cninfo_source_policy_version",
+    "TRADINGAGENTS_CNINFO_OPERATOR_MINIMUM_INTERVAL_SECONDS": "cninfo_operator_minimum_interval_seconds",
     "TRADINGAGENTS_TUSHARE_ENABLED_CAPABILITIES": "tushare_enabled_capabilities",
     "TRADINGAGENTS_TUSHARE_QUALIFICATION_PROFILE": "tushare_qualification_profile",
     "TRADINGAGENTS_TUSHARE_ACCOUNT_SCOPE_LABEL": "tushare_account_scope_label",

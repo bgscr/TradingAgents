@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from dataclasses import replace
 from hashlib import sha256
@@ -10,6 +11,13 @@ from pathlib import Path
 import pytest
 
 import tradingagents.windows_sandbox_qualification as qualification_module
+from scripts import verify_ticket06_immutable_state as immutable_verifier
+from tradingagents.market_history import (
+    DataUsageMode,
+    MarketHistoryConfig,
+    MarketHistoryMode,
+    MarketHistoryStore,
+)
 from tradingagents.windows_sandbox_acceptance import (
     QUALIFIED_RUNNER_SOURCE_FILES,
     QUALIFIED_RUNNER_TARGET_FILES,
@@ -31,10 +39,12 @@ from tradingagents.windows_sandbox_qualification import (
     LocalWriteResult,
     LocalWriteTarget,
     MappingVerification,
+    MinimalSandboxLaunchContract,
     MinimalSandboxLaunchEvidence,
     NetworkVerification,
     ProbeMechanism,
     ProbeObservation,
+    ProtectedHostInventory,
     QualificationStaticBindings,
     ReviewedHostHarnessFile,
     ReviewedHostHarnessManifest,
@@ -43,6 +53,7 @@ from tradingagents.windows_sandbox_qualification import (
     _validate_historical_report_pins,
     _validate_historical_report_pins_in_inventory,
     build_guest_qualification_result,
+    build_minimal_sandbox_launch_contract,
     build_protected_writer_quiescence_contract,
     build_protected_writer_quiescence_evidence,
     build_qualification_completion_marker,
@@ -50,8 +61,10 @@ from tradingagents.windows_sandbox_qualification import (
     capture_protected_host_inventory,
     capture_windows_host_platform_facts,
     compare_protected_host_inventories,
+    construct_minimal_sandbox_launch,
     execute_iso03_boundary_qualification,
     host_path_identity,
+    launch_minimal_sandbox,
     load_historical_iso03_qualification_report,
     qualify_windows_sandbox_host,
     run_minimal_sandbox_launch,
@@ -65,6 +78,7 @@ from tradingagents.windows_sandbox_qualification import (
 from tradingagents.windows_sandbox_runner import (
     ProtectedObjectKind,
     ProtectedRootBinding,
+    ProtectedRootManifest,
     ProtectedRootRole,
     SandboxContractError,
     SandboxFailureReason,
@@ -159,6 +173,120 @@ def _protected_manifest(root: Path):
             kind = ProtectedObjectKind.FILE
         bindings.append(ProtectedRootBinding(role, path, kind))
     return build_protected_root_manifest(tuple(bindings))
+
+
+def _create_historical_provider_ledger(path: Path) -> None:
+    path.unlink()
+    fixture_sequence_ids = tuple(
+        f"fixture-sequence-{index:04d}" for index in range(1020)
+    )
+    sequence_ids = (*immutable_verifier.INCIDENT_SEQUENCE_IDS, *fixture_sequence_ids)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE provider_request_sequences (
+                sequence_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE provider_request_attempts (
+                sequence_id TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                attempt_event_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                upstream_service_name TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                PRIMARY KEY (sequence_id, attempt_index)
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_sequences VALUES (?, 'completed')",
+            ((sequence_id,) for sequence_id in sequence_ids),
+        )
+        incident_attempt_ids = dict(immutable_verifier.INCIDENT_IDENTITIES)
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 1, ?, "
+            "'market-snapshot', 'Yahoo Finance', 'available')",
+            (
+                (
+                    sequence_id,
+                    incident_attempt_ids.get(
+                        sequence_id,
+                        f"fixture-attempt-{sequence_id}-1",
+                    ),
+                )
+                for sequence_id in sequence_ids
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 2, ?, "
+            "'market-snapshot', 'Yahoo Finance', 'available')",
+            (
+                (sequence_id, f"fixture-attempt-{sequence_id}-2")
+                for sequence_id in fixture_sequence_ids[:12]
+            ),
+        )
+
+
+def _append_authorized_live_provider_rows(path: Path) -> tuple[str, ...]:
+    sequence_ids = tuple(
+        f"authorized-live-sequence-{index:02d}" for index in range(11)
+    )
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO provider_request_sequences VALUES (?, 'completed')",
+            ((sequence_id,) for sequence_id in sequence_ids),
+        )
+        connection.executemany(
+            "INSERT INTO provider_request_attempts VALUES (?, 1, ?, "
+            "'market-snapshot', 'BaoStock', 'available')",
+            (
+                (sequence_id, f"authorized-live-attempt-{index:02d}")
+                for index, sequence_id in enumerate(sequence_ids)
+            ),
+        )
+    return sequence_ids
+
+
+def _create_semantic_calendar(path: Path) -> None:
+    path.unlink()
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE market_session_calendars (
+                calendar_revision_id TEXT PRIMARY KEY,
+                payload_digest TEXT NOT NULL
+            );
+            CREATE TABLE market_sessions (
+                calendar_revision_id TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                session_status TEXT NOT NULL,
+                PRIMARY KEY (calendar_revision_id, session_date)
+            );
+            INSERT INTO market_session_calendars VALUES ('calendar-1', 'digest-1');
+            INSERT INTO market_sessions VALUES ('calendar-1', '2026-08-20', 'open');
+            """
+        )
+
+
+def _materialize_required_default_roots(
+    bindings: tuple[ProtectedRootBinding, ...],
+) -> None:
+    optional_companions = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL,
+        ProtectedRootRole.PROVIDER_LEDGER_SHM,
+        ProtectedRootRole.CALENDAR_DATABASE_WAL,
+        ProtectedRootRole.CALENDAR_DATABASE_SHM,
+    }
+    for binding in bindings:
+        if binding.role in optional_companions:
+            continue
+        if binding.object_kind is ProtectedObjectKind.DIRECTORY:
+            binding.path.mkdir(parents=True, exist_ok=True)
+        else:
+            binding.path.parent.mkdir(parents=True, exist_ok=True)
+            if not binding.path.exists():
+                binding.path.write_bytes(binding.role.value.encode("ascii"))
 
 
 def _write_report_marker(
@@ -301,6 +429,418 @@ def test_iso_03_host_inventory_is_deterministic_and_detects_rewrites(
     delta = compare_protected_host_inventories(before, after)
     assert delta.equal is False
     assert (delta.appended, delta.deleted, delta.rewritten) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("mutation", ("append", "delete", "rewrite"))
+def test_iso_03_current_provider_ledger_capture_is_self_relative_and_detects_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    by_role = {binding.role: binding.path for binding in manifest.bindings}
+    provider_ledger = by_role[ProtectedRootRole.PROVIDER_LEDGER]
+    calendar_database = by_role[ProtectedRootRole.CALENDAR_DATABASE]
+    _create_historical_provider_ledger(provider_ledger)
+    _create_semantic_calendar(calendar_database)
+
+    with sqlite3.connect(provider_ledger) as connection:
+        historical_counts = (
+            connection.execute(
+                "SELECT COUNT(*) FROM provider_request_sequences"
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM provider_request_attempts"
+            ).fetchone()[0],
+        )
+    assert historical_counts == (1024, 1036)
+
+    authorized_sequence_ids = _append_authorized_live_provider_rows(provider_ledger)
+
+    def semantic_capture() -> dict[str, object]:
+        return qualification_module._immutable_semantic_capture(
+            manifest,
+            capture=immutable_verifier.capture_immutable_state,
+        )
+
+    current = semantic_capture()
+    sequences = current["provider_ledger"]["sequences"]
+    attempts = current["provider_ledger"]["attempts"]
+    assert (sequences["count"], attempts["count"]) == (1035, 1047)
+    assert sequences["inventory_sha256"] == (
+        "643dfdb9ac8ccc4bf4377e18451c3b931450587a38adfd71fba1a4790b438155"
+    )
+    assert attempts["inventory_sha256"] == (
+        "0e96170bb4dac96fa382aacd46e32e444075971c9813756a975c5f26c95bcbbf"
+    )
+    assert semantic_capture() == current
+
+    verifier_identity = "immutable-verifier:sha256:" + ("c" * 64)
+    sentinel = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=semantic_capture,
+        immutable_verifier_identity=verifier_identity,
+    )
+    with sqlite3.connect(provider_ledger) as connection:
+        target = authorized_sequence_ids[-1]
+        if mutation == "append":
+            connection.execute(
+                "INSERT INTO provider_request_sequences VALUES "
+                "('qualification-window-append', 'completed')"
+            )
+            connection.execute(
+                "INSERT INTO provider_request_attempts VALUES "
+                "('qualification-window-append', 1, 'qualification-window-attempt', "
+                "'market-snapshot', 'BaoStock', 'available')"
+            )
+        elif mutation == "delete":
+            connection.execute(
+                "DELETE FROM provider_request_attempts WHERE sequence_id = ?",
+                (target,),
+            )
+            connection.execute(
+                "DELETE FROM provider_request_sequences WHERE sequence_id = ?",
+                (target,),
+            )
+        else:
+            connection.execute(
+                "UPDATE provider_request_sequences SET status = 'failed' "
+                "WHERE sequence_id = ?",
+                (target,),
+            )
+            connection.execute(
+                "UPDATE provider_request_attempts SET outcome = 'provider_error' "
+                "WHERE sequence_id = ?",
+                (target,),
+            )
+
+    after = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=semantic_capture,
+        immutable_verifier_identity=verifier_identity,
+    )
+    delta = compare_protected_host_inventories(sentinel, after)
+
+    assert delta.equal is False
+    assert delta.semantic_equal is False
+
+
+def test_iso_03_clean_close_keeps_absent_sqlite_companions_as_empty_protected_roots(
+    tmp_path: Path,
+) -> None:
+    user_profile = tmp_path / "profile"
+    repository_root = tmp_path / "repository"
+    history_root = user_profile / ".tradingagents" / "market_history"
+    config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    with MarketHistoryStore.open(config):
+        pass
+    with MarketHistoryStore.open_provider_request_authority(config) as authority:
+        provider_ledger = authority.config.database_path
+
+    bindings = default_protected_root_bindings(
+        user_profile=user_profile,
+        repository_root=repository_root,
+    )
+    _materialize_required_default_roots(bindings)
+    companions = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL: Path(f"{provider_ledger}-wal"),
+        ProtectedRootRole.PROVIDER_LEDGER_SHM: Path(f"{provider_ledger}-shm"),
+        ProtectedRootRole.CALENDAR_DATABASE_WAL: Path(f"{config.database_path}-wal"),
+        ProtectedRootRole.CALENDAR_DATABASE_SHM: Path(f"{config.database_path}-shm"),
+    }
+
+    assert config.database_path.is_file()
+    assert provider_ledger.is_file()
+    assert all(not path.exists() for path in companions.values())
+
+    manifest = build_protected_root_manifest(bindings)
+    inventory = capture_protected_host_inventory(
+        manifest,
+        semantic_capture=lambda: {},
+        immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+    )
+    entries = {entry.role: entry for entry in manifest.entries}
+    roots = {root.role: root for root in inventory.roots}
+
+    assert entries[ProtectedRootRole.PROVIDER_LEDGER].concrete_object_required is True
+    assert entries[ProtectedRootRole.CALENDAR_DATABASE].concrete_object_required is True
+    for role, path in companions.items():
+        assert entries[role].concrete_object_required is False
+        assert roots[role].root_path_identity == host_path_identity(path)
+        assert (roots[role].file_count, roots[role].byte_length, roots[role].files) == (
+            0,
+            0,
+            (),
+        )
+
+
+def test_iso_03_repository_sqlite_companions_retain_full_byte_accounting(
+    tmp_path: Path,
+) -> None:
+    user_profile = tmp_path / "profile"
+    repository_root = tmp_path / "repository"
+    history_root = user_profile / ".tradingagents" / "market_history"
+    config = MarketHistoryConfig(
+        mode=MarketHistoryMode.SHADOW,
+        database_path=history_root / "market_history.sqlite3",
+        payload_root=history_root / "payloads",
+        backup_root=history_root / "backups",
+        data_usage_mode=DataUsageMode.PERSONAL_RESEARCH,
+    )
+    with (
+        MarketHistoryStore.open(config),
+        MarketHistoryStore.open_provider_request_authority(config) as authority,
+    ):
+        bindings = default_protected_root_bindings(
+            user_profile=user_profile,
+            repository_root=repository_root,
+        )
+        _materialize_required_default_roots(bindings)
+        companion_paths = {
+            ProtectedRootRole.PROVIDER_LEDGER_WAL: Path(
+                f"{authority.config.database_path}-wal"
+            ),
+            ProtectedRootRole.PROVIDER_LEDGER_SHM: Path(
+                f"{authority.config.database_path}-shm"
+            ),
+            ProtectedRootRole.CALENDAR_DATABASE_WAL: Path(
+                f"{config.database_path}-wal"
+            ),
+            ProtectedRootRole.CALENDAR_DATABASE_SHM: Path(
+                f"{config.database_path}-shm"
+            ),
+        }
+        assert all(path.is_file() for path in companion_paths.values())
+        companion_content = {
+            role: path.read_bytes() for role, path in companion_paths.items()
+        }
+
+        manifest = build_protected_root_manifest(bindings)
+        inventory = capture_protected_host_inventory(
+            manifest,
+            semantic_capture=lambda: {},
+            immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+        )
+        entries = {entry.role: entry for entry in manifest.entries}
+        roots = {root.role: root for root in inventory.roots}
+
+        for role, content in companion_content.items():
+            root = roots[role]
+            assert entries[role].concrete_object_required is False
+            assert (root.file_count, root.byte_length) == (1, len(content))
+            assert len(root.files) == 1
+            assert root.files[0].relative_path == "."
+            assert root.files[0].sha256 == sha256(content).hexdigest()
+
+
+@pytest.mark.parametrize(
+    (
+        "initial_content",
+        "final_content",
+        "expected_equal",
+        "expected_counts",
+    ),
+    (
+        pytest.param(None, None, True, (0, 0, 0), id="absent-to-absent"),
+        pytest.param(b"stable", b"stable", True, (0, 0, 0), id="present-stable"),
+        pytest.param(None, b"created", False, (1, 0, 0), id="absent-to-present"),
+        pytest.param(b"deleted", None, False, (0, 1, 0), id="present-to-absent"),
+        pytest.param(b"before", b"after", False, (0, 0, 1), id="present-rewrite"),
+    ),
+)
+def test_iso_03_sqlite_companion_lifecycle_transitions_remain_protected(
+    tmp_path: Path,
+    initial_content: bytes | None,
+    final_content: bytes | None,
+    expected_equal: bool,
+    expected_counts: tuple[int, int, int],
+) -> None:
+    manifest = _protected_manifest(tmp_path / "protected")
+    target = next(
+        binding.path
+        for binding in manifest.bindings
+        if binding.role is ProtectedRootRole.PROVIDER_LEDGER_WAL
+    )
+    if initial_content is None:
+        target.unlink()
+    else:
+        target.write_bytes(initial_content)
+    def capture():
+        return capture_protected_host_inventory(
+            manifest,
+            semantic_capture=lambda: {},
+            immutable_verifier_identity="immutable-verifier:sha256:" + ("c" * 64),
+        )
+
+    before = capture()
+
+    if final_content is None:
+        target.unlink(missing_ok=True)
+    else:
+        target.write_bytes(final_content)
+    after = capture()
+
+    delta = compare_protected_host_inventories(before, after)
+    assert delta.equal is expected_equal
+    assert (delta.appended, delta.deleted, delta.rewritten) == expected_counts
+    assert delta.changed_roles == (
+        () if expected_equal else (ProtectedRootRole.PROVIDER_LEDGER_WAL,)
+    )
+
+
+def _representative_historical_companion_contract(
+    evidence_name: str,
+) -> tuple[ProtectedRootManifest, ProtectedHostInventory]:
+    companion_content = {
+        ProtectedRootRole.PROVIDER_LEDGER_WAL: b"",
+        ProtectedRootRole.PROVIDER_LEDGER_SHM: b"p" * 32_768,
+        ProtectedRootRole.CALENDAR_DATABASE_WAL: b"",
+        ProtectedRootRole.CALENDAR_DATABASE_SHM: b"c" * 32_768,
+    }
+    root_path_identities = {
+        role: _test_identity("host-path", [evidence_name, role.value])
+        for role in ProtectedRootRole
+    }
+    recorded_entries = [
+        {
+            "role": role.value,
+            "object_kind": (
+                ProtectedObjectKind.DIRECTORY.value
+                if role in _DIRECTORY_ROLES
+                else ProtectedObjectKind.FILE.value
+            ),
+            "path_identity": root_path_identities[role],
+            "concrete_object_required": True,
+            "reparse_points_permitted": False,
+        }
+        for role in ProtectedRootRole
+    ]
+    manifest_payload = {
+        "contract_version": "windows-sandbox-protected-roots-v3",
+        "entries": recorded_entries,
+    }
+    recorded_manifest = ProtectedRootManifest(
+        **manifest_payload,
+        manifest_identity=_test_identity(
+            "windows-sandbox-protected-roots:v3",
+            manifest_payload,
+        ),
+    )
+    roots = []
+    files = []
+    for role in ProtectedRootRole:
+        content = companion_content.get(role)
+        root_files = []
+        if content is not None:
+            row = {
+                "relative_path": ".",
+                "canonical_path_identity": root_path_identities[role],
+                "byte_length": len(content),
+                "sha256": sha256(content).hexdigest(),
+            }
+            root_files.append(row)
+            files.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "relative_path"
+                }
+            )
+        root_payload = {
+            "role": role.value,
+            "object_kind": (
+                ProtectedObjectKind.DIRECTORY.value
+                if role in _DIRECTORY_ROLES
+                else ProtectedObjectKind.FILE.value
+            ),
+            "root_path_identity": root_path_identities[role],
+            "file_count": len(root_files),
+            "byte_length": sum(row["byte_length"] for row in root_files),
+            "files": root_files,
+        }
+        roots.append(
+            {
+                **root_payload,
+                "inventory_identity": _test_identity(
+                    "windows-sandbox-protected-root-inventory:v1",
+                    root_payload,
+                ),
+            }
+        )
+    files.sort(key=lambda row: row["canonical_path_identity"])
+    semantic_inventory: dict[str, object] = {}
+    inventory_payload = {
+        "contract_version": "windows-sandbox-protected-host-inventory-v1",
+        "protected_root_manifest_identity": recorded_manifest.manifest_identity,
+        "immutable_verifier_identity": (
+            "immutable-verifier:sha256:"
+            + sha256(evidence_name.encode("ascii")).hexdigest()
+        ),
+        "roots": roots,
+        "files": files,
+        "file_count": len(files),
+        "byte_length": sum(row["byte_length"] for row in files),
+        "semantic_inventory": semantic_inventory,
+        "semantic_inventory_identity": _test_identity(
+            "ticket06-immutable-semantic-inventory:v1",
+            semantic_inventory,
+        ),
+    }
+    recorded_inventory = ProtectedHostInventory(
+        **inventory_payload,
+        inventory_identity=_test_identity(
+            "windows-sandbox-protected-host-inventory:v1",
+            inventory_payload,
+        ),
+    )
+    return recorded_manifest, recorded_inventory
+
+
+def test_iso_03_run_026_and_iso04_004_historical_companion_contracts_remain_readable() -> None:
+    expected_identities = {
+        "run-026": (
+            "windows-sandbox-protected-roots:v3:sha256:"
+            "7543b6e9696069f5595599bdcfec7f10da5f93ba2f047d8694a07f0d6dcfbcb8",
+            "windows-sandbox-protected-host-inventory:v1:sha256:"
+            "6ee5e6e8474e1967793e22c8499b437d8dea5ad53626e56fce045b1681e104f0",
+        ),
+        "ISO04-004": (
+            "windows-sandbox-protected-roots:v3:sha256:"
+            "0e3ee71c2e185d6fa1456cc32c712b4c7584f83b9da406bf02f5c43e551b6ddf",
+            "windows-sandbox-protected-host-inventory:v1:sha256:"
+            "12c06e8d85d0d7a7a8ab100df1ce8e64e8931b23cda0e0026d4857c54bbac031",
+        ),
+    }
+    for evidence_name, expected in expected_identities.items():
+        recorded_manifest, recorded_inventory = (
+            _representative_historical_companion_contract(evidence_name)
+        )
+        loaded_manifest = ProtectedRootManifest.model_validate_json(
+            recorded_manifest.model_dump_json()
+        )
+        loaded_inventory = ProtectedHostInventory.model_validate_json(
+            recorded_inventory.model_dump_json()
+        )
+        loaded_roots = {root.role: root for root in loaded_inventory.roots}
+
+        assert (
+            loaded_manifest.manifest_identity,
+            loaded_inventory.inventory_identity,
+        ) == expected
+        assert all(entry.concrete_object_required for entry in loaded_manifest.entries)
+        assert (
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_WAL].file_count,
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_WAL].byte_length,
+        ) == (1, 0)
+        assert (
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_SHM].file_count,
+            loaded_roots[ProtectedRootRole.PROVIDER_LEDGER_SHM].byte_length,
+        ) == (1, 32_768)
 
 
 def test_iso_03_quiescence_requires_attestation_and_stable_prelaunch_inventory(
@@ -862,6 +1402,46 @@ def _minimal_launch(*, succeeded: bool = True) -> MinimalSandboxLaunchEvidence:
         marker_sha256="5" * 64 if succeeded else None,
         launched_processes=_successful_process_topology() if succeeded else (),
     )
+
+
+def test_iso_03_minimal_launch_contract_is_complete_deterministic_and_immutable(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+
+    first = build_minimal_sandbox_launch_contract(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    second = build_minimal_sandbox_launch_contract(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    assert isinstance(first, MinimalSandboxLaunchContract)
+    assert first == second
+    assert first.run_root == evidence_root / "minimal-iso03min"
+    assert first.results_export_path == first.run_root / "results-export"
+    assert first.config_path == first.run_root / "minimal.wsb"
+    assert first.marker_path == first.results_export_path / "minimal-launch.json"
+    assert first.marker_bytes == (
+        b'{"contract_version":"windows-sandbox-minimal-launch-marker-v1",'
+        b'"run_id":"iso03min","status":"pass"}'
+    )
+    assert first.marker_sha256 == sha256(first.marker_bytes).hexdigest()
+    assert len(first.mappings) == 1
+    assert first.mappings[0].role == SandboxMappingRole.RESULTS_EXPORT
+    assert first.mappings[0].host_path == first.results_export_path
+    assert first.mappings[0].guest_path == r"C:\QCF17\Minimal"
+    assert first.mappings[0].read_only is False
+    assert first.mappings[0].fresh_empty is True
+    assert first.mapping_bytes == second.mapping_bytes
+    assert first.mapping_identity == second.mapping_identity
+    assert first.wsb_bytes == second.wsb_bytes
+    assert first.config_identity == second.config_identity
+    assert first.contract_identity == second.contract_identity
+    with pytest.raises(ValueError, match="frozen"):
+        first.run_id = "iso03other"
 
 
 def test_iso_03_minimal_launch_pass_requires_observed_launcher_image() -> None:
@@ -1764,6 +2344,7 @@ class _MinimalLaunchPlatform:
         self.write_marker = write_marker
         self.termination_confirmed = termination_confirmed
         self.config_xml = ""
+        self.launch_calls = 0
 
     def probe(self) -> SandboxPlatformReport:
         return SandboxPlatformReport.available(protected_client_supported=True)
@@ -1771,6 +2352,7 @@ class _MinimalLaunchPlatform:
     def launch(
         self, config_path: Path, *, timeout_seconds: int
     ) -> SandboxProcessResult:
+        self.launch_calls += 1
         assert timeout_seconds == 30
         self.config_xml = config_path.read_text(encoding="utf-8")
         if self.write_marker:
@@ -1795,6 +2377,143 @@ class _MinimalLaunchPlatform:
             launched_processes=_successful_process_topology(),
             termination_confirmed=self.termination_confirmed,
         )
+
+
+def test_iso_03_minimal_launch_construction_materializes_without_launch(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    assert isinstance(contract, MinimalSandboxLaunchContract)
+    assert platform.launch_calls == 0
+    assert contract.run_root.is_dir()
+    assert contract.results_export_path.is_dir()
+    assert tuple(contract.results_export_path.iterdir()) == ()
+    assert contract.config_path.read_bytes() == contract.wsb_bytes
+    assert contract.mapping_identity.startswith(
+        "windows-sandbox-minimal-mapping:v1:sha256:"
+    )
+    assert contract.config_identity.startswith(
+        "windows-sandbox-minimal-config:v1:sha256:"
+    )
+
+
+def test_iso_03_separately_constructed_minimal_contract_launches(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+
+    result = launch_minimal_sandbox(
+        contract=contract,
+        platform=platform,
+        timeout_seconds=30,
+    )
+
+    assert platform.launch_calls == 1
+    assert result.succeeded is True
+    assert result.config_identity == contract.config_identity
+    assert result.marker_sha256 == contract.marker_sha256
+    assert result.launched_processes == _successful_process_topology()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "contract_version",
+        "contract_wsb_bytes",
+        "mapping_identity",
+        "mapping_topology",
+        "contract_identity",
+        "results_export_path",
+    ),
+)
+def test_iso_03_minimal_launch_rejects_tampered_contract_before_launch(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    if tamper == "contract_version":
+        contract = contract.model_copy(update={"contract_version": "tampered"})
+    elif tamper == "contract_wsb_bytes":
+        contract = contract.model_copy(update={"wsb_bytes": contract.wsb_bytes + b" "})
+    elif tamper == "mapping_identity":
+        contract = contract.model_copy(
+            update={
+                "mapping_identity": (
+                    "windows-sandbox-minimal-mapping:v1:sha256:" + ("0" * 64)
+                )
+            }
+        )
+    elif tamper == "mapping_topology":
+        contract = contract.model_copy(update={"mappings": ()})
+    elif tamper == "contract_identity":
+        contract = contract.model_copy(
+            update={
+                "contract_identity": (
+                    "windows-sandbox-minimal-launch-contract:v1:sha256:"
+                    + ("0" * 64)
+                )
+            }
+        )
+    else:
+        contract = contract.model_copy(
+            update={"results_export_path": contract.run_root / "other-export"}
+        )
+
+    with pytest.raises(SandboxContractError):
+        launch_minimal_sandbox(
+            contract=contract,
+            platform=platform,
+            timeout_seconds=30,
+        )
+
+    assert platform.launch_calls == 0
+
+
+@pytest.mark.parametrize("tamper", ("config_bytes", "nonempty_export"))
+def test_iso_03_minimal_launch_rejects_tampered_artifacts_before_launch(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    platform = _MinimalLaunchPlatform(evidence_root=evidence_root)
+    contract = construct_minimal_sandbox_launch(
+        evidence_root=evidence_root,
+        run_id="iso03min",
+    )
+    if tamper == "config_bytes":
+        contract.config_path.write_bytes(contract.wsb_bytes + b" ")
+    else:
+        (contract.results_export_path / "unexpected.txt").write_bytes(b"unexpected")
+
+    with pytest.raises(SandboxContractError):
+        launch_minimal_sandbox(
+            contract=contract,
+            platform=platform,
+            timeout_seconds=30,
+        )
+
+    assert platform.launch_calls == 0
 
 
 def test_iso_03_fatal_preconstruction_failure_writes_closed_receipt(
@@ -1951,6 +2670,7 @@ def test_iso_03_minimal_launch_requires_exact_guest_marker(
     )
 
     assert result.succeeded is write_marker
+    assert platform.launch_calls == 1
     assert "<Networking>Disable</Networking>" in platform.config_xml
     assert "<ProtectedClient>Enable</ProtectedClient>" in platform.config_xml
     assert platform.config_xml.count("<MappedFolder>") == 1
