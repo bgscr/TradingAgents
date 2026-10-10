@@ -600,6 +600,10 @@ message_buffer = MessageBuffer()
 
 def get_user_selections():
     """Get all user selections before starting the analysis display."""
+    if os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT"):
+        from tradingagents.runtime_protection_handoff import validate_protected_configuration
+
+        validate_protected_configuration(DEFAULT_CONFIG, phase="step4")
     # Display ASCII art welcome message
     with open(Path(__file__).parent / "static" / "welcome.txt", encoding="utf-8") as f:
         welcome_ascii = f.read()
@@ -711,6 +715,16 @@ def get_user_selections():
         )
     )
     selected_analysts = select_analysts(asset_type, selected_ticker)
+    if os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT"):
+        from tradingagents.runtime_protection_handoff import confirm_protected_step4
+
+        confirm_protected_step4(
+            symbol=selected_ticker,
+            analysis_session=analysis_date,
+            selected_analysts=[analyst.value for analyst in selected_analysts],
+            output_language=output_language,
+            configuration=DEFAULT_CONFIG,
+        )
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
@@ -889,9 +903,9 @@ def get_analysis_date(ticker: str | None = None):
             )
 
 
-def save_report_to_disk(final_state, ticker: str, save_path: Path):
+def save_report_to_disk(final_state, ticker: str, save_path: Path, *, output_language="English"):
     """Save the complete analysis report to disk (shared CLI/API writer)."""
-    return write_report_tree(final_state, ticker, save_path)
+    return write_report_tree(final_state, ticker, save_path, output_language=output_language)
 
 
 def display_complete_report(final_state):
@@ -1504,6 +1518,7 @@ def _prepare_run_artifacts(
         "artifact_root": Path(config["results_dir"]) / "runtime_artifacts",
         "metrics_file": run_dir / "runtime_metrics.json",
         "configuration_digest": config_digest,
+        "output_language": config.get("output_language", "English"),
     }
 
 
@@ -1830,7 +1845,10 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
         ).model_dump(mode="json")
         final_state["run_telemetry"] = telemetry
         artifacts["terminal_run_telemetry"] = telemetry
-    report_file = save_report_to_disk(final_state, ticker, artifacts["report_dir"])
+    report_file = save_report_to_disk(
+        final_state, ticker, artifacts["report_dir"],
+        output_language=artifacts.get("output_language", "English"),
+    )
     runtime_writer = artifacts.get("runtime_writer")
     if runtime_writer is not None:
         runtime_writer.record_duration(
@@ -2154,6 +2172,10 @@ def run_analysis(
     selections = get_user_selections()
 
     config = _build_run_config(selections, checkpoint)
+    if os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT"):
+        from tradingagents.runtime_protection_handoff import validate_protected_configuration
+
+        validate_protected_configuration(config, phase="step4")
     asset_configuration = None
     asset_configuration_error = None
     capability_routing_plan: MainlandCapabilityRoutingPlan | None = None
@@ -2476,7 +2498,11 @@ def run_analysis(
                 )
                 path = report_dir / file_name
                 with open(path, "w", encoding="utf-8") as report_file:
-                    report_file.write(text)
+                    from tradingagents.report_presentation import advisory_markdown
+
+                    report_file.write(advisory_markdown(
+                        section_name, text, selections.get("output_language", "English")
+                    ))
                 display.report_ready(section_name, text, path)
                 runtime_writer.record_duration(
                     "report",
@@ -2881,7 +2907,10 @@ def run_analysis(
         ).strip()
         save_path = Path(save_path_str)
         try:
-            report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
+            report_file = save_report_to_disk(
+                final_state, selections["ticker"], save_path,
+                output_language=selections.get("output_language", "English"),
+            )
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
         except Exception as e:

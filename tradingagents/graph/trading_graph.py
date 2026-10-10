@@ -1711,7 +1711,10 @@ class TradingAgentsGraph:
                 / "reports"
                 / f"{safe_ticker_component(ticker)}_{stamp}"
             )
-        return write_report_tree(final_state, ticker, save_path)
+        return write_report_tree(
+            final_state, ticker, save_path,
+            output_language=getattr(self, "config", {}).get("output_language", "English"),
+        )
 
     def _run_graph(
         self,

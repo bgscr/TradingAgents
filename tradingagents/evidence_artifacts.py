@@ -28,6 +28,12 @@ from tradingagents.evidence import (
     SourceAcquisitionUnavailable,
     SourceArtifact,
 )
+from tradingagents.evidence_diagnostics import (
+    EvidenceDiagnosticCode,
+    PublicSourceDiagnostic,
+    claim_diagnostic,
+    source_diagnostic,
+)
 
 SOURCE_ARTIFACT_MANIFEST_VERSION = "1.0"
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -202,6 +208,9 @@ class AuditClaimValidation(BaseModel):
     claim_id: str
     status: ClaimValidationStatus
     fact_ids: tuple[str, ...] = ()
+    diagnostic_code: EvidenceDiagnosticCode | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AuditEvidenceSource(BaseModel):
@@ -211,6 +220,9 @@ class AuditEvidenceSource(BaseModel):
     source_id: str = Field(pattern=r"^source=sha256:[0-9a-f]{64}$")
     status: EvidenceStatus
     required: bool
+    diagnostic: PublicSourceDiagnostic | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AuditCalculationReadiness(BaseModel):
@@ -515,6 +527,10 @@ def project_evidence_for_audit(
             claim_id=validation.claim_id,
             status=validation.status,
             fact_ids=tuple(sorted(validation.fact_ids)),
+            diagnostic_code=(
+                claim_diagnostic(validation)
+                if validation.status is ClaimValidationStatus.UNSUPPORTED else None
+            ),
         )
         for validation in sorted(
             evidence.claim_validations,
@@ -528,6 +544,10 @@ def project_evidence_for_audit(
                     source_id=_opaque_source_id(source.source_id),
                     status=source.status,
                     required=source.required,
+                    diagnostic=(
+                        source_diagnostic(source, evidence.acquisition_outcomes)
+                        if source.status is EvidenceStatus.UNAVAILABLE else None
+                    ),
                 )
                 for source in evidence.sources
             ),

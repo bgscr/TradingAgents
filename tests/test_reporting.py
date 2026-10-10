@@ -436,13 +436,12 @@ def test_write_report_tree_renders_only_the_validated_decision(tmp_path):
     assert SOURCE_REF not in decision_report
     assert FACT_ID in decision_report
     assert f"artifact=sha256:{ARTIFACT_SHA256}" in decision_report
-    assert "MODEL SAYS SELL" not in complete
-    assert "BUY EVERYTHING" not in complete
-    assert "FINAL TRANSACTION PROPOSAL" not in complete
-    assert not (tmp_path / "1_analysts").exists()
-    assert not (tmp_path / "2_research").exists()
-    assert not (tmp_path / "3_trading").exists()
-    assert not (tmp_path / "4_risk").exists()
+    for advisory in ("MODEL SAYS SELL", "BUY EVERYTHING", "FINAL TRANSACTION PROPOSAL"):
+        assert advisory not in decision_report
+        assert advisory in complete.split("# Advisory stage reports", 1)[1]
+    for section in ("1_analysts", "2_research", "3_trading", "4_risk"):
+        assert (tmp_path / section).is_dir()
+    assert "Advisory Commentary" in complete
     assert state["lifecycle_status"] == "completed"
     assert state["terminal_outcome_kind"] == "trading_decision"
     assert state["active_phase"] is None

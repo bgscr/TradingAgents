@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -29,6 +28,13 @@ from tradingagents.evidence import (
     SourceAcquisitionUnavailable,
     render_analysis_outcome,
 )
+from tradingagents.report_presentation import (
+    advisory_markdown,
+    advisory_sections,
+    evidence_diagnostic_markdown,
+    is_chinese,
+    localize_report,
+)
 from tradingagents.terminal_contract import (
     CanonicalRunIdentity,
     DecisionCoverage,
@@ -42,21 +48,10 @@ def _write_markdown(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _remove_unvalidated_outputs(root: Path) -> None:
-    """Remove stale/model-authored files that are not terminal contracts."""
+def _remove_terminal_outputs(root: Path) -> None:
+    """Replace only owned terminal outputs; retain stage and unrelated files."""
 
-    for relative in ("1_analysts", "2_research", "3_trading", "4_risk"):
-        path = root / relative
-        if path.is_dir():
-            shutil.rmtree(path)
     for relative in (
-        "market_report.md",
-        "sentiment_report.md",
-        "news_report.md",
-        "fundamentals_report.md",
-        "investment_plan.md",
-        "trader_investment_plan.md",
-        "final_trade_decision.md",
         "5_portfolio/decision.md",
         "5_portfolio/analysis_outcome.md",
     ):
@@ -1388,8 +1383,8 @@ def _report_header(
     )
 
 
-def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
-    """Publish one validated terminal report and its immutable decision audit."""
+def write_report_tree(final_state: dict, ticker: str, save_path, *, output_language="English") -> Path:
+    """Publish the validated decision and separately labeled advisory stages."""
 
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -1442,7 +1437,7 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
     if identity.audit_digest is None:
         raise ValueError("canonical export identity is missing its audit digest")
 
-    _remove_unvalidated_outputs(save_path)
+    _remove_terminal_outputs(save_path)
     if terminal.terminal_outcome_kind is TerminalOutcomeKind.ANALYSIS_OUTCOME:
         outcome = AnalysisOutcome.model_validate(
             final_state["analysis_outcome_contract"]
@@ -1457,7 +1452,7 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             shadow_financial_dispatch=shadow_financial_dispatch,
             shadow_failure=shadow_failure,
         )
-        _write_markdown(save_path / "5_portfolio" / "analysis_outcome.md", body)
+        terminal_path = save_path / "5_portfolio" / "analysis_outcome.md"
     elif terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
         decision = TradingDecisionContract.model_validate(final_state["trading_decision"])
         body = render_decision_report(
@@ -1470,9 +1465,13 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
             shadow_financial_dispatch=shadow_financial_dispatch,
             shadow_failure=shadow_failure,
         )
-        _write_markdown(save_path / "5_portfolio" / "decision.md", body)
+        terminal_path = save_path / "5_portfolio" / "decision.md"
     else:
         raise ValueError("operational failures cannot be published as decision reports")
+
+    body = localize_report(body, output_language)
+    body += "\n" + evidence_diagnostic_markdown(evidence, output_language)
+    _write_markdown(terminal_path, body)
 
     header = _report_header(
         ticker,
@@ -1481,5 +1480,16 @@ def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
         str(final_state["decision_audit_created_at"]),
     )
     complete_path = save_path / "complete_report.md"
-    complete_path.write_text(header + body, encoding="utf-8")
+    advisory = []
+    for relative, title, chinese_title, content in advisory_sections(final_state):
+        text = advisory_markdown(
+            chinese_title if is_chinese(output_language) else title, content, output_language
+        )
+        _write_markdown(save_path / relative, text)
+        advisory.append(text)
+    appendix = ""
+    if advisory:
+        heading = "辅助分析阶段正文" if is_chinese(output_language) else "Advisory stage reports"
+        appendix = "\n\n---\n\n# " + heading + "\n\n" + "\n\n".join(advisory)
+    complete_path.write_text(localize_report(header, output_language) + body + appendix, encoding="utf-8")
     return complete_path

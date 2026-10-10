@@ -53,7 +53,7 @@ def offline_boundaries(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
-    monkeypatch.setenv("TUSHARE_TOKEN", "fixture-only-production-binding")
+    monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
     monkeypatch.setenv("TRADINGAGENTS_CLI_ANNOUNCEMENTS_ENABLED", "0")
     # Optional dependency discovery is an environment boundary, not a provider.
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
