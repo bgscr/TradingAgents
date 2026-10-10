@@ -1,19 +1,19 @@
-"""Resolve only the version explicitly named by the current report entrypoint."""
+"""Use the exact returned version; never guess which of several exports is current."""
 
 import json
-import re
 from pathlib import Path
 
 
-def current_export_root(root):
-    root = Path(root)
-    line = (root / "complete_report.md").read_text(encoding="utf-8").splitlines()[0]
-    match = re.fullmatch(
-        r"<!-- tradingagents-export: (report_exports/[0-9a-f]{64})/manifest.json -->", line
-    )
-    assert match, "current export marker is missing or malformed"
-    return root / match.group(1)
+def export_root(report_or_root):
+    path = Path(report_or_root)
+    if path.name == "complete_report.md":
+        assert (path.parent / "manifest.json").is_file()
+        return path.parent
+    # Convenience only for fixtures that create exactly one independent export.
+    manifests = list(path.glob("report_exports/*/manifest.json"))
+    assert len(manifests) == 1, "multiple exports require the exact returned report path"
+    return manifests[0].parent
 
 
-def current_export_manifest(root):
-    return json.loads((current_export_root(root) / "manifest.json").read_text(encoding="utf-8"))
+def export_manifest(report_or_root):
+    return json.loads((export_root(report_or_root) / "manifest.json").read_text(encoding="utf-8"))

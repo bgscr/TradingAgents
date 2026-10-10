@@ -2914,7 +2914,7 @@ def run_analysis(
                 output_language=selections.get("output_language", "English"),
             )
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
-            console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+            console.print(f"  [dim]Complete report:[/dim] {report_file}")
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
 

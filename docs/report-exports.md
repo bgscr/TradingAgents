@@ -1,37 +1,40 @@
-# Current and historical report exports
+# Independent report exports
 
-`complete_report.md` is the current report entrypoint. Its first line and
-visible manifest link identify one immutable presentation version beneath
-`report_exports/<export-id>/`. That version contains the terminal report,
-the exact set of advisory stage documents, a complete report, and
-`manifest.json`.
+`write_report_tree` returns the exact `complete_report.md` path for that call:
+`report_exports/<export-id>/complete_report.md`. The CLI records that full
+path in `reports_written` and displays it for manual exports. There is no
+mutable root-level "current report" alias and no automatic selection of the
+newest directory.
 
-The manifest binds the version to its run ID, immutable decision-audit digest,
-presentation language, and SHA-256 of every report file. Advisory text remains
-outside the validated decision contract. Changing or removing advisory content
-creates another presentation version without rewriting the decision audit.
-Repeating the same export reuses the identical version.
+Every call allocates a fresh version. Its `manifest.json` binds the run ID,
+unchanged decision-audit digest, language, exact stage set and file hashes.
+Identical re-exports have the same content identity but distinct paths.
+Removed or changed stages cannot contaminate another version. Model prose
+remains explicitly advisory and does not change the validated decision.
 
-Readers should follow the current entrypoint and manifest instead of assuming
-that root-level `1_analysts` through `5_portfolio` directories describe the
-current run. Existing root-level directories and old stage aliases are retained
-history, as declared in each new manifest. Streaming CLI stage revisions are
-also retained separately under `advisory_drafts/`. Unknown user files are not
-deleted. A pre-versioning complete report is copied byte-for-byte to a
-content-addressed legacy version before the current entrypoint is replaced.
-Changed versioned entrypoints, including manual edits, are also retained
-byte-for-byte under `report_exports/entry-history/`.
+Existing root reports, aliases, previous versions and manual edits are left
+in place, without reading their bodies for backup or replacing them.
+Streaming CLI revisions likewise use independent `advisory_drafts/` paths.
+Consumers must use the returned report path and its sibling manifest.
 
-The exporter writes the immutable files and manifest first, then atomically
-replaces the current entrypoint. An interrupted export does not make a partial
-version current. Unreferenced partial versions are retained; there is no
-automatic cleanup.
+New files are created exclusively at their final names. They are written,
+flushed, and checked for object identity and exact content through the
+original open descriptor. Descriptors remain open until the entire export
+has been verified; the manifest is written last. There is no rename or link
+from a closed temporary source. Failure raises instead of returning a path;
+partial versions are retained for inspection, not automatically retried or
+cleaned up.
 
-Publication rejects links, reparse points and aliased file targets. On Windows,
-ordinary local-drive ancestors and parent directories remain held against
-write/delete sharing during publication; on POSIX, operations use no-follow
-directory descriptors. Files are published from exclusive temporary files
-without opening existing targets for truncation. Filesystems which cannot
-create the immutable hard-link publication fail closed rather than falling
-back to an unsafe overwrite. This is a report I/O boundary, not policy
-approval, native qualification, or an execution grant.
+The Windows adapter uses CREATE_NEW, OPEN_REPARSE_POINT and FILE_SHARE_READ
+only: write/delete sharing is denied while each file handle is held.
+Directory ancestors are also held against substitution. The POSIX adapter
+uses O_EXCL/O_NOFOLLOW and directory-relative operations; these descriptors
+do not impose Windows-style mandatory sharing restrictions. It checks the
+named object and descriptor content before close and rejects observed
+interference. Neither backend claims tamper-proof storage after handles close.
+Callers inspecting stored reports later can compare them with manifest hashes.
+
+Links, reparse points and aliased file targets are rejected. The targeted
+development checks simulate Windows handles and interference; they do not
+certify real Windows sharing or the POSIX backend. Report publication grants
+no native policy, service, authentication, qualification or B1 authority.

@@ -1,17 +1,17 @@
 """No-follow report publication, independent of policy authority or credentials.
 
 Windows directory handles deny write/delete sharing for the entire publication.
-POSIX operations are relative to O_NOFOLLOW directory descriptors. Existing
-report files are never opened for truncation; publication replaces directory
-entries or creates a new immutable entry.
+POSIX operations are relative to O_NOFOLLOW directory descriptors. New files
+are written and verified through the original open descriptor. No closed
+temporary pathname is linked or renamed, and no existing file is replaced.
 """
 
 from __future__ import annotations
 
 import os
 import stat
-import uuid
 from contextlib import ExitStack, suppress
+from hashlib import sha256
 from pathlib import Path
 
 
@@ -33,6 +33,36 @@ def _hold_windows_object(path, *, directory):
     return _held(path, directory, stable_metadata=not directory)
 
 
+def _open_windows_exclusive(path):
+    """CREATE_NEW with write/delete sharing denied until the stream closes."""
+    import ctypes
+    import msvcrt
+
+    from tradingagents.policy_evidence_acquisition import _file_api
+
+    api, _ = _file_api()
+    handle = api.CreateFileW(str(path), 0xC0000000, 1, None, 1, 0x00200080, None)
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (80, 183):
+            raise FileExistsError(f"report file already exists: {path}")
+        raise ctypes.WinError(error)
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        api.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(descriptor, "w+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_windows_file(path):
+    return _open_windows_exclusive(path)
+
+
 class ReportStore:
     """Own only report paths below one root, with pinned directory traversal."""
 
@@ -40,6 +70,7 @@ class ReportStore:
         self.root = Path(os.path.abspath(root))
         self._stack = ExitStack()
         self._directories = {}
+        self._created = []
         self._windows = os.name == "nt"
 
     def __enter__(self):
@@ -65,7 +96,12 @@ class ReportStore:
             raise
 
     def __exit__(self, *error):
-        return self._stack.__exit__(*error)
+        try:
+            if error[0] is None:
+                for record in self._created:
+                    self._verify_created(*record)
+        finally:
+            self._stack.__exit__(*error)
 
     def _parts(self, relative):
         relative = Path(relative)
@@ -135,67 +171,91 @@ class ReportStore:
         _ordinary(info, directory=stat.S_ISDIR(info.st_mode))
         return info
 
-    def read_bytes(self, relative):
+    def new_directory(self, relative):
+        """Allocate this export once; an existing name is a conflict."""
         parts = self._parts(relative)
+        parent = self.directory(parts[:-1])
+        if self._windows:
+            (parent / parts[-1]).mkdir()
+        else:
+            os.mkdir(parts[-1], dir_fd=parent)
+        self.directory(parts)
+
+    def read_bytes(self, relative):
+        """Read immutable input while retaining its handles through store exit."""
+        parts = self._parts(relative)
+        for record in self._created:
+            if self._parts(record[0]) == parts:
+                self._verify_created(*record)
+                record[1].seek(0)
+                return record[1].read()
         try:
             parent = self.directory(parts[:-1], create=False)
             if self._windows:
                 path = parent / parts[-1]
                 _ordinary(path.lstat(), directory=False)
-                with _hold_windows_object(path, directory=False):
-                    return path.read_bytes()
-            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-            with os.fdopen(descriptor, "rb") as stream:
-                _ordinary(os.fstat(stream.fileno()), directory=False)
-                return stream.read()
+                self._stack.enter_context(_hold_windows_object(path, directory=False))
+                stream = path.open("rb", buffering=0)
+            else:
+                descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                stream = os.fdopen(descriptor, "rb", buffering=0)
         except FileNotFoundError:
             return None
+        self._stack.enter_context(stream)
+        info = os.fstat(stream.fileno())
+        _ordinary(info, directory=False)
+        data = stream.read()
+        record = (relative, stream, (info.st_dev, info.st_ino), sha256(data).hexdigest(), len(data))
+        self._verify_created(*record)
+        self._created.append(record)
+        return data
 
-    def write_bytes(self, relative, data, *, replace=False):
-        """Publish flushed bytes without following an existing target."""
+    def _verify_created(self, relative, stream, identity, digest, length):
+        info = os.fstat(stream.fileno())
+        _ordinary(info, directory=False)
+        named = self.inspect(relative)
+        if (
+            named is None
+            or (named.st_dev, named.st_ino) != identity
+            or (info.st_dev, info.st_ino) != identity
+        ):
+            raise ValueError("report object changed while its descriptor was held")
+        stream.seek(0)
+        observed = sha256()
+        count = 0
+        while chunk := stream.read(1024 * 1024):
+            observed.update(chunk)
+            count += len(chunk)
+        if count != length or observed.hexdigest() != digest:
+            raise ValueError("report content changed while its descriptor was held")
+
+    def write_bytes(self, relative, data):
+        """Create, flush and verify the final file through one held descriptor."""
         parts = self._parts(relative)
         if not parts:
             raise ValueError("report file path required")
         parent = self.directory(parts[:-1])
-        existing = self.inspect(relative)
-        if existing is not None:
-            _ordinary(existing, directory=False)
-            if not replace:
-                if self.read_bytes(relative) != data:
-                    raise FileExistsError(f"immutable report conflicts: {relative}")
-                return
-        temporary = ".report-" + uuid.uuid4().hex + ".tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        if self._windows:
-            descriptor = os.open(parent / temporary, flags, 0o600)
-        else:
-            descriptor = os.open(temporary, flags | os.O_NOFOLLOW, 0o600, dir_fd=parent)
         try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
             if self._windows:
-                if replace:
-                    os.replace(parent / temporary, parent / parts[-1])
-                else:
-                    os.link(parent / temporary, parent / parts[-1], follow_symlinks=False)
-            elif replace:
-                os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+                stream = _create_windows_file(parent / parts[-1])
             else:
-                os.link(
-                    temporary,
+                descriptor = os.open(
                     parts[-1],
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
-                    follow_symlinks=False,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent,
                 )
+                stream = os.fdopen(descriptor, "w+b", buffering=0)
         except FileExistsError:
-            if replace or self.read_bytes(relative) != data:
-                raise
-        finally:
-            if self._windows:
-                (parent / temporary).unlink(missing_ok=True)
-            else:
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary, dir_fd=parent)
+            self.inspect(relative)
+            raise FileExistsError(f"new report file already exists: {relative}") from None
+        self._stack.enter_context(stream)
+        info = os.fstat(stream.fileno())
+        _ordinary(info, directory=False)
+        identity = (info.st_dev, info.st_ino)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+        record = (relative, stream, identity, sha256(data).hexdigest(), len(data))
+        self._verify_created(*record)
+        self._created.append(record)

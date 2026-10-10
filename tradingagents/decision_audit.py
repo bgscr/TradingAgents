@@ -796,7 +796,11 @@ def write_immutable_decision_audit(
     target = directory / filename
     if publication is not None:
         try:
-            publication.write_bytes(target, encoded)
+            existing = publication.read_bytes(target)
+            if existing is None:
+                publication.write_bytes(target, encoded)
+            elif existing != encoded:
+                raise FileExistsError(f"immutable decision audit already exists: {target}")
         except FileExistsError as error:
             raise FileExistsError(f"immutable decision audit already exists: {target}") from error
         return target
