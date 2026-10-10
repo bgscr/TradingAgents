@@ -2,13 +2,13 @@
 
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.
 
-## Before exploring, read these
+## When domain behavior or contracts are in scope
 
 - **`CONTEXT.md`** at the repo root, or
 - **`CONTEXT-MAP.md`** at the repo root if it exists — it points at one `CONTEXT.md` per context. Read each one relevant to the topic.
 - **`docs/adr/`** — read ADRs that touch the area you're about to work in. In multi-context repos, also check `src/<context>/docs/adr/` for context-scoped decisions.
 
-If any of these files don't exist, proceed silently. Don't flag their absence or suggest creating them upfront; `/domain-modeling` creates them lazily when terms or decisions get resolved.
+Read the sections that govern the affected behavior. A documentation typo or tooling-only change does not require reading the whole domain model. If an optional map is absent, use `CONTEXT.md`; if required authority is missing, report that gap rather than inventing a contract. Do not create new domain documents merely to satisfy this reading convention.
 
 ## File structure
 

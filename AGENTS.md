@@ -1,54 +1,29 @@
-# AGENTS.md - Project Agent Guide
+# TradingAgents agent guide
 
-## Project Context
-- **Tech Stack**: Python 3.10+, LangGraph, Typer/Rich, market-data providers, point-in-time ingestion, LLM-based trading analysis.
-- **Domain & Architecture Authority**: Read `CONTEXT.md` for strict terminology, evidence contracts, and decisions. Check `docs/adr/` for architecture history.
-- **Local Triage & Specs**: Follow `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md`.
+## Scope and authority
 
-## Exploration & Editing Rules
-- @RTK.md
-- **Code Graph First**: When `.codegraph/` exists, use CodeGraph tools first for symbols, callers, dependencies, and call paths.
-- **Direct Search Fallback**: Use direct file reads/grep for docs, configs, exact text, unindexed files, or when CodeGraph misses/is unavailable.
-- **Direct Investigation**: Primary agent inspects affected behavior directly before edit. No separate investigator subagent is needed if context can be built directly.
-- **Minimal Scope**: Make the smallest coherent edit. Preserve unrelated worktree changes.
-- **Ignored State**: Treat `.venv/`, `build/`, `dist/`, `reports/`, `.pytest_cache/`, `.ruff_cache/`, and `.worktrees/` as local generated state unless explicitly targeted.
+Work from the actual branch, HEAD, working tree, and applicable instruction/configuration sources. Preserve unrelated changes. Implement and finish validation within the user's authorized scope, including attributable local helper fixes and reruns of affected safe tests, without seeking approval for each step.
 
-## Delegation & Subagent Rules
-### Hard Constraints
-1. **Delegation Authority**: Only the primary agent can delegate. **Subagents must never create subagents.**
-2. **Concurrency Cap**: Maximum **1 writing subagent + 1 read-only subagent** running concurrently.
-3. **Strict File Ownership**: Never assign overlapping write scopes or files to multiple writers.
-4. **Primary Responsibilities**: Primary agent retains synthesis, conflict resolution, implementation coordination, and final user communication.
-5. **Profile Standard**: `.codex/agents/*.toml` is the source of truth for agent role names, model settings, reasoning effort, and sandbox modes.
-6. **Reporting Contract**: Subagents must return a structured summary containing: (1) Files modified/analyzed, (2) Key changes/insights, (3) Verification status.
+That permission never renews an exhausted attempt/time budget, overrides no-retry/no-launch limits, or crosses installation, privilege, network, protected-state, exact-source, packet, session, thread, or authorization bindings. Old context is evidence, not fresh execution authority. At a real boundary, report the exact missing authority and its source once; revisit only after relevant authority or evidence changes. Report unclear authority or conflicts with specifications/ADRs rather than silently overriding them.
 
-### Specialist Routing
-Select the **single most-specific role** matching the task's primary risk:
+Preserve reviewed snapshots, historical evidence, sealed inventories and packets. New diagnostic notes belong outside sealed inventory scopes unless their contract permits them. Never alter inventory rules or omit inconvenient evidence to make a check pass. Prospective workflow/model changes cannot authorize past actions, erase BLOCKED outcomes, or relax the `0x10000000` comparison.
 
-| Role Name | Access Mode | Dominant Risk / Task Scope |
-| :--- | :--- | :--- |
-| `cli-developer` | **Write** | Typer/Rich CLI behavior, config precedence, output contracts, shell workflows, exit codes. |
-| `data-engineer` | **Write** | Ingestion pipelines, point-in-time data, schema/cache changes, lineage, provider state, quality. |
-| `python-pro` | **Write** | General Python runtime, packaging, typing, framework implementation (when no specific writer owns it). |
-| `test-automator` | **Write** | Substantial automated test suites, test harnesses, and testing infrastructure implementation. |
-| `debugger` | Read-Only | Deep-dive investigation of cross-layer, intermittent, or difficult runtime failures. |
-| `llm-architect` | Read-Only | LangGraph topology, prompts, tool contracts, retrieval, structured outputs, LLM workflows. |
-| `quant-analyst` | Read-Only | Financial indicators, rankings, simulations, lookahead bias, portfolio logic, risk math. |
-| `security-auditor` | Read-Only | Secrets handling, auth, untrusted input validation, infra/dependency security. |
-| `model-risk-manager` | Read-Only | LLM failure modes, unsafe/misleading outputs, tool misuse, model risk mitigations. |
-| `prompt-regression-tester` | Read-Only | Design/assessment of regression test coverage for prompts, models, tools, and AI chains. |
-| `docs-researcher` | Read-Only | External API validation, framework specs, version-specific documentation research. |
-| `reviewer` | Read-Only | Final formal review of material code changes for correctness, security, and missing tests. |
+## Context and tools
 
-*Note: Read-only specialists investigate/review; implementation is performed by the primary agent or one writing specialist. Run read-only specialists sequentially unless scopes are strictly independent.*
+- Before changing domain behavior or evidence contracts, read the relevant sections of [CONTEXT.md](CONTEXT.md) and applicable [ADRs](docs/adr/); [domain guidance](docs/agents/domain.md) explains their use.
+- For issue/spec work, use the [local tracker](docs/agents/issue-tracker.md) and [triage labels](docs/agents/triage-labels.md). These conventions do not authorize writes to protected records.
+- When `.codegraph/` exists, use CodeGraph first for code symbols, callers and dependencies. Direct reads/search are appropriate for docs, config, exact text, unindexed files, or unavailable/missing graph results. Do not create an index unless requested.
+- The primary agent inspects affected behavior before editing. Follow [RTK.md](RTK.md) for shell output handling. Generated state such as `.venv/`, `build/`, `dist/`, `reports/`, caches and `.worktrees/` is outside ordinary source-edit scope; being generated or ignored does not authorize cleanup.
+- Select skills by the current task, not historical mentions. Skill recipes cannot expand the task's permissions or override project contracts. For diagnosis or experimental claims, read [diagnostic guidance](docs/agents/diagnostics.md). For a pause/session transition, use one [current-task handoff](docs/agents/task-handoff.md) linking retained evidence.
 
-## Verification & Review Process
-- **Scaled Verification**: Run targeted tests first. For broad or cross-module changes, run repository CI checks via RTK:
-  - `rtk pytest -q`
-  - `rtk ruff check .`
-- **Review Strategy**: Small localized edits may be self-reviewed by the primary agent. High-risk/cross-module changes require the `reviewer` role.
-- **Two-Stage Review Framework**:
-  1. **Spec Compliance**: Verify requested behavior, explicit interfaces, data contracts, terminology (`CONTEXT.md`), and ADR adherence.
-  2. **Code Quality**: Audit error handling, durability boundaries, security/evidence boundaries, regression coverage, and maintainability.
-- **Findings Classification**: Categorize all review findings as `Critical`, `Important`, or `Minor`.
-- **Conflict Reporting**: Verify actual codebase state before editing. Explicitly report any conflict between user requests and specifications/ADRs rather than silently overriding them.
+## Delegation and review
+
+Only the primary agent delegates: at most **one writing subagent and one read-only subagent** concurrently. Subagents never spawn subagents. Assign disjoint write ownership, tell writers they share the worktree, and retain synthesis, conflict resolution and final communication in the primary agent.
+
+Select the single most-specific role by `.codex/agents/*.toml`. Those files declare role/model/effort/sandbox intent; verify the loaded role and effective permissions in the actual session. Independent worktrees and external directories need their own configuration check. Read-only roles must not edit or invoke mutating tools, even if a tool is available. Pass the concrete scope, current limits and evidence paths to each delegate. Model/effort choices do not change execution or review requirements.
+
+Small localized edits may be self-reviewed. High-risk or cross-module changes require an independent read-only `reviewer`: check Spec compliance, then code quality, evidence/security boundaries and relevant regression coverage. When a task/skill requires independent Standards and Spec reviews, use separate reviewers with separate contexts, **sequentially** to respect the concurrency cap. Keep both reports; one axis cannot substitute for the other. Findings are `Critical`, `Important` or `Minor`, with file/evidence references. Delegates return files analyzed/modified, findings or changes, and verification/limitations.
+
+## Verification
+
+Choose checks that exercise the changed behavior within the authorized environment. A documentation/configuration edit normally needs parsing, links and scope checks. Broad code changes warrant targeted tests followed by `rtk pytest -q` and `rtk ruff check .` only where the task's execution and isolation contracts allow them. Do not assume repository tests have no production/native access. After relevant checks pass, repeat or broaden only for new changes, failures or unresolved concerns. Preserve the distinction between test setup, executed results, reproduced mechanisms, historical causation and qualification authority.

@@ -1,4 +1,6 @@
 [agents]
-max_threads = 3
+# Limit spawned threads, excluding the primary; supported by Codex CLI 0.159.2.
+# AGENTS.md additionally limits these to one writer and one read-only agent.
+max_concurrent_threads_per_session = 2
 max_depth = 1
 interrupt_message = true
