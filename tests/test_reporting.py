@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
+from tests.report_export_helpers import current_export_root
 from tradingagents.agents.analysts import submission
 from tradingagents.agents.managers.direction_selector import render_trading_decision
 from tradingagents.agents.schemas import PortfolioRating
@@ -423,7 +424,7 @@ def test_write_report_tree_renders_only_the_validated_decision(tmp_path):
     state = _decision_state()
     out = write_report_tree(state, "AAPL", tmp_path)
 
-    decision_report = (tmp_path / "5_portfolio" / "decision.md").read_text()
+    decision_report = (current_export_root(tmp_path) / "5_portfolio" / "decision.md").read_text()
     complete = out.read_text()
     assert "`pe_ratio`" in decision_report
     assert "9.5 ratio" in decision_report
@@ -440,7 +441,7 @@ def test_write_report_tree_renders_only_the_validated_decision(tmp_path):
         assert advisory not in decision_report
         assert advisory in complete.split("# Advisory stage reports", 1)[1]
     for section in ("1_analysts", "2_research", "3_trading", "4_risk"):
-        assert (tmp_path / section).is_dir()
+        assert (current_export_root(tmp_path) / section).is_dir()
     assert "Advisory Commentary" in complete
     assert state["lifecycle_status"] == "completed"
     assert state["terminal_outcome_kind"] == "trading_decision"
@@ -487,7 +488,7 @@ def test_decision_report_renders_sanitized_deterministic_acquisition_outcomes(
     state["evidence_state"] = evidence.model_dump(mode="json")
 
     out = write_report_tree(state, "AAPL", tmp_path)
-    decision_report = (tmp_path / "5_portfolio" / "decision.md").read_text()
+    decision_report = (current_export_root(tmp_path) / "5_portfolio" / "decision.md").read_text()
     complete = out.read_text()
 
     assert "## Acquisition Outcomes" in decision_report
@@ -557,7 +558,7 @@ def test_analysis_outcome_report_renders_sanitized_deterministic_acquisitions(
     ).model_dump(mode="json")
 
     out = write_report_tree(state, "AAPL", tmp_path)
-    outcome_report = (tmp_path / "5_portfolio" / "analysis_outcome.md").read_text()
+    outcome_report = (current_export_root(tmp_path) / "5_portfolio" / "analysis_outcome.md").read_text()
     complete = out.read_text()
 
     assert "## Acquisition Outcomes" in outcome_report
@@ -620,7 +621,7 @@ def test_snapshotless_analysis_report_renders_run_physical_attempts(tmp_path):
     ).model_dump(mode="json")
 
     write_report_tree(state, "SOL-USD", tmp_path)
-    report = (tmp_path / "5_portfolio" / "analysis_outcome.md").read_text()
+    report = (current_export_root(tmp_path) / "5_portfolio" / "analysis_outcome.md").read_text()
 
     assert "## Physical Provider Attempts" in report
     assert "**Total physical-attempt count:** 1" in report
@@ -693,7 +694,7 @@ def test_report_and_audit_counts_derive_only_from_typed_attempt_events(tmp_path)
         audit = prepare_decision_audit(state, tmp_path / "audit")
         write_report_tree(state, "600519.SS", tmp_path / "reports")
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text()
 
     audit_evidence = audit["evidence_state"]
@@ -883,8 +884,8 @@ def test_blocked_analysis_writes_split_coverage_and_no_direction(tmp_path):
     out = write_report_tree(state, "AAPL", tmp_path)
     complete = out.read_text()
 
-    assert (tmp_path / "5_portfolio" / "analysis_outcome.md").exists()
-    assert not (tmp_path / "5_portfolio" / "decision.md").exists()
+    assert (current_export_root(tmp_path) / "5_portfolio" / "analysis_outcome.md").exists()
+    assert not (current_export_root(tmp_path) / "5_portfolio" / "decision.md").exists()
     assert "Source Availability Coverage" in complete
     assert "Validated Fact Coverage" in complete
     assert "Decision Assertion Coverage" in complete

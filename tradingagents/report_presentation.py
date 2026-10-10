@@ -96,9 +96,68 @@ _LABELS = {
     "Evaluation digest": "求值摘要",
     "Material Degradation": "实质性降级说明",
     "Analysis Outcome": "分析结果",
+    "Non-Directional Analysis Outcome": "非方向性分析结果",
+    "Reason Code": "原因代码",
+    "Deterministic Blockers": "确定性阻断原因",
+    "Current Tradeability": "当前可交易状态",
+    "Latest Genuinely Traded Close": "最近实际成交收盘价",
     "Reason": "原因",
     "Readiness": "证据就绪状态",
 }
+
+_OUTCOME_ZH = {
+    "preflight_blocked": "确定性预检要求尚未满足决定条件，分析在模型工作开始前停止。",
+    "admission_blocked": "必需证据与规则支持的断言尚未满足决定条件，分析在观点综合前停止。",
+    "decision_gate_blocked": "最终方向提议未通过确定性决定门禁，分析结束但未形成交易决定。",
+    "portfolio_gate_blocked": "投资组合经理未能形成满足决定条件的证据链，分析结束但未形成交易决定。",
+    "shadow_mode_blocked": "影子证据模式仅用于诊断，分析结束但未形成交易决定。",
+    "instrument_currently_suspended": "大陆市场标的当前停牌、不可交易，分析结束但未形成交易决定。",
+}
+_BLOCKER_ZH = {
+    "identity_unavailable": "权威标的身份不可用或无效。",
+    "snapshot_unavailable": "权威市场快照不可用。",
+    "snapshot_invalid": "权威市场快照未通过确定性验证。",
+    "history_insufficient": "权威快照中的可用历史数据不足。",
+    "required_evidence_unavailable": "必需证据能力不可用或不适用。",
+    "optional_evidence_unavailable": "部分可选证据不可用。",
+    "required_evidence_conflicted": "必需证据存在尚未解决的实质冲突。",
+    "decision_configuration_invalid": "确定性决定配置不可用或无效。",
+    "strategy_rule_invalid": "没有有效的已注册策略规则应用可授权该方向。",
+    "direction_context_invalid": "经验证的方向上下文不可用或无效。",
+    "direction_assertions_conflicted": "经验证的决定断言不能授权唯一明确的评级。",
+    "direction_selection_invalid": "方向选择不可用或与其上下文不兼容。",
+    "decision_assertion_invalid": "决定断言未通过确定性验证。",
+    "structured_output_invalid": "必需的结构化投资组合输出不可用或无效。",
+    "shadow_mode": "影子证据模式不能发布方向性决定。",
+    "deterministic_gate_rejected": "确定性信任边界检查拒绝发布。",
+    "instrument_currently_suspended": "最近适用的大陆市场交易时段已权威确认停牌。",
+}
+
+
+def localized_analysis_outcome(outcome, language):
+    from tradingagents.evidence import render_analysis_outcome
+
+    if not is_chinese(language):
+        return render_analysis_outcome(outcome)
+    readiness = "证据不足" if outcome.readiness.value == "insufficient" else "证据冲突"
+    lines = [
+        f"**Analysis Outcome:** {readiness}", "",
+        f"**Reason Code:** `{outcome.reason.value}`", "",
+        _OUTCOME_ZH[outcome.reason.value],
+    ]
+    if outcome.current_suspension is not None:
+        suspension = outcome.current_suspension
+        latest = str(suspension.latest_traded_close) if suspension.latest_traded_close_status == "available" else "不可用"
+        lines += ["", "**Current Tradeability:** `suspended`", "",
+                  f"**Latest Genuinely Traded Close:** `{latest}`"]
+    lines += ["", "未形成交易决定。"]
+    if outcome.diagnostic_codes:
+        lines += ["", "### Deterministic Blockers", ""]
+        lines += [
+            f"- `{code.value}`: {_BLOCKER_ZH[code.value]}"
+            for code in sorted(outcome.diagnostic_codes, key=lambda item: item.value)
+        ]
+    return "\n".join(lines)
 
 
 def localize_report(text, language):

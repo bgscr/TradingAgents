@@ -17,6 +17,7 @@ import tradingagents.dataflows.akshare_data as akshare_data
 import tradingagents.dataflows.config as config_module
 import tradingagents.dataflows.market_snapshot as market_snapshot
 from cli import main as cli_main
+from tests.report_export_helpers import current_export_root
 from tradingagents.agents.utils.core_stock_tools import get_stock_data
 from tradingagents.dataflows.acquisition import AcquisitionController, RetryPolicy
 from tradingagents.dataflows.errors import NoMarketDataError, VendorRateLimitError
@@ -211,7 +212,7 @@ def test_mainland_eastmoney_physical_attempt_has_exact_public_cardinality(
         tmp_path / "reports",
     )
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
 
     assert len(transport_calls) == 1
@@ -266,7 +267,7 @@ def test_mainland_akshare_cli_tool_snapshot_has_exact_public_cardinality(
         tmp_path / "reports",
     )
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
 
     assert "# Provider: akshare" in rendered
@@ -546,7 +547,7 @@ def test_mainland_akshare_retry_then_success_has_exact_physical_cardinality(
         tmp_path / "reports",
     )
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
 
     assert transport_calls == [1, 2]
@@ -601,7 +602,7 @@ def test_mainland_akshare_exact_exhaustion_has_no_hidden_extra_request(
         tmp_path / "reports",
     )
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
 
     assert transport_calls == [1, 2, 3]

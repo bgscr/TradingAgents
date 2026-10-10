@@ -374,6 +374,8 @@ def _persist_one(target: Path, raw_bytes: bytes, digest: str) -> None:
 def persist_source_artifacts(
     evidence: EvidenceState,
     audit_directory: Path,
+    *,
+    publication=None,
 ) -> SourceArtifactManifest:
     """Persist exact artifact bytes immutably and return their logical manifest."""
 
@@ -383,7 +385,19 @@ def persist_source_artifacts(
     for digest in sorted(raw_by_digest):
         raw_bytes = raw_by_digest[digest]
         target = storage_root / digest[:2] / f"{digest}.utf8.gz"
-        _persist_one(target, raw_bytes, digest)
+        if publication is None:
+            _persist_one(target, raw_bytes, digest)
+        else:
+            stored = publication.read_bytes(target)
+            if stored is not None:
+                try:
+                    matches = gzip.decompress(stored) == raw_bytes
+                except (OSError, EOFError):
+                    matches = False
+                if not matches:
+                    raise FileExistsError(f"immutable source artifact conflicts: {target}")
+            else:
+                publication.write_bytes(target, gzip.compress(raw_bytes, mtime=0))
         entries.append(
             SourceArtifactManifestEntry(
                 artifact_ref=f"artifact=sha256:{digest}",

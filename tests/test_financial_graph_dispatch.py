@@ -18,6 +18,7 @@ import tradingagents.dataflows.akshare_data as akshare_data
 import tradingagents.dataflows.config as config_module
 import tradingagents.dataflows.interface as vendor_interface
 import tradingagents.dataflows.market_snapshot as market_snapshot
+from tests.report_export_helpers import current_export_root
 from tradingagents.agents.analysts.submission import (
     render_allowed_source_ref_catalog,
     source_ref_tool_call_ids,
@@ -832,7 +833,7 @@ def test_compiled_mainland_financial_transport_has_exact_published_cardinality(
         audit = prepare_decision_audit(terminal_state, tmp_path / "audit")
         write_report_tree(terminal_state, "601328.SS", tmp_path / "reports")
     report = (
-        tmp_path / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(tmp_path / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
     history_config = MarketHistoryConfig.from_mapping(runtime_config)
     with MarketHistoryStore.open_provider_request_authority(history_config) as store:

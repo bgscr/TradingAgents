@@ -399,9 +399,12 @@ def prepare_decision_audit(
     directory: str | Path,
     *,
     config: Mapping[str, Any] | None = None,
+    publication=None,
 ) -> dict[str, Any]:
     """Persist source artifacts before authorizing a safe decision audit."""
 
+    if publication is not None and Path(directory) != publication.root:
+        raise ValueError("audit directory differs from its pinned report root")
     evidence = EvidenceState.model_validate(final_state.get("evidence_state", {}))
     from tradingagents.dataflows.market_snapshot import (
         refresh_active_evidence_physical_attempts,
@@ -409,7 +412,7 @@ def prepare_decision_audit(
 
     evidence = refresh_active_evidence_physical_attempts(evidence)
     final_state["evidence_state"] = evidence.model_dump(mode="python")
-    manifest = persist_source_artifacts(evidence, Path(directory))
+    manifest = persist_source_artifacts(evidence, Path(directory), publication=publication)
     projection = project_evidence_for_audit(evidence, manifest)
     payload = build_decision_audit(
         final_state,
@@ -763,10 +766,14 @@ def write_immutable_decision_audit(
     filename: str | None = "decision-audit.json",
     config: Mapping[str, Any] | None = None,
     payload: Mapping[str, Any] | None = None,
+    publication=None,
 ) -> Path:
     """Publish a complete audit atomically and never overwrite different data."""
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    if publication is None:
+        directory.mkdir(parents=True, exist_ok=True)
+    elif directory != publication.root:
+        raise ValueError("audit directory differs from its pinned report root")
     if payload is not None:
         raise ValueError(
             "prebuilt decision audit payloads are not accepted; "
@@ -776,6 +783,7 @@ def write_immutable_decision_audit(
         final_state,
         directory,
         config=config,
+        publication=publication,
     )
     if filename is None:
         filename = (
@@ -786,6 +794,12 @@ def write_immutable_decision_audit(
         json.dumps(audit_payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     )
     target = directory / filename
+    if publication is not None:
+        try:
+            publication.write_bytes(target, encoded)
+        except FileExistsError as error:
+            raise FileExistsError(f"immutable decision audit already exists: {target}") from error
+        return target
     if target.exists():
         if target.read_bytes() != encoded:
             raise FileExistsError(f"immutable decision audit already exists: {target}")

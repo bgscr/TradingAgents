@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.run_display import PlainRunDisplay
+from tests.report_export_helpers import current_export_root
 from tradingagents.evidence import (
     AnalysisOutcome,
     AnalysisOutcomeReason,
@@ -827,13 +828,13 @@ def test_blocked_analysis_outcome_is_published_and_saved_without_decision(
     ]
     run_dir = next(tmp_path.rglob("run_status.json")).parent
     saved_outcome = (
-        run_dir / "reports" / "5_portfolio" / "analysis_outcome.md"
+        current_export_root(run_dir / "reports") / "5_portfolio" / "analysis_outcome.md"
     ).read_text(encoding="utf-8")
     assert outcome in saved_outcome
     assert "Source Availability Coverage" in saved_outcome
     assert "Validated Fact Coverage" in saved_outcome
     assert "Decision Assertion Coverage" in saved_outcome
-    assert not (run_dir / "reports" / "5_portfolio" / "decision.md").exists()
+    assert not (current_export_root(run_dir / "reports") / "5_portfolio" / "decision.md").exists()
 
 
 @pytest.mark.unit
@@ -860,7 +861,11 @@ def test_blocked_cli_report_enforces_boundary_across_streamed_state_deltas(
     complete = (run_dir / "reports" / "complete_report.md").read_text(
         encoding="utf-8"
     )
-    assert "Market report body" not in complete
+    terminal = (
+        current_export_root(run_dir / "reports") / "5_portfolio" / "analysis_outcome.md"
+    ).read_text(encoding="utf-8")
+    assert "Market report body" not in terminal
+    assert "Market report body" in complete.split("# Advisory stage reports", 1)[1]
     assert outcome in complete
     assert not (run_dir / "reports" / "1_analysts").exists()
     assert not (run_dir / "reports" / "market_report.md").exists()

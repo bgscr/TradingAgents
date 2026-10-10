@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from tests.report_export_helpers import current_export_root
 from tests.test_reporting import _decision_state
 from tradingagents.evidence import ClaimValidation, EvidenceSource
 from tradingagents.evidence_artifacts import AuditClaimValidation, AuditEvidenceSource
@@ -34,10 +35,11 @@ def test_chinese_market_only_export_preserves_all_nine_advisory_roles(tmp_path):
     complete = write_report_tree(state, "AAPL", tmp_path, output_language="中文").read_text(
         encoding="utf-8"
     )
-    authoritative = (tmp_path / "5_portfolio/decision.md").read_text(encoding="utf-8")
+    export_root = current_export_root(tmp_path)
+    authoritative = (export_root / "5_portfolio/decision.md").read_text(encoding="utf-8")
     assert len(advisory_sections(state)) == 9
     for relative, _, _, content in advisory_sections(state):
-        saved = (tmp_path / relative).read_text(encoding="utf-8")
+        saved = (export_root / relative).read_text(encoding="utf-8")
         assert "辅助分析（模型生成，未经事实验证）" in saved
         assert content in saved and content in complete
         assert content not in authoritative

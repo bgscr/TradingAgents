@@ -2496,13 +2496,15 @@ def run_analysis(
                 text = (
                     "\n".join(str(item) for item in stored) if isinstance(stored, list) else stored
                 )
-                path = report_dir / file_name
-                with open(path, "w", encoding="utf-8") as report_file:
-                    from tradingagents.report_presentation import advisory_markdown
+                from tradingagents.report_exports import write_advisory_draft
+                from tradingagents.report_presentation import advisory_markdown
 
-                    report_file.write(advisory_markdown(
+                path = write_advisory_draft(
+                    report_dir, file_name,
+                    advisory_markdown(
                         section_name, text, selections.get("output_language", "English")
-                    ))
+                    ),
+                )
                 display.report_ready(section_name, text, path)
                 runtime_writer.record_duration(
                     "report",
