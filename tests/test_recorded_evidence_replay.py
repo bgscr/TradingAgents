@@ -1,6 +1,7 @@
 import json
 from datetime import date
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -243,5 +244,13 @@ def test_recorded_fixture_cli_matches_programmatic_terminal_contract(tmp_path):
     assert cli_terminal == programmatic.terminal
     assert payload["blocked_stage"] == programmatic.blocked_stage
     assert payload["counters"] == programmatic.counters.model_dump(mode="json")
-    assert (cli_output / "complete_report.md").is_file()
+    report_path = Path(payload["report_path"])
+    assert report_path.is_file()
+    assert report_path.name == "complete_report.md"
+    assert report_path.parent.parent == cli_output / "report_exports"
+    manifest = json.loads((report_path.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] == programmatic.run_identity.run_id
+    assert manifest["audit_sha256"] == programmatic.run_identity.audit_digest
+    assert manifest["files"]["complete_report.md"] == sha256(report_path.read_bytes()).hexdigest()
+    assert not (cli_output / "complete_report.md").exists()
     assert (cli_output / "decision-audit.json").is_file()

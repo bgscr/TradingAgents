@@ -284,15 +284,20 @@ def test_mark_run_completed_publishes_canonical_identity_after_reports(
     monkeypatch,
 ):
     artifacts = cli_main._prepare_run_artifacts(
-        {"results_dir": str(tmp_path), "evidence_gate_mode": "enforce"},
+        {
+            "results_dir": str(tmp_path),
+            "evidence_gate_mode": "enforce",
+            "output_language": "Chinese",
+        },
         _selections(),
     )
     report_file = artifacts["report_dir"] / "complete_report.md"
 
-    def fake_save(final_state, ticker, report_dir):
+    def fake_save(final_state, ticker, report_dir, *, output_language):
         assert final_state["configuration_digest"] == artifacts["configuration_digest"]
         assert ticker == "688519.SS"
         assert report_dir == artifacts["report_dir"]
+        assert output_language == "Chinese"
         final_state.update(
             {
                 "lifecycle_status": "completed",
