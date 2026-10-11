@@ -1119,6 +1119,7 @@ def reconstruct_snapshot(
     bundle_revision_id: str,
     *,
     requested_date: date,
+    requested_start: date | None = None,
     purpose: SnapshotPurpose,
     replay_as_of: datetime | None,
     pin: bool,
@@ -1174,8 +1175,11 @@ def reconstruct_snapshot(
             "o.low_value, o.close_value, o.volume_value "
             "FROM history_bundle_observation_revisions AS m "
             "JOIN raw_market_observation_revisions AS o ON o.revision_id = m.revision_id "
-            "WHERE m.bundle_revision_id = ? AND o.session_date <= ? ORDER BY o.session_date",
-            (bundle_revision_id, requested_date.isoformat()),
+            "WHERE m.bundle_revision_id = ? AND o.session_date <= ? "
+            "AND (? IS NULL OR o.session_date >= ?) ORDER BY o.session_date",
+            (bundle_revision_id, requested_date.isoformat(),
+             requested_start.isoformat() if requested_start else None,
+             requested_start.isoformat() if requested_start else None),
         )
     )
     if not observation_rows:

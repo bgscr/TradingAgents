@@ -72,6 +72,10 @@ class SnapshotProvider:
     reports_physical_requests: bool = False
     crypto_dataset: CryptoProviderDatasetDescriptor | None = None
     uses_typed_physical_requests: bool = False
+    history_binding: Callable | None = None
+    history_uses_typed_physical_requests: bool = False
+    history_uses_physical_workflow: bool = False
+    current_cache_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,9 @@ class AuthoritativeMarketSnapshot:
     physical_attempt_events: tuple[ProviderPhysicalAttemptEvent, ...] = ()
     asset_configuration: RunAssetConfiguration | None = None
     crypto_provider_dataset: CryptoProviderDatasetDescriptor | None = None
+
+    history_local_rows: int = 0
+    history_requested_ranges: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         configured_crypto = (
@@ -629,6 +636,9 @@ def _load_baostock_history(
     end_date: str,
     *,
     before_physical_request: Callable[[str], None] | None = None,
+    physical_request: Callable | None = None,
+    physical_workflow: Callable | None = None,
+    adjustment_as_of: str | None = None,
 ) -> object:
     from .baostock_data import load_snapshot_with_history
 
@@ -637,7 +647,26 @@ def _load_baostock_history(
         start_date,
         end_date,
         before_physical_request=before_physical_request,
+        physical_request=physical_request,
+        physical_workflow=physical_workflow,
+        adjustment_as_of=adjustment_as_of,
     )
+
+
+def _baostock_history_binding(symbol):
+    from tradingagents.market_history.current import baostock_history_binding
+    return baostock_history_binding(symbol)
+
+
+def _tushare_history_binding(symbol):
+    from .tushare_market_history import history_binding
+    return history_binding(symbol)
+
+
+def _load_tushare(symbol, start_date, end_date, *, physical_request=None):
+    from .tushare_market_history import load_snapshot_with_history
+    return load_snapshot_with_history(symbol, start_date, end_date,
+                                      request_executor=physical_request)
 
 
 def _load_yfinance(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -651,14 +680,22 @@ SNAPSHOT_PROVIDERS: dict[str, SnapshotProvider] = {
         _load_akshare,
         "qfq",
         uses_typed_physical_requests=True,
+        current_cache_version="akshare-qfq-v1",
     ),
     "baostock": SnapshotProvider(
         _load_baostock,
         "qfq",
         history_load=_load_baostock_history,
         reports_physical_requests=True,
+        history_binding=_baostock_history_binding,
+        history_uses_physical_workflow=True,
+        current_cache_version="baostock-qfq-status-v1",
     ),
-    "yfinance": SnapshotProvider(_load_yfinance, "auto_adjusted"),
+    "yfinance": SnapshotProvider(_load_yfinance, "auto_adjusted", current_cache_version="yahoo-auto-adjusted-v1"),
+    "tushare": SnapshotProvider(_load_tushare, "qfq",
+        history_load=_load_tushare, uses_typed_physical_requests=True,
+        history_binding=_tushare_history_binding,
+        history_uses_typed_physical_requests=True, current_cache_version="tushare-daily-factor-status-v1"),
 }
 
 
@@ -716,7 +753,10 @@ def _typed_mainland_physical_request(
             retryable=True,
             status_code=exc.status_code,
             error_code=error_code,
-            retry_after_seconds=exc.retry_after_seconds,
+            # Preserve the legacy snapshot path's local cooldown when a vendor
+            # reports capacity exhaustion without an explicit Retry-After.
+            retry_after_seconds=(300.0 if exc.retry_after_seconds is None
+                                 else max(0.0, float(exc.retry_after_seconds))),
         ) from exc
     except (RequestsTimeout, TimeoutError) as exc:
         raise PhysicalAttemptFailure(
@@ -772,6 +812,7 @@ def _load_through_provider_coordinator(
     start_date: str,
     end_date: str,
     *,
+    adjustment_as_of: str | None = None,
     attempt_observer: Callable[[tuple[ProviderPhysicalAttemptEvent, ...]], None]
     | None = None,
 ) -> object:
@@ -822,50 +863,18 @@ def _load_through_provider_coordinator(
             provider_name
         )
         coordinator.register_upstream_service(upstream_service_id, service_name)
+        if provider_name == "tushare":
+            rates = (get_config().get("tushare_calls_per_minute", 40),
+                     get_config().get("tushare_operator_safety_ceiling_calls_per_minute", 40))
+            if any(not isinstance(rate, int) or isinstance(rate, bool) or not 1 <= rate <= 40
+                   for rate in rates):
+                raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NOT_CONFIGURED)
+            coordinator.configure_operator_ceiling(
+                upstream_service_id=upstream_service_id,
+                minimum_interval=timedelta(seconds=60 / min(rates)),
+                allow_prewarming=False, configured_at=_coordinator_now())
         history_start_date = start_date
         history_end_date = end_date
-        if (
-            history_config.mode is MarketHistoryMode.AUTHORITATIVE
-            and provider.history_load is not None
-        ):
-            instrument = resolve_china_a_symbol(symbol)
-            if instrument is not None:
-                from tradingagents.market_history.maintenance import (
-                    plan_incremental_refresh,
-                )
-                from tradingagents.market_history.models import SnapshotPurpose
-
-                try:
-                    with MarketHistoryStore.open(history_config) as history_store:
-                        latest_bundle = history_store.latest_qualified_history_bundle(
-                            instrument.yahoo_symbol,
-                            end_date,
-                        )
-                        retained = history_store.reconstruct_snapshot(
-                            latest_bundle.bundle_revision_id,
-                            requested_date=date.fromisoformat(end_date),
-                            purpose=SnapshotPurpose.CURRENT_ANALYSIS,
-                        )
-                        calendar = history_store.read_current_session_calendar(
-                            "mainland-cn"
-                        )
-                except Exception:
-                    pass
-                else:
-                    retained_dates = {
-                        value.date()
-                        for value in retained.frame["Date"].dt.to_pydatetime()
-                    }
-                    refresh_plan = plan_incremental_refresh(
-                        sessions=calendar.sessions,
-                        as_of_date=date.fromisoformat(end_date),
-                        retained_session_dates=retained_dates,
-                        seeded=True,
-                    )
-                    if refresh_plan.requested_start is not None:
-                        history_start_date = refresh_plan.requested_start.isoformat()
-                    if refresh_plan.requested_end is not None:
-                        history_end_date = refresh_plan.requested_end.isoformat()
         now = _coordinator_now()
         lease_duration = timedelta(minutes=2)
         request_key = stable_acquisition_source_ref(
@@ -875,14 +884,95 @@ def _load_through_provider_coordinator(
             history_start_date,
             history_end_date,
             provider.adjustment_basis,
+            repr(provider.history_binding(symbol)) if provider.history_binding is not None else "current-only",
+            "current_analysis",
+            adjustment_as_of or end_date,
+            str(get_config().get("tushare_account_scope_label", "personal-research-default")) if provider_name == "tushare" else "",
         )
         owner_id = f"snapshot:{threading.get_ident()}:{uuid4().hex}"
-        if provider.uses_typed_physical_requests:
+        use_history = (history_config.mode in {MarketHistoryMode.AUTHORITATIVE, MarketHistoryMode.CURRENT}
+                       and provider.history_load is not None)
+        if use_history and provider.history_uses_physical_workflow:
+            from tradingagents.market_history.coordinator import (
+                PhysicalAttemptBudgetExhausted,
+            )
+
+            previous_event_ids = {row[0] for row in store._connection.execute(
+                "SELECT attempt_event_id FROM provider_request_attempts")}
+            workflow_called = False
+
+            def execute_history_workflow(workflow: Callable) -> object:
+                nonlocal workflow_called
+                if workflow_called:
+                    raise ValueError("history loader may execute only one physical workflow")
+                workflow_called = True
+
+                def typed_workflow(execute_operation):
+                    def execute(operation, physical_request):
+                        return execute_operation(
+                            operation,
+                            lambda: _typed_mainland_physical_request(physical_request),
+                        )
+
+                    return workflow(execute)
+
+                try:
+                    result = coordinator.execute_physical_workflow(
+                        request_key=stable_acquisition_source_ref(
+                            "provider-history-workflow-v1", request_key
+                        ),
+                        upstream_service_id=upstream_service_id,
+                        owner_id=owner_id,
+                        priority=RequestPriority.INTERACTIVE_MAINLAND,
+                        now=_coordinator_now,
+                        sleep=_coordinator_sleep,
+                        lease_duration=lease_duration,
+                        max_physical_operations=5,
+                        workflow=typed_workflow,
+                        cooldown_scope="market-snapshot",
+                    )
+                except PhysicalAttemptBudgetExhausted as exc:
+                    if attempt_observer is not None:
+                        attempt_observer(tuple(
+                            event for event in exc.attempt_events
+                            if event.attempt_event_id not in previous_event_ids
+                        ))
+                    raise exc.failure from exc
+                if attempt_observer is not None:
+                    attempt_observer(tuple(
+                        event for event in result.attempt_events
+                        if event.attempt_event_id not in previous_event_ids
+                    ))
+                return result.value
+
+            try:
+                value = provider.history_load(
+                    symbol, start_date, end_date,
+                    physical_workflow=execute_history_workflow,
+                    adjustment_as_of=adjustment_as_of or end_date,
+                )
+            except PhysicalAttemptFailure as failure:
+                raise AcquisitionFailure(
+                    reason=_ACQUISITION_REASON_BY_PHYSICAL_OUTCOME[failure.outcome],
+                    status_code=failure.status_code,
+                    error_code=failure.error_code,
+                    retry_after_seconds=failure.retry_after_seconds,
+                ) from failure
+            if not workflow_called:
+                raise AcquisitionFailure(
+                    reason=AcquisitionUnavailableReason.PROVIDER_ERROR
+                )
+            return value
+        if provider.uses_typed_physical_requests or (
+            use_history and provider.history_uses_typed_physical_requests
+        ):
             from tradingagents.market_history.coordinator import (
                 PhysicalAttemptBudgetExhausted,
             )
 
             physical_request_index = 0
+            previous_event_ids = {row[0] for row in store._connection.execute(
+                "SELECT attempt_event_id FROM provider_request_attempts")}
 
             def execute_physical_request(
                 operation: str,
@@ -913,18 +1003,23 @@ def _load_through_provider_coordinator(
                     )
                 except PhysicalAttemptBudgetExhausted as exc:
                     if attempt_observer is not None:
-                        attempt_observer(exc.attempt_events)
+                        attempt_observer(tuple(event for event in exc.attempt_events
+                                               if event.attempt_event_id not in previous_event_ids))
                     raise exc.failure from exc
                 if attempt_observer is not None:
-                    attempt_observer(result.attempt_events)
+                    attempt_observer(tuple(event for event in result.attempt_events
+                                           if event.attempt_event_id not in previous_event_ids))
                 return result.value
 
             try:
-                value = provider.load(
+                loader = provider.history_load if use_history else provider.load
+                value = loader(
                     symbol,
                     start_date,
                     end_date,
                     physical_request=execute_physical_request,
+                    **({"adjustment_as_of": adjustment_as_of or end_date}
+                       if use_history and provider_name == "baostock" else {}),
                 )
             except PhysicalAttemptFailure as failure:
                 raise AcquisitionFailure(
@@ -1197,8 +1292,11 @@ def _provider_chain(symbol: str) -> list[str]:
     if configured == "default":
         configured = config.get("data_vendors", {}).get("core_stock_apis", "default")
     if configured == "default":
-        return list(SNAPSHOT_PROVIDERS)
-    return [name.strip() for name in configured.split(",") if name.strip()]
+        return ["akshare", "baostock", "yfinance"]
+    selected = [name.strip() for name in configured.split(",") if name.strip()]
+    if "tushare" in selected and config.get("mainland_capability_routing_mode", "legacy") != "legacy":
+        raise ValueError("Tushare daily snapshots are not admitted by the pinned qualified capability plan")
+    return selected
 
 
 def validate_ohlcv_frame(
@@ -1660,6 +1758,154 @@ def _resolve_snapshot_asset_configuration(
     return configuration
 
 
+def _validate_history_candidate_window(candidate, provider, symbol, start_date, end_date):
+    """Validate a fetched piece against its own range before publishing any coverage."""
+    from datetime import timedelta
+
+    from tradingagents.market_history.current import _analysis_as_of
+    from tradingagents.market_history.maintenance import latest_completed_session
+    bundle = candidate.history_bundle
+    if provider.history_binding is not None:
+        expected_provider, expected_instrument = provider.history_binding(symbol)
+        if (bundle.provider, bundle.instrument) != (expected_provider, expected_instrument):
+            raise ValueError("history candidate identity contradicts configured adapter")
+    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    calendar = {item.session_date: item.status.value for item in candidate.calendar.sessions}
+    if any(start + timedelta(days=index) not in calendar
+           for index in range((end - start).days + 1)):
+        raise ValueError("history candidate calendar does not cover its request")
+    completed = latest_completed_session(candidate.calendar, as_of=_analysis_as_of(
+        end, timezone_name=candidate.calendar.timezone_name))
+    if completed is None:
+        raise ValueError("no completed session in the requested window")
+    expected = {day for day, status in calendar.items() if start <= day <= min(end, completed) and status == "open"}
+    actual = {item.session_date for item in bundle.observations}
+    if actual != expected:
+        raise ValueError("history candidate does not cover its requested open sessions")
+    frame = validate_ohlcv_frame(candidate.frame, end_date, start_date)
+    _validated_candidate_status(candidate, frame,
+                                provider_name=bundle.provider.provider_name,
+                                requested_date=min(end, completed).isoformat())
+
+
+def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None):
+    """Discover missing calendar membership only for explicitly enabled local reuse."""
+    from tradingagents.market_history.calendar_discovery import ensure_mainland_calendar_window
+    from tradingagents.market_history.config import (
+        DataUsageMode,
+        MarketHistoryConfig,
+        MarketHistoryMode,
+    )
+    from tradingagents.market_history.coordinator import ProviderRequestCoordinator
+    from tradingagents.market_history.store import MarketHistoryStore
+
+    config = MarketHistoryConfig.from_mapping(get_config())
+    if config.mode not in {MarketHistoryMode.CURRENT, MarketHistoryMode.AUTHORITATIVE}:
+        raise ValueError("calendar discovery requires explicitly enabled history reuse")
+    if config.data_usage_mode is not DataUsageMode.PERSONAL_RESEARCH:
+        raise ValueError("calendar usage not entitled")
+    with MarketHistoryStore.open(config) as store, MarketHistoryStore.open_provider_request_authority(config) as authority:
+        previous = {row[0] for row in authority._connection.execute("SELECT attempt_event_id FROM provider_request_attempts")}
+        class ObservedCalendarCoordinator(ProviderRequestCoordinator):
+            def execute_physical_workflow(self, **kwargs):
+                from tradingagents.market_history.coordinator import PhysicalAttemptBudgetExhausted
+                try:
+                    result = super().execute_physical_workflow(**kwargs)
+                except PhysicalAttemptBudgetExhausted as exc:
+                    observe(exc.attempt_events)
+                    raise
+                observe(result.attempt_events)
+                return result
+
+        def observe(events):
+            if attempt_observer is not None:
+                attempt_observer(tuple(event for event in events if event.attempt_event_id not in previous))
+
+        coordinator = ObservedCalendarCoordinator(authority)
+        from tradingagents.dataflows.baostock_calendar import (
+            BaoStockSessionCalendarAcquisitionError,
+        )
+        try:
+            return ensure_mainland_calendar_window(store, date.fromisoformat(start_date), date.fromisoformat(end_date),
+                coordinator=coordinator, owner_id=f"calendar:{uuid4().hex}", now=_coordinator_now, sleep=_coordinator_sleep)
+        except BaoStockSessionCalendarAcquisitionError as exc:
+            reason = _ACQUISITION_REASON_BY_PHYSICAL_OUTCOME.get(exc.physical_outcome,
+                AcquisitionUnavailableReason.UPSTREAM_BUSY if exc.reason.value == "provider_cooldown_active"
+                else AcquisitionUnavailableReason.PROVIDER_ERROR)
+            raise AcquisitionFailure(reason=reason, error_code=exc.reason.value,
+                retryable=exc.retryable, retry_after_seconds=exc.retry_after_seconds) from exc
+
+
+def _load_complete_history_window(provider_name, provider, symbol, start_date, end_date,
+                                  *, minimum_history_rows, history_read, attempt_observer):
+    from tradingagents.market_history.current import (
+        _analysis_as_of,
+        try_read_authoritative_mainland_frame,
+    )
+    from tradingagents.market_history.maintenance import (
+        latest_completed_session,
+        plan_incremental_refresh,
+    )
+    from tradingagents.market_history.shadow import persist_mainland_history_candidate
+
+    if history_read is not None and history_read.diagnostic == "publication_cooldown":
+        raise AcquisitionFailure(reason=AcquisitionUnavailableReason.UPSTREAM_BUSY)
+    retained = history_read.retained if history_read is not None else None
+    ranges = ((start_date, end_date),)
+    if retained is not None and provider.history_load is not None:
+        calendar = _ensure_analysis_calendar(start_date, end_date, attempt_observer)
+        completed = latest_completed_session(calendar, as_of=_analysis_as_of(
+            date.fromisoformat(end_date), timezone_name=calendar.timezone_name))
+        retained_dates = {item.date() for item in retained.frame["Date"]}
+        refresh_due = bool(completed is not None and completed > max(retained_dates))
+        plan = plan_incremental_refresh(
+            sessions=calendar.sessions, as_of_date=completed or date.fromisoformat(end_date),
+            requested_start=date.fromisoformat(start_date),
+            retained_session_dates=retained_dates,
+            seeded=True, refresh_due=refresh_due,
+        )
+        ranges = tuple((start.isoformat(), end.isoformat()) for start, end in plan.request_ranges)
+        if not ranges:
+            dataset, instrument = provider.history_binding(symbol)
+            read = try_read_authoritative_mainland_frame(symbol, start_date, end_date,
+                minimum_history_rows=minimum_history_rows, provider=dataset, instrument_identity=instrument)
+            if read.loaded is None:
+                raise ValueError(read.diagnostic or "calendar-only extension remains incomplete")
+            return None, read, None, (), len(retained.frame)
+    candidate = None
+    write_result = None
+    for range_start, range_end in ranges:
+        candidate = _load_through_provider_coordinator(
+            provider_name, provider, symbol, range_start, range_end,
+            attempt_observer=attempt_observer,
+            adjustment_as_of=end_date,
+        )
+        if not hasattr(candidate, "history_bundle"):
+            if retained is not None:
+                raise ValueError("incremental provider did not return a raw history bundle")
+            continue
+        _validate_history_candidate_window(candidate, provider, symbol, range_start, range_end)
+        # The acquisition range stays in the raw payload. The merged bundle's
+        # as-of covers the complete view, including later retained members.
+        publication_candidate = replace(candidate, history_bundle=replace(
+            candidate.history_bundle, requested_as_of=date.fromisoformat(end_date)))
+        write_result = persist_mainland_history_candidate(publication_candidate)
+        if retained is not None and not write_result.persisted:
+            raise ValueError(write_result.diagnostic or "incremental publication failed")
+    rebuilt = None
+    if write_result is not None and write_result.persisted and provider.history_binding is not None:
+        dataset, instrument = provider.history_binding(symbol)
+        read = try_read_authoritative_mainland_frame(
+            symbol, start_date, end_date, minimum_history_rows=minimum_history_rows,
+            provider=dataset, instrument_identity=instrument,
+        )
+        if read.loaded is not None:
+            rebuilt = read
+        elif retained is not None:
+            raise ValueError(read.diagnostic or "published history window remains incomplete")
+    return candidate, rebuilt, write_result, ranges, len(retained.frame) if retained is not None else 0
+
+
 def _acquire_authoritative_market_snapshot(
     symbol: str,
     start_date: str,
@@ -1677,15 +1923,35 @@ def _acquire_authoritative_market_snapshot(
         active=(active.asset_configuration if active is not None else None),
     )
     from tradingagents.market_history.current import (
+        CurrentHistoryRead,
         try_read_authoritative_mainland_frame,
     )
 
-    history_read = try_read_authoritative_mainland_frame(
-        symbol,
-        start_date,
-        end_date,
-        minimum_history_rows=minimum_history_rows,
-    )
+    provider_chain = _provider_chain(symbol)
+    from tradingagents.market_history.current_cache import try_read as try_read_current_cache
+    cached, current_cache_diagnostic = try_read_current_cache(
+        symbol, start_date, end_date, provider_chain, SNAPSHOT_PROVIDERS, minimum_history_rows)
+    if cached is not None:
+        if active is not None:
+            record = MarketSnapshotAcquisitionRecord(cached, cached.acquisition_outcomes,
+                cached.source_artifact, cached.status_artifact)
+            active.acquisition_records[(symbol, start_date, end_date)] = record
+            active.latest_acquisition_records[(symbol.strip().upper(), str(end_date))] = record
+        return cached
+    history_reads = {}
+    for name in provider_chain:
+        descriptor = SNAPSHOT_PROVIDERS.get(name)
+        if descriptor is None or descriptor.history_binding is None:
+            continue
+        if resolve_china_a_symbol(symbol) is None or descriptor.adjustment_basis != "qfq":
+            continue
+        dataset, instrument = descriptor.history_binding(symbol)
+        history_reads[name] = try_read_authoritative_mainland_frame(
+            symbol, start_date, end_date, minimum_history_rows=minimum_history_rows,
+            provider=dataset, instrument_identity=instrument,
+        )
+    history_read = next((item for item in history_reads.values() if item.loaded is not None),
+                        next(iter(history_reads.values()), CurrentHistoryRead(False)))
     if history_read.loaded is not None:
         stored = history_read.loaded
         frame = stored.frame.copy(deep=True)
@@ -1729,6 +1995,7 @@ def _acquire_authoritative_market_snapshot(
             acquisition_outcomes=(available,),
             source_artifact=artifact,
             history_store_status="stored",
+            history_local_rows=len(frame),
             current_tradeability=stored.current_tradeability,
             current_status_provenance=stored.current_status_provenance,
             latest_traded_close=stored.latest_traded_close,
@@ -1753,32 +2020,42 @@ def _acquire_authoritative_market_snapshot(
         if active is not None
         else AcquisitionController(providers=())
     )
-    provider_chain = _provider_chain(symbol)
     validation_quarantine: dict[str, QuarantinedSnapshot] = {}
     validated_frames: dict[str, pd.DataFrame] = {}
     history_candidates: dict[str, object] = {}
     current_status_candidates: dict[str, object] = {}
     crypto_provider_datasets: dict[str, CryptoProviderDatasetDescriptor] = {}
     physical_attempt_events: list[ProviderPhysicalAttemptEvent] = []
+    rebuilt_history = {}
+    persistence_results = {}
+    requested_ranges = {}
+    local_rows = {}
+    validated_calendars = {}
 
     def observe_physical_attempts(
         events: tuple[ProviderPhysicalAttemptEvent, ...],
     ) -> None:
-        physical_attempt_events.extend(events)
-        record_active_physical_attempt_events(events)
+        seen = {event.attempt_event_id for event in physical_attempt_events}
+        fresh = tuple(event for event in events if event.attempt_event_id not in seen)
+        physical_attempt_events.extend(fresh)
+        record_active_physical_attempt_events(fresh)
 
     def load_and_validate(
         provider_name: str, provider: SnapshotProvider
     ) -> pd.DataFrame:
         try:
-            raw_candidate = _load_through_provider_coordinator(
-                provider_name,
-                provider,
-                symbol,
-                start_date,
-                end_date,
+            raw_candidate, rebuilt, write_result, ranges, retained_rows = _load_complete_history_window(
+                provider_name, provider, symbol, start_date, end_date,
+                minimum_history_rows=minimum_history_rows,
+                history_read=history_reads.get(provider_name),
                 attempt_observer=observe_physical_attempts,
             )
+            if rebuilt is not None:
+                rebuilt_history[provider_name] = rebuilt
+            if write_result is not None:
+                persistence_results[provider_name] = write_result
+            requested_ranges[provider_name] = ranges
+            local_rows[provider_name] = retained_rows
         except (NoMarketDataError, ValueError) as exc:
             validation_quarantine[provider_name] = QuarantinedSnapshot(
                 provider_name,
@@ -1791,7 +2068,7 @@ def _acquire_authoritative_market_snapshot(
                 else AcquisitionUnavailableReason.MALFORMED_RESPONSE
             )
             raise AcquisitionFailure(reason=reason) from exc
-        raw_frame = getattr(raw_candidate, "frame", raw_candidate)
+        raw_frame = rebuilt.loaded.frame if rebuilt is not None else getattr(raw_candidate, "frame", raw_candidate)
         if (
             hasattr(raw_candidate, "history_bundle")
             and hasattr(raw_candidate, "calendar")
@@ -1804,6 +2081,15 @@ def _acquire_authoritative_market_snapshot(
             current_status_candidates[provider_name] = raw_candidate
         try:
             validated = validate_ohlcv_frame(raw_frame, end_date, start_date)
+            if get_config().get("market_history_mode") == "current" and resolve_china_a_symbol(symbol) is not None:
+                from tradingagents.market_history.current_cache import (
+                    calendar_evidence,
+                    validate_coverage,
+                )
+                calendar = (raw_candidate.calendar if provider_name == "tushare" and hasattr(raw_candidate, "calendar")
+                            else _ensure_analysis_calendar(start_date, end_date, observe_physical_attempts))
+                validate_coverage(validated, calendar_evidence(calendar), start_date, end_date)
+                validated_calendars[provider_name] = calendar
             blocking_gap_dates = (
                 _blocking_live_history_gaps(
                     validated,
@@ -1930,12 +2216,19 @@ def _acquire_authoritative_market_snapshot(
         quarantined = tuple(quarantined_items)
         history_candidate = history_candidates.get(provider_name)
         current_status_candidate = current_status_candidates.get(provider_name)
-        if history_candidate is not None:
+        rebuilt = rebuilt_history.get(provider_name)
+        if rebuilt is not None:
+            stored = rebuilt.loaded
+            status_values = (stored.current_tradeability, stored.current_status_provenance,
+                             stored.latest_traded_close, stored.latest_traded_close_diagnostic,
+                             stored.carried_suspension_close)
+            status_artifact = None
+        elif history_candidate is not None:
             status_values = _validated_candidate_status(
                 history_candidate,
                 frame,
                 provider_name=provider_name,
-                requested_date=end_date,
+                requested_date=effective_date,
             )
             status_artifact = None
         elif current_status_candidate is not None:
@@ -1968,7 +2261,7 @@ def _acquire_authoritative_market_snapshot(
             symbol=symbol,
             frame=frame,
             provider=provider_name,
-            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            retrieved_at=(rebuilt.retrieved_at if rebuilt is not None else datetime.now(timezone.utc).isoformat()),
             adjustment_basis=provider.adjustment_basis,
             requested_date=end_date,
             effective_trading_date=effective_date,
@@ -1987,7 +2280,15 @@ def _acquire_authoritative_market_snapshot(
             history_gap_dates=(),
             asset_configuration=asset_configuration,
             crypto_provider_dataset=crypto_provider_datasets.get(provider_name),
+            history_local_rows=local_rows.get(provider_name, 0),
+            history_requested_ranges=requested_ranges.get(provider_name, ()),
+            **({"snapshot_id": stored.snapshot_id,
+                "snapshot_id_version": stored.snapshot_id_version,
+                "pin_membership_digest": stored.pin_membership_digest,
+                "snapshot_manifest_json": stored.manifest_json} if rebuilt is not None else {}),
         )
+        if rebuilt is not None:
+            snapshot = replace(snapshot, history_store_status="refreshed", history_store_diagnostic=None)
         from tradingagents.market_history.shadow import (
             persist_mainland_history_candidate,
             persist_mainland_provider_frame,
@@ -1995,12 +2296,24 @@ def _acquire_authoritative_market_snapshot(
 
         persistence_diagnostics: list[str] = []
         if history_candidate is not None:
-            history_write = persist_mainland_history_candidate(history_candidate)
+            history_write = persistence_results.get(provider_name)
+            if history_write is None:
+                history_write = persist_mainland_history_candidate(history_candidate)
             if history_write.attempted and not history_write.persisted:
                 persistence_diagnostics.append(
                     history_write.diagnostic or "history_bundle_write_failed"
                 )
-        write_result = persist_mainland_provider_frame(
+        if get_config().get("market_history_mode") == "current" and resolve_china_a_symbol(symbol) is not None:
+            from tradingagents.market_history.current_cache import persist as persist_current_cache
+            from tradingagents.market_history.shadow import ShadowWriteResult
+            try:
+                calendar = validated_calendars[provider_name]
+                write_result = persist_current_cache(snapshot, provider, start_date, end_date, calendar)
+            except Exception as exc:
+                write_result = ShadowWriteResult(True, False, diagnostic=f"current_cache_calendar_failed:{exc}")
+            snapshot = replace(snapshot, physical_attempt_events=tuple(physical_attempt_events))
+        else:
+            write_result = persist_mainland_provider_frame(
             symbol=symbol,
             provider=provider_name,
             adjustment_basis=provider.adjustment_basis,
@@ -2013,6 +2326,8 @@ def _acquire_authoritative_market_snapshot(
             history_rows=len(frame),
             normalized_frame_text=_normalized_frame_text(frame),
         )
+        if current_cache_diagnostic:
+            persistence_diagnostics.append(current_cache_diagnostic)
         if write_result.attempted and not write_result.persisted:
             persistence_diagnostics.append(
                 write_result.diagnostic or "shadow_write_failed"

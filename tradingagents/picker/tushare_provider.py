@@ -158,6 +158,78 @@ class TushareProvider:
 
         return self._fetch_pages(spec, query_args, request_executor)
 
+    def fetch_range(
+        self,
+        endpoint: str,
+        *,
+        end_date: str,
+        start_date: str | None = None,
+        ts_code: str | None = None,
+        exchange: str | None = None,
+        request_executor: RequestExecutor | None = None,
+    ) -> pd.DataFrame:
+        """Fetch a bounded single-security range through the existing transport.
+
+        ``adj_factor`` permits an omitted start to retrieve all factor revisions
+        through the requested end. This is not a whole-market acquisition seam.
+        The daily suspension schema is intentionally separate from the legacy
+        picker partition schema.
+        """
+        specs = {
+            "daily": ENDPOINTS[Dataset.DAILY],
+            "adj_factor": EndpointSpec(
+                "adj_factor", None, "ts_code,trade_date,adj_factor"
+            ),
+            "suspend_d": EndpointSpec(
+                "suspend_d", None, "ts_code,trade_date,suspend_timing,suspend_type"
+            ),
+            "trade_cal": ENDPOINTS[Dataset.TRADE_CAL],
+        }
+        if endpoint not in specs:
+            raise PITConfigurationError("unsupported Tushare market-history endpoint")
+        if (
+            isinstance(self.page_size, bool)
+            or not isinstance(self.page_size, int)
+            or not 1 <= self.page_size <= 5000
+        ):
+            raise PITConfigurationError("range page_size must be between 1 and 5000")
+        for value in (start_date, end_date):
+            if value is not None:
+                try:
+                    if (
+                        not isinstance(value, str)
+                        or len(value) != 8
+                        or not value.isascii()
+                        or not value.isdigit()
+                    ):
+                        raise ValueError
+                    datetime.strptime(value, "%Y%m%d")
+                except (TypeError, ValueError):
+                    raise PITConfigurationError("range dates must use YYYYMMDD") from None
+        if not end_date or (start_date is not None and start_date > end_date):
+            raise PITConfigurationError("invalid Tushare market-history range")
+        if start_date is None and endpoint != "adj_factor":
+            raise PITConfigurationError("range start is required for this endpoint")
+        query_args: dict[str, object] = {"end_date": end_date}
+        if start_date is not None:
+            query_args["start_date"] = start_date
+        if endpoint == "trade_cal":
+            if exchange not in {"SSE", "SZSE"} or ts_code is not None:
+                raise PITConfigurationError("calendar range requires one mainland exchange")
+            query_args["exchange"] = exchange
+        else:
+            if (
+                not isinstance(ts_code, str)
+                or len(ts_code) != 9
+                or not ts_code[:6].isascii()
+                or not ts_code[:6].isdigit()
+                or ts_code[6:] not in {".SH", ".SZ"}
+                or exchange is not None
+            ):
+                raise PITConfigurationError("range requires one mainland ts_code")
+            query_args["ts_code"] = ts_code
+        return self._fetch_pages(specs[endpoint], query_args, request_executor)
+
     def _fetch_pages(
         self,
         spec: EndpointSpec,
@@ -214,10 +286,12 @@ class TushareProvider:
                 retry_after = None
 
         if throttled:
-            raise TushareRateLimitError(
+            failure = TushareRateLimitError(
                 f"Tushare endpoint '{endpoint}' rate limit exceeded",
                 retry_after=retry_after,
             )
+            failure.retry_after_seconds = retry_after
+            raise failure
         raise PITError(f"Tushare endpoint '{endpoint}' request failed")
 
     @staticmethod

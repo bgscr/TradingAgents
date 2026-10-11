@@ -19,6 +19,7 @@ from stockstats import wrap
 
 from tradingagents.evidence import SourceArtifact, stable_acquisition_source_ref
 from tradingagents.market_history.calendar import MarketSessionCalendarPublication
+from tradingagents.market_history.coordinator import record_active_physical_attempt_io
 from tradingagents.market_history.models import (
     ProviderHistoryBundlePublication,
     TradingStatusObservation,
@@ -70,7 +71,7 @@ class BaoStockCurrentSnapshotCandidate:
 
 
 @contextmanager
-def _session():
+def _session(physical_request=None, *, record_physical_io: bool = False):
     acquired = _BAOSTOCK_SESSION_LOCK.acquire(timeout=_BAOSTOCK_SESSION_LOCK_TIMEOUT_SECONDS)
     if not acquired:
         message = (
@@ -80,8 +81,10 @@ def _session():
         logger.warning(message)
         raise TimeoutError(message)
 
-    try:
+    def login_request():
         with contain_baostock_output():
+            if record_physical_io:
+                record_active_physical_attempt_io()
             login = bs.login()
         if getattr(login, "error_code", "0") == "10001005":
             raise VendorRateLimitError(
@@ -90,11 +93,36 @@ def _session():
             )
         if getattr(login, "error_code", "0") != "0":
             raise VendorNotConfiguredError(f"Baostock login failed: {login.error_msg}")
+        return True
+
+    def logout_request():
+        with contain_baostock_output():
+            if record_physical_io:
+                record_active_physical_attempt_io()
+            bs.logout()
+        return True
+
+    try:
+        if physical_request is None:
+            login_request()
+        else:
+            physical_request("baostock-login", login_request)
+        primary_error = False
         try:
             yield
+        except BaseException:
+            primary_error = True
+            raise
         finally:
-            with contain_baostock_output():
-                bs.logout()
+            try:
+                if physical_request is None:
+                    logout_request()
+                else:
+                    physical_request("baostock-logout", logout_request)
+            except Exception:
+                if not primary_error:
+                    raise
+                logger.warning("BaoStock logout unavailable after failed acquisition")
     finally:
         _BAOSTOCK_SESSION_LOCK.release()
 
@@ -340,26 +368,11 @@ def load_snapshot_with_history(
     end_date: str,
     *,
     before_physical_request: Callable[[str], None] | None = None,
+    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
+    physical_workflow: Callable | None = None,
+    adjustment_as_of: str | None = None,
 ) -> BaoStockSnapshotHistoryCandidate:
     """Acquire one complete BaoStock raw/status/factor/calendar workflow."""
-    from tradingagents.market_history.calendar import (
-        MarketSession,
-        MarketSessionCalendarPublication,
-        MarketSessionStatus,
-    )
-    from tradingagents.market_history.coordinator import (
-        upstream_service_identity_for_provider,
-    )
-    from tradingagents.market_history.models import (
-        AdjustmentFactorObservation,
-        InstrumentSpec,
-        ProvenanceClass,
-        ProviderDatasetSpec,
-        ProviderHistoryBundlePublication,
-        TradingStatus,
-    )
-    from tradingagents.market_history.suspension import normalize_mainland_session
-
     instrument = resolve_china_a_symbol(symbol)
     if instrument is None:
         raise NoMarketDataError(
@@ -367,6 +380,79 @@ def load_snapshot_with_history(
             symbol,
             "BaoStock supports China A-share symbols only",
         )
+    observed_at = None
+    if physical_workflow is not None:
+        if physical_request is not None or before_physical_request is not None:
+            raise ValueError("BaoStock history accepts only one physical workflow executor")
+
+        def workflow(execute_operation):
+            def query(operation, call):
+                def request():
+                    with contain_baostock_output():
+                        record_active_physical_attempt_io()
+                        return _named_query_rows(call(), operation)
+
+                return execute_operation(operation, request)
+
+            # One leader owns this session and consumes every SDK cursor before
+            # logout. Followers receive only codec-safe rows and the leader time.
+            with _session(
+                physical_request=execute_operation, record_physical_io=True
+            ):
+                raw_rows = query("raw-history", lambda: bs.query_history_k_data_plus(
+                    instrument.baostock_code, RAW_HISTORY_FIELDS,
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag="3"))
+                factor_rows = query("adjustment-factors", lambda: bs.query_adjust_factor(
+                    instrument.baostock_code, end_date=adjustment_as_of or end_date))
+                calendar_rows = query("session-calendar", lambda: bs.query_trade_dates(
+                    start_date=start_date, end_date=end_date))
+            return {
+                "raw_rows": raw_rows,
+                "factor_rows": factor_rows,
+                "calendar_rows": calendar_rows,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        payload = physical_workflow(workflow)
+        if not isinstance(payload, dict) or set(payload) != {
+            "raw_rows", "factor_rows", "calendar_rows", "observed_at"
+        }:
+            raise ValueError("invalid BaoStock history workflow result")
+        observed_at = datetime.fromisoformat(payload["observed_at"])
+        if observed_at.tzinfo is None:
+            raise ValueError("BaoStock history observation time must be timezone-aware")
+        raw_rows = payload["raw_rows"]
+        factor_rows = payload["factor_rows"]
+        calendar_rows = payload["calendar_rows"]
+    elif physical_request is not None:
+        # Keep query and row consumption inside the physical attempt. SDK result
+        # objects are session-bound and must never enter the persisted handoff.
+        def query(operation, call):
+            def request():
+                with contain_baostock_output():
+                    return _named_query_rows(call(), operation)
+            return physical_request(operation, request)
+
+        with _session(physical_request=physical_request):
+            raw_rows = query("raw-history", lambda: bs.query_history_k_data_plus(
+                instrument.baostock_code, RAW_HISTORY_FIELDS, start_date=start_date,
+                end_date=end_date, frequency="d", adjustflag="3"))
+            factor_rows = query("adjustment-factors", lambda: bs.query_adjust_factor(
+                instrument.baostock_code, end_date=adjustment_as_of or end_date))
+            calendar_rows = query("session-calendar", lambda: bs.query_trade_dates(
+                start_date=start_date, end_date=end_date))
+    else:
+        raw_rows, factor_rows, calendar_rows = _load_history_rows_legacy(
+            instrument, start_date, end_date, before_physical_request)
+
+    return _history_candidate(
+        symbol, instrument, end_date, raw_rows, factor_rows, calendar_rows,
+        observed_at=observed_at,
+    )
+
+
+def _load_history_rows_legacy(instrument, start_date, end_date, before_physical_request):
     with _session():
         if before_physical_request is not None:
             before_physical_request("raw-history")
@@ -398,6 +484,28 @@ def load_snapshot_with_history(
             raw_rows = _named_query_rows(raw_result, "raw history")
             factor_rows = _named_query_rows(factor_result, "adjustment factors")
             calendar_rows = _named_query_rows(calendar_result, "session calendar")
+    return raw_rows, factor_rows, calendar_rows
+
+
+def _history_candidate(
+    symbol, instrument, end_date, raw_rows, factor_rows, calendar_rows,
+    *, observed_at: datetime | None = None,
+):
+    from tradingagents.market_history.calendar import (
+        MarketSession,
+        MarketSessionCalendarPublication,
+        MarketSessionStatus,
+    )
+    from tradingagents.market_history.coordinator import upstream_service_identity_for_provider
+    from tradingagents.market_history.models import (
+        AdjustmentFactorObservation,
+        InstrumentSpec,
+        ProvenanceClass,
+        ProviderDatasetSpec,
+        ProviderHistoryBundlePublication,
+        TradingStatus,
+    )
+    from tradingagents.market_history.suspension import normalize_mainland_session
 
     normalized_sessions = []
     for row in raw_rows:
@@ -509,7 +617,8 @@ def load_snapshot_with_history(
             "BaoStock returned no session calendar rows",
         )
 
-    observed_at = datetime.now(timezone.utc)
+    if observed_at is None:
+        observed_at = datetime.now(timezone.utc)
     upstream_service_id, service_name = upstream_service_identity_for_provider(
         "baostock"
     )

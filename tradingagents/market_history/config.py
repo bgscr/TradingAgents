@@ -10,6 +10,7 @@ class MarketHistoryMode(str, Enum):
     """Controls whether stored history can influence current analysis."""
 
     SHADOW = "shadow"
+    CURRENT = "current"
     AUTHORITATIVE = "authoritative"
     DISABLED = "disabled"
 

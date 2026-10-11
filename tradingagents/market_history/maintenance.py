@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
 
@@ -77,6 +77,7 @@ class HistoryRefreshPlan:
     session_dates: tuple[date, ...]
     requested_start: date | None
     requested_end: date | None
+    request_ranges: tuple[tuple[date, date], ...] = ()
 
 
 def plan_incremental_refresh(
@@ -87,17 +88,29 @@ def plan_incremental_refresh(
     seeded: bool,
     listed_on: date | None = None,
     refresh_window_sessions: int = 21,
+    requested_start: date | None = None,
+    refresh_due: bool = True,
 ) -> HistoryRefreshPlan:
     if refresh_window_sessions < 1:
         raise ValueError("refresh window must contain at least one session")
-    eligible = tuple(
+    sessions = tuple(sessions)
+    known_dates = {session.session_date for session in sessions}
+    unknown_dates = (
+        {requested_start + timedelta(days=index)
+         for index in range((as_of_date - requested_start).days + 1)} - known_dates
+        if requested_start is not None else set()
+    )
+    open_dates = {
         session.session_date
         for session in sessions
         if session.status is MarketSessionStatus.OPEN
         and session.session_date <= as_of_date
-    )
+        and (requested_start is None or session.session_date >= requested_start)
+        and (listed_on is None or session.session_date >= listed_on)
+    }
+    eligible = tuple(sorted(open_dates | unknown_dates))
     if not seeded:
-        seed_start = as_of_date - relativedelta(years=5)
+        seed_start = requested_start or as_of_date - relativedelta(years=5)
         if listed_on is not None:
             seed_start = max(seed_start, listed_on)
         planned = tuple(day for day in eligible if day >= seed_start)
@@ -106,15 +119,28 @@ def plan_incremental_refresh(
             session_dates=planned,
             requested_start=planned[0] if planned else None,
             requested_end=planned[-1] if planned else None,
+            request_ranges=((planned[0], planned[-1]),) if planned else (),
         )
     missing = {day for day in eligible if day not in retained_session_dates}
-    overlap = set(eligible[-refresh_window_sessions:])
+    # Unknown dates require calendar discovery; they are never counted as
+    # confirmed sessions in the bounded correction overlap.
+    overlap = set(sorted(open_dates)[-refresh_window_sessions:]) if refresh_due else set()
     planned = tuple(sorted(missing | overlap))
+    ranges: list[tuple[date, date]] = []
+    for index, day in enumerate(eligible):
+        if day not in missing | overlap:
+            continue
+        previous = eligible[index - 1] if index else None
+        if ranges and ranges[-1][1] == previous:
+            ranges[-1] = (ranges[-1][0], day)
+        else:
+            ranges.append((day, day))
     return HistoryRefreshPlan(
         is_seed=False,
         session_dates=planned,
         requested_start=planned[0] if planned else None,
         requested_end=planned[-1] if planned else None,
+        request_ranges=tuple(ranges),
     )
 
 

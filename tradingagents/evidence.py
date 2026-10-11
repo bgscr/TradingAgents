@@ -3263,7 +3263,12 @@ def build_evidence_state(
                 None,
             ),
             history_gap_dates=getattr(snapshot, "history_gap_dates", ()),
-            history_store_status=getattr(snapshot, "history_store_status", "live"),
+            # The external v1 field describes access, not strict PIT eligibility.
+            # Preserve its closed vocabulary; current-only provenance remains in
+            # the retained manifest and diagnostic.
+            history_store_status=("stored" if getattr(snapshot, "history_store_status", "live")
+                                  in {"refreshed", "current_only_cached"}
+                                  else getattr(snapshot, "history_store_status", "live")),
             history_store_diagnostic=getattr(
                 snapshot,
                 "history_store_diagnostic",

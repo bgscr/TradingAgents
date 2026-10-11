@@ -12,6 +12,7 @@ from tradingagents.market_history.config import MarketHistoryConfig, MarketHisto
 from tradingagents.market_history.coordinator import (
     upstream_service_identity_for_provider,
 )
+from tradingagents.market_history.models import InstrumentSpec, ProviderDatasetSpec
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,17 @@ def persist_mainland_history_candidate(candidate: object) -> HistoryBundleWriteR
     try:
         publication = candidate.history_bundle
         calendar = candidate.calendar
+        if not publication.provider.strict_history_qualified:
+            return HistoryBundleWriteResult(True, False,
+                diagnostic="provider_history_not_qualified")
         with MarketHistoryStore.open(config) as store:
             prior_bundle_revision_id = None
             try:
                 prior_bundle = store.latest_qualified_history_bundle(
                     publication.instrument.canonical_symbol,
                     publication.requested_as_of.isoformat(),
+                    provider=publication.provider,
+                    instrument=publication.instrument,
                 )
             except KeyError:
                 pass
@@ -134,6 +140,9 @@ def persist_mainland_provider_frame(
     frame_digest: str,
     history_rows: int,
     normalized_frame_text: str,
+    cache_provider: ProviderDatasetSpec | None = None,
+    cache_instrument: InstrumentSpec | None = None,
+    snapshot_metadata: dict | None = None,
 ) -> ShadowWriteResult:
     """Fail open after persisting one accepted live frame; never reacquire data."""
     runtime = get_config()
@@ -147,6 +156,22 @@ def persist_mainland_provider_frame(
     instrument = resolve_mainland_instrument(symbol)
     if instrument is None:
         return ShadowWriteResult(False, False)
+    if (cache_provider is None) != (cache_instrument is None):
+        return ShadowWriteResult(
+            True, False, diagnostic="cache_binding_incomplete"
+        )
+    if cache_provider is not None and (
+        not isinstance(cache_provider, ProviderDatasetSpec)
+        or not isinstance(cache_instrument, InstrumentSpec)
+        or cache_provider.strict_history_qualified
+        or cache_provider.provider_name != provider
+        or cache_instrument.canonical_symbol != instrument.yahoo_symbol
+        or cache_instrument.instrument_kind != instrument.instrument_kind
+        or cache_instrument.currency != "CNY"
+    ):
+        return ShadowWriteResult(
+            True, False, diagnostic="current_only_cache_binding_invalid"
+        )
 
     upstream_service_id, service_name = upstream_service_identity_for_provider(
         provider
@@ -165,12 +190,7 @@ def persist_mainland_provider_frame(
         instrument.instrument_kind,
         "CNY",
     )
-    from tradingagents.market_history.store import (
-        MarketHistoryStore,
-        ProviderFramePublication,
-    )
-
-    publication = ProviderFramePublication(
+    provider_spec = cache_provider or ProviderDatasetSpec(
         upstream_service_id=upstream_service_id,
         upstream_service_name=service_name,
         provider_dataset_id=provider_dataset_id,
@@ -178,12 +198,34 @@ def persist_mainland_provider_frame(
         dataset_name="mainland-current-adjusted-v1",
         adjustment_methodology=adjustment_basis,
         strict_history_qualified=False,
+    )
+    instrument_spec = cache_instrument or InstrumentSpec(
         instrument_id=instrument_id,
         canonical_symbol=canonical_symbol,
         reference_market=instrument.exchange,
         instrument_kind=instrument.instrument_kind,
         currency="CNY",
         identity_revision="mainland-routing-v1",
+    )
+    from tradingagents.market_history.store import (
+        MarketHistoryStore,
+        ProviderFramePublication,
+    )
+
+    publication = ProviderFramePublication(
+        upstream_service_id=provider_spec.upstream_service_id,
+        upstream_service_name=provider_spec.upstream_service_name,
+        provider_dataset_id=provider_spec.provider_dataset_id,
+        provider_name=provider_spec.provider_name,
+        dataset_name=provider_spec.dataset_name,
+        adjustment_methodology=provider_spec.adjustment_methodology,
+        strict_history_qualified=False,
+        instrument_id=instrument_spec.instrument_id,
+        canonical_symbol=instrument_spec.canonical_symbol,
+        reference_market=instrument_spec.reference_market,
+        instrument_kind=instrument_spec.instrument_kind,
+        currency=instrument_spec.currency,
+        identity_revision=instrument_spec.identity_revision,
         snapshot_id=snapshot_id,
         requested_start=requested_start,
         requested_end=requested_end,
@@ -193,6 +235,7 @@ def persist_mainland_provider_frame(
         history_rows=history_rows,
         retrieved_at=retrieved_at,
         normalized_frame=normalized_frame_text.encode("utf-8"),
+        snapshot_metadata=snapshot_metadata,
     )
     try:
         with MarketHistoryStore.open(config) as store:

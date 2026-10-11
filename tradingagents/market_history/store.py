@@ -37,6 +37,8 @@ from tradingagents.market_history.equivalence import (
 from tradingagents.market_history.frames import normalized_frame_sha256
 from tradingagents.market_history.models import (
     HistoryBundleProvenanceAudit,
+    InstrumentSpec,
+    ProviderDatasetSpec,
     ProviderHistoryBundlePublication,
     PublishedHistoryBundle,
     ReconstructedMarketSnapshot,
@@ -195,6 +197,7 @@ class ProviderFramePublication:
     history_rows: int
     retrieved_at: str
     normalized_frame: bytes
+    snapshot_metadata: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +223,7 @@ class StoredProviderFrame:
 class LoadedProviderFrame:
     stored: StoredProviderFrame
     frame: pd.DataFrame
+    metadata: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +234,45 @@ class StoredHistoryBundleRef:
 
 class MarketHistoryCorruptionError(RuntimeError):
     """Stored history cannot be trusted because durable bytes violate their digest."""
+
+
+_CURRENT_PROVIDER_FRAME_ENVELOPE = "current-provider-frame-envelope-v2"
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+def _provider_frame_payload(publication: ProviderFramePublication) -> bytes:
+    if publication.strict_history_qualified:
+        raise ValueError("current-only provider frames cannot confer strict-history qualification")
+    if sha256(publication.normalized_frame).hexdigest() != publication.frame_digest:
+        raise ValueError("normalized provider frame does not match frame_digest")
+    if publication.snapshot_metadata is None:
+        return publication.normalized_frame
+    if not isinstance(publication.snapshot_metadata, dict):
+        raise TypeError("provider frame snapshot_metadata must be an object")
+    payload = json.dumps(
+        {
+            "contract": _CURRENT_PROVIDER_FRAME_ENVELOPE,
+            "normalized_frame": publication.normalized_frame.decode("utf-8"),
+            "snapshot_metadata": publication.snapshot_metadata,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    # Reject key coercions that could otherwise create duplicate JSON keys.
+    json.loads(payload, object_pairs_hook=_unique_json_object,
+               parse_constant=_reject_json_constant)
+    return payload
 
 
 class ProviderRequestAuthorityUnavailableError(RuntimeError):
@@ -371,6 +414,15 @@ class MarketHistoryStore:
                 )
             require_preserved_rows(
                 "upstream_services",
+                columns="upstream_service_id, service_name, account_scope",
+            )
+            # An absent legacy ceiling imposes no policy to preserve. Keep an
+            # already-configured authority ceiling (notably Tushare's 40/min)
+            # when a price cache is first created after the coordinator DB.
+            # Explicit conflicting legacy ceilings still fail closed.
+            require_preserved_rows(
+                "upstream_services",
+                where="WHERE operator_ceiling_json IS NOT NULL",
                 columns=(
                     "upstream_service_id, account_scope, operator_ceiling_json"
                 ),
@@ -963,9 +1015,12 @@ class MarketHistoryStore:
         self,
         publication: ProviderFramePublication,
     ) -> StoredProviderFrame:
-        digest = sha256(publication.normalized_frame).hexdigest()
+        payload_bytes = _provider_frame_payload(publication)
+        digest = sha256(payload_bytes).hexdigest()
         with self._payload_mutation_scope("publisher", digest):
-            stored = self._publish_provider_frame_locked(publication)
+            stored = self._publish_provider_frame_locked(
+                publication, payload_bytes=payload_bytes
+            )
             self._phase_hook("publisher_references_committed", digest)
             self._verify_registered_payload_digest(digest)
             return stored
@@ -973,16 +1028,22 @@ class MarketHistoryStore:
     def _publish_provider_frame_locked(
         self,
         publication: ProviderFramePublication,
+        *,
+        payload_bytes: bytes | None = None,
     ) -> StoredProviderFrame:
         """Publish one independently validated current-provider frame in shadow state."""
         self._require_open()
         if publication.history_rows < 1:
             raise ValueError("provider frame must contain at least one history row")
-        if sha256(publication.normalized_frame).hexdigest() != publication.frame_digest:
-            raise ValueError("normalized provider frame does not match frame_digest")
+        if payload_bytes is None:
+            payload_bytes = _provider_frame_payload(publication)
         payload = self.install_payload(
-            publication.normalized_frame,
-            media_type="text/csv; charset=utf-8",
+            payload_bytes,
+            media_type=(
+                "application/json; charset=utf-8"
+                if publication.snapshot_metadata is not None
+                else "text/csv; charset=utf-8"
+            ),
         )
         frame_revision_id = revision_identity(
             RevisionKind.PROVIDER_FRAME,
@@ -1061,14 +1122,57 @@ class MarketHistoryStore:
                     publication.retrieved_at,
                 ),
             )
+            self._validate_provider_frame_entities(publication)
+            try:
+                stored = self.get_provider_frame_revision(frame_revision_id)
+            except KeyError:
+                raise ValueError(
+                    "provider frame snapshot identity already belongs to another revision"
+                ) from None
             self._connection.commit()
         except BaseException:
             self._connection.rollback()
             raise
-        return self.get_provider_frame(publication.snapshot_id)
+        return stored
+
+    def _validate_provider_frame_entities(
+        self, publication: ProviderFramePublication,
+    ) -> None:
+        provider = self._connection.execute(
+            "SELECT d.provider_name, d.upstream_service_id, d.dataset_name, "
+            "d.adjustment_methodology, d.strict_history_qualified, u.service_name "
+            "FROM provider_datasets AS d JOIN upstream_services AS u "
+            "ON u.upstream_service_id = d.upstream_service_id "
+            "WHERE d.provider_dataset_id = ?", (publication.provider_dataset_id,),
+        ).fetchone()
+        if provider != (
+            publication.provider_name, publication.upstream_service_id,
+            publication.dataset_name, publication.adjustment_methodology,
+            0, publication.upstream_service_name,
+        ):
+            raise ValueError("current provider dataset identity conflicts with stored metadata")
+        instrument = self._connection.execute(
+            "SELECT canonical_symbol, reference_market, instrument_kind, currency, "
+            "identity_revision FROM instruments WHERE instrument_id = ?",
+            (publication.instrument_id,),
+        ).fetchone()
+        if instrument != (
+            publication.canonical_symbol, publication.reference_market,
+            publication.instrument_kind, publication.currency, publication.identity_revision,
+        ):
+            raise ValueError("current instrument identity conflicts with stored metadata")
 
     def get_provider_frame(self, snapshot_id: str) -> StoredProviderFrame:
+        return self._get_provider_frame("snapshot_id", snapshot_id)
+
+    def get_provider_frame_revision(self, frame_revision_id: str) -> StoredProviderFrame:
+        """Read the exact immutable frame revision, without a snapshot-ID lookup."""
+        return self._get_provider_frame("frame_revision_id", frame_revision_id)
+
+    def _get_provider_frame(self, identity_column: str, value: str) -> StoredProviderFrame:
         self._require_open()
+        if identity_column not in {"snapshot_id", "frame_revision_id"}:
+            raise ValueError("unsupported provider frame identity column")
         row = self._connection.execute(
             "SELECT f.frame_revision_id, f.snapshot_id, f.provider_dataset_id, "
             "d.provider_name, f.instrument_id, i.canonical_symbol, f.requested_start, "
@@ -1077,11 +1181,11 @@ class MarketHistoryStore:
             "f.current_only FROM provider_frame_revisions AS f "
             "JOIN provider_datasets AS d ON d.provider_dataset_id = f.provider_dataset_id "
             "JOIN instruments AS i ON i.instrument_id = f.instrument_id "
-            "WHERE f.snapshot_id = ?",
-            (snapshot_id,),
+            f"WHERE f.{identity_column} = ?",
+            (value,),
         ).fetchone()
         if row is None:
-            raise KeyError(f"unknown provider frame snapshot {snapshot_id}")
+            raise KeyError(f"unknown provider frame {identity_column} {value}")
         return StoredProviderFrame(
             frame_revision_id=str(row[0]),
             snapshot_id=str(row[1]),
@@ -1107,46 +1211,131 @@ class MarketHistoryStore:
         requested_end: str,
         *,
         minimum_history_rows: int,
+        provider: ProviderDatasetSpec | None = None,
+        instrument: InstrumentSpec | None = None,
+        adjustment_basis: str | None = None,
     ) -> LoadedProviderFrame:
         self._require_open()
+        predicates = ""
+        parameters: list[object] = [canonical_symbol, requested_start, requested_end]
+        if provider is not None:
+            if provider.strict_history_qualified:
+                raise ValueError("current-only lookup cannot request a strict-history dataset")
+            predicates += (
+                " AND d.provider_dataset_id = ? AND d.provider_name = ?"
+                " AND d.upstream_service_id = ? AND u.service_name = ?"
+                " AND d.dataset_name = ? AND d.adjustment_methodology = ?"
+                " AND d.strict_history_qualified = 0"
+            )
+            parameters.extend((
+                provider.provider_dataset_id, provider.provider_name,
+                provider.upstream_service_id, provider.upstream_service_name,
+                provider.dataset_name, provider.adjustment_methodology,
+            ))
+        if instrument is not None:
+            predicates += (
+                " AND i.instrument_id = ? AND i.canonical_symbol = ?"
+                " AND i.reference_market = ? AND i.instrument_kind = ?"
+                " AND i.currency = ? AND i.identity_revision = ?"
+            )
+            parameters.extend((
+                instrument.instrument_id, instrument.canonical_symbol,
+                instrument.reference_market, instrument.instrument_kind,
+                instrument.currency, instrument.identity_revision,
+            ))
+        if adjustment_basis is not None:
+            predicates += " AND f.adjustment_basis = ?"
+            parameters.append(adjustment_basis)
         row = self._connection.execute(
-            "SELECT f.snapshot_id FROM provider_frame_revisions AS f "
+            "SELECT f.frame_revision_id FROM provider_frame_revisions AS f "
             "JOIN instruments AS i ON i.instrument_id = f.instrument_id "
+            "JOIN provider_datasets AS d ON d.provider_dataset_id = f.provider_dataset_id "
+            "JOIN upstream_services AS u ON u.upstream_service_id = d.upstream_service_id "
             "WHERE i.canonical_symbol = ? AND f.requested_start = ? "
-            "AND f.requested_end = ? AND f.current_only = 1 "
-            "ORDER BY f.retrieved_at DESC LIMIT 1",
-            (canonical_symbol, requested_start, requested_end),
+            "AND f.requested_end = ? AND f.current_only = 1 " + predicates +
+            " ORDER BY f.retrieved_at DESC, f.frame_revision_id DESC LIMIT 1",
+            tuple(parameters),
         ).fetchone()
         if row is None:
             raise KeyError(
                 f"no stored current frame for {canonical_symbol} "
                 f"from {requested_start} to {requested_end}"
             )
-        stored = self.get_provider_frame(str(row[0]))
+        return self.load_provider_frame_revision(
+            str(row[0]), minimum_history_rows=minimum_history_rows
+        )
+
+    def load_provider_frame_revision(
+        self, frame_revision_id: str, *, minimum_history_rows: int = 1,
+    ) -> LoadedProviderFrame:
+        stored = self.get_provider_frame_revision(frame_revision_id)
         if stored.history_rows < minimum_history_rows:
             raise KeyError(
                 f"stored frame has {stored.history_rows} rows; "
                 f"{minimum_history_rows} required"
             )
-        text = self.read_payload(stored.payload_digest).decode("utf-8")
-        frame = pd.read_csv(io.StringIO(text))
-        frame["Date"] = pd.to_datetime(frame["Date"])
-        for column in ("Open", "High", "Low", "Close"):
-            if column in frame:
-                frame[column] = frame[column].astype(float)
+        metadata = None
+        try:
+            text = self.read_payload(stored.payload_digest).decode("utf-8")
+            if text.lstrip().startswith("{"):
+                envelope = json.loads(
+                    text, object_pairs_hook=_unique_json_object,
+                    parse_constant=_reject_json_constant,
+                )
+                if (
+                    not isinstance(envelope, dict)
+                    or set(envelope) != {"contract", "normalized_frame", "snapshot_metadata"}
+                    or envelope["contract"] != _CURRENT_PROVIDER_FRAME_ENVELOPE
+                    or not isinstance(envelope["normalized_frame"], str)
+                    or not isinstance(envelope["snapshot_metadata"], dict)
+                ):
+                    raise ValueError("invalid current provider frame envelope")
+                text = envelope["normalized_frame"]
+                metadata = envelope["snapshot_metadata"]
+            if sha256(text.encode("utf-8")).hexdigest() != stored.frame_digest:
+                raise ValueError("stored provider CSV bytes no longer match frame_digest")
+            frame = pd.read_csv(io.StringIO(text), float_precision="round_trip")
+            frame["Date"] = pd.to_datetime(frame["Date"])
+            for column in ("Open", "High", "Low", "Close"):
+                if column in frame:
+                    frame[column] = frame[column].astype(float)
+        except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+            raise MarketHistoryCorruptionError("stored provider frame payload is invalid") from exc
         if len(frame) != stored.history_rows:
             raise MarketHistoryCorruptionError("stored provider frame row count changed")
         if normalized_frame_sha256(frame) != stored.frame_digest:
             raise MarketHistoryCorruptionError("stored provider frame digest changed")
-        return LoadedProviderFrame(stored=stored, frame=frame)
+        return LoadedProviderFrame(stored=stored, frame=frame, metadata=metadata)
 
     def latest_qualified_history_bundle(
         self,
         canonical_symbol: str,
         requested_as_of: str,
+        *,
+        provider: ProviderDatasetSpec | None = None,
+        instrument: InstrumentSpec | None = None,
     ) -> StoredHistoryBundleRef:
         """Select one complete strict-history bundle, never a current-only frame."""
         self._require_open()
+        predicates = ""
+        parameters: list[object] = [canonical_symbol, requested_as_of]
+        if provider is not None:
+            predicates += (
+                " AND d.provider_dataset_id = ? AND d.provider_name = ?"
+                " AND d.upstream_service_id = ? AND d.dataset_name = ?"
+                " AND d.adjustment_methodology = ?"
+            )
+            parameters.extend((provider.provider_dataset_id, provider.provider_name,
+                               provider.upstream_service_id, provider.dataset_name,
+                               provider.adjustment_methodology))
+        if instrument is not None:
+            predicates += (
+                " AND i.instrument_id = ? AND i.identity_revision = ?"
+                " AND i.reference_market = ? AND i.instrument_kind = ? AND i.currency = ?"
+            )
+            parameters.extend((instrument.instrument_id, instrument.identity_revision,
+                               instrument.reference_market, instrument.instrument_kind,
+                               instrument.currency))
         row = self._connection.execute(
             "SELECT b.bundle_revision_id, b.observed_at "
             "FROM history_bundle_revisions AS b "
@@ -1154,10 +1343,10 @@ class MarketHistoryStore:
             "ON d.provider_dataset_id = b.provider_dataset_id "
             "JOIN instruments AS i ON i.instrument_id = b.instrument_id "
             "WHERE i.canonical_symbol = ? AND d.strict_history_qualified = 1 "
-            "AND b.requested_as_of <= ? "
+            "AND b.requested_as_of <= ? " + predicates +
             "ORDER BY b.requested_as_of DESC, b.observed_at DESC, "
             "b.bundle_revision_id DESC LIMIT 1",
-            (canonical_symbol, requested_as_of),
+            tuple(parameters),
         ).fetchone()
         if row is None:
             raise KeyError(
@@ -1415,6 +1604,7 @@ class MarketHistoryStore:
         bundle_revision_id: str,
         *,
         requested_date,
+        requested_start=None,
         purpose: SnapshotPurpose,
         replay_as_of: datetime | None = None,
         asset_configuration: RunAssetConfiguration | None = None,
@@ -1431,6 +1621,7 @@ class MarketHistoryStore:
                 self,
                 bundle_revision_id,
                 requested_date=requested_date,
+                requested_start=requested_start,
                 purpose=purpose,
                 replay_as_of=replay_as_of,
                 pin=True,
