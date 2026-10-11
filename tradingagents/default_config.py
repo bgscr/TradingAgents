@@ -1,3 +1,4 @@
+import json
 import os
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
@@ -151,6 +152,73 @@ def _apply_env_overrides(config: dict) -> dict:
             else "crypto_identity_registry_path"
         )
         config[missing_key] = None
+    # This nested selection preserves other markets and vendor categories.
+    cn_a_core = os.environ.get("TRADINGAGENTS_CN_A_CORE_STOCK_APIS")
+    if cn_a_core is not None and cn_a_core != "":
+        market_vendors = dict(config.get("market_data_vendors", {}))
+        cn_a_vendors = dict(market_vendors.get("cn_a", {}))
+        cn_a_vendors["core_stock_apis"] = cn_a_core
+        market_vendors["cn_a"] = cn_a_vendors
+        config["market_data_vendors"] = market_vendors
+    return config
+
+
+def _local_config_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate key in tradingagents.local.json")
+        result[key] = value
+    return result
+
+
+def _apply_local_analysis_overrides(config: dict) -> dict:
+    """Load an explicit non-secret research profile after environment settings.
+
+    The launcher supplies PROJECT_ROOT; direct CLI/package use resolves the
+    source installation root. Never search the working directory or dotenv.
+    """
+    root = _PROJECT_RUNTIME_ROOT or os.path.dirname(os.path.dirname(__file__))
+    path = os.path.join(root, "tradingagents.local.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            local = json.load(handle, object_pairs_hook=_local_config_object)
+    except FileNotFoundError:
+        return config
+    scalar_choices = {
+        "market_history_mode": {"disabled", "shadow", "current"},
+        "data_usage_mode": {"personal_research"},
+        "mainland_capability_routing_mode": {"legacy"},
+    }
+    if not isinstance(local, dict) or set(local) - (
+        set(scalar_choices) | {"market_data_vendors"}
+    ):
+        raise ValueError("Unsupported fields in tradingagents.local.json")
+    for key, choices in scalar_choices.items():
+        if key in local and (
+            not isinstance(local[key], str) or local[key] not in choices
+        ):
+            raise ValueError("Invalid research setting in tradingagents.local.json")
+    core = None
+    if "market_data_vendors" in local:
+        vendors = local["market_data_vendors"]
+        if not isinstance(vendors, dict) or set(vendors) != {"cn_a"}:
+            raise ValueError("Invalid market selection in tradingagents.local.json")
+        mainland = vendors["cn_a"]
+        if not isinstance(mainland, dict) or set(mainland) != {"core_stock_apis"}:
+            raise ValueError("Invalid vendor selection in tradingagents.local.json")
+        core = mainland["core_stock_apis"]
+        if not isinstance(core, str) or not core.strip():
+            raise ValueError("Invalid vendor selection in tradingagents.local.json")
+    for key in scalar_choices:
+        if key in local:
+            config[key] = local[key]
+    if core is not None:
+        vendors = dict(config.get("market_data_vendors", {}))
+        mainland = dict(vendors.get("cn_a", {}))
+        mainland["core_stock_apis"] = core
+        vendors["cn_a"] = mainland
+        config["market_data_vendors"] = vendors
     return config
 
 
@@ -303,3 +371,6 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "":     "SPY",         # default for US-listed tickers (no suffix)
     },
 })
+
+# This file is an operator's explicit local selection, not a product default.
+DEFAULT_CONFIG = _apply_local_analysis_overrides(DEFAULT_CONFIG)

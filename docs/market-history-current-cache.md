@@ -4,6 +4,23 @@
 
 ## 配置与读取顺序
 
+日常使用可在项目根目录创建独立、无秘密的 `tradingagents.local.json`：
+
+```json
+{
+  "market_history_mode": "current",
+  "data_usage_mode": "personal_research",
+  "mainland_capability_routing_mode": "legacy",
+  "market_data_vendors": {
+    "cn_a": {"core_stock_apis": "tushare"}
+  }
+}
+```
+
+启动脚本通过 `TRADINGAGENTS_PROJECT_ROOT` 指定该目录；直接运行 CLI 或 Python 包时，使用所加载源码的项目根目录，不搜索当前工作目录。此文件只允许上述四项普通研究配置，可仅提供其中部分项。其明确设置优先于环境变量和 dotenv，其他配置保持原值；文件不存在时原行为完全不变。重复键、未知字段和无效类型会使配置加载失败。不要在此文件放入密钥、数据库路径或资格设置，也不要把个人启用文件提交到版本库。
+
+无需改动全局环境变量或 `.env`。如调用方主动使用进程环境配置，嵌套源选择还可通过 `TRADINGAGENTS_CN_A_CORE_STOCK_APIS` 指定；它只覆盖 `cn_a.core_stock_apis`。移除本地文件，或将其中 `market_history_mode` 改为 `shadow`，即可恢复相应行为。
+
 - 设置 `market_history_mode="current"`，并使用 `data_usage_mode="personal_research"`。
 - 如需 Tushare 普通单源，显式设置 `market_data_vendors.cn_a.core_stock_apis="tushare"`，并设置 `mainland_capability_routing_mode="legacy"`；普通入口要求 legacy 路由才能选择 Tushare。这只选择当前分析供应商，不授予历史回放资格。凭据继续使用既有配置边界，不写入缓存配置或本文示例。
 - `market_history_current_cache_max_age_seconds` 默认 `86400`，接受 `1..86400` 的整数秒；超过有效期的帧不能命中。
