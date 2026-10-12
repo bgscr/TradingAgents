@@ -183,14 +183,10 @@ def test_native_v3_prepared_controls_completion_and_old_schema_rejection(complet
 
 
 @pytest.mark.windows
-def test_real_worker_materialization_dispatch_accepts_v2_and_preserves_ancestry(
-    completed, tmp_path, monkeypatch
-):
-    """Only owner construction is an explicit synthetic seam; dispatch is real."""
-    from scripts.policy_owner.owner_worker import dispatch
+def test_materialization_preserves_v2_coverage_and_exact_ancestry(completed):
+    """Pure consumers retain coverage; enrollment-only workers cannot materialize."""
     from tests.test_runtime_protection_contract import attempt_inputs
     from tests.test_runtime_protection_handoff import prepared_evidence
-    from tradingagents import windows_policy_owner
     from tradingagents.policy_qualified_contract import canonical_bytes
     from tradingagents.policy_qualified_native import (
         NativeOwnerBinding,
@@ -262,7 +258,6 @@ def test_real_worker_materialization_dispatch_accepts_v2_and_preserves_ancestry(
     native_source["identity"] = content_identity(
         "policy-qualified-native-consumer-source:v1", native_source
     )
-    (tmp_path / "native-consumer-source.json").write_bytes(canonical_bytes(native_source))
     anchor = {
         "instance": "test-20990101-999",
         "storage_binding_identity": content_identity("synthetic-storage:v1", "none"),
@@ -279,21 +274,22 @@ def test_real_worker_materialization_dispatch_accepts_v2_and_preserves_ancestry(
         native_consumer_source_identity=native_source["identity"],
         execution_authorized=False,
     )
-    plan = seal_conditional_materialization_plan(
-        attempt=attempt,
-        owner_binding=binding,
-        policy_verifier=case.verifier,
-        runtime_content=manifests["runtime"],
-        app_content=manifests["app"],
-        source_locations={
+    materialization_inputs = {
+        "attempt": attempt,
+        "owner_binding": binding,
+        "policy_verifier": case.verifier,
+        "runtime_content": manifests["runtime"],
+        "app_content": manifests["app"],
+        "source_locations": {
             "runtime/base/fixture.txt": r"D:\SYNTHETIC\runtime.txt",
             "app/tradingagents/fixture.txt": r"D:\SYNTHETIC\app.txt",
         },
-        deployment_configuration=config,
-        environment=environment,
-        working_directory=cwd,
-        python_version="3.13.7",
-    )
+        "deployment_configuration": config,
+        "environment": environment,
+        "working_directory": cwd,
+        "python_version": "3.13.7",
+    }
+    plan = seal_conditional_materialization_plan(**materialization_inputs)
     collection = case.owner.save("synthetic-test-collection:v1", {"execution_authorized": False})
     provenance = NativePayloadProvenance.seal(
         contract_version="policy-qualified-native-payload-provenance-v1",
@@ -306,33 +302,52 @@ def test_real_worker_materialization_dispatch_accepts_v2_and_preserves_ancestry(
         collection_provenance=collection,
         execution_authorized=False,
     )
-    owner = case.owner
-    owner.root = tmp_path
-    owner.anchor = anchor
-    owner.ledger = case.ledger
-    owner.reconcile_authenticated_records = lambda: None
+    assert plan["contract_version"] == "policy-qualified-runtime-protection-materialization-v3"
+    assert plan["attempt"]["inputs"]["acceptance"] == envelope.model_dump(mode="json")
+    assert plan["runtime_content"] == manifests["runtime"]
+    assert plan["app_content"] == manifests["app"]
+    assert plan["execution_authorized"] is False
+    assert NativePayloadProvenance.read(provenance) == provenance
 
-    def registration(kind, key):
-        assert kind == "native-payload" and key == provenance.preparation_lineage_identity
-        return provenance.model_dump(mode="json")
-
-    owner._registration = registration
-    monkeypatch.setattr(windows_policy_owner, "LocalWindowsPolicyOwner", lambda *args: owner)
-    request = {
-        "anchor": anchor,
-        "authenticated_records": [],
-        "now_utc": owner.resolution.now_utc,
-        "operation": "verify-materialization",
-        "payload": {
-            "materialization": plan,
-            "native_consumer_source_identity": native_source["identity"],
+    # Reseal the changed component so rejection exercises ancestry, rather than
+    # merely detecting an outdated digest on the original valid component.
+    changed_app = make_content_manifest(
+        **{
+            key: value
+            for key, value in manifests["app"].items()
+            if key not in {"contract_version", "identity", "source_commit"}
         },
+        source_commit="0" * 40,
+    )
+    with pytest.raises(ValueError, match="ancestry mismatch"):
+        seal_conditional_materialization_plan(
+            **{**materialization_inputs, "app_content": changed_app}
+        )
+    with pytest.raises(ValueError, match="exact qualified source/runtime ancestry"):
+        NativePayloadProvenance.seal(
+            **{**provenance.model_dump(mode="json", exclude={"identity"}), "app_content": changed_app}
+        )
+
+
+def test_legacy_materialization_worker_rejects_before_project_import(monkeypatch):
+    import builtins
+
+    from scripts.policy_owner.owner_worker import dispatch
+
+    original_import = builtins.__import__
+
+    def reject_project_import(name, *args, **kwargs):
+        if name == "tradingagents" or name.startswith("tradingagents."):
+            raise AssertionError("legacy request reached a project import")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_project_import)
+    request = {
+        "anchor": {},
+        "authenticated_records": [],
+        "now_utc": "2099-01-01T00:00:04+00:00",
+        "operation": "verify-materialization",
+        "payload": {},
     }
-    response = dispatch(request)
-    assert response["contract_version"] == "policy-owner-native-conditional-verification-v2"
-    assert response["envelope"] == envelope.model_dump(mode="json")
-    assert response["execution_authorized"] is False
-    changed = deepcopy(request)
-    changed["payload"]["materialization"]["app_content"]["source_commit"] = "0" * 40
-    with pytest.raises(ValueError):
-        dispatch(changed)
+    with pytest.raises(ValueError, match="v1/generic worker route permanently disabled"):
+        dispatch(request)
