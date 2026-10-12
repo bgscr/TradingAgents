@@ -404,10 +404,14 @@ def test_normal_five_year_two_stock_5000_page_requirement_is_ten_and_reopen_zero
     assert rig.events() == before and len(rig.calls) == 10
 
 
-def test_acceptance_guard_full_five_year_path_counts_ten_then_reopens_without_network(ordinary_rig, monkeypatch):
+@pytest.mark.parametrize("explicit_end,duplicate", [(None, False), (date(2026, 10, 8), False), (None, True)])
+def test_acceptance_discovery_real_chain_then_reopen_or_reject_duplicate(ordinary_rig, monkeypatch, explicit_end, duplicate):
+    import importlib.util
     import json
+    from pathlib import Path
     from types import SimpleNamespace
 
+    import tradingagents.tushare_acceptance as support
     from tradingagents import tushare_https as tls
     from tradingagents.dataflows import market_snapshot
     from tradingagents.market_history import coordinator
@@ -420,12 +424,15 @@ def test_acceptance_guard_full_five_year_path_counts_ten_then_reopens_without_ne
     def sleep(seconds):
         rig.clock[0] += timedelta(seconds=seconds)
 
-    guard = RequestGuard("2021-10-08", "2026-10-08", records.append,
-        now=lambda: (rig.clock[0] - NOW).total_seconds(), sleep=sleep)
+    discovery = support.CalendarDiscoveryWindow.capture(explicit_end, started_at=rig.clock[0])
+    guard = RequestGuard(discovery.start.isoformat(), discovery.end.isoformat(), records.append,
+        now=lambda: (rig.clock[0] - NOW).total_seconds(), sleep=sleep, discovery=discovery)
 
     class SyntheticTransport:
         def post(self, url, *, json, timeout):
             frame = rig.synthetic_client.query(json["api_name"], **json["params"])
+            if duplicate and guard.discovering:
+                frame = pd.concat([frame, frame.iloc[:1]], ignore_index=True)
             return SimpleNamespace(text=__import__("json").dumps({"code": 0, "data": {
                 "fields": list(frame.columns), "items": frame.values.tolist()}}))
 
@@ -446,9 +453,22 @@ def test_acceptance_guard_full_five_year_path_counts_ten_then_reopens_without_ne
 
     monkeypatch.setattr(TushareProvider, "create",
         lambda *args, **kwargs: TushareProvider(tls._Client(sdk_query), page_size=5000))
-    run_data_phases(guard, market_snapshot, records.append, end="2026-10-08")
-    assert guard.attempts == len(rig.calls) == len(rig.events()) == 10
-    assert records[-1] == {"kind": "completed", "physical_attempts": 10,
+    path = Path(__file__).resolve().parents[1] / "scripts/accept_tushare_current.py"
+    spec = importlib.util.spec_from_file_location("synthetic_calendar_acceptance_launcher", path)
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    if duplicate:
+        with pytest.raises(support.AcceptanceStop, match="calendar_response_invalid"):
+            launcher.discover_end(support, guard, rig.runtime)
+        assert guard.attempts == len(rig.calls) == len(rig.events()) == 1
+        assert guard.discovering and all(item["kind"] == "physical_attempt" for item in records)
+        return
+    selected = launcher.discover_end(support, guard, rig.runtime)
+    assert selected == "2026-10-08" and guard.attempts == 2
+    assert [(endpoint, args["exchange"]) for endpoint, args in rig.calls] == [("trade_cal", "SSE"), ("trade_cal", "SZSE")]
+    run_data_phases(guard, market_snapshot, records.append, end=selected)
+    assert guard.attempts == len(rig.calls) == len(rig.events()) == 12
+    assert records[-1] == {"kind": "completed", "physical_attempts": 12,
                            "reuse_attempts": 0, "model_calls": 0}
     initial = [item for item in records if item["kind"] == "initial"]
     assert len(initial) == 2

@@ -53,14 +53,16 @@ Current-cache compatibility manifest 仅约束当前缓存实现和对应源码�
 
 ## 用户手动启动的双股票数据验收
 
-`scripts/accept_tushare_current.py` 只调用普通行情入口，固定处理 `600895.SH`、`000001.SZ` 从 `E` 往前五年的完整窗口；不调用模型。`--end E` 必须是两个交易所均已完整发布的前一个共同交易日，脚本还要求它早于上海当前日期。本文不执行该脚本。
+`scripts/accept_tushare_current.py` 固定处理 `600895.SH`、`000001.SZ` 从 `E` 往前五年的完整窗口，不调用模型。用户启动后，脚本先安装 HTTPS 和共享预算闸，再通过既有跨进程 coordinator 查询 SSE、SZSE 在启动时上海日期之前的 31 个自然日。两个日历必须逐日完整、无重复且开闭市状态一致，才能自动选择最近共同开市日 E；空日历、覆盖不全、两所冲突或没有共同开市日均停止。日期窗口在启动时固定，跨午夜不扩展窗口、不重查。
 
-在明确授权的源码目录 `SOURCE` 中，用该项目的 Python 手动启动，例如（路径及 `E` 应替换为真实确认值）：
+`--end E` 可选；指定时 E 必须位于同一近期 31 日范围，并经两所日历确认开市。显式日期不会跳过日历查询。日历只证明交易安排，不能证明日线或因子已完整发布；后续普通行情入口仍校验完整五年覆盖，且每只返回的有效日期必须等于 E。本文不执行该脚本。
+
+在明确授权的源码目录 `SOURCE` 中，用该项目的 Python 手动启动，例如（路径应替换为真实确认值，账本必须使用新文件名）：
 
 ```powershell
-& 'SOURCE\.venv\Scripts\python.exe' -I -S -B 'SOURCE\scripts\accept_tushare_current.py' --end E --database 'SOURCE\data\market_history\market_history.sqlite3' --ledger 'SOURCE\logs\tushare-current-acceptance-new.jsonl'
+& 'SOURCE\.venv\Scripts\python.exe' -I -S -B 'SOURCE\scripts\accept_tushare_current.py' --database 'SOURCE\data\market_history\market_history.sqlite3' --ledger 'SOURCE\logs\tushare-current-acceptance-new.jsonl'
 ```
 
 `--database` 必须精确指向本 checkout 既有的 `data/market_history/market_history.sqlite3`；该库及相邻 `.provider-requests.sqlite3` authority 库必须已具备当前 schema 9，authority 中还须存在主库对应的 legacy-state import marker。缺库、旧 schema、缺 marker 或 SDK source pin 不符均在应用导入/凭据加载前停止；脚本不会初始化、迁移或自动重试。`--ledger` 必须是 `SOURCE/logs` 直属、尚不存在的 `.jsonl` 文件，禁止复用旧账本。
 
-两个股票合计最多 24 次实际请求，仍受 40 次/分钟限制；正常完成初次阶段后，关闭旧连接并使用新请求上下文重开，复用阶段必须新增 0 次发送，且价格 digest、snapshot 身份和原始检索时间一致。5000 行/页、每股五年 daily、完整自然日 calendar、空 suspend、6000 行全历史 factor 的合成场景应为每股 5 页、合计 10 页；此计数不是对真实响应、权限或停牌窗口可成功的承诺。更多分页、错误或不完整数据仍服从合计 24 次上限，不能通过缩短五年范围或提高预算通过验收。
+日历发现、两个股票及每一分页/失败合计最多 24 次实际请求，使用同一账本和计数器，仍受 40 次/分钟限制。选定 E 时不重置预算或 pacing；没有额外日历预算。正常完成初次数据阶段后，关闭旧连接并使用新请求上下文重开，复用阶段必须新增 0 次发送，且价格 digest、snapshot 身份和原始检索时间一致。5000 行/页、每股五年 daily、完整自然日 calendar、空 suspend、6000 行全历史 factor 的合成场景为发现阶段 2 页，加每股 5 页，共 12 页；此计数不是对真实响应、权限或停牌窗口可成功的承诺。更多分页、错误或不完整数据仍服从合计 24 次上限，不能通过缩短五年范围或提高预算通过验收。账本保留两所 31 日开闭市安排、选定 E 和 `publication_checked=false`，随后单独记录实际行情验证结果。

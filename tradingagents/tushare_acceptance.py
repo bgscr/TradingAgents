@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 LIMIT = 24
@@ -43,14 +44,46 @@ def five_year_start(end: date) -> date:
         return end.replace(year=end.year - 5, day=28)
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+@dataclass(frozen=True)
+class CalendarDiscoveryWindow:
+    """A run's fixed 31 prior natural days; midnight never expands its scope."""
+
+    started_at: datetime
+    run_date: date
+    start: date
+    end: date
+    requested_end: date | None
+
+    @classmethod
+    def capture(cls, requested_end=None, *, started_at=None):
+        instant = started_at if started_at is not None else utc_now()
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError("acceptance start must be timezone aware")
+        today = instant.astimezone(timezone(timedelta(hours=8))).date()
+        first, last = today - timedelta(days=31), today - timedelta(days=1)
+        if requested_end is not None and (
+            type(requested_end) is not date or not first <= requested_end <= last
+        ):
+            raise AcceptanceStop("explicit_end_outside_recent_calendar_window")
+        return cls(instant.astimezone(timezone.utc), today, first, last, requested_end)
+
+
 class RequestGuard:
     """One physical-send owner, shared by both stocks and the reopen phase."""
 
-    def __init__(self, start, end, record, *, now=time.monotonic, sleep=time.sleep):
+    def __init__(self, start, end, record, *, now=time.monotonic, sleep=time.sleep, discovery=None):
         self.start = date.fromisoformat(start)
         self.end = date.fromisoformat(end)
         if self.start > self.end:
             raise ValueError("invalid acceptance window")
+        if discovery is not None and (self.start, self.end) != (discovery.start, discovery.end):
+            raise ValueError("calendar discovery window mismatch")
+        self.discovery = discovery
+        self.discovering = discovery is not None
         self.record, self.now, self.sleep = record, now, sleep
         self.attempts = 0
         self.stopped = None
@@ -170,6 +203,10 @@ class RequestGuard:
             start = datetime.strptime(start_value, "%Y%m%d").date() if start_value else None
         except (KeyError, TypeError, ValueError):
             self.stop("date_rejected")
+        if self.discovering and (
+            endpoint != "trade_cal" or (start, end) != (self.discovery.start, self.discovery.end)
+        ):
+            self.stop("calendar_discovery_scope_rejected")
         if (end > self.end or end < self.start or (start is not None and start > end)
                 or (endpoint != "adj_factor" and (start is None or start < self.start))):
             self.stop("date_rejected")
@@ -260,6 +297,69 @@ def require_imported_authority(connection, primary):
         raise AcceptanceStop("coordinator_state_import_required") from None
 
 
+def validate_calendar_page(guard, exchange, rows, membership):
+    """Validate raw rows before provider deduplication, retaining cross-page dates."""
+    window = guard.discovery
+    for row in rows:
+        try:
+            value, flag = row["cal_date"], row["is_open"]
+            if (row["exchange"] != exchange or type(value) is not str or len(value) != 8
+                    or not value.isascii() or not value.isdigit()
+                    or type(flag) not in (int, str) or str(flag) not in {"0", "1"}):
+                raise ValueError
+            day = datetime.strptime(value, "%Y%m%d").date()
+            if not window.start <= day <= window.end or day in membership:
+                raise ValueError
+            membership[day] = str(flag) == "1"
+        except (KeyError, TypeError, ValueError):
+            guard.stop("calendar_response_invalid")
+
+
+def discover_session(guard, fetch_calendar):
+    """Select a scheduled session, never assert that its prices are published.
+
+    The caller supplies the existing coordinated, HTTPS-guarded provider. Every
+    page shares this guard's ledger with the later two-stock data phase.
+    """
+    if not guard.discovering:
+        guard.stop("calendar_discovery_already_finished")
+    window = guard.discovery
+    expected = {window.start + timedelta(days=index) for index in range(31)}
+    calendars = {}
+    for exchange in ("SSE", "SZSE"):
+        rows = fetch_calendar(exchange, window.start, window.end)
+        membership = {}
+        validate_calendar_page(guard, exchange, rows, membership)
+        if set(membership) != expected:
+            guard.stop("calendar_coverage_incomplete")
+        calendars[exchange] = membership
+    if calendars["SSE"] != calendars["SZSE"]:
+        guard.stop("calendar_exchange_disagreement")
+    common = [day for day in expected if calendars["SSE"][day]]
+    if not common:
+        guard.stop("calendar_no_common_open_session")
+    selected = window.requested_end or max(common)
+    if selected not in common:
+        guard.stop("explicit_end_not_common_open_session")
+    start = five_year_start(selected)
+    try:
+        guard.record({"kind": "calendar_selected", "selection": "explicit" if window.requested_end else "automatic",
+            "run_date": window.run_date.isoformat(), "calendar_start": window.start.isoformat(),
+            "calendar_end": window.end.isoformat(), "selected_end": selected.isoformat(),
+            "start": start.isoformat(), "publication_checked": False,
+            "calendars": {exchange: [[day.isoformat(), "open" if opened else "closed"]
+                                      for day, opened in sorted(days.items())]
+                          for exchange, days in calendars.items()}})
+    except BaseException:
+        guard.stop("calendar_ledger_failure")
+    # One transition, after complete agreement and a retained selection record.
+    # Neither the attempt count nor pacing/stop state is reset here.
+    with guard.lock:
+        guard.start, guard.end = start, selected
+        guard.discovering = False
+    return selected
+
+
 def snapshot_facts(snapshot):
     """Compare provenance and normalized data, never credentials or model prose."""
     return {key: getattr(snapshot, key) for key in (
@@ -269,6 +369,8 @@ def snapshot_facts(snapshot):
 
 
 def run_data_phases(guard, snapshot_module, record, *, end, require_closed=lambda: None):
+    if guard.discovering or end != guard.end.isoformat():
+        guard.stop("data_window_not_selected")
     first = {}
     for symbol in SYMBOLS:
         with snapshot_module.authoritative_snapshot_run():

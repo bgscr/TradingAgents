@@ -59,18 +59,77 @@ def reject_alias(path):
             raise ValueError("aliased acceptance path")
 
 
+def discover_end(support, guard, runtime):
+    """Two calendars under the same shared authority and acceptance send cap."""
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from tradingagents.dataflows import market_snapshot
+    from tradingagents.market_history import coordinator
+    from tradingagents.market_history.config import MarketHistoryConfig
+    from tradingagents.market_history.store import MarketHistoryStore
+    from tradingagents.picker.pit_config import PITConfig
+    from tradingagents.picker.tushare_provider import TushareProvider
+
+    config = MarketHistoryConfig.from_mapping(runtime)
+    service, name = coordinator.upstream_service_identity_for_provider("tushare")
+    with MarketHistoryStore.open_provider_request_authority(config) as store:
+        owner = coordinator.ProviderRequestCoordinator(store)
+        owner.register_upstream_service(service, name)
+        owner.configure_operator_ceiling(upstream_service_id=service,
+            minimum_interval=timedelta(seconds=1.5), allow_prewarming=False,
+            configured_at=market_snapshot._coordinator_now())
+
+        def workflow(execute_operation):
+            provider = TushareProvider.create(PITConfig.from_env())
+
+            def fetch(exchange, first, last):
+                membership = {}
+
+                def execute(endpoint, request):
+                    def physical():
+                        coordinator.record_active_physical_attempt_io()
+                        frame = market_snapshot._typed_mainland_physical_request(request)
+                        try:
+                            if not frame.columns.is_unique:
+                                raise ValueError
+                            rows = frame.to_dict(orient="records")
+                        except (AttributeError, TypeError, ValueError):
+                            guard.stop("calendar_response_invalid")
+                        support.validate_calendar_page(guard, exchange, rows, membership)
+                        return frame
+                    return execute_operation(endpoint, physical)
+
+                return provider.fetch_range("trade_cal", exchange=exchange,
+                    start_date=first.strftime("%Y%m%d"), end_date=last.strftime("%Y%m%d"),
+                    request_executor=execute).to_dict(orient="records")
+
+            return support.discover_session(guard, fetch).isoformat()
+
+        # A new ledger is a new acceptance run. Never replay an earlier run's
+        # completed workflow in place of this run's guarded calendar discovery.
+        nonce = uuid4().hex
+        result = owner.execute_physical_workflow(request_key="acceptance-calendar:" + nonce,
+            upstream_service_id=service, owner_id="acceptance:" + nonce,
+            priority=coordinator.RequestPriority.INTERACTIVE_MAINLAND,
+            now=market_snapshot._coordinator_now, sleep=market_snapshot._coordinator_sleep,
+            lease_duration=timedelta(minutes=2), max_physical_operations=support.LIMIT,
+            wait_for_initial_pacing=True, cooldown_scope="market-snapshot", workflow=workflow)
+        return result.value
+
+
 def main(argv=None):
     if not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
         raise SystemExit("Requires -I -S -B; no application was started.")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--end", required=True, type=date.fromisoformat,
-                        help="Previous fully published common SSE/SZSE session, YYYY-MM-DD")
+    parser.add_argument("--end", type=date.fromisoformat,
+                        help="Optional common session within the prior 31 days; verified against both calendars")
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--ledger", required=True, type=Path,
                         help="New .jsonl file directly under this checkout's logs directory")
     options = parser.parse_args(argv)
     support = load_support()
-    support.closed_date(options.end)
+    discovery = support.CalendarDiscoveryWindow.capture(options.end)
     data_root = SOURCE / "data/market_history"
     primary = data_root / "market_history.sqlite3"
     authority = primary.with_name(primary.name + ".provider-requests.sqlite3")
@@ -103,7 +162,7 @@ def main(argv=None):
     if hashlib.sha256(sdk.read_bytes()).hexdigest() != SDK_SHA256:
         raise support.AcceptanceStop("sdk_source_pin_mismatch")
     print(f"Database={primary}\nPayloads={data_root / 'payloads'}\nSchema={version}\nLedger={ledger}")
-    print(f"Stocks=600895.SH,000001.SZ Window={support.five_year_start(options.end)}..{options.end} "
+    print(f"Stocks=600895.SH,000001.SZ Calendars={discovery.start}..{discovery.end} "
           "PhysicalLimit=24 RateLimit=40/min Models=0")
     ledger.parent.mkdir(exist_ok=True)
     with ledger.open("x", encoding="utf-8") as output:
@@ -112,8 +171,8 @@ def main(argv=None):
             output.flush()
             os.fsync(output.fileno())
 
-        guard = support.RequestGuard(support.five_year_start(options.end).isoformat(),
-                                     options.end.isoformat(), record)
+        guard = support.RequestGuard(discovery.start.isoformat(), discovery.end.isoformat(),
+                                     record, discovery=discovery)
 
         def audit(event, args):
             guard.audit(event, args)
@@ -139,7 +198,9 @@ def main(argv=None):
 
         sys.addaudithook(audit)
         record({"kind": "started", "limit": 24, "symbols": list(support.SYMBOLS),
-                "start": guard.start.isoformat(), "end": guard.end.isoformat(),
+                "started_at": discovery.started_at.isoformat(), "run_date": discovery.run_date.isoformat(),
+                "calendar_start": discovery.start.isoformat(), "calendar_end": discovery.end.isoformat(),
+                "requested_end": options.end.isoformat() if options.end else None,
                 "database": str(primary), "schema": version})
         connections = {}
         real_connect = sqlite3.connect
@@ -217,7 +278,10 @@ def main(argv=None):
                 if connections:
                     guard.stop("unclosed_database_connections")
 
-            support.run_data_phases(guard, market_snapshot, record, end=options.end.isoformat(),
+            selected_end = discover_end(support, guard, config.get_config())
+            require_closed()
+            print(f"ScheduledEnd={selected_end} Window={guard.start}..{guard.end}; checking price coverage next.")
+            support.run_data_phases(guard, market_snapshot, record, end=selected_end,
                                     require_closed=require_closed)
             print(f"PASS: {guard.attempts}/24 physical requests; reopened reuse=0; model calls=0.")
             return 0
