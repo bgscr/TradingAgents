@@ -1333,6 +1333,8 @@ class ProductionQualifiedRoutingRuntimeFactories:
 def production_qualified_routing_runtime_factories() -> ProductionQualifiedRoutingRuntimeFactories:
     """Return lazy production acquisitions without opening any run resource."""
 
+    runtime_blueprint_value: ProductionQualifiedRoutingCompositionBlueprint
+
     def runtime_blueprint(value: object) -> ProductionQualifiedRoutingCompositionBlueprint:
         if not isinstance(value, ProductionQualifiedRoutingCompositionBlueprint):
             raise ProductionQualifiedRoutingLifecycleError(
@@ -1460,8 +1462,6 @@ def production_qualified_routing_runtime_factories() -> ProductionQualifiedRouti
             raise ProductionQualifiedRoutingLifecycleError(
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             ) from None
-
-    runtime_blueprint_value: ProductionQualifiedRoutingCompositionBlueprint
 
     def remember_blueprint(value: object) -> MarketHistoryStore:
         nonlocal runtime_blueprint_value
