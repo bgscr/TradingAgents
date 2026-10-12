@@ -6,6 +6,7 @@ from tests.fixtures.coverage_case import coverage_case
 from tradingagents.policy_qualified_contract import AcceptancePolicy, OperatorApproval
 
 
+@pytest.mark.windows
 def test_v2_claim_irreversibly_binds_coverage_baseline_with_unknown_history(tmp_path):
     case = coverage_case(tmp_path)
     claim = case.verifier.claim(
@@ -20,6 +21,7 @@ def test_v2_claim_irreversibly_binds_coverage_baseline_with_unknown_history(tmp_
         )
 
 
+@pytest.mark.windows
 def test_old_schema_does_not_reinterpret_new_policy_or_approval(tmp_path):
     case = coverage_case(tmp_path)
     with pytest.raises(ValueError):
@@ -28,12 +30,14 @@ def test_old_schema_does_not_reinterpret_new_policy_or_approval(tmp_path):
         OperatorApproval.read(case.approval)
 
 
+@pytest.mark.windows
 def test_new_policy_rejects_old_approval_before_any_claim(tmp_path):
     case = coverage_case(tmp_path)
     with pytest.raises(ValueError):
         case.verifier.eligibility(case.policy, case.old_approval)
 
 
+@pytest.mark.windows
 def test_six_stage_fixture_result_separate_receipt_and_report_keep_coverage_unknown(tmp_path):
     from scripts.policy_owner.registered_test_fixtures import synthetic_stage_vectors
     from tradingagents.policy_coverage_models import CoverageEnvelope
@@ -63,6 +67,7 @@ def test_six_stage_fixture_result_separate_receipt_and_report_keep_coverage_unkn
     assert report["execution_authorized"] is False
 
 
+@pytest.mark.windows
 def test_actual_coverage_preparation_and_attempt_preserve_complete_caveat(tmp_path, monkeypatch):
     monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
     from scripts.policy_owner.registered_test_fixtures import synthetic_stage_vectors

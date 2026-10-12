@@ -63,6 +63,34 @@ class PytestPersistenceIsolationError(RuntimeError):
     """A deterministic test attempted to write application-owned state."""
 
 
+def pytest_collection_modifyitems(items):
+    if os.name == "nt":
+        return
+    windows = pytest.mark.skip(reason="requires Windows filesystem/native contracts; exercised by Windows CI")
+    for item in items:
+        # This existing test intentionally exercises cmd.exe child-environment
+        # propagation, so it belongs to the Windows CI job.
+        command_wrapper = (
+            item.path.name == "test_pytest_persistence_isolation.py"
+            and item.name == "test_wrapper_subprocess_with_empty_roots_is_repaired"
+        )
+        if item.get_closest_marker("windows") is not None or command_wrapper:
+            item.add_marker(windows)
+
+
+def _directory_relative_path(path, directory_fd=None):
+    candidate = Path(path)
+    if directory_fd is None or candidate.is_absolute():
+        return candidate
+    try:
+        parent = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
+    except (OSError, AttributeError) as exc:
+        raise PytestPersistenceIsolationError("cannot resolve directory descriptor safely") from exc
+    if not parent.is_absolute() or str(parent).endswith(" (deleted)"):
+        raise PytestPersistenceIsolationError("directory descriptor has no stable absolute path")
+    return parent / candidate
+
+
 def _canonical_path(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve(strict=False)
 
@@ -342,13 +370,13 @@ def _install_persistence_guard() -> pytest.MonkeyPatch:
     def guarded_os_open(path, flags, *args, **kwargs):
         write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
         if flags & write_flags and isinstance(path, (str, os.PathLike)):
-            _reject_protected_write(path)
+            _reject_protected_write(_directory_relative_path(path, kwargs.get("dir_fd")))
         return original_os_open(path, flags, *args, **kwargs)
 
     def guard_one_path(operation):
         def guarded(path, *args, **kwargs):
             if isinstance(path, (str, os.PathLike)):
-                _reject_protected_write(path)
+                _reject_protected_write(_directory_relative_path(path, kwargs.get("dir_fd")))
             return operation(path, *args, **kwargs)
 
         return guarded
@@ -356,9 +384,11 @@ def _install_persistence_guard() -> pytest.MonkeyPatch:
     def guard_two_paths(operation, *, protect_source: bool = True):
         def guarded(source, destination, *args, **kwargs):
             if protect_source and isinstance(source, (str, os.PathLike)):
-                _reject_protected_write(source)
+                _reject_protected_write(_directory_relative_path(source, kwargs.get("src_dir_fd")))
             if isinstance(destination, (str, os.PathLike)):
-                _reject_protected_write(destination)
+                _reject_protected_write(_directory_relative_path(
+                    destination, kwargs.get("dst_dir_fd", kwargs.get("dir_fd"))
+                ))
             return operation(source, destination, *args, **kwargs)
 
         return guarded

@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import json
-from pathlib import Path
 import sys
 import traceback
 import types
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 
 OPERATIONS = {"inspect-v2", "adopt-closed-v2", "reserve-v2", "begin-creation-v2",
@@ -84,7 +87,7 @@ def dispatch(request: dict, depot: Path | None = None) -> dict:
         try:
             authority.close()
         except BaseException as release:
-            raise BaseExceptionGroup("admission worker operation and release both failed", [primary, release])
+            raise BaseExceptionGroup("admission worker operation and release both failed", [primary, release]) from None
         raise
     else:
         authority.close()

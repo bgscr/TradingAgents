@@ -285,7 +285,14 @@ def test_incomplete_response_body_retains_all_three_physical_attempts():
             llm.invoke([HumanMessage(content="safe prompt")])
         projection = telemetry_ledger.finalize(terminal_route="operational_failure")
 
-    assert isinstance(raised.value.__cause__, httpx.RemoteProtocolError)
+    cause = raised.value.__cause__
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, httpx.RemoteProtocolError):
+            break
+        seen.add(id(cause))
+        cause = cause.__cause__
+    assert isinstance(cause, httpx.RemoteProtocolError)
     assert len(transport.requests) == 3
     assert len({id(request) for request in transport.requests}) == 3
     assert [request.headers["x-stainless-retry-count"] for request in transport.requests] == [

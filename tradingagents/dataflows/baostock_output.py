@@ -8,7 +8,6 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import TextIO
 
-
 _BAOSTOCK_OUTPUT_LOCK = threading.RLock()
 _SUPPRESSED_THREAD_COUNTS: dict[int, int] = {}
 

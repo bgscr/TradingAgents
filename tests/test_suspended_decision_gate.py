@@ -464,8 +464,9 @@ def _joint_baostock_candidate(*, tradeable: bool):
         calendar=replace(
             base.calendar,
             sessions=tuple(
-                MarketSession(session_date, MarketSessionStatus.OPEN)
-                for session_date in session_dates
+                MarketSession(day.date(), MarketSessionStatus.OPEN if day.date() in session_dates
+                              else MarketSessionStatus.CLOSED)
+                for day in pd.date_range(session_dates[0], session_dates[-1])
             ),
         ),
         current_tradeability="tradeable" if tradeable else "suspended",

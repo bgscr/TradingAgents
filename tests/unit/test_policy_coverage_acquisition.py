@@ -120,6 +120,7 @@ def observation(b, d, at):
     }
 
 
+@pytest.mark.windows
 def test_two_fresh_acquisitions_share_immutable_content_but_not_authentication(tmp_path):
     b, *_ = owner_case(tmp_path)
     raw, ref = host_bytes()
@@ -149,6 +150,7 @@ def test_two_fresh_acquisitions_share_immutable_content_but_not_authentication(t
         )
 
 
+@pytest.mark.windows
 def test_v3_rejects_old_wrapper_missing_or_substituted_descriptor_and_old_policy(tmp_path):
     b, *_ = owner_case(tmp_path)
     raw, ref = host_bytes()

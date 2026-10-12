@@ -52,6 +52,7 @@ def digest(path):
     return len(raw), sha256(raw).hexdigest()
 
 
+@pytest.mark.windows
 def test_preflight_requires_complete_proof_and_exact_proposed_candidate(tmp_path):
     policy, witness, path, depot = fixture(tmp_path)
     assert verify_coverage_source_proof(
@@ -74,6 +75,7 @@ def test_preflight_requires_complete_proof_and_exact_proposed_candidate(tmp_path
         )
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "change", ["missing_pin", "unknown_member", "changed_delivered", "changed_fixture"]
 )

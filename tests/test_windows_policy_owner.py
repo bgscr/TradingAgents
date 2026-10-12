@@ -14,6 +14,7 @@ from tradingagents.policy_qualified_contract import BytePin, EvidenceRef, conten
 from tradingagents.windows_policy_owner import LocalWindowsPolicyOwner, require_service_token
 
 
+@pytest.mark.windows
 def test_current_user_cannot_be_the_registered_service_owner():
     # Native token query, no impersonation, account creation or enrollment.
     with pytest.raises(ValueError, match="exact dedicated virtual service account"):
@@ -73,6 +74,7 @@ def test_authenticated_intake_batch_rejects_duplicate_nested_or_extra_entries():
         evidence_intake_entries({**batch, "execution_authorized": True})
 
 
+@pytest.mark.windows
 def test_blob_publication_and_conflicting_intake_before_authentication(tmp_path):
     # Storage primitive only. Bypass constructor ONLY in this explicit offline
     # fixture; the real constructor remains token-gated and is tested above.

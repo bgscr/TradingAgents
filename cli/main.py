@@ -1856,7 +1856,10 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
             "complete_report",
             time.monotonic() - started_at,
         )
-    _update_run_status(artifacts, reports_written=[str(report_file)])
+    _update_run_status(
+        artifacts,
+        reports_written=[report_file.relative_to(artifacts["report_dir"].parent).as_posix()],
+    )
     return report_file
 
 

@@ -128,6 +128,7 @@ class AcquisitionController:
         providers: tuple[tuple[str, Provider], ...] | None = None,
         accept_candidate: CandidateAcceptance[T] | None = None,
         fallback_candidate_index: FallbackCandidateIndex[T] | None = None,
+        terminal_errors: tuple[type[Exception], ...] = (),
     ) -> AcquisitionResult[T]:
         outcomes: list[SourceAcquisitionOutcome] = []
         candidates: list[tuple[str, T, SourceArtifact]] = []
@@ -196,6 +197,10 @@ class AcquisitionController:
                         continue
                     self._open_circuits.add(circuit_key)
                     break
+                except terminal_errors:
+                    # Evidence contradictions must not become recoverable provider
+                    # failures or permit a fallback to overwrite the contradiction.
+                    raise
                 except Exception:
                     self._record_outcome(
                         outcomes,

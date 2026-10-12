@@ -6,6 +6,7 @@ from tests.fixtures.coverage_case import coverage_case
 from tradingagents.policy_coverage_verification import coverage_operation, resolve_coverage
 
 
+@pytest.mark.windows
 def test_successful_proof_is_reused_only_inside_one_public_operation(tmp_path, monkeypatch):
     import tradingagents.policy_coverage_verification as module
 
@@ -34,6 +35,7 @@ def test_successful_proof_is_reused_only_inside_one_public_operation(tmp_path, m
     assert len(calls) == 4  # no cache outside the public operation
 
 
+@pytest.mark.windows
 def test_cache_rechecks_mutable_parsed_baseline_and_discards_failed_entry(tmp_path):
     case = coverage_case(tmp_path)
 
@@ -50,6 +52,7 @@ def test_cache_rechecks_mutable_parsed_baseline_and_discards_failed_entry(tmp_pa
     check(case.verifier)
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("member", ["scope", "measurement", "baseline", "assessment"])
 def test_cache_reads_complete_artifacts_again_and_rejects_changed_bytes(tmp_path, member):
     case = coverage_case(tmp_path)
@@ -65,6 +68,7 @@ def test_cache_reads_complete_artifacts_again_and_rejects_changed_bytes(tmp_path
     check(case.verifier)
 
 
+@pytest.mark.windows
 def test_current_proofs_are_ordered_bounded_freshly_pinned_and_operation_local(
     tmp_path, monkeypatch
 ):

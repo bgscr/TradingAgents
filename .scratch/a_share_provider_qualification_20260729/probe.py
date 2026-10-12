@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pandas as pd
 
-
 AS_OF = pd.Timestamp("2026-07-29")
 START_DATE = "20210101"
 END_DATE = "20260729"
@@ -255,10 +254,8 @@ def analyze_frame(frame, frequency: str = "all", max_periods: int | None = None)
     working = frame.copy()
     if date_col is not None:
         dates = pd.to_datetime(working[date_col].astype(str), errors="coerce")
-        try:
+        with contextlib.suppress(AttributeError, TypeError):
             dates = dates.dt.tz_localize(None)
-        except (AttributeError, TypeError):
-            pass
         working = working.assign(_period=dates)
         working = working[working["_period"].notna() & (working["_period"] <= AS_OF)]
         if frequency == "annual":
@@ -464,8 +461,8 @@ def probe_baostock(rec: Recorder):
         for symbol in SYMBOLS:
             native = symbol["baostock"]
             fields = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
-            raw, raw_err, raw_ms, raw_id = rec.call(symbol, "query_history_k_data_plus(raw)", lambda s=symbol: _bs_frame(bs.query_history_k_data_plus(s["baostock"], fields, start_date="2021-01-01", end_date="2026-07-29", frequency="d", adjustflag="3")))
-            qfq, qfq_err, qfq_ms, qfq_id = rec.call(symbol, "query_history_k_data_plus(qfq)", lambda s=symbol: _bs_frame(bs.query_history_k_data_plus(s["baostock"], fields, start_date="2021-01-01", end_date="2026-07-29", frequency="d", adjustflag="2")))
+            raw, raw_err, raw_ms, raw_id = rec.call(symbol, "query_history_k_data_plus(raw)", lambda s=symbol, fields=fields: _bs_frame(bs.query_history_k_data_plus(s["baostock"], fields, start_date="2021-01-01", end_date="2026-07-29", frequency="d", adjustflag="3")))
+            qfq, qfq_err, qfq_ms, qfq_id = rec.call(symbol, "query_history_k_data_plus(qfq)", lambda s=symbol, fields=fields: _bs_frame(bs.query_history_k_data_plus(s["baostock"], fields, start_date="2021-01-01", end_date="2026-07-29", frequency="d", adjustflag="2")))
             if qfq_err:
                 add_failure_record(rec, symbol, "daily_ohlcv", "query_history_k_data_plus(adjustflag=2)", qfq_err, qfq_ms, [qfq_id], native_symbol=native)
             else:
@@ -580,9 +577,9 @@ def probe_tushare(rec: Recorder):
             calls[endpoint] = rec.call(symbol, endpoint, fn)
             time.sleep(0.12)
 
-        def record_one(capability, endpoint, *, frequency="all", max_periods=None, status_override=None, unit="not supplied", currency="not supplied", scope="not supplied", company_type="not supplied", notes=""):
+        def record_one(capability, endpoint, *, calls=calls, native=native, symbol=symbol, frequency="all", max_periods=None, status_override=None, unit="not supplied", currency="not supplied", scope="not supplied", company_type="not supplied", notes=""):
             frame, err, elapsed, call_id = calls[endpoint]
-            kwargs = dict(native_symbol=native, permission_requirement="current configured Tushare token", point_requirement=TUSHARE_POINTS[endpoint])
+            kwargs = {"native_symbol": native, "permission_requirement": "current configured Tushare token", "point_requirement": TUSHARE_POINTS[endpoint]}
             if err:
                 kwargs["point_requirement"] = err["point_requirement"] if err["point_requirement"] != "not stated by API error" else TUSHARE_POINTS[endpoint]
                 add_failure_record(rec, symbol, capability, endpoint, err, elapsed, [call_id], **kwargs)
@@ -651,7 +648,7 @@ def probe_yahoo(rec: Recorder, scratch: Path):
     for symbol in SYMBOLS:
         native = symbol["yahoo"]
         ticker = yf.Ticker(native)
-        hist, hist_err, hist_ms, hist_id = rec.call(symbol, "Ticker.history", lambda: ticker.history(start="2021-01-01", end="2026-07-30", auto_adjust=False, actions=True, timeout=15, raise_errors=True))
+        hist, hist_err, hist_ms, hist_id = rec.call(symbol, "Ticker.history", lambda ticker=ticker: ticker.history(start="2021-01-01", end="2026-07-30", auto_adjust=False, actions=True, timeout=15, raise_errors=True))
         if hist_err:
             add_failure_record(rec, symbol, "daily_ohlcv", "Ticker.history(auto_adjust=False)", hist_err, hist_ms, [hist_id], native_symbol=native)
             add_failure_record(rec, symbol, "raw_and_adjusted_prices", "Ticker.history(auto_adjust=False)", hist_err, hist_ms, [hist_id], native_symbol=native)
@@ -675,7 +672,7 @@ def probe_yahoo(rec: Recorder, scratch: Path):
             "quarterly_cash_flow": "quarterly_cash_flow",
         }
         for capability, attr in statement_specs.items():
-            frame, err, elapsed, call_id = rec.call(symbol, f"Ticker.{attr}", lambda a=attr: _yf_statement(ticker, a))
+            frame, err, elapsed, call_id = rec.call(symbol, f"Ticker.{attr}", lambda a=attr, ticker=ticker: _yf_statement(ticker, a))
             statements[capability] = (frame, err, elapsed, call_id, attr)
             if err:
                 add_failure_record(rec, symbol, capability, f"Ticker.{attr}", err, elapsed, [call_id], native_symbol=native)
@@ -689,7 +686,7 @@ def probe_yahoo(rec: Recorder, scratch: Path):
         else:
             add_df_record(rec, symbol, "financial_indicators_ratios", "Ticker.get_info", info_frame, info_ms, [info_id], native_symbol=native, status_override="partial" if not info_frame.empty else "unavailable", unit="mixed", currency=str(info.get("financialCurrency") or info.get("currency") or "not supplied"), company_type=str(info.get("industry") or info.get("sector") or "not supplied"))
 
-        earnings, earnings_err, earnings_ms, earnings_id = rec.call(symbol, "Ticker.get_earnings_dates", lambda: ticker.get_earnings_dates(limit=20))
+        earnings, earnings_err, earnings_ms, earnings_id = rec.call(symbol, "Ticker.get_earnings_dates", lambda ticker=ticker: ticker.get_earnings_dates(limit=20))
         earnings_frame = as_frame(earnings).reset_index() if earnings is not None else pd.DataFrame()
         if earnings_err:
             add_failure_record(rec, symbol, "announcement_first_publication_dates", "Ticker.get_earnings_dates", earnings_err, earnings_ms, [earnings_id], native_symbol=native)

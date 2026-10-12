@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import argparse
 import base64
-from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.machinery
 import json
-from pathlib import Path
 import shutil
 import sqlite3
 import struct
@@ -21,7 +19,8 @@ import sys
 import threading
 import types
 import unittest
-
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # This retained synthetic batch has its own isolated interpreter and artifact
 # lifecycle. Ordinary pytest must not collect its uninitialized unittest cases.
@@ -110,7 +109,8 @@ def _sign(challenge: bytes) -> tuple[dict, dict]:
 
     pair = integer(r) + integer(s)
     signature = b"\x30" + bytes([len(pair)]) + pair
-    encode = lambda raw: base64.b64encode(raw).decode("ascii")
+    def encode(raw):
+        return base64.b64encode(raw).decode("ascii")
     return ({"id": encode(credential), "authenticator_data": encode(registered), "public_key": encode(public)},
             {"credential_id": encode(credential), "authenticator_data": encode(assertion),
              "signature": encode(signature), "client_data": encode(client)})

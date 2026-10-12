@@ -1,8 +1,9 @@
 # Independent report exports
 
 `write_report_tree` returns the exact `complete_report.md` path for that call:
-`report_exports/<export-id>/complete_report.md`. The CLI records that full
-path in `reports_written` and displays it for manual exports. There is no
+`report_exports/<export-id>/complete_report.md`. The CLI records that path
+relative to the run directory in `reports_written`; consumers resolve it
+against that run directory. Manual exports display the returned path. There is no
 mutable root-level "current report" alias and no automatic selection of the
 newest directory.
 

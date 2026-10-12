@@ -9,21 +9,22 @@ human ceremony. JSON cannot manufacture that capability.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import base64
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import contextlib
 import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import sqlite3
 import stat
-from typing import Callable, Iterator
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from tradingagents.policy_owner_admission_crypto import RP_ID, b64, canonical, verify_proof
 
@@ -50,7 +51,7 @@ FAULT_POINTS = (
     "complete_before_commit", "complete_after_commit",
 )
 _CLASSIFICATION_ISSUER = object()
-_SYNTHETIC_LEASES: dict[tuple[str, str], "SyntheticAuthority"] = {}
+_SYNTHETIC_LEASES: dict[tuple[str, str], SyntheticAuthority] = {}
 
 
 class AdmissionRejected(ValueError):
@@ -613,7 +614,7 @@ class EnrollmentOnlyStore:
         cursor = connection.execute("SELECT * FROM admission_v2_control WHERE singleton=1")
         values = cursor.fetchall()
         require(len(values) == 1, "one durable admission control required")
-        row = dict(zip((item[0] for item in cursor.description), values[0]))
+        row = dict(zip((item[0] for item in cursor.description), values[0], strict=True))
         require(row["phase"] in PHASES and type(row["epoch"]) is int and 0 <= row["epoch"] <= 2**63-1,
                 "control phase/epoch")
         require(row["attempt"] is None or (type(row["attempt"]) is str and re.fullmatch("[0-9a-f]{64}", row["attempt"])),
@@ -875,12 +876,10 @@ class EnrollmentOnlyStore:
             raise
 
     def _try_block(self, error: Exception, epoch: int, attempt: str | None) -> None:
-        try:
+        # No authority to repair/reopen. The interrupted durable phase is
+        # retained and a future different lease must mark it BLOCKED.
+        with contextlib.suppress(Exception):
             self._block(type(error).__name__ + ": " + str(error), (epoch, attempt))
-        except Exception:
-            # No authority to repair/reopen. The interrupted durable phase is
-            # retained and a future different lease must mark it BLOCKED.
-            pass
 
     def _publish(self, path: Path, raw: bytes, epoch: int, attempt: str, phase: str) -> None:
         with self._connection() as connection:

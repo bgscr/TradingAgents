@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import stat
+import sys
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1191,7 +1192,10 @@ def _runtime_artifact_lock(content: bytes) -> dict[str, dict[str, object]]:
 
 def _project_dependency_roots(content: bytes) -> tuple[str, ...]:
     try:
-        import tomllib
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
 
         project = tomllib.loads(content.decode("utf-8"))["project"]
         optional = project["optional-dependencies"]

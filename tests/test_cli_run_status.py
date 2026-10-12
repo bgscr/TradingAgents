@@ -316,7 +316,10 @@ def test_mark_run_completed_publishes_canonical_identity_after_reports(
     interim = json.loads(artifacts["status_file"].read_text(encoding="utf-8"))
     assert interim["status"] == "running"
     assert interim["completed_at"] is None
-    assert interim["reports_written"] == [str(report_file)]
+    assert interim["reports_written"] == [
+        report_file.relative_to(artifacts["report_dir"].parent).as_posix()
+    ]
+    assert not Path(interim["reports_written"][0]).is_absolute()
 
     cli_main._mark_run_completed(final_state, artifacts)
 

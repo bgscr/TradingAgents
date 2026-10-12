@@ -59,6 +59,7 @@ def make_case(tmp_path, change=None):
     return boundary, descriptor, entry
 
 
+@pytest.mark.windows
 def test_compact_registration_admits_only_complete_bound_bytes(tmp_path):
     boundary, descriptor, entry = make_case(tmp_path)
     with pytest.raises(ValueError, match="not registered"):
@@ -79,6 +80,7 @@ def test_compact_registration_admits_only_complete_bound_bytes(tmp_path):
         boundary.owner.validate_authentication_document("REGISTER_EVIDENCE", entry)
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "change",
     [
@@ -98,6 +100,7 @@ def test_context_mismatches_cannot_be_registered(tmp_path, change):
         boundary.owner.read_artifact(descriptor.artifact)
 
 
+@pytest.mark.windows
 def test_expired_new_request_rejects_but_retained_record_derivation_uses_record_time(tmp_path):
     boundary, descriptor, entry = make_case(tmp_path)
     retained = boundary.record("REGISTER_EVIDENCE", entry)
@@ -113,6 +116,7 @@ def test_expired_new_request_rejects_but_retained_record_derivation_uses_record_
     assert BytePin.of(boundary.owner.read_artifact(descriptor.artifact)) == descriptor.artifact.pin
 
 
+@pytest.mark.windows
 def test_compact_intake_cannot_be_downgraded_to_v1(tmp_path):
     _boundary, _descriptor, entry = make_case(tmp_path)
     with pytest.raises(ValueError, match="downgrade"):
@@ -127,6 +131,7 @@ def test_compact_intake_cannot_be_downgraded_to_v1(tmp_path):
         )
 
 
+@pytest.mark.windows
 def test_conflicting_setup_reference_rejects_before_authentication(tmp_path):
     boundary, descriptor, entry = make_case(tmp_path)
     blob = boundary.owner.root / "artifacts" / (descriptor.artifact.pin.sha256 + ".blob")
@@ -139,6 +144,7 @@ def test_conflicting_setup_reference_rejects_before_authentication(tmp_path):
     assert BytePin.of(boundary.owner.read_artifact(old)) == old.pin
 
 
+@pytest.mark.windows
 def test_cross_version_artifact_collision_in_one_batch_rejects_before_authentication(tmp_path):
     boundary, descriptor, entry = make_case(tmp_path)
     blob = boundary.owner.root / "artifacts" / (descriptor.artifact.pin.sha256 + ".blob")
@@ -167,6 +173,7 @@ def test_cross_version_artifact_collision_in_one_batch_rejects_before_authentica
         boundary.owner.read_artifact(descriptor.artifact)
 
 
+@pytest.mark.windows
 def test_opaque_bytes_cannot_be_reinterpreted_as_current_source(tmp_path):
     """A mathematically valid TEST proof is still the wrong authenticated schema."""
     from hashlib import sha1

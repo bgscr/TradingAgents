@@ -10,22 +10,36 @@ partial evidence. Existing owner metadata/immutable rows are not rewritten.
 from __future__ import annotations
 
 import ctypes as c
-from ctypes import wintypes as w
-from datetime import datetime, timezone
-import hashlib
 import os
-from pathlib import Path
 import re
 import secrets
 import sys
 import time
+from ctypes import wintypes as w
+from datetime import datetime, timezone
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 from tradingagents.policy_owner_admission_v2 import (
-    EnrollmentOnlyStore, PlatformValidationRequired, StorePaths, canonical,
-    classify_legacy_copies, closed, identity, integer, pin, require, seal,
-    strict_json, utc, validate_binding, validate_pin, validate_role,
+    EnrollmentOnlyStore,
+    PlatformValidationRequired,
+    StorePaths,
+    canonical,
+    classify_legacy_copies,
+    closed,
+    identity,
+    integer,
+    pin,
+    require,
+    seal,
+    utc,
+    validate_binding,
+    validate_pin,
+    validate_role,
 )
-from tradingagents.policy_owner_admission_windows import WindowsAuthority, _FileInfo
+from tradingagents.policy_owner_admission_windows import WindowsAuthority
 
 MAX_COPY_BYTES = 512 * 1024 * 1024
 MAX_COPY_MEMBERS = 10000
@@ -126,7 +140,7 @@ class MaintenanceCoordinator:
                 raise BaseExceptionGroup(
                     "maintenance operation and owned-handle release both failed",
                     [primary_error, release_error],
-                )
+                ) from None
 
 
 class WindowsMaintenanceAuthority(WindowsAuthority):
@@ -200,7 +214,7 @@ class WindowsMaintenanceAuthority(WindowsAuthority):
                 raise BaseExceptionGroup(
                     "maintenance authority construction and release both failed",
                     [error, release_error],
-                )
+                ) from None
             raise
 
     def _budget(self) -> None:
@@ -220,7 +234,7 @@ class WindowsMaintenanceAuthority(WindowsAuthority):
                 require(self._write_key_handle is not None and int(values[0]) == self._write_key_handle and
                         values[1] == "AdmissionV2Json", "only exact newly staged v2 registry value is writable")
             if event == "sqlite3.connect":
-                from urllib.parse import unquote, urlsplit, parse_qs
+                from urllib.parse import parse_qs, unquote, urlsplit
                 value = str(values[0])
                 require(value.startswith("file:"), "explicit SQLite URI required")
                 parsed = urlsplit(value)
@@ -234,11 +248,11 @@ class WindowsMaintenanceAuthority(WindowsAuthority):
                 else:
                     require(target.is_relative_to(self.control / "copies") and
                             query == {"mode": ["ro"], "immutable": ["1"]}, "SQLite reads only on complete new copies")
-            if event == "open" and isinstance(values[0], (str, bytes, os.PathLike)):
-                if values[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
-                    target = Path(os.fsdecode(values[0])).absolute()
-                    require(".." not in target.parts and target.is_relative_to(self.control),
-                            "Python writes restricted to new maintenance control evidence")
+            if (event == "open" and isinstance(values[0], (str, bytes, os.PathLike))
+                    and values[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)):
+                target = Path(os.fsdecode(values[0])).absolute()
+                require(".." not in target.parts and target.is_relative_to(self.control),
+                        "Python writes restricted to new maintenance control evidence")
             if event == "os.mkdir":
                 require(Path(values[0]).absolute().is_relative_to(self.control), "new directories only in maintenance control")
         sys.addaudithook(audit)

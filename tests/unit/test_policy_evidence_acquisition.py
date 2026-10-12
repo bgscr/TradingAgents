@@ -19,6 +19,7 @@ def request(root):
     }
 
 
+@pytest.mark.windows
 def test_two_real_captures_match_and_a_new_difference_blocks(tmp_path):
     root = tmp_path / "disposable-capture-root"
     root.mkdir()
@@ -42,6 +43,7 @@ def test_two_real_captures_match_and_a_new_difference_blocks(tmp_path):
     assert changed["equal"] is False
 
 
+@pytest.mark.windows
 def test_capture_is_additive_and_missing_objects_remain_visible(tmp_path):
     path = tmp_path / "missing.json"
     result = capture_roots(request(tmp_path / "absent"), path, phase="before", maximum_seconds=10)
@@ -52,6 +54,7 @@ def test_capture_is_additive_and_missing_objects_remain_visible(tmp_path):
         capture_roots(request(tmp_path / "absent"), path, phase="before", maximum_seconds=10)
 
 
+@pytest.mark.windows
 def test_capture_refuses_an_output_inside_its_scope(tmp_path):
     root = tmp_path / "fixture-root"
     root.mkdir()
@@ -59,6 +62,7 @@ def test_capture_refuses_an_output_inside_its_scope(tmp_path):
         capture_roots(request(root), root / "observation.json", phase="before", maximum_seconds=10)
 
 
+@pytest.mark.windows
 def test_two_incomplete_captures_never_report_equal(tmp_path):
     missing = tmp_path / "MISSING"
     before = capture_roots(
@@ -75,6 +79,7 @@ def test_two_incomplete_captures_never_report_equal(tmp_path):
     assert after["equal"] is False
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "field,value",
     [

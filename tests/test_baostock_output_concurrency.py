@@ -16,7 +16,6 @@ from pathlib import Path
 from queue import Queue
 from unittest.mock import Mock
 
-
 # Load only this stdlib-only source file. Importing tradingagents.dataflows
 # would also execute package initializers outside this unit's reviewed scope.
 _SOURCE_PATH = (
@@ -135,11 +134,10 @@ class BaoStockOutputConcurrencyTests(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             with contain_baostock_output():
                 print("outer-secret")
-                with self.assertRaisesRegex(ValueError, "sentinel"):
-                    with contain_baostock_output():
-                        sys.stdout.writelines(["nested-secret", "nested-secret"])
-                        sys.stderr.flush()
-                        raise ValueError("sentinel")
+                with self.assertRaisesRegex(ValueError, "sentinel"), contain_baostock_output():
+                    sys.stdout.writelines(["nested-secret", "nested-secret"])
+                    sys.stderr.flush()
+                    raise ValueError("sentinel")
                 print("after-inner-secret")
             self.assertIs(sys.stdout, out)
             self.assertIs(sys.stderr, err)

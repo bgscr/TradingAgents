@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ import pytest
 import tradingagents.dataflows.config as config_module
 import tradingagents.dataflows.market_snapshot as market_snapshot
 import tradingagents.market_history.shadow as shadow_module
+from tests.fixtures.synthetic_calendar import canonical_calendar
 from tradingagents.dataflows.baostock_data import BaoStockSnapshotHistoryCandidate
 from tradingagents.dataflows.errors import NoMarketDataError, VendorRateLimitError
 from tradingagents.dataflows.market_snapshot import (
@@ -57,7 +58,7 @@ from tradingagents.market_history import (
 def _suspended_baostock_candidate() -> BaoStockSnapshotHistoryCandidate:
     observed_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
     provider = ProviderDatasetSpec(
-        upstream_service_id="upstream:baostock-tcp",
+        upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
         upstream_service_name="BaoStock TCP service",
         provider_dataset_id="provider:baostock-strict-v1",
         provider_name="baostock",
@@ -417,7 +418,11 @@ def test_selected_baostock_candidate_publishes_complete_history_workflow(
     )
 
     assert snapshot.provider == "baostock"
-    assert persisted == [candidate]
+    assert len(persisted) == 1
+    pd.testing.assert_frame_equal(persisted[0].frame, candidate.frame)
+    assert {field.name: getattr(persisted[0], field.name) for field in fields(candidate) if field.name != "frame"} == {
+        field.name: getattr(candidate, field.name) for field in fields(candidate) if field.name != "frame"
+    }
     assert provider_calls == ["baostock"]
     assert snapshot.current_tradeability == "suspended"
     assert snapshot.current_status_provenance == candidate.current_status_provenance
@@ -748,7 +753,7 @@ def test_history_candidate_seed_and_refresh_are_durable_and_replay_qualified(
     monkeypatch.setattr(config_module, "_config", runtime_config)
     observed_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
     provider = ProviderDatasetSpec(
-        upstream_service_id="upstream:baostock-tcp",
+        upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
         upstream_service_name="BaoStock TCP service",
         provider_dataset_id="provider:baostock-strict-v1",
         provider_name="baostock",
@@ -1087,24 +1092,10 @@ def test_authoritative_history_refresh_requests_missing_dates_plus_overlap(
         MarketHistoryConfig.from_mapping(runtime_config)
     ) as store:
         store.publish_session_calendar(
-            MarketSessionCalendarPublication(
-                provider=replace(
-                    history_provider,
-                    provider_dataset_id="provider:calendar",
-                    dataset_name="mainland-session-calendar-v1",
-                    adjustment_methodology="not-applicable",
-                    strict_history_qualified=False,
-                ),
-                reference_market="mainland-cn",
-                timezone_name="Asia/Shanghai",
-                observed_at=observed_at,
-                provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
-                raw_payload=b'{"calendar":"seed"}',
-                sessions=tuple(
+            canonical_calendar(tuple(
                     MarketSession(day, MarketSessionStatus.OPEN)
                     for day in session_dates
-                ),
-            )
+                ), observed_at)
         )
         store.publish_history_bundle(
             ProviderHistoryBundlePublication(
@@ -1153,7 +1144,28 @@ def test_authoritative_history_refresh_requests_missing_dates_plus_overlap(
 
     def load_history(_symbol, start_date, end_date):
         history_calls.append((start_date, end_date))
-        return frame_for(session_dates[-21:])
+        refreshed = tuple(day for day in session_dates
+                          if start_date <= day.isoformat() <= end_date)
+        bundle = ProviderHistoryBundlePublication(
+            provider=history_provider, instrument=instrument,
+            requested_as_of=date.fromisoformat(end_date), retrieval_cutoff=observed_at,
+            observed_at=observed_at, provenance_class=ProvenanceClass.RETROSPECTIVE_BACKFILL,
+            raw_payload=b'{"synthetic_refresh":true}',
+            observations=tuple(RawMarketObservation(day, Decimal("10"), Decimal("11"),
+                Decimal("9"), Decimal("10.5"), Decimal("100")) for day in refreshed),
+            trading_statuses=tuple(TradingStatusObservation(day, TradingStatus.TRADED) for day in refreshed),
+            adjustment_factors=(AdjustmentFactorObservation(refreshed[0], Decimal("1")),),
+        )
+        return BaoStockSnapshotHistoryCandidate(
+            frame=frame_for(refreshed), history_bundle=bundle,
+            calendar=canonical_calendar(tuple(MarketSession(day, MarketSessionStatus.OPEN)
+                                               for day in refreshed), observed_at),
+            current_tradeability="tradeable",
+            current_status_provenance=TradingStatusProvenance("baostock", history_provider.provider_dataset_id,
+                refreshed[-1], TradingStatus.TRADED, observed_at),
+            latest_traded_close=Decimal("10.5"), latest_traded_close_diagnostic=None,
+            carried_suspension_close=None,
+        )
 
     monkeypatch.setattr(
         market_snapshot,
@@ -1162,8 +1174,7 @@ def test_authoritative_history_refresh_requests_missing_dates_plus_overlap(
             "baostock": SnapshotProvider(
                 lambda *_args: pytest.fail("current loader should not replace refresh"),
                 "qfq",
-                history_load=load_history,
-            )
+                history_load=load_history, history_binding=lambda _symbol: (history_provider, instrument))
         },
     )
 
@@ -1312,7 +1323,7 @@ def test_authoritative_mode_never_promotes_current_only_adjusted_frame(
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(lambda *_args: frame, "qfq")},
+        {"only": SnapshotProvider(lambda *_args: frame, "qfq", history_binding=lambda _symbol: (_suspended_baostock_candidate().history_bundle.provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
     live = get_authoritative_market_snapshot(
         "600519.SS",
@@ -1353,7 +1364,7 @@ def test_authoritative_mode_never_promotes_current_only_adjusted_frame(
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(complete_live_frame, "qfq")},
+        {"only": SnapshotProvider(complete_live_frame, "qfq", history_binding=lambda _symbol: (_suspended_baostock_candidate().history_bundle.provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
 
     stored = get_authoritative_market_snapshot(
@@ -1388,7 +1399,7 @@ def test_authoritative_mode_reads_complete_strict_bundle_and_surfaces_suspension
     monkeypatch.setattr(config_module, "_config", runtime_config)
     observed_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
     provider = ProviderDatasetSpec(
-        upstream_service_id="upstream:baostock-tcp",
+        upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
         upstream_service_name="BaoStock TCP service",
         provider_dataset_id="provider:baostock-strict-v1",
         provider_name="baostock",
@@ -1448,18 +1459,10 @@ def test_authoritative_mode_reads_complete_strict_bundle_and_surfaces_suspension
             )
         )
         store.publish_session_calendar(
-            MarketSessionCalendarPublication(
-                provider=provider,
-                reference_market="mainland-cn",
-                timezone_name="Asia/Shanghai",
-                observed_at=observed_at,
-                provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
-                raw_payload=b'{"calendar":"2026-07-23/24"}',
-                sessions=(
+            canonical_calendar((
                     MarketSession(date(2026, 7, 23), MarketSessionStatus.OPEN),
                     MarketSession(date(2026, 7, 24), MarketSessionStatus.OPEN),
-                ),
-            )
+                ), observed_at)
         )
         subject = SnapshotEquivalenceSubject(
             instrument_identity_id="registry:mainland-v1",
@@ -1481,12 +1484,12 @@ def test_authoritative_mode_reads_complete_strict_bundle_and_surfaces_suspension
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(must_not_call_provider, "qfq")},
+        {"only": SnapshotProvider(must_not_call_provider, "qfq", history_binding=lambda _symbol: (provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
 
     snapshot = get_authoritative_market_snapshot(
         "600519.SS",
-        "2026-07-24",
+        "2026-07-23",
         "2026-07-24",
     )
 
@@ -1572,7 +1575,7 @@ def test_authoritative_weekend_reuses_latest_retained_session_without_provider_c
             )
         observed_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
         strict_provider = ProviderDatasetSpec(
-            upstream_service_id="upstream:baostock-tcp",
+            upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
             upstream_service_name="BaoStock TCP service",
             provider_dataset_id="provider:baostock-strict-v1",
             provider_name="baostock",
@@ -1624,28 +1627,12 @@ def test_authoritative_weekend_reuses_latest_retained_session_without_provider_c
             )
         )
         store.publish_session_calendar(
-            MarketSessionCalendarPublication(
-                provider=ProviderDatasetSpec(
-                    upstream_service_id="upstream:baostock-calendar",
-                    upstream_service_name="BaoStock calendar service",
-                    provider_dataset_id="provider:baostock-calendar-v1",
-                    provider_name="baostock",
-                    dataset_name="mainland-session-calendar-v1",
-                    adjustment_methodology="not-applicable",
-                    strict_history_qualified=False,
-                ),
-                reference_market="mainland-cn",
-                timezone_name="Asia/Shanghai",
-                observed_at=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
-                provenance_class=ProvenanceClass.OBSERVED_POINT_IN_TIME,
-                raw_payload=b'{"calendar":"2026-07-24/26"}',
-                sessions=(
+            canonical_calendar((
                     MarketSession(date(2026, 7, 23), MarketSessionStatus.OPEN),
                     MarketSession(date(2026, 7, 24), MarketSessionStatus.OPEN),
                     MarketSession(date(2026, 7, 25), MarketSessionStatus.CLOSED),
                     MarketSession(date(2026, 7, 26), MarketSessionStatus.CLOSED),
-                ),
-            )
+                ), datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc))
         )
 
     runtime_config["market_history_mode"] = "authoritative"
@@ -1659,7 +1646,7 @@ def test_authoritative_weekend_reuses_latest_retained_session_without_provider_c
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(must_not_call, "qfq")},
+        {"only": SnapshotProvider(must_not_call, "qfq", history_binding=lambda _symbol: (strict_provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
 
     weekend = get_authoritative_market_snapshot(
@@ -1709,7 +1696,7 @@ def test_authoritative_mode_degrades_to_live_until_persisted_gate_passes(
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(lambda *_args: frame, "qfq")},
+        {"only": SnapshotProvider(lambda *_args: frame, "qfq", history_binding=lambda _symbol: (_suspended_baostock_candidate().history_bundle.provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
 
     snapshot = get_authoritative_market_snapshot(
@@ -1754,7 +1741,7 @@ def test_authoritative_mode_degrades_to_live_when_store_is_unavailable(
     monkeypatch.setattr(
         market_snapshot,
         "SNAPSHOT_PROVIDERS",
-        {"only": SnapshotProvider(lambda *_args: frame, "qfq")},
+        {"only": SnapshotProvider(lambda *_args: frame, "qfq", history_binding=lambda _symbol: (_suspended_baostock_candidate().history_bundle.provider, _suspended_baostock_candidate().history_bundle.instrument))},
     )
 
     snapshot = get_authoritative_market_snapshot(

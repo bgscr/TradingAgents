@@ -522,6 +522,7 @@ def synthetic(tmp_path, monkeypatch):
     return SyntheticCase(tmp_path)
 
 
+@pytest.mark.windows
 def test_synthetic_eligibility_requires_a_trusted_owner(synthetic):
     with pytest.raises(ValueError, match="authenticated"):
         PolicyQualifiedVerifier().eligibility(synthetic.policy, synthetic.approval)
@@ -530,6 +531,7 @@ def test_synthetic_eligibility_requires_a_trusted_owner(synthetic):
         synthetic.ledger.events(synthetic.claim)
 
 
+@pytest.mark.windows
 def test_exact_human_challenge_creates_no_approval(synthetic):
     answers = iter([synthetic.policy.acceptance_policy_identity, "YES"])
     assert (
@@ -1008,6 +1010,7 @@ def synthetic_result(case):
     return result, envelope
 
 
+@pytest.mark.windows
 def test_real_serialization_finalizer_receipt_and_report_preserve_unresolved_history(synthetic):
     result, envelope = synthetic_result(synthetic)
     assert result.status == "CONDITIONALLY_ACCEPTED_UNRESOLVED_HISTORY"
@@ -1030,6 +1033,7 @@ def test_real_serialization_finalizer_receipt_and_report_preserve_unresolved_his
     assert envelope.execution_authorized is False
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -1057,6 +1061,7 @@ def test_unapproved_unknown_unauthenticated_or_misbound_authority_rejected(synth
         synthetic.ledger.events(synthetic.claim)
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("field", ["current_candidate", "execution_candidate"])
 def test_wrong_candidate_from_trusted_resolution_is_rejected(synthetic, field):
     other = Candidate(commit="f" * 40, tree="e" * 40, parent="d" * 40)
@@ -1065,6 +1070,7 @@ def test_wrong_candidate_from_trusted_resolution_is_rejected(synthetic, field):
         synthetic.reserve()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("selection", ["DRAFT", "NOT_APPROVED", "REJECT", None, True])
 def test_serialized_approval_has_no_default_approve(synthetic, selection):
     approval = synthetic.approval.model_dump(mode="json")
@@ -1073,6 +1079,7 @@ def test_serialized_approval_has_no_default_approve(synthetic, selection):
         synthetic.verifier.eligibility(synthetic.policy, canonical_bytes(approval))
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "field", ["acceptance_policy_identity", "exception_identity", "approval_identity"]
 )
@@ -1088,6 +1095,7 @@ def test_wrong_policy_exception_or_approval_in_claim_rejected(synthetic, field):
         )
 
 
+@pytest.mark.windows
 def test_original_pair_cannot_be_replaced_by_a_new_identical_acquisition(synthetic):
     original = synthetic.policy.scope.before
     # Same bytes and numbers, but the trusted acquisition registry says this is
@@ -1102,6 +1110,7 @@ def test_original_pair_cannot_be_replaced_by_a_new_identical_acquisition(synthet
         synthetic.reserve()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "field,value", [("root", r"D:\SYNTHETIC-OTHER\build"), ("raw_after", 0x30), ("changed_rows", 2)]
 )
@@ -1116,6 +1125,7 @@ def test_additional_historical_path_bit_or_ledger_scope_cannot_use_old_approval(
         synthetic.verifier.eligibility(policy, synthetic.approval)
 
 
+@pytest.mark.windows
 def test_truncated_or_changed_complete_delta_ledger_is_rejected(synthetic):
     ref = synthetic.policy.scope.complete_delta_ledger
     raw = strict_json(synthetic.owner.read_artifact(ref))
@@ -1125,6 +1135,7 @@ def test_truncated_or_changed_complete_delta_ledger_is_rejected(synthetic):
         synthetic.reserve()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("attributes", [0x30, 0x10000010, 0x20000010])
 def test_new_raw_discrepancy_is_not_covered_by_the_historical_exception(synthetic, attributes):
     old = synthetic.owner.observations[synthetic.bridge.after_observation]
@@ -1137,6 +1148,7 @@ def test_new_raw_discrepancy_is_not_covered_by_the_historical_exception(syntheti
         )
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "when", ["2000-12-31T23:59:59Z", "2001-01-08T00:00:00Z", "2001-01-31T00:00:00Z"]
 )
@@ -1146,6 +1158,7 @@ def test_claim_and_terminal_boundaries_use_fixture_clocks(synthetic, when):
         synthetic.reserve()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -1159,6 +1172,7 @@ def test_seven_and_thirty_day_policy_cannot_be_extended_or_made_ambiguous(synthe
         reseal(OperatorApproval, synthetic.approval, **{field: value})
 
 
+@pytest.mark.windows
 def test_consumed_claim_survives_reopen_and_concurrent_claims_have_one_winner(synthetic):
     def attempt(_):
         try:
@@ -1177,6 +1191,7 @@ def test_consumed_claim_survives_reopen_and_concurrent_claims_have_one_winner(sy
         reopened.claim(synthetic.claim)
 
 
+@pytest.mark.windows
 def test_missing_or_wrong_owner_ledger_is_not_initialized(synthetic):
     path = synthetic.root / "SYNTHETIC-missing.sqlite"
     with pytest.raises(FileNotFoundError):
@@ -1186,6 +1201,7 @@ def test_missing_or_wrong_owner_ledger_is_not_initialized(synthetic):
         LineageLedger(synthetic.ledger.path, "wrong-ledger")
 
 
+@pytest.mark.windows
 def test_failed_mandatory_execution_stops_before_later_stages_and_cannot_finalize(synthetic):
     execution = synthetic_execution(synthetic, guest_pass=False)
     with pytest.raises(ValueError, match="mandatory ISO04"):
@@ -1208,6 +1224,7 @@ def test_failed_mandatory_execution_stops_before_later_stages_and_cannot_finaliz
         )
 
 
+@pytest.mark.windows
 def test_started_stage_is_consumed_even_if_no_completion_was_saved(synthetic):
     synthetic.reserve()
     synthetic.verifier.begin_stage(
@@ -1228,6 +1245,7 @@ def test_started_stage_is_consumed_even_if_no_completion_was_saved(synthetic):
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("state", ["REVOKED", "EXPIRED"])
 def test_terminal_revocation_and_expiry_cannot_be_undone_by_a_later_active_snapshot(
     synthetic, state
@@ -1243,6 +1261,7 @@ def test_terminal_revocation_and_expiry_cannot_be_undone_by_a_later_active_snaps
         synthetic.verifier.verify_downstream(envelope)
 
 
+@pytest.mark.windows
 def test_no_terminal_result_without_complete_pre_result_closure(synthetic):
     execution = synthetic_execution(synthetic)
     complete_synthetic_stages(synthetic, execution)
@@ -1259,6 +1278,7 @@ def test_no_terminal_result_without_complete_pre_result_closure(synthetic):
         )
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("change", ["bridge", "comparable", "current_comparison", "wrong_ledger"])
 def test_missing_bridge_comparability_or_wrong_ledger_cannot_finalize(synthetic, change):
     execution = synthetic_execution(synthetic)
@@ -1341,6 +1361,7 @@ def conditional_consumers(case, envelope):
     return blueprint, source, prep, attempt, inputs
 
 
+@pytest.mark.windows
 def test_actual_conditional_preparation_and_attempt_propagate_the_whole_binding(synthetic):
     _result, envelope = synthetic_result(synthetic)
     before = synthetic.owner.resolutions
@@ -1356,6 +1377,7 @@ def test_actual_conditional_preparation_and_attempt_propagate_the_whole_binding(
     assert attempt.contract_version == "policy-qualified-runtime-protection-attempt-v1"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "consumer",
     [
@@ -1430,6 +1452,7 @@ def test_missing_caveat_rejected_at_every_intended_consumer(synthetic, consumer)
             validate_conditional_attempt(canonical_bytes(value), policy_verifier=synthetic.verifier)
 
 
+@pytest.mark.windows
 def test_conditional_to_legacy_downgrade_and_unaware_models_reject(synthetic):
     from tradingagents.qualified_routing_composition import (
         ProductionQualifiedRoutingPreparation,
@@ -1470,6 +1493,7 @@ def test_conditional_to_legacy_downgrade_and_unaware_models_reject(synthetic):
         )
 
 
+@pytest.mark.windows
 def test_authentication_is_required_again_at_each_consumer(synthetic):
     from tradingagents.qualified_routing_composition import (
         seal_production_qualified_routing_preparation,
@@ -1498,6 +1522,7 @@ def test_authentication_is_required_again_at_each_consumer(synthetic):
             use()
 
 
+@pytest.mark.windows
 def test_missing_or_forged_separate_receipt_is_rejected(synthetic):
     from tradingagents.policy_qualified_contract import PostResultAcceptanceReceipt
 
@@ -1515,6 +1540,7 @@ def test_missing_or_forged_separate_receipt_is_rejected(synthetic):
         synthetic.verifier.verify_downstream(envelope.model_copy(update={"receipt": receipt}))
 
 
+@pytest.mark.windows
 def test_file_hashes_are_distinct_from_content_identities_and_framing_is_bound(synthetic):
     result, envelope = synthetic_result(synthetic)
     assert envelope.core.result.pin.sha256 != result.result_identity.rsplit(":", 1)[1]
@@ -1547,6 +1573,7 @@ def test_closed_schema_descriptor_has_acyclic_identity_and_complete_consumer_ent
     assert "receipt" in descriptor["schema"]["$defs"]["DownstreamEnvelope"]["required"]
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("artifact", ["source", "runtime"])
 def test_canonical_source_and_full_bundle_verifiers_reject_changed_fixture_bytes(
     synthetic, artifact
@@ -1577,12 +1604,14 @@ def test_canonical_source_and_full_bundle_verifiers_reject_changed_fixture_bytes
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 def test_missing_reviewed_predecessor_file_fails_activation(synthetic):
     synthetic.owner.pinned.clear()
     with pytest.raises(ValueError, match="predecessor"):
         synthetic.reserve()
 
 
+@pytest.mark.windows
 def test_repeated_finalization_or_receipt_does_not_rewrite_terminal_outcome(synthetic):
     result, envelope = synthetic_result(synthetic)
     before = synthetic.ledger.events(synthetic.claim)
@@ -1599,6 +1628,7 @@ def test_repeated_finalization_or_receipt_does_not_rewrite_terminal_outcome(synt
     assert synthetic.verifier.verify_downstream(envelope) == envelope
 
 
+@pytest.mark.windows
 def test_wrong_ledger_in_claim_is_not_the_approved_lineage_plan(synthetic):
     plan = reseal(
         LineagePlan,
@@ -1621,6 +1651,7 @@ def replace_synthetic_closure(case, execution, closure_ref):
     )
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "missing",
     [
@@ -1644,6 +1675,7 @@ def test_required_post_review_closure_evidence_cannot_be_omitted(synthetic, miss
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("kind", ["canonical", "raw"])
 def test_post_review_discrepancy_is_fatal_even_after_successful_iso04(synthetic, kind):
     from tradingagents.windows_sandbox_qualification import ProtectedHostInventory
@@ -1684,6 +1716,7 @@ def test_post_review_discrepancy_is_fatal_even_after_successful_iso04(synthetic,
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 def test_post_review_inventory_detects_new_unlisted_evidence(synthetic):
     execution = synthetic_execution(synthetic)
     (Path(synthetic.claim.stages[4].root) / "SYNTHETIC-extra-after-review.txt").write_text(
@@ -1693,6 +1726,7 @@ def test_post_review_inventory_detects_new_unlisted_evidence(synthetic):
         complete_synthetic_stages(synthetic, execution)
 
 
+@pytest.mark.windows
 def test_post_review_inventory_cannot_omit_a_required_file_even_after_removal(synthetic):
     from tradingagents.policy_qualified_contract import PreResultEvidenceInventory
 
@@ -1719,6 +1753,7 @@ def test_post_review_inventory_cannot_omit_a_required_file_even_after_removal(sy
         complete_synthetic_stages(synthetic, execution)
 
 
+@pytest.mark.windows
 def test_post_review_inventory_cannot_suppress_inaccessible_directories(synthetic, monkeypatch):
     import tradingagents.policy_qualified_results as results
 
@@ -1737,6 +1772,7 @@ def test_post_review_inventory_cannot_suppress_inaccessible_directories(syntheti
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("change", ["earlier", "wrong_stage", "missing"])
 def test_post_review_host_inventory_requires_a_fresh_registered_acquisition(synthetic, change):
     execution = synthetic_execution(synthetic)
@@ -1758,6 +1794,7 @@ def test_post_review_host_inventory_requires_a_fresh_registered_acquisition(synt
         complete_synthetic_stages(synthetic, execution)
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("axis", ["EVIDENCE", "CONTRACT"])
 def test_implementation_review_axes_cannot_substitute_for_qualification_reviews(synthetic, axis):
     execution = synthetic_execution(synthetic)
@@ -1769,12 +1806,14 @@ def test_implementation_review_axes_cannot_substitute_for_qualification_reviews(
         reseal(IndependentReviewRecord, record, axis=axis)
 
 
+@pytest.mark.windows
 def test_additional_null_historical_field_is_not_misclassified_as_attributes_only(tmp_path):
     case = SyntheticCase(tmp_path, additional_historical_field=True)
     with pytest.raises(ValueError, match="additional historical field"):
         case.reserve()
 
 
+@pytest.mark.windows
 def test_missing_source_bytes_terminate_the_claim_without_retry(synthetic):
     execution = synthetic_execution(synthetic)
     (synthetic.owner.source_root / "source-manifest.json").unlink()
@@ -1783,6 +1822,7 @@ def test_missing_source_bytes_terminate_the_claim_without_retry(synthetic):
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("change", ["stage_id", "stage_root", "baseline", "inventory_root"])
 def test_claim_must_match_canonical_allocation_authority(synthetic, change):
     payload = synthetic.allocation.model_dump(mode="json")
@@ -1801,6 +1841,7 @@ def test_claim_must_match_canonical_allocation_authority(synthetic, change):
         )
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("reused", ["root", "run_id", "baseline"])
 def test_new_policy_cannot_reuse_consumed_stage_or_baseline_allocations(synthetic, reused):
     synthetic.reserve()
@@ -1864,6 +1905,7 @@ def advance_authority_on_read(case, reference_to_read, **changes):
     return fired
 
 
+@pytest.mark.windows
 def test_iso03_wrong_source_fails_completion_before_any_later_stage(synthetic):
     from tradingagents.windows_sandbox_qualification import ISO03HostQualificationReport
 
@@ -1902,6 +1944,7 @@ def test_iso03_wrong_source_fails_completion_before_any_later_stage(synthetic):
         )
 
 
+@pytest.mark.windows
 def test_wrong_predecessor_fails_at_stage_completion(synthetic):
     execution = synthetic_execution(synthetic)
     begin_synthetic_stage(synthetic, execution, 1)
@@ -1914,6 +1957,7 @@ def test_wrong_predecessor_fails_at_stage_completion(synthetic):
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 def test_baseline_must_bind_the_completed_iso03_before_iso04_admission(synthetic):
     execution = synthetic_execution(synthetic)
     begin_synthetic_stage(synthetic, execution, 2)
@@ -1932,6 +1976,7 @@ def test_baseline_must_bind_the_completed_iso03_before_iso04_admission(synthetic
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 def test_source_change_after_completion_blocks_the_next_start(synthetic):
     execution = synthetic_execution(synthetic)
     synthetic.reserve()
@@ -1963,6 +2008,7 @@ def test_source_change_after_completion_blocks_the_next_start(synthetic):
     assert not any(x["kind"] == "START:ISO03" for x in synthetic.ledger.events(synthetic.claim))
 
 
+@pytest.mark.windows
 def test_claim_timestamp_is_minted_after_checks_with_an_advancing_fixture_clock(synthetic):
     original = synthetic.owner.resolve
     initial = utc(synthetic.owner.resolution.now_utc)
@@ -1983,6 +2029,7 @@ def test_claim_timestamp_is_minted_after_checks_with_an_advancing_fixture_clock(
     assert bridge_observation.allocation_identity == claim.allocation_identity
 
 
+@pytest.mark.windows
 def test_claim_cannot_backdate_across_seven_day_deadline_during_evidence_reads(synthetic):
     old = synthetic.owner.resolution
     fired = advance_authority_on_read(
@@ -1998,6 +2045,7 @@ def test_claim_cannot_backdate_across_seven_day_deadline_during_evidence_reads(s
         synthetic.reserve()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "operation", ["begin", "complete", "finalize", "receipt", "verify", "report"]
 )
@@ -2079,6 +2127,7 @@ def test_later_expiry_snapshot_blocks_each_lifecycle_or_acceptance_operation(syn
         assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "TERMINAL"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("margin", [0, 1])
 def test_remaining_stage_cleanup_and_closure_budgets_must_fit_exclusively(synthetic, margin):
     synthetic.reserve()
@@ -2109,6 +2158,7 @@ def test_remaining_stage_cleanup_and_closure_budgets_must_fit_exclusively(synthe
         assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "START:ISO02"
 
 
+@pytest.mark.windows
 def test_separate_execution_window_must_fit_canonical_remaining_budgets(synthetic):
     synthetic.owner.resolution = replace(
         synthetic.owner.resolution, execution_expires_utc="2001-01-02T00:01:00Z"
@@ -2117,6 +2167,7 @@ def test_separate_execution_window_must_fit_canonical_remaining_budgets(syntheti
         synthetic.reserve()
 
 
+@pytest.mark.windows
 def test_declared_budgets_must_match_the_authenticated_execution_procedure(synthetic):
     budgets = list(synthetic.owner.resolution.execution_stage_budgets)
     budgets[3] = budgets[3].model_copy(update={"maximum_execution_seconds": 1})
@@ -2127,6 +2178,7 @@ def test_declared_budgets_must_match_the_authenticated_execution_procedure(synth
         synthetic.reserve()
 
 
+@pytest.mark.windows
 def test_stage_cannot_complete_after_its_approved_execution_and_cleanup_budget(synthetic):
     execution = synthetic_execution(synthetic)
     begin_synthetic_stage(synthetic, execution, 0)
@@ -2145,6 +2197,7 @@ def test_stage_cannot_complete_after_its_approved_execution_and_cleanup_budget(s
         )
 
 
+@pytest.mark.windows
 def test_terminal_verification_cannot_exceed_its_approved_budget(synthetic):
     execution = synthetic_execution(synthetic)
     complete_synthetic_stages(synthetic, execution)
@@ -2163,6 +2216,7 @@ def test_terminal_verification_cannot_exceed_its_approved_budget(synthetic):
     assert synthetic.ledger.events(synthetic.claim)[-1]["kind"] == "FAILED"
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("operation", ["start", "complete", "terminal", "receipt"])
 def test_concurrent_durable_revocation_blocks_lifecycle_commit_atomically(synthetic, operation):
     """The authority read succeeds, then a concurrent owner invalidates storage."""

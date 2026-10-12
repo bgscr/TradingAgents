@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -82,13 +83,20 @@ def test_standard_package_pin_is_the_default_refresh_target() -> None:
 @pytest.mark.unit
 def test_built_wheel_contains_standard_crypto_registry_pin(tmp_path: Path) -> None:
     wheel_directory = tmp_path / "wheel"
+    source = tmp_path / "source"
+    source.mkdir()
+    for package in ("tradingagents", "cli"):
+        shutil.copytree(PROJECT_ROOT / package, source / package,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for filename in ("pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy2(PROJECT_ROOT / filename, source / filename)
     completed = subprocess.run(
         (
             sys.executable,
             "-m",
             "pip",
             "wheel",
-            str(PROJECT_ROOT),
+            str(source),
             "--no-build-isolation",
             "--no-deps",
             "--wheel-dir",
@@ -108,6 +116,7 @@ def test_built_wheel_contains_standard_crypto_registry_pin(tmp_path: Path) -> No
     assert {
         "tradingagents/config/crypto_identity_registry.json",
         "tradingagents/config/crypto_identity_registry.sha256",
+        "tradingagents/market_history/current_cache_compatibility.json",
     } <= packaged_files
 
 

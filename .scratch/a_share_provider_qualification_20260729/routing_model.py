@@ -6,7 +6,6 @@ import math
 from collections import defaultdict
 from statistics import mean
 
-
 FINANCIAL_CAPABILITIES = {
     "annual_balance_sheet",
     "quarterly_balance_sheet",
@@ -99,7 +98,7 @@ def score_policies(summary_records):
         complexity_penalty = 0.0
         compatibility_penalty = 0.0
         maintenance_penalty = 0.0
-        for (symbol, capability), records in grouped.items():
+        for (_symbol, capability), records in grouped.items():
             winner, attempted = _winner(records, routes[capability], capability)
             for item in attempted:
                 request_ids.update(item.get("call_ids", []))

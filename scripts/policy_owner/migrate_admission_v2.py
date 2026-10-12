@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import json
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 
 def _error_details(error: BaseException) -> dict:

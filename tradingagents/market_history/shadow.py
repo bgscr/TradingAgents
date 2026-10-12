@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from hashlib import sha256
 
@@ -75,13 +76,15 @@ def persist_mainland_history_candidate(candidate: object) -> HistoryBundleWriteR
                     requested_date=publication.requested_as_of,
                     purpose=SnapshotPurpose.CURRENT_ANALYSIS,
                 )
-            try:
+            prior_calendar = None
+            with suppress(KeyError):
                 prior_calendar = store.read_current_session_calendar(
                     calendar.reference_market
                 )
-            except KeyError:
-                pass
-            else:
+            # CAL-02 payloads bind exact provider-returned membership. Keep
+            # these immutable; calendar_discovery composes verified views
+            # when a requested window spans several stored revisions.
+            if prior_calendar is not None and not calendar.payload_contract:
                 sessions_by_date = {
                     item.session_date: item for item in prior_calendar.sessions
                 }

@@ -31,6 +31,9 @@ dependencies = [
     "stockstats>=0.6.5",
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
+    "tomli>=2.0.1; python_version < '3.11'",
+    "exceptiongroup>=1.2.0; python_version < '3.11'",
+    "lxml==6.1.1",
     "akshare>=1.18.64",
     "baostock>=0.8.9",
     "yfinance>=1.4.1",
@@ -68,6 +71,7 @@ cli = ["static/*"]
 tradingagents = [
     "config/crypto_identity_registry.json",
     "config/crypto_identity_registry.sha256",
+    "market_history/current_cache_compatibility.json",
 ]
 
 [tool.pytest.ini_options]
@@ -77,6 +81,7 @@ markers = [
     "unit: fast isolated unit tests",
     "integration: tests requiring external services",
     "smoke: quick sanity-check tests",
+    "windows: requires Windows filesystem or native API contracts (Windows CI)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

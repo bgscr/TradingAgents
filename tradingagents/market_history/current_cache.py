@@ -62,9 +62,8 @@ SOURCE_FILES = (
 )
 VERIFICATION_FILES = (
     "tests/test_market_history_persistent_reuse.py",
-    ".integration-work/market_history_ab_bootstrap.py",
-    ".integration-work/market_history_ab_current_bootstrap.py",
-    ".integration-work/tushare_tls_bootstrap.py",
+    "tests/test_tushare_pit_provider.py",
+    "scripts/run_current_cache_compatibility.py",
 )
 SCENARIOS = (
     "shanghai_primary", "shenzhen_primary", "baostock_fallback", "yahoo_fallback",

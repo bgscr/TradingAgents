@@ -2898,6 +2898,7 @@ def test_iso_03_reviewed_host_harness_rejects_dirty_executing_module_bytes(
         )
 
 
+@pytest.mark.windows
 def test_iso_03_probe_plan_binds_python_i_and_sqlite_to_exact_protected_files(
     tmp_path: Path,
 ) -> None:

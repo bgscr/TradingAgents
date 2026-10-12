@@ -1779,13 +1779,13 @@ def _validate_history_candidate_window(candidate, provider, symbol, start_date, 
     if completed is None:
         raise ValueError("no completed session in the requested window")
     expected = {day for day, status in calendar.items() if start <= day <= min(end, completed) and status == "open"}
-    actual = {item.session_date for item in bundle.observations}
-    if actual != expected:
-        raise ValueError("history candidate does not cover its requested open sessions")
     frame = validate_ohlcv_frame(candidate.frame, end_date, start_date)
     _validated_candidate_status(candidate, frame,
                                 provider_name=bundle.provider.provider_name,
                                 requested_date=min(end, completed).isoformat())
+    actual = {item.session_date for item in bundle.observations}
+    if actual != expected:
+        raise ValueError("history candidate does not cover its requested open sessions")
 
 
 def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None):
@@ -2056,6 +2056,8 @@ def _acquire_authoritative_market_snapshot(
                 persistence_results[provider_name] = write_result
             requested_ranges[provider_name] = ranges
             local_rows[provider_name] = retained_rows
+        except AuthoritativeTradingStatusValidationError:
+            raise
         except (NoMarketDataError, ValueError) as exc:
             validation_quarantine[provider_name] = QuarantinedSnapshot(
                 provider_name,
@@ -2179,6 +2181,7 @@ def _acquire_authoritative_market_snapshot(
             tool_call_id=source_ref,
             tool_name="authoritative_market_snapshot_normalized_frame_v1",
         ),
+        terminal_errors=(AuthoritativeTradingStatusValidationError,),
         providers=providers,
         validator=lambda value: value,
         serializer=_normalized_frame_text,

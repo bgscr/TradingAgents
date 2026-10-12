@@ -7,12 +7,16 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import zipfile
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 
-import tomllib
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from tradingagents.offline_runtime_bundle import (
     OfflineBundleSourceBinding,

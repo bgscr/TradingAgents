@@ -105,6 +105,7 @@ def owner_case(tmp_path):
     return b, scope, measurement, value, descriptor, entry
 
 
+@pytest.mark.windows
 def test_versioned_decision_derives_scope_then_compact_native_fixture_intake(tmp_path):
     b, scope, measurement, value, descriptor, entry = owner_case(tmp_path)
     assert b.owner.read_artifact(artifact_ref(scope)) == scope.to_bytes()
@@ -117,6 +118,7 @@ def test_versioned_decision_derives_scope_then_compact_native_fixture_intake(tmp
         b.owner.validate_authentication_document("REGISTER_EVIDENCE", entry)
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("field", ["scope", "candidate", "instance", "approval"])
 def test_wrong_versioned_intake_context_rejects_before_authentication(tmp_path, field):
     b, scope, measurement, value, descriptor, entry = owner_case(tmp_path)

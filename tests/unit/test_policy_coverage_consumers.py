@@ -30,6 +30,7 @@ def completed(tmp_path_factory):
     return case, result, receipt, envelope
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize(
     "boundary",
     ["stage", "review", "closure", "execution", "history", "result", "receipt", "envelope"],
@@ -73,6 +74,7 @@ def test_missing_coverage_never_parses_at_any_boundary(completed, boundary):
         type(value).read(body)
 
 
+@pytest.mark.windows
 def test_native_v3_prepared_controls_completion_and_old_schema_rejection(completed):
     from tests.test_runtime_protection_handoff import handoff_fixture, prepared_evidence
     from tradingagents.policy_coverage_models import CoverageEnvelope
@@ -180,6 +182,7 @@ def test_native_v3_prepared_controls_completion_and_old_schema_rejection(complet
     assert CoverageEnvelope.read(envelope) == envelope
 
 
+@pytest.mark.windows
 def test_real_worker_materialization_dispatch_accepts_v2_and_preserves_ancestry(
     completed, tmp_path, monkeypatch
 ):

@@ -1,4 +1,4 @@
-"""Synthetic-only acceptance; run exclusively through the task's guarded bootstrap."""
+"""Synthetic-only acceptance; standalone runner: scripts/run_current_cache_compatibility.py."""
 
 import json
 from dataclasses import dataclass, replace
@@ -515,7 +515,10 @@ def test_unknown_weekend_does_not_consume_correction_sessions():
 def test_incomplete_refresh_never_claims_coverage(rig):
     first = rig["get"](DAYS[-261], DAYS[-2])
     rig["omissions"][0] = (DAYS[-1],)
-    with pytest.raises(NoMarketDataError):
+    with pytest.raises(
+        snapshot.AuthoritativeTradingStatusValidationError,
+        match="does not cover the latest applicable mainland session",
+    ):
         rig["get"](DAYS[-261], DAYS[-1])
     with MarketHistoryStore.open(rig["config"]) as store:
         assert len(store.read_pinned_snapshot(first.snapshot_id).frame) == 260
@@ -927,7 +930,7 @@ def validated_manifest(tmp_path, monkeypatch):
         "sources": cache.source_fingerprints(), "matrix": CURRENT_MATRIX,
         "details": CURRENT_MATRIX_DETAILS,
         "matrix_sha256": cache.digest(CURRENT_MATRIX),
-        "evidence": {"path": str(evidence_path), "sha256": cache.sha256(evidence_path.read_bytes()).hexdigest(),
+        "evidence": {"path": evidence_path.name, "sha256": cache.sha256(evidence_path.read_bytes()).hexdigest(),
                      "scope": "isolated-synthetic-current-cache-only"}}
     path.write_text(cache.canonical(manifest), encoding="utf-8")
     monkeypatch.setattr(cache, "MANIFEST_PATH", path)

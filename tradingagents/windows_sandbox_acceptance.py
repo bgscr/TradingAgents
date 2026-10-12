@@ -14,9 +14,10 @@ import stat
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from typing_extensions import Self
 
 if TYPE_CHECKING:
     from tradingagents.windows_sandbox_qualification import (

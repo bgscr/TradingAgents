@@ -9,10 +9,7 @@ import time
 from pathlib import Path
 
 import baostock as bs
-import pandas as pd
-
 from probe import SYMBOLS, _bs_frame, analyze_frame, failure, merge_frames
-
 
 ROOT = Path(__file__).resolve().parent
 PERIODS = sorted({

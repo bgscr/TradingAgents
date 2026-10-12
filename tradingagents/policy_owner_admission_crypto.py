@@ -47,7 +47,7 @@ def client_json(challenge: bytes) -> bytes:
     require(type(challenge) is bytes and len(challenge) == 32, "256-bit challenge required")
     token = base64.urlsafe_b64encode(challenge).rstrip(b"=").decode("ascii")
     return (f'{{"type":"webauthn.get","challenge":"{token}",'
-            f'"origin":"https://{RP_ID}","crossOrigin":false}}').encode("utf-8")
+            f'"origin":"https://{RP_ID}","crossOrigin":false}}').encode()
 
 
 def authenticator_header(raw: bytes, registration: bool) -> int:

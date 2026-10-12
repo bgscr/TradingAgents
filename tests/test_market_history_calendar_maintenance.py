@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 import tradingagents.market_history.current as current_history
+from tests.fixtures.synthetic_calendar import canonical_calendar
 from tradingagents.market_history import (
     AdjustmentFactorObservation,
     DataUsageMode,
@@ -33,6 +34,7 @@ from tradingagents.market_history import (
     normalize_mainland_session,
     plan_incremental_refresh,
     reconciliation_due,
+    upstream_service_identity_for_provider,
 )
 
 
@@ -50,7 +52,7 @@ def _config(tmp_path) -> MarketHistoryConfig:
 def _calendar_publication() -> MarketSessionCalendarPublication:
     return MarketSessionCalendarPublication(
         provider=ProviderDatasetSpec(
-            upstream_service_id="upstream:baostock-tcp",
+            upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
             upstream_service_name="BaoStock TCP service",
             provider_dataset_id="provider-dataset:baostock-calendar-v1",
             provider_name="baostock",
@@ -76,7 +78,7 @@ def _history_publication() -> ProviderHistoryBundlePublication:
     observed_at = datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc)
     return ProviderHistoryBundlePublication(
         provider=ProviderDatasetSpec(
-            upstream_service_id="upstream:baostock-tcp",
+            upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
             upstream_service_name="BaoStock TCP service",
             provider_dataset_id="provider-dataset:baostock-cn-a-v1",
             provider_name="baostock",
@@ -419,6 +421,7 @@ def test_authoritative_current_read_degrades_on_in_range_history_gap(
             for day in (date(2026, 7, 22), date(2026, 7, 23), date(2026, 7, 24))
         ),
     )
+    calendar = canonical_calendar(calendar.sessions, calendar.observed_at)
     with MarketHistoryStore.open(config) as store:
         store.publish_history_bundle(publication)
         store.publish_session_calendar(calendar)
@@ -448,7 +451,7 @@ def test_authoritative_current_read_degrades_on_in_range_history_gap(
     )
     exact_latest_only = current_history.try_read_authoritative_mainland_frame(
         "600519.SS",
-        "2026-07-22",
+        "2026-07-24",
         "2026-07-24",
         minimum_history_rows=1,
     )
@@ -575,12 +578,12 @@ def test_maintenance_summary_reports_durable_work_and_diagnostics(tmp_path) -> N
         orphan = store.install_payload(b"orphan", media_type="application/octet-stream")
         coordinator = ProviderRequestCoordinator(store)
         coordinator.register_upstream_service(
-            "upstream:baostock-tcp",
+            upstream_service_identity_for_provider("baostock")[0],
             "BaoStock TCP service",
         )
         decision = coordinator.acquire(
             request_key="maintenance:600519.SS",
-            upstream_service_id="upstream:baostock-tcp",
+            upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
             owner_id="maintenance-worker",
             priority=RequestPriority.RECONCILIATION,
             now=now,
@@ -590,7 +593,7 @@ def test_maintenance_summary_reports_durable_work_and_diagnostics(tmp_path) -> N
         coordinator.record_physical_attempt(decision.lease, occurred_at=now)
         coordinator.release(decision.lease)
         coordinator.record_rate_limit(
-            upstream_service_id="upstream:baostock-tcp",
+            upstream_service_id=upstream_service_identity_for_provider("baostock")[0],
             cooldown_scope="history-maintenance",
             observed_at=now,
             retry_after=timedelta(minutes=5),

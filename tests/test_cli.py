@@ -334,13 +334,17 @@ def test_market_session_calendar_bootstrap_is_separate_from_analysis_options() -
 
     assert analyze_help.exit_code == 0, analyze_help.output
     assert bootstrap_help.exit_code == 0, bootstrap_help.output
-    assert "--authorize-provider-io" not in analyze_help.output
-    assert "--force-refresh" not in analyze_help.output
-    assert "--bootstrap-if-missing" not in analyze_help.output
-    assert "--authorize-provider-io" in bootstrap_help.output
-    assert "--force-refresh" in bootstrap_help.output
-    assert "symbol" not in bootstrap_help.output.casefold()
-    assert "checkpoint" not in bootstrap_help.output.casefold()
+    from rich.text import Text
+
+    analyze_text = Text.from_ansi(analyze_help.output).plain
+    bootstrap_text = Text.from_ansi(bootstrap_help.output).plain
+    assert "--authorize-provider-io" not in analyze_text
+    assert "--force-refresh" not in analyze_text
+    assert "--bootstrap-if-missing" not in analyze_text
+    assert "--authorize-provider-io" in bootstrap_text
+    assert "--force-refresh" in bootstrap_text
+    assert "symbol" not in bootstrap_text.casefold()
+    assert "checkpoint" not in bootstrap_text.casefold()
 
 
 @pytest.mark.unit
