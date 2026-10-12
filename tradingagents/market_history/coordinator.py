@@ -1137,6 +1137,7 @@ class ProviderRequestCoordinator:
         max_physical_operations: int,
         workflow: Callable[[PhysicalWorkflowOperation], T],
         cooldown_scope: str = "all",
+        wait_for_initial_pacing: bool = False,
     ) -> CoordinatedRequestResult[T]:
         """Run a bounded multi-operation provider workflow under one lease.
 
@@ -1181,6 +1182,7 @@ class ProviderRequestCoordinator:
                 max_physical_operations=max_physical_operations,
                 workflow=workflow,
                 cooldown_scope=cooldown_scope,
+                wait_for_initial_pacing=wait_for_initial_pacing,
             )
         except BaseException as exc:
             with self._single_flight_lock:
@@ -1220,17 +1222,36 @@ class ProviderRequestCoordinator:
         max_physical_operations: int,
         workflow: Callable[[PhysicalWorkflowOperation], T],
         cooldown_scope: str,
+        wait_for_initial_pacing: bool,
     ) -> CoordinatedRequestResult[T]:
         started_at = _as_utc(now(), label="coordinator time")
-        decision = self.acquire(
-            request_key=request_key,
-            upstream_service_id=upstream_service_id,
-            owner_id=owner_id,
-            priority=priority,
-            now=started_at,
-            lease_duration=lease_duration,
-            cooldown_scope=cooldown_scope,
-        )
+        initial_pacing_wait_seconds = 0.0
+        while True:
+            self._raise_if_stopped()
+            decision = self.acquire(
+                request_key=request_key,
+                upstream_service_id=upstream_service_id,
+                owner_id=owner_id,
+                priority=priority,
+                now=started_at,
+                lease_duration=lease_duration,
+                cooldown_scope=cooldown_scope,
+            )
+            if (wait_for_initial_pacing and decision.disposition is LeaseDisposition.PACING
+                    and decision.cooldown_until is not None):
+                wait_seconds = min(60.0, lease_duration.total_seconds() / 2,
+                    max(0.0, (decision.cooldown_until-started_at).total_seconds()))
+                try:
+                    self._wait_or_raise_if_stopped(wait_seconds, sleep=sleep)
+                except PhysicalAttemptBudgetExhausted:
+                    self.cancel_queued_request(request_key=request_key,
+                                               upstream_service_id=upstream_service_id)
+                    raise
+                initial_pacing_wait_seconds += wait_seconds
+                started_at = max(_as_utc(now(), label="coordinator time"),
+                                 started_at + timedelta(seconds=wait_seconds))
+                continue
+            break
         if decision.disposition is LeaseDisposition.DUPLICATE_IN_FLIGHT:
             assert decision.active_owner_id is not None
             return self._wait_for_persisted_sequence(
@@ -1348,9 +1369,11 @@ class ProviderRequestCoordinator:
             lease = renewed
             pacing_event = (
                 "paced_then_permit_acquired"
-                if pacing_wait_seconds
+                if pacing_wait_seconds or (attempt_index == 1 and initial_pacing_wait_seconds)
                 else "permit_acquired"
             )
+            if attempt_index == 1:
+                pacing_wait_seconds += initial_pacing_wait_seconds
             connection = self._database_connection()
             attempt_recorded = False
 

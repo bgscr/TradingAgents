@@ -108,13 +108,16 @@ def main():
                 Path(sys.base_prefix),
                 Path(sys.prefix),
             )
-            exact = {SOURCE / "scripts/run_current_cache_compatibility.py"}
+            exact = {SOURCE / "scripts/run_current_cache_compatibility.py",
+                     SOURCE / "scripts/accept_tushare_current.py"}
             exact.update(
                 SOURCE / "tests" / name
                 for name in (
                     "__init__.py",
                     "test_market_history_persistent_reuse.py",
                     "test_tushare_pit_provider.py",
+                    "test_tushare_current_incremental.py",
+                    "test_tushare_current_acceptance.py",
                 )
             )
             if not writing and not (path in exact or any(below(path, root) for root in allowed)):
@@ -365,6 +368,8 @@ def main():
                 [
                     str(SOURCE / "tests/test_market_history_persistent_reuse.py"),
                     str(SOURCE / "tests/test_tushare_pit_provider.py"),
+                    str(SOURCE / "tests/test_tushare_current_incremental.py"),
+                    str(SOURCE / "tests/test_tushare_current_acceptance.py"),
                     "-c",
                     str(ROOT / "pytest.ini"),
                     "--noconftest",

@@ -127,6 +127,7 @@ class AuthoritativeMarketSnapshot:
 
     history_local_rows: int = 0
     history_requested_ranges: tuple[tuple[str, str], ...] = ()
+    current_history_lineage: str | None = None
 
     def __post_init__(self) -> None:
         configured_crypto = (
@@ -411,12 +412,16 @@ def _live_snapshot_identity(
         adjustment_basis=snapshot.adjustment_basis,
         frame_digest=frame_digest,
         history_rows=len(snapshot.frame),
-        derivation_version="provider-current-frame-v1",
+        derivation_version=("tushare-current-raw-view-v1" if snapshot.current_history_lineage
+                            else "provider-current-frame-v1"),
         normalization_version="normalized-frame-csv-v1",
-        accepted_artifact_identity=artifact_identity,
+        accepted_artifact_identity=(artifact_identity + ";current-history=sha256:"
+            + sha256(snapshot.current_history_lineage.encode()).hexdigest()
+            if snapshot.current_history_lineage else artifact_identity),
         authoritative_status_identity=status_identity,
         authoritative_status_value=status_value,
-        provenance_class=snapshot.history_store_status,
+        provenance_class=("retrospective_backfill" if snapshot.current_history_lineage
+                          else snapshot.history_store_status),
         asset_configuration=asset_configuration,
         crypto_provider_dataset=crypto_dataset,
     )
@@ -663,8 +668,61 @@ def _tushare_history_binding(symbol):
     return history_binding(symbol)
 
 
-def _load_tushare(symbol, start_date, end_date, *, physical_request=None):
-    from .tushare_market_history import load_snapshot_with_history
+def _load_tushare(symbol, start_date, end_date, *, physical_request=None,
+                  physical_workflow=None, adjustment_as_of=None):
+    from .tushare_market_history import load_calendar, load_snapshot_with_history
+    runtime = get_config()
+    if runtime.get("market_history_mode") == "current":
+        from tradingagents.market_history.config import MarketHistoryConfig
+        from tradingagents.market_history.current_cache import compatibility_diagnostic
+        from tradingagents.market_history.current_incremental import (
+            _materialize,
+            load_current_history,
+        )
+        from tradingagents.market_history.store import MarketHistoryStore
+        diagnostic = compatibility_diagnostic()
+        if diagnostic:
+            # A denied reuse gate permits a complete independent provider read,
+            # but must never open or consult retained CURRENT raw history.
+            return load_snapshot_with_history(symbol, start_date, end_date,
+                request_executor=physical_request, adjustment_as_of=adjustment_as_of)
+        if runtime.get("data_usage_mode") != "personal_research":
+            raise ValueError("CURRENT Tushare usage is not entitled")
+        with MarketHistoryStore.open(MarketHistoryConfig.from_mapping(runtime)) as store:
+            def load(executor, *, probe=False):
+                def acquire(first, last, anchor):
+                    if probe:
+                        raise NeedsAcquisition
+                    return load_snapshot_with_history(symbol, first, last,
+                        request_executor=executor, adjustment_as_of=anchor)
+                def calendar(first, last):
+                    if probe:
+                        raise NeedsAcquisition
+                    return load_calendar(symbol, first, last, request_executor=executor)
+                return load_current_history(store, symbol, start_date, end_date,
+                    acquire=acquire, acquire_calendar=calendar,
+                    max_age_seconds=runtime.get("market_history_current_cache_max_age_seconds", 86400),
+                    repair_ranges=runtime.get("market_history_current_repair_ranges", ()),
+                    force_refresh=runtime.get("market_history_current_force_refresh", False))
+            class NeedsAcquisition(Exception):
+                pass
+            try:
+                return load(None, probe=True)
+            except NeedsAcquisition:
+                pass
+            if physical_workflow is None:
+                return load(physical_request)
+            def workflow(executor):
+                candidate = load(executor)
+                return (candidate.bundle_revision_id, candidate.history_requested_ranges,
+                        candidate.history_local_rows)
+            revision, ranges, local_rows = physical_workflow(workflow)
+            binding, identity = _tushare_history_binding(symbol)
+            retained = store.load_current_history(binding, identity)
+            if retained is None or retained.bundle_revision_id != revision:
+                raise ValueError("CURRENT workflow committed revision is no longer the head")
+            return replace(_materialize(retained, symbol, date.fromisoformat(start_date), date.fromisoformat(end_date)),
+                           history_requested_ranges=tuple(ranges), history_local_rows=local_rows)
     return load_snapshot_with_history(symbol, start_date, end_date,
                                       request_executor=physical_request)
 
@@ -888,11 +946,18 @@ def _load_through_provider_coordinator(
             "current_analysis",
             adjustment_as_of or end_date,
             str(get_config().get("tushare_account_scope_label", "personal-research-default")) if provider_name == "tushare" else "",
+            repr((get_config().get("market_history_current_repair_ranges", ()),
+                  get_config().get("market_history_current_force_refresh", False))) if provider_name == "tushare" else "",
         )
         owner_id = f"snapshot:{threading.get_ident()}:{uuid4().hex}"
         use_history = (history_config.mode in {MarketHistoryMode.AUTHORITATIVE, MarketHistoryMode.CURRENT}
                        and provider.history_load is not None)
-        if use_history and provider.history_uses_physical_workflow:
+        tushare_current_reuse = False
+        if provider_name == "tushare" and history_config.mode is MarketHistoryMode.CURRENT:
+            from tradingagents.market_history.current_cache import compatibility_diagnostic
+            tushare_current_reuse = compatibility_diagnostic() is None
+        if use_history and (provider.history_uses_physical_workflow or (
+            tushare_current_reuse)):
             from tradingagents.market_history.coordinator import (
                 PhysicalAttemptBudgetExhausted,
             )
@@ -909,9 +974,18 @@ def _load_through_provider_coordinator(
 
                 def typed_workflow(execute_operation):
                     def execute(operation, physical_request):
+                        def query():
+                            if provider_name == "tushare":
+                                from tradingagents.market_history.coordinator import (
+                                    record_active_physical_attempt_io,
+                                )
+                                # One validated provider page, inside its leased
+                                # operation callback; neither login nor retries.
+                                record_active_physical_attempt_io()
+                            return _typed_mainland_physical_request(physical_request)
                         return execute_operation(
                             operation,
-                            lambda: _typed_mainland_physical_request(physical_request),
+                            query,
                         )
 
                     return workflow(execute)
@@ -927,7 +1001,8 @@ def _load_through_provider_coordinator(
                         now=_coordinator_now,
                         sleep=_coordinator_sleep,
                         lease_duration=lease_duration,
-                        max_physical_operations=5,
+                        max_physical_operations=24 if provider_name == "tushare" else 5,
+                        wait_for_initial_pacing=provider_name == "tushare",
                         workflow=typed_workflow,
                         cooldown_scope="market-snapshot",
                     )
@@ -958,7 +1033,9 @@ def _load_through_provider_coordinator(
                     error_code=failure.error_code,
                     retry_after_seconds=failure.retry_after_seconds,
                 ) from failure
-            if not workflow_called:
+            if not workflow_called and not (
+                provider_name == "tushare" and getattr(value, "bundle_revision_id", None) is not None
+            ):
                 raise AcquisitionFailure(
                     reason=AcquisitionUnavailableReason.PROVIDER_ERROR
                 )
@@ -1028,7 +1105,10 @@ def _load_through_provider_coordinator(
                     error_code=failure.error_code,
                     retry_after_seconds=failure.retry_after_seconds,
                 ) from failure
-            if physical_request_index == 0:
+            if physical_request_index == 0 and not (
+                provider_name == "tushare" and get_config().get("market_history_mode") == "current"
+                and getattr(value, "bundle_revision_id", None) is not None
+            ):
                 raise AcquisitionFailure(
                     reason=AcquisitionUnavailableReason.PROVIDER_ERROR
                 )
@@ -1502,8 +1582,10 @@ def _validated_candidate_status(
         or provenance.provider_dataset_id != bundle.provider.provider_dataset_id
         or provenance.session_date != latest_status.session_date
         or provenance.status is not latest_status.status
-        or provenance.observed_at != bundle.observed_at
-        or provenance.revision_id is not None
+        or (getattr(candidate, "bundle_revision_id", None) is None and (
+            provenance.observed_at != bundle.observed_at or provenance.revision_id is not None))
+        or (getattr(candidate, "bundle_revision_id", None) is not None and (
+            provenance.observed_at > bundle.observed_at or not provenance.revision_id))
     ):
         raise AuthoritativeTradingStatusValidationError(
             "selected provider status provenance contradicts its history bundle"
@@ -1885,6 +1967,10 @@ def _load_complete_history_window(provider_name, provider, symbol, start_date, e
                 raise ValueError("incremental provider did not return a raw history bundle")
             continue
         _validate_history_candidate_window(candidate, provider, symbol, range_start, range_end)
+        if getattr(candidate, "bundle_revision_id", None) is not None:
+            from tradingagents.market_history.shadow import ShadowWriteResult
+            return (candidate, None, ShadowWriteResult(True, True),
+                    candidate.history_requested_ranges, candidate.history_local_rows)
         # The acquisition range stays in the raw payload. The merged bundle's
         # as-of covers the complete view, including later retained members.
         publication_candidate = replace(candidate, history_bundle=replace(
@@ -2264,7 +2350,9 @@ def _acquire_authoritative_market_snapshot(
             symbol=symbol,
             frame=frame,
             provider=provider_name,
-            retrieved_at=(rebuilt.retrieved_at if rebuilt is not None else datetime.now(timezone.utc).isoformat()),
+            retrieved_at=(rebuilt.retrieved_at if rebuilt is not None else
+                          history_candidate.history_bundle.observed_at.isoformat() if history_candidate is not None
+                          else datetime.now(timezone.utc).isoformat()),
             adjustment_basis=provider.adjustment_basis,
             requested_date=end_date,
             effective_trading_date=effective_date,
@@ -2284,6 +2372,8 @@ def _acquire_authoritative_market_snapshot(
             asset_configuration=asset_configuration,
             crypto_provider_dataset=crypto_provider_datasets.get(provider_name),
             history_local_rows=local_rows.get(provider_name, 0),
+            current_history_lineage=(history_candidate.history_bundle.raw_payload.decode()
+                if history_candidate is not None and getattr(history_candidate, "bundle_revision_id", None) else None),
             history_requested_ranges=requested_ranges.get(provider_name, ()),
             **({"snapshot_id": stored.snapshot_id,
                 "snapshot_id_version": stored.snapshot_id_version,
@@ -2292,6 +2382,10 @@ def _acquire_authoritative_market_snapshot(
         )
         if rebuilt is not None:
             snapshot = replace(snapshot, history_store_status="refreshed", history_store_diagnostic=None)
+        elif history_candidate is not None and getattr(history_candidate, "bundle_revision_id", None):
+            snapshot = replace(snapshot, history_store_status=("current_only_refreshed"
+                if history_candidate.history_requested_ranges else "current_only_cached"),
+                history_store_diagnostic="retrospective_raw_history;strict_history_qualified=false")
         from tradingagents.market_history.shadow import (
             persist_mainland_history_candidate,
             persist_mainland_provider_frame,
@@ -2329,7 +2423,7 @@ def _acquire_authoritative_market_snapshot(
             history_rows=len(frame),
             normalized_frame_text=_normalized_frame_text(frame),
         )
-        if current_cache_diagnostic:
+        if current_cache_diagnostic and not snapshot.current_history_lineage:
             persistence_diagnostics.append(current_cache_diagnostic)
         if write_result.attempted and not write_result.persisted:
             persistence_diagnostics.append(
@@ -2464,7 +2558,9 @@ def get_authoritative_market_snapshot(
             raise CryptoSnapshotIdentityMismatch(
                 "cached crypto snapshot contradicts the authoritative run asset"
             )
-        if snapshot is None or len(snapshot.frame) < minimum_history_rows:
+        if (snapshot is None or len(snapshot.frame) < minimum_history_rows
+                or get_config().get("market_history_current_force_refresh", False)
+                or get_config().get("market_history_current_repair_ranges", ())):
             snapshot = _acquire_authoritative_market_snapshot(
                 symbol,
                 start_date,

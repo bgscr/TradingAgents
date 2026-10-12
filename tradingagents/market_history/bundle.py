@@ -416,6 +416,7 @@ def publish_history_bundle(
     publication: ProviderHistoryBundlePublication,
     *,
     prior_bundle_revision_id: str | None = None,
+    current_only: bool = False,
 ) -> PublishedHistoryBundle:
     publication = replace(
         publication,
@@ -429,7 +430,7 @@ def publish_history_bundle(
             sorted(publication.adjustment_factors, key=lambda item: item.effective_date)
         ),
     )
-    _validate_bundle(publication)
+    _validate_bundle(publication, current_only=current_only)
     artifact = store.install_payload(publication.raw_payload, media_type="application/json")
     observed_at = _utc_text(publication.observed_at)
     retrieval_cutoff = _utc_text(publication.retrieval_cutoff)
@@ -1141,6 +1142,12 @@ def reconstruct_snapshot(
     ).fetchone()
     if bundle_record is None:
         raise KeyError(f"unknown history bundle {bundle_revision_id}")
+    qualified = connection.execute(
+        "SELECT strict_history_qualified FROM provider_datasets WHERE provider_dataset_id = ?",
+        (bundle_record[0],),
+    ).fetchone()
+    if qualified is None or not qualified[0]:
+        raise StrictReplayUnavailable("CURRENT-only bundle is not qualified for reconstruction")
     bundle = _BundleRow(*(str(value) for value in bundle_record))
     _validate_crypto_bundle_binding(
         bundle,
@@ -1900,8 +1907,17 @@ def read_pinned_snapshot(
     )
 
 
-def _validate_bundle(publication: ProviderHistoryBundlePublication) -> None:
-    if not publication.provider.strict_history_qualified:
+def _validate_bundle(publication: ProviderHistoryBundlePublication, *, current_only=False) -> None:
+    if current_only:
+        if (publication.provider.strict_history_qualified
+                or publication.provider.provider_name != "tushare"
+                or publication.provenance_class is not ProvenanceClass.RETROSPECTIVE_BACKFILL
+                or any(item.provenance_class is not ProvenanceClass.RETROSPECTIVE_BACKFILL
+                       or item.provider_available_at is not None
+                       for item in (*publication.observations, *publication.trading_statuses,
+                                    *publication.adjustment_factors))):
+            raise ValueError("CURRENT publication requires unqualified retrospective Tushare evidence")
+    elif not publication.provider.strict_history_qualified:
         raise ValueError("history bundle provider is not qualified for strict reconstruction")
     if not publication.raw_payload:
         raise ValueError("history bundle payload must not be empty")

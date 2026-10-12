@@ -122,6 +122,8 @@ def rig(tmp_path, monkeypatch):
         store_module,
     ):
         monkeypatch.setattr(module, "datetime", FrozenDatetime)
+    from tradingagents.market_history import current_incremental
+    monkeypatch.setattr(current_incremental, "datetime", FrozenDatetime)
     monkeypatch.setattr(snapshot, "_coordinator_now", lambda: clock[0])
     monkeypatch.setattr(
         snapshot,
@@ -960,27 +962,39 @@ def test_current_public_entry_persistent_tushare_hit(current_rig, validated_mani
     print("CURRENT_CACHE_MANIFEST=" + str(validated_manifest))
 
 
-@pytest.mark.parametrize("change", ["expired", "window", "version", "basis", "provider", "corruption", "missing_manifest", "source_mismatch", "shadow", "disabled"])
-def test_current_cache_rejects_incompatible_or_disabled(current_rig, validated_manifest, monkeypatch, change):
+@pytest.mark.parametrize("change", ["expired", "window", "version", "basis", "provider", "corruption"])
+def test_adjusted_frame_codec_rejects_incompatible_evidence(current_rig, validated_manifest, change):
+    # The codec remains an exact-window evidence contract. Tushare's normal
+    # entry now uses raw history; its incremental refresh is covered separately.
     from tradingagents.market_history import current_cache as cache
     rig = current_rig
-    first = rig["get"](rig["start"], rig["end"], 21)
+    live = rig["get"](rig["start"], rig["end"], 21)
+    _, loaded, _ = current_roundtrip(rig, live)
+    descriptor = snapshot.SNAPSHOT_PROVIDERS["tushare"]
     start, end = rig["start"], rig["end"]
     if change == "expired":
         rig["clock"][0] += timedelta(days=2)
     elif change == "window":
         start = DAYS[-26]
     elif change in {"version", "basis"}:
-        descriptor = snapshot.SNAPSHOT_PROVIDERS["tushare"]
-        monkeypatch.setitem(snapshot.SNAPSHOT_PROVIDERS, "tushare", replace(descriptor,
-            **({"current_cache_version": "different-v2"} if change == "version" else {"adjustment_basis": "raw"})))
-    elif change in {"provider", "corruption"}:
-        with MarketHistoryStore.open(rig["config"]) as store:
-            if change == "corruption":
-                store._connection.execute("UPDATE provider_frame_revisions SET frame_digest = ?", ("0"*64,))
-            else:
-                store._connection.execute("UPDATE provider_datasets SET adjustment_methodology = ? WHERE dataset_name LIKE ?", ("poison", cache.CONTRACT + "%"))
-    elif change == "missing_manifest":
+        descriptor = replace(descriptor,
+            **({"current_cache_version": "different-v2"} if change == "version" else {"adjustment_basis": "raw"}))
+    elif change == "provider":
+        loaded.metadata["provider"]["adjustment_methodology"] = "poison"
+    else:
+        loaded.frame.loc[loaded.frame.index[0], "Close"] = 999
+    with pytest.raises(ValueError):
+        cache.decode(loaded, descriptor, SYMBOL, str(start), str(end), 21)
+    assert len(rig["queries"]) == 4
+
+
+@pytest.mark.parametrize("change", ["missing_manifest", "source_mismatch", "shadow", "disabled"])
+def test_current_gate_or_disabled_mode_uses_independent_live_acquisition(current_rig, validated_manifest, monkeypatch, change):
+    from tradingagents.market_history import current_cache as cache
+    rig = current_rig
+    start, end = rig["start"], rig["end"]
+    rig["get"](start, end, 21)
+    if change == "missing_manifest":
         monkeypatch.setattr(cache, "MANIFEST_PATH", validated_manifest.with_name("absent.json"))
     elif change == "source_mismatch":
         manifest = json.loads(validated_manifest.read_text(encoding="utf-8"))
@@ -992,10 +1006,6 @@ def test_current_cache_rejects_incompatible_or_disabled(current_rig, validated_m
     assert len(rig["queries"]) == 8 and result.history_store_status != "current_only_cached"
     if change in {"missing_manifest", "source_mismatch"}:
         assert "current_cache_gate_denied" in result.history_store_diagnostic
-    if change == "expired":
-        third = rig["get"](start, end, 21)
-        assert third.history_store_status == "current_only_cached" and len(rig["queries"]) == 8
-        assert third.retrieved_at != first.retrieved_at
 
 
 def test_closed_start_extension_discovers_calendar_without_price_request(rig, monkeypatch):

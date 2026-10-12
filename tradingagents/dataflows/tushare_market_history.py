@@ -62,6 +62,9 @@ class TushareSnapshotHistoryCandidate:
     latest_traded_close: Decimal | None
     latest_traded_close_diagnostic: str | None
     carried_suspension_close: Decimal | None
+    bundle_revision_id: str | None = None
+    history_requested_ranges: tuple[tuple[str, str], ...] = ()
+    history_local_rows: int = 0
 
 
 def history_binding(symbol: str) -> tuple[ProviderDatasetSpec, InstrumentSpec]:
@@ -101,6 +104,7 @@ def load_snapshot_with_history(
     before_physical_request: Callable[[str], None] | None = None,
     provider: TushareProvider | None = None,
     request_executor: RequestExecutor | None = None,
+    adjustment_as_of: str | None = None,
 ) -> TushareSnapshotHistoryCandidate:
     """Acquire one atomic current-analysis candidate; perform no persistence.
 
@@ -133,7 +137,8 @@ def load_snapshot_with_history(
         range_args = {**common, "start_date": start.strftime("%Y%m%d")}
         raw = source.fetch_range("daily", **range_args, request_executor=execute)
         factor_frame = source.fetch_range(
-            "adj_factor", **common, request_executor=execute
+            "adj_factor", ts_code=ts_code,
+            end_date=(adjustment_as_of or end_date).replace("-", ""), request_executor=execute
         )
         suspension_frame = source.fetch_range(
             "suspend_d", **range_args, request_executor=execute
@@ -154,6 +159,7 @@ def load_snapshot_with_history(
             raw, factor_frame, suspension_frame, calendar_frame,
             binding=binding, instrument=instrument_spec, ts_code=ts_code,
             exchange=exchange, start=start, end=end,
+            factor_end=date.fromisoformat(adjustment_as_of or end_date),
         )
     except (ValueError, TypeError, KeyError, InvalidOperation) as exc:
         raise NoMarketDataError(symbol, ts_code, f"Tushare history unavailable: {exc}") from None
@@ -171,6 +177,8 @@ def _candidate(
     exchange: str,
     start: date,
     end: date,
+    factor_end: date | None = None,
+    observed_at: datetime | None = None,
 ) -> TushareSnapshotHistoryCandidate:
     raw_rows = _rows(
         raw, ("ts_code", "trade_date", "open", "high", "low", "close", "vol")
@@ -196,7 +204,9 @@ def _candidate(
     expected_days = {start + timedelta(days=n) for n in range((end - start).days + 1)}
     if set(calendar_by_day) != expected_days:
         raise ValueError("incomplete session calendar")
-    observed_at = datetime.now(timezone.utc)
+    observed_at = observed_at or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        raise ValueError("Tushare observation time must be timezone aware")
     calendar = MarketSessionCalendarPublication(
         provider=ProviderDatasetSpec(
             upstream_service_id=binding.upstream_service_id,
@@ -251,7 +261,7 @@ def _candidate(
 
     cumulative_factors: dict[date, Decimal] = {}
     for row in factor_rows:
-        day = _security_day(row, ts_code, date.min, end)
+        day = _security_day(row, ts_code, date.min, factor_end or end)
         factor = _decimal(row["adj_factor"])
         if factor <= 0:
             raise ValueError("adjustment factor must be positive")
@@ -266,7 +276,7 @@ def _candidate(
     anchor_factor = cumulative_factors[anchor_day]
     factors = tuple(
         AdjustmentFactorObservation(day, cumulative_factors[day] / anchor_factor)
-        for day in sorted(cumulative_factors) if day <= anchor_day
+        for day in sorted(cumulative_factors)
     )
     observations = tuple(
         observations_by_day[day] for day in sorted(observations_by_day)
@@ -322,6 +332,39 @@ def _candidate(
         ),
         latest_traded_close_diagnostic=None, carried_suspension_close=None,
     )
+
+
+def load_calendar(symbol, start_date, end_date, *, provider=None, request_executor=None):
+    """Acquire calendar membership without making an instrument-price request."""
+    security = _instrument(symbol)
+    exchange = "SSE" if security.exchange == "shanghai" else "SZSE"
+    source = provider if provider is not None else TushareProvider.create(PITConfig.from_env())
+    frame = source.fetch_range("trade_cal", exchange=exchange,
+        start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""),
+        request_executor=request_executor)
+    rows = _rows(frame, ("exchange", "cal_date", "is_open"))
+    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    result = {}
+    for row in rows:
+        day = _day(row["cal_date"])
+        flag = _decimal(row["is_open"])
+        if row["exchange"] != exchange or not start <= day <= end or flag not in (0, 1) or day in result:
+            raise ValueError("invalid CURRENT calendar membership")
+        result[day] = str(int(flag))
+    if set(result) != {start + timedelta(days=index) for index in range((end-start).days+1)}:
+        raise ValueError("CURRENT calendar acquisition incomplete")
+    binding, _ = history_binding(symbol)
+    return MarketSessionCalendarPublication(
+        provider=ProviderDatasetSpec(binding.upstream_service_id, binding.upstream_service_name,
+            _identity("provider-dataset", binding.upstream_service_id, CALENDAR_DATASET_NAME,
+                      "not-applicable", NORMALIZER_VERSION, exchange),
+            "tushare", CALENDAR_DATASET_NAME, "not-applicable", False),
+        reference_market="mainland-cn", timezone_name="Asia/Shanghai",
+        observed_at=datetime.now(timezone.utc), provenance_class=ProvenanceClass.RETROSPECTIVE_BACKFILL,
+        raw_payload=json.dumps({"calendar": rows, "normalizer_version": NORMALIZER_VERSION,
+                               "adjustment_methodology": ADJUSTMENT_METHODOLOGY}, sort_keys=True).encode(),
+        sessions=tuple(MarketSession(day, MarketSessionStatus.OPEN if flag == "1" else MarketSessionStatus.CLOSED)
+                       for day, flag in sorted(result.items())))
 
 
 def _instrument(symbol: str) -> MainlandInstrument:

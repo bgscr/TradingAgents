@@ -1475,6 +1475,29 @@ class MarketHistoryStore:
             ) from None
         return published
 
+    def load_current_history(self, provider, instrument):
+        """Read the exact unqualified CURRENT family; never use strict readers."""
+        self._require_open()
+        from tradingagents.market_history.current_incremental import read_retained
+        return read_retained(self, provider, instrument)
+
+    def publish_current_history(self, publication, *, prior_bundle_revision_id=None):
+        """Atomically append CURRENT revisions with a serialized prior-head check."""
+        self._require_open()
+        from tradingagents.market_history.bundle import publish_history_bundle
+        from tradingagents.market_history.current_incremental import read_retained
+        digest = sha256(publication.raw_payload).hexdigest()
+        with self._payload_mutation_scope("publisher", digest):
+            retained = read_retained(self, publication.provider, publication.instrument)
+            current = retained.bundle_revision_id if retained else None
+            if current != prior_bundle_revision_id:
+                raise ValueError("CURRENT history changed during acquisition; candidate not published")
+            published = publish_history_bundle(self, publication,
+                prior_bundle_revision_id=prior_bundle_revision_id, current_only=True)
+            self._phase_hook("publisher_references_committed", digest)
+            self._verify_registered_payload_digest(digest)
+            return published
+
     def read_history_bundle_provenance_audit(
         self,
         bundle_revision_id: str,

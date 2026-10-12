@@ -30,6 +30,7 @@ MANIFEST_PATH = Path(__file__).with_name("current_cache_compatibility.json")
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_FILES = (
     "tradingagents/market_history/current_cache.py",
+    "tradingagents/market_history/current_incremental.py",
     "tradingagents/market_history/config.py",
     "tradingagents/market_history/store.py",
     "tradingagents/market_history/shadow.py",
@@ -61,6 +62,10 @@ SOURCE_FILES = (
     "tradingagents/evidence.py",
 )
 VERIFICATION_FILES = (
+    "tests/test_tushare_current_incremental.py",
+    "tests/test_tushare_current_acceptance.py",
+    "scripts/accept_tushare_current.py",
+    "tradingagents/tushare_acceptance.py",
     "tests/test_market_history_persistent_reuse.py",
     "tests/test_tushare_pit_provider.py",
     "scripts/run_current_cache_compatibility.py",
@@ -152,6 +157,7 @@ _SNAPSHOT_FIELDS = (
     "effective_trading_date", "frame_sha256", "snapshot_id", "snapshot_id_version",
     "pin_membership_digest", "snapshot_manifest_json", "history_store_status",
     "current_tradeability", "latest_traded_close_diagnostic",
+    "current_history_lineage",
 )
 
 
@@ -160,7 +166,8 @@ def calendar_evidence(calendar):
     if provider is not None:
         if provider.provider_name != "tushare":
             raise ValueError("current cache publication requires registered Tushare evidence")
-        proof = {"kind": "tushare-response-v1", "provider": asdict(provider),
+        proof = {"kind": ("tushare-current-view-v1" if calendar.payload_contract == "tushare-current-view-v1"
+                          else "tushare-response-v1"), "provider": asdict(provider),
                  "provenance": calendar.provenance_class.value,
                  "raw_payload": calendar.raw_payload.decode("utf-8")}
     else:
@@ -185,7 +192,25 @@ def validate_calendar_evidence(evidence):
     observed = datetime.fromisoformat(evidence["observed_at"])
     if observed.tzinfo is None or observed > _now():
         raise ValueError("calendar observation is invalid")
-    if proof["kind"] == "tushare-response-v1":
+    if proof["kind"] == "tushare-current-view-v1":
+        from tradingagents.dataflows.tushare_market_history import history_binding
+        from tradingagents.market_history.current_incremental import _materialize, read_retained
+        raw = proof["raw_payload"].encode()
+        manifest = json.loads(raw, object_pairs_hook=_unique_json_object)
+        provider, instrument = history_binding(manifest["instrument"]["canonical_symbol"])
+        if manifest["provider"] != asdict(provider) or manifest["instrument"] != asdict(instrument):
+            raise ValueError("CURRENT view family binding")
+        with MarketHistoryStore.open(MarketHistoryConfig.from_mapping(get_config())) as store:
+            retained = read_retained(store, provider, instrument,
+                bundle_revision_id=manifest["bundle_revision_id"],
+                calendar_revision_ids=manifest["calendar_revision_ids"])
+            if retained is None:
+                raise ValueError("CURRENT view bundle missing")
+            restored = _materialize(retained, instrument.canonical_symbol,
+                date.fromisoformat(manifest["start"]), date.fromisoformat(manifest["end"]))
+        if calendar_evidence(restored.calendar) != evidence:
+            raise ValueError("CURRENT view immutable source closure mismatch")
+    elif proof["kind"] == "tushare-response-v1":
         from tradingagents.dataflows.tushare_market_history import (
             ADJUSTMENT_METHODOLOGY,
             CALENDAR_DATASET_NAME,
@@ -369,6 +394,11 @@ def try_read(symbol, start, end, provider_chain, descriptors, minimum_rows):
     try:
         with MarketHistoryStore.open(MarketHistoryConfig.from_mapping(runtime)) as store:
             for name in provider_chain:
+                # Tushare CURRENT uses the durable raw family, including explicit
+                # repairs and bounded refresh; an exact adjusted frame cannot
+                # short-circuit that policy.
+                if name == "tushare":
+                    continue
                 descriptor = descriptors.get(name)
                 if descriptor is None:
                     continue
@@ -382,7 +412,7 @@ def try_read(symbol, start, end, provider_chain, descriptors, minimum_rows):
                     diagnostics.append(f"{name}:{type(exc).__name__}:{exc}")
     except Exception as exc:
         diagnostics.append(f"store:{type(exc).__name__}:{exc}")
-    return None, "current_cache_miss:" + ";".join(diagnostics)
+    return None, "current_cache_miss:" + ";".join(diagnostics) if diagnostics else None
 
 
 def persist(snapshot, descriptor, start, end, calendar):
