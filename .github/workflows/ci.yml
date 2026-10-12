@@ -71,7 +71,9 @@ jobs:
             "hypothesis==6.10.1" \
             "ruff==0.15.0"
       - name: Run test suite at dependency floors
-        run: pytest -q
+        # Keep every failure and its traceback while avoiding repeated fixture
+        # source and captured output overwhelming the downloadable job log.
+        run: pytest -q --tb=short --show-capture=no
       - name: Lint at the declared Ruff floor
         run: ruff check .
 
