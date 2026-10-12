@@ -22,6 +22,7 @@
 无需改动全局环境变量或 `.env`。如调用方主动使用进程环境配置，嵌套源选择还可通过 `TRADINGAGENTS_CN_A_CORE_STOCK_APIS` 指定；它只覆盖 `cn_a.core_stock_apis`。移除本地文件，或将其中 `market_history_mode` 改为 `shadow`，即可恢复相应行为。
 
 - 设置 `market_history_mode="current"`，并使用 `data_usage_mode="personal_research"`。
+- 普通入口和 picker 通过同一个客户端工厂使用固定的 `https://api.waditu.com/dataapi` 协议。应用只绑定每个 SDK 客户端的查询发送层，不修改已安装 SDK 或全局 Requests；证书及主机名验证始终开启，拒绝重定向、HTTP 降级和未知目标。没有自定义服务 URL 配置。发送层不自行重试，既有协调器、picker 显式重试策略及 40 次/分钟限制继续适用。资格路由的独立客户端及其资格绑定不在此功能范围内。
 - 如需 Tushare 普通单源，显式设置 `market_data_vendors.cn_a.core_stock_apis="tushare"`，并设置 `mainland_capability_routing_mode="legacy"`；普通入口要求 legacy 路由才能选择 Tushare。这只选择当前分析供应商，不授予历史回放资格。凭据继续使用既有配置边界，不写入缓存配置或本文示例。
 - `market_history_current_cache_max_age_seconds` 默认 `86400`，接受 `1..86400` 的整数秒；超过有效期的帧不能命中。
 - Tushare 受项目每分钟最多 40 次调用的上限及既有协调器约束。2000 积分表示接口访问档位，不是每次请求扣减的可消耗余额，也不保证账户拥有每项接口权限。

@@ -52,6 +52,7 @@ SOURCE_FILES = (
     "tradingagents/dataflows/baostock_calendar.py",
     "tradingagents/dataflows/tushare_market_history.py",
     "tradingagents/picker/tushare_provider.py",
+    "tradingagents/tushare_https.py",
     "tradingagents/dataflows/akshare_data.py",
     "tradingagents/dataflows/y_finance.py",
     "tradingagents/strategy_registry.py",
@@ -63,6 +64,7 @@ VERIFICATION_FILES = (
     "tests/test_market_history_persistent_reuse.py",
     ".integration-work/market_history_ab_bootstrap.py",
     ".integration-work/market_history_ab_current_bootstrap.py",
+    ".integration-work/tushare_tls_bootstrap.py",
 )
 SCENARIOS = (
     "shanghai_primary", "shenzhen_primary", "baostock_fallback", "yahoo_fallback",

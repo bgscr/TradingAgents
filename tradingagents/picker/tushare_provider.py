@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,6 +7,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from tradingagents.tushare_https import create_https_client
 
 from .errors import (
     PITConfigurationError,
@@ -84,8 +85,7 @@ class TushareProvider:
             import_failed = False
             initialization_failed = False
             try:
-                module = importlib.import_module("tushare")
-                resolved_client = module.pro_api(config.token)
+                resolved_client = create_https_client(config.token)
             except ImportError:
                 import_failed = True
             except Exception:

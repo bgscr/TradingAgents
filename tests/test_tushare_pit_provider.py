@@ -72,25 +72,22 @@ def test_injected_client_does_not_import_optional_sdk(tmp_path, monkeypatch):
     assert provider.client is client
 
 
-def test_create_imports_tushare_lazily_and_passes_token(tmp_path, monkeypatch):
+def test_create_uses_https_client_factory_and_passes_token(tmp_path, monkeypatch):
     client = FakePro([])
     calls = []
 
-    class FakeModule:
-        @staticmethod
-        def pro_api(token):
-            calls.append(token)
-            return client
+    def create_client(token):
+        calls.append(token)
+        return client
 
     monkeypatch.setattr(
-        "importlib.import_module",
-        lambda name: calls.append(name) or FakeModule(),
+        "tradingagents.picker.tushare_provider.create_https_client", create_client,
     )
 
     provider = TushareProvider.create(config(tmp_path, token="secret-token"))
 
     assert provider.client is client
-    assert calls == ["tushare", "secret-token"]
+    assert calls == ["secret-token"]
 
 
 def test_missing_sdk_error_has_install_hint_without_token(tmp_path, monkeypatch):
