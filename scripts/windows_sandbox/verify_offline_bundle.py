@@ -7,10 +7,16 @@ import hashlib
 import json
 import re
 import stat
+import sys
 import zipfile
 from pathlib import Path, PurePosixPath
 
-import tomllib
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    # Host-side compatibility checks also run on 3.10. The qualified 3.13
+    # guest continues to use only the standard library.
+    import tomli as tomllib
 
 _NATIVE_SUFFIXES = frozenset({".dll", ".exe", ".pyd"})
 _PE_MACHINE_NAMES = {0x014C: "I386", 0x8664: "AMD64", 0xAA64: "ARM64"}

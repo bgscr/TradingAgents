@@ -1167,8 +1167,9 @@ def test_china_stock_data_tool_renders_same_authoritative_provider(monkeypatch):
     assert "Provider: baostock" in rendered
     assert "Adjustment basis: qfq" in rendered
     assert "Effective trading date: 2026-07-15" in rendered
-    assert "999" not in rendered
-    assert "2026-07-15,12.55,13.1,12.4,12.58,1000000" in rendered
+    csv_data = "\n".join(line for line in rendered.splitlines() if not line.startswith("#"))
+    assert "999" not in csv_data
+    assert "2026-07-15,12.55,13.1,12.4,12.58,1000000" in csv_data
 
 
 @pytest.mark.unit

@@ -433,6 +433,13 @@ def _install_persistence_guard() -> pytest.MonkeyPatch:
         "symlink",
         guard_two_paths(os.symlink, protect_source=False),
     )
+    # Python 3.10 caches these OS functions in pathlib before this guard is
+    # installed. Route that accessor through the same checks as direct calls.
+    accessor = getattr(Path, "_accessor", None)
+    if accessor is not None:
+        for name in ("chmod", "mkdir", "unlink", "rmdir", "link", "rename", "replace", "symlink"):
+            if hasattr(accessor, name):
+                guard.setattr(accessor, name, getattr(os, name))
     guard.setattr(shutil, "rmtree", guard_one_path(shutil.rmtree))
     guard.setattr(shutil, "move", guard_two_paths(shutil.move))
     for name in ("copy", "copy2", "copyfile", "copytree"):

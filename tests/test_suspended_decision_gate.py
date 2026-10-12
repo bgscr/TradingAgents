@@ -389,9 +389,10 @@ class _RecordingDisplay:
 
 def _joint_baostock_candidate(*, tradeable: bool):
     base = _suspended_baostock_candidate()
+    request_start, request_end = "2021-07-24", "2026-07-24"
     session_dates = tuple(
         timestamp.date()
-        for timestamp in pd.bdate_range(end="2026-07-24", periods=21)
+        for timestamp in pd.bdate_range(start=request_start, end=request_end)
     )
     prior_close = Decimal("10.00")
     final_close = Decimal("10.75") if tradeable else Decimal("10.25")
@@ -426,8 +427,8 @@ def _joint_baostock_candidate(*, tradeable: bool):
             volume=None if tradeable else Decimal("0"),
         ),
     )
-    closes = [float(prior_close)] * 20 + [float(final_close)]
-    volumes = [100.0] * 20 + [120.0 if tradeable else 0.0]
+    closes = [float(prior_close)] * (len(session_dates) - 1) + [float(final_close)]
+    volumes = [100.0] * (len(session_dates) - 1) + [120.0 if tradeable else 0.0]
     frame = pd.DataFrame(
         {
             "Date": pd.to_datetime(session_dates),
@@ -466,7 +467,7 @@ def _joint_baostock_candidate(*, tradeable: bool):
             sessions=tuple(
                 MarketSession(day.date(), MarketSessionStatus.OPEN if day.date() in session_dates
                               else MarketSessionStatus.CLOSED)
-                for day in pd.date_range(session_dates[0], session_dates[-1])
+                for day in pd.date_range(request_start, request_end)
             ),
         ),
         current_tradeability="tradeable" if tradeable else "suspended",
@@ -495,7 +496,8 @@ def test_real_baostock_candidate_reaches_joint_cli_and_audit_contract(
     candidate = _joint_baostock_candidate(tradeable=tradeable)
     provider_calls: list[str] = []
 
-    def baostock(*_args, **_kwargs):
+    def baostock(symbol, start_date, end_date, **_kwargs):
+        assert (symbol, start_date, end_date) == ("601328.SS", "2021-07-24", "2026-07-24")
         provider_calls.append("baostock")
         return candidate
 
@@ -611,7 +613,7 @@ def test_real_baostock_candidate_reaches_joint_cli_and_audit_contract(
     snapshot = audit["evidence_state"]["market_snapshot"]
     assert snapshot["provider"] == "baostock"
     assert snapshot["adjustment_basis"] == "qfq"
-    assert snapshot["history_rows"] == 21
+    assert snapshot["history_rows"] == len(candidate.frame) == 1305
     assert snapshot["current_tradeability"] == expected_status
     assert snapshot["current_status_provenance"]["status"] == (
         "traded" if tradeable else "suspended"

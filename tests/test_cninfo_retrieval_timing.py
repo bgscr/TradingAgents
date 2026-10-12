@@ -223,7 +223,9 @@ def test_preserved_blocker_retrieval_follows_complete_response(tmp_path, legacy)
     assert len(entries) == len(sequences) == len(transport.completions)
     assert len(result.physical_attempt_ids) == len(transport.completions)
     for event, completed in zip(result.attempt_events, transport.completions, strict=True):
-        retained = datetime.fromisoformat(entries[event.sequence_id]["artifact"]["retrieved_at"])
+        retained = datetime.fromisoformat(
+            entries[event.sequence_id]["artifact"]["retrieved_at"].replace("Z", "+00:00")
+        )
         _, started, terminal, status = terminals[event.sequence_id]
         assert datetime.fromisoformat(started) <= event.attempted_at <= completed <= retained
         assert retained <= datetime.fromisoformat(terminal)
