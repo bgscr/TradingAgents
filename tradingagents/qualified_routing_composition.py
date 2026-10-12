@@ -1333,7 +1333,7 @@ class ProductionQualifiedRoutingRuntimeFactories:
 def production_qualified_routing_runtime_factories() -> ProductionQualifiedRoutingRuntimeFactories:
     """Return lazy production acquisitions without opening any run resource."""
 
-    runtime_blueprint_value: ProductionQualifiedRoutingCompositionBlueprint
+    runtime_blueprint_value: ProductionQualifiedRoutingCompositionBlueprint | None = None
 
     def runtime_blueprint(value: object) -> ProductionQualifiedRoutingCompositionBlueprint:
         if not isinstance(value, ProductionQualifiedRoutingCompositionBlueprint):
@@ -1363,8 +1363,9 @@ def production_qualified_routing_runtime_factories() -> ProductionQualifiedRouti
                 ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
             )
         try:
+            blueprint = runtime_blueprint(runtime_blueprint_value)
             coordinator = ProviderRequestCoordinator(store, stop_signal=stop_signal)
-            contract = runtime_blueprint_value.factory_contract
+            contract = blueprint.factory_contract
             services = (
                 ("akshare_sina", ""),
                 ("baostock", ""),

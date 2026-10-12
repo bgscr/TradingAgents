@@ -51,6 +51,35 @@ from tradingagents.qualified_routing_composition import (
 from tradingagents.run_telemetry import RunTelemetryLedger
 
 
+@pytest.mark.parametrize("invalid_blueprint_first", [False, True])
+def test_production_coordinator_requires_blueprint_before_resource_allocation(
+    monkeypatch, invalid_blueprint_first
+):
+    allocations = []
+
+    class SyntheticStore:
+        @classmethod
+        def open_provider_request_authority(cls, _config):
+            allocations.append("store")
+            return cls()
+
+    def construct_coordinator(*_args, **_kwargs):
+        allocations.append("coordinator")
+        return object()
+
+    monkeypatch.setattr(composition_module, "MarketHistoryStore", SyntheticStore)
+    monkeypatch.setattr(composition_module, "ProviderRequestCoordinator", construct_coordinator)
+    factories = production_qualified_routing_runtime_factories()
+    if invalid_blueprint_first:
+        with pytest.raises(ProductionQualifiedRoutingLifecycleError) as captured:
+            factories.open_coordinator_store(object())
+        assert captured.value.reason is ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+    with pytest.raises(ProductionQualifiedRoutingLifecycleError) as captured:
+        factories.build_coordinator(SyntheticStore(), Event())
+    assert captured.value.reason is ProductionQualifiedRoutingLifecycleFailureReason.BINDING_INVALID
+    assert allocations == []
+
+
 def _blueprint_and_binding(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(importlib.util, "find_spec", lambda _name: object())
     monkeypatch.setenv("TUSHARE_TOKEN", "deterministic-fixture-secret")
