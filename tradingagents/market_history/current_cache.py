@@ -136,7 +136,7 @@ def compatibility_diagnostic():
     return None
 
 
-def binding(symbol, provider_name, descriptor):
+def binding(symbol, provider_name, descriptor, *, store=None):
     instrument = resolve_mainland_instrument(symbol)
     version = descriptor.current_cache_version
     if instrument is None or not version or provider_name not in {"akshare", "baostock", "tushare", "yfinance"}:
@@ -149,7 +149,30 @@ def binding(symbol, provider_name, descriptor):
     identity = InstrumentSpec("instrument=sha256:" + digest([
         instrument.yahoo_symbol, instrument.exchange, instrument.instrument_kind, "CNY", "mainland-routing-v1"]),
         instrument.yahoo_symbol, instrument.exchange, instrument.instrument_kind, "CNY", "mainland-routing-v1")
+    if store is not None:
+        row = store._connection.execute(
+            "SELECT instrument_id,currency,identity_revision FROM instruments "
+            "WHERE canonical_symbol=? AND reference_market=? AND instrument_kind=?",
+            (identity.canonical_symbol, identity.reference_market, identity.instrument_kind),
+        ).fetchone()
+        if row is not None:
+            if row[1:] != (identity.currency, identity.identity_revision):
+                raise ValueError("current instrument identity conflicts with stored metadata")
+            identity = _compatible_instrument_id(identity, row[0])
     return provider, identity
+
+
+def _compatible_instrument_id(instrument, stored_id):
+    # The legacy shadow writer and CURRENT used different deterministic keys
+    # for the same unique (symbol, venue, kind). Preserve the existing entity;
+    # never rewrite old evidence or accept arbitrary IDs/semantic aliases.
+    from tradingagents.market_history.shadow import _stable_id
+
+    legacy_id = _stable_id("instrument", instrument.canonical_symbol,
+        instrument.reference_market, instrument.instrument_kind, instrument.currency)
+    if stored_id not in {instrument.instrument_id, legacy_id}:
+        raise ValueError("current instrument identity is not a known stored binding")
+    return replace(instrument, instrument_id=stored_id)
 
 
 _SNAPSHOT_FIELDS = (
@@ -296,8 +319,8 @@ def validate_coverage(frame, evidence, start, end):
         raise ValueError("current cache window incomplete")
 
 
-def encode(snapshot, descriptor, start, end, calendar):
-    provider, instrument = binding(snapshot.symbol, snapshot.provider, descriptor)
+def encode(snapshot, descriptor, start, end, calendar, *, store=None):
+    provider, instrument = binding(snapshot.symbol, snapshot.provider, descriptor, store=store)
     evidence = calendar_evidence(calendar)
     validate_coverage(snapshot.frame, evidence, start, end)
     status = snapshot.current_status_provenance
@@ -335,6 +358,7 @@ def decode(loaded, descriptor, symbol, start, end, minimum_rows=1):
     if not isinstance(metadata, dict) or set(metadata) != keys or metadata["contract"] != CONTRACT:
         raise ValueError("legacy or invalid current cache evidence")
     provider, instrument = binding(symbol, stored.provider_name, descriptor)
+    instrument = _compatible_instrument_id(instrument, stored.instrument_id)
     if (metadata["provider"] != asdict(provider) or metadata["instrument"] != asdict(instrument)
             or metadata["window"] != [start, end] or stored.requested_start != start or stored.requested_end != end
             or metadata["data_usage_mode"] != get_config()["data_usage_mode"]
@@ -403,7 +427,7 @@ def try_read(symbol, start, end, provider_chain, descriptors, minimum_rows):
                 if descriptor is None:
                     continue
                 try:
-                    provider, instrument = binding(symbol, name, descriptor)
+                    provider, instrument = binding(symbol, name, descriptor, store=store)
                     loaded = store.load_current_provider_frame(instrument.canonical_symbol, start, end,
                         minimum_history_rows=minimum_rows, provider=provider, instrument=instrument,
                         adjustment_basis=descriptor.adjustment_basis)
@@ -421,7 +445,8 @@ def persist(snapshot, descriptor, start, end, calendar):
         persist_mainland_provider_frame,
     )
     try:
-        metadata, provider, instrument = encode(snapshot, descriptor, start, end, calendar)
+        with MarketHistoryStore.open(MarketHistoryConfig.from_mapping(get_config())) as store:
+            metadata, provider, instrument = encode(snapshot, descriptor, start, end, calendar, store=store)
         result = persist_mainland_provider_frame(symbol=snapshot.symbol, provider=snapshot.provider,
             adjustment_basis=snapshot.adjustment_basis, requested_start=start, requested_end=end,
             effective_trading_date=snapshot.effective_trading_date, retrieved_at=snapshot.retrieved_at,

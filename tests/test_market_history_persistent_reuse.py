@@ -774,8 +774,8 @@ def current_roundtrip(rig, live, *, start=None, end=None):
     from tradingagents.market_history import current_cache as cache
     start, end = str(start or rig["start"]), str(end or rig["end"])
     descriptor = snapshot.SNAPSHOT_PROVIDERS[live.provider]
-    provider, instrument = cache.binding(live.symbol, live.provider, descriptor)
     with MarketHistoryStore.open(rig["config"]) as store:
+        provider, instrument = cache.binding(live.symbol, live.provider, descriptor, store=store)
         assert not store.mainland_cutover_ready()
         loaded = store.load_current_provider_frame(instrument.canonical_symbol, start, end,
             minimum_history_rows=21, provider=provider, instrument=instrument,
@@ -807,6 +807,14 @@ def test_current_cache_real_compatibility_matrix(current_rig, monkeypatch, scena
     start, end = rig["start"], rig["end"]
     symbol = "000001.SZ" if scenario == "shenzhen_primary" else SYMBOL
     faults = []
+    if scenario == "representation_noise":
+        text = "Date,Open,High,Low,Close,Volume\n2026-10-08,10,12,9,11,100\n"
+        legacy = shadow.persist_mainland_provider_frame(symbol=symbol, provider="akshare",
+            adjustment_basis="qfq", requested_start=str(end), requested_end=str(end),
+            effective_trading_date=str(end), retrieved_at=NOW.isoformat(),
+            snapshot_id="synthetic-legacy-frame", frame_digest=cache.sha256(text.encode()).hexdigest(),
+            history_rows=1, normalized_frame_text=text)
+        assert legacy.persisted
     if scenario in {"baostock_fallback", "yahoo_fallback", "rate_limit_fallback", "representation_noise", "confirmed_suspension"}:
         target = "yfinance" if scenario == "yahoo_fallback" else "baostock" if scenario != "representation_noise" else "akshare"
         rig["runtime"]["market_data_vendors"]["cn_a"]["core_stock_apis"] = ("akshare," + target if target != "akshare" else target)
@@ -860,6 +868,14 @@ def test_current_cache_real_compatibility_matrix(current_rig, monkeypatch, scena
         rig["clock"][0] += timedelta(minutes=6)
     live = snapshot.get_authoritative_market_snapshot(symbol, str(start), str(end), minimum_history_rows=21)
     restored, loaded, proof = current_roundtrip(rig, live)
+    if scenario == "representation_noise":
+        with MarketHistoryStore.open(rig["config"]) as store:
+            assert loaded.stored.instrument_id == store.get_provider_frame_revision(legacy.frame_revision_id).instrument_id
+        monkeypatch.setattr(cache, "compatibility_diagnostic", lambda: None)
+        cached, diagnostic = cache.try_read(symbol, str(start), str(end), ["akshare"],
+                                            snapshot.SNAPSHOT_PROVIDERS, 21)
+        assert diagnostic is None and cached.snapshot_id == live.snapshot_id
+        faults.append("legacy-shadow-identity-retained;adjusted-frame-readback")
     if scenario in {"baostock_fallback", "yahoo_fallback", "rate_limit_fallback"}:
         assert live.acquisition_outcomes[0].provider == "akshare" and live.acquisition_outcomes[0].outcome == "unavailable"
         faults.append([outcome.model_dump(mode="json") for outcome in live.acquisition_outcomes])
@@ -962,7 +978,8 @@ def test_current_public_entry_persistent_tushare_hit(current_rig, validated_mani
     print("CURRENT_CACHE_MANIFEST=" + str(validated_manifest))
 
 
-@pytest.mark.parametrize("change", ["expired", "window", "version", "basis", "provider", "corruption"])
+@pytest.mark.parametrize("change", ["expired", "window", "version", "basis", "provider", "corruption",
+                                    "unknown_instrument_id", "instrument_metadata"])
 def test_adjusted_frame_codec_rejects_incompatible_evidence(current_rig, validated_manifest, change):
     # The codec remains an exact-window evidence contract. Tushare's normal
     # entry now uses raw history; its incremental refresh is covered separately.
@@ -981,6 +998,14 @@ def test_adjusted_frame_codec_rejects_incompatible_evidence(current_rig, validat
             **({"current_cache_version": "different-v2"} if change == "version" else {"adjustment_basis": "raw"}))
     elif change == "provider":
         loaded.metadata["provider"]["adjustment_methodology"] = "poison"
+    elif change in {"unknown_instrument_id", "instrument_metadata"}:
+        if change == "unknown_instrument_id":
+            loaded.metadata["instrument"]["instrument_id"] = "unknown-instrument"
+        else:
+            loaded.metadata["instrument"]["currency"] = "USD"
+        loaded = replace(loaded, stored=replace(loaded.stored,
+            instrument_id=loaded.metadata["instrument"]["instrument_id"],
+            snapshot_id="current-cache-record=sha256:" + cache.digest(loaded.metadata)))
     else:
         loaded.frame.loc[loaded.frame.index[0], "Close"] = 999
     with pytest.raises(ValueError):

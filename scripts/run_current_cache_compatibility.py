@@ -3,6 +3,7 @@
 Usage: python -I -S -B scripts/run_current_cache_compatibility.py
 Optional --site-packages selects an existing dependency directory (no install).
 Optional --work-dir selects the parent for retained synthetic evidence.
+Optional --test-filter selects a focused pytest expression without a matrix manifest.
 No network, child process, native qualification or real database is permitted.
 """
 
@@ -20,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site-packages", type=Path)
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--test-filter")
     options = parser.parse_args()
     SOURCE = Path(__file__).resolve().parent.parent
     executable_dir = Path(sys.executable).absolute().parent
@@ -36,7 +38,7 @@ def main():
         / "site-packages"
     )
     SITE = SITE.resolve(strict=True)
-    MODE = "matrix"
+    MODE = "focused" if options.test_filter else "matrix"
     ROOT = Path(tempfile.mkdtemp(prefix="synthetic-current-cache-", dir=options.work_dir)).resolve()
     os.environ.clear()  # Never inspect/copy inherited credential values.
     sys.pycache_prefix = str(ROOT / "bytecode")  # Fresh source; -B prevents writing caches.
@@ -391,11 +393,11 @@ def main():
                     "--rootdir",
                     str(ROOT),
                     "-x",
-                ],
+                ] + (["-k", options.test_filter] if options.test_filter else []),
                 plugins=[Report()],
             )
         )
-        if status == 0:
+        if status == 0 and MODE == "matrix":
             manifests = sorted(ROOT.glob("pytest/**/current-cache-compatibility-manifest.json"))
             if not manifests:
                 raise RuntimeError("successful matrix did not produce an accepted manifest")

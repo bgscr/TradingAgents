@@ -248,6 +248,36 @@ def test_reopened_request_contexts_preserve_evidence_without_sends():
                                        "reuse_attempts": 0, "model_calls": 0}
 
 
+@pytest.mark.parametrize("phase,status", [
+    (phase, status) for phase in ("initial", "reopened")
+    for status in ("degraded", "live", "refreshed", None)
+] + [("reopened", "current_only_refreshed")])
+def test_acceptance_rejects_unproven_persistence(phase, status):
+    guard, records, sent, _ = fixture_guard()
+    calls = []
+
+    @contextmanager
+    def context():
+        yield
+
+    def snapshot(symbol, start, end, **kwargs):
+        calls.append(symbol)
+        current_phase = "initial" if len(calls) <= 2 else "reopened"
+        return SimpleNamespace(symbol=symbol, provider="tushare", frame_sha256="synthetic-frame",
+            snapshot_id=symbol, retrieved_at="2026-10-09T00:00:00Z", adjustment_basis="qfq",
+            effective_trading_date=end, pin_membership_digest="synthetic-pin", frame=range(260),
+            history_store_status=status if current_phase == phase else "current_only_cached")
+
+    module = SimpleNamespace(authoritative_snapshot_run=context,
+                             get_authoritative_market_snapshot=snapshot)
+    with pytest.raises(AcceptanceStop, match="persistence_not_confirmed"):
+        run_data_phases(guard, module, records.append, end="2026-10-08")
+    assert not any(row["kind"] == "completed" for row in records)
+    assert records[-1]["kind"] == phase and records[-1]["history_store_status"] == status
+    assert len(calls) == (1 if phase == "initial" else 3)
+    assert not sent and guard.attempts == 0
+
+
 def test_date_requires_previous_day_and_leap_start():
     assert five_year_start(date(2024, 2, 29)) == date(2019, 2, 28)
     with pytest.raises(AcceptanceStop, match="previous_completed"):

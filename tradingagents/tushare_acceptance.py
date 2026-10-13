@@ -445,6 +445,8 @@ def run_data_phases(guard, snapshot_module, record, *, end, require_closed=lambd
         first[symbol] = snapshot_facts(value)
         record({"kind": "initial", **first[symbol], "rows": len(value.frame),
                 "history_store_status": value.history_store_status})
+        if value.history_store_status not in {"current_only_refreshed", "current_only_cached"}:
+            guard.stop("initial_persistence_not_confirmed")
     before = guard.attempts
     with guard.cache_only():
         for symbol in SYMBOLS:
@@ -457,6 +459,8 @@ def run_data_phases(guard, snapshot_module, record, *, end, require_closed=lambd
                 guard.stop("reopen_evidence_mismatch")
             record({"kind": "reopened", **snapshot_facts(value), "rows": len(value.frame),
                     "history_store_status": value.history_store_status})
+            if value.history_store_status != "current_only_cached":
+                guard.stop("reopened_persistence_not_confirmed")
     if guard.attempts != before:
         guard.stop("reuse_attempt_count_changed")
     record({"kind": "completed", "physical_attempts": guard.attempts,

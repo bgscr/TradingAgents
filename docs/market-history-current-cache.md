@@ -29,6 +29,8 @@
 
 CURRENT 核对证券身份、provider/dataset、复权方法与 normalizer 版本、证据完整性及 freshness。Tushare 在配置供应商链的相应位置读取持久 raw/status/factor 家族，允许平移、缩小、扩展窗口；其他供应商保留精确窗口 adjusted-frame 缓存。读取不会刷新原始观察时间。Tushare CURRENT 不以历史 acquisition outcomes 冒充本次网络调用，物理调用统计来自现有协调器的新增事件。
 
+已有 shadow 数据库可能使用旧版确定性 instrument ID。CURRENT 发布和读取只兼容该旧 ID 与现有 CURRENT ID，并逐项核对证券、市场、类型、币种和身份版本；保留已存实体、旧 frame 和 payload，不迁移或重新命名历史记录。未知 ID 或身份字段冲突仍拒绝。Tushare raw 家族的独立身份不变。
+
 ## 更新与日历
 
 Tushare CURRENT 使用现有 MarketHistoryStore 的 observation/status/factor revision、bundle membership 和不可变 payload；不新增数据库，也不设置 200 日保留上限。后续仅补缺失的离散区间、新增交易日及到期的最近 21 个交易日；不把相隔很远的缺口压成一个大范围。每次需要 raw 更新时取得覆盖全部保留 raw 日期的同源因子集，从 raw 重建完整请求窗口，禁止拼接不同 qfq 基准的片段。缩小窗口不会删除旧行；全部候选验证成功后才一次发布，发布前核对前一版本，失败不推进覆盖。
@@ -70,3 +72,5 @@ Windows 验收进程在网络守卫安装后、首次应用导入前提供局部
 `--database` 必须精确指向本 checkout 既有的 `data/market_history/market_history.sqlite3`；该库及相邻 `.provider-requests.sqlite3` authority 库必须已具备当前 schema 9，authority 中还须存在主库对应的 legacy-state import marker。缺库、旧 schema、缺 marker 或 SDK source pin 不符均在应用导入/凭据加载前停止；脚本不会初始化、迁移或自动重试。`--ledger` 必须是 `SOURCE/logs` 直属、尚不存在的 `.jsonl` 文件，禁止复用旧账本。
 
 日历发现、两个股票及每一分页/失败合计最多 24 次实际请求，使用同一账本和计数器，仍受 40 次/分钟限制。选定 E 时不重置预算或 pacing；没有额外日历预算。正常完成初次数据阶段后，关闭旧连接并使用新请求上下文重开，复用阶段必须新增 0 次发送，且价格 digest、snapshot 身份和原始检索时间一致。5000 行/页、每股五年 daily、完整自然日 calendar、空 suspend、6000 行全历史 factor 的合成场景为发现阶段 2 页，加每股 5 页，共 12 页；此计数不是对真实响应、权限或停牌窗口可成功的承诺。更多分页、错误或不完整数据仍服从合计 24 次上限，不能通过缩短五年范围或提高预算通过验收。账本保留两所 31 日开闭市安排、选定 E 和 `publication_checked=false`，随后单独记录实际行情验证结果。
+
+验收首次阶段还要求 `current_only_refreshed` 或 `current_only_cached`，重开阶段要求 `current_only_cached`。`degraded`、live 或其他未确认持久化的状态先记录到本地账本，随后 STOP，不输出 PASS；成功获取价格或新增零发送本身不能证明派生 frame 写入成功。普通当前分析仍按既有降级合同返回完整可用行情，验收施加的持久化要求不改变该合同。

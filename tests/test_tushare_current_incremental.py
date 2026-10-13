@@ -385,6 +385,44 @@ def ordinary_rig(tmp_path, monkeypatch):
         synthetic_client=synthetic_client)
 
 
+@pytest.mark.parametrize("symbol", ["600895.SH", "000001.SZ"])
+def test_legacy_shadow_identity_preserved_by_current_publication_and_reopen(ordinary_rig, symbol):
+    from hashlib import sha256
+
+    from tradingagents.market_history.shadow import persist_mainland_provider_frame
+
+    rig = ordinary_rig
+    text = "Date,Open,High,Low,Close,Volume\n2026-10-08,10,12,9,11,100\n"
+    legacy = persist_mainland_provider_frame(symbol=symbol, provider="akshare",
+        adjustment_basis="qfq", requested_start="2026-10-08", requested_end="2026-10-08",
+        effective_trading_date="2026-10-08", retrieved_at=NOW.isoformat(),
+        snapshot_id="synthetic-legacy:" + symbol, frame_digest=sha256(text.encode()).hexdigest(),
+        history_rows=1, normalized_frame_text=text)
+    assert legacy.persisted
+    with MarketHistoryStore.open(rig.config) as store:
+        old = store.load_provider_frame_revision(legacy.frame_revision_id)
+        old_payload = store.read_payload(old.stored.payload_digest)
+    first = rig.get(symbol)
+    assert first.history_store_status == "current_only_refreshed", first.history_store_diagnostic
+    before = rig.events()
+    restored = rig.get(symbol)
+    assert restored.history_store_status == "current_only_cached", restored.history_store_diagnostic
+    assert (restored.snapshot_id, restored.frame_sha256, restored.retrieved_at,
+            restored.current_history_lineage) == (first.snapshot_id, first.frame_sha256,
+            first.retrieved_at, first.current_history_lineage)
+    assert len(rig.calls) == 5 and rig.events() == before
+    with MarketHistoryStore.open(rig.config) as store:
+        retained_legacy = store.load_provider_frame_revision(legacy.frame_revision_id)
+        assert retained_legacy.stored == old.stored and retained_legacy.metadata == old.metadata
+        pd.testing.assert_frame_equal(retained_legacy.frame, old.frame)
+        assert store.read_payload(old.stored.payload_digest) == old_payload
+        rows = store._connection.execute(
+            "SELECT f.instrument_id FROM provider_frame_revisions f JOIN provider_datasets d "
+            "USING(provider_dataset_id) WHERE d.provider_name='tushare'").fetchall()
+        assert rows and {row[0] for row in rows} == {old.stored.instrument_id}
+        assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_normal_five_year_two_stock_5000_page_requirement_is_ten_and_reopen_zero(ordinary_rig):
     rig = ordinary_rig
     first = [rig.get(symbol) for symbol in ("600895.SH", "000001.SZ")]
@@ -402,6 +440,35 @@ def test_normal_five_year_two_stock_5000_page_requirement_is_ten_and_reopen_zero
         assert restored.history_store_status == "current_only_cached"
         assert restored.physical_attempt_events == ()
     assert rig.events() == before and len(rig.calls) == 10
+
+
+@pytest.mark.parametrize("change", ["unknown_id", "currency", "identity_revision", "other_venue_id"])
+def test_current_identity_conflicts_rejected_without_mutation(ordinary_rig, change):
+    from tradingagents.dataflows import market_snapshot
+    from tradingagents.market_history import current_cache
+    from tradingagents.market_history.shadow import _stable_id
+
+    rig = ordinary_rig
+    descriptor = market_snapshot.SNAPSHOT_PROVIDERS["tushare"]
+    _, instrument = current_cache.binding("600895.SH", "tushare", descriptor)
+    stored_id = _stable_id("instrument", "600895.SS", "shanghai", "equity", "CNY")
+    if change == "unknown_id":
+        stored_id = "unrecognized-instrument"
+    elif change == "other_venue_id":
+        stored_id = _stable_id("instrument", "600895.SS", "shenzhen", "equity", "CNY")
+    with MarketHistoryStore.open(rig.config) as store:
+        values = (stored_id, instrument.canonical_symbol, instrument.reference_market,
+            instrument.instrument_kind, "USD" if change == "currency" else "CNY",
+            "unknown-v2" if change == "identity_revision" else instrument.identity_revision, NOW.isoformat())
+        store._connection.execute("INSERT INTO instruments "
+            "(instrument_id,canonical_symbol,reference_market,instrument_kind,currency,identity_revision,created_at) "
+            "VALUES (?,?,?,?,?,?,?)", values)
+        before = store._connection.total_changes
+        with pytest.raises(ValueError, match="current instrument identity"):
+            current_cache.binding("600895.SH", "tushare", descriptor, store=store)
+        assert store._connection.total_changes == before
+        assert store._connection.execute("SELECT COUNT(*) FROM provider_frame_revisions").fetchone() == (0,)
+    assert rig.calls == []
 
 
 @pytest.mark.parametrize("explicit_end,duplicate", [(None, False), (date(2026, 10, 8), False), (None, True)])
