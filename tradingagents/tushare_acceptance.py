@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -24,6 +25,61 @@ FIELDS = {
     "suspend_d": "ts_code,trade_date,suspend_timing,suspend_type",
     "trade_cal": "exchange,cal_date,is_open,pretrade_date",
 }
+# Diagnostic vocabulary only; these names grant no additional audit permission.
+AUDIT_NAMES = frozenset({
+    "socket.__new__", "socket.bind", "socket.connect", "socket.getaddrinfo",
+    "socket.gethostbyaddr", "socket.gethostbyname", "socket.gethostname",
+    "socket.getnameinfo", "socket.sendto", "http.client.connect", "http.client.send",
+    "urllib.Request", "subprocess.Popen", "os.spawn", "os.posix_spawn", "os.system",
+    "os.fork", "os.exec", "os.startfile", "open", "sqlite3.connect",
+    "sqlite3.enable_load_extension", "sqlite3.load_extension", "os.remove", "os.rmdir",
+    "os.mkdir", "os.chmod", "os.utime", "os.truncate", "os.rename", "os.link", "os.symlink",
+})
+STAGES = frozenset({"bootstrap", "application_imports", "runtime_configuration",
+                    "calendar_discovery", "data_phases"})
+
+
+@contextmanager
+def local_platform_metadata():
+    """Process metadata for this dedicated data run, without host probes.
+
+    Windows platform.uname normally queries hostname and may use WMI or a
+    subprocess. Dependencies need only OS/architecture flags here. Report the
+    interpreter's architecture (not native host architecture under emulation),
+    the kernel version, and blanks for unqueried host/CPU/marketing details.
+    No platform query, environment credential access or permission is added.
+    """
+    import platform
+    import socket
+
+    ipv6 = socket.has_ipv6
+    original_uname, original_win32_ver = platform.uname, platform.win32_ver
+    # platform.platform caches the adapted result; restore that cache as well.
+    original_platform_cache = platform._platform_cache
+    try:
+        socket.has_ipv6 = False  # Avoid urllib3's optional local socket probe.
+        if sys.platform == "win32":
+            import sysconfig
+            from collections import namedtuple
+
+            machine = {"win32": "x86", "win-amd64": "AMD64", "win-arm32": "ARM",
+                       "win-arm64": "ARM64"}.get(sysconfig.get_platform())
+            if machine is None:
+                raise AcceptanceStop("unsupported_process_platform")
+            windows = sys.getwindowsversion()
+            # major/minor/build may describe a Windows compatibility mode.
+            version = ".".join(str(part) for part in windows.platform_version)
+            result = namedtuple("uname_result", "system node release version machine processor")(
+                "Windows", "", "", version, machine, "")
+            platform.uname = lambda: result
+            platform.win32_ver = lambda release="", version="", csd="", ptype="": (
+                "", result.version, "", "")
+            platform._platform_cache = {}
+        yield
+    finally:
+        socket.has_ipv6 = ipv6
+        platform.uname, platform.win32_ver = original_uname, original_win32_ver
+        platform._platform_cache = original_platform_cache
 
 
 class AcceptanceStop(BaseException):
@@ -91,8 +147,15 @@ class RequestGuard:
         self.last_send = None
         self.lock = threading.RLock()
         self.local = threading.local()
+        self.stage = "bootstrap"
+        self.rejection = {}
 
-    def stop(self, code):
+    def stop(self, code, *, event=None):
+        if not self.stopped and event is not None:
+            self.rejection = {
+                "audit_event": event if event in AUDIT_NAMES else "other_audit_event",
+                "stage": self.stage if self.stage in STAGES else "unknown",
+            }
         self.stopped = self.stopped or code
         raise AcceptanceStop(self.stopped) from None
 
@@ -249,11 +312,11 @@ class RequestGuard:
     def audit(self, event, args):
         if event.startswith(("socket.", "http.client.", "urllib.")):
             if not getattr(self.local, "sending", False) or self.reusing:
-                self.stop("unexpected_network")
+                self.stop("unexpected_network", event=event)
         elif event.startswith(("subprocess.", "os.spawn", "os.posix_spawn")) or event in {
             "os.system", "os.fork", "os.exec", "os.startfile",
         }:
-            self.stop("subprocess_forbidden")
+            self.stop("subprocess_forbidden", event=event)
 
     def bind(self, tls, coordinator):
         self.transport = tls.HTTPSPost()

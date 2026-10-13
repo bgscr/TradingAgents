@@ -14,11 +14,81 @@ from tradingagents.tushare_acceptance import (
     closed_date,
     discover_session,
     five_year_start,
+    local_platform_metadata,
     require_imported_authority,
     run_data_phases,
     validate_calendar_page,
     validate_schema,
 )
+
+
+@pytest.mark.parametrize("tag,machine", [
+    ("win32", "x86"), ("win-amd64", "AMD64"), ("win-arm32", "ARM"), ("win-arm64", "ARM64"),
+])
+@pytest.mark.parametrize("fail", [False, True])
+def test_windows_metadata_is_process_scoped_and_restored(monkeypatch, tag, machine, fail):
+    import platform
+    import socket
+    import sysconfig
+
+    import tradingagents.tushare_acceptance as support
+
+    monkeypatch.setattr(support, "sys", SimpleNamespace(platform="win32", getwindowsversion=
+                        lambda: SimpleNamespace(major=6, minor=2, build=9200,
+                                                platform_version=(10, 0, 12345))))
+    monkeypatch.setattr(sysconfig, "get_platform", lambda: tag)
+    before = platform.uname, platform.win32_ver, platform._platform_cache, socket.has_ipv6
+    class DeliberateStop(BaseException):
+        pass
+    try:
+        with local_platform_metadata():
+            assert platform.uname() == ("Windows", "", "", "10.0.12345", machine, "")
+            assert platform.uname().processor == ""
+            assert platform.win32_ver("ignored", "ignored", "ignored", "ignored") == (
+                "", "10.0.12345", "", "")
+            assert socket.has_ipv6 is False
+            platform._platform_cache[(False, False)] = "scoped value"
+            if fail:
+                raise DeliberateStop
+    except DeliberateStop:
+        pass
+    assert platform.uname is before[0] and platform.win32_ver is before[1]
+    assert platform._platform_cache is before[2] and socket.has_ipv6 is before[3]
+
+
+def test_unknown_windows_process_platform_stops_and_restores(monkeypatch):
+    import platform
+    import socket
+    import sysconfig
+
+    import tradingagents.tushare_acceptance as support
+
+    monkeypatch.setattr(support, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(sysconfig, "get_platform", lambda: "unrecognized")
+    before = platform.uname, platform.win32_ver, platform._platform_cache, socket.has_ipv6
+    with pytest.raises(AcceptanceStop, match="unsupported_process_platform"), local_platform_metadata():
+        pytest.fail("unknown architecture must not enter the data runtime")
+    assert (platform.uname, platform.win32_ver, platform._platform_cache, socket.has_ipv6) == before
+
+
+@pytest.mark.parametrize("event,stage,expected", [
+    ("socket.gethostname", "application_imports", "socket.gethostname"),
+    ("socket.getaddrinfo", "calendar_discovery", "socket.getaddrinfo"),
+    ("subprocess.Popen", "data_phases", "subprocess.Popen"),
+    ("socket.PRIVATE_VALUE", "PRIVATE_VALUE", "other_audit_event"),
+])
+def test_audit_rejection_projects_only_safe_event_and_stage(event, stage, expected):
+    guard, records, sent, _ = fixture_guard()
+    guard.stage = stage
+    with pytest.raises(AcceptanceStop):
+        guard.audit(event, ("PRIVATE_VALUE", {"token": "PRIVATE_VALUE"}))
+    assert guard.rejection == {"audit_event": expected,
+                               "stage": stage if stage != "PRIVATE_VALUE" else "unknown"}
+    assert "PRIVATE_VALUE" not in repr(guard.rejection)
+    with pytest.raises(AcceptanceStop):
+        guard.audit("socket.bind", ())
+    assert guard.rejection["audit_event"] == expected
+    assert guard.attempts == 0 and not records and not sent
 
 
 def fixture_guard():

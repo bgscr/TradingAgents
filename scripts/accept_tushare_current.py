@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import sys
+from contextlib import ExitStack, contextmanager
 from datetime import date
 from pathlib import Path
 
@@ -57,6 +58,19 @@ def reject_alias(path):
             or getattr(component.lstat(), "st_file_attributes", 0) & 0x400
         ):
             raise ValueError("aliased acceptance path")
+
+
+@contextmanager
+def application_runtime(support, guard):
+    """Shared live/cold-regression bootstrap; call only after installing guards."""
+    guard.stage = "application_imports"
+    with support.local_platform_metadata():
+        from tradingagents import tushare_https
+        from tradingagents.dataflows import config, market_snapshot
+        from tradingagents.market_history import coordinator, current_cache
+        from tradingagents.market_history.store import MarketHistoryStore
+
+        yield tushare_https, config, market_snapshot, coordinator, current_cache, MarketHistoryStore
 
 
 def discover_end(support, guard, runtime):
@@ -183,18 +197,18 @@ def main(argv=None):
                 if writing and not isinstance(path, int):
                     value = Path(os.fsdecode(path)).absolute()
                     if value != ledger and not below(value, data_root):
-                        guard.stop("outside_write")
+                        guard.stop("outside_write", event=event)
             elif event == "sqlite3.connect":
                 if Path(os.fsdecode(args[0])).resolve() not in databases:
-                    guard.stop("outside_database")
+                    guard.stop("outside_database", event=event)
             elif event in {"sqlite3.enable_load_extension", "sqlite3.load_extension"}:
-                guard.stop("sqlite_extension_forbidden")
+                guard.stop("sqlite_extension_forbidden", event=event)
             elif event in {"os.remove", "os.rmdir", "os.mkdir", "os.chmod", "os.utime", "os.truncate"}:
                 if not below(Path(os.fsdecode(args[0])), data_root):
-                    guard.stop("outside_write")
+                    guard.stop("outside_write", event=event)
             elif event in {"os.rename", "os.link", "os.symlink"}:
                 if any(not below(Path(os.fsdecode(item)), data_root) for item in args[:2]):
-                    guard.stop("outside_write")
+                    guard.stop("outside_write", event=event)
 
         sys.addaudithook(audit)
         record({"kind": "started", "limit": 24, "symbols": list(support.SYMBOLS),
@@ -235,18 +249,16 @@ def main(argv=None):
             return real_connect(database, *args, factory=ExistingConnection, **kwargs)
 
         sqlite3.connect = sqlite3.dbapi2.connect = connect
+        startup = ExitStack()
         try:
             # Standard package initialization owns existing dotenv/credential
             # loading only after preflight and the network/write boundaries.
             os.chdir(SOURCE)
             os.environ["TRADINGAGENTS_PROJECT_ROOT"] = str(SOURCE)
             sys.path[:0] = [str(SOURCE), str(site)]
-            import socket
-            socket.has_ipv6 = False  # Avoid urllib3's optional local socket probe.
-            from tradingagents import tushare_https
-            from tradingagents.dataflows import config, market_snapshot
-            from tradingagents.market_history import coordinator, current_cache
-            from tradingagents.market_history.store import MarketHistoryStore
+            tushare_https, config, market_snapshot, coordinator, current_cache, MarketHistoryStore = (
+                startup.enter_context(application_runtime(support, guard)))
+            guard.stage = "runtime_configuration"
 
             def no_migration(store):
                 support.validate_schema(store._connection, version)
@@ -278,21 +290,27 @@ def main(argv=None):
                 if connections:
                     guard.stop("unclosed_database_connections")
 
+            guard.stage = "calendar_discovery"
             selected_end = discover_end(support, guard, config.get_config())
             require_closed()
             print(f"ScheduledEnd={selected_end} Window={guard.start}..{guard.end}; checking price coverage next.")
+            guard.stage = "data_phases"
             support.run_data_phases(guard, market_snapshot, record, end=selected_end,
                                     require_closed=require_closed)
             print(f"PASS: {guard.attempts}/24 physical requests; reopened reuse=0; model calls=0.")
             return 0
         except BaseException as exc:
             code = str(exc) if isinstance(exc, support.AcceptanceStop) else "data_acceptance_failed"
-            record({"kind": "stopped", "code": code, "physical_attempts": guard.attempts})
+            record({"kind": "stopped", "code": code, "physical_attempts": guard.attempts,
+                    **guard.rejection})
             print(f"STOP: {code}. Keep ledger and partial data; do not retry this run.", file=sys.stderr)
             return 1
         finally:
-            for connection in tuple(connections.values()):
-                connection.close()
+            try:
+                for connection in tuple(connections.values()):
+                    connection.close()
+            finally:
+                startup.close()
 
 
 if __name__ == "__main__":

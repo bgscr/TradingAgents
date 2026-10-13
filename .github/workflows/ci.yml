@@ -32,6 +32,8 @@ jobs:
           pip install -e ".[dev,pit]"
       - name: Run test suite
         run: pytest -q
+      - name: Cold data-acceptance bootstrap (offline)
+        run: python -I -S -B scripts/check_tushare_acceptance_startup.py
 
   smoke-install:
     name: clean-install smoke
