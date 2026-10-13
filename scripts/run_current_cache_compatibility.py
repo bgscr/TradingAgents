@@ -345,6 +345,17 @@ def main():
         unavailable_ctypes.WinError = unavailable_native
         unavailable_ctypes.__getattr__ = unavailable_ctypes_attribute
         sys.modules["ctypes"] = unavailable_ctypes
+        # Report/terminal code imports only this annotation from the real lazy
+        # runnables package. Avoid importing asyncio's Windows native transport;
+        # no runnable execution or model behavior is replaced or permitted.
+        import langchain_core.runnables as runnables
+
+        class AnnotationOnlyRunnableConfig:
+            def __new__(cls, *args, **kwargs):
+                BOUNDARY.deny("runnable_config_execution")
+
+        runnables.RunnableConfig = AnnotationOnlyRunnableConfig
+        summary["annotation_only_overrides"] = ["langchain_core.runnables.RunnableConfig"]
         import pytest
 
         (ROOT / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")

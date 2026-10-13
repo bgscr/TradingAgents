@@ -36,6 +36,7 @@ from tradingagents.evidence import (
     merge_source_acquisition_outcomes,
     merge_source_artifacts,
     merge_source_facts,
+    project_history_store_access,
 )
 
 logger = logging.getLogger(__name__)
@@ -483,6 +484,10 @@ def build_analyst_update(
         str(state["trade_date"]),
     )
     if active_snapshot is not None:
+        history_access, history_diagnostic = project_history_store_access(
+            active_snapshot.history_store_status,
+            active_snapshot.history_store_diagnostic,
+        )
         active_snapshot_evidence = MarketSnapshotEvidence(
                     symbol=active_snapshot.symbol,
                     provider=active_snapshot.provider,
@@ -525,8 +530,8 @@ def build_analyst_update(
                         active_snapshot.carried_suspension_close
                     ),
                     history_gap_dates=active_snapshot.history_gap_dates,
-                    history_store_status=active_snapshot.history_store_status,
-                    history_store_diagnostic=active_snapshot.history_store_diagnostic,
+                    history_store_status=history_access,
+                    history_store_diagnostic=history_diagnostic,
                     physical_attempt_events=tuple(
                         {
                             "attempt_event_id": event.attempt_event_id,

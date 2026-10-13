@@ -978,6 +978,164 @@ def test_current_public_entry_persistent_tushare_hit(current_rig, validated_mani
     print("CURRENT_CACHE_MANIFEST=" + str(validated_manifest))
 
 
+@pytest.mark.parametrize("reuse", [True, False], ids=["cached", "refreshed"])
+def test_current_cached_snapshot_survives_analyst_audit_and_report(
+    current_rig, validated_manifest, monkeypatch, tmp_path, reuse,
+):
+    """Real cache/evidence/submission/rendering; only acquisition/model IO is synthetic.
+
+    Catches the runtime status rejected after a cache hit, loss of current-only
+    provenance in checkpoint/audit/report, and accidental cache-hit acquisition.
+    Does not exercise a model transport, graph scheduling or native report IO.
+    """
+    from langchain_core.messages import AIMessage
+    from pydantic import ValidationError
+
+    from tradingagents.agents.analysts import submission
+    from tradingagents.evidence import (
+        AnalysisDiagnosticCode,
+        AnalysisOutcome,
+        AnalysisOutcomeReason,
+        EvidenceReadiness,
+        EvidenceSource,
+        EvidenceState,
+        EvidenceStatus,
+        build_evidence_state,
+        render_analysis_outcome,
+    )
+    from tradingagents.evidence_artifacts import (
+        AuditEvidenceProjection,
+        persist_source_artifacts,
+        project_evidence_for_audit,
+    )
+
+    rig = current_rig
+    first = rig["get"](rig["start"], rig["end"], 21)
+    before = rig["events"]()
+    cached = rig["get"](rig["start"], rig["end"], 21) if reuse else first
+    expected_status = "current_only_cached" if reuse else "current_only_refreshed"
+    assert cached.history_store_status == expected_status
+    assert cached.snapshot_id == first.snapshot_id
+    assert rig["events"]() == before and len(rig["queries"]) == 4
+    evidence = build_evidence_state(symbol=SYMBOL, identity={}, snapshot=cached)
+    # The production graph's active-snapshot lookup receives the exact snapshot
+    # returned above, not a fabricated typed evidence object.
+    monkeypatch.setattr(submission, "get_active_authoritative_market_snapshot", lambda *_: cached)
+    state = {
+        "company_of_interest": SYMBOL,
+        "trade_date": str(rig["end"]),
+        "messages": [],
+        "evidence_state": evidence.model_dump(mode="json"),
+    }
+    result = submission.AnalystSubmissionResult(
+        message=AIMessage(content="合成市场分析"),
+        report="合成市场分析",
+        submission_source=EvidenceSource(
+            source_id="analyst_submission:market", status=EvidenceStatus.AVAILABLE, required=True,
+        ),
+    )
+    update = submission.build_analyst_update(state, result, "market_report")
+    from tradingagents.decision_audit import prepare_decision_audit
+    from tradingagents.report_presentation import localize_report
+    from tradingagents.reporting import render_analysis_outcome_report
+    from tradingagents.terminal_contract import build_terminal_contract
+
+    restored = EvidenceState.model_validate_json(json.dumps(update["evidence_state"]))
+    observed = restored.market_snapshot
+    assert observed.history_store_status == "stored"
+    assert f"runtime_history_store_status={expected_status}" in observed.history_store_diagnostic
+    assert "strict_history_qualified=false" in observed.history_store_diagnostic
+    assert cached.history_store_diagnostic in observed.history_store_diagnostic
+    assert observed.snapshot_manifest_json == cached.snapshot_manifest_json
+    assert observed.retrieved_at == cached.retrieved_at
+    assert observed.physical_attempt_count == (0 if reuse else 4)
+    assert observed.model_dump(mode="json") == evidence.market_snapshot.model_dump(mode="json")
+    manifest = persist_source_artifacts(restored, tmp_path / "audit")
+    audit = project_evidence_for_audit(restored, manifest)
+    audit = AuditEvidenceProjection.model_validate_json(audit.model_dump_json())
+    assert audit.market_snapshot.history_store_status == "stored"
+    assert audit.market_snapshot.history_store_diagnostic == observed.history_store_diagnostic
+    assert audit.market_snapshot.snapshot_manifest_json == cached.snapshot_manifest_json
+    outcome = AnalysisOutcome(
+        readiness=EvidenceReadiness.INSUFFICIENT,
+        reason=AnalysisOutcomeReason.PREFLIGHT_BLOCKED,
+        diagnostic_codes=(AnalysisDiagnosticCode.IDENTITY_UNAVAILABLE,),
+    )
+    terminal_state = {
+        **state, **update,
+        "analysis_outcome_contract": outcome.model_dump(mode="json"),
+        "analysis_outcome": render_analysis_outcome(outcome),
+    }
+    terminal = build_terminal_contract(terminal_state)
+    final_audit = prepare_decision_audit(terminal_state, tmp_path / "final-audit", config=rig["runtime"])
+    assert final_audit["evidence_state"]["market_snapshot"]["history_store_diagnostic"] == observed.history_store_diagnostic
+    report = render_analysis_outcome_report(outcome, terminal, restored)
+    chinese = localize_report(report, "Chinese")
+    assert expected_status in report and "strict_history_qualified=false" in report
+    assert "仅供当前分析复用" in chinese
+    assert terminal.terminal_outcome_kind.value == "analysis_outcome"
+    assert rig["events"]() == before and len(rig["queries"]) == 4
+    with MarketHistoryStore.open(rig["config"]) as store, pytest.raises(StrictReplayUnavailable):
+        store.read_pinned_snapshot(cached.snapshot_id)
+    # Reintroduce the original broken projection at the production call site.
+    # Assert the precise schema/input failure, so a setup error cannot count as
+    # a successful sensitivity check. No model, acquisition or writer is called.
+    with monkeypatch.context() as mutation:
+        mutation.setattr(submission, "project_history_store_access", lambda status, diagnostic: (status, diagnostic))
+        with pytest.raises(ValidationError) as error:
+            submission.build_analyst_update(state, result, "market_report")
+        assert [(item["loc"], item["type"], item["input"]) for item in error.value.errors()] == [
+            (("history_store_status",), "literal_error", expected_status),
+        ]
+    print(f"CACHED_STATUS_MUTATION_DETECTED={expected_status}")
+
+
+@pytest.mark.parametrize("status", ["live", "stored", "degraded", "refreshed", "unknown-state"])
+def test_history_access_evidence_boundary_preserves_legacy_and_rejects_unknown(
+    current_rig, validated_manifest, monkeypatch, status,
+):
+    from langchain_core.messages import AIMessage
+    from pydantic import ValidationError
+
+    from tradingagents.agents.analysts import submission
+    from tradingagents.evidence import (
+        EvidenceSource,
+        EvidenceState,
+        EvidenceStatus,
+        build_evidence_state,
+    )
+    from tradingagents.evidence_artifacts import (
+        persist_source_artifacts,
+        project_evidence_for_audit,
+    )
+
+    rig = current_rig
+    acquired = rig["get"](rig["start"], rig["end"], 21)
+    value = replace(acquired, history_store_status=status, history_store_diagnostic="original-diagnostic")
+    monkeypatch.setattr(submission, "get_active_authoritative_market_snapshot", lambda *_: value)
+    state = {"company_of_interest": SYMBOL, "trade_date": str(rig["end"]), "messages": []}
+    result = submission.AnalystSubmissionResult(
+        message=AIMessage(content="合成市场分析"), report="合成市场分析",
+        submission_source=EvidenceSource(source_id="analyst_submission:market", status=EvidenceStatus.AVAILABLE, required=True),
+    )
+    if status == "unknown-state":
+        with pytest.raises(ValidationError, match="history_store_status"):
+            build_evidence_state(symbol=SYMBOL, identity={}, snapshot=value)
+        with pytest.raises(ValidationError, match="history_store_status"):
+            submission.build_analyst_update(state, result, "market_report")
+        return
+    expected = "stored" if status == "refreshed" else status
+    initial = build_evidence_state(symbol=SYMBOL, identity={}, snapshot=value)
+    state["evidence_state"] = initial.model_dump(mode="json")
+    updated = submission.build_analyst_update(state, result, "market_report")
+    evidence = EvidenceState.model_validate_json(json.dumps(updated["evidence_state"]))
+    assert evidence.market_snapshot.history_store_status == expected
+    assert evidence.market_snapshot == initial.market_snapshot
+    assert "original-diagnostic" in evidence.market_snapshot.history_store_diagnostic
+    manifest = persist_source_artifacts(evidence, rig["config"].payload_root.parent / "legacy-audit")
+    assert project_evidence_for_audit(evidence, manifest).market_snapshot.history_store_status == expected
+
+
 @pytest.mark.parametrize("change", ["expired", "window", "version", "basis", "provider", "corruption",
                                     "unknown_instrument_id", "instrument_metadata"])
 def test_adjusted_frame_codec_rejects_incompatible_evidence(current_rig, validated_manifest, change):

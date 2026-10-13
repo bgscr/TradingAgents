@@ -3163,6 +3163,25 @@ def evaluate_decision_gate(
     )
 
 
+def project_history_store_access(
+    status: str, diagnostic: str | None,
+) -> tuple[str, str | None]:
+    """Project trusted runtime access into v1 without promoting PIT eligibility.
+
+    ``stored`` describes access only. Preserve the finer runtime state and its
+    original diagnostic; never turn CURRENT reuse into qualified strict history.
+    Unknown states pass through so the closed evidence model rejects them.
+    """
+    if status not in {"refreshed", "current_only_refreshed", "current_only_cached"}:
+        return status, diagnostic
+    markers = [f"runtime_history_store_status={status}"]
+    if status.startswith("current_only_"):
+        markers.append("strict_history_qualified=false")
+    if diagnostic:
+        markers.append(diagnostic)
+    return "stored", ";".join(markers)
+
+
 def build_evidence_state(
     *,
     symbol: str,
@@ -3215,6 +3234,10 @@ def build_evidence_state(
         )
     market_snapshot = None
     if snapshot is not None:
+        history_access, history_diagnostic = project_history_store_access(
+            getattr(snapshot, "history_store_status", "live"),
+            getattr(snapshot, "history_store_diagnostic", None),
+        )
         status_provenance = getattr(snapshot, "current_status_provenance", None)
         canonical_status_provenance = (
             TradingStatusProvenanceEvidence(
@@ -3263,17 +3286,8 @@ def build_evidence_state(
                 None,
             ),
             history_gap_dates=getattr(snapshot, "history_gap_dates", ()),
-            # The external v1 field describes access, not strict PIT eligibility.
-            # Preserve its closed vocabulary; current-only provenance remains in
-            # the retained manifest and diagnostic.
-            history_store_status=("stored" if getattr(snapshot, "history_store_status", "live")
-                                  in {"refreshed", "current_only_cached"}
-                                  else getattr(snapshot, "history_store_status", "live")),
-            history_store_diagnostic=getattr(
-                snapshot,
-                "history_store_diagnostic",
-                None,
-            ),
+            history_store_status=history_access,
+            history_store_diagnostic=history_diagnostic,
             physical_attempt_events=tuple(
                 ProviderPhysicalAttemptEvidence(
                     attempt_event_id=event.attempt_event_id,

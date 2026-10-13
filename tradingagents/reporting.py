@@ -240,7 +240,19 @@ def _render_market_snapshot_binding(evidence: EvidenceState) -> list[str]:
         "",
         f"- **Snapshot ID:** `{snapshot.snapshot_id}`",
         f"- **Snapshot identity version:** {snapshot.snapshot_id_version}",
+        f"- **History store access:** `{snapshot.history_store_status}`",
     ]
+    # Only emit allowlisted runtime tokens, never arbitrary diagnostic text.
+    diagnostics = set((snapshot.history_store_diagnostic or "").split(";"))
+    for status in ("refreshed", "current_only_refreshed", "current_only_cached"):
+        if f"runtime_history_store_status={status}" in diagnostics:
+            lines.append(f"- **History runtime status:** `{status}`")
+            if status.startswith("current_only_"):
+                lines.append(
+                    "- Current-analysis reuse only; `strict_history_qualified=false`."
+                )
+    if snapshot.history_store_status == "stored":
+        lines.append("- Stored access does not establish strict point-in-time eligibility.")
     if snapshot.pin_membership_digest is not None:
         lines.append(
             "- **Canonical manifest digest:** "

@@ -22,6 +22,8 @@ def is_chinese(language):
 
 
 _LABELS = {
+    "History store access": "历史存储访问状态",
+    "History runtime status": "历史运行时状态",
     "Trading Analysis Report": "交易分析报告",
     "Validated Trading Decision": "经验证的交易决定",
     "Run ID": "运行 ID",
@@ -187,6 +189,13 @@ def localize_report(text, language):
             line = line.replace(
                 "No predictive-confidence score is reported because no out-of-sample calibration is available.",
                 "未进行样本外校准，因此不提供预测置信度。",
+            )
+            line = line.replace(
+                "Current-analysis reuse only; `strict_history_qualified=false`.",
+                "仅供当前分析复用；`strict_history_qualified=false`。",
+            ).replace(
+                "Stored access does not establish strict point-in-time eligibility.",
+                "存储访问状态不代表已获得严格时点历史资格。",
             )
             line = line.replace(
                 "Optional evidence was unavailable. The validated facts and every directional assertion above nevertheless passed the Decision Gate.",

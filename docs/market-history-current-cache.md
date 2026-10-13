@@ -45,6 +45,13 @@ Tushare 独立日历扩展写入现有不可变 session-calendar 表；只有闭
 
 ## 证据、资格与回滚
 
+证据和审计 v1 的 `history_store_status` 只描述 `live/stored/degraded` 访问状态。
+初始证据和分析师提交使用同一转换：`refreshed/current_only_refreshed/current_only_cached`
+映射为 `stored`，同时在诊断中保留精确的 `runtime_history_store_status` 和原始诊断；
+CURRENT 状态明确附带 `strict_history_qualified=false`。未知状态仍被封闭 schema 拒绝。
+这不修改原始 snapshot 状态、manifest、采集时间或 lineage，也不赋予严格历史资格。
+报告显示访问状态与允许的运行时标记，并明确 CURRENT 仅供当前分析复用；不输出任意诊断正文。
+
 缓存保留原始来源 artifact、snapshot 身份、采集时间和来源观察时间，使 evidence 层能够重建同一 source facts 与 lineage；Tushare proof 保留原始响应及因子数据。恢复读取会重新校验帧与证据的绑定。关闭后重新打开数据库的离线复用验证，只能证明相应本地持久化与读取行为，不能代表真实 native/API 调用通过或供应商获得资格。
 
 Tushare raw 重建明确使用 `tushare-current-view-v1`，绑定精确 bundle、源 payload digest、独立日历 revision 及请求窗口；它不标为原始 provider response。该 lineage 参与普通 snapshot 身份。新增记录均为 retrospective backfill，`strict_history_qualified=False`；qualified publication 和直接 strict reconstruction 都拒绝该数据家族。旧 revision、payload、snapshot 证据持续保留。
