@@ -33,7 +33,8 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="synthetic-acceptance-startup-", dir=options.work_dir)).resolve()
     os.environ.clear()
     os.environ.update(HOME=str(root), USERPROFILE=str(root), TEMP=str(root), TMP=str(root),
-                      TRADINGAGENTS_PROJECT_ROOT=str(root), TZ="UTC", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+                      TRADINGAGENTS_PROJECT_ROOT=str(root), TZ="UTC", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+                      PYDANTIC_DISABLE_PLUGINS="__all__")
     os.chdir(root)
     sys.pycache_prefix = str(root / "unused-bytecode")
 
@@ -185,6 +186,7 @@ def main():
         with launcher.application_runtime(support, guard) as modules:
             assert len(modules) == 6
             assert "pandas" in sys.modules and "numpy" in sys.modules
+            assert sys.modules["pydantic.plugin._loader"]._plugins is None
             assert public_functions == tuple(getattr(platform, name) for name in ("machine", "system", "processor", "platform"))
             if sys.platform == "win32":
                 assert platform.machine() in {"x86", "AMD64", "ARM", "ARM64"}
@@ -204,6 +206,7 @@ def main():
         summary.update(completed=True, numpy=sys.modules["numpy"].__version__,
                        pandas=sys.modules["pandas"].__version__, platform_functions_unstubbed=True,
                        timezone="dateutil bundled UTC; system search disabled",
+                       pydantic_plugins="disabled before imports",
                        restoration_checked=True, post_import_guard_rejection=guard.rejection)
         status = 0
     except BaseException as exc:
