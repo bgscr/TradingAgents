@@ -17,7 +17,7 @@ def main():
     import json
     import tempfile
     import types
-    from datetime import timedelta, tzinfo
+    from datetime import datetime, timedelta, tzinfo
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -165,6 +165,17 @@ def main():
         import platform
         import socket
 
+        from dateutil.tz import tz as dateutil_tz
+
+        # Pandas 2.x resolves UTC while importing its timezone extensions. Use
+        # dateutil's own bundled zonefile, never /etc/localtime or system TZPATHS.
+        # Exercise the same file lookup on Windows too; no broader read permission.
+        dateutil_tz.TZPATHS = ()
+        dateutil_tz.TZFILES = ()
+        dateutil_tz.tzwin = None
+        fixed_utc = dateutil_tz.gettz.nocache("UTC")
+        assert isinstance(fixed_utc, dateutil_tz.tzfile)
+        assert fixed_utc.utcoffset(datetime(2026, 10, 13, tzinfo=fixed_utc)) == timedelta(0)
         assert platform._uname_cache is None and not platform._platform_cache
         assert not any(name in sys.modules for name in ("numpy", "pandas", "tradingagents"))
         public_functions = tuple(getattr(platform, name) for name in ("machine", "system", "processor", "platform"))
@@ -192,6 +203,7 @@ def main():
         assert audited == ["socket.gethostname"] and not denials and guard.attempts == 0
         summary.update(completed=True, numpy=sys.modules["numpy"].__version__,
                        pandas=sys.modules["pandas"].__version__, platform_functions_unstubbed=True,
+                       timezone="dateutil bundled UTC; system search disabled",
                        restoration_checked=True, post_import_guard_rejection=guard.rejection)
         status = 0
     except BaseException as exc:
