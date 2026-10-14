@@ -1018,6 +1018,9 @@ class SourceAcquisitionAvailable(BaseModel):
     capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     attempt: int = Field(ge=1)
+    acquisition_id: str | None = Field(
+        default=None, pattern=ACQUISITION_TOKEN_PATTERN, exclude_if=lambda value: value is None
+    )
     retrieved_at: str = Field(min_length=1)
     retryable: Literal[False] = False
     artifact: SourceArtifact
@@ -1055,6 +1058,9 @@ class SourceAcquisitionUnavailable(BaseModel):
     capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     attempt: int = Field(ge=1)
+    acquisition_id: str | None = Field(
+        default=None, pattern=ACQUISITION_TOKEN_PATTERN, exclude_if=lambda value: value is None
+    )
     retrieved_at: str = Field(min_length=1)
     retryable: bool
     reason: AcquisitionUnavailableReason
@@ -1085,12 +1091,13 @@ SourceAcquisitionOutcome = Annotated[
 def _canonicalize_source_acquisition_outcomes(
     outcomes: Iterable[SourceAcquisitionOutcome],
 ) -> tuple[SourceAcquisitionOutcome, ...]:
-    by_attempt: dict[tuple[str, str, str, int], SourceAcquisitionOutcome] = {}
+    by_attempt: dict[tuple[str, str, str, str | None, int], SourceAcquisitionOutcome] = {}
     for outcome in outcomes:
         identity = (
             outcome.provider,
             outcome.capability,
             outcome.source_ref,
+            outcome.acquisition_id,
             outcome.attempt,
         )
         existing = by_attempt.get(identity)
@@ -1107,6 +1114,7 @@ def _canonicalize_source_acquisition_outcomes(
                 outcome.capability,
                 outcome.source_ref,
                 outcome.provider_order,
+                outcome.acquisition_id or "",
                 outcome.attempt,
                 outcome.provider,
                 outcome.retrieved_at,
@@ -1158,6 +1166,28 @@ class ToolExecutionEvidenceEnvelope(BaseModel):
             raise ValueError("selected artifact tool_name does not match envelope")
         if artifact.source_ref != self.source_ref:
             raise ValueError("selected artifact source_ref does not match envelope")
+        return self
+
+    @model_validator(mode="after")
+    def _bind_news_acquisition_identity(self) -> ToolExecutionEvidenceEnvelope:
+        if self.tool_name != "get_news":
+            return self
+        acquisition_id = stable_acquisition_source_ref(
+            "tool-call", self.tool_name, self.tool_call_id
+        )
+        if any(
+            outcome.acquisition_id not in (None, acquisition_id)
+            for outcome in self.acquisition_outcomes
+        ):
+            raise ValueError("news acquisition identity does not match its tool call")
+        # Older checkpoints already retain this binding in the envelope. Adapt
+        # it in memory, without renumbering retries or rewriting saved results.
+        # Bare legacy outcomes have no such authority and keep their old key.
+        object.__setattr__(self, "acquisition_outcomes", tuple(
+            outcome.model_copy(update={"acquisition_id": acquisition_id})
+            if outcome.acquisition_id is None else outcome
+            for outcome in self.acquisition_outcomes
+        ))
         return self
 
 

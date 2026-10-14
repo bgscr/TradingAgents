@@ -33,6 +33,9 @@ class AcquisitionRequest(BaseModel):
     source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     tool_call_id: str = Field(min_length=1, pattern=r".*\S.*")
     tool_name: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
+    # Stable logical-call identity, independent of the provider retry ordinal.
+    # None retains the identity of legacy/non-call-scoped acquisition contracts.
+    acquisition_id: str | None = Field(default=None, pattern=ACQUISITION_TOKEN_PATTERN)
 
 
 class RetryPolicy(BaseModel):
@@ -145,6 +148,7 @@ class AcquisitionController:
                         capability=request.capability,
                         source_ref=request.source_ref,
                         attempt=1,
+                        acquisition_id=request.acquisition_id,
                         retrieved_at=self._timestamp(),
                         retryable=False,
                         reason=AcquisitionUnavailableReason.CIRCUIT_OPEN,
@@ -176,6 +180,7 @@ class AcquisitionController:
                             capability=request.capability,
                             source_ref=request.source_ref,
                             attempt=attempt,
+                            acquisition_id=request.acquisition_id,
                             retrieved_at=self._timestamp(),
                             retryable=retryable,
                             reason=failure.reason,
@@ -211,6 +216,7 @@ class AcquisitionController:
                             capability=request.capability,
                             source_ref=request.source_ref,
                             attempt=attempt,
+                            acquisition_id=request.acquisition_id,
                             retrieved_at=self._timestamp(),
                             retryable=False,
                             reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
@@ -232,6 +238,7 @@ class AcquisitionController:
                     capability=request.capability,
                     source_ref=request.source_ref,
                     attempt=attempt,
+                    acquisition_id=request.acquisition_id,
                     retrieved_at=self._timestamp(),
                     artifact=artifact,
                 )

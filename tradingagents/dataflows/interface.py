@@ -4,6 +4,7 @@ import logging
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     InstrumentIdentityEvidence,
+    stable_acquisition_source_ref,
 )
 
 from .acquisition import AcquisitionController, AcquisitionFailure, AcquisitionRequest
@@ -512,6 +513,7 @@ def route_to_vendor_acquired(
             source_ref=source_ref,
             tool_call_id=tool_call_id,
             tool_name=method,
+            acquisition_id=stable_acquisition_source_ref("tool-call", method, tool_call_id),
         ),
         providers=providers,
         validator=validate_news,

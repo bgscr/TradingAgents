@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pandas as pd
@@ -13,6 +14,7 @@ from tradingagents.agents.analysts.submission import (
 )
 from tradingagents.agents.utils.news_data_tools import get_news
 from tradingagents.dataflows import akshare_data, interface, yfinance_news
+from tradingagents.dataflows.acquisition import AcquisitionController
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.errors import NoMarketDataError, VendorRateLimitError
 from tradingagents.dataflows.market_snapshot import (
@@ -22,6 +24,7 @@ from tradingagents.dataflows.market_snapshot import (
 from tradingagents.evidence import (
     AcquisitionUnavailableReason,
     EvidenceSource,
+    EvidenceState,
     EvidenceStatus,
     IdentityProvenance,
     InstrumentIdentityEvidence,
@@ -29,9 +32,137 @@ from tradingagents.evidence import (
     MaterialClaim,
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
+    ToolExecutionEvidenceEnvelope,
     build_tool_evidence_state,
+    merge_source_acquisition_outcomes,
     stable_acquisition_source_ref,
 )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+def test_repeated_news_calls_keep_distinct_unavailable_acquisitions(legacy_checkpoint):
+    """A repeated query is a new call, including when its circuit is open."""
+    set_config({"tool_vendors": {"get_news": "akshare"}})
+    controller = AcquisitionController(providers=())
+    provider = mock.Mock(side_effect=RuntimeError("offline provider failure"))
+    builder = StateGraph(MessagesState)
+    builder.add_node("tools", ToolNode([get_news]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+    messages = []
+    with mock.patch.dict(interface.VENDOR_METHODS["get_news"], {"akshare": provider}), mock.patch.object(
+        interface, "get_active_acquisition_controller", return_value=controller
+    ):
+        for call_id in ("news-turn-1", "news-turn-2"):
+            messages.append(AIMessage(content="", tool_calls=[{
+                "name": "get_news",
+                "args": {"ticker": "600895.SS", "start_date": "2026-10-05", "end_date": "2026-10-12"},
+                "id": call_id,
+                "type": "tool_call",
+            }]))
+            messages = graph.invoke({"messages": messages})["messages"]
+    if legacy_checkpoint:
+        # Serialized pre-fix envelopes retained the call binding but no acquisition ID.
+        for message in messages:
+            if getattr(message, "artifact", None):
+                for outcome in message.artifact["acquisition_outcomes"]:
+                    outcome.pop("acquisition_id", None)
+    source_ref = stable_acquisition_source_ref("news", "600895.SS", "2026-10-05", "2026-10-12")
+    update = build_analyst_update(
+        {"messages": messages, "company_of_interest": "600895.SS", "trade_date": "2026-10-12"},
+        AnalystSubmissionResult(
+            message=AIMessage(content="No news evidence"), report="No news evidence",
+            claims=(MaterialClaim(claim_id="news.claim", analyst="news", statement="An unverified claim",
+                source_refs=(source_ref,), source_quote="An unverified claim"),),
+            submission_source=EvidenceSource(source_id="analyst.news.submission", status=EvidenceStatus.AVAILABLE, required=True),
+        ),
+        "news_report",
+    )
+    outcomes = update["evidence_state"]["acquisition_outcomes"]
+    assert len(outcomes) == 2
+    assert {item["reason"] for item in outcomes} == {"provider_error", "circuit_open"}
+    assert update["evidence_state"]["source_facts"] == []
+    assert provider.call_count == 1
+
+
+@pytest.mark.unit
+def test_open_news_circuit_retains_each_call_and_replay_is_idempotent():
+    set_config({"tool_vendors": {"get_news": "akshare,yfinance"}})
+    ticks = iter(datetime(2026, 10, 14, tzinfo=timezone.utc) + timedelta(seconds=i) for i in range(6))
+    controller = AcquisitionController(providers=(), clock=lambda: next(ticks))
+    failed = mock.Mock(side_effect=RuntimeError("offline failure"))
+    with mock.patch.dict(interface.VENDOR_METHODS["get_news"], {"akshare": failed, "yfinance": failed}), mock.patch.object(
+        interface, "get_active_acquisition_controller", return_value=controller
+    ):
+        outcomes = []
+        # The sentiment node opens the operational circuits, then news re-enters.
+        for call_id, capability in (("sentiment-1", "sentiment_news"), ("news-1", "get_news"), ("news-2", "get_news")):
+            result = interface.route_to_vendor_acquired(
+                "get_news", "600895.SS", "2026-10-05", "2026-10-12",
+                tool_call_id=call_id, source_ref="news:synthetic", capability=capability,
+            )
+            outcomes.extend(result.outcomes)
+    assert failed.call_count == 2
+    assert [item.reason.value for item in outcomes] == ["provider_error"] * 2 + ["circuit_open"] * 4
+    assert len({item.acquisition_id for item in outcomes}) == 3
+    evidence = merge_source_acquisition_outcomes(None, outcomes)
+    saved = EvidenceState.model_validate_json(evidence.model_dump_json())
+    assert merge_source_acquisition_outcomes(saved, reversed(outcomes)) == saved
+    assert len(saved.acquisition_outcomes) == 6
+    changed = outcomes[-1].model_copy(update={"retrieved_at": "2026-10-15T00:00:00Z"})
+    with pytest.raises(ValueError, match="source acquisition attempt was redefined"):
+        merge_source_acquisition_outcomes(saved, (changed,))
+
+
+@pytest.mark.unit
+def test_news_new_calls_allow_changed_results_but_same_call_cannot_be_redefined():
+    set_config({"tool_vendors": {"get_news": "akshare"}})
+    results = []
+    for call_id, payload in (("news-1", RuntimeError("offline failure")), ("news-2", "First headline"), ("news-3", "Changed headline")):
+        provider = mock.Mock(side_effect=payload) if isinstance(payload, Exception) else mock.Mock(return_value=payload)
+        # A fresh controller represents a process restart, not a continuing circuit.
+        with mock.patch.dict(interface.VENDOR_METHODS["get_news"], {"akshare": provider}), mock.patch.object(
+            interface, "get_active_acquisition_controller", return_value=AcquisitionController(providers=())
+        ):
+            results.append(interface.route_to_vendor_acquired(
+                "get_news", "600895.SS", "2026-10-05", "2026-10-12",
+                tool_call_id=call_id, source_ref="news:synthetic", capability="get_news",
+            ))
+    evidence = merge_source_acquisition_outcomes(None, (item for result in results for item in result.outcomes))
+    assert len(evidence.acquisition_outcomes) == 3
+    assert {item.outcome for item in evidence.acquisition_outcomes} == {"available", "unavailable"}
+    assert {item.artifact.raw_text for item in evidence.acquisition_outcomes if isinstance(item, SourceAcquisitionAvailable)} == {"First headline", "Changed headline"}
+    assert merge_source_acquisition_outcomes(evidence, evidence.acquisition_outcomes) == evidence
+    # A success cannot overwrite an unavailable result of the same logical attempt.
+    redefined = results[1].outcomes[0].model_copy(update={"acquisition_id": results[0].outcomes[0].acquisition_id})
+    with pytest.raises(ValueError, match="source acquisition attempt was redefined"):
+        merge_source_acquisition_outcomes(evidence, (redefined,))
+    # A changed artifact cannot overwrite the available result either.
+    redefined = results[2].outcomes[0].model_copy(update={"acquisition_id": results[1].outcomes[0].acquisition_id})
+    with pytest.raises(ValueError, match="source acquisition attempt was redefined"):
+        merge_source_acquisition_outcomes(evidence, (redefined,))
+    with pytest.raises(ValueError, match="news acquisition identity does not match"):
+        ToolExecutionEvidenceEnvelope(
+            tool_call_id="different-call", tool_name="get_news", capability="get_news",
+            source_ref="news:synthetic", acquisition_outcomes=results[0].outcomes,
+        )
+
+
+@pytest.mark.unit
+def test_unbound_legacy_attempts_keep_strict_identity_and_serialization():
+    original = SourceAcquisitionUnavailable(
+        provider="akshare", capability="get_news", source_ref="legacy:news", attempt=1,
+        retrieved_at="2026-10-14T00:00:00Z", retryable=False,
+        reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+    )
+    assert "acquisition_id" not in original.model_dump(mode="json")
+    evidence = merge_source_acquisition_outcomes(None, (original, original))
+    assert evidence.acquisition_outcomes == (original,)
+    changed = original.model_copy(update={"reason": AcquisitionUnavailableReason.CIRCUIT_OPEN})
+    with pytest.raises(ValueError, match="source acquisition attempt was redefined"):
+        merge_source_acquisition_outcomes(evidence, (changed,))
 
 
 def _mainland_identity() -> InstrumentIdentityEvidence:
