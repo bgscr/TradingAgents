@@ -50,7 +50,16 @@ def test_five_body_failures_end_cli_run_without_outer_retry(tmp_path, monkeypatc
     with pytest.raises(openai.APIConnectionError) as error:
         cli_main.run_analysis()
 
-    assert isinstance(error.value.__cause__, httpx.RemoteProtocolError)
+    # LangChain versions may add their own connection-error wrapper around
+    # the SDK exception. The transport cause must survive the full chain.
+    cause = error.value
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, httpx.RemoteProtocolError):
+            break
+        seen.add(id(cause))
+        cause = cause.__cause__
+    assert isinstance(cause, httpx.RemoteProtocolError)
     assert len(transport.requests) == 5
     assert [r.headers["x-stainless-retry-count"] for r in transport.requests] == ["0", "1", "2", "3", "4"]
     status_path, = tmp_path.rglob("run_status.json")
