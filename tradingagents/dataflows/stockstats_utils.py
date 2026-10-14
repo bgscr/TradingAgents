@@ -39,11 +39,13 @@ class _YahooSessionAttemptGuard:
         self._remaining = 0
         self._consumed = False
         self._last_response = None
+        self._additional_request_blocked = False
         for method_name in ("get", "post"):
             original = getattr(session, method_name)
 
             def guarded(*args, _original=original, **kwargs):
                 if self._remaining < 1:
+                    self._additional_request_blocked = True
                     raise _YahooAdditionalRequestBlocked(self._last_response)
                 self._remaining -= 1
                 self._consumed = True
@@ -62,14 +64,17 @@ class _YahooSessionAttemptGuard:
         self._remaining = 1
         self._consumed = False
         self._last_response = None
+        self._additional_request_blocked = False
 
     def end_attempt(self) -> None:
         self._remaining = 0
         self._consumed = False
         self._last_response = None
+        self._additional_request_blocked = False
 
     def mark_injected_transport_attempt(self) -> None:
         if self._remaining < 1:
+            self._additional_request_blocked = True
             raise _YahooAdditionalRequestBlocked(self._last_response)
         self._remaining -= 1
         self._consumed = True
@@ -78,6 +83,15 @@ class _YahooSessionAttemptGuard:
         )
 
         record_active_physical_attempt_io()
+
+    def raise_if_failure_swallowed(self) -> None:
+        if self._additional_request_blocked:
+            # Some SDK paths catch our guard exception and return an empty frame.
+            # Preserve the failure without turning that formerly terminal result
+            # into additional physical requests.
+            raise _blocked_request_failure(
+                _YahooAdditionalRequestBlocked(self._last_response), retry_allowed=False
+            )
 
     @property
     def consumed(self) -> bool:
@@ -130,14 +144,14 @@ def _retry_after_from_response(response) -> float | None:
     return max(0.0, seconds)
 
 
-def _blocked_request_failure(exc: _YahooAdditionalRequestBlocked):
+def _blocked_request_failure(exc: _YahooAdditionalRequestBlocked, *, retry_allowed=True):
     from tradingagents.market_history import PhysicalAttemptFailure, PhysicalAttemptOutcome
 
     status_code = getattr(exc.response, "status_code", None)
     if status_code == 429:
         return PhysicalAttemptFailure(
             outcome=PhysicalAttemptOutcome.RATE_LIMITED,
-            retryable=True,
+            retryable=retry_allowed,
             status_code=429,
             error_code="YAHOO_HTTP_429",
             retry_after_seconds=_retry_after_from_response(exc.response),
@@ -151,7 +165,7 @@ def _blocked_request_failure(exc: _YahooAdditionalRequestBlocked):
         )
     return PhysicalAttemptFailure(
         outcome=PhysicalAttemptOutcome.PROVIDER_ERROR,
-        retryable=status_code is None or int(status_code) < 400,
+        retryable=retry_allowed and (status_code is None or int(status_code) < 400),
         status_code=int(status_code) if status_code is not None else None,
         error_code="YAHOO_ADDITIONAL_NETWORK_REQUEST_BLOCKED",
     )
@@ -204,7 +218,11 @@ def _execute_guarded_yahoo_attempt(
     result_validator=None,
 ):
     """Run one Yahoo call under one permit with shared typing and cleanup."""
-    from tradingagents.market_history import PhysicalAttemptFailure, PhysicalAttemptNotMade
+    from tradingagents.market_history import (
+        PhysicalAttemptFailure,
+        PhysicalAttemptNotMade,
+        PhysicalAttemptOutcome,
+    )
 
     session_guard.begin_attempt()
     try:
@@ -213,9 +231,17 @@ def _execute_guarded_yahoo_attempt(
             session_guard.mark_injected_transport_attempt()
         try:
             value = func()
+            session_guard.raise_if_failure_swallowed()
             if result_validator is not None:
                 value = result_validator(value)
-        except PhysicalAttemptFailure:
+        except PhysicalAttemptFailure as exc:
+            # Adapters may validate an SDK empty frame inside func(). A derived
+            # empty/malformed result must not hide the latched transport failure.
+            if exc.outcome in {
+                PhysicalAttemptOutcome.EMPTY_FRAME,
+                PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+            }:
+                session_guard.raise_if_failure_swallowed()
             raise
         except Exception as exc:
             raise _physical_attempt_failure_from_yahoo_exception(exc) from exc

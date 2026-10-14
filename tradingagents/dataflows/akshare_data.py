@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from functools import lru_cache
+from functools import lru_cache, partial
+from types import FunctionType
 from typing import cast
 
 import akshare as ak
@@ -399,9 +400,39 @@ def _safe_frame(
     return data, None
 
 
+class _NewsPandas:
+    """Keep the SDK news frame on Python strings without changing pandas options."""
+
+    DataFrame = staticmethod(partial(pd.DataFrame, dtype=object))
+
+    def __getattr__(self, name):
+        return getattr(pd, name)
+
+
+def _stock_news_em(symbol: str) -> pd.DataFrame:
+    implementation = ak.stock_news_em
+    if (
+        not isinstance(implementation, FunctionType)
+        or not implementation.__module__.startswith("akshare.")
+        or implementation.__globals__.get("pd") is not pd
+    ):
+        return implementation(symbol=symbol)
+    # AKShare's news cleanup uses a Unicode regex escape unsupported by Arrow.
+    # Bind only this invocation's DataFrame constructor, keeping the SDK's
+    # transport, request count and parser unchanged. Shared module globals and
+    # pandas settings are never patched, including while network I/O is pending.
+    local_globals = {**implementation.__globals__, "pd": _NewsPandas()}
+    local_call = FunctionType(
+        implementation.__code__, local_globals, implementation.__name__,
+        implementation.__defaults__, implementation.__closure__,
+    )
+    local_call.__kwdefaults__ = implementation.__kwdefaults__
+    return local_call(symbol=symbol)
+
+
 def get_news(ticker: str, start_date: str, end_date: str) -> str:
     instrument = _require_china_a(ticker)
-    raw = ak.stock_news_em(symbol=instrument.akshare_code)
+    raw = _stock_news_em(symbol=instrument.akshare_code)
     if raw is None or raw.empty:
         raise NoMarketDataError(
             ticker, instrument.yahoo_symbol, "AKShare returned no news rows"

@@ -44,6 +44,50 @@ from tradingagents.evidence import (
 
 
 @pytest.mark.unit
+def test_akshare_news_wire_response_survives_arrow_string_backend(monkeypatch):
+    """Exercise the registered news provider from a nonempty synthetic HTTP page."""
+    from types import SimpleNamespace
+
+    from tradingagents.dataflows import config as config_module
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    monkeypatch.setattr(config_module, "_config", {
+        **DEFAULT_CONFIG, "tool_vendors": {"get_news": "akshare"},
+    })
+    calls = []
+    rows = [{
+        "date": "2026-10-10 12:00:00", "mediaName": "Synthetic fixture",
+        "code": "202610100001", "title": "<em>项目</em>进展",
+        "content": "园区\u3000运营\r\n消息", "image": "",
+    }]
+
+    def response(url, *, params, **kwargs):
+        calls.append((url, json.loads(params["param"]), kwargs))
+        body = params["cb"] + "(" + json.dumps({"result": {"cmsArticleWebOld": rows}}) + ")"
+        return SimpleNamespace(status_code=200, text=body)
+
+    # Keep the real SDK parser and replace only its wire response.
+    import importlib
+
+    sdk_module = importlib.import_module(akshare_data.ak.stock_news_em.__module__)
+    sdk_function = akshare_data.ak.stock_news_em
+    monkeypatch.setattr(sdk_module.requests, "get", response)
+    string_storage = pd.options.mode.string_storage
+    with authoritative_snapshot_run():
+        result = interface.route_to_vendor_acquired(
+            "get_news", "600895.SS", "2026-10-05", "2026-10-12",
+            tool_call_id="news-wire", source_ref="news-wire:600895", capability="get_news",
+        )
+    assert len(calls) == 1
+    assert result.artifact is not None
+    assert "项目进展" in result.artifact.raw_text
+    assert "园区运营 消息" in result.artifact.raw_text
+    assert pd.options.mode.string_storage == string_storage
+    assert sdk_module.pd is pd
+    assert akshare_data.ak.stock_news_em is sdk_function
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("legacy_checkpoint", [False, True])
 def test_repeated_news_calls_keep_distinct_unavailable_acquisitions(legacy_checkpoint):
     """A repeated query is a new call, including when its circuit is open."""

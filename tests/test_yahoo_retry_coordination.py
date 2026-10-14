@@ -12,6 +12,7 @@ import tradingagents.dataflows.market_snapshot as market_snapshot
 import tradingagents.dataflows.stockstats_utils as stockstats_utils
 import tradingagents.dataflows.y_finance as y_finance
 from tradingagents.dataflows.acquisition import AcquisitionFailure
+from tradingagents.dataflows.errors import VendorRateLimitError
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evidence import build_evidence_state
 from tradingagents.evidence_artifacts import (
@@ -43,6 +44,116 @@ def _runtime_config(tmp_path, *, max_attempts: int = 4) -> dict:
     )
     runtime_config["data_vendors"]["core_stock_apis"] = "yfinance"
     return runtime_config
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status, outcome, error_code", [
+    (200, PhysicalAttemptOutcome.PROVIDER_ERROR, "YAHOO_ADDITIONAL_NETWORK_REQUEST_BLOCKED"),
+    (404, PhysicalAttemptOutcome.PROVIDER_ERROR, "YAHOO_ADDITIONAL_NETWORK_REQUEST_BLOCKED"),
+    (401, PhysicalAttemptOutcome.AUTHENTICATION, "YAHOO_HTTP_401"),
+    (429, PhysicalAttemptOutcome.RATE_LIMITED, "YAHOO_HTTP_429"),
+])
+def test_sdk_swallowed_guard_failure_is_not_available_or_retried(
+    tmp_path, monkeypatch, status, outcome, error_code,
+):
+    from types import SimpleNamespace
+
+    from yfinance.scrapers.fundamentals import Financials
+
+    monkeypatch.setattr(config_module, "_config", _runtime_config(tmp_path, max_attempts=4))
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            return SimpleNamespace(status_code=status, headers={}, text="synthetic initialization")
+
+        post = get
+
+    session = Session()
+    guard = stockstats_utils._YahooSessionAttemptGuard(session)
+    monkeypatch.setattr(stockstats_utils, "_yahoo_session_guard", lambda: guard)
+    monkeypatch.setattr(stockstats_utils, "_activate_yahoo_session_guard", lambda _guard: None)
+
+    class Data:
+        fundamentals_use_chunked = False
+
+        def cache_get(self, *, url):
+            session.get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+            return session.get(url)
+
+    financials = Financials(Data(), "600895.SS")
+    with market_snapshot.authoritative_snapshot_run() as run:
+        failure_type = VendorRateLimitError if status == 429 else PhysicalAttemptFailure
+        with pytest.raises(failure_type) as captured:
+            stockstats_utils.yf_retry(
+                lambda: financials.get_balance_sheet_time_series("quarterly"),
+                request_key="swallowed-sdk-guard", operation="fundamentals",
+            )
+        events = tuple(run.physical_attempt_events)
+    assert calls == ["https://query1.finance.yahoo.com/v1/test/getcrumb"]
+    assert captured.value.error_code == error_code
+    assert captured.value.status_code == status
+    if status != 429:
+        assert captured.value.outcome is outcome
+        assert captured.value.retryable is False
+    assert [event.outcome for event in events] == [outcome]
+    assert not guard.consumed
+    guard.raise_if_failure_swallowed()  # Per-attempt failure state is cleared on exit.
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("entrypoint, swallow", [("csv", True), ("range", True), ("range", False)])
+def test_history_inline_validation_preserves_guard_failure(
+    tmp_path, monkeypatch, entrypoint, swallow,
+):
+    from types import SimpleNamespace
+
+    from yfinance.config import YfConfig
+    from yfinance.scrapers.history import PriceHistory
+
+    monkeypatch.setattr(config_module, "_config", _runtime_config(tmp_path, max_attempts=4))
+    monkeypatch.setattr(YfConfig.debug, "hide_exceptions", swallow)
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            return SimpleNamespace(status_code=200, headers={}, text="synthetic initialization")
+
+        post = get
+
+    session = Session()
+    guard = stockstats_utils._YahooSessionAttemptGuard(session)
+    monkeypatch.setattr(stockstats_utils, "_yahoo_session_guard", lambda: guard)
+    monkeypatch.setattr(y_finance, "_yahoo_session_guard", lambda: guard)
+    monkeypatch.setattr(stockstats_utils, "_activate_yahoo_session_guard", lambda _guard: None)
+
+    class Data:
+        def get(self, *, url, **kwargs):
+            session.get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+            return session.get(url)
+
+        cache_get = get
+
+    history = PriceHistory(Data(), "600895.SS", "Asia/Shanghai", session=session)
+    monkeypatch.setattr(y_finance.yf, "Ticker", lambda _symbol: history)
+    with market_snapshot.authoritative_snapshot_run() as run:
+        with pytest.raises(PhysicalAttemptFailure) as captured:
+            if entrypoint == "csv":
+                y_finance.get_YFin_data_online("600895.SS", "2026-10-05", "2026-10-12")
+            else:
+                stockstats_utils.yf_retry(
+                    lambda: y_finance.load_ohlcv_range("600895.SS", "2026-10-05", "2026-10-12"),
+                    request_key="history-inline-guard", operation="market-snapshot",
+                )
+        events = tuple(run.physical_attempt_events)
+    expected_attempts = 1 if swallow else 4
+    assert calls == ["https://query1.finance.yahoo.com/v1/test/getcrumb"] * expected_attempts
+    assert captured.value.outcome is PhysicalAttemptOutcome.PROVIDER_ERROR
+    assert captured.value.error_code == "YAHOO_ADDITIONAL_NETWORK_REQUEST_BLOCKED"
+    assert captured.value.retryable is (not swallow)
+    assert [event.outcome for event in events] == [PhysicalAttemptOutcome.PROVIDER_ERROR] * expected_attempts
 
 
 @pytest.mark.unit
