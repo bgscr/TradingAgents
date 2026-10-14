@@ -461,14 +461,17 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
     ``_create_chat_result`` captures it on receive and
     ``_get_request_payload`` re-attaches it on send.
 
-    Ordinary V4/reasoner tool binding keeps capability-driven ``tool_choice``
-    suppression. Required V4 schema finalizers use a narrowly scoped named
-    choice through ``with_required_structured_output`` below.
+    Ordinary thinking-model tool binding keeps capability-driven ``tool_choice``
+    suppression. Required Flash/V4 schema finalizers use JSON mode through
+    ``with_required_structured_output`` below.
     """
 
     def get_required_structured_method(self) -> str:
         """Return the transport used by fail-closed required schemas."""
-        if self.model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        if self.model_name in {
+            "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+            "deepseek-v4-pro",
+        }:
             return "json_mode"
         return get_capabilities(self.model_name).preferred_structured_method
 

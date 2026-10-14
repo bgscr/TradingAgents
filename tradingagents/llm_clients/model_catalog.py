@@ -126,18 +126,16 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Grok 4.20 Multi-Agent - Multi-agent reasoning", "grok-4.20-multi-agent-0309"),
         ],
     },
-    # DeepSeek: the deepseek-chat / deepseek-reasoner aliases are deprecated
-    # (2026-07-24) and now map to V4 Flash; expose the V4 IDs directly. V4 Flash
-    # serves both non-thinking and thinking modes (the DeepSeekChatOpenAI client
-    # handles the reasoning_content round-trip).
+    # DeepSeek V4.1 Flash uses deepseek-flash; V4 Pro keeps its distinct ID.
+    # Legacy Flash aliases remain valid below without crowding the menu.
     "deepseek": {
         "quick": [
-            ("DeepSeek V4 Flash - Latest fast model, thinking + non-thinking", "deepseek-v4-flash"),
+            ("DeepSeek V4.1 Flash - Fast model, thinking + non-thinking", "deepseek-flash"),
             ("Custom model ID", "custom"),
         ],
         "deep": [
             ("DeepSeek V4 Pro - Latest flagship", "deepseek-v4-pro"),
-            ("DeepSeek V4 Flash - Fast, supports thinking", "deepseek-v4-flash"),
+            ("DeepSeek V4.1 Flash - Fast, supports thinking", "deepseek-flash"),
             ("Custom model ID", "custom"),
         ],
     },
@@ -198,13 +196,14 @@ def get_model_options(provider: str, mode: str) -> list[ModelOption]:
 
 def get_known_models() -> dict[str, list[str]]:
     """Build known model names from the shared CLI catalog."""
+    aliases = {"deepseek": {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}}
     return {
         provider: sorted(
             {
                 value
                 for options in mode_options.values()
                 for _, value in options
-            }
+            } | aliases.get(provider, set())
         )
         for provider, mode_options in MODEL_OPTIONS.items()
     }
