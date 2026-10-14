@@ -4,8 +4,10 @@ import base64
 import copy
 import json
 import sqlite3
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
@@ -3417,6 +3419,7 @@ def test_qcf10_fresh_builtin_exact_terminal_attempt_and_cache_hits(
 def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     fresh = _fresh_builtin_run(
         tmp_path,
@@ -3615,9 +3618,34 @@ def test_qcf11_fresh_builtin_single_flight_and_bulk_reuse(
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = tuple(executor.submit(route_factor) for _ in range(2))
             start.wait(timeout=5)
-            assert provider_entered.wait(timeout=5)
+            provider_started = provider_entered.wait(timeout=5)
+            # Release the fixture even when entry is late, then surface worker
+            # exceptions before the timing assertion can hide their traceback.
             release_provider.set()
-            factor_results = tuple(future.result(timeout=10) for future in futures)
+            factor_results = []
+            for future in futures:
+                try:
+                    factor_results.append(future.result(timeout=10))
+                except TimeoutError as error:
+                    if future.done():
+                        raise
+                    stacks = "\n".join(
+                        f"thread {thread_id}:\n{''.join(traceback.format_stack(frame))}"
+                        for thread_id, frame in sys._current_frames().items()
+                    )
+                    # Executor shutdown waits for workers, so retain the stacks
+                    # before leaving the context even if one never completes.
+                    with capfd.disabled():
+                        print(stacks, file=sys.stderr, flush=True)
+                    raise AssertionError(
+                        f"adjustment-factor worker did not finish; thread stacks:\n{stacks}"
+                    ) from error
+            assert provider_started, (
+                "provider entry was not observed within 5 seconds; "
+                f"entered_later={provider_entered.is_set()}; "
+                f"selected_providers={tuple(result.selected_provider for result in factor_results)}; "
+                f"provider_calls={tuple(tuple((call.provider_id, call.kind, call.reason) for call in result.provider_calls) for result in factor_results)}"
+            )
 
         assert factor_results[0] == factor_results[1]
         assert factor_results[0].selected_provider == "tushare"
