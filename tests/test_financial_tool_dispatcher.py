@@ -1546,9 +1546,72 @@ def test_configured_akshare_financial_dispatch_does_not_expand_to_yahoo(
     )
 
 
+def test_dispatcher_owned_akshare_preserves_received_sections_after_disconnect(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(config_module, "_config", _coordinator_runtime_config(tmp_path))
+    calls = []
+
+    def business(*, symbol):
+        calls.append(("business", symbol))
+        return pd.DataFrame([{
+            "股票代码": "600895", "主营业务": "园区开发", "产品类型": "园区",
+            "产品名称": "租赁", "经营范围": "园区运营",
+        }])
+
+    def abstract(*, symbol):
+        calls.append(("abstract", symbol))
+        # Retained response shape from the 20261014_074827 run, with synthetic values.
+        return pd.DataFrame([
+            ["常用指标", "归母净利润", 30.0, 8.0, 90.0, 60.0],
+            ["常用指标", "营业总收入", 180.0, 80.0, 410.0, 200.0],
+        ], columns=["选项", "指标", "20260630", "20260331", "20251231", "20250930"])
+
+    def fund_flow(*, stock, market):
+        calls.append(("fund_flow", stock, market))
+        raise ConnectionError("credential=must-not-enter-the-artifact")
+
+    monkeypatch.setattr(akshare_data.ak, "stock_zyjs_ths", business)
+    monkeypatch.setattr(akshare_data.ak, "stock_financial_abstract", abstract)
+    monkeypatch.setattr(akshare_data.ak, "stock_individual_fund_flow", fund_flow)
+    dispatcher = FinancialToolDispatcher.from_configured_vendors(
+        instrument_identity=_identity(symbol="600895.SS", venue="XSHG", currency="CNY"),
+        config={"data_vendors": {"fundamental_data": "akshare"}},
+    )
+    with market_snapshot.authoritative_snapshot_run() as run:
+        result = dispatcher.dispatch(_request(
+            tool_name="get_fundamentals",
+            statement_type=FinancialStatementType.COMPREHENSIVE_FUNDAMENTALS,
+            frequency=FinancialReportingFrequency.NOT_APPLICABLE,
+            as_of_date=date(2026, 10, 12),
+            material_arguments={},
+        ))
+        events = tuple(run.physical_attempt_events)
+
+    assert calls == [("business", "600895"), ("abstract", "600895"), ("fund_flow", "600895", "sh")]
+    assert [event.outcome for event in events] == [
+        PhysicalAttemptOutcome.AVAILABLE,
+        PhysicalAttemptOutcome.AVAILABLE,
+        PhysicalAttemptOutcome.DISCONNECT,
+    ]
+    assert result.artifact is not None
+    assert result.provider == "akshare"
+    assert "主营业务: 园区开发" in result.artifact.raw_text
+    assert "营业总收入,180.0,80.0,410.0,200.0" in result.artifact.raw_text
+    assert "stock_individual_fund_flow unavailable (disconnect)" in result.artifact.raw_text
+    assert "credential=" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("business_fields,has_artifact", [
+    ({"主营业务": "Semiconductors"}, True),
+    ({"股票代码": "600000"}, False),
+])
 def test_dispatcher_owned_akshare_subrequests_are_typed_and_cardinality_exact(
     tmp_path,
     monkeypatch,
+    business_fields,
+    has_artifact,
 ) -> None:
     runtime_config = _coordinator_runtime_config(tmp_path)
     monkeypatch.setattr(config_module, "_config", runtime_config)
@@ -1557,7 +1620,7 @@ def test_dispatcher_owned_akshare_subrequests_are_typed_and_cardinality_exact(
 
     def business(**_kwargs: object) -> pd.DataFrame:
         calls.append("stock_zyjs_ths")
-        return pd.DataFrame([{"主营业务": "Semiconductors"}])
+        return pd.DataFrame([business_fields])
 
     def financial_abstract(**_kwargs: object) -> pd.DataFrame:
         calls.append("stock_financial_abstract")
@@ -1613,10 +1676,13 @@ def test_dispatcher_owned_akshare_subrequests_are_typed_and_cardinality_exact(
         PhysicalAttemptOutcome.AVAILABLE,
         PhysicalAttemptOutcome.PROVIDER_ERROR,
     ]
-    assert result.artifact is None
-    assert result.plan_outcomes[-1].outcome.reason is (
-        AcquisitionUnavailableReason.PROVIDER_ERROR
-    )
+    if has_artifact:
+        assert result.artifact is not None
+        assert "主营业务: Semiconductors" in result.artifact.raw_text
+        assert "stock_financial_abstract unavailable (provider_error)" in result.artifact.raw_text
+    else:
+        assert result.artifact is None
+        assert result.plan_outcomes[-1].outcome.reason is AcquisitionUnavailableReason.PROVIDER_ERROR
     assert raw_detail not in result.model_dump_json()
 
 

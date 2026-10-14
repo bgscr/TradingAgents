@@ -12,6 +12,8 @@ import requests
 from dateutil.relativedelta import relativedelta
 from stockstats import wrap
 
+from tradingagents.market_history import PhysicalAttemptFailure
+
 from .errors import NoMarketDataError
 from .market_snapshot import validate_ohlcv_frame
 from .monetary_facts import extract_chinese_monetary_facts, render_monetary_source_facts
@@ -476,6 +478,8 @@ def _business_section(
         value = row.get(col)
         if pd.notna(value) and str(value).strip():
             lines.append(f"{col}: {value}")
+    if len(lines) == 1:
+        return [], ["DATA_DEGRADED: AKShare stock_zyjs_ths returned no business fields."]
     return lines, []
 
 
@@ -589,7 +593,19 @@ def get_fundamentals(
             )
         )
     for source_ref, builder in builders:
-        lines, errors = builder()
+        try:
+            lines, errors = builder()
+        except PhysicalAttemptFailure as exc:
+            if not _acquired or primary_sections == 0:
+                raise
+            # Earlier successful sections remain useful; the coordinator retains
+            # the failed physical event. Stop here without expanding the request.
+            endpoint = source_ref.split(":", 1)[0]
+            degraded.append(
+                f"DATA_DEGRADED: {endpoint} unavailable ({exc.outcome.value}); "
+                "remaining acquisition stopped."
+            )
+            break
         if lines:
             if source_ref.startswith("AKShare "):
                 primary_sections += 1
