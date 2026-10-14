@@ -1018,12 +1018,18 @@ class SourceAcquisitionAvailable(BaseModel):
     capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     attempt: int = Field(ge=1)
-    acquisition_id: str | None = Field(
-        default=None, pattern=ACQUISITION_TOKEN_PATTERN, exclude_if=lambda value: value is None
-    )
+    acquisition_id: str | None = Field(default=None, pattern=ACQUISITION_TOKEN_PATTERN)
     retrieved_at: str = Field(min_length=1)
     retryable: Literal[False] = False
     artifact: SourceArtifact
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_acquisition_identity(self, handler) -> dict[str, Any]:
+        # Pydantic 2.12 union serialization warns when exclude_if removes a field.
+        payload = handler(self)
+        if self.acquisition_id is None:
+            payload.pop("acquisition_id", None)
+        return payload
 
     @field_validator("retrieved_at")
     @classmethod
@@ -1058,9 +1064,7 @@ class SourceAcquisitionUnavailable(BaseModel):
     capability: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     source_ref: str = Field(pattern=ACQUISITION_TOKEN_PATTERN)
     attempt: int = Field(ge=1)
-    acquisition_id: str | None = Field(
-        default=None, pattern=ACQUISITION_TOKEN_PATTERN, exclude_if=lambda value: value is None
-    )
+    acquisition_id: str | None = Field(default=None, pattern=ACQUISITION_TOKEN_PATTERN)
     retrieved_at: str = Field(min_length=1)
     retryable: bool
     reason: AcquisitionUnavailableReason
@@ -1075,6 +1079,13 @@ class SourceAcquisitionUnavailable(BaseModel):
     )
     http_status: int | None = Field(default=None, ge=100, le=599)
     calculation_readiness: CalculationReadinessDiagnostic | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_acquisition_identity(self, handler) -> dict[str, Any]:
+        payload = handler(self)
+        if self.acquisition_id is None:
+            payload.pop("acquisition_id", None)
+        return payload
 
     @field_validator("retrieved_at")
     @classmethod

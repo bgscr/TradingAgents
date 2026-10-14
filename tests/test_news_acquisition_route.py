@@ -1,3 +1,5 @@
+import json
+import warnings
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -6,6 +8,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from pydantic import TypeAdapter
 from yfinance.exceptions import YFRateLimitError
 
 from tradingagents.agents.analysts.submission import (
@@ -31,6 +34,7 @@ from tradingagents.evidence import (
     InstrumentKind,
     MaterialClaim,
     SourceAcquisitionAvailable,
+    SourceAcquisitionOutcome,
     SourceAcquisitionUnavailable,
     ToolExecutionEvidenceEnvelope,
     build_tool_evidence_state,
@@ -163,6 +167,36 @@ def test_unbound_legacy_attempts_keep_strict_identity_and_serialization():
     changed = original.model_copy(update={"reason": AcquisitionUnavailableReason.CIRCUIT_OPEN})
     with pytest.raises(ValueError, match="source acquisition attempt was redefined"):
         merge_source_acquisition_outcomes(evidence, (changed,))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("acquisition_id", [None, "news:serialization-call"])
+def test_acquisition_identity_serializes_through_unions_without_warnings(available, acquisition_id):
+    set_config({"tool_vendors": {"get_news": "akshare"}})
+    provider = mock.Mock(return_value="A headline") if available else mock.Mock(side_effect=RuntimeError("offline"))
+    with mock.patch.dict(interface.VENDOR_METHODS["get_news"], {"akshare": provider}), mock.patch.object(
+        interface, "get_active_acquisition_controller", return_value=AcquisitionController(providers=())
+    ):
+        result = interface.route_to_vendor_acquired(
+            "get_news", "600895.SS", "2026-10-05", "2026-10-12",
+            tool_call_id="serialization-call", source_ref="news:synthetic", capability="get_news",
+        )
+    outcome = result.outcomes[0].model_copy(update={"acquisition_id": acquisition_id})
+    adapter = TypeAdapter(SourceAcquisitionOutcome)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        encoded = adapter.dump_json(outcome)
+        assert adapter.validate_json(encoded) == outcome
+        state = merge_source_acquisition_outcomes(None, (outcome,))
+        assert EvidenceState.model_validate_json(state.model_dump_json()) == state
+        assert adapter.dump_python(outcome, mode="json") == json.loads(encoded)
+    payload = json.loads(encoded)
+    assert ("acquisition_id" in payload) == (acquisition_id is not None)
+    if acquisition_id is not None:
+        assert payload["acquisition_id"] == acquisition_id
+    if not available:
+        assert "error_code" in payload and payload["error_code"] is None
 
 
 def _mainland_identity() -> InstrumentIdentityEvidence:
