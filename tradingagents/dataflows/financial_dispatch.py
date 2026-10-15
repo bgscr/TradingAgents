@@ -3597,6 +3597,7 @@ class FinancialToolDispatcher:
             from tradingagents.dataflows.config import get_config
 
             config = get_config()
+        builtin_vendors = vendor_methods is None
         if vendor_methods is None:
             from tradingagents.dataflows.interface import VENDOR_METHODS
 
@@ -3620,6 +3621,7 @@ class FinancialToolDispatcher:
                     "configured Capability Routing Plan contradicts qualified router"
                 )
         market = _market_from_authoritative_identity(instrument_identity)
+        current_statements = None
         provider_chains: dict[str, tuple[FinancialProvider, ...]] = {}
         for tool_name in _FINANCIAL_TOOL_SPECS:
             available = vendor_methods.get(tool_name)
@@ -3634,6 +3636,26 @@ class FinancialToolDispatcher:
             )
             requested = [token.strip() for token in configured.split(",")]
             explicit = [token for token in requested if token and token != "default"]
+            tool_selections = config.get("tool_vendors", {})
+            if (
+                builtin_vendors
+                and qualified_statement_router is None
+                and config.get("mainland_capability_routing_mode", "legacy") == "legacy"
+                and tool_name in {"get_balance_sheet", "get_income_statement", "get_cashflow"}
+                and isinstance(tool_selections, Mapping)
+                and tool_name in tool_selections
+                and "tushare" in explicit
+            ):
+                from tradingagents.dataflows.current_tushare_statements import (
+                    CurrentTushareStatements,
+                )
+
+                if current_statements is None:
+                    current_statements = CurrentTushareStatements(
+                        instrument_identity=instrument_identity, config=config,
+                        clock=clock, sleeper=sleeper,
+                    )
+                available = {**available, "tushare": current_statements}
             if explicit:
                 vendor_names = [name for name in explicit if name in available]
                 if not vendor_names:
@@ -3644,7 +3666,15 @@ class FinancialToolDispatcher:
             else:
                 vendor_names = list(available)
             provider_chains[tool_name] = tuple(
-                _financial_provider_from_implementation(
+                FinancialProvider(
+                    name=provider_name,
+                    variants=(FinancialProviderVariant(
+                        variant_id=current_statements.variant_id,
+                        invoke=current_statements,
+                    ),),
+                )
+                if current_statements is not None and available[provider_name] is current_statements
+                else _financial_provider_from_implementation(
                     provider_name,
                     tool_name=tool_name,
                     implementation=available[provider_name],

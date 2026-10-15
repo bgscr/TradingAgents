@@ -144,7 +144,7 @@ def decode_provider_artifact(
 
 def financial_artifact_identity(
     *,
-    key: ProviderSubrequestKey,
+    key: ProviderSubrequestKey | Mapping[str, object],
     payload: Mapping[str, object],
 ) -> FinancialProviderArtifactIdentity:
     """Bind the bulk response to its canonical request and canonical row payload."""
@@ -159,7 +159,7 @@ def financial_artifact_identity(
         provider_metadata["adapter_metadata"] = payload["adapter_metadata"]
     return FinancialProviderArtifactIdentity.create(
         dataset=dataset,
-        canonical_request=key.model_dump(mode="json"),
+        canonical_request=(key.model_dump(mode="json") if isinstance(key, ProviderSubrequestKey) else dict(key)),
         provider_metadata=provider_metadata,
         retrieved_at=_payload_time(payload, "retrieved_at"),
         observed_at=_payload_time(payload, "observed_at"),
@@ -169,7 +169,7 @@ def financial_artifact_identity(
 
 def financial_row_artifact_identities(
     *,
-    key: ProviderSubrequestKey,
+    key: ProviderSubrequestKey | Mapping[str, object],
     response_artifact: FinancialProviderArtifactIdentity,
     payload: Mapping[str, object],
 ) -> tuple[FinancialProviderArtifactIdentity, ...]:
@@ -193,7 +193,7 @@ def financial_row_artifact_identities(
         identities.append(
             FinancialProviderArtifactIdentity.create(
                 dataset=dataset,
-                canonical_request=key.model_dump(mode="json"),
+                canonical_request=(key.model_dump(mode="json") if isinstance(key, ProviderSubrequestKey) else dict(key)),
                 provider_metadata={
                     "provider_id": "tushare",
                     "endpoint_id": str(payload["endpoint_id"]),

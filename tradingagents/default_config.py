@@ -89,6 +89,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TUSHARE_QUALIFICATION_PROFILE": "tushare_qualification_profile",
     "TRADINGAGENTS_TUSHARE_ACCOUNT_SCOPE_LABEL": "tushare_account_scope_label",
     "TRADINGAGENTS_TUSHARE_CALLS_PER_MINUTE": "tushare_calls_per_minute",
+    "TRADINGAGENTS_TUSHARE_FINANCIAL_HTTPS_ENDPOINT": "tushare_financial_https_endpoint",
+    "TRADINGAGENTS_TUSHARE_FINANCIAL_CACHE_MAX_AGE_SECONDS": "tushare_financial_cache_max_age_seconds",
+    "TRADINGAGENTS_TUSHARE_FINANCIAL_FORCE_REFRESH": "tushare_financial_force_refresh",
     "TRADINGAGENTS_TUSHARE_OPERATOR_SAFETY_CEILING_CALLS_PER_MINUTE": (
         "tushare_operator_safety_ceiling_calls_per_minute"
     ),
@@ -189,9 +192,11 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
         "market_history_mode": {"disabled", "shadow", "current"},
         "data_usage_mode": {"personal_research"},
         "mainland_capability_routing_mode": {"legacy"},
+        "tushare_financial_https_endpoint": {"https://api.tushare.pro", "https://api.waditu.com/dataapi"},
     }
     if not isinstance(local, dict) or set(local) - (
-        set(scalar_choices) | {"market_data_vendors"}
+        set(scalar_choices) | {"market_data_vendors", "tool_vendors",
+                              "tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh"}
     ):
         raise ValueError("Unsupported fields in tradingagents.local.json")
     for key, choices in scalar_choices.items():
@@ -200,6 +205,18 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
         ):
             raise ValueError("Invalid research setting in tradingagents.local.json")
     core = None
+    if "tool_vendors" in local:
+        selections = local["tool_vendors"]
+        if (not isinstance(selections, dict)
+                or set(selections) - {"get_balance_sheet", "get_income_statement", "get_cashflow"}
+                or any(value != "tushare" for value in selections.values())):
+            raise ValueError("Invalid financial selection in tradingagents.local.json")
+    if "tushare_financial_cache_max_age_seconds" in local:
+        seconds = local["tushare_financial_cache_max_age_seconds"]
+        if type(seconds) is not int or not 1 <= seconds <= 31536000:
+            raise ValueError("Invalid financial cache age in tradingagents.local.json")
+    if "tushare_financial_force_refresh" in local and type(local["tushare_financial_force_refresh"]) is not bool:
+        raise ValueError("Invalid financial refresh in tradingagents.local.json")
     if "market_data_vendors" in local:
         vendors = local["market_data_vendors"]
         if not isinstance(vendors, dict) or set(vendors) != {"cn_a"}:
@@ -213,6 +230,11 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
     for key in scalar_choices:
         if key in local:
             config[key] = local[key]
+    for key in ("tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh"):
+        if key in local:
+            config[key] = local[key]
+    if "tool_vendors" in local:
+        config["tool_vendors"] = {**config.get("tool_vendors", {}), **local["tool_vendors"]}
     if core is not None:
         vendors = dict(config.get("market_data_vendors", {}))
         mainland = dict(vendors.get("cn_a", {}))
@@ -255,6 +277,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "tushare_qualification_profile": "cn-a-2000-20260729-v1",
     "tushare_account_scope_label": "personal-research-default",
     "tushare_calls_per_minute": 40,
+    # Explicit CURRENT statements only. Destination selection is an operator
+    # decision; no HTTP or SDK default is inherited. These are freshness rules,
+    # never account entitlements or a promise of historical PIT availability.
+    "tushare_financial_https_endpoint": None,
+    "tushare_financial_cache_max_age_seconds": 86400,
+    "tushare_financial_force_refresh": False,
     "tushare_operator_safety_ceiling_calls_per_minute": 40,
     # Total Yahoo physical calls per coordinated sequence, including the first.
     "yahoo_max_physical_attempts": 4,
