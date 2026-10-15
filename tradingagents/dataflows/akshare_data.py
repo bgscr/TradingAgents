@@ -430,6 +430,15 @@ def _stock_news_em(symbol: str) -> pd.DataFrame:
     return local_call(symbol=symbol)
 
 
+def _news_in_window(raw: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    """The production date filter, also observed by the offline diagnostic."""
+    frame = raw.copy()
+    frame["发布时间"] = pd.to_datetime(frame["发布时间"], errors="coerce")
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
+    return frame[(frame["发布时间"] >= start) & (frame["发布时间"] < end)]
+
+
 def get_news(ticker: str, start_date: str, end_date: str) -> str:
     instrument = _require_china_a(ticker)
     raw = _stock_news_em(symbol=instrument.akshare_code)
@@ -438,11 +447,7 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
             ticker, instrument.yahoo_symbol, "AKShare returned no news rows"
         )
 
-    frame = raw.copy()
-    frame["发布时间"] = pd.to_datetime(frame["发布时间"], errors="coerce")
-    start = pd.to_datetime(start_date)
-    end = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-    frame = frame[(frame["发布时间"] >= start) & (frame["发布时间"] < end)]
+    frame = _news_in_window(raw, start_date, end_date)
     if frame.empty:
         raise NoMarketDataError(
             ticker,
