@@ -54,9 +54,10 @@ def create_client(destination):
 
 
 class _Client:
-    def __init__(self, destination, token):
+    def __init__(self, destination, token, *, before_request=None):
         self._destination = destination
         self._token = token
+        self._before_request = before_request
 
     def query(self, endpoint, **params):
         if (
@@ -89,6 +90,8 @@ class _Client:
             if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
                 raise ValueError("verification required")
             connection = http.client.HTTPSConnection(host, timeout=30, context=context)
+            if self._before_request is not None:
+                self._before_request(endpoint)
             connection.request(
                 "POST",
                 path,
