@@ -6,18 +6,18 @@ from the project `.venv`. No Linux or other Python version runs automatically.
 When that local runtime changes, update the daily test, clean-install and package
 lanes together. This exact patch pin does not follow later Python patches.
 
-| Coverage | Automatic push / PR | Manual `workflow_dispatch` |
-| --- | --- | --- |
-| Windows full pytest, offline cold bootstrap and full-repo Ruff | Python 3.13.7 | Python 3.13.7, once |
-| Windows clean package install/imports, without dev extras | Python 3.13.7, separate fresh runner | Same |
-| Windows launcher / PyInstaller / packaged CLI smoke | Python 3.13.7 | Same |
-| Additional full pytest + offline cold bootstrap | None | Linux 3.10 / 3.11 / 3.12 / 3.13; Windows 3.12 |
-| Minimum dependency versions, full pytest + Ruff floor | None | Linux Python 3.13 |
-| Linux clean package install/imports, without dev extras | None | Python 3.12, separate fresh runner |
-| **Executed jobs** | **3** | **10** |
+| Coverage | Automatic push / PR | Manual default | Manual full compatibility |
+| --- | --- | --- | --- |
+| Windows full pytest, offline cold bootstrap and full-repo Ruff | Python 3.13.7 | Same, once | Same, once |
+| Windows clean package install/imports, without dev extras | Python 3.13.7, separate fresh runner | Same | Same |
+| Windows launcher / PyInstaller / packaged CLI smoke | Python 3.13.7 | Same | Same |
+| Additional full pytest + offline cold bootstrap | None | None | Linux 3.10 / 3.11 / 3.12 / 3.13; Windows 3.12 |
+| Minimum dependency versions, full pytest + Ruff floor | None | None | Linux Python 3.13 |
+| Linux clean package install/imports, without dev extras | None | None | Python 3.12, separate fresh runner |
+| **Executed jobs** | **3** | **3** | **10** |
 
-The manual-only minimum-dependency job is skipped on automatic events; that is
-not a test pass. Previously each automatic event ran nine jobs: five full-test
+The minimum-dependency job is skipped unless full compatibility is explicitly
+selected; that is not a test pass. Previously each automatic event ran nine jobs: five full-test
 lanes, minimum dependencies, clean install, Windows packaging and standalone
 Ruff. Ruff now runs once inside the daily Windows test job, using the same
 `ruff>=0.15` dev dependency. The complete Windows pytest command remains intact;
@@ -30,20 +30,24 @@ Linux, older interpreters or dependency floors. Use manual compatibility checks
 before distributing a release, changing that compatibility claim, or making
 changes that need those environments (including dependencies and CI coverage).
 Keep change-related tests; a passing Windows run cannot establish Linux or older
-Python compatibility. Manual mode retains the former compatibility lanes plus
+Python compatibility. Manual full mode retains the former compatibility lanes plus
 the new personal Windows runtime, and does not run a second daily matrix.
 
 After the workflow is on the default branch and Actions is enabled, select
-**Actions → CI → Run workflow** and the intended branch. This always runs the
-full compatibility mode. Verify its exact commit, event, branch, attempt and all
-ten executed jobs. A manual run on a different SHA does not validate a PR merge
+**Actions → CI → Run workflow**, select **main**, and leave **full_compatibility**
+unchecked (the default is **false**) to run only the three Windows jobs. Check
+**full_compatibility** only when you intentionally want all ten compatibility
+jobs, including Linux and other Python versions. The typed boolean input is
+checked only for a manual event; automatic events always use the personal mode.
+Verify the run's exact commit, event, branch, attempt and the three or ten executed
+job results for the chosen mode. A manual run on a different SHA does not validate a PR merge
 commit. Do not dispatch redundant runs solely because multiple branches contain
 the same commit.
 
 The `test`, `smoke-install`, `minimum-compatibility` and `windows-package-smoke`
 job IDs remain. The clean-install and package check names remain; clean-install
 now validates Windows by default. The former test lane names occur only in manual
-mode, `minimum dependencies (py3.13)` is manual-only, and the standalone
+full mode, `minimum dependencies (py3.13)` is full-mode-only, and the standalone
 `ruff (strict, full repo)` check is replaced by the Windows test job's lint step.
 Before publishing, a maintainer must verify the actual required-check policy is
 compatible with these changed/absent/skipped check contexts. Do not change branch
