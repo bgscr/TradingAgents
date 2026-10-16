@@ -147,4 +147,8 @@ class CaptureDiagnosticTests(unittest.TestCase):
         complete = False
         with self.assertRaises(AssertionError) as failure:
             assert complete is True, capture_failure_diagnostic([{"error": "[WinError 5] SECRET"}])
-        self.assertEqual(json.loads(str(failure.exception))["errors"][0]["code"], 5)
+        # Pytest assertion rewriting appends its explanation after our JSON.
+        message = str(failure.exception)
+        diagnostic, _ = json.JSONDecoder().raw_decode(message)
+        self.assertEqual(diagnostic["errors"][0]["code"], 5)
+        self.assertNotIn("SECRET", message)
