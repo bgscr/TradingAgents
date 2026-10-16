@@ -74,7 +74,21 @@ jobs:
         if: matrix.os == 'windows-latest' && matrix.python-version == '3.13.7'
         run: '& $env:TA_CI_PYTHON -m ruff check .'
       - name: Run test suite
-        run: '& $env:TA_CI_PYTHON -m pytest -q'
+        id: tests
+        env:
+          TA_CI_POLICY_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/policy-coverage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}/failures.jsonl
+        run: |
+          $diagnosticDirectory = Split-Path -Parent $env:TA_CI_POLICY_COVERAGE_DIAGNOSTICS
+          New-Item -ItemType Directory -Path $diagnosticDirectory -ErrorAction Stop | Out-Null
+          & $env:TA_CI_PYTHON -m pytest -q
+      - name: Upload filtered synthetic coverage failures
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-coverage-diagnostics-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/policy-coverage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}/failures.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
 
   smoke-install:
     name: ${{ matrix.os == 'windows-latest' && 'clean-install smoke' || 'Linux clean-install smoke' }}

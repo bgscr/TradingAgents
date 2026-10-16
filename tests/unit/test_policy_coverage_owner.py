@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tests.fixtures.policy_owner.local_owner_fixture import SyntheticNativeBoundary
+from tests.policy_coverage_diagnostics import capture_failure_diagnostic
 from tests.unit.test_policy_coverage_native import native_fixture
 from tradingagents.policy_coverage_contract import CoverageMeasurement, artifact_ref, build_scope
 from tradingagents.policy_coverage_models import (
@@ -81,7 +82,9 @@ def owner_case(tmp_path):
         phase="before",
         fixture_only=True,
     )
-    assert value["capture"]["complete"] is True
+    assert value["capture"]["complete"] is True, capture_failure_diagnostic(
+        value["capture"].get("errors")
+    )
     now = datetime.now(timezone.utc)
     descriptor = ArtifactDescriptor.seal(
         contract_version="policy-owner-artifact-descriptor-v2",
