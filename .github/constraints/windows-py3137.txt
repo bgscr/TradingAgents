@@ -1,0 +1,14 @@
+# Targeted reproduction baseline: Windows / Python 3.13.7 test job only.
+# Versions read from the owner's existing project venv on 2026-10-15.
+# This is not a complete dependency lock or an approval of a new SDK source.
+# See docs/ci.md before changing the baseline or applying it to other lanes.
+
+# News parser identity, dataframe conversion, retained frames and HTTP adapter.
+akshare==1.18.73
+pandas==3.0.3
+pyarrow==25.0.0
+curl_cffi==0.15.0
+
+# Keep test and lint behavior aligned with the validated local tooling.
+pytest==9.1.1
+ruff==0.15.22

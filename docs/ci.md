@@ -20,9 +20,57 @@ The minimum-dependency job is skipped unless full compatibility is explicitly
 selected; that is not a test pass. Previously each automatic event ran nine jobs: five full-test
 lanes, minimum dependencies, clean install, Windows packaging and standalone
 Ruff. Ruff now runs once inside the daily Windows test job, using the same
-`ruff>=0.15` dev dependency. The complete Windows pytest command remains intact;
+dev dependency with the daily constraint described below. The complete Windows
+pytest collection remains intact (`python -m pytest -q`);
 `pytest -m windows` or packaging smoke would miss tests that use platform or
 PowerShell availability checks instead of a Windows marker.
+
+## Daily test environment
+
+Each Windows full-test lane creates a new venv under the runner's temporary
+directory with `--copies`, without system site packages. Installation, Ruff,
+pytest and the cold bootstrap all use that venv's Python explicitly. The main
+Windows / Python 3.13.7 lane additionally uses
+[targeted constraints](../.github/constraints/windows-py3137.txt): AKShare 1.18.73,
+pandas 3.0.3, pyarrow 25.0.0, curl_cffi 0.15.0, pytest 9.1.1 and Ruff 0.15.22.
+These versions were read from the existing local project venv; CI builds its
+environment afresh and does not copy that venv, local data or configuration.
+
+The constraints cover the news parser/dataframe/HTTP path and test tooling, not
+the complete dependency graph. Other dependencies and pip can still change.
+Review a clean dependency resolution before claiming full reproducibility or
+replacing these constraints with a complete lock. Do not use an unreviewed
+machine-wide `pip freeze` as the project's lock. A future local reproduction
+should install `.[dev,pit]` with the same constraints into a separate fresh
+Python 3.13.7 venv; changing CI does not upgrade the owner's daily environment.
+
+AKShare 1.18.73 matches the currently reviewed news parser source. The official
+1.19.1 parser differs only in a comment punctuation character, but that changes
+the exact source fingerprint checked by production. Unit tests use a fixed,
+reviewed parser fixture; installed-SDK checks retain unknown-source rejection.
+Pinning this baseline does not replace those tests or approve another parser.
+AKShare 1.19.1 also requires Python >=3.11, so adopting it must account for the
+project's Python 3.10 compatibility lane. See the official
+[1.18.73](https://pypi.org/project/akshare/1.18.73/) and
+[1.19.1](https://pypi.org/project/akshare/1.19.1/) release metadata.
+
+The Windows venv layout lets the existing isolated diagnostic runtime find
+`Lib/site-packages` relative to `Scripts/python.exe`. This does not add support
+for a Windows base interpreter. Real CLI subprocess checks still enforce
+`-I -S -B`; ordinary pytest does not depend on those outer-process flags. Manual
+Linux test lanes retain the setup-python base interpreter: the current runtime's
+POSIX fallback needs separate verification before switching those lanes to venvs.
+The Windows 3.12 compatibility lane uses a fresh venv but not the 3.13.7 constraints.
+
+CI still verifies a clean checkout and installation even when its declared
+environment matches local development. The separate clean-install job continues
+to install the package without dev extras; the package job separately installs
+the build extra and checks launchers and the packaged executable. Neither job
+reuses the test venv or these test-only constraints, so they continue to exercise
+dependency resolution from the package declarations and can differ from the
+daily test baseline.
+
+## Compatibility and workflow operation
 
 This is a personal-use validation policy, not a reduction of the declared
 `requires-python >=3.10` compatibility claim. Routine CI no longer validates
@@ -63,7 +111,8 @@ test different trees even with the same PR head SHA. See
 [GitHub's concurrency semantics](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
 The full-test and minimum-dependency jobs cache only pip downloads/wheels, keyed
-by interpreter/platform and the dependency/workflow files. Every run still
+by interpreter/platform and the dependency/workflow files; full-test cache keys
+also include the daily constraints. Every run still
 installs dependencies and executes its checks. The clean-install and packaged
 release jobs remain uncached and use separate runners; no dev environment is
 reused for clean-install evidence. Floating versions can limit cache reuse; see

@@ -1,10 +1,33 @@
 import hashlib
+import inspect
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import pytest
+
+from tests.fixtures.akshare_news_parser import stock_news_em
+
+# Fixed source identity, not a hash computed from whichever SDK is installed.
+TEST_PARSER_SHA256 = "fc1515244d5cc2afc16603b3f655820e0903ded18745c6221ffd7f299dde77ee"
+
+
+@pytest.fixture(autouse=True)
+def reviewed_parser(monkeypatch):
+    """These unit tests use a reviewed, sanitized parser; no live SDK approval."""
+    from tradingagents import news_diagnostic as diagnostic
+
+    assert hashlib.sha256(inspect.getsource(stock_news_em).encode()).hexdigest() == TEST_PARSER_SHA256
+    # Preserve the SDK namespace dispatch so the real production adapter still
+    # supplies its per-call pandas string handling. Do not change global options.
+    parser = FunctionType(
+        stock_news_em.__code__,
+        {**stock_news_em.__globals__, "__name__": "akshare.news.reviewed_test_fixture"},
+        stock_news_em.__name__, stock_news_em.__defaults__,
+    )
+    monkeypatch.setattr(diagnostic.akshare_data.ak, "stock_news_em", parser)
+    monkeypatch.setattr(diagnostic, "PROJECTION_SDK_SHA256", TEST_PARSER_SHA256)
 
 
 def synthetic_get(*, extra=None, dates=None, mutate=None):
@@ -38,7 +61,7 @@ def test_public_metadata_capture_keeps_production_counts_and_replays(tmp_path):
         tmp_path, get=synthetic_get(extra={"code": 0, "hits": 3, "success": True}),
         start="2026-10-05", end="2026-10-12",
     )
-    assert result["artifact_sha256"]  # actual SDK + get_news + acquisition succeeded
+    assert result["artifact_sha256"]  # fixed parser + get_news + acquisition succeeded
     assert result["body_saved"], "public envelope metadata must not lose the replay body"
     assert result["checks"]["retention"]["status"] == "passed"
     assert result["articles"]["raw"]["count"] == 3
@@ -249,13 +272,26 @@ def test_projection_does_not_drop_or_weaken_article_validation(tmp_path, change,
 def test_projection_requires_reviewed_sdk(tmp_path, monkeypatch):
     from tradingagents import news_diagnostic as diagnostic
 
-    monkeypatch.setattr(diagnostic, "PROJECTION_SDK_SHA256", "0" * 64)
-    result = diagnostic.capture(
+    captured = diagnostic.capture(
         tmp_path, get=synthetic_get(extra={"message": "fixture"}),
+        start="2026-10-05", end="2026-10-12",
+    )
+    assert captured["projection_saved"]
+    monkeypatch.setattr(diagnostic, "PROJECTION_SDK_SHA256", "0" * 64)
+    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
+    assert replay["same_sdk"] and replay["same_sdk_frame"] and replay["same_artifact"]
+    assert replay["checks"]["replay"]["reason"] == "sdk_projection_not_reviewed"
+    assert not replay["projection_replay_passed"]
+    assert not replay["acceptance_passed"]
+    output = tmp_path / "unreviewed"
+    output.mkdir()
+    result = diagnostic.capture(
+        output, get=synthetic_get(extra={"message": "fixture"}),
         start="2026-10-05", end="2026-10-12",
     )
     assert not result["projection_saved"]
     assert result["checks"]["projection"]["reason"] == "sdk_projection_not_reviewed"
+    assert not (output / "public-projection.txt").exists()
 
 
 def test_structure_summary_is_bounded_and_never_copies_unknown_names_or_values(tmp_path):
@@ -612,7 +648,7 @@ def test_replay_cannot_pass_acceptance_for_failed_source_capture(tmp_path):
     assert not result["acceptance_passed"]
 
 
-def test_news_diagnostic_replays_actual_sdk_and_production_path(tmp_path):
+def test_news_diagnostic_replays_fixed_parser_and_production_path(tmp_path):
     from tradingagents import news_diagnostic as diagnostic
 
     calls = []
@@ -693,16 +729,20 @@ def test_news_diagnostic_names_failure_stage_without_claiming_recovery(tmp_path,
 def _news_cli(monkeypatch, output, *, replay=None, mode=None):
     from scripts import diagnose_public_news as cli
 
-    # The task's outer worker already installed the real offline guard before
-    # application imports. Avoid stacking process-global guards across test cases.
-    monkeypatch.setattr(cli, "install", lambda *a, **k: ({}, []))
     args = ["diagnose_public_news.py", "--output", str(output),
             "--start", "2026-10-05", "--end", "2026-10-12"]
     args += ["--replay", str(replay)] if replay else ["--authorize-one-public-get-and-save"]
     if mode is not None:
         args += ["--acceptance-mode", mode]
-    monkeypatch.setattr(sys, "argv", args)
-    code = cli.main()
+    # Acceptance logic is a unit seam: control only this module's view of the
+    # runtime. Real interpreter flags/guard are tested in a separate subprocess.
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "sys", SimpleNamespace(
+            flags=SimpleNamespace(isolated=1, no_site=1), dont_write_bytecode=True,
+        ))
+        patch.setattr(cli, "install", lambda *a, **k: ({}, []))
+        patch.setattr(sys, "argv", args)
+        code = cli.main()
     return code, json.loads((output / "result.json").read_text(encoding="utf-8"))
 
 
