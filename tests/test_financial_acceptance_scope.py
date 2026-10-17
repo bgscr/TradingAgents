@@ -266,6 +266,17 @@ def test_cli_failure_writes_terminal_receipt_and_does_not_launch_reuse(tmp_path,
         return SimpleNamespace(returncode=1)
 
     monkeypatch.setattr(cli.subprocess, "run", failed_child)
+    # This test targets the receipt after startup validation. Model that CLI
+    # precondition locally without changing pytest's actual interpreter flags.
+    monkeypatch.setattr(
+        cli,
+        "sys",
+        SimpleNamespace(
+            flags=SimpleNamespace(isolated=True, no_site=True),
+            dont_write_bytecode=True,
+            executable=sys.executable,
+        ),
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -290,6 +301,43 @@ def test_cli_failure_writes_terminal_receipt_and_does_not_launch_reuse(tmp_path,
     assert result["failure"]["error_code"] == "acceptance_worker_exit"
     assert result["physical_requests"] == [None, None]
     assert len(calls) == 1
+    assert calls[0][:4] == [sys.executable, "-I", "-S", "-B"]
+    assert calls[0][-2:] == ["--worker", "synthetic"]
+
+
+@pytest.mark.parametrize(
+    ("isolated", "no_site", "dont_write_bytecode"),
+    [(False, True, True), (True, False, True), (True, True, False)],
+    ids=["missing-I", "missing-S", "missing-B"],
+)
+def test_cli_requires_each_isolated_startup_flag(
+    tmp_path, monkeypatch, capsys, isolated, no_site, dont_write_bytecode
+):
+    import sys
+    from types import SimpleNamespace
+
+    from scripts import accept_financial_statements as cli
+
+    output = tmp_path / "reservation"
+    monkeypatch.setattr(sys, "argv", [str(cli.__file__), "--output", str(output)])
+    monkeypatch.setattr(
+        cli,
+        "sys",
+        SimpleNamespace(
+            flags=SimpleNamespace(isolated=isolated, no_site=no_site),
+            dont_write_bytecode=dont_write_bytecode,
+        ),
+    )
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("invalid startup must not launch a worker")
+
+    monkeypatch.setattr(cli.subprocess, "run", unexpected_child)
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert stopped.value.code == 2
+    assert "use Python -I -S -B" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_network_gate_blocks_unplanned_hosts_and_restores_closed_state():
