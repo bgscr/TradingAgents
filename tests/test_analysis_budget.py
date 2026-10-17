@@ -143,6 +143,84 @@ def config(**overrides):
     }
 
 
+@pytest.mark.parametrize("enabled", [False, True], ids=["budget-off", "budget-on"])
+@pytest.mark.parametrize("cancel", [False, True], ids=["select", "cancel"])
+def test_cli_menu_announcements_contract(monkeypatch, enabled, cancel):
+    """Run the real menu and announcement renderer before any analysis starts."""
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    import cli.main as main
+    import cli.utils as utils
+
+    fetch_calls, network_calls, prompts = [], [], []
+    output = io.StringIO()
+
+    def offline_announcements():
+        fetch_calls.append("fetch")
+        return {"announcements": ["Synthetic startup notice"], "require_attention": False}
+
+    def unexpected_network(*args, **kwargs):
+        network_calls.append("request")
+        raise OfflineNetworkAttempt("menu must not make a real announcement request")
+
+    def ticker_prompt(message, **kwargs):
+        prompts.append("ticker")
+        assert message.startswith("Enter ticker symbol")
+        return SimpleNamespace(ask=lambda: None if cancel else "SPY")
+
+    def analyst_prompt(message, **kwargs):
+        prompts.append("analysts")
+        assert message == "Select Your [Analysts Team]:"
+        assert len(kwargs["choices"]) == 4
+        return SimpleNamespace(ask=lambda: [value for _, value in utils.ANALYST_ORDER])
+
+    monkeypatch.setattr(main, "fetch_announcements", offline_announcements)
+    monkeypatch.setattr(requests, "get", unexpected_network)
+    monkeypatch.setattr(main, "console", Console(file=output, color_system=None, width=160))
+    monkeypatch.setattr(utils.questionary, "text", ticker_prompt)
+    monkeypatch.setattr(utils.questionary, "checkbox", analyst_prompt)
+    monkeypatch.setattr(main.typer, "prompt", lambda *args, **kwargs: "2026-10-16")
+    monkeypatch.setattr(main, "_analysis_date_limit", lambda *_: (date(2026, 10, 17), "local"))
+    settings = {
+        "output_language": "Chinese", "max_debate_rounds": 1, "max_risk_discuss_rounds": 1,
+        "llm_provider": "deepseek", "backend_url": "https://api.deepseek.com",
+        "quick_think_llm": "deepseek-flash", "deep_think_llm": "deepseek-v4-pro",
+    }
+    monkeypatch.setattr(main, "DEFAULT_CONFIG", {
+        **main.DEFAULT_CONFIG, **settings, "analysis_budget_enabled": enabled,
+    })
+    for name in (
+        "TRADINGAGENTS_OUTPUT_LANGUAGE", "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+        "TRADINGAGENTS_MAX_RISK_ROUNDS", "TRADINGAGENTS_LLM_PROVIDER",
+        "TRADINGAGENTS_QUICK_THINK_LLM", "TRADINGAGENTS_DEEP_THINK_LLM",
+    ):
+        monkeypatch.setenv(name, "configured-by-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
+
+    if cancel:
+        with pytest.raises(SystemExit) as stopped:
+            main.get_user_selections()
+        assert stopped.value.code == 1
+        assert prompts == ["ticker"]
+    else:
+        selections = main.get_user_selections()
+        assert prompts == ["ticker", "analysts"]
+        assert selections["ticker"] == "SPY"
+        assert selections["analysis_date"] == "2026-10-16"
+        assert selections["output_language"] == "Chinese"
+        assert selections["research_depth"] == 1
+        assert selections["shallow_thinker"] == "deepseek-flash"
+        assert selections["deep_thinker"] == "deepseek-v4-pro"
+        assert [item.value for item in selections["analysts"]] == [
+            "market", "social", "news", "fundamentals",
+        ]
+    assert fetch_calls == ([] if enabled else ["fetch"])
+    assert network_calls == []
+    assert ("Synthetic startup notice" in output.getvalue()) is not enabled
+
+
 def model_client(module=httpx):
     client = module.Client(trust_env=False)
     client._tradingagents_budget_provider = "deepseek"

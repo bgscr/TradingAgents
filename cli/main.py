@@ -630,7 +630,11 @@ def get_user_selections():
     console.print()  # Add vertical space before announcements
 
     # Fetch and display announcements (silent on failure)
-    announcements = [] if DEFAULT_CONFIG.get("analysis_budget_enabled", False) else fetch_announcements()
+    announcements = (
+        {"announcements": [], "require_attention": False}
+        if DEFAULT_CONFIG.get("analysis_budget_enabled", False)
+        else fetch_announcements()
+    )
     display_announcements(console, announcements)
 
     # Create a boxed questionnaire for each step
