@@ -1,11 +1,15 @@
 """Offline physical-boundary tests; all responses and credentials are fixed fakes."""
 # ruff: noqa: SIM117 -- keep terminal exception scopes distinct from run scopes.
 
+import inspect
 import io
 import socket
+import ssl
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
+from importlib import import_module
+from importlib.util import find_spec
 
 import httpx
 import pytest
@@ -26,6 +30,105 @@ from tradingagents.dataflows.current_statement_cache import (
     StatementCacheScope,
 )
 
+HTTPX_FAMILIES = tuple(name for name in ("httpx", "httpx2") if find_spec(name) is not None)
+
+
+def httpx_families():
+    # Discover independently of the production compatibility helper.
+    return tuple(import_module(name) for name in HTTPX_FAMILIES)
+
+
+def clear_model_client_cache():
+    from langchain_openai.chat_models import _client_utils
+
+    _client_utils._cached_sync_httpx_client.cache_clear()
+    _client_utils._cached_async_httpx_client.cache_clear()
+
+
+class OfflineNetworkAttempt(BaseException):
+    """A missing fake must escape provider retry handlers before any network I/O."""
+
+
+class OfflineHTTPPool:
+    """Lifecycle-only pool; provider replies are installed on the real transport class."""
+
+    def __init__(self, retries):
+        self._retries = retries
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    async def aclose(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+
+
+def install_network_denial(monkeypatch):
+    def denied(*args, **kwargs):
+        raise OfflineNetworkAttempt("unmocked network operation")
+
+    async def async_denied(*args, **kwargs):
+        denied()
+
+    def fake_constructor(original):
+        signature = inspect.signature(original)
+
+        def initialize(transport, *args, **kwargs):
+            bound = signature.bind(transport, *args, **kwargs)
+            bound.apply_defaults()
+            transport._pool = OfflineHTTPPool(bound.arguments["retries"])
+
+        return initialize
+
+    def exit_pool(transport, *exc):
+        transport._pool.__exit__(*exc)
+
+    async def exit_async_pool(transport, *exc):
+        await transport._pool.__aexit__(*exc)
+
+    # Preserve exact HTTPTransport identity and retry configuration for admission.
+    # The fake wire needs no real TLS pool or native trust-store initialization.
+    for module in httpx_families():
+        for transport in (module.HTTPTransport, module.AsyncHTTPTransport):
+            monkeypatch.setattr(transport, "__init__", fake_constructor(transport.__init__))
+        monkeypatch.setattr(module.HTTPTransport, "handle_request", denied)
+        monkeypatch.setattr(module.AsyncHTTPTransport, "handle_async_request", async_denied)
+        monkeypatch.setattr(module.HTTPTransport, "__exit__", exit_pool)
+        monkeypatch.setattr(module.AsyncHTTPTransport, "__aexit__", exit_async_pool)
+
+    for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr"):
+        monkeypatch.setattr(socket, name, denied)
+    for owner in (socket.socket, ssl.SSLSocket):
+        for name in ("connect", "connect_ex", "send", "sendall", "sendto", "sendmsg", "write"):
+            if hasattr(owner, name):
+                monkeypatch.setattr(owner, name, denied)
+    from curl_cffi import AsyncCurl, Curl
+
+    monkeypatch.setattr(Curl, "perform", denied)
+    monkeypatch.setattr(AsyncCurl, "add_handle", denied)
+
+
+@pytest.fixture(autouse=True)
+def deny_unmocked_network(monkeypatch):
+    install_network_denial(monkeypatch)
+
+
+@pytest.fixture(params=HTTPX_FAMILIES)
+def http_module(request):
+    return import_module(request.param)
+
 
 def config(**overrides):
     return {
@@ -40,8 +143,8 @@ def config(**overrides):
     }
 
 
-def model_client():
-    client = httpx.Client(trust_env=False)
+def model_client(module=httpx):
+    client = module.Client(trust_env=False)
     client._tradingagents_budget_provider = "deepseek"
     return client
 
@@ -55,14 +158,15 @@ def data_get(url):
 def fake_httpx(monkeypatch, statuses=(200,)):
     calls = []
 
-    def send(_transport, request):
-        calls.append(request)
-        status = statuses[min(len(calls) - 1, len(statuses) - 1)]
-        return httpx.Response(status, request=request, headers={"retry-after-ms": "1"},
-                              json={"id": "fake", "choices": [{"index": 0, "message": {
-                                  "role": "assistant", "content": "fake"}, "finish_reason": "stop"}]})
+    for module in httpx_families():
+        def send(_transport, request, family=module):
+            calls.append(request)
+            status = statuses[min(len(calls) - 1, len(statuses) - 1)]
+            return family.Response(status, request=request, headers={"retry-after-ms": "1"},
+                                   json={"id": "fake", "choices": [{"index": 0, "message": {
+                                       "role": "assistant", "content": "fake"}, "finish_reason": "stop"}]})
 
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
+        monkeypatch.setattr(module.HTTPTransport, "handle_request", send)
     return calls
 
 
@@ -179,41 +283,44 @@ def test_deadline_timeout_is_clamped(monkeypatch):
     assert all(0 < value <= 2 for value in calls[0].extensions["timeout"].values())
 
 
-def test_async_actual_send_and_limit(monkeypatch):
+def test_async_actual_send_and_limit(monkeypatch, http_module):
     import sniffio
 
     calls = []
+    pools = []
 
     async def send(_transport, request):
         calls.append(request)
-        return httpx.Response(200, json={}, request=request)
+        return http_module.Response(200, json={}, request=request)
 
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", send)
-
-    async def close_fake_pool(*args):
-        # Fake handle_async_request never opens a pool connection. Avoid real
-        # loop cancellation machinery solely for this socket-free coroutine test.
-        pass
-
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "__aexit__", close_fake_pool)
+    monkeypatch.setattr(http_module.AsyncHTTPTransport, "handle_async_request", send)
 
     async def run():
-        async with httpx.AsyncClient(trust_env=False) as client:
+        async with http_module.AsyncClient(trust_env=False) as client:
+            pools.append(client._transport._pool)
             client._tradingagents_budget_provider = "deepseek"
-            with analysis_budget_scope(config(analysis_max_calls=1)):
-                await client.get("https://fake.invalid")
-                await client.get("https://fake.invalid")
+            scope = analysis_budget_scope(config(analysis_max_calls=1))
+            budget = scope.__enter__()
+            try:
+                assert (await client.get("https://fake.invalid")).status_code == 200
+                assert budget.receipt()["model_attempts"] == len(calls) == 1
+                with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+                    await client.get("https://fake.invalid")
+            finally:
+                with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+                    scope.__exit__(None, None, None)
 
     # Fake async transport completes inline: no real Windows socketpair/loop.
     coroutine = run()
     token = sniffio.current_async_library_cvar.set("asyncio")
     try:
-        with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+        with pytest.raises(StopIteration):
             coroutine.send(None)
     finally:
         coroutine.close()
         sniffio.current_async_library_cvar.reset(token)
     assert len(calls) == 1
+    assert len(pools) == 1 and pools[0].closed
 
 
 @pytest.mark.parametrize("kind", ["httpx", "native", "socket", "vendor", "adapter"])
@@ -242,14 +349,14 @@ def test_uncovered_transports_stop_before_send(kind):
                     session.get("https://fake.invalid")
 
 
-def test_disabled_retains_unlimited_transport_and_restores_hooks(monkeypatch):
+def test_disabled_retains_unlimited_transport_and_restores_hooks(monkeypatch, http_module):
     calls = fake_httpx(monkeypatch)
-    original = httpx.Client._send_single_request
-    with analysis_budget_scope({}) as budget, model_client() as client:
+    original = http_module.Client._send_single_request
+    with analysis_budget_scope({}) as budget, model_client(http_module) as client:
         for _ in range(5):
             client.get("https://fake.invalid")
     assert budget is None and len(calls) == 5
-    assert original is httpx.Client._send_single_request
+    assert original is http_module.Client._send_single_request
 
 
 @pytest.mark.parametrize("overrides", [
@@ -348,18 +455,137 @@ def test_deepseek_factory_client_is_instrumented(monkeypatch):
     from tradingagents.llm_clients.openai_client import OpenAIClient
 
     calls = fake_httpx(monkeypatch)
+    clear_model_client_cache()
     # A fixed synthetic mapping, never the caller's environment.
     monkeypatch.setattr(os, "environ", {"DEEPSEEK_API_KEY": "test", "NO_PROXY": "*"})
     llm = OpenAIClient("deepseek-chat", provider="deepseek", max_retries=0).get_llm()
     try:
         with authoritative_snapshot_run() as snapshot:
-            with pytest.raises(AnalysisBudgetStopped), analysis_budget_scope(config(analysis_max_calls=1)):
+            scope = analysis_budget_scope(config(analysis_max_calls=1))
+            budget = scope.__enter__()
+            try:
                 assert llm.invoke("fake").content == "fake"
-                llm.invoke("fake")
+                assert len(calls) == budget.receipt()["model_attempts"] == 1
+                with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+                    llm.invoke("fake")
+            finally:
+                with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+                    scope.__exit__(None, None, None)
         assert snapshot.telemetry_ledger.finalize().model_transport.summary.physical_attempts == 1
+        assert budget.receipt()["stop_reason"] == "call_limit_exceeded"
     finally:
         llm.root_client.close()
+        clear_model_client_cache()
     assert len(calls) == 1
+
+
+def test_sync_family_limit_timeout_and_hook_restoration(monkeypatch, http_module):
+    calls = fake_httpx(monkeypatch)
+    original_sync = http_module.Client._send_single_request
+    original_async = http_module.AsyncClient._send_single_request
+    scope = analysis_budget_scope(config(analysis_max_calls=1, analysis_timeout_seconds=2))
+    budget = scope.__enter__()
+    try:
+        with model_client(http_module) as client:
+            assert client.get("https://fake.invalid", timeout=100).status_code == 200
+            assert budget.receipt()["model_attempts"] == len(calls) == 1
+            with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+                client.get("https://fake.invalid")
+    finally:
+        with pytest.raises(AnalysisBudgetStopped, match="call_limit_exceeded"):
+            scope.__exit__(None, None, None)
+    assert budget.receipt()["model_attempts"] == len(calls) == 1
+    assert all(0 < value <= 2 for value in calls[0].extensions["timeout"].values())
+    assert http_module.Client._send_single_request is original_sync
+    assert http_module.AsyncClient._send_single_request is original_async
+    with pytest.raises(AnalysisBudgetStopped, match="uncovered_httpx_transport"):
+        with analysis_budget_scope(config()):
+            with http_module.Client(transport=http_module.HTTPTransport(retries=1), trust_env=False) as retry_client:
+                retry_client._tradingagents_budget_provider = "deepseek"
+                retry_client.get("https://fake.invalid")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_missing_http_fake_is_denied_before_dns(enabled, http_module):
+    with analysis_budget_scope(config(analysis_budget_enabled=enabled)), model_client(http_module) as client:
+        with pytest.raises(OfflineNetworkAttempt, match="unmocked network"):
+            client.get("https://fake.invalid")
+
+
+def test_transport_exception_families(http_module):
+    from tradingagents.llm_clients.openai_client import _transport_exception_family
+
+    for exception, expected in (
+        (http_module.RemoteProtocolError("synthetic"), "remote_protocol"),
+        (http_module.ReadTimeout("synthetic"), "timeout"),
+        (http_module.ConnectError("synthetic"), "connection"),
+        (http_module.ReadError("synthetic"), "transport"),
+        (ValueError("synthetic"), "client"),
+    ):
+        assert _transport_exception_family(exception) == expected
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_factory_async_client_records_exact_physical_attempt(monkeypatch, enabled):
+    import inspect
+    import os
+
+    import sniffio
+
+    from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
+    from tradingagents.llm_clients.openai_client import OpenAIClient
+
+    calls = []
+
+    for module in httpx_families():
+        async def send(_transport, request, family=module):
+            calls.append(request)
+            return family.Response(200, json={"synthetic": True}, request=request)
+
+        monkeypatch.setattr(module.AsyncHTTPTransport, "handle_async_request", send)
+    monkeypatch.setattr(os, "environ", {"DEEPSEEK_API_KEY": "test", "NO_PROXY": "*"})
+    clear_model_client_cache()
+    llm = OpenAIClient("deepseek-chat", provider="deepseek", max_retries=0).get_llm()
+
+    async def run():
+        try:
+            client = llm.root_async_client._client
+            assert inspect.iscoroutinefunction(client.send)
+            assert all(inspect.iscoroutinefunction(hook) for hook in client.event_hooks["response"])
+            with authoritative_snapshot_run() as snapshot:
+                activation = llm._activate_model_transport_call()
+                assert activation is not None
+                try:
+                    with analysis_budget_scope(config(analysis_budget_enabled=enabled)) as budget:
+                        response = await client.post("https://fake.invalid")
+                        assert response.status_code == 200
+                finally:
+                    llm._deactivate_model_transport_call(activation)
+            assert snapshot.telemetry_ledger.finalize().model_transport.summary.physical_attempts == 1
+            assert len(calls) == 1
+            if enabled:
+                assert budget.receipt()["model_attempts"] == 1
+            else:
+                assert budget is None
+        finally:
+            await llm.root_async_client.close()
+            assert client.is_closed and client._transport._pool.closed
+
+    coroutine = run()
+    token = sniffio.current_async_library_cvar.set("asyncio")
+    try:
+        with pytest.raises(StopIteration):
+            coroutine.send(None)
+    finally:
+        try:
+            coroutine.close()
+        finally:
+            sniffio.current_async_library_cvar.reset(token)
+            try:
+                llm.root_client.close()
+            finally:
+                clear_model_client_cache()
 
 
 def test_explicit_financial_https_stops_before_second_post(monkeypatch):

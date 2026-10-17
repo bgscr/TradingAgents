@@ -13,7 +13,11 @@ from langchain_openai import ChatOpenAI
 from openai import DEFAULT_MAX_RETRIES
 from pydantic import PrivateAttr
 
-from tradingagents.analysis_budget import active_budget, transport_is_admitted
+from tradingagents.analysis_budget import (
+    active_budget,
+    httpx_transport_modules,
+    transport_is_admitted,
+)
 from tradingagents.run_telemetry import ModelTransportAttempt, RunTelemetryLedger
 
 from .api_key_env import get_api_key_env
@@ -76,14 +80,15 @@ def _retry_index(request: httpx.Request) -> int | None:
 
 
 def _transport_exception_family(exc: Exception) -> str:
-    if isinstance(exc, httpx.RemoteProtocolError):
-        return "remote_protocol"
-    if isinstance(exc, httpx.TimeoutException):
-        return "timeout"
-    if isinstance(exc, httpx.ConnectError):
-        return "connection"
-    if isinstance(exc, httpx.TransportError):
-        return "transport"
+    for module in httpx_transport_modules():
+        if isinstance(exc, module.RemoteProtocolError):
+            return "remote_protocol"
+        if isinstance(exc, module.TimeoutException):
+            return "timeout"
+        if isinstance(exc, module.ConnectError):
+            return "connection"
+        if isinstance(exc, module.TransportError):
+            return "transport"
     return "client"
 
 
@@ -282,7 +287,7 @@ def _instrument_http_client(client: httpx.Client | httpx.AsyncClient) -> None:
 
     if getattr(client, _OBSERVED_CLIENT_ATTRIBUTE, False):
         return
-    if isinstance(client, httpx.AsyncClient):
+    if isinstance(client, tuple(module.AsyncClient for module in httpx_transport_modules())):
         client.event_hooks["response"].append(_capture_async_response_metadata)
         original_send = client.send
 

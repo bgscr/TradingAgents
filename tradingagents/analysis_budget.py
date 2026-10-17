@@ -103,6 +103,19 @@ def transport_is_admitted() -> bool:
     return _IN_TRANSPORT.get()
 
 
+def httpx_transport_modules() -> tuple:
+    """Return the distinct HTTPX families supported at the physical boundary."""
+    import httpx
+
+    try:
+        import httpx2
+    except ModuleNotFoundError as exc:
+        if exc.name != "httpx2":
+            raise
+        return (httpx,)
+    return (httpx, httpx2)
+
+
 def require_data_vendor(vendor: str) -> None:
     budget = active_budget()
     if budget is not None:
@@ -143,12 +156,9 @@ def _transport_guards():
     from contextlib import ExitStack
     from unittest.mock import patch
 
-    import httpx
     import requests.adapters
 
     original_requests = requests.adapters.HTTPAdapter.send
-    original_sync = httpx.Client._send_single_request
-    original_async = httpx.AsyncClient._send_single_request
     original_sleep = time.sleep
     original_async_sleep = asyncio.sleep
     try:
@@ -193,33 +203,41 @@ def _transport_guards():
             for key in ("connect", "read", "write", "pool")
         }
 
-    def sync_send(client, request):
-        from tradingagents.llm_clients.openai_client import _record_sync_transport_send
+    def httpx_sends(module):
+        # Bind each family separately; a hook must never call the other
+        # family's original method or accept its transport types by accident.
+        original_sync = module.Client._send_single_request
+        original_async = module.AsyncClient._send_single_request
 
-        check_httpx(client, request, httpx.HTTPTransport)
-        with admitted_transport("model") as remaining:
-            set_httpx_timeout(request, remaining)
+        def sync_send(client, request):
+            from tradingagents.llm_clients.openai_client import _record_sync_transport_send
 
-            def send_and_read(req):
-                response = original_sync(client, req)
-                response.read()
-                return response
+            check_httpx(client, request, module.HTTPTransport)
+            with admitted_transport("model") as remaining:
+                set_httpx_timeout(request, remaining)
 
-            return _record_sync_transport_send(send_and_read, request)
+                def send_and_read(req):
+                    response = original_sync(client, req)
+                    response.read()
+                    return response
 
-    async def async_send(client, request):
-        from tradingagents.llm_clients.openai_client import _record_async_transport_send
+                return _record_sync_transport_send(send_and_read, request)
 
-        check_httpx(client, request, httpx.AsyncHTTPTransport)
-        with admitted_transport("model") as remaining:
-            set_httpx_timeout(request, remaining)
+        async def async_send(client, request):
+            from tradingagents.llm_clients.openai_client import _record_async_transport_send
 
-            async def send_and_read(req):
-                response = await original_async(client, req)
-                await response.aread()
-                return response
+            check_httpx(client, request, module.AsyncHTTPTransport)
+            with admitted_transport("model") as remaining:
+                set_httpx_timeout(request, remaining)
 
-            return await _record_async_transport_send(send_and_read, request)
+                async def send_and_read(req):
+                    response = await original_async(client, req)
+                    await response.aread()
+                    return response
+
+                return await _record_async_transport_send(send_and_read, request)
+
+        return sync_send, async_send
 
     def guarded_socket(original):
         def call(sock, *args, **kwargs):
@@ -244,8 +262,10 @@ def _transport_guards():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(requests.adapters.HTTPAdapter, "send", requests_send))
-        stack.enter_context(patch.object(httpx.Client, "_send_single_request", sync_send))
-        stack.enter_context(patch.object(httpx.AsyncClient, "_send_single_request", async_send))
+        for module in httpx_transport_modules():
+            sync_send, async_send = httpx_sends(module)
+            stack.enter_context(patch.object(module.Client, "_send_single_request", sync_send))
+            stack.enter_context(patch.object(module.AsyncClient, "_send_single_request", async_send))
         stack.enter_context(patch.object(time, "sleep", bounded_sleep))
         stack.enter_context(patch.object(asyncio, "sleep", bounded_async_sleep))
         for cls in (socket.socket, ssl.SSLSocket):

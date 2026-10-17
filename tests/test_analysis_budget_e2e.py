@@ -21,10 +21,10 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-import httpx
 import pytest
 from urllib3.response import HTTPResponse
 
+from tests.test_analysis_budget import httpx_families, install_network_denial
 from tests.test_current_tushare_statements import (
     TOOLS,
     dispatcher,
@@ -111,7 +111,7 @@ class FakeWire:
         reply = self.urllib3(SimpleNamespace(host=urlsplit(url).hostname), method, url)
         return SimpleNamespace(text=reply.data.decode(), status_code=200)
 
-    def httpx(self, _transport, request):
+    def httpx(self, _transport, request, module):
         assert request.url.host == "api.deepseek.com"
         body = json.loads(request.content)
         assert body["model"] in MODELS
@@ -177,7 +177,7 @@ class FakeWire:
             else:
                 message["content"] = "Synthetic news draft for required finalization."
         self.phases[phase] += 1
-        return httpx.Response(200, request=request, json={
+        return module.Response(200, request=request, json={
             "id": "synthetic-completion", "object": "chat.completion", "created": 1,
             "model": body["model"], "choices": [{"index": 0, "message": message,
                 "finish_reason": "tool_calls" if "tool_calls" in message else "stop"}],
@@ -238,6 +238,7 @@ class FakeWire:
 
 
 def prepare(tmp_path, monkeypatch, *, enabled=True, cache_only=True, cache_damage=None):
+    install_network_denial(monkeypatch)
     from curl_cffi import requests as curl_requests
     from urllib3.connectionpool import HTTPConnectionPool
 
@@ -257,12 +258,13 @@ def prepare(tmp_path, monkeypatch, *, enabled=True, cache_only=True, cache_damag
     settings["market_data_vendors"]["cn_a"] = dict.fromkeys(
         ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data"), "akshare"
     )
-    # Supply only fixed synthetic keys, preserving the harness's cleared mapping.
-    monkeypatch.setattr(os, "environ", {**dict(os.environ), "DEEPSEEK_API_KEY": "synthetic",
-                                        "TUSHARE_TOKEN": "synthetic", "NO_PROXY": "*"})
+    # Supply only fixed synthetic keys; never copy the caller's environment.
+    monkeypatch.setattr(os, "environ", {"DEEPSEEK_API_KEY": "synthetic", "TUSHARE_TOKEN": "synthetic",
+                                        "NO_PROXY": "*", "PYTHON_DOTENV_DISABLED": "1"})
     wire = FakeWire()
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request",
-                        lambda transport, request: wire.httpx(transport, request))
+    for module in httpx_families():
+        monkeypatch.setattr(module.HTTPTransport, "handle_request",
+                            lambda transport, request, family=module: wire.httpx(transport, request, family))
     monkeypatch.setattr(HTTPConnectionPool, "urlopen",
                         lambda pool, method, url, **kwargs: wire.urllib3(pool, method, url, **kwargs))
     monkeypatch.setattr(curl_requests.Session, "request",
@@ -397,11 +399,12 @@ def test_complete_graph_budget_stops_following_physical_sends(tmp_path, monkeypa
     wire.expire_on_model = stop == "deadline"
     graph = TradingAgentsGraph(config=settings, instrument_symbol=SYMBOL)
     try:
-        with pytest.raises(AnalysisBudgetStopped):
+        expected_reason = "call_limit_exceeded" if stop == "count" else "deadline_exceeded"
+        with pytest.raises(AnalysisBudgetStopped, match=expected_reason):
             graph.propagate(SYMBOL, AS_OF.isoformat())
         receipt = graph.last_analysis_budget
         assert receipt["admitted_attempts"] == len(wire.model_calls) + len(wire.data_calls) == 2
-        assert receipt["stop_reason"] == ("call_limit_exceeded" if stop == "count" else "deadline_exceeded")
+        assert receipt["stop_reason"] == expected_reason
         assert wire.phases["research_plan"] == 0
         _assert_cache_unchanged(path, before)
     finally:

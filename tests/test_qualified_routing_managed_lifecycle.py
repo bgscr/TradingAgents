@@ -1020,6 +1020,7 @@ def _graph_host(
             return Workflow()
 
     host = SimpleNamespace(
+        config={},
         _managed_qualified_routing_composition=composition,
         asset_configuration=binding.asset_configuration,
         capability_routing_plan=binding.routing_plan,
