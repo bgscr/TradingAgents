@@ -41,7 +41,7 @@ class DeniedAccess(RuntimeError):
     pass
 
 
-def install(root, source, *, offline=True):
+def install(root, source, *, offline=True, network_guard=None):
     if not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
         raise RuntimeError("diagnostics require -I -S -B")
     root, source = Path(root).resolve(), Path(source).resolve()
@@ -114,12 +114,12 @@ def install(root, source, *, offline=True):
         if event in {"subprocess.Popen", "os.system", "os.posix_spawn"}:
             counts["subprocess"] += 1
             raise DeniedAccess("worker subprocess prohibited")
-        if offline and event in {
-            "socket.connect",
-            "socket.getaddrinfo",
-            "socket.bind",
-            "socket.sendto",
-        }:
+        network_event = (
+            event.startswith("socket.") and event != "socket.__new__"
+        ) or event in {"http.client.connect", "http.client.send"}
+        if network_event and (
+            offline or (network_guard is not None and not network_guard.allows(event, args))
+        ):
             counts["network"] += 1
             frame = sys._getframe(1)
             blocked_network.append(
@@ -129,7 +129,7 @@ def install(root, source, *, offline=True):
                     "function": frame.f_code.co_name,
                 }
             )
-            raise DeniedAccess("offline network prohibited")
+            raise DeniedAccess("unplanned diagnostic network prohibited")
         if event == "ctypes.dlopen" and Path(str(args[0])).stem.casefold() in {
             "kernel32",
             "advapi32",
@@ -173,7 +173,7 @@ def install(root, source, *, offline=True):
             write(args[1])
 
     sys.addaudithook(audit)
-    if offline:
+    if offline or network_guard is not None:
         # curl_cffi's native transport does not emit Python socket audit events.
         # Seal that path before application/AKShare imports.
         from curl_cffi import requests as curl_requests

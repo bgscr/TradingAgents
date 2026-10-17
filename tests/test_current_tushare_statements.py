@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -27,7 +28,11 @@ TOOLS = {
 
 def runtime_config(tmp_path):
     config = copy.deepcopy(DEFAULT_CONFIG)
+    authority = Path(__file__).resolve().parents[1] / "config"
     config.update(
+        instrument_identity_registry_path=str(authority / "instrument_identity_registry.json"),
+        instrument_identity_registry_sha256=(authority / "instrument_identity_registry.sha256")
+        .read_text(encoding="ascii").split()[0],
         market_history_mode="current",
         data_usage_mode="personal_research",
         mainland_capability_routing_mode="legacy",

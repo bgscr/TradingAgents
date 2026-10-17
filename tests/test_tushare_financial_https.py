@@ -51,7 +51,9 @@ def fake_connection(
     monkeypatch.setattr(
         transport.ssl, "create_default_context", lambda **_: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     )
-    monkeypatch.setenv("TUSHARE_TOKEN", "synthetic-test-token")
+    getenv = transport.os.getenv
+    monkeypatch.setattr(transport.os, "getenv", lambda key, default=None:
+                        "synthetic-test-token" if key == "TUSHARE_TOKEN" else getenv(key, default))
     return calls
 
 
@@ -142,7 +144,7 @@ def test_timeout_retains_its_type_and_cannot_retry(monkeypatch):
 @pytest.mark.parametrize(
     "payload,outcome",
     [
-        ({"code": 2002, "msg": "synthetic 权限不足"}, PhysicalAttemptOutcome.PERMISSION_DENIED),
+        ({"code": 2002, "msg": "synthetic 权限不足"}, PhysicalAttemptOutcome.PROVIDER_ERROR),
         ({"code": -1, "msg": "synthetic 每分钟"}, PhysicalAttemptOutcome.RATE_LIMITED),
         (
             {"code": 0, "data": {"fields": ["same", "same"], "items": [[1, 2]]}},

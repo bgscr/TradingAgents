@@ -8,6 +8,7 @@ import math
 import os
 import re
 import ssl
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -54,10 +55,13 @@ def create_client(destination):
 
 
 class _Client:
-    def __init__(self, destination, token, *, before_request=None):
+    def __init__(self, destination, token, *, before_request=None, exchange_guard=None,
+                 failure_metadata=None):
         self._destination = destination
         self._token = token
         self._before_request = before_request
+        self._exchange_guard = exchange_guard
+        self._failure_metadata = failure_metadata
 
     def query(self, endpoint, **params):
         if (
@@ -83,7 +87,11 @@ class _Client:
         ).encode()
         connection = None
         failure, retry_after, status = None, None, None
+        error_code = None
+        provider_code = None
+        classification_basis = "transport"
         frame = None
+        permission = ExitStack()
         try:
             context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -92,6 +100,8 @@ class _Client:
             connection = http.client.HTTPSConnection(host, timeout=30, context=context)
             if self._before_request is not None:
                 self._before_request(endpoint)
+            if self._exchange_guard is not None:
+                permission.enter_context(self._exchange_guard(connection, endpoint))
             connection.request(
                 "POST",
                 path,
@@ -100,6 +110,7 @@ class _Client:
             )
             response = connection.getresponse()
             status = response.status
+            classification_basis = "http_status"
             if status == 429:
                 failure = PhysicalAttemptOutcome.RATE_LIMITED
                 retry_after = _retry_after_seconds(response.getheader("Retry-After", ""))
@@ -112,25 +123,34 @@ class _Client:
             elif status != 200:
                 failure = PhysicalAttemptOutcome.PROVIDER_ERROR
             else:
+                classification_basis = "response_schema"
                 content = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(content) > MAX_RESPONSE_BYTES:
                     raise ValueError("oversized response")
                 decoded = json.loads(content)
-                if type(decoded) is not dict or type(decoded.get("code")) is not int:
+                if (type(decoded) is not dict or type(decoded.get("code")) is not int
+                        or not -(2 ** 31) <= decoded["code"] < 2 ** 31):
                     raise ValueError("invalid response")
-                if decoded["code"] != 0:
-                    message = str(decoded.get("msg", "")).casefold()
+                provider_code = decoded["code"]
+                if provider_code != 0:
+                    # No provider-code mapping has been qualified for this route.
+                    # Message hints never establish that the supplied token is invalid.
+                    classification_basis = "provider_code_unmapped"
+                    failure = PhysicalAttemptOutcome.PROVIDER_ERROR
+                    error_code = "financial_https_upstream_rejection"
+                    message = decoded.get("msg")
+                    message = message.casefold() if isinstance(message, str) else ""
                     if any(
                         term in message
                         for term in ("rate limit", "too many requests", "频次", "每分钟")
                     ):
                         failure = PhysicalAttemptOutcome.RATE_LIMITED
+                        error_code = "financial_https_rate_limited"
+                        classification_basis = "message_heuristic_rate_limit"
                     elif any(term in message for term in ("权限", "积分", "permission")):
-                        failure = PhysicalAttemptOutcome.PERMISSION_DENIED
+                        classification_basis = "message_heuristic_permission"
                     elif any(term in message for term in ("token", "认证", "authentication")):
-                        failure = PhysicalAttemptOutcome.AUTHENTICATION
-                    else:
-                        failure = PhysicalAttemptOutcome.PROVIDER_ERROR
+                        classification_basis = "message_heuristic_authentication"
                 else:
                     data = decoded.get("data")
                     if (
@@ -149,10 +169,16 @@ class _Client:
                     # Object dtype avoids implicit optional Arrow inference in
                     # pandas 3 and retains original provider scalar values.
                     frame = pd.DataFrame(data["items"], columns=data["fields"], dtype=object)
+        except KeyboardInterrupt:
+            failure = PhysicalAttemptOutcome.PROVIDER_ERROR
+            error_code = "financial_https_interrupted"
+            classification_basis = "transport"
         except TimeoutError:
             failure = PhysicalAttemptOutcome.TIMEOUT
+            classification_basis = "transport"
         except (http.client.RemoteDisconnected, ConnectionError):
             failure = PhysicalAttemptOutcome.DISCONNECT
+            classification_basis = "transport"
         except (ValueError, TypeError, KeyError, UnicodeError):
             failure = PhysicalAttemptOutcome.MALFORMED_RESPONSE
         except Exception:
@@ -164,8 +190,14 @@ class _Client:
                 except Exception:
                     if failure is None:
                         failure = PhysicalAttemptOutcome.DISCONNECT
+                        classification_basis = "transport"
+            permission.close()
         if failure is not None:
             # No raw exception or response text crosses this boundary.
+            if self._failure_metadata is not None:
+                self._failure_metadata.update(
+                    provider_code=provider_code, classification_basis=classification_basis
+                )
             raise PhysicalAttemptFailure(
                 outcome=failure,
                 retryable=False,
@@ -175,6 +207,6 @@ class _Client:
                     if failure is PhysicalAttemptOutcome.RATE_LIMITED
                     else None
                 ),
-                error_code="financial_https_" + failure.value,
+                error_code=error_code or "financial_https_" + failure.value,
             )
         return frame

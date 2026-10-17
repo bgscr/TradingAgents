@@ -56,6 +56,7 @@ def test_three_statement_acceptance_stops_at_first_http_failure(
     monkeypatch.setattr(transport.http.client, "HTTPSConnection", Connection)
     result = acceptance.acquire(
         tmp_path,
+        ticker="600895.SH",
         destination="https://api.tushare.pro",
         account="synthetic",
         as_of="2026-10-15",
@@ -65,6 +66,15 @@ def test_three_statement_acceptance_stops_at_first_http_failure(
     assert result["status"] == "stopped"
     assert result["physical_requests"] == failure_at
     assert len(result["completed_tools"]) == failure_at - 1
+    expected = {"redirect": "financial_https_provider_error",
+                "rate_limit": "financial_https_rate_limited",
+                "permission": "financial_https_permission_denied",
+                "timeout": "financial_https_timeout",
+                "malformed": "financial_https_malformed_response",
+                "empty": "current_financial_no_eligible_periods"}[failure]
+    assert result["failure"]["error_code"] == expected
+    assert not result["failure"]["retryable"]
+    assert "synthetic-only" not in json.dumps(result)
 
 
 @pytest.mark.parametrize(
@@ -104,6 +114,7 @@ def test_acceptance_three_physical_posts_and_offline_views(tmp_path, monkeypatch
     monkeypatch.setattr(transport.http.client, "HTTPSConnection", Connection)
     result = acceptance.acquire(
         tmp_path,
+        ticker="600895.SH",
         destination=destination,
         account="synthetic",
         as_of="2026-10-15",
@@ -113,7 +124,7 @@ def test_acceptance_three_physical_posts_and_offline_views(tmp_path, monkeypatch
     assert result["physical_requests"] == 3
     assert [call[3] for call in calls] == ["balancesheet", "income", "cashflow"]
     replay = acceptance.reuse(
-        tmp_path, destination=destination, account="synthetic", as_of="2026-10-15"
+        tmp_path, ticker="600895.SH", destination=destination, account="synthetic", as_of="2026-10-15"
     )
     assert replay["status"] == "reused"
     assert replay["views"] == result["views"]

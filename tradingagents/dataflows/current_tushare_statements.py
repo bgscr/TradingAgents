@@ -29,11 +29,13 @@ from tradingagents.dataflows.current_statement_cache import (
 )
 from tradingagents.dataflows.financial_contracts import (
     FinancialCapability,
+    FinancialCompanyType,
     FinancialConsolidationScope,
     FinancialPeriodDisposition,
     FinancialProviderCandidate,
     assess_financial_period_candidate,
     financial_revision_selection_key,
+    financial_statement_field_declaration,
     order_financial_provider_revisions,
 )
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestInstrumentIdentity
@@ -96,6 +98,7 @@ class CurrentTushareStatements:
         self._sleep = sleeper or time.sleep
         self._responses = {}
         binding = {
+            "presentation": "current-statement-applicability-v2",
             "normalizer": NORMALIZER_VERSION,
             "endpoint": self._config["tushare_financial_https_endpoint"],
             "account": self._config["tushare_account_scope_label"],
@@ -158,7 +161,7 @@ class CurrentTushareStatements:
                 fetch=lambda lo, hi: self._fetch(scope, lo, hi),
             )
         result = self._responses[memo_key]
-        candidates, rejected = [], 0
+        candidates, rejected, unsupported = [], 0, 0
         for chunk in result.chunks:
             payload = decode_provider_artifact(chunk.payload, endpoint_id=endpoint)
             # A refreshed subinterval can split an older response. Project only
@@ -189,6 +192,12 @@ class CurrentTushareStatements:
             )
             rejected += len(row_rejections)
             for candidate in annual if request.frequency.value == "annual" else reporting:
+                if candidate.period_identity.company_type not in {
+                    FinancialCompanyType.BANK, FinancialCompanyType.INDUSTRIAL_NON_BANK
+                }:
+                    unsupported += 1
+                    rejected += 1
+                    continue
                 if candidate.period_identity.period_end > request.as_of_date or (
                     candidate.filing_metadata.f_ann_date is not None
                     and candidate.filing_metadata.f_ann_date > request.as_of_date
@@ -247,7 +256,13 @@ class CurrentTushareStatements:
             if result.failure is not None:
                 _raise_acquisition_failure(result.failure)
             raise AcquisitionFailure(
-                reason=AcquisitionUnavailableReason.EMPTY_FRAME, retryable=False
+                reason=AcquisitionUnavailableReason.EMPTY_FRAME,
+                error_code=(
+                    "current_financial_unsupported_company_type" if unsupported
+                    else "current_financial_ineligible_rows" if rejected
+                    else "current_financial_no_eligible_periods"
+                ),
+                retryable=False,
             )
         return _render(self._identity.symbol, request, selected, result, rejected)
 
@@ -387,6 +402,16 @@ def _render(symbol, request, selected, result, rejected):
     buffer.write(f"# {titles[request.tool_name]} data for {symbol} ({request.frequency.value})\n")
     buffer.write(f"# Data retrieved on: {latest}\n")
     buffer.write("# CURRENT-only; source=tushare; not strict PIT evidence.\n")
+    company_types = {item.period_identity.company_type for item in selected}
+    buffer.write("# company_types=" + ",".join(sorted(t.value for t in company_types)) + "\n")
+    buffer.write("# value_status=reported includes true zero; missing has no numeric value.\n")
+    if FinancialCompanyType.BANK in company_types:
+        buffer.write(
+            "# bank_not_applicable_metrics=gross_margin,current_ratio,quick_ratio,inventory_turnover\n"
+        )
+        buffer.write(
+            "# bank_unavailable_metrics=net_interest_margin,nonperforming_loan_ratio,capital_adequacy_ratio,provision_coverage_ratio; require separate source, never infer zero.\n"
+        )
     buffer.write(
         "# Query coverage is an announcement window, not complete report-period coverage.\n"
     )
@@ -423,9 +448,8 @@ def _render(symbol, request, selected, result, rejected):
             )
             + "\n"
         )
-    writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(
-        [
+    writer = csv.DictWriter(
+        buffer, lineterminator="\n", fieldnames=[
             "period_end",
             "ann_date",
             "f_ann_date",
@@ -438,24 +462,35 @@ def _render(symbol, request, selected, result, rejected):
             "value",
             "unit",
             "artifact_identity",
+            "value_status",
         ]
     )
+    writer.writeheader()
     for item in selected:
+        provenance = {
+            "period_end": item.period_identity.period_end,
+            "ann_date": item.filing_metadata.ann_date,
+            "f_ann_date": item.filing_metadata.f_ann_date,
+            "retrieved_at": item.artifact.retrieved_at.isoformat(),
+            "observed_at": item.artifact.observed_at.isoformat(),
+            "artifact_identity": item.artifact.artifact_identity,
+        }
         for field in item.fields:
             writer.writerow(
-                [
-                    item.period_identity.period_end,
-                    item.filing_metadata.ann_date,
-                    item.filing_metadata.f_ann_date,
-                    item.artifact.retrieved_at.isoformat(),
-                    item.artifact.observed_at.isoformat(),
-                    field.provider_field,
-                    field.original_value,
-                    field.original_unit,
-                    field.normalized_field,
-                    field.normalized_value,
-                    field.normalized_unit,
-                    item.artifact.artifact_identity,
-                ]
+                {**provenance,
+                 "provider_field": field.provider_field,
+                 "original_value": field.original_value,
+                 "original_unit": field.original_unit,
+                 "field": field.normalized_field,
+                 "value": field.normalized_value,
+                 "unit": field.normalized_unit,
+                 "value_status": "reported"}
             )
+        declared = financial_statement_field_declaration(
+            item.period_identity.company_type, request.statement_type,
+            declaration_version="financial-field-declarations-tushare-v2",
+        )
+        missing = set(declared.core_fields) - {field.normalized_field for field in item.fields}
+        for name in sorted(missing):
+            writer.writerow({**provenance, "field": name, "value_status": "missing"})
     return buffer.getvalue()
