@@ -630,7 +630,7 @@ def get_user_selections():
     console.print()  # Add vertical space before announcements
 
     # Fetch and display announcements (silent on failure)
-    announcements = fetch_announcements()
+    announcements = [] if DEFAULT_CONFIG.get("analysis_budget_enabled", False) else fetch_announcements()
     display_announcements(console, announcements)
 
     # Create a boxed questionnaire for each step
@@ -1342,6 +1342,9 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     # the flag preserves TRADINGAGENTS_CHECKPOINT_ENABLED / the default (#976).
     if checkpoint is not None:
         config["checkpoint_enabled"] = checkpoint
+    from tradingagents.analysis_budget import validate_budget_config
+
+    validate_budget_config(config)
     return config
 
 
@@ -1538,6 +1541,9 @@ def _update_run_status(artifacts: dict, **updates) -> None:
     if updates.get("status") is not None:
         updates.setdefault("lifecycle_status", updates["status"])
     payload.update(updates)
+    budget = artifacts.get("analysis_budget")
+    if budget is not None:
+        payload["analysis_budget"] = budget.receipt()
     payload["updated_at"] = _now_iso()
     if updates.get("status") == "completed":
         payload["completed_at"] = payload["updated_at"]
@@ -2557,6 +2563,11 @@ def run_analysis(
     snapshot_scope = ExitStack()
     primary_failure: BaseException | None = None
     try:
+        from tradingagents.analysis_budget import analysis_budget_scope
+
+        budget = snapshot_scope.enter_context(analysis_budget_scope(config))
+        if budget is not None:
+            artifacts["analysis_budget"] = budget
         run_asset = getattr(graph, "asset_configuration", None)
         snapshot_context = (
             authoritative_snapshot_run()
@@ -2679,6 +2690,8 @@ def run_analysis(
             None if checkpoint_session.resume_from_checkpoint else init_agent_state
         )
         for chunk in graph.graph.stream(graph_input, **args):
+            if budget is not None:
+                budget.check()
             observed_phase = _runtime_graph_phase_for_chunk(chunk)
             if _RUNTIME_GRAPH_PHASES.index(observed_phase) > _RUNTIME_GRAPH_PHASES.index(
                 runtime_graph_phase
@@ -2831,6 +2844,9 @@ def run_analysis(
 
         display.refresh()
         current_phase = "report_writing"
+        if budget is not None:
+            budget.check()
+            final_state["analysis_budget"] = budget.receipt()
         _update_run_status(artifacts, current_phase=current_phase)
         _write_run_reports(final_state, selections["ticker"], artifacts)
         checkpoint_clearer = getattr(graph, "clear_run_checkpoint", None)

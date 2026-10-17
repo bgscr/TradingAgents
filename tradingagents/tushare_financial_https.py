@@ -14,6 +14,7 @@ from email.utils import parsedate_to_datetime
 
 import pandas as pd
 
+from tradingagents.analysis_budget import admitted_transport
 from tradingagents.market_history.coordinator import PhysicalAttemptFailure, PhysicalAttemptOutcome
 
 DESTINATIONS = {
@@ -102,6 +103,9 @@ class _Client:
                 self._before_request(endpoint)
             if self._exchange_guard is not None:
                 permission.enter_context(self._exchange_guard(connection, endpoint))
+            remaining = permission.enter_context(admitted_transport("data"))
+            if remaining is not None:
+                connection.timeout = min(30, remaining)
             connection.request(
                 "POST",
                 path,

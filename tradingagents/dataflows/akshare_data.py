@@ -418,10 +418,17 @@ def _stock_news_em(symbol: str) -> pd.DataFrame:
     ):
         return implementation(symbol=symbol)
     # AKShare's news cleanup uses a Unicode regex escape unsupported by Arrow.
-    # Bind only this invocation's DataFrame constructor, keeping the SDK's
-    # transport, request count and parser unchanged. Shared module globals and
-    # pandas settings are never patched, including while network I/O is pending.
+    # Bind only this invocation's DataFrame constructor. Shared module globals
+    # and pandas settings are never patched while network I/O is pending.
     local_globals = {**implementation.__globals__, "pd": _NewsPandas()}
+    from tradingagents.analysis_budget import active_budget
+
+    if (active_budget() is not None
+            and getattr(local_globals.get("requests"), "__name__", None) == "curl_cffi.requests"):
+        # This SDK endpoint uses only the Requests-compatible get/text API.
+        # Keep its request and parser, but use the admitted standard transport
+        # for this budgeted invocation. Native curl remains fail-closed elsewhere.
+        local_globals["requests"] = requests
     local_call = FunctionType(
         implementation.__code__, local_globals, implementation.__name__,
         implementation.__defaults__, implementation.__closure__,

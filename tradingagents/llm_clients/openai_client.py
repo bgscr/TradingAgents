@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from openai import DEFAULT_MAX_RETRIES
 from pydantic import PrivateAttr
 
+from tradingagents.analysis_budget import active_budget, transport_is_admitted
 from tradingagents.run_telemetry import ModelTransportAttempt, RunTelemetryLedger
 
 from .api_key_env import get_api_key_env
@@ -161,6 +162,9 @@ def _record_sync_transport_send(
     *args: Any,
     **kwargs: Any,
 ) -> httpx.Response:
+    if active_budget() is not None and not transport_is_admitted():
+        # Budget mode records only admitted single requests, including redirects.
+        return original_send(request, *args, **kwargs)
     context = _ACTIVE_MODEL_TRANSPORT_CALL.get()
     if context is None:
         return original_send(request, *args, **kwargs)
@@ -195,6 +199,8 @@ async def _record_async_transport_send(
     *args: Any,
     **kwargs: Any,
 ) -> httpx.Response:
+    if active_budget() is not None and not transport_is_admitted():
+        return await original_send(request, *args, **kwargs)
     context = _ACTIVE_MODEL_TRANSPORT_CALL.get()
     if context is None:
         return await original_send(request, *args, **kwargs)
@@ -722,6 +728,8 @@ class OpenAIClient(BaseLLMClient):
         # The subclass (provider quirks) comes from the registry spec.
         llm = chat_cls(**llm_kwargs)
         llm._instrument_model_transport_clients()
+        llm.root_client._client._tradingagents_budget_provider = self.provider
+        llm.root_async_client._client._tradingagents_budget_provider = self.provider
         llm._model_transport_provider_family = self.provider
         configured_max_retries = llm_kwargs.get("max_retries")
         llm._model_transport_configured_max_retries = (

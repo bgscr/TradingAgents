@@ -210,6 +210,9 @@ class TradingAgentsGraph:
                 run asset before clients, workflow, or checkpoint state are built.
         """
         resolved_config = config or DEFAULT_CONFIG
+        from tradingagents.analysis_budget import validate_budget_config
+
+        validate_budget_config(resolved_config)
         if asset_configuration is None and instrument_symbol is not None:
             asset_configuration = resolve_run_asset_configuration(
                 instrument_symbol,
@@ -1671,8 +1674,12 @@ class TradingAgentsGraph:
                 source_ref=asset_configuration.registry_source_ref,
             )
         self.ticker = company_name
+        from tradingagents.analysis_budget import analysis_budget_scope
+
+        budget = None
         try:
             with (
+                analysis_budget_scope(self.config) as budget,
                 TradingAgentsGraph.checkpoint_scope(
                     self,
                     company_name,
@@ -1696,6 +1703,7 @@ class TradingAgentsGraph:
             self.interrupt_qualified_routing_runtime()
             raise
         finally:
+            self.last_analysis_budget = budget.receipt() if budget is not None else None
             self.close_qualified_routing_runtime()
 
     def save_reports(self, final_state, ticker, save_path=None) -> Path:
@@ -1823,6 +1831,12 @@ class TradingAgentsGraph:
                 final_state.update(chunk)
         else:
             final_state = self.graph.invoke(graph_input, **args)
+        from tradingagents.analysis_budget import active_budget
+
+        budget = active_budget()
+        if budget is not None:
+            budget.check()
+            final_state["analysis_budget"] = budget.receipt()
         if routing_checkpoint_compatibility is not None:
             final_state["capability_routing_checkpoint_compatibility"] = (
                 routing_checkpoint_compatibility.model_dump(mode="json")
@@ -1906,6 +1920,10 @@ class TradingAgentsGraph:
                 run_signature=checkpoint_run_signature,
             )
 
+        if budget is not None:
+            budget.check()
+            # Include deferred reflections in the returned whole-run receipt.
+            final_state["analysis_budget"] = budget.receipt()
         return final_state, processed_signal
 
     def _log_state(self, trade_date, final_state):

@@ -91,6 +91,7 @@ class CurrentTushareStatements:
                 "tushare_operator_safety_ceiling_calls_per_minute",
                 "tushare_financial_force_refresh",
                 "tushare_financial_cache_max_age_seconds",
+                "financial_cache_only",
             )
         }
         self._max_age_seconds = config.get("tushare_financial_cache_max_age_seconds", 86400)
@@ -107,6 +108,8 @@ class CurrentTushareStatements:
             "refresh": self._config["tushare_financial_force_refresh"] is True,
             "max_age_seconds": self._max_age_seconds,
         }
+        if self._config["financial_cache_only"] is True:
+            binding["cache_only"] = True
         self.variant_id = (
             "current-v1:" + sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
         )
@@ -147,10 +150,12 @@ class CurrentTushareStatements:
         )
         start, end = date(request.as_of_date.year - 6, 1, 1), request.as_of_date
         memo_key = (scope.key, start, end)
-        if memo_key not in self._responses:
+        cache_only = self._config["financial_cache_only"] is True
+        if cache_only or memo_key not in self._responses:
             cache = CurrentStatementCache(
                 Path(self._config["data_cache_dir"]) / "current-financial-statements.sqlite3",
                 max_age=timedelta(seconds=self._max_age_seconds),
+                read_only=cache_only,
             )
             self._responses[memo_key] = cache.read_through(
                 scope=scope,
@@ -161,6 +166,13 @@ class CurrentTushareStatements:
                 fetch=lambda lo, hi: self._fetch(scope, lo, hi),
             )
         result = self._responses[memo_key]
+        if cache_only:
+            from tradingagents.analysis_budget import active_budget
+
+            budget = active_budget()
+            if budget is not None:
+                for chunk in result.chunks:
+                    budget.record_cache_hit(endpoint, chunk)
         candidates, rejected, unsupported = [], 0, 0
         for chunk in result.chunks:
             payload = decode_provider_artifact(chunk.payload, endpoint_id=endpoint)
@@ -264,13 +276,38 @@ class CurrentTushareStatements:
                 ),
                 retryable=False,
             )
-        return _render(self._identity.symbol, request, selected, result, rejected)
+        rendered = _render(self._identity.symbol, request, selected, result, rejected)
+        if cache_only:
+            receipts = [{
+                "announcement_start": c.range_start.isoformat(),
+                "announcement_end": c.range_end.isoformat(),
+                "observed_at": c.checked_at.isoformat(),
+                "payload_sha256": c.payload_sha256,
+            } for c in result.chunks]
+            title, _, body = rendered.partition("\n")
+            rendered = title + "\n# cache_observations=" + json.dumps(receipts, sort_keys=True) + "\n" + body
+        return rendered
 
     @property
     def _provider_symbol(self):
         return self._identity.symbol.split(".")[0] + (
             ".SH" if self._identity.venue == "XSHG" else ".SZ"
         )
+
+    def validate_reuse(self, request, original_value):
+        """Validate restored results against fresh reads of the exact cache scope."""
+        if self._config["financial_cache_only"] is not True:
+            return
+        from tradingagents.analysis_budget import AnalysisBudgetStopped, active_budget
+
+        # A graph ToolNode can restore a logical ledger into a new adapter even
+        # with durable checkpoints disabled. Never trust its empty local memo.
+        # The deterministic rendering binds original timestamps and chunk hashes;
+        # a newer cache must not validate and then return an older artifact.
+        if self(request) != original_value:
+            if active_budget() is not None:
+                active_budget().stop("financial_cache_changed")
+            raise AnalysisBudgetStopped("financial_cache_changed")
 
     def _fetch(self, scope, start, end):
         from tradingagents.dataflows.market_snapshot import (

@@ -874,6 +874,9 @@ def _load_through_provider_coordinator(
     attempt_observer: Callable[[tuple[ProviderPhysicalAttemptEvent, ...]], None]
     | None = None,
 ) -> object:
+    from tradingagents.analysis_budget import require_data_vendor
+
+    require_data_vendor(provider_name)
     from datetime import timedelta
 
     from tradingagents.market_history.config import (

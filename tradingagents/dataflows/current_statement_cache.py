@@ -12,7 +12,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
@@ -119,13 +119,24 @@ class CurrentStatementCache:
     ``fetch`` must return a complete response for its inclusive date window.
     """
 
-    def __init__(self, path: str | Path, max_age: timedelta = timedelta(hours=24)):
+    def __init__(self, path: str | Path, max_age: timedelta = timedelta(hours=24), *, read_only=False):
         if not isinstance(max_age, timedelta) or max_age <= timedelta(0):
             raise ValueError("max_age must be a positive timedelta")
         self.path = Path(path)
         self.max_age = max_age
+        self.read_only = read_only
 
     def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            # Immutable prevents sidecar creation too. Refuse a live WAL rather
+            # than silently ignore its uncheckpointed observations.
+            if Path(str(self.path) + "-wal").exists():
+                raise sqlite3.OperationalError("read-only cache has a WAL")
+            connection = sqlite3.connect(
+                self.path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True, timeout=5
+            )
+            connection.execute("PRAGMA query_only = ON")
+            return connection
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=5)
         try:
@@ -198,6 +209,8 @@ class CurrentStatementCache:
         return chunks, cache_failure
 
     def _store(self, scope: str, chunk: StatementCacheChunk) -> None:
+        if self.read_only:
+            raise RuntimeError("read-only statement cache cannot store")
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             overlapping = connection.execute(
@@ -269,6 +282,9 @@ class CurrentStatementCache:
         fetch: Callable[[date, date], bytes],
         refresh: bool = False,
     ) -> StatementCacheResult:
+        if self.read_only:
+            # An analysis date or caller's reconstruction clock is never now.
+            now = datetime.now(timezone.utc)
         if type(range_start) is not date or type(range_end) is not date or range_start > range_end:
             raise ValueError("range must be ordered inclusive dates")
         if not isinstance(now, datetime) or now.utcoffset() is None:
@@ -286,6 +302,19 @@ class CurrentStatementCache:
         failure = None
         failure_range = None
         ranges = [(range_start, range_end)] if refresh else _gaps(range_start, range_end, reused)
+        if self.read_only and (refresh or cache_failure or ranges):
+            from tradingagents.analysis_budget import AnalysisBudgetStopped, active_budget
+
+            reason = (
+                "financial_cache_refresh_conflict" if refresh else
+                "financial_cache_unreadable" if cache_failure else
+                "financial_cache_stale" if any(
+                    not timedelta(0) <= now - c.checked_at < self.max_age for c in chunks
+                ) else "financial_cache_missing"
+            )
+            if active_budget() is not None:
+                active_budget().stop(reason)
+            raise AnalysisBudgetStopped(reason)
         for start, end in ranges:
             try:
                 payload = fetch(start, end)

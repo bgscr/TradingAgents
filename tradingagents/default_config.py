@@ -73,6 +73,10 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
+    "TRADINGAGENTS_ANALYSIS_BUDGET_ENABLED": "analysis_budget_enabled",
+    "TRADINGAGENTS_ANALYSIS_MAX_CALLS": "analysis_max_calls",
+    "TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS": "analysis_timeout_seconds",
+    "TRADINGAGENTS_FINANCIAL_CACHE_ONLY": "financial_cache_only",
     "TRADINGAGENTS_MARKET_HISTORY_MODE":  "market_history_mode",
     "TRADINGAGENTS_MARKET_HISTORY_DATABASE_PATH": "market_history_database_path",
     "TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT": "market_history_payload_root",
@@ -142,6 +146,10 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         try:
+            if key in {"analysis_budget_enabled", "financial_cache_only"} and raw.lower() not in {
+                "true", "false", "1", "0", "yes", "no", "on", "off",
+            }:
+                raise ValueError("budget/cache-only flag must be an explicit boolean")
             config[key] = _coerce(raw, config.get(key))
             applied.add(env_var)
         except ValueError as exc:
@@ -313,6 +321,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # provider/SDK at its own default (usually 2). Raise it to ride out bursty
     # 429 throttling on rate-limited deployments instead of aborting a run (#1091).
     "llm_max_retries": None,
+    # Opt-in admission limits, not a monetary cap. No personal config is changed.
+    "analysis_budget_enabled": False,
+    "analysis_max_calls": 30,
+    "analysis_timeout_seconds": 600,
+    "financial_cache_only": False,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,

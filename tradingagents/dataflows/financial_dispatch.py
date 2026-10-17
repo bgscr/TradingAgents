@@ -3783,6 +3783,11 @@ class FinancialToolDispatcher:
 
         if not is_leader:
             original = shared.result()
+            for provider in self._provider_chains[request.tool_name]:
+                for variant in provider.variants:
+                    validator = getattr(variant.invoke, "validate_reuse", None)
+                    if callable(validator):
+                        validator(request, original.value)
             with self._dispatch_lock:
                 self._reuse_counts[canonical_key.request_key] = (
                     self._reuse_counts.get(canonical_key.request_key, 0) + 1
