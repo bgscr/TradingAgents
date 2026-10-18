@@ -1348,7 +1348,15 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
         config["checkpoint_enabled"] = checkpoint
     from tradingagents.analysis_budget import validate_budget_config
 
-    validate_budget_config(config)
+    if config.get("analysis_budget_enabled", False) is not False:
+        from tradingagents.budget_preflight import validate_budget_preflight
+        from tradingagents.dataflows.config import preview_config
+
+        config = preview_config(config)
+        validate_budget_preflight(config, selected_analysts=_analyst_values(selections.get("analysts")),
+                                  ticker=selections.get("ticker"), as_of_date=selections.get("analysis_date"))
+    else:
+        validate_budget_config(config)
     return config
 
 

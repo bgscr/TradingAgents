@@ -75,6 +75,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_ANALYSIS_BUDGET_ENABLED": "analysis_budget_enabled",
     "TRADINGAGENTS_ANALYSIS_MAX_CALLS": "analysis_max_calls",
+    "TRADINGAGENTS_ANALYSIS_DISABLE_ALPHA_VANTAGE": "analysis_disable_alpha_vantage",
     "TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS": "analysis_timeout_seconds",
     "TRADINGAGENTS_FINANCIAL_CACHE_ONLY": "financial_cache_only",
     "TRADINGAGENTS_MARKET_HISTORY_MODE":  "market_history_mode",
@@ -146,7 +147,7 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         try:
-            if key in {"analysis_budget_enabled", "financial_cache_only"} and raw.lower() not in {
+            if key in {"analysis_budget_enabled", "financial_cache_only", "analysis_disable_alpha_vantage"} and raw.lower() not in {
                 "true", "false", "1", "0", "yes", "no", "on", "off",
             }:
                 raise ValueError("budget/cache-only flag must be an explicit boolean")
@@ -324,6 +325,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Opt-in admission limits, not a monetary cap. No personal config is changed.
     "analysis_budget_enabled": False,
     "analysis_max_calls": 30,
+    # Explicit per-run opt-out; requires budget mode and does not modify keys.
+    "analysis_disable_alpha_vantage": False,
     "analysis_timeout_seconds": 600,
     "financial_cache_only": False,
     # Checkpoint/resume: when True, LangGraph saves state after each node

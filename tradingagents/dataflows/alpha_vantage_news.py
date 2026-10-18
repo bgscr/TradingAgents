@@ -38,6 +38,17 @@ def get_global_news(curr_date, look_back_days: int = 7, limit: int = 50) -> dict
     """
     from datetime import datetime, timedelta
 
+    # The shared tool passes None for omitted values so every news vendor
+    # inherits the active run's configured defaults.
+    if look_back_days is None or limit is None:
+        from .config import get_config
+
+        config = get_config()
+        if look_back_days is None:
+            look_back_days = config["global_news_lookback_days"]
+        if limit is None:
+            limit = config["global_news_article_limit"]
+
     # Calculate start date
     curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     start_dt = curr_dt - timedelta(days=look_back_days)

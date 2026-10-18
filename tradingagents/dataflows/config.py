@@ -23,7 +23,12 @@ def set_config(config: dict):
     keeps the other nested keys from the default; scalar keys are replaced.
     """
     global _config
-    initialize_config()
+    _config = preview_config(config)
+
+
+def preview_config(config: dict) -> dict:
+    """Return the exact set_config merge without changing process configuration."""
+    merged = get_config()
     incoming = deepcopy(config)
     path_overridden = _CRYPTO_REGISTRY_PATH_KEY in incoming
     digest_overridden = _CRYPTO_REGISTRY_DIGEST_KEY in incoming
@@ -35,10 +40,11 @@ def set_config(config: dict):
         )
         incoming[missing_key] = None
     for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(_config.get(key), dict):
-            _config[key].update(value)
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)
         else:
-            _config[key] = value
+            merged[key] = value
+    return merged
 
 
 def get_config() -> dict:

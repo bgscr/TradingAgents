@@ -1358,6 +1358,26 @@ def render_analysis_outcome_report(
     return "\n".join(lines)
 
 
+def budget_data_gap_markdown(state: dict, language="English") -> str:
+    """Render fixed operational gaps separately from the validated decision."""
+    from tradingagents.budget_data import ALPHA_ENRICHMENT_TOOLS
+
+    receipt = state.get("analysis_budget") or {}
+    allowed = {"user_disabled", "not_configured", "authentication_failed", "permission_denied", "rate_limited"}
+    rows = [item for item in receipt.get("data_gaps", [])
+            if item.get("tool") in ALPHA_ENRICHMENT_TOOLS
+            and item.get("provider") == "alpha_vantage" and item.get("reason") in allowed]
+    if not rows:
+        return ""
+    heading = "## 预算运行数据缺口" if is_chinese(language) else "## Budget run data gaps"
+    warning = ("运行诊断，不是来源事实；未自动换源，不代表没有新闻或内幕交易。"
+               if is_chinese(language) else
+               "Operational diagnostics, not source facts. No automatic fallback; these gaps do not mean no news or insider transactions.")
+    return "\n".join([heading, "", warning, "", *(
+        f"- DATA_UNAVAILABLE: `{item['tool']}`; `alpha_vantage`; `{item['reason']}`."
+        for item in rows), ""])
+
+
 def _report_header(
     ticker: str,
     terminal: TerminalContract,
@@ -1479,6 +1499,7 @@ def _write_report_tree(final_state, ticker, publication, output_language):
 
     body = localize_report(body, output_language)
     body += "\n" + evidence_diagnostic_markdown(evidence, output_language)
+    body += "\n" + budget_data_gap_markdown(final_state, output_language)
     documents = {terminal_path: body}
 
     header = _report_header(

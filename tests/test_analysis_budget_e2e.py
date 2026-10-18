@@ -24,10 +24,10 @@ from zoneinfo import ZoneInfo
 import pytest
 from urllib3.response import HTTPResponse
 
+from cli.utils import normalize_ticker_symbol
 from tests.test_analysis_budget import httpx_families, install_network_denial
 from tests.test_current_tushare_statements import (
     TOOLS,
-    dispatcher,
     request,
     runtime_config,
     statement_rows,
@@ -35,9 +35,9 @@ from tests.test_current_tushare_statements import (
 from tradingagents.analysis_budget import AnalysisBudgetStopped, active_budget
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-AS_OF = date(2026, 10, 15)
-FIRST = date(2021, 10, 15)
-SYMBOL = "600895.SS"
+AS_OF = date(2026, 10, 16)
+FIRST = date(2021, 10, 16)
+SYMBOL = normalize_ticker_symbol("601328.SH")
 MODELS = ("deepseek-flash", "deepseek-v4-pro")
 
 
@@ -102,6 +102,8 @@ class FakeWire:
         self.seeding = True
         self.expire_on_model = False
         self.legacy_news_calls = 0
+        self.tools_requested = set()
+        self.repair_finalizer = False
 
     def legacy_news(self, _session, method, url, **kwargs):
         """Default SDK's native request boundary, fully fake and never sent."""
@@ -123,6 +125,13 @@ class FakeWire:
         message = {"role": "assistant", "content": "Synthetic debate evidence.",
                    "reasoning_content": "Synthetic reasoning."}
         phase = "debate"
+
+        def tool_responses(calls):
+            self.tools_requested.update(calls)
+            message.update(content="", tool_calls=[{
+                "id": f"fake-{len(self.model_calls)}-{name}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            } for name, args in calls.items()])
 
         def tool_response(name, args):
             message.update(content="", tool_calls=[{
@@ -147,7 +156,7 @@ class FakeWire:
                 assert match, text[:300]
                 analyst = match.group(1)
                 phase = analyst + "_finalizer"
-                if analyst == "fundamentals" and not self.phases[phase]:
+                if self.repair_finalizer and analyst == "fundamentals" and not self.phases[phase]:
                     result = {"invalid": "one deliberate schema failure"}
                 else:
                     result = {"report_markdown": f"# Synthetic {analyst} report\nVerified fixture data.",
@@ -156,24 +165,31 @@ class FakeWire:
         elif "get_balance_sheet" in names:
             phase = "fundamentals_tools"
             if not any(m.get("role") == "tool" for m in body["messages"]):
-                message.update(content="", tool_calls=[{
-                    "id": f"fake-{len(self.model_calls)}-{name}", "type": "function",
-                    "function": {"name": name, "arguments": json.dumps({
-                        "ticker": SYMBOL, "freq": "quarterly", "curr_date": AS_OF.isoformat(),
-                    })},
-                } for name in TOOLS])
+                tool_responses({
+                    **{name: {"ticker": SYMBOL, "freq": "quarterly", "curr_date": AS_OF.isoformat()} for name in TOOLS},
+                    "get_fundamentals": {"ticker": SYMBOL, "curr_date": AS_OF.isoformat()},
+                })
             else:
                 message["content"] = "Synthetic fundamentals draft for required finalization."
         elif "get_verified_market_snapshot" in names:
             phase = "market_tools"
             if not any(m.get("role") == "tool" for m in body["messages"]):
-                tool_response("get_verified_market_snapshot", {"symbol": SYMBOL, "curr_date": AS_OF.isoformat()})
+                tool_responses({
+                    "get_verified_market_snapshot": {"symbol": SYMBOL, "curr_date": AS_OF.isoformat()},
+                    "get_stock_data": {"symbol": SYMBOL, "start_date": "2026-10-01", "end_date": AS_OF.isoformat()},
+                    "get_indicators": {"symbol": SYMBOL, "indicator": "rsi", "curr_date": AS_OF.isoformat()},
+                })
             else:
                 message["content"] = "Synthetic market draft for required finalization."
         elif "get_news" in names:
             phase = "news_tools"
             if not any(m.get("role") == "tool" for m in body["messages"]):
-                tool_response("get_news", {"ticker": SYMBOL, "start_date": "2026-10-08", "end_date": AS_OF.isoformat()})
+                tool_responses({
+                    "get_news": {"ticker": SYMBOL, "start_date": "2026-10-08", "end_date": AS_OF.isoformat()},
+                    "get_global_news": {"curr_date": AS_OF.isoformat()},
+                    "get_macro_indicators": {"indicator": "cpi", "curr_date": AS_OF.isoformat()},
+                    "get_prediction_markets": {"topic": "synthetic macro"},
+                })
             else:
                 message["content"] = "Synthetic news draft for required finalization."
         self.phases[phase] += 1
@@ -193,6 +209,16 @@ class FakeWire:
                 price = 10 + index / 100
                 rows.append(f"{day},{price},{price},{price+1},{price-1},1000,10000,1,1,1,1")
             payload = json.dumps({"data": {"klines": rows}}).encode()
+        elif pool.host == "push2his.eastmoney.com" and "/fflow/" in parsed.path:
+            payload = json.dumps({"data": {"klines": [AS_OF.isoformat() + ",1,1,1,1,1,1,1,1,1,1,10,1,0,0"]}}).encode()
+        elif pool.host == "basic.10jqka.com.cn":
+            payload = '<ul class="main_intro_list"><li>主营业务：Synthetic fixture business</li></ul>'.encode('gb2312')
+        elif pool.host == "quotes.sina.cn":
+            labels = ["常用指标", "每股指标", "盈利能力", "成长能力", "收益质量", "财务风险", "营运能力", "结束"]
+            rows = [row for label in labels for row in (
+                {"item_title": label, "item_value": "0"},
+                {"item_title": label + "合成", "item_value": "1"})]
+            payload = json.dumps({"result": {"data": {"report_list": {"20260630": {"data": rows}}}}}).encode()
         elif pool.host == "search-api-web.eastmoney.com":
             payload = ("jQuery35101792940631092459_1764599530165(" + json.dumps({"result": {
                 "cmsArticleWebOld": [{"date": "2026-10-14 12:00:00", "mediaName": "Synthetic",
@@ -202,6 +228,13 @@ class FakeWire:
             # Fixed empty optional sentiment data exercises the actual SDK parser
             # and degradation path; it never grants fallback to another vendor.
             payload = b'{"data":[],"result":{"pages":0,"data":[]}}'
+        elif pool.host == "www.alphavantage.co":
+            payload = b'{"feed":[],"data":[]}'
+        elif pool.host == "api.stlouisfed.org":
+            payload = json.dumps({'observations': [{'date': '2026-10-01', 'value': '3'}]} if '/observations' in parsed.path else {
+                'seriess': [{'title': 'Synthetic CPI', 'units': 'Index', 'frequency': 'Monthly'}]}).encode()
+        elif pool.host == "gamma-api.polymarket.com":
+            payload = b'{"events":[]}'
         else:
             pytest.fail(f"unplanned fake provider request: {pool.host}{parsed.path}")
         return HTTPResponse(body=io.BytesIO(payload), status=200, preload_content=False,
@@ -227,6 +260,7 @@ class FakeWire:
 
             def read(self, limit):
                 frame = statement_rows(self.payload["api_name"])
+                frame["ts_code"] = "601328.SH"
                 return json.dumps({"code": 0, "data": {
                     "fields": list(frame.columns), "items": frame.values.tolist(),
                 }}).encode()
@@ -258,10 +292,16 @@ def prepare(tmp_path, monkeypatch, *, enabled=True, cache_only=True, cache_damag
     settings["market_data_vendors"]["cn_a"] = dict.fromkeys(
         ("core_stock_apis", "technical_indicators", "fundamental_data", "news_data"), "akshare"
     )
+    settings["tool_vendors"].update(get_global_news="alpha_vantage", get_insider_transactions="alpha_vantage")
     # Supply only fixed synthetic keys; never copy the caller's environment.
     monkeypatch.setattr(os, "environ", {"DEEPSEEK_API_KEY": "synthetic", "TUSHARE_TOKEN": "synthetic",
+                                        "FRED_API_KEY": "synthetic", "ALPHA_VANTAGE_API_KEY": "synthetic",
                                         "NO_PROXY": "*", "PYTHON_DOTENV_DISABLED": "1"})
     wire = FakeWire()
+    # Cover one schema repair in the unlimited legacy run. The budgeted run
+    # invokes every bound tool and fits exactly 30 physical attempts without it;
+    # repair/count exhaustion are separately exercised by budget unit tests.
+    wire.repair_finalizer = not enabled
     for module in httpx_families():
         monkeypatch.setattr(module.HTTPTransport, "handle_request",
                             lambda transport, request, family=module: wire.httpx(transport, request, family))
@@ -271,9 +311,14 @@ def prepare(tmp_path, monkeypatch, *, enabled=True, cache_only=True, cache_damag
                         lambda session, method, url, **kwargs: wire.legacy_news(session, method, url, **kwargs))
     monkeypatch.setattr(tushare_financial_https.http.client, "HTTPSConnection", wire.connection_type())
     _seed_calendar(settings)
-    seeder = dispatcher(settings)
+    from tradingagents.asset_configuration import resolve_run_asset_configuration
+    from tradingagents.dataflows.financial_dispatch import FinancialToolDispatcher
+
+    asset = resolve_run_asset_configuration(SYMBOL, config=settings)
+    seeder = FinancialToolDispatcher.from_configured_vendors(
+        instrument_identity=asset.instrument_identity, run_asset_configuration=asset, config=settings)
     for tool in TOOLS:
-        assert seeder.dispatch(request(tool)).artifact is not None
+        assert seeder.dispatch(request(tool).model_copy(update={"as_of_date": AS_OF})).artifact is not None
     assert len(wire.financial_calls) == 3
     wire.seeding = False
     settings["financial_cache_only"] = cache_only
@@ -313,15 +358,39 @@ def _clear_client_cache():
     _client_utils._cached_async_httpx_client.cache_clear()
 
 
-@pytest.mark.parametrize("enabled", [True, False], ids=["budget-cache-only", "legacy-defaults"])
-def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize("enabled,alpha", [(True, "configured"), (False, "configured"),
+                                           (True, "missing"), (True, "disabled")],
+                         ids=["budget-cache-only", "legacy-defaults", "alpha-missing", "alpha-disabled"])
+def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled, alpha):
     from tradingagents import reporting
 
     settings, wire, path, before = prepare(tmp_path, monkeypatch, enabled=enabled, cache_only=enabled)
+    if alpha == "missing":
+        monkeypatch.delenv("ALPHA_VANTAGE_API_KEY")
+    if alpha == "disabled":
+        # An old synthetic key remains present; the policy must skip it.
+        settings["analysis_disable_alpha_vantage"] = True
+        from tradingagents.dataflows import alpha_vantage_common as av
+
+        monkeypatch.setattr(av, "get_api_key", lambda: pytest.fail("disabled Alpha key read"))
     if not enabled:
         for key in ("analysis_budget_enabled", "analysis_max_calls", "analysis_timeout_seconds", "financial_cache_only"):
             settings.pop(key)
+    import cli.main as cli
+
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG", settings)
+    settings = cli._build_run_config({
+        "ticker": SYMBOL, "analysis_date": AS_OF.isoformat(), "research_depth": 1,
+        "shallow_thinker": MODELS[0], "deep_thinker": MODELS[1],
+        "backend_url": "https://api.deepseek.com", "llm_provider": "DeepSeek",
+        "analysts": ["market", "social", "news", "fundamentals"],
+        "china_a_enhancement_preset": "basic",
+    }, False)
     graph = TradingAgentsGraph(config=settings, instrument_symbol=SYMBOL)
+    if enabled:
+        from tradingagents.dataflows.config import set_config
+
+        set_config({"llm_provider": "openai", "analysis_max_calls": 0})
     try:
         state, signal = graph.propagate(SYMBOL, AS_OF.isoformat())
         (tmp_path / "e2e-observation.json").write_text(json.dumps({
@@ -336,7 +405,10 @@ def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled):
         assert state["admission_gate"]["admitted"] is True
         assert signal in {"Buy", "Hold", "Sell"}
         assert {body["model"] for body in wire.model_calls} == set(MODELS)
-        assert wire.phases["fundamentals_finalizer"] == 2
+        assert wire.tools_requested == {"get_stock_data", "get_indicators", "get_verified_market_snapshot",
+                                        "get_news", "get_global_news", "get_macro_indicators", "get_prediction_markets",
+                                        "get_fundamentals", *TOOLS}
+        assert wire.phases["fundamentals_finalizer"] == (1 if enabled else 2)
         assert wire.phases["research_plan"] == wire.phases["trader"] == 1
         assert any(host == "search-api-web.eastmoney.com" for host, _, _ in wire.data_calls)
         assert wire.legacy_news_calls == (0 if enabled else 2)
@@ -354,6 +426,7 @@ def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled):
             state["financial_dispatch_audit_projection"]
         )
         rendered = reporting.render_decision_report(decision, terminal, evidence, financial)
+        rendered += "\n" + reporting.budget_data_gap_markdown(state)
         for _, title, _, content in reporting.advisory_sections(state):
             rendered += "\n" + reporting.advisory_markdown(title, content, "English")
         report = tmp_path / "rendered-report-only.md"
@@ -368,6 +441,14 @@ def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled):
             assert receipt["data_attempts"] == len(wire.data_calls)
             assert len(receipt["financial_cache_hits"]) == 3
             assert receipt["stop_reason"] is None
+            assert receipt["admitted_attempts"] == (30 if alpha == "configured" else 29)
+            if alpha != "configured":
+                reason = "not_configured" if alpha == "missing" else "user_disabled"
+                assert receipt["data_gaps"] == [{"tool": "get_global_news", "provider": "alpha_vantage", "reason": reason}]
+                assert all(host != "www.alphavantage.co" for host, _, _ in wire.data_calls)
+                assert "DATA_UNAVAILABLE" in rendered and reason in rendered
+                assert any("DATA_UNAVAILABLE" in str(message.get("content", ""))
+                           for call in wire.model_calls for message in call["messages"] if message.get("role") == "tool")
         else:
             assert graph.last_analysis_budget is None
         _assert_cache_unchanged(path, before)
@@ -380,13 +461,16 @@ def test_complete_graph_cache_failure_stops_before_debate(tmp_path, monkeypatch,
     settings, wire, path, before = prepare(tmp_path, monkeypatch, cache_damage=damage)
     graph = TradingAgentsGraph(config=settings, instrument_symbol=SYMBOL)
     try:
-        with pytest.raises(AnalysisBudgetStopped, match="financial_cache"):
+        from tradingagents.budget_readiness import BudgetReadinessError
+
+        with pytest.raises(BudgetReadinessError, match="financial"):
             graph.propagate(SYMBOL, AS_OF.isoformat())
-        assert wire.phases["fundamentals_tools"] == 1
+        assert not wire.model_calls and not wire.data_calls
+        assert wire.phases["fundamentals_tools"] == 0
         assert wire.phases["research_plan"] == wire.phases["debate"] == 0
         assert len(wire.financial_calls) == 3
         assert not list((tmp_path / "results").rglob("*.md"))
-        assert graph.last_analysis_budget["stop_reason"].startswith("financial_cache")
+        assert graph.last_analysis_budget["admitted_attempts"] == 0
         _assert_cache_unchanged(path, before)
     finally:
         _close(graph)
@@ -406,6 +490,31 @@ def test_complete_graph_budget_stops_following_physical_sends(tmp_path, monkeypa
         assert receipt["admitted_attempts"] == len(wire.model_calls) + len(wire.data_calls) == 2
         assert receipt["stop_reason"] == expected_reason
         assert wire.phases["research_plan"] == 0
+        _assert_cache_unchanged(path, before)
+    finally:
+        _close(graph)
+
+
+@pytest.mark.parametrize("damage", ["missing", "membership"])
+def test_calendar_gaps_block_complete_graph_before_any_send(tmp_path, monkeypatch, damage):
+    from contextlib import closing
+
+    from tradingagents.budget_readiness import BudgetReadinessError
+
+    settings, wire, path, before = prepare(tmp_path, monkeypatch)
+    calendar_path = Path(settings["market_history_database_path"])
+    if damage == "missing":
+        calendar_path.unlink()
+    else:
+        with closing(sqlite3.connect(calendar_path)) as db, db:
+            db.execute("DELETE FROM market_sessions WHERE session_date=?", (FIRST.isoformat(),))
+    graph = TradingAgentsGraph(config=settings, instrument_symbol=SYMBOL)
+    try:
+        with pytest.raises(BudgetReadinessError, match="calendar"):
+            graph.propagate(SYMBOL, AS_OF.isoformat())
+        assert not wire.model_calls and not wire.data_calls
+        assert graph.last_analysis_budget["admitted_attempts"] == 0
+        assert len(wire.financial_calls) == 3  # fixture seeding only
         _assert_cache_unchanged(path, before)
     finally:
         _close(graph)

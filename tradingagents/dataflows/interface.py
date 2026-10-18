@@ -356,14 +356,13 @@ def route_to_vendor(method: str, *args, **kwargs):
     first_error: Exception | None = None
     first_error_vendor: str | None = None
     for vendor in vendor_chain:
-        from tradingagents.analysis_budget import require_data_vendor
+        from tradingagents.budget_data import invoke_budget_data
 
-        require_data_vendor(vendor)
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            result = impl_func(*args, **kwargs)
+            result = invoke_budget_data(method, vendor, impl_func, *args, **kwargs)
             return append_china_a_enhancement(method, result, args, kwargs)
         except VendorRateLimitError:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
@@ -455,18 +454,17 @@ def route_to_vendor_acquired(
 
     def acquired_provider(vendor_name, impl):
         def call(_request):
-            from tradingagents.analysis_budget import require_data_vendor
+            from tradingagents.budget_data import invoke_budget_data
 
-            require_data_vendor(vendor_name)
             try:
                 if method == "get_news" and impl is get_news_yfinance:
-                    return impl(
-                        *args,
+                    return invoke_budget_data(
+                        method, vendor_name, impl, *args,
                         **kwargs,
                         _acquired=True,
                         instrument_identity=instrument_identity,
                     )
-                return impl(*args, **kwargs)
+                return invoke_budget_data(method, vendor_name, impl, *args, **kwargs)
             except VendorRateLimitError as error:
                 raise AcquisitionFailure(
                     reason=AcquisitionUnavailableReason.RATE_LIMITED,

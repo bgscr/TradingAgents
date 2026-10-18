@@ -59,6 +59,10 @@ class AlphaVantageRateLimitError(VendorRateLimitError):
     """Raised when the Alpha Vantage API rate limit is exceeded."""
     pass
 
+class AlphaVantageEntitlementError(AlphaVantageRateLimitError):
+    """Remote subscription denial; retains the legacy routing exception family."""
+
+
 def _make_api_request(function_name: str, params: dict) -> dict | str:
     """Helper function to make API requests and handle responses.
 
@@ -102,8 +106,10 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     notice = response_json.get("Information") or response_json.get("Note")
     if notice:
         low = notice.lower()
-        if any(m in low for m in ("rate limit", "requests per day", "call frequency", "premium")):
+        if any(m in low for m in ("rate limit", "requests per day", "call frequency")):
             raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {notice}")
+        if any(marker in low for marker in ("premium", "subscription", "entitlement")):
+            raise AlphaVantageEntitlementError(f"Alpha Vantage permission denied: {notice}")
         if "api key" in low or "apikey" in low:
             # Reuse the existing "not configured" error so a bad key surfaces as
             # a real, actionable failure rather than a mislabeled rate limit (#991).

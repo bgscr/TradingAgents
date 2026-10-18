@@ -22,12 +22,21 @@ class AnalysisBudgetStopped(BaseException):
         super().__init__(f"analysis_budget:{reason}")
 
 
+def _valid_timeout(value) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:
+        return False
+
+
 class AnalysisBudget:
-    def __init__(self, max_calls: int, timeout_seconds: float, *, clock=time.monotonic):
+    def __init__(self, max_calls: int, timeout_seconds: float, *, clock=time.monotonic,
+                 disable_alpha_vantage: bool = False):
         if type(max_calls) is not int or max_calls < 1:
             raise ValueError("analysis_max_calls must be a positive integer")
-        if (type(timeout_seconds) not in {int, float}
-                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        if not _valid_timeout(timeout_seconds):
             raise ValueError("analysis_timeout_seconds must be positive and finite")
         self.max_calls = max_calls
         self.timeout_seconds = timeout_seconds
@@ -37,6 +46,8 @@ class AnalysisBudget:
         self._counts = {"model": 0, "data": 0}
         self._reason = None
         self._cache_hits = []
+        self.disable_alpha_vantage = disable_alpha_vantage
+        self._data_gaps = []
 
     def stop(self, reason: str):
         with self._lock:
@@ -75,6 +86,19 @@ class AnalysisBudget:
             if item not in self._cache_hits:
                 self._cache_hits.append(item)
 
+    def record_data_gap(self, tool: str, reason: str) -> str:
+        """Operational diagnostics only; never source facts or usable data."""
+        with self._lock:
+            self.check()
+            item = {"tool": tool, "provider": "alpha_vantage", "reason": reason}
+            if item not in self._data_gaps:
+                self._data_gaps.append(item)
+        return (
+            f"DATA_UNAVAILABLE: {tool}; provider=alpha_vantage; reason={reason}. "
+            "No cross-provider fallback. Report this gap; do not treat it as empty "
+            "news, absence of transactions, or evidence for a factual claim."
+        )
+
     def receipt(self) -> dict:
         with self._lock:
             return {
@@ -85,6 +109,7 @@ class AnalysisBudget:
                 "data_attempts": self._counts["data"],
                 "stop_reason": self._reason,
                 "financial_cache_hits": list(self._cache_hits),
+                "data_gaps": [dict(item) for item in self._data_gaps],
             }
 
 
@@ -180,6 +205,9 @@ def _transport_guards():
         return value
 
     def requests_send(adapter, request, **kwargs):
+        from tradingagents.budget_data import check_budget_data_destination
+
+        check_budget_data_destination(request)
         if (type(adapter) is not requests.adapters.HTTPAdapter
                 or adapter.max_retries.total not in (0, False)):
             _ACTIVE.stop("uncovered_requests_adapter")
@@ -282,29 +310,53 @@ def _transport_guards():
         yield
 
 
-def validate_budget_config(config: dict) -> None:
+def inspect_budget_config(config: dict) -> tuple[tuple[str, str], ...]:
+    """Collect fixed-safe configuration issues without constructing a budget."""
+    issues = []
     enabled = config.get("analysis_budget_enabled", False)
     cache_only = config.get("financial_cache_only", False)
-    if type(enabled) is not bool or type(cache_only) is not bool:
-        raise ValueError("analysis budget/cache-only flags must be boolean")
-    if cache_only and config.get("tushare_financial_force_refresh", False):
-        raise ValueError("financial_cache_only conflicts with force refresh")
-    if cache_only and (
-        config.get("market_history_mode") != "current"
-        or config.get("mainland_capability_routing_mode", "legacy") != "legacy"
-        or config.get("checkpoint_enabled", False)
-        or any(config.get("tool_vendors", {}).get(tool) != "tushare"
-               for tool in ("get_balance_sheet", "get_income_statement", "get_cashflow"))
-    ):
-        raise ValueError("cache-only requires explicit CURRENT Tushare statements, legacy, no checkpoint")
-    if enabled:
-        AnalysisBudget(config.get("analysis_max_calls", 30),
-                       config.get("analysis_timeout_seconds", 600))
-        if (str(config.get("llm_provider", "")).lower() != "deepseek"
-                or config.get("market_history_mode") != "current"
-                or config.get("mainland_capability_routing_mode", "legacy") != "legacy"
-                or config.get("checkpoint_enabled", False)):
-            raise ValueError("budget requires DeepSeek, CURRENT, legacy routing, no checkpoint")
+    for name, value in (("analysis_budget_enabled", enabled), ("financial_cache_only", cache_only)):
+        if type(value) is not bool:
+            issues.append((name, "must_be_boolean"))
+    disabled = config.get("analysis_disable_alpha_vantage", False)
+    if type(disabled) is not bool:
+        issues.append(("analysis_disable_alpha_vantage", "must_be_boolean"))
+    elif disabled and enabled is not True:
+        issues.append(("analysis_disable_alpha_vantage", "requires_analysis_budget"))
+    if cache_only is not False:
+        if config.get("tushare_financial_force_refresh", False):
+            issues.append(("financial_cache_only", "force_refresh_conflict"))
+        tools = config.get("tool_vendors", {})
+        if not isinstance(tools, dict):
+            issues.append(("tool_vendors", "invalid_mapping"))
+        else:
+            for tool in ("get_balance_sheet", "get_income_statement", "get_cashflow"):
+                if tools.get(tool) != "tushare":
+                    issues.append(("tool_vendors." + tool, "cache_only_requires_explicit_tushare"))
+    if enabled is not False or cache_only is not False:
+        for name, expected in (("market_history_mode", "current"),
+                               ("mainland_capability_routing_mode", "legacy"),
+                               ("checkpoint_enabled", False)):
+            if config.get(name, expected if name != "market_history_mode" else None) != expected:
+                issues.append((name, "requires_" + str(expected).lower()))
+    if enabled is not False:
+        maximum = config.get("analysis_max_calls", 30)
+        timeout = config.get("analysis_timeout_seconds", 600)
+        if type(maximum) is not int or maximum < 1:
+            issues.append(("analysis_max_calls", "must_be_positive_integer"))
+        if not _valid_timeout(timeout):
+            issues.append(("analysis_timeout_seconds", "must_be_positive_finite"))
+        if str(config.get("llm_provider", "")).lower() != "deepseek":
+            issues.append(("llm_provider", "requires_deepseek"))
+    return tuple(issues)
+
+
+def validate_budget_config(config: dict) -> None:
+    issues = inspect_budget_config(config)
+    if issues:
+        raise ValueError("analysis_budget:invalid_config; " + "; ".join(
+            field + ":" + reason for field, reason in issues
+        ))
 
 
 @contextmanager
@@ -326,7 +378,8 @@ def analysis_budget_scope(config: dict):
         if _ACTIVE is not None or _UNBUDGETED_RUNS:
             raise AnalysisBudgetStopped("concurrent_analysis_unsupported")
         budget = AnalysisBudget(config.get("analysis_max_calls", 30),
-                                config.get("analysis_timeout_seconds", 600))
+                                config.get("analysis_timeout_seconds", 600),
+                                disable_alpha_vantage=config.get("analysis_disable_alpha_vantage", False))
         _ACTIVE = budget
     try:
         with _transport_guards():

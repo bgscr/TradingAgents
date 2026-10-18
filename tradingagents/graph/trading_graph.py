@@ -212,7 +212,18 @@ class TradingAgentsGraph:
         resolved_config = config or DEFAULT_CONFIG
         from tradingagents.analysis_budget import validate_budget_config
 
-        validate_budget_config(resolved_config)
+        if resolved_config.get("analysis_budget_enabled", False) is not False:
+            from tradingagents.budget_preflight import validate_budget_routes
+            from tradingagents.dataflows.config import preview_config
+
+            resolved_config = preview_config(resolved_config)
+            selected_analysts = tuple(selected_analysts)
+            route_symbol = (asset_configuration.instrument_identity.symbol
+                            if asset_configuration is not None else instrument_symbol)
+            validate_budget_routes(resolved_config, selected_analysts=selected_analysts,
+                                   symbol=route_symbol)
+        else:
+            validate_budget_config(resolved_config)
         if asset_configuration is None and instrument_symbol is not None:
             asset_configuration = resolve_run_asset_configuration(
                 instrument_symbol,
@@ -1245,6 +1256,19 @@ class TradingAgentsGraph:
 
     def resolve_evidence_state(self, ticker: str, trade_date: str) -> EvidenceState:
         """Acquire the typed identity and market evidence for one analysis run."""
+        if self.config.get("analysis_budget_enabled", False):
+            from tradingagents.budget_preflight import validate_budget_preflight
+            from tradingagents.dataflows.config import get_config
+
+            # Market/news tools read the active process config; financial tools
+            # retain the graph's configuration. Validate what each will execute.
+            routes = get_config()
+            routes["analysis_budget_enabled"] = True
+            self.last_budget_preflight = validate_budget_preflight(
+                routes, selected_analysts=self.selected_analysts, ticker=ticker,
+                as_of_date=trade_date, financial_config=self.config, budget_config=self.config,
+                instrument_identity=getattr(getattr(self, "asset_configuration", None), "instrument_identity", None),
+            )
         return acquire_run_evidence(
             ticker,
             trade_date,
