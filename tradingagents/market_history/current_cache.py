@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -13,11 +13,13 @@ from pydantic import TypeAdapter
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.evidence import SourceAcquisitionOutcome, SourceArtifact
+from tradingagents.market_history.calendar import MarketSessionCalendarPublication
 from tradingagents.market_history.config import MarketHistoryConfig, MarketHistoryMode
 from tradingagents.market_history.coordinator import upstream_service_identity_for_provider
 from tradingagents.market_history.current import _analysis_as_of, _now
 from tradingagents.market_history.models import (
     InstrumentSpec,
+    ProvenanceClass,
     ProviderDatasetSpec,
     TradingStatus,
     TradingStatusProvenance,
@@ -25,6 +27,8 @@ from tradingagents.market_history.models import (
 from tradingagents.market_history.store import MarketHistoryStore, _unique_json_object
 
 CONTRACT = "mainland-current-cache-v1"
+SSE_CALENDAR_PROOF = "tushare-sse-current-calendar-v1"
+SSE_CALENDAR_SYMBOL = "601328.SS"
 MANIFEST_CONTRACT = "current-cache-compatibility-manifest-v1"
 MANIFEST_PATH = Path(__file__).with_name("current_cache_compatibility.json")
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -184,6 +188,132 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+@dataclass(frozen=True)
+class _StoredSSECalendar(MarketSessionCalendarPublication):
+    """Exact retained Tushare publication; CURRENT-only, not a CAL-02 pin."""
+
+    calendar_revision_id: str = ""
+
+
+def prepared_sse_calendar_provider():
+    """Exact source family; identifying it does not admit it to other readers."""
+    from tradingagents.dataflows.tushare_market_history import (
+        CALENDAR_DATASET_NAME,
+        NORMALIZER_VERSION,
+        _identity,
+    )
+
+    upstream, service = upstream_service_identity_for_provider("tushare")
+    return ProviderDatasetSpec(upstream, service, _identity("provider-dataset", upstream,
+        CALENDAR_DATASET_NAME, "not-applicable", NORMALIZER_VERSION, "SSE"),
+        "tushare", CALENDAR_DATASET_NAME, "not-applicable", False)
+
+
+def verify_prepared_sse_revision(store, revision_id):
+    """Authenticate one immutable source before admission OR source exclusion.
+
+    This integrity check grants no instrument/mode eligibility. Callers must
+    enforce their own policy; the BaoStock reader only excludes this source.
+    """
+    from tradingagents.dataflows.tushare_market_history import (
+        CALENDAR_DATASET_NAME,
+        NORMALIZER_VERSION,
+    )
+    from tradingagents.market_history.calendar import MarketSession, MarketSessionStatus
+    from tradingagents.market_history.revisions import RevisionKind, revision_identity
+
+    expected = prepared_sse_calendar_provider()
+    upstream, service = expected.upstream_service_id, expected.upstream_service_name
+    connection = store._connection
+    row = connection.execute(
+        "SELECT c.calendar_revision_id,c.reference_market,c.timezone_name,c.observed_at,"
+        "c.first_observed_at,c.provenance_class,c.payload_digest,c.ingestion_run_id,"
+        "d.provider_name,d.upstream_service_id,d.dataset_name,d.adjustment_methodology,"
+        "d.strict_history_qualified,u.service_name,u.account_scope,c.provider_dataset_id "
+        "FROM market_session_calendars c LEFT JOIN provider_datasets d "
+        "ON c.provider_dataset_id=d.provider_dataset_id LEFT JOIN upstream_services u "
+        "ON d.upstream_service_id=u.upstream_service_id WHERE c.calendar_revision_id=?",
+        (revision_id,),
+    ).fetchone()
+    if (row is None or row[15] != expected.provider_dataset_id
+            or row[1:3] != ("mainland-cn", "Asia/Shanghai") or row[4] != row[3]
+            or row[5] != "retrospective_backfill"
+            or row[8:15] != ("tushare", upstream, CALENDAR_DATASET_NAME,
+                           "not-applicable", 0, service, "")):
+        raise ValueError("prepared SSE calendar source mismatch")
+    raw = store.read_payload(row[6])
+    session_rows = connection.execute(
+        "SELECT session_date,session_status,opens_at,closes_at FROM market_sessions "
+        "WHERE calendar_revision_id=? ORDER BY session_date", (row[0],),
+    ).fetchall()
+    if not session_rows or any(item[2:] != (None, None) for item in session_rows):
+        raise ValueError("prepared SSE calendar membership invalid")
+    sessions = tuple(MarketSession(date.fromisoformat(item[0]), MarketSessionStatus(item[1]))
+                     for item in session_rows)
+    fields = [{"session_date": item.session_date.isoformat(), "status": item.status.value,
+               "opens_at": None, "closes_at": None} for item in sessions]
+    if (any(item[0] != session.session_date.isoformat() for item, session in zip(session_rows, sessions, strict=True))
+            or sha256(raw).hexdigest() != row[6]
+            or row[0] != revision_identity(RevisionKind.MARKET_SESSION_CALENDAR, {
+                "payload_digest": row[6], "provider_dataset_id": expected.provider_dataset_id,
+                "reference_market": row[1], "sessions": fields, "timezone_name": row[2]})):
+        raise ValueError("prepared SSE calendar revision mismatch")
+    run = connection.execute(
+        "SELECT provider_dataset_id,instrument_id,operation,provenance_class,requested_start,"
+        "requested_end,started_at,completed_at,status,payload_digest,error_code "
+        "FROM ingestion_runs WHERE run_id=?", (row[7],),
+    ).fetchone()
+    if (row[7] != revision_identity(RevisionKind.INGESTION_RUN, {
+            "calendar_revision_id": row[0], "observed_at": row[3], "operation": "calendar_refresh"})
+            or run != (expected.provider_dataset_id, None, "calendar_refresh", row[5],
+                       sessions[0].session_date.isoformat(), sessions[-1].session_date.isoformat(),
+                       row[3], row[3], "published", row[6], None)):
+        raise ValueError("prepared SSE calendar ingestion mismatch")
+    dates = {item.session_date for item in sessions}
+    first, last = sessions[0].session_date, sessions[-1].session_date
+    if (len(dates) != (last-first).days+1):
+        raise ValueError("prepared SSE calendar range incomplete")
+    calendar = _StoredSSECalendar(provider=expected, reference_market=row[1], timezone_name=row[2],
+        observed_at=datetime.fromisoformat(row[3]), provenance_class=ProvenanceClass.RETROSPECTIVE_BACKFILL,
+        raw_payload=raw, sessions=sessions, payload_contract=SSE_CALENDAR_PROOF,
+        endpoint="trade_cal", normalizer_version=NORMALIZER_VERSION, calendar_revision_id=row[0])
+    validate_calendar_evidence(calendar_evidence(calendar))
+    return calendar
+
+
+def read_prepared_sse_calendar(store, symbol, start, end):
+    """Read a separately prepared full SSE window for 601328, with no acquisition.
+
+    A partial latest revision or corrupt source is a refusal, not permission to
+    fall back to older data. No cross-revision union or new observation is made.
+    Other instruments and history modes retain their existing calendar path.
+    """
+    instrument = resolve_mainland_instrument(symbol) if symbol else None
+    if (store.config.mode is not MarketHistoryMode.CURRENT or instrument is None
+            or instrument.yahoo_symbol != SSE_CALENDAR_SYMBOL):
+        return None
+    if store.config.data_usage_mode.value != "personal_research":
+        raise ValueError("prepared SSE calendar usage not entitled")
+    if type(start) is not date or type(end) is not date or start > end:
+        raise ValueError("prepared SSE calendar range invalid")
+    rows = store._connection.execute(
+        "SELECT calendar_revision_id,observed_at FROM market_session_calendars "
+        "WHERE provider_dataset_id=? ORDER BY observed_at DESC,calendar_revision_id",
+        (prepared_sse_calendar_provider().provider_dataset_id,),
+    ).fetchall()
+    selected = None
+    for revision_id, observed_at in rows:
+        if selected is not None and observed_at != rows[0][1]:
+            break
+        calendar = verify_prepared_sse_revision(store, revision_id)
+        if calendar.sessions[0].session_date > start or calendar.sessions[-1].session_date < end:
+            raise ValueError("prepared SSE calendar range incomplete")
+        if selected is not None and calendar.sessions != selected.sessions:
+            raise ValueError("prepared SSE calendar equally recent conflict")
+        selected = calendar
+    return selected
+
+
 def calendar_evidence(calendar):
     provider = getattr(calendar, "provider", None)
     if provider is not None:
@@ -193,6 +323,8 @@ def calendar_evidence(calendar):
                           else "tushare-response-v1"), "provider": asdict(provider),
                  "provenance": calendar.provenance_class.value,
                  "raw_payload": calendar.raw_payload.decode("utf-8")}
+        if calendar.payload_contract == SSE_CALENDAR_PROOF:
+            proof.update(kind=SSE_CALENDAR_PROOF, symbol_scope=SSE_CALENDAR_SYMBOL)
     else:
         proof = {"kind": "verified-calendar-view-v1", "manifest": calendar.view_manifest_json,
                  "provenance": calendar.provenance_class.value}
@@ -233,14 +365,16 @@ def validate_calendar_evidence(evidence):
                 date.fromisoformat(manifest["start"]), date.fromisoformat(manifest["end"]))
         if calendar_evidence(restored.calendar) != evidence:
             raise ValueError("CURRENT view immutable source closure mismatch")
-    elif proof["kind"] == "tushare-response-v1":
+    elif proof["kind"] in {"tushare-response-v1", SSE_CALENDAR_PROOF}:
         from tradingagents.dataflows.tushare_market_history import (
             ADJUSTMENT_METHODOLOGY,
             CALENDAR_DATASET_NAME,
             NORMALIZER_VERSION,
             _identity,
         )
-        if set(proof) != {"kind", "provider", "provenance", "raw_payload"} or proof["provenance"] != "retrospective_backfill":
+        scoped = proof["kind"] == SSE_CALENDAR_PROOF
+        keys = {"kind", "provider", "provenance", "raw_payload"} | ({"symbol_scope"} if scoped else set())
+        if set(proof) != keys or proof["provenance"] != "retrospective_backfill":
             raise ValueError("Tushare calendar provenance")
         raw = proof["raw_payload"].encode("utf-8")
         if sha256(raw).hexdigest() != evidence["payload_sha256"]:
@@ -251,6 +385,9 @@ def validate_calendar_evidence(evidence):
         dates = {}
         exchanges = set()
         for row in payload["calendar"]:
+            text = row["cal_date"]
+            if not isinstance(text, str) or len(text) != 8 or not text.isascii() or not text.isdigit():
+                raise ValueError("Tushare calendar date")
             day = datetime.strptime(row["cal_date"], "%Y%m%d").date().isoformat()
             flag = Decimal(str(row["is_open"]))
             if day in dates or flag not in {Decimal(0), Decimal(1)}:
@@ -259,6 +396,8 @@ def validate_calendar_evidence(evidence):
             exchanges.add(row["exchange"])
         if len(exchanges) != 1 or next(iter(exchanges)) not in {"SSE", "SZSE", "BSE"}:
             raise ValueError("Tushare calendar exchange")
+        if scoped and (exchanges != {"SSE"} or proof["symbol_scope"] != SSE_CALENDAR_SYMBOL):
+            raise ValueError("prepared SSE calendar scope")
         upstream, service = upstream_service_identity_for_provider("tushare")
         expected = ProviderDatasetSpec(upstream, service, _identity("provider-dataset", upstream,
             CALENDAR_DATASET_NAME, "not-applicable", NORMALIZER_VERSION, next(iter(exchanges))),
@@ -266,6 +405,15 @@ def validate_calendar_evidence(evidence):
         if (proof["provider"] != asdict(expected) or evidence["provider_dataset_id"] != expected.provider_dataset_id
                 or evidence["sessions"] != [[day, dates[day], None] for day in sorted(dates)]):
             raise ValueError("Tushare calendar source binding")
+        if scoped:
+            from tradingagents.market_history.revisions import RevisionKind, revision_identity
+            expected_revision = revision_identity(RevisionKind.MARKET_SESSION_CALENDAR, {
+                "payload_digest": evidence["payload_sha256"], "provider_dataset_id": expected.provider_dataset_id,
+                "reference_market": evidence["reference_market"], "timezone_name": evidence["timezone"],
+                "sessions": [{"session_date": day, "status": dates[day], "opens_at": None, "closes_at": None}
+                             for day in sorted(dates)]})
+            if evidence["revision"] != expected_revision:
+                raise ValueError("prepared SSE calendar revision binding")
     elif proof["kind"] == "verified-calendar-view-v1":
         from tradingagents.market_history.calendar_discovery import (
             _calendar_view,
@@ -291,7 +439,7 @@ def validate_calendar_evidence(evidence):
         raise ValueError("unsupported calendar evidence")
 
 
-def validate_coverage(frame, evidence, start, end):
+def validate_coverage(frame, evidence, start, end, *, symbol=None):
     if set(evidence) != {"reference_market", "timezone", "provider_dataset_id", "revision",
                         "payload_sha256", "observed_at", "sessions", "proof"}:
         raise ValueError("calendar evidence shape")
@@ -299,6 +447,10 @@ def validate_coverage(frame, evidence, start, end):
             or not evidence["provider_dataset_id"] or len(evidence["payload_sha256"]) != 64):
         raise ValueError("calendar identity")
     validate_calendar_evidence(evidence)
+    if evidence["proof"]["kind"] == SSE_CALENDAR_PROOF:
+        instrument = resolve_mainland_instrument(symbol) if symbol else None
+        if instrument is None or instrument.yahoo_symbol != SSE_CALENDAR_SYMBOL:
+            raise ValueError("prepared SSE calendar instrument scope")
     as_of = _analysis_as_of(date.fromisoformat(end), timezone_name=evidence["timezone"])
     sessions = {}
     for day, status, closes_at in evidence["sessions"]:
@@ -322,7 +474,7 @@ def validate_coverage(frame, evidence, start, end):
 def encode(snapshot, descriptor, start, end, calendar, *, store=None):
     provider, instrument = binding(snapshot.symbol, snapshot.provider, descriptor, store=store)
     evidence = calendar_evidence(calendar)
-    validate_coverage(snapshot.frame, evidence, start, end)
+    validate_coverage(snapshot.frame, evidence, start, end, symbol=snapshot.symbol)
     status = snapshot.current_status_provenance
     metadata = {
         "contract": CONTRACT, "provider": asdict(provider), "instrument": asdict(instrument),
@@ -383,7 +535,7 @@ def decode(loaded, descriptor, symbol, start, end, minimum_rows=1):
             or _frame_sha256(frame) != stored.frame_digest
             or frame["Date"].max().strftime("%Y-%m-%d") != stored.effective_trading_date):
         raise ValueError("current cache frame mismatch")
-    validate_coverage(frame, metadata["calendar"], start, end)
+    validate_coverage(frame, metadata["calendar"], start, end, symbol=symbol)
     artifact = SourceArtifact.model_validate(metadata["source_artifact"])
     if artifact.raw_text != _normalized_frame_text(frame) or artifact.artifact_sha256 != stored.frame_digest:
         raise ValueError("current cache source artifact mismatch")

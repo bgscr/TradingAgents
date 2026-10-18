@@ -1873,7 +1873,7 @@ def _validate_history_candidate_window(candidate, provider, symbol, start_date, 
         raise ValueError("history candidate does not cover its requested open sessions")
 
 
-def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None):
+def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None, *, symbol=None):
     """Discover missing calendar membership only for explicitly enabled local reuse."""
     from tradingagents.market_history.calendar_discovery import ensure_mainland_calendar_window
     from tradingagents.market_history.config import (
@@ -1889,36 +1889,43 @@ def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None):
         raise ValueError("calendar discovery requires explicitly enabled history reuse")
     if config.data_usage_mode is not DataUsageMode.PERSONAL_RESEARCH:
         raise ValueError("calendar usage not entitled")
-    with MarketHistoryStore.open(config) as store, MarketHistoryStore.open_provider_request_authority(config) as authority:
-        previous = {row[0] for row in authority._connection.execute("SELECT attempt_event_id FROM provider_request_attempts")}
-        class ObservedCalendarCoordinator(ProviderRequestCoordinator):
-            def execute_physical_workflow(self, **kwargs):
-                from tradingagents.market_history.coordinator import PhysicalAttemptBudgetExhausted
-                try:
-                    result = super().execute_physical_workflow(**kwargs)
-                except PhysicalAttemptBudgetExhausted as exc:
-                    observe(exc.attempt_events)
-                    raise
-                observe(result.attempt_events)
-                return result
+    with MarketHistoryStore.open(config) as store:
+        from tradingagents.market_history.current_cache import read_prepared_sse_calendar
+        prepared = read_prepared_sse_calendar(store, symbol, date.fromisoformat(start_date), date.fromisoformat(end_date))
+        if prepared is not None:
+            return prepared
+        with MarketHistoryStore.open_provider_request_authority(config) as authority:
+            previous = {row[0] for row in authority._connection.execute("SELECT attempt_event_id FROM provider_request_attempts")}
+            class ObservedCalendarCoordinator(ProviderRequestCoordinator):
+                def execute_physical_workflow(self, **kwargs):
+                    from tradingagents.market_history.coordinator import (
+                        PhysicalAttemptBudgetExhausted,
+                    )
+                    try:
+                        result = super().execute_physical_workflow(**kwargs)
+                    except PhysicalAttemptBudgetExhausted as exc:
+                        observe(exc.attempt_events)
+                        raise
+                    observe(result.attempt_events)
+                    return result
 
-        def observe(events):
-            if attempt_observer is not None:
-                attempt_observer(tuple(event for event in events if event.attempt_event_id not in previous))
+            def observe(events):
+                if attempt_observer is not None:
+                    attempt_observer(tuple(event for event in events if event.attempt_event_id not in previous))
 
-        coordinator = ObservedCalendarCoordinator(authority)
-        from tradingagents.dataflows.baostock_calendar import (
-            BaoStockSessionCalendarAcquisitionError,
-        )
-        try:
-            return ensure_mainland_calendar_window(store, date.fromisoformat(start_date), date.fromisoformat(end_date),
-                coordinator=coordinator, owner_id=f"calendar:{uuid4().hex}", now=_coordinator_now, sleep=_coordinator_sleep)
-        except BaoStockSessionCalendarAcquisitionError as exc:
-            reason = _ACQUISITION_REASON_BY_PHYSICAL_OUTCOME.get(exc.physical_outcome,
-                AcquisitionUnavailableReason.UPSTREAM_BUSY if exc.reason.value == "provider_cooldown_active"
-                else AcquisitionUnavailableReason.PROVIDER_ERROR)
-            raise AcquisitionFailure(reason=reason, error_code=exc.reason.value,
-                retryable=exc.retryable, retry_after_seconds=exc.retry_after_seconds) from exc
+            coordinator = ObservedCalendarCoordinator(authority)
+            from tradingagents.dataflows.baostock_calendar import (
+                BaoStockSessionCalendarAcquisitionError,
+            )
+            try:
+                return ensure_mainland_calendar_window(store, date.fromisoformat(start_date), date.fromisoformat(end_date),
+                    coordinator=coordinator, owner_id=f"calendar:{uuid4().hex}", now=_coordinator_now, sleep=_coordinator_sleep)
+            except BaoStockSessionCalendarAcquisitionError as exc:
+                reason = _ACQUISITION_REASON_BY_PHYSICAL_OUTCOME.get(exc.physical_outcome,
+                    AcquisitionUnavailableReason.UPSTREAM_BUSY if exc.reason.value == "provider_cooldown_active"
+                    else AcquisitionUnavailableReason.PROVIDER_ERROR)
+                raise AcquisitionFailure(reason=reason, error_code=exc.reason.value,
+                    retryable=exc.retryable, retry_after_seconds=exc.retry_after_seconds) from exc
 
 
 def _load_complete_history_window(provider_name, provider, symbol, start_date, end_date,
@@ -2178,8 +2185,8 @@ def _acquire_authoritative_market_snapshot(
                     validate_coverage,
                 )
                 calendar = (raw_candidate.calendar if provider_name == "tushare" and hasattr(raw_candidate, "calendar")
-                            else _ensure_analysis_calendar(start_date, end_date, observe_physical_attempts))
-                validate_coverage(validated, calendar_evidence(calendar), start_date, end_date)
+                            else _ensure_analysis_calendar(start_date, end_date, observe_physical_attempts, symbol=symbol))
+                validate_coverage(validated, calendar_evidence(calendar), start_date, end_date, symbol=symbol)
                 validated_calendars[provider_name] = calendar
             blocking_gap_dates = (
                 _blocking_live_history_gaps(

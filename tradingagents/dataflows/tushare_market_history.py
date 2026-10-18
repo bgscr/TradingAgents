@@ -338,19 +338,36 @@ def load_calendar(symbol, start_date, end_date, *, provider=None, request_execut
     """Acquire calendar membership without making an instrument-price request."""
     security = _instrument(symbol)
     exchange = "SSE" if security.exchange == "shanghai" else "SZSE"
+    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    if start > end:
+        raise ValueError("invalid CURRENT calendar range")
     source = provider if provider is not None else TushareProvider.create(PITConfig.from_env())
+    page_dates = {}
+
+    def check_rows(rows, seen):
+        for row in rows:
+            day = _day(row["cal_date"])
+            flag = _decimal(row["is_open"])
+            if row["exchange"] != exchange or not start <= day <= end or flag not in (0, 1) or day in seen:
+                raise ValueError("invalid CURRENT calendar membership")
+            seen[day] = str(int(flag))
+
+    # Check physical pages before the provider's generic concatenation deduplicates
+    # them. Duplicate dates (including identical rows across pages) are not evidence.
+    def execute(endpoint, request):
+        def checked():
+            frame = request()
+            rows = _rows(frame, ("exchange", "cal_date", "is_open"), allow_empty=True)
+            check_rows(rows, page_dates)
+            return frame
+        return request_executor(endpoint, checked) if request_executor else checked()
+
     frame = source.fetch_range("trade_cal", exchange=exchange,
         start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""),
-        request_executor=request_executor)
+        request_executor=execute)
     rows = _rows(frame, ("exchange", "cal_date", "is_open"))
-    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
     result = {}
-    for row in rows:
-        day = _day(row["cal_date"])
-        flag = _decimal(row["is_open"])
-        if row["exchange"] != exchange or not start <= day <= end or flag not in (0, 1) or day in result:
-            raise ValueError("invalid CURRENT calendar membership")
-        result[day] = str(int(flag))
+    check_rows(rows, result)
     if set(result) != {start + timedelta(days=index) for index in range((end-start).days+1)}:
         raise ValueError("CURRENT calendar acquisition incomplete")
     binding, _ = history_binding(symbol)

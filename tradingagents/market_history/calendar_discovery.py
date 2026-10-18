@@ -144,19 +144,35 @@ def _validate_window(store: MarketHistoryStore, start: date, end: date) -> None:
 def _read_verified_membership(
     store: MarketHistoryStore, start: date, end: date,
 ) -> dict[date, tuple[MarketSession, StoredSessionCalendar]]:
-    # Read all relevant immutable revisions, not just the latest revision whose
-    # narrower range may have displaced older coverage in a latest-only lookup.
-    revision_ids = tuple(str(row[0]) for row in store._connection.execute(
-        "SELECT c.calendar_revision_id FROM market_session_calendars AS c "
-        "WHERE c.reference_market = ? AND EXISTS ("
-        "SELECT 1 FROM market_sessions AS s "
-        "WHERE s.calendar_revision_id = c.calendar_revision_id "
-        "AND s.session_date >= ? AND s.session_date <= ?) "
-        "ORDER BY c.observed_at DESC, c.calendar_revision_id DESC",
-        (MAINLAND_REFERENCE_MARKET, start.isoformat(), end.isoformat()),
-    ))
+    from tradingagents.market_history.current_cache import (
+        prepared_sse_calendar_provider,
+        verify_prepared_sse_revision,
+    )
+
+    # Preserve all relevant candidates before selecting source families. Request
+    # bounds/empty membership keep a damaged revision visible to validation.
+    revisions = store._connection.execute(
+        "SELECT c.calendar_revision_id,c.provider_dataset_id FROM market_session_calendars AS c "
+        "WHERE c.reference_market = ? AND (EXISTS ("
+        "SELECT 1 FROM market_sessions s WHERE s.calendar_revision_id=c.calendar_revision_id "
+        "AND s.session_date BETWEEN ? AND ?) OR EXISTS ("
+        "SELECT 1 FROM ingestion_runs r WHERE r.run_id=c.ingestion_run_id "
+        "AND r.requested_start<=? AND r.requested_end>=?) OR NOT EXISTS ("
+        "SELECT 1 FROM market_sessions s WHERE s.calendar_revision_id=c.calendar_revision_id)) "
+        "ORDER BY c.observed_at DESC,c.calendar_revision_id DESC",
+        (MAINLAND_REFERENCE_MARKET, start.isoformat(), end.isoformat(), end.isoformat(), start.isoformat()),
+    ).fetchall()
+    separate_sse_dataset = prepared_sse_calendar_provider().provider_dataset_id
     membership: dict[date, tuple[MarketSession, StoredSessionCalendar]] = {}
-    for revision_id in revision_ids:
+    for revision_id, dataset_id in revisions:
+        if dataset_id == separate_sse_dataset:
+            # Validate BEFORE excluding: relabeling a corrupt BaoStock record as
+            # Tushare must not hide it. This never adds SSE sessions to this view.
+            try:
+                verify_prepared_sse_revision(store, revision_id)
+            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                raise _integrity_failure() from exc
+            continue
         calendar = _read_verified_revision(store, revision_id)
         for session in calendar.sessions:
             day = session.session_date

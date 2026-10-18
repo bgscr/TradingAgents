@@ -164,7 +164,7 @@ def _market_cache_status(store, config, symbol, start, end, calendar, provider_n
         as_of = _analysis_as_of(end, timezone_name=calendar.timezone_name)
         expected = {
             session.session_date for session in calendar.sessions
-            if session.status is MarketSessionStatus.OPEN
+            if start <= session.session_date <= end and session.status is MarketSessionStatus.OPEN
             and (session.closes_at or datetime.fromisoformat(
                 session.session_date.isoformat() + "T15:00:00+08:00"
             )) <= as_of
@@ -177,7 +177,10 @@ def _market_cache_status(store, config, symbol, start, end, calendar, provider_n
 def _inspect_market(config, symbol, start, end, issues, checked):
     from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
     from tradingagents.market_history.calendar_discovery import read_mainland_calendar_window
-    from tradingagents.market_history.current_cache import compatibility_diagnostic
+    from tradingagents.market_history.current_cache import (
+        compatibility_diagnostic,
+        read_prepared_sse_calendar,
+    )
 
     if resolve_mainland_instrument(symbol) is None:
         issues.append(BudgetReadinessIssue("market", "non_mainland_context_not_supported"))
@@ -189,7 +192,9 @@ def _inspect_market(config, symbol, start, end, issues, checked):
         chain = _market_chain(config)
         with _readonly_history(config) as store:
             try:
-                calendar = read_mainland_calendar_window(store, start, end)
+                calendar = read_prepared_sse_calendar(store, symbol, start, end)
+                if calendar is None:
+                    calendar = read_mainland_calendar_window(store, start, end)
                 if calendar is None:
                     issues.append(BudgetReadinessIssue("calendar", "incomplete_natural_date_window"))
                 elif calendar.observed_at > datetime.now(timezone.utc):
