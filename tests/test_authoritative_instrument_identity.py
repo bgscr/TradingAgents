@@ -434,9 +434,11 @@ def test_graph_evidence_resolution_uses_its_injected_policy_history_floor():
         )
     )
     graph = SimpleNamespace(
+        config=copy.deepcopy(default_config.DEFAULT_CONFIG),
         decision_policy=custom_policy,
         decision_horizon=DEFAULT_DECISION_HORIZON,
     )
+    assert graph.config["analysis_budget_enabled"] is False
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     set_config(
         {

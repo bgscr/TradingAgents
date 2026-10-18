@@ -1954,6 +1954,8 @@ def test_unpinned_identity_enrichment_does_not_trigger_market_acquisition(monkey
     agent_utils.resolve_instrument_identity.cache_clear()
 
     graph = object.__new__(TradingAgentsGraph)
+    graph.config = DEFAULT_CONFIG.copy()
+    assert graph.config["analysis_budget_enabled"] is False
     graph.decision_policy = MagicMock()
     evidence = graph.resolve_evidence_state(
         "000725.SZ",

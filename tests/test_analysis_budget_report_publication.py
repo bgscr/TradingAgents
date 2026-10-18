@@ -35,8 +35,11 @@ def test_budget_graph_publishes_with_modeled_handles(tmp_path, monkeypatch, duri
         assert state["terminal_outcome_kind"] == "trading_decision"
         assert state["evidence_preflight"]["passed"] and state["admission_gate"]["admitted"]
         analysis_receipt = graph.last_analysis_budget
-        assert analysis_receipt["model_attempts"] == len(wire.model_calls) == 18
-        assert analysis_receipt["data_attempts"] == len(wire.data_calls) == 6
+        # The shared budget fixture exercises every bound tool without a
+        # deliberate schema repair: 17 model + 13 data physical sends.
+        assert analysis_receipt["model_attempts"] == len(wire.model_calls) == 17
+        assert analysis_receipt["data_attempts"] == len(wire.data_calls) == 13
+        assert analysis_receipt["admitted_attempts"] == 30
         assert len(analysis_receipt["financial_cache_hits"]) == 3
         assert len(wire.financial_calls) == 3 and not wire.seeding
 
@@ -82,7 +85,7 @@ def test_budget_graph_publishes_with_modeled_handles(tmp_path, monkeypatch, duri
                 assert publication_budget.receipt()["stop_reason"] is None
         assert active_budget() is None
         assert graph.last_analysis_budget == analysis_receipt
-        assert len(wire.model_calls) == 18 and len(wire.data_calls) == 6
+        assert len(wire.model_calls) == 17 and len(wire.data_calls) == 13
         assert len(wire.financial_calls) == 3
         _assert_cache_unchanged(cache, before)
         (tmp_path / "publication-observation.json").write_text(json.dumps({
