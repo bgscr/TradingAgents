@@ -35,6 +35,30 @@ from tradingagents.policy_evidence_acquisition import (
 )
 from tradingagents.policy_qualified_contract import BytePin, canonical_bytes, content_identity
 
+_HELD_FIELDS = (
+    "handle_volume_serial", "handle_file_index", "st_dev", "st_ino", "st_size",
+    "st_mtime_ns", "st_ctime_ns", "st_file_attributes",
+)
+_HELD_ROLES = frozenset({
+    "ordinary_file", "ordinary_directory", "ancestor", "junction_root",
+    "junction_parent", "junction_target", "unknown",
+})
+
+
+class _HeldMeasurementChanged(ValueError):
+    """Same rejection, with finite labels only; never retain observed values."""
+
+    def __init__(self, fields, role):
+        super().__init__("held measurement object changed during acquisition")
+        self.changed_fields = tuple(name for name in _HELD_FIELDS if name in fields)
+        self.object_role = role if type(role) is str and role in _HELD_ROLES else "unknown"
+
+
+def _held_error_details(error):
+    if type(error) is _HeldMeasurementChanged:
+        return {"changed_fields": list(error.changed_fields), "object_role": error.object_role}
+    return {}
+
 
 def _information(handle):
     api, Info = _file_api()
@@ -60,7 +84,7 @@ def _available_local(path):
 
 
 @contextmanager
-def _held(path, directory):
+def _held(path, directory, *, role=None):
     """Ordinary measurement handle with no-recall and unchanged alias protections."""
     before = _available_local(path)
     if (
@@ -90,22 +114,40 @@ def _held(path, directory):
         after = _available_local(path)
         if _security(handle) != security_before:
             raise ValueError("held ordinary security descriptor changed during acquisition")
-        if _identity(handle) != original or (
+        current = _identity(handle)
+        object_role = role if role is not None else (
+            "ordinary_directory" if directory else "ordinary_file"
+        )
+        if current != original:
+            # Preserve the original short-circuit: do not inspect metadata here.
+            fields = tuple(
+                "handle_" + name for name in ("volume_serial", "file_index")
+                if current[name] != original[name]
+            )
+            raise _HeldMeasurementChanged(fields, object_role)
+        before_metadata = (
             before.st_dev,
             before.st_ino,
             before.st_size,
             before.st_mtime_ns,
             before.st_ctime_ns,
             before.st_file_attributes,
-        ) != (
+        )
+        after_metadata = (
             after.st_dev,
             after.st_ino,
             after.st_size,
             after.st_mtime_ns,
             after.st_ctime_ns,
             after.st_file_attributes,
-        ):
-            raise ValueError("held measurement object changed during acquisition")
+        )
+        if before_metadata != after_metadata:
+            fields = tuple(
+                name for name, left, right in zip(
+                    _HELD_FIELDS[2:], before_metadata, after_metadata, strict=True
+                ) if left != right
+            )
+            raise _HeldMeasurementChanged(fields, object_role)
     finally:
         api.CloseHandle(handle)
 
@@ -116,7 +158,7 @@ def _ancestors(path):
         raise ValueError("finite ordinary ancestor depth exhausted")
     with ExitStack() as stack:
         for parent in reversed(path.parents):
-            stack.enter_context(_held(parent, True))
+            stack.enter_context(_held(parent, True, role="ancestor"))
         yield
 
 
@@ -220,7 +262,7 @@ def _link_object(path):
         api.CloseHandle(handle)
 
 
-def _hold_chain(stack, root, path, *, maximum_depth=128):
+def _hold_chain(stack, root, path, *, maximum_depth=128, role="junction_parent"):
     relative = path.relative_to(root)
     if len(relative.parts) > maximum_depth:
         raise ValueError("native containment depth exceeds contract")
@@ -230,7 +272,7 @@ def _hold_chain(stack, root, path, *, maximum_depth=128):
         relative_parts(part)
         current = current / part
         try:
-            final = stack.enter_context(_held(current, True))
+            final = stack.enter_context(_held(current, True, role=role))
         except ValueError as error:
             raise ValueError(
                 "indirect/cyclic/aliased containment component is forbidden"
@@ -252,7 +294,7 @@ def measure_junction(root: Path, path: Path, *, maximum_depth: int = 128) -> dic
         raise ValueError("link is outside exact measurement root")
     with ExitStack() as stack:
         stack.enter_context(_ancestors(root))
-        root_handle, _, _ = stack.enter_context(_held(root, True))
+        root_handle, _, _ = stack.enter_context(_held(root, True, role="junction_root"))
         _hold_chain(stack, root, path.parent, maximum_depth=maximum_depth)
         handle, before, metadata, raw = stack.enter_context(_link_object(path))
         target = Path(parse_mount_point(raw))
@@ -260,7 +302,9 @@ def measure_junction(root: Path, path: Path, *, maximum_depth: int = 128) -> dic
             raise ValueError("reparse target escapes exact protected root")
         if target == path or path.parent == target or path.parent.is_relative_to(target):
             raise ValueError("reparse target cycle")
-        held_target = _hold_chain(stack, root, target, maximum_depth=maximum_depth)
+        held_target = _hold_chain(
+            stack, root, target, maximum_depth=maximum_depth, role="junction_target"
+        )
         target_handle = root_handle if held_target is None else held_target[0]
         root_identity, target_identity = _identity(root_handle), _identity(target_handle)
         if (
@@ -415,7 +459,10 @@ def capture_coverage(
                         or getattr(error, "errno", None),
                     }
                 )
-                errors.append({"root": str(root), "path": relative, "error": str(error)})
+                errors.append({
+                    "root": str(root), "path": relative, "error": str(error),
+                    **_held_error_details(error),
+                })
                 if isinstance(error, TimeoutError):
                     raise
 
@@ -423,7 +470,9 @@ def capture_coverage(
             with _ancestors(root):
                 walk(root)
         except (OSError, ValueError, TimeoutError) as error:
-            errors.append({"root": str(root), "error": str(error)})
+            errors.append({
+                "root": str(root), "error": str(error), **_held_error_details(error),
+            })
         rows.sort(key=lambda row: (row["path"].casefold(), row["kind"]))
         inventories.append(
             {

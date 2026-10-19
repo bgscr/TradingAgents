@@ -326,8 +326,29 @@ def test_source_locked_module_help_succeeds_with_announcements_disabled() -> Non
         env=environment,
         stdin=subprocess.DEVNULL,
         capture_output=True,
-        text=True,
+        text=False,
         check=False,
     )
 
     assert probe.returncode == 0, probe.stdout + probe.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("returncode", (0, 1))
+def test_source_locked_help_preserves_non_text_output(monkeypatch, returncode):
+    """Exercise the existing probe contract without launching a child process."""
+    output = b"stdout\x90"
+    errors = b"stderr\xff"
+
+    def fake_run(command, **kwargs):
+        assert kwargs["text"] is False
+        assert kwargs["capture_output"] is True
+        return subprocess.CompletedProcess(command, returncode, output, errors)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if returncode:
+        with pytest.raises(AssertionError) as failure:
+            test_source_locked_module_help_succeeds_with_announcements_disabled()
+        assert str(failure.value).splitlines()[0] == repr(output + errors)
+    else:
+        test_source_locked_module_help_succeeds_with_announcements_disabled()

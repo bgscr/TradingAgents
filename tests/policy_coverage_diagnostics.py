@@ -85,6 +85,30 @@ _KNOWN_GUARDS = frozenset(
 _OS_CODE = re.compile(r"\A\[(WinError|Errno) (-?[0-9]{1,10})\](?: |$)")
 
 
+# Independent output allowlist: do not import a native collector to render errors.
+_HELD_FIELDS = frozenset({
+    "handle_volume_serial", "handle_file_index", "st_dev", "st_ino", "st_size",
+    "st_mtime_ns", "st_ctime_ns", "st_file_attributes",
+})
+_HELD_ROLES = frozenset({
+    "ordinary_file", "ordinary_directory", "ancestor", "junction_root",
+    "junction_parent", "junction_target", "unknown",
+})
+
+
+def _safe_held_details(error):
+    fields = error.get("changed_fields")
+    role = error.get("object_role")
+    if (
+        type(fields) is list and 0 < len(fields) <= len(_HELD_FIELDS)
+        and all(type(name) is str and name in _HELD_FIELDS for name in fields)
+        and len(set(fields)) == len(fields)
+        and type(role) is str and role in _HELD_ROLES
+    ):
+        return {"changed_fields": list(fields), "object_role": role}
+    return {}
+
+
 def _safe_error(error):
     result = {"stage": "unknown", "message_kind": "invalid"}
     if type(error) is not dict:
@@ -104,6 +128,8 @@ def _safe_error(error):
         result["message_kind"] = "oversized"
     elif message in _KNOWN_GUARDS:
         result.update(message_kind="known_guard", guard=message)
+        if message == "held measurement object changed during acquisition":
+            result.update(_safe_held_details(error))
     else:
         match = _OS_CODE.match(message)
         if match and -(2**31) <= int(match[2]) <= 2**32 - 1:
