@@ -6,3 +6,7 @@ config/crypto_identity_registry.sha256 text eol=lf
 tradingagents/config/crypto_identity_registry.json text eol=lf
 tradingagents/config/crypto_identity_registry.sha256 text eol=lf
 tests/fixtures/recorded_runs/[0-9a-f]*.json text eol=lf
+
+# Keep synthetic CURRENT qualification artifacts byte-stable.
+tradingagents/market_history/current_cache_compatibility.json text eol=lf
+tradingagents/market_history/current-cache-matrix-evidence.json text eol=lf
