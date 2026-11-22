@@ -35,8 +35,21 @@ LEGACY_FILES = (
 )
 
 
-def write_advisory_draft(root, filename, text):
+def write_advisory_draft(root, filename, text, *, state=None, config=None, section_name=None, language="English"):
     """Keep streaming stage revisions without replacing legacy root aliases."""
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_output_enabled,
+        has_finite_material,
+        validate_stage_text,
+    )
+    if finite_output_enabled(config) or (state is not None and has_finite_material(state)):
+        if state is None or section_name is None:
+            raise ValueError("finite draft requires bound stage state")
+        from tradingagents.report_presentation import advisory_markdown
+        content = state.get(section_name)
+        validate_stage_text(section_name, content, state, config)
+        if filename != section_name + ".md" or text != advisory_markdown(section_name, content, language):
+            raise ValueError("finite draft differs from bounded stage rendering")
     data = text.encode("utf-8")
     relative = f"advisory_drafts/{uuid.uuid4().hex}/{filename}"
     with ReportStore(root) as store:
@@ -51,7 +64,23 @@ def preflight_report_paths(store):
         store.inspect(path)
 
 
-def publish_report_export(store, identity, language, documents, stages):
+def publish_report_export(store, identity, language, documents, stages, *, state=None, config=None):
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_export_documents,
+        finite_output_enabled,
+        has_finite_material,
+        publication_projection,
+    )
+    finite_projection = None
+    if finite_output_enabled(config) or "finite_publication.json" in documents or (state is not None and has_finite_material(state)):
+        if state is None:
+            raise ValueError("finite export requires bound state")
+        expected_documents, expected_stages = finite_export_documents(state, language, config)
+        if documents != expected_documents or list(stages) != expected_stages:
+            raise ValueError("finite export documents differ from bounded templates")
+        if identity.run_id != state.get("run_id") or identity.audit_digest != state.get("decision_audit_sha256"):
+            raise ValueError("finite export identity differs from validated state")
+        finite_projection = publication_projection(state, config)
     label = "本次导出清单" if is_chinese(language) else "This export manifest"
     note = (
         "本次阶段正文仅以同目录清单列出的文件为准。其他版本、根目录旧报告与别名文件均保留，不属于本次导出。"
@@ -79,6 +108,8 @@ def publish_report_export(store, identity, language, documents, stages):
         },
         "streaming_drafts": "advisory_drafts are historical, not current stage exports",
     }
+    if finite_projection is not None:
+        manifest["finite_publication"] = finite_projection
     canonical = json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     content_id = sha256(canonical.encode("utf-8")).hexdigest()
     export_id = uuid.uuid4().hex

@@ -320,6 +320,10 @@ class FinancialDispatchToolNode:
             )
 
     def __call__(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        from tradingagents.dataflows.finite_disclosure_cache import enabled
+        if enabled(self._config or {}):
+            from tradingagents.dataflows.finite_disclosure_tools import dispatch_finite_node
+            return dispatch_finite_node(state, self._config)
         messages = state.get("messages") or ()
         if not messages:
             raise ValueError("financial tool node requires a model tool-call message")

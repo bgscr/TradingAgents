@@ -115,7 +115,17 @@ class GraphSetup:
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_direction_selector()
+        direction_selector_node = create_direction_selector()
+
+        def portfolio_manager_node(state):
+            from tradingagents.agents.finite_disclosure_advisory import (
+                finite_advisory_update,
+                is_finite_state,
+            )
+            if not is_finite_state(state):
+                return direction_selector_node(state)
+            advisory = finite_advisory_update(self.deep_thinking_llm, 'portfolio_manager', state)
+            return {**advisory, **direction_selector_node({**state, **advisory})}
         decision_gate_node = create_decision_gate_node(
             self.decision_policy,
             evidence_gate_mode=self.evidence_gate_mode,

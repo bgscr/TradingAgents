@@ -74,6 +74,9 @@ def create_preflight_gate_node(
     policy = decision_policy if decision_policy is not None else DecisionPolicyEngine()
 
     def preflight_gate_node(state: dict) -> dict:
+        from tradingagents.finite_disclosure_runtime import is_finite_state, require_context
+        if is_finite_state(state):
+            require_context(state)
         evidence = _evidence_from_state(state.get("evidence_state", {}))
         effective_minimum_history_rows = minimum_history_rows
         applicable_history_rows = None
@@ -196,6 +199,18 @@ def create_admission_gate_node(
         )
 
     def admission_gate_node(state: dict) -> dict:
+        from tradingagents.finite_disclosure_runtime import (
+            is_finite_state,
+            require_context,
+            validate_finite_envelope,
+        )
+        if is_finite_state(state):
+            require_context(state)
+            finite = _evidence_from_state(state.get('evidence_state',{}))
+            if not finite.finite_cache_reads:
+                raise ValueError('finite_cache_evidence_required')
+            for read in finite.finite_cache_reads:
+                validate_finite_envelope(read.model_dump(mode='json'))
         evidence = _evidence_from_state(state.get("evidence_state", {}))
         gate = evaluate_admission_gate(evidence, minimum_history_rows)
         context = None

@@ -313,6 +313,10 @@ def get_vendor(category: str, method: str = None, market: str | None = None) -> 
 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
+    from .finite_disclosure_cache import enabled
+    from .finite_disclosure_tools import FINITE_TOOLS, route_finite_tool
+    if enabled(get_config()) and method in FINITE_TOOLS:
+        return route_finite_tool(get_config(), method, *args, **kwargs)
     if method == 'get_news' and _powershell_news_selected():
         from tradingagents.powershell_news import acquire_powershell_news
 

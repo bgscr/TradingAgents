@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import LLMResult
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.dataflows.finite_disclosure_contracts import FiniteDisclosureCacheEvidence
 from tradingagents.evidence import (
     ACQUISITION_TOKEN_PATTERN,
     AcquisitionUnavailableReason,
@@ -336,10 +337,13 @@ class StageTelemetry(BaseModel):
     cost: TelemetryCost
 
 
+
+
 class RunTelemetryProjection(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0", "1.1"] = RUN_TELEMETRY_CONTRACT_VERSION
+    finite_cache_reads: tuple[FiniteDisclosureCacheEvidence, ...] = Field(default=(),exclude_if=lambda value:not value)
     terminal_route: RunTelemetryTerminalRoute | None = None
     acquisition: AcquisitionTelemetryProjection
     stages: dict[str, StageTelemetry] = Field(default_factory=dict)
@@ -381,6 +385,7 @@ class RunTelemetryLedger:
 
     def __init__(self) -> None:
         self._events: list[AcquisitionTelemetryEvent] = []
+        self._finite_cache_reads = []
         self._current_stage = "unassigned"
         self._stages: dict[str, dict[str, float | int]] = {}
         self._next_model_transport_call = 1
@@ -395,6 +400,11 @@ class RunTelemetryLedger:
         self._model_transport_retries_observed = 0
         self._model_transport_dropped_records = 0
         self._lock = Lock()
+
+    def record_finite_cache_read(self, envelope):
+        with self._lock:
+            if envelope not in self._finite_cache_reads:
+                self._finite_cache_reads.append(envelope)
 
     def begin_model_transport_call(self) -> str:
         """Allocate a deterministic run-local identity for one logical model call."""
@@ -641,6 +651,7 @@ class RunTelemetryLedger:
             ),
         )
         return RunTelemetryProjection(
+            finite_cache_reads=tuple(self._finite_cache_reads),
             terminal_route=terminal_route,
             acquisition=AcquisitionTelemetryProjection(
                 events=events,

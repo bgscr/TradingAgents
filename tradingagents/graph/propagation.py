@@ -134,6 +134,15 @@ class Propagator:
             "sentiment_report": "",
             "news_report": "",
         }
+        from tradingagents.dataflows.config import get_config
+        from tradingagents.dataflows.finite_disclosure_cache import enabled
+        if enabled(get_config()):
+            from tradingagents.finite_disclosure_runtime import context_binding
+            state['finite_disclosure_context'] = context_binding(get_config())
+            state['finite_analyst_selections'] = {}
+            state['finite_advisory_trace'] = []
+            state['portfolio_advisory'] = ''
+            state['past_context'] = ''
         if financial_eligibility_binding is not None:
             state["financial_eligibility_binding"] = (
                 financial_eligibility_binding.model_dump(mode="json")

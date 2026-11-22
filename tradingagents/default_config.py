@@ -456,3 +456,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
 # This file is an operator's explicit local selection, not a product default.
 if not _OFFLINE_TEST_PROFILE_DISABLED:
     DEFAULT_CONFIG = _apply_local_analysis_overrides(DEFAULT_CONFIG)
+
+# Explicit selection only. No environment or local-file auto-activation.
+DEFAULT_CONFIG["finite_disclosure_profile"] = None
+
+def select_finite_disclosure_profile(config: dict, profile: str) -> dict:
+    """Select the installed finite profile without provider or model work."""
+    from tradingagents.dataflows.finite_disclosure_cache import select_profile
+    return select_profile(config, profile)
+

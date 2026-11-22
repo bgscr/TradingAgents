@@ -32,6 +32,9 @@ def create_news_analyst(llm):
             get_macro_indicators,
             get_prediction_markets,
         ]
+        from tradingagents.finite_disclosure_runtime import finite_analyst_step, is_finite_state
+        if is_finite_state(state):
+            return finite_analyst_step(llm,'news',state,data_tools)
         tools = [*data_tools, AnalystEvidenceReport]
 
         system_message = (

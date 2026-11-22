@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from tradingagents.agents.finite_disclosure_advisory import (
+    finite_advisory_update,
+    is_finite_state,
+)
 from tradingagents.agents.schemas import ResearchPlan, render_research_plan
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
@@ -18,6 +22,8 @@ def create_research_manager(llm):
     structured_llm = bind_structured(llm, ResearchPlan, "Research Manager")
 
     def research_manager_node(state) -> dict:
+        if is_finite_state(state):
+            return finite_advisory_update(llm, "research_manager", state)
         instrument_context = get_instrument_context_from_state(state)
         history = state["investment_debate_state"].get("history", "")
 

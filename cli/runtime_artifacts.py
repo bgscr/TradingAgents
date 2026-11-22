@@ -106,8 +106,20 @@ def _persist_encoded_runtime_artifact(
     return len(compressed), created, True
 
 
-def persist_runtime_artifact(artifact_root: Path, payload: Any) -> str:
+def persist_runtime_artifact(artifact_root: Path, payload: Any, *, config=None, state=None) -> str:
     """Persist an exact JSON payload inside the designated raw-artifact boundary."""
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_output_enabled,
+        has_finite_material,
+        publication_projection,
+    )
+    if finite_output_enabled(config) or (state is not None and has_finite_material(state)):
+        if state is None:
+            payload = {"contract": "finite-runtime-event-v2", "content": "unbound callback payload withheld"}
+        else:
+            expected = publication_projection(state, config)
+            if payload != expected:
+                raise ValueError("finite runtime payload differs from validated projection")
     encoded, digest = _encode_runtime_artifact(payload)
     _persist_encoded_runtime_artifact(artifact_root, encoded, digest)
     return digest
@@ -168,7 +180,14 @@ class RuntimeArtifactWriter:
         batch_size: int = 32,
         flush_interval_seconds: float = 0.25,
         metrics_path: Path | None = None,
+        config=None,
     ) -> None:
+        from tradingagents.dataflows.finite_disclosure_output import (
+            finite_output_enabled,
+            publication_config,
+        )
+        self._publication_config = dict(publication_config(config))
+        self._finite_mode = finite_output_enabled(self._publication_config)
         self.artifact_root = Path(artifact_root)
         self.log_paths = tuple(Path(path) for path in log_paths)
         self.preview_chars = preview_chars
@@ -216,12 +235,27 @@ class RuntimeArtifactWriter:
         )
         self._worker.start()
 
+    def record_validated_state(self, state) -> None:
+        from tradingagents.dataflows.finite_disclosure_output import (
+            ANALYST_REPORTS,
+            publication_projection,
+        )
+        projection = publication_projection(state, self._publication_config)
+        if projection is None:
+            return
+        projection["reports"] = {field: state[field] for field in ANALYST_REPORTS.values() if state.get(field)}
+        projection["portfolio_advisory"] = state.get("portfolio_advisory", "")
+        self._enqueue(_QueuedEvent("advisory", ("", "Validated finite stages", json.dumps(projection, ensure_ascii=True, sort_keys=True))))
+
     def record_tool_call(
         self,
         timestamp: str,
         tool_name: str,
         payload: Any,
     ) -> None:
+        if self._finite_mode:
+            self.record_message("", "System", "")
+            return
         self._enqueue(
             _QueuedEvent(
                 "tool",
@@ -230,6 +264,9 @@ class RuntimeArtifactWriter:
         )
 
     def record_message(self, timestamp: str, message_type: str, content: str) -> None:
+        if self._finite_mode:
+            from tradingagents.dataflows.finite_disclosure_output import FINITE_RUNTIME_NOTICE
+            timestamp, message_type, content = "", "System", FINITE_RUNTIME_NOTICE
         if message_type == "Advisory Commentary":
             self._enqueue(
                 _QueuedEvent(
@@ -242,6 +279,9 @@ class RuntimeArtifactWriter:
         self._enqueue(_QueuedEvent("log", (line,)))
 
     def record_tool_result(self, timestamp: str, payload: Any) -> None:
+        if self._finite_mode:
+            self.record_message("", "System", "")
+            return
         self._enqueue(_QueuedEvent("tool_result", (timestamp, payload)))
 
     def record_diagnostic(self, timestamp: str, payload: Any, *, critical: bool = False) -> None:
@@ -263,6 +303,9 @@ class RuntimeArtifactWriter:
         message_type: str,
         content: str,
     ) -> None:
+        if self._finite_mode:
+            from tradingagents.dataflows.finite_disclosure_output import FINITE_RUNTIME_NOTICE
+            timestamp, message_type, content = "", "System", FINITE_RUNTIME_NOTICE
         self.flush()
         line = f"{timestamp} [{message_type}] {content.replace(chr(10), ' ')}\n"
         self._append_log_line(line)
@@ -291,6 +334,9 @@ class RuntimeArtifactWriter:
             self._flush_max_seconds = max(self._flush_max_seconds, elapsed)
 
     def record_duration(self, category: str, name: str, seconds: float) -> None:
+        if self._finite_mode:
+            category = category if category in {"model", "tool", "report"} else "runtime"
+            name = "finite-validated-stage"
         with self._metrics_lock:
             item = self._durations[category].setdefault(
                 name,

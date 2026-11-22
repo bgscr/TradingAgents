@@ -448,8 +448,11 @@ def validated_trading_decision_from_state(
 
 def authorized_trading_decision_from_state(
     final_state: Mapping[str, Any],
+    *, config=None,
 ) -> TradingDecisionContract:
     """Return a decision only after terminal and immutable-audit publication."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
 
     if not isinstance(final_state, Mapping):
         raise TypeError("authorized decision publication must be a final-state mapping")
@@ -476,8 +479,10 @@ def authorized_trading_decision_from_state(
     return decision
 
 
-def build_terminal_contract(final_state: Mapping[str, Any]) -> TerminalContract:
+def build_terminal_contract(final_state: Mapping[str, Any], *, config=None) -> TerminalContract:
     """Validate and classify a final state without inferring direction from prose."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
 
     evidence = EvidenceState.model_validate(final_state.get("evidence_state", {}))
     analysis_outcome = final_state.get("analysis_outcome")
@@ -631,10 +636,12 @@ def apply_terminal_contract(
     audit_digest: str | None = None,
 ) -> tuple[TerminalContract, CanonicalRunIdentity]:
     """Attach the shared terminal and canonical run identity fields to state."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
 
     if config is not None:
         final_state["configuration_digest"] = configuration_digest(config)
-    terminal = build_terminal_contract(final_state)
+    terminal = build_terminal_contract(final_state, config=config)
     identity = build_run_identity(
         final_state,
         terminal,

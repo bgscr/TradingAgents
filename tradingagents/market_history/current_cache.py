@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
+from tradingagents.dataflows import current_cache_qualification as _qualification
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
 from tradingagents.evidence import SourceAcquisitionOutcome, SourceArtifact
@@ -112,7 +113,16 @@ def source_fingerprints(*, include_verification=True):
         "\r\n", "\n").encode("utf-8")).hexdigest() for name in paths}
 
 
-def compatibility_diagnostic():
+def compatibility_diagnostic(*, manifest_path=None):
+    finite_path = MANIFEST_PATH.with_name("current_cache_compatibility_finite_v2.json")
+    profile = get_config().get("finite_disclosure_profile")
+    if profile is not None:
+        if profile != "601328-2026H1-v2" or manifest_path is not None and Path(manifest_path) != finite_path:
+            return "current_cache_gate_denied:finite_qualification_scope"
+        return _qualification.compatibility_diagnostic(manifest_path=finite_path, source_root=SOURCE_ROOT)
+    if manifest_path is not None and Path(manifest_path) != MANIFEST_PATH:
+        return "current_cache_gate_denied:ordinary_qualification_scope"
+
     """Fail closed independently of strict-history/qualification DB records."""
     try:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"),

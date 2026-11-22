@@ -916,16 +916,18 @@ def get_analysis_date(ticker: str | None = None):
 
 def save_report_to_disk(final_state, ticker: str, save_path: Path, *, output_language="English",
                         supplemental_statement=None, company_announcement=None, announcement_timeout_seconds=25,
-                        announcement_remaining=None, news_source_selection=None):
+                        announcement_remaining=None, news_source_selection=None, config=None):
     """Save the complete analysis report to disk (shared CLI/API writer)."""
     return write_report_tree(final_state, ticker, save_path, output_language=output_language,
                              supplemental_statement=supplemental_statement, company_announcement=company_announcement,
                              announcement_timeout_seconds=announcement_timeout_seconds,
-                             announcement_remaining=announcement_remaining, news_source_selection=news_source_selection)
+                             announcement_remaining=announcement_remaining, news_source_selection=news_source_selection, config=config)
 
 
 def display_complete_report(final_state):
     """Display the complete analysis report sequentially (avoids truncation)."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, terminal=True)
     console.print()
     console.print(Rule("Complete Analysis Report", style="bold green"))
 
@@ -1880,6 +1882,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
                 "failed_phase": current_phase,
                 "exception_diagnostics": _exception_chain_diagnostics(exc),
             },
+            config=artifacts.get("publication_config"),
         )
     detail_artifact = (
         f"artifact=sha256:{detail_digest}"
@@ -1953,6 +1956,7 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
     report_file = save_report_to_disk(
         final_state, ticker, artifacts["report_dir"],
         output_language=artifacts.get("output_language", "English"),
+        config=artifacts.get("publication_config"),
     )
     runtime_writer = artifacts.get("runtime_writer")
     if runtime_writer is not None:
@@ -2552,8 +2556,10 @@ def _run_analysis(
             artifact_root=artifacts["artifact_root"],
             log_paths=[artifacts["log_file"], artifacts["latest_log_file"]],
             metrics_path=artifacts["metrics_file"],
+            config=config,
         )
         artifacts["runtime_writer"] = runtime_writer
+        artifacts["publication_config"] = dict(config)
         stats_handler = StatsCallbackHandler(metrics_recorder=runtime_writer)
         artifacts["stats_handler"] = stats_handler
     except BaseException:
@@ -2610,6 +2616,15 @@ def _run_analysis(
             runtime_writer.close()
         raise
 
+    from tradingagents.dataflows.finite_disclosure_output import (
+        FINITE_RUNTIME_NOTICE,
+        finite_output_enabled,
+        validate_publication,
+        validate_stage_text,
+    )
+    finite_publication_mode = finite_output_enabled(config)
+    publication_state = {}
+
     # Track start time for elapsed display
     start_time = time.time()
 
@@ -2618,6 +2633,8 @@ def _run_analysis(
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            if finite_publication_mode:
+                args, kwargs = ("System", FINITE_RUNTIME_NOTICE), {}
             func(*args, **kwargs)
             timestamp, message_type, content = obj.messages[-1]
             if message_type == "Data":
@@ -2632,6 +2649,9 @@ def _run_analysis(
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            if finite_publication_mode:
+                runtime_writer.record_tool_call("", "", None)
+                return
             func(*args, **kwargs)
             timestamp, tool_name, args = obj.tool_calls[-1]
             runtime_writer.record_tool_call(timestamp, tool_name, args)
@@ -2643,6 +2663,8 @@ def _run_analysis(
 
         @wraps(func)
         def wrapper(section_name, content):
+            if finite_publication_mode:
+                validate_stage_text(section_name, content, publication_state, config)
             changed = func(section_name, content)
             if not changed:
                 return False
@@ -2662,6 +2684,8 @@ def _run_analysis(
                     advisory_markdown(
                         section_name, text, selections.get("output_language", "English")
                     ),
+                    state=publication_state, config=config, section_name=section_name,
+                    language=selections.get("output_language", "English"),
                 )
                 display.report_ready(section_name, text, path)
                 runtime_writer.record_duration(
@@ -2840,6 +2864,10 @@ def _run_analysis(
             None if checkpoint_session.resume_from_checkpoint else init_agent_state
         )
         for chunk in graph.graph.stream(graph_input, **args):
+            publication_state = {**latest_state, **chunk}
+            validate_publication(publication_state, config)
+            if finite_publication_mode:
+                runtime_writer.record_validated_state(publication_state)
             if budget is not None:
                 budget.check()
             observed_phase = _runtime_graph_phase_for_chunk(chunk)
@@ -2849,7 +2877,7 @@ def _run_analysis(
                 runtime_graph_phase = observed_phase
                 runtime_writer.transition_phase(runtime_graph_phase)
                 snapshot_run.telemetry_ledger.transition_stage(runtime_graph_phase)
-            for message in chunk.get("messages", []):
+            for message in ([] if finite_publication_mode else chunk.get("messages", [])):
                 key = message_key(message)
                 if key in message_buffer._processed_message_ids:
                     continue

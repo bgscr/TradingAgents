@@ -1,3 +1,7 @@
+from tradingagents.agents.finite_disclosure_advisory import (
+    finite_advisory_update,
+    is_finite_state,
+)
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -6,6 +10,8 @@ from tradingagents.agents.utils.agent_utils import (
 
 def create_bear_researcher(llm):
     def bear_node(state) -> dict:
+        if is_finite_state(state):
+            return finite_advisory_update(llm, "bear", state)
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
         bear_history = investment_debate_state.get("bear_history", "")

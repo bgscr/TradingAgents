@@ -31,6 +31,9 @@ def create_fundamentals_analyst(llm):
             get_cashflow,
             get_income_statement,
         ]
+        from tradingagents.finite_disclosure_runtime import finite_analyst_step, is_finite_state
+        if is_finite_state(state):
+            return finite_analyst_step(llm,'fundamentals',state,data_tools)
         tools = [*data_tools, AnalystEvidenceReport]
 
         system_message = (
@@ -43,6 +46,14 @@ def create_fundamentals_analyst(llm):
             + " Record synthetic-data warnings and missing or inapplicable bank metrics as evidence_notes, not as financial premises. Preserve their limitations in the report. An available financial table does not make every metric available; omitted business, summary or fund-flow sources provide no financial evidence. Notes never satisfy the evidence required for a financial conclusion."
             + get_language_instruction()
         )
+        from tradingagents.dataflows.config import get_config
+        from tradingagents.dataflows.finite_disclosure_output import (
+            finite_prompt,
+            validate_submission,
+        )
+        finite_config = get_config()
+        if finite_prompt(finite_config):
+            system_message = finite_prompt(finite_config)
         system_message += "\n\n" + render_allowed_source_ref_catalog(
             state["messages"],
             state["company_of_interest"],
@@ -86,6 +97,7 @@ def create_fundamentals_analyst(llm):
             trade_date=current_date,
             messages=state["messages"],
         )
+        validate_submission(result, finite_config)
         return build_analyst_update(state, result, "fundamentals_report")
 
     return fundamentals_analyst_node

@@ -7,6 +7,10 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from tradingagents.agents.finite_disclosure_advisory import (
+    finite_advisory_update,
+    is_finite_state,
+)
 from tradingagents.agents.schemas import (
     PortfolioDecision,
     PortfolioDecisionRevision,
@@ -318,6 +322,8 @@ def create_portfolio_manager(llm, evidence_gate_mode: str = "enforce"):
         )
 
     def portfolio_manager_node(state) -> dict[str, Any]:
+        if is_finite_state(state):
+            return finite_advisory_update(llm, "portfolio_manager", state)
         evidence = EvidenceState.model_validate(state.get("evidence_state", {}))
         prompt = _base_prompt(state, evidence)
 

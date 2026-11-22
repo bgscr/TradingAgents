@@ -330,7 +330,19 @@ class MarketHistoryStore:
     ) -> MarketHistoryStore:
         """Open the one coordinator database and import any legacy primary state."""
 
+        if config.coordinator_path is not None:
+            # Inspect the literal binding before the derived config canonicalizes
+            # it; resolving first can conceal a symlink/junction substitution.
+            literal = Path(config.coordinator_path)
+            if any(p.is_symlink() or p.is_junction() for p in (literal, *literal.parents)):
+                raise ProviderRequestAuthorityUnavailableError(
+                    "finite_existing_provider_request_authority_unavailable"
+                )
         authority_config = provider_request_authority_config(config)
+        if config.coordinator_path is not None:
+            # Explicit finite scope binds the already shared authority. Never
+            # create, migrate, claim a payload root or import a new legacy store.
+            return cls._open_existing_provider_request_authority(authority_config)
         try:
             authority = cls.open(authority_config)
         except sqlite3.DatabaseError as exc:
@@ -344,6 +356,65 @@ class MarketHistoryStore:
             authority.close()
             raise
         return authority
+
+    @classmethod
+    def _open_existing_provider_request_authority(
+        cls, config: MarketHistoryConfig,
+    ) -> MarketHistoryStore:
+        """Finite-only existing authority: no schema, owner or quota creation."""
+        from tradingagents.market_history.coordinator import (
+            ProviderRequestCoordinator,
+            upstream_service_identity_for_provider,
+        )
+
+        database = Path(config.database_path)
+        payloads = Path(config.payload_root)
+        connection = None
+        try:
+            if not database.is_file() or not payloads.is_dir():
+                raise ValueError("existing_authority_missing")
+            owner = payloads / _PAYLOAD_ROOT_OWNER_FILENAME
+            if any(p.is_symlink() or p.is_junction()
+                   for path in (database, owner) for p in (path, *path.parents)):
+                raise ValueError("existing_authority_path_alias")
+            expected_owner = os.path.normcase(str(database.resolve())).encode("utf-8") + b"\n"
+            if owner.read_bytes() != expected_owner:
+                raise ValueError("existing_authority_owner_mismatch")
+            # mode=rw is essential: a disappearance after is_file must not cause
+            # SQLite to manufacture a new empty authority.
+            connection = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True,
+                                         isolation_level=None, timeout=30.0)
+            if connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone() != (SCHEMA_VERSION,):
+                raise ValueError("existing_authority_schema_mismatch")
+            # These zero-row queries validate the coordinator's required tables
+            # without reading request payloads or touching preserved counts.
+            for table in ("request_cooldowns", "request_leases", "provider_request_sequences",
+                          "provider_request_attempts", "provider_request_state_imports",
+                          "request_queue", "history_store_diagnostics"):
+                connection.execute("SELECT 1 FROM " + table + " LIMIT 0")
+            upstream, name = upstream_service_identity_for_provider("tushare")
+            row = connection.execute(
+                "SELECT service_name, account_scope, operator_ceiling_json FROM upstream_services "
+                "WHERE upstream_service_id = ?", (upstream,),
+            ).fetchone()
+            if row is None or row[:2] != (name, ""):
+                raise ValueError("existing_authority_identity_mismatch")
+            policy = ProviderRequestCoordinator._parse_operator_ceiling(upstream, row[2])
+            if (policy.minimum_interval.total_seconds() < 1.5
+                    or policy.allow_prewarming is not False):
+                raise ValueError("existing_authority_policy_mismatch")
+            # Connection-local settings only; journal mode and persisted schema
+            # remain exactly as found. The normal coordinator may later account
+            # for separately authorized work through this existing connection.
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA synchronous = FULL")
+            return cls(config, connection)
+        except (OSError, sqlite3.DatabaseError, ValueError, TypeError, AttributeError) as exc:
+            if connection is not None:
+                connection.close()
+            raise ProviderRequestAuthorityUnavailableError(
+                "finite_existing_provider_request_authority_unavailable"
+            ) from exc
 
     def _import_legacy_provider_request_state(self, source_path: Path) -> None:
         source_path = Path(source_path)

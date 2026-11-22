@@ -333,8 +333,10 @@ def localize_report(text, language):
     return "\n".join(output).rstrip() + "\n"
 
 
-def advisory_sections(state):
+def advisory_sections(state, *, config=None):
     """Extract only explicit stage fields; never promote or invent facts."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(state, config)
     rows = []
     for key, name, zh in (
         ("market", "Market analyst", "市场分析师"),
@@ -374,7 +376,7 @@ def advisory_sections(state):
                 "中立风险分析师",
                 risk.get("neutral_history"),
             ),
-            ("4_risk/manager.md", "Risk manager", "风险经理", risk.get("judge_decision")),
+            ("4_risk/manager.md", "Risk manager", "风险经理", state.get("portfolio_advisory") or risk.get("judge_decision")),
         ]
     )
     return [

@@ -85,6 +85,7 @@ class RecordedRunInput(BaseModel):
     evidence_state: EvidenceState
     run_telemetry: RunTelemetryProjection
     legacy_selection: RecordedLegacySelection | None = None
+    finite_publication_state: dict | None = None
 
 
 class RecordedRunExpectation(BaseModel):
@@ -336,8 +337,31 @@ def adapt_recorded_evidence(evidence: EvidenceState) -> EvidenceState:
 def replay_recorded_run(
     fixture: LoadedRecordedRunFixture,
     output_directory: str | Path,
+    *, config=None,
 ) -> RecordedReplayResult:
     """Replay one immutable fixture without live providers or model calls."""
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_output_enabled,
+        validate_publication,
+    )
+    finite_state = fixture.recorded.finite_publication_state
+    if finite_state is not None or fixture.recorded.evidence_state.finite_cache_reads or finite_output_enabled(config):
+        if finite_state is None:
+            raise ValueError("finite replay lost context or cache-read ledger")
+        validate_publication(finite_state, config, terminal=True)
+        if (finite_state.get("company_of_interest") != fixture.recorded.run.ticker
+                or finite_state.get("trade_date") != fixture.recorded.run.requested_date.isoformat()
+                or EvidenceState.model_validate(finite_state.get("evidence_state")) != fixture.recorded.evidence_state):
+            raise ValueError("finite replay coordinates or evidence differ")
+        state = dict(finite_state)
+        apply_terminal_contract(state, config=config)
+        report_path = write_report_tree(state, fixture.recorded.run.ticker, output_directory, config=config)
+        return RecordedReplayResult(
+            final_state=state, terminal=TerminalContract.model_validate(state["terminal_contract"]),
+            run_identity=CanonicalRunIdentity.model_validate(state["run_identity"]),
+            counters=RecordedReplayCounters(), blocked_stage=None, report_path=report_path,
+            audit_path=Path(output_directory) / "decision-audit.json",
+        )
 
     recorded = fixture.recorded
     output_directory = Path(output_directory)

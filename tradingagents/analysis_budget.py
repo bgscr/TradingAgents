@@ -85,6 +85,7 @@ class AnalysisBudget:
         self._counts = {"model": 0, "data": 0}
         self._reason = None
         self._cache_hits = []
+        self._finite_cache_reads = []
         self.disable_alpha_vantage = disable_alpha_vantage
         self._data_gaps = []
         self._data_transport_denial = None
@@ -478,6 +479,16 @@ class AnalysisBudget:
             if item not in self._cache_hits:
                 self._cache_hits.append(item)
 
+    def record_finite_cache_read(self, envelope) -> None:
+        with self._lock:
+            self.check()
+            item = {'contract':envelope.contract,'source_ref':envelope.source_ref,
+                    'tool_call_id':envelope.tool_call_id,'new_physical_requests':0,
+                    'read_at':envelope.read_at.isoformat(),
+                    'original_observations':[x.model_dump(mode='json') for x in envelope.historical_observations]}
+            if item not in self._finite_cache_reads:
+                self._finite_cache_reads.append(item)
+
     def record_data_gap(self, tool: str, reason: str, *, provider="alpha_vantage") -> str:
         """Operational diagnostics only; never source facts or usable data."""
         with self._lock:
@@ -513,6 +524,7 @@ class AnalysisBudget:
     def receipt(self) -> dict:
         with self._lock:
             return {
+                **({'finite_cache_reads':list(self._finite_cache_reads)} if self._finite_cache_reads else {}),
                 "max_calls": self.max_calls,
                 "max_output_tokens": self.max_output_tokens,
                 "timeout_seconds": self.timeout_seconds,

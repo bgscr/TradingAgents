@@ -7,6 +7,10 @@ from typing import Any, Literal
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from tradingagents.agents.finite_disclosure_advisory import (
+    is_finite_state,
+    validate_finite_inputs,
+)
 from tradingagents.decision_policy import (
     AdmittedEvidenceBinding,
     DecisionGateResultV2,
@@ -56,6 +60,8 @@ def create_direction_selector(_llm: Any | None = None):
     """
 
     def direction_selector_node(state: Mapping[str, Any]) -> dict[str, Any]:
+        if is_finite_state(state):
+            validate_finite_inputs(state)
         try:
             context = _context_from_state(state.get("validated_decision_context"))
         except (ValidationError, TypeError, ValueError):
@@ -228,6 +234,8 @@ def create_decision_gate_node(
         state: Mapping[str, Any],
         config: RunnableConfig | None = None,
     ) -> dict[str, Any]:
+        if is_finite_state(state):
+            validate_finite_inputs(state)
         if (
             evidence_gate_mode == "shadow"
             or state.get("evidence_gate_mode") == "shadow"

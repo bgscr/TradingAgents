@@ -548,6 +548,13 @@ def _semantic_evidence_payload(evidence: EvidenceState) -> dict[str, Any]:
         payload[field] = tuple(
             sorted({_canonical_json(item) for item in payload[field]})
         )
+    if payload.get('finite_cache_reads'):
+        finite=[]
+        for read in payload['finite_cache_reads']:
+            read=dict(read)
+            read.pop('read_at',None)
+            finite.append(_canonical_json(read))
+        payload['finite_cache_reads']=tuple(sorted(set(finite)))
     return payload
 
 

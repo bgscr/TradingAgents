@@ -1,3 +1,7 @@
+from tradingagents.agents.finite_disclosure_advisory import (
+    finite_advisory_update,
+    is_finite_state,
+)
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
@@ -6,6 +10,8 @@ from tradingagents.agents.utils.agent_utils import (
 
 def create_conservative_debator(llm):
     def conservative_node(state) -> dict:
+        if is_finite_state(state):
+            return finite_advisory_update(llm, "conservative", state)
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
         conservative_history = risk_debate_state.get("conservative_history", "")

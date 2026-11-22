@@ -317,3 +317,14 @@ DIAGNOSTIC_LABELS = {
     "fact_binding_missing": ("No validated fact binding", "没有经验证的事实绑定"),
     "details_not_retained": ("Detailed reason was not retained", "详细原因未保留，无法还原"),
 }
+
+
+def finite_cache_read_diagnostics(evidence, *, state=None, config=None):
+    """Project retained cache reads without describing a new acquisition."""
+    from tradingagents.dataflows.finite_disclosure_output import cache_read_projection
+    return [
+        {"kind": "finite_cache_read", "tool_name": item["tool_name"],
+         "new_physical_requests": 0, "historical_observation_count": len(item["historical_observations"]),
+         "strict_pit_eligible": False, "full_announcement_window_coverage": False}
+        for item in cache_read_projection(evidence, state, config)
+    ]

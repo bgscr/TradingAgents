@@ -42,7 +42,7 @@ def provider_request_authority_config(
 ) -> MarketHistoryConfig:
     """Derive the one coordinator authority used in normal and degraded modes."""
 
-    database_path = config.database_path.with_name(
+    database_path = config.coordinator_path or config.database_path.with_name(
         f"{config.database_path.name}.provider-requests.sqlite3"
     )
     return MarketHistoryConfig(
@@ -63,6 +63,7 @@ class MarketHistoryConfig:
     backup_root: Path
     data_usage_mode: DataUsageMode
     yahoo_max_physical_attempts: int = 4
+    coordinator_path: Path | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -97,7 +98,11 @@ class MarketHistoryConfig:
             or yahoo_max_physical_attempts < 1
         ):
             raise ValueError("Yahoo physical-attempt budget must be a positive integer")
+        coordinator_path = values.get('provider_request_coordinator_path')
+        if coordinator_path is not None:
+            raise ValueError('finite_shared_coordinator_binding_unconfigured')
         return cls(
+            coordinator_path=Path(str(coordinator_path)) if coordinator_path is not None else None,
             mode=MarketHistoryMode(str(values["market_history_mode"])),
             database_path=canonical_market_history_database_path(
                 str(values["market_history_database_path"])

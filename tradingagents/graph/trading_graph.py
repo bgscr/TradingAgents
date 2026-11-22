@@ -218,6 +218,19 @@ class TradingAgentsGraph:
         """
         require_runtime_profile_loading()
         resolved_config = config or DEFAULT_CONFIG
+        from tradingagents.dataflows.finite_disclosure_cache import (
+            enabled,
+            load_view,
+            validate_runtime,
+        )
+        if enabled(resolved_config):
+            validate_runtime(resolved_config, symbol=instrument_symbol, selected_analysts=selected_analysts)
+            load_view(resolved_config, instrument_symbol or "601328.SH", "2026-10-16")
+            from tradingagents.budget_readiness import inspect_budget_readiness
+            readiness = inspect_budget_readiness(resolved_config, ticker=instrument_symbol or '601328.SH', as_of_date='2026-10-16')
+            price_checks = [item for item in readiness.checked if item.location.startswith('market_cache.')]
+            if readiness.issues or not price_checks or not any(item.status == 'evidence_checked_runtime_revalidation_required' for item in price_checks) or any(item.status == 'compatibility_gate_denied' for item in readiness.checked):
+                raise ValueError('finite_startup_requires_verified_calendar_and_price_cache')
         from tradingagents.analysis_budget import validate_budget_config
 
         if resolved_config.get("analysis_budget_enabled", False) is not False:
@@ -526,7 +539,7 @@ class TradingAgentsGraph:
         self.propagator = Propagator(
             max_recur_limit=self.config.get("max_recur_limit", 100),
         )
-        self.reflector = Reflector(self.quick_thinking_llm)
+        self.reflector = Reflector(self.quick_thinking_llm, config=self.config)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
 
         # State tracking
@@ -1222,6 +1235,11 @@ class TradingAgentsGraph:
         Trade-off: only same-ticker entries are resolved per run.  Entries for
         other tickers accumulate until that ticker is run again.
         """
+        from tradingagents.dataflows.finite_disclosure_cache import enabled
+        if enabled(self.config):
+            # No independently bound realized-outcome evidence exists in this finite scope.
+            # Memory remains readable; no automatic price acquisition or outcome attribution.
+            return
         pending = [e for e in self.memory_log.get_pending_entries() if e["ticker"] == ticker]
         if not pending:
             return
@@ -1438,6 +1456,9 @@ class TradingAgentsGraph:
             signature_fields.append("cninfo_profile=" + binding.profile.profile_identity)
         # Storage is bound by checkpoint_budget_binding, not the thread ID:
         # moving a database must expose a policy mismatch, not a fresh budget.
+        if config.get('finite_disclosure_profile') is not None:
+            from tradingagents.dataflows.finite_disclosure_cache import installed_profile
+            signature_fields.append('finite_release='+installed_profile()['release_sha256'])
         return "|".join(signature_fields)
 
     @contextmanager
@@ -1802,6 +1823,7 @@ class TradingAgentsGraph:
             final_state, ticker, save_path,
             output_language=getattr(self, "config", {}).get("output_language", "English"),
             supplemental_statement=supplemental_statement,
+            config=getattr(self, "config", {}),
         )
 
     def _run_graph(
@@ -1891,9 +1913,13 @@ class TradingAgentsGraph:
 
         graph_input = None if resume_from_checkpoint else init_agent_state
         if self.debug:
+            finite_stream_state = dict(initial_merge_state)
             trace = []
             last_printed = None
             for chunk in self.graph.stream(graph_input, **args):
+                finite_stream_state.update(chunk)
+                from tradingagents.dataflows.finite_disclosure_output import validate_publication
+                validate_publication(finite_stream_state,self.config)
                 if chunk["messages"]:
                     msg = chunk["messages"][-1]
                     # Nodes after the trader don't append to messages, so the
@@ -1901,7 +1927,13 @@ class TradingAgentsGraph:
                     # when it changes (#1027); the trace/state merge is unchanged.
                     signature = (type(msg).__name__, getattr(msg, "content", None))
                     if signature != last_printed:
-                        msg.pretty_print()
+                        if self.config.get('finite_disclosure_profile') is not None:
+                            from tradingagents.dataflows.finite_disclosure_output import (
+                                FINITE_RUNTIME_NOTICE,
+                            )
+                            print(FINITE_RUNTIME_NOTICE)
+                        else:
+                            msg.pretty_print()
                         last_printed = signature
                     trace.append(chunk)
             # Streamed chunks are per-node deltas. Merge them so the returned
@@ -1921,6 +1953,9 @@ class TradingAgentsGraph:
             final_state["capability_routing_checkpoint_compatibility"] = (
                 routing_checkpoint_compatibility.model_dump(mode="json")
             )
+
+        from tradingagents.dataflows.finite_disclosure_output import validate_terminal_output
+        validate_terminal_output(final_state, self.config)
 
         # The audit is a critical terminal artifact: publish it before exposing
         # a directional decision to memory, signal processing, or the caller.

@@ -28,11 +28,22 @@ class TradingMemoryLog:
     )
 
     def __init__(self, config: dict = None):
+        from tradingagents.dataflows.finite_disclosure_output import (
+            finite_output_enabled,
+            publication_config,
+        )
         cfg = config or {}
+        self._publication_config = dict(publication_config(config))
+        self._finite_mode = finite_output_enabled(self._publication_config)
         self._log_path = None
         path = cfg.get("memory_log_path")
         if path:
             self._log_path = Path(path).expanduser()
+            if self._finite_mode:
+                from tradingagents.dataflows.finite_disclosure_cache import installed_profile
+                profile = installed_profile()
+                self._log_path = (self._log_path.parent / "finite-disclosure-v2"
+                                  / profile["release_sha256"] / "decision-memory.json")
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
         # Optional cap on resolved entries. None disables rotation.
         self._max_entries = cfg.get("memory_log_max_entries")
@@ -59,6 +70,10 @@ class TradingMemoryLog:
         final_state: Mapping[str, Any],
     ) -> None:
         """Append a pending entry only from an audited terminal publication."""
+        from tradingagents.dataflows.finite_disclosure_output import has_finite_material
+        if self._finite_mode or has_finite_material(final_state):
+            self._store_finite_decision(ticker, trade_date, final_state)
+            return
         from tradingagents.agents.managers.direction_selector import (
             render_trading_decision,
         )
@@ -100,6 +115,8 @@ class TradingMemoryLog:
 
     def load_entries(self) -> list[dict]:
         """Parse all entries from log. Returns list of dicts."""
+        if self._finite_mode:
+            return self._load_finite_entries()
         if not self._log_path or not self._log_path.exists():
             return []
         text = self._log_path.read_text(encoding="utf-8")
@@ -159,6 +176,8 @@ class TradingMemoryLog:
         its tag with return figures, and appends a REFLECTION section.  Uses
         a temp-file + os.replace() so a crash mid-write never corrupts the log.
         """
+        if self._finite_mode:
+            raise ValueError("finite memory outcome updates require independently bound outcome evidence")
         if not self._log_path or not self._log_path.exists():
             return
 
@@ -216,6 +235,8 @@ class TradingMemoryLog:
         Each element of updates must have keys: ticker, trade_date,
         raw_return, alpha_return, holding_days, reflection.
         """
+        if self._finite_mode:
+            raise ValueError("finite memory outcome updates require independently bound outcome evidence")
         if not self._log_path or not self._log_path.exists() or not updates:
             return
 
@@ -352,3 +373,57 @@ class TradingMemoryLog:
         text = e["decision"][:300]
         suffix = "..." if len(e["decision"]) > 300 else ""
         return f"{tag}\n{text}{suffix}"
+
+
+    def _load_finite_records(self):
+        import json
+
+        from tradingagents.dataflows.finite_disclosure_output import validate_publication
+        if not self._log_path or not self._log_path.exists():
+            return []
+        payload = json.loads(self._log_path.read_text(encoding="utf-8"))
+        if (not isinstance(payload, dict) or set(payload) != {"contract", "records"}
+                or payload["contract"] != "finite-memory-v2" or not isinstance(payload["records"], list)):
+            raise ValueError("finite memory is not a closed standalone record")
+        for record in payload["records"]:
+            if not isinstance(record, dict) or set(record) != {"state"}:
+                raise ValueError("finite memory record contains unbound fields")
+            validate_publication(record["state"], self._publication_config, terminal=True)
+        return payload["records"]
+
+    def _load_finite_entries(self):
+        from tradingagents.terminal_contract import authorized_trading_decision_from_state
+        entries = []
+        for record in self._load_finite_records():
+            state = record["state"]
+            decision = authorized_trading_decision_from_state(state, config=self._publication_config)
+            entries.append({
+                "date": state["trade_date"], "ticker": state["company_of_interest"],
+                "rating": decision.rating.value, "pending": True,
+                "raw": None, "alpha": None, "holding": None,
+                "decision": state["final_trade_decision"], "reflection": "",
+            })
+        return entries
+
+    def _store_finite_decision(self, ticker, trade_date, final_state):
+        import json
+
+        from tradingagents.dataflows.finite_disclosure_output import replay_state_payload
+        from tradingagents.terminal_contract import authorized_trading_decision_from_state
+        payload = replay_state_payload(final_state, self._publication_config)
+        authorized_trading_decision_from_state(payload, config=self._publication_config)
+        if ticker != payload["company_of_interest"] or trade_date != payload["trade_date"]:
+            raise ValueError("finite memory coordinates differ from publication")
+        if not self._log_path:
+            return
+        records = self._load_finite_records()
+        for record in records:
+            if record["state"].get("run_id") == payload.get("run_id"):
+                if record["state"] != payload:
+                    raise ValueError("finite memory run identity conflict")
+                return
+        encoded = json.dumps({"contract": "finite-memory-v2", "records": [*records, {"state": payload}]},
+                             ensure_ascii=True, sort_keys=True, indent=2) + "\n"
+        temporary = self._log_path.with_suffix(".tmp")
+        temporary.write_text(encoded, encoding="utf-8")
+        temporary.replace(self._log_path)

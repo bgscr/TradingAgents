@@ -106,6 +106,20 @@ def inspect_budget_routes(config, *, selected_analysts=tuple(ANALYST_TOOLS), sym
     financial_markets = mapping(financial.get("market_data_vendors", {}), "financial.market_data_vendors")
     financial_market = mapping(financial_markets.get("cn_a", {}), "financial.market_data_vendors.cn_a") if mainland else {}
 
+    # Inspect the same resolved financial configuration consumed by financial
+    # dispatch. Cache integrity and original TTL remain separate readiness gates.
+    from tradingagents.dataflows import finite_disclosure_cache as finite_cache
+    from tradingagents.dataflows.finite_disclosure_tools import FINITE_TOOLS
+
+    finite_requested = finite_cache.enabled(financial)
+    finite_valid = False
+    if finite_requested:
+        try:
+            finite_cache.validate_runtime(financial, symbol=symbol)
+            finite_valid = True
+        except (ValueError, OSError, KeyError, TypeError):
+            add("financial.finite", 0, "", "invalid_finite_configuration_or_binding")
+
     def tokens(value, location, default, *, snapshot=False):
         if not isinstance(value, str) or not value.strip():
             add(location, 0, "", "invalid_provider_chain")
@@ -172,6 +186,11 @@ def inspect_budget_routes(config, *, selected_analysts=tuple(ANALYST_TOOLS), sym
                 continue
             # Unknown ticker: ticker-scoped choices cannot be resolved yet.
             if symbol is None and method not in ("get_global_news", "get_macro_indicators", "get_prediction_markets"):
+                continue
+            if analyst == "fundamentals" and finite_requested and method in FINITE_TOOLS:
+                if finite_valid:
+                    chains.append((location, ("finite_disclosure_cache",)))
+                    dependencies.append("finite_selected_periods_pinned_cache_original_ttl_new_requests_0")
                 continue
             if method in _STATEMENTS and method_tools.get(method) == "tushare":
                 chains.append((location, ("tushare",)))

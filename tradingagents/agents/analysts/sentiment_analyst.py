@@ -442,6 +442,13 @@ def create_sentiment_analyst(llm, *, external_sources: bool = True, structured_m
         # data is already in the prompt.
         formatted_messages = prompt.format_messages(messages=state["messages"])
 
+        from tradingagents.finite_disclosure_runtime import finite_analyst_step, is_finite_state
+        if is_finite_state(state):
+            inline_evidence = _evidence_for_blocks(
+                ticker, blocks, (), required_source_ids=_required_sentiment_source_ids(state),
+                news_acquisition=news_acquisition, stocktwits_acquisition=stocktwits_acquisition,
+                reddit_acquisition=reddit_acquisition)
+            return finite_analyst_step(llm,'social',state,inline_evidence=inline_evidence)
         structured_result = invoke_required_structured(
             structured_llm,
             formatted_messages,

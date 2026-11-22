@@ -325,12 +325,35 @@ AuditSourceAcquisitionOutcome = Annotated[
 ]
 
 
+class AuditFiniteCacheRead(BaseModel):
+    """Cache access is not a newly executed provider request."""
+    model_config = _CLOSED_MODEL_CONFIG
+    contract: Literal["finite-disclosure-cache-evidence-v2"]
+    profile: Literal["601328-2026H1-v2"]
+    release_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    view_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scope_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_ref: str = Field(pattern=r"^finite-cache:v2:[0-9a-f]{64}$")
+    tool_call_id: str = Field(min_length=1, max_length=160)
+    tool_name: Literal["get_fundamentals", "get_balance_sheet", "get_income_statement", "get_cashflow"]
+    capability: Literal["company_financials"]
+    read_at: str
+    historical_observations: tuple[dict, ...]
+    new_physical_requests: Literal[0]
+    full_announcement_window_coverage: Literal[False]
+    strict_pit_eligible: Literal[False]
+    selected_artifact_ref: str = Field(pattern=r"^artifact=sha256:[0-9a-f]{64}$")
+
+
 class AuditEvidenceProjection(BaseModel):
     """Closed payload-safe projection of evidence for immutable audit records."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = SOURCE_ARTIFACT_MANIFEST_VERSION
+    finite_cache_reads: tuple[AuditFiniteCacheRead, ...] = Field(
+        default=(), exclude_if=lambda value: not value,
+    )
     financial_eligibility_binding: (
         MainlandFinancialEligibilityProjectionBinding | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
@@ -352,7 +375,11 @@ def _candidate_artifacts(evidence: EvidenceState) -> tuple[SourceArtifact, ...]:
         for outcome in evidence.acquisition_outcomes
         if isinstance(outcome, SourceAcquisitionAvailable)
     )
-    return evidence.source_artifacts + nested
+    finite = tuple(
+        SourceArtifact.model_validate(read.selected_artifact)
+        for read in evidence.finite_cache_reads
+    )
+    return evidence.source_artifacts + nested + finite
 
 
 def _raw_bytes_by_digest(evidence: EvidenceState) -> dict[str, bytes]:
@@ -427,8 +454,12 @@ def persist_source_artifacts(
     audit_directory: Path,
     *,
     publication=None,
+    state=None,
+    config=None,
 ) -> SourceArtifactManifest:
     """Persist exact artifact bytes immutably and return their logical manifest."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_evidence_publication
+    validate_evidence_publication(evidence, state, config)
 
     raw_by_digest = _raw_bytes_by_digest(evidence)
     entries: list[SourceArtifactManifestEntry] = []
@@ -484,11 +515,22 @@ def _require_artifact_ref(
 def project_evidence_for_audit(
     evidence: EvidenceState,
     manifest: SourceArtifactManifest,
+    *, state=None, config=None,
 ) -> AuditEvidenceProjection:
     """Project safe evidence semantics without provider or model-authored prose."""
+    from tradingagents.dataflows.finite_disclosure_output import cache_read_projection
+    finite_reads = tuple(
+        AuditFiniteCacheRead.model_validate({**item, "historical_observations": tuple(item["historical_observations"])})
+        for item in cache_read_projection(evidence, state, config)
+    )
 
     evidence = EvidenceState.model_validate(evidence.model_dump(mode="python"))
     entries_by_digest = _manifest_by_digest(manifest)
+    for read in finite_reads:
+        _require_artifact_ref(
+            entries_by_digest,
+            read.selected_artifact_ref.removeprefix("artifact=sha256:"),
+        )
     canonical_manifest = SourceArtifactManifest(
         artifacts=tuple(
             sorted(manifest.artifacts, key=lambda entry: entry.artifact_ref)
@@ -683,6 +725,7 @@ def project_evidence_for_audit(
         )
 
     return AuditEvidenceProjection(
+        finite_cache_reads=finite_reads,
         financial_eligibility_binding=evidence.financial_eligibility_binding,
         instrument_identity=projected_identity,
         market_snapshot=projected_snapshot,

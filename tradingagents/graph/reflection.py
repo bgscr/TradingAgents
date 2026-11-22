@@ -6,8 +6,10 @@ from typing import Any
 class Reflector:
     """Handles reflection on trading decisions."""
 
-    def __init__(self, quick_thinking_llm: Any):
+    def __init__(self, quick_thinking_llm: Any, *, config=None):
         """Initialize the reflector with an LLM."""
+        from tradingagents.dataflows.finite_disclosure_output import publication_config
+        self._publication_config = dict(publication_config(config))
         self.quick_thinking_llm = quick_thinking_llm
         self.log_reflection_prompt = self._get_log_reflection_prompt()
 
@@ -34,6 +36,7 @@ class Reflector:
         raw_return: float,
         alpha_return: float,
         benchmark_name: str = "SPY",
+        *, final_state=None,
     ) -> str:
         """Single reflection call on the final trade decision with outcome context.
 
@@ -43,6 +46,13 @@ class Reflector:
         for US tickers, ``"^N225"`` for ``.T`` listings); defaults to SPY for
         callers that haven't been updated to thread the benchmark through.
         """
+        from tradingagents.dataflows.finite_disclosure_output import (
+            finite_output_enabled,
+            finite_reflection,
+            has_finite_material,
+        )
+        if finite_output_enabled(self._publication_config) or (final_state is not None and has_finite_material(final_state)):
+            return finite_reflection(final_decision, final_state, self._publication_config)
         messages = [
             ("system", self.log_reflection_prompt),
             (

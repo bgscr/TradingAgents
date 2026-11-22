@@ -248,7 +248,14 @@ def _inspect_market(config, symbol, start, end, issues, checked):
             except Exception:
                 calendar = None
                 issues.append(BudgetReadinessIssue("calendar", "corrupt_or_unreadable"))
-            if compatibility_diagnostic() is not None:
+            from tradingagents.dataflows import finite_disclosure_cache as finite_cache
+
+            manifest = (
+                finite_cache.PROJECT_ROOT / "tradingagents/market_history/current_cache_compatibility_finite_v2.json"
+                if finite_cache.enabled(config) else None
+            )
+            diagnostic = compatibility_diagnostic(manifest_path=manifest) if manifest is not None else compatibility_diagnostic()
+            if diagnostic is not None:
                 checked.append(BudgetReadinessCheck("market_cache", "compatibility_gate_denied", True))
                 # Preserve the runtime denial. Structural findings below remain
                 # useful diagnostics; they neither admit this cache nor waive
@@ -331,6 +338,15 @@ def _financial_payloads(chunks, endpoint, identity, statement_type, now):
 
 
 def _inspect_financial(config, symbol, end, supplied_identity, issues, checked):
+    from tradingagents.dataflows.finite_disclosure_cache import enabled, financial_preflight
+    if enabled(config):
+        try:
+            report = financial_preflight(config, symbol, end.isoformat())
+            for item in report["periods"]:
+                checked.append(BudgetReadinessCheck("financial.finite." + item["table"] + ":" + item["period"], "available", False))
+        except ValueError:
+            issues.append(BudgetReadinessIssue("financial.finite", "missing_stale_or_invalid_finite_disclosure"))
+        return
     from tradingagents.dataflows.current_statement_cache import (
         CurrentStatementCache,
         StatementCacheScope,

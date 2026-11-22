@@ -1260,8 +1260,27 @@ def render_decision_report(
     ) = None,
     shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
     shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
+    state=None,
+    config=None,
 ) -> str:
     """Render only canonical facts and rule semantics from the gated decision."""
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_output_enabled,
+        has_finite_material,
+        render_limits,
+        validate_evidence_publication,
+        validate_publication,
+    )
+    if finite_output_enabled(config) or (evidence is not None and evidence.finite_cache_reads) or (state is not None and has_finite_material(state)):
+        if state is None:
+            raise ValueError("finite report renderer requires bound state")
+        validate_publication(state, config, terminal=True)
+        if evidence is not None:
+            validate_evidence_publication(evidence, state, config)
+        if TradingDecisionContract.model_validate(decision) != TradingDecisionContract.model_validate(state.get("trading_decision")):
+            raise ValueError("finite report contract differs from bound state")
+        return state["final_trade_decision"] + render_limits(state, config)
+
 
     lines = [
         "# Validated Trading Decision",
@@ -1341,7 +1360,26 @@ def render_analysis_outcome_report(
     ) = None,
     shadow_financial_dispatch: FinancialDispatchAuditProjection | None = None,
     shadow_failure: MainlandCapabilityRoutingShadowFailure | None = None,
+    state=None,
+    config=None,
 ) -> str:
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_output_enabled,
+        has_finite_material,
+        render_limits,
+        validate_evidence_publication,
+        validate_publication,
+    )
+    if finite_output_enabled(config) or (evidence is not None and evidence.finite_cache_reads) or (state is not None and has_finite_material(state)):
+        if state is None:
+            raise ValueError("finite report renderer requires bound state")
+        validate_publication(state, config, terminal=True)
+        if evidence is not None:
+            validate_evidence_publication(evidence, state, config)
+        if AnalysisOutcome.model_validate(outcome) != AnalysisOutcome.model_validate(state.get("analysis_outcome_contract")):
+            raise ValueError("finite report contract differs from bound state")
+        return state["analysis_outcome"] + render_limits(state, config)
+
     outcome = AnalysisOutcome.model_validate(outcome)
     lines = [
         "# Non-Directional Analysis Outcome",
@@ -1509,9 +1547,14 @@ def _supplemental_report_text(final_state, ticker, request, output_language="Chi
 def write_report_tree(final_state: dict, ticker: str, save_path, *, output_language="English",
                       supplemental_statement: SupplementalStatementRequest | None = None,
                       company_announcement=None, announcement_timeout_seconds=25, announcement_remaining=None,
-                      news_source_selection=None) -> Path:
+                      news_source_selection=None, config=None) -> Path:
     """Publish the validated decision and separately labeled advisory stages."""
 
+    from tradingagents.dataflows.finite_disclosure_output import validate_terminal_output
+    if validate_terminal_output(final_state, config):
+        with ReportStore(save_path) as publication:
+            preflight_report_paths(publication)
+            return _write_report_tree(final_state, ticker, publication, output_language, config=config)
     supplemental_text = _supplemental_report_text(final_state, ticker, supplemental_statement, output_language)
     from tradingagents.news_projection import render_source_selection_report
     if news_source_selection is not None:
@@ -1520,13 +1563,22 @@ def write_report_tree(final_state: dict, ticker: str, save_path, *, output_langu
     with ReportStore(save_path) as publication:
         preflight_report_paths(publication)
         return _write_report_tree(final_state, ticker, publication, output_language, supplemental_text,
-                                  company_announcement, announcement_timeout_seconds, announcement_remaining, news_selection_text)
+                                  company_announcement, announcement_timeout_seconds, announcement_remaining, news_selection_text, config=config)
 
 
 def _write_report_tree(final_state, ticker, publication, output_language, supplemental_text="",
-                       company_announcement=None, announcement_timeout_seconds=25, announcement_remaining=None, news_selection_text=""):
+                       company_announcement=None, announcement_timeout_seconds=25, announcement_remaining=None, news_selection_text="", *, config=None):
     save_path = publication.root
-    write_immutable_decision_audit(final_state, save_path, publication=publication)
+    from tradingagents.dataflows.finite_disclosure_output import (
+        finite_export_documents,
+        validate_publication,
+    )
+    finite = validate_publication(final_state, config, terminal=True)
+    write_immutable_decision_audit(final_state, save_path, publication=publication, config=config)
+    if finite:
+        identity = CanonicalRunIdentity.model_validate(final_state["run_identity"])
+        documents, stages = finite_export_documents(final_state, output_language, config)
+        return publish_report_export(publication, identity, output_language, documents, stages, state=final_state, config=config)
     terminal = TerminalContract.model_validate(final_state["terminal_contract"])
     identity = CanonicalRunIdentity.model_validate(final_state["run_identity"])
     evidence = EvidenceState.model_validate(final_state["evidence_state"])
@@ -1614,6 +1666,8 @@ def _write_report_tree(final_state, ticker, publication, output_language, supple
     body = decision_scope_markdown(final_state, decision, evidence, output_language) + "\n" + localize_report(body, output_language)
     body += "\n" + evidence_diagnostic_markdown(evidence, output_language)
     body += "\n" + budget_data_gap_markdown(final_state, output_language)
+    from tradingagents.dataflows.finite_disclosure_output import render_limits
+    body += render_limits(final_state)
     documents = {terminal_path: body}
     trend = multiyear_trend_markdown(
         evidence, symbol=ticker, as_of=final_state.get("trade_date"), language=output_language,

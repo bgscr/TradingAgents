@@ -36,6 +36,9 @@ def create_market_analyst(llm):
             get_indicators,
             get_verified_market_snapshot,
         ]
+        from tradingagents.finite_disclosure_runtime import finite_analyst_step, is_finite_state
+        if is_finite_state(state):
+            return finite_analyst_step(llm,'market',state,data_tools)
         tools = [*data_tools, AnalystEvidenceReport]
 
         system_message = (

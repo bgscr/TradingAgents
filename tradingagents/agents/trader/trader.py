@@ -6,6 +6,10 @@ import functools
 
 from langchain_core.messages import AIMessage
 
+from tradingagents.agents.finite_disclosure_advisory import (
+    finite_advisory_update,
+    is_finite_state,
+)
 from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
@@ -22,6 +26,12 @@ def create_trader(llm):
     structured_llm = bind_structured(llm, TraderProposal, "Trader")
 
     def trader_node(state, name):
+        if is_finite_state(state):
+            update = finite_advisory_update(llm, "trader", state)
+            update["messages"] = [
+                AIMessage(content=update["trader_investment_plan"])
+            ]
+            return update
         company_name = state["company_of_interest"]
         instrument_context = get_instrument_context_from_state(state)
         investment_plan = state["investment_plan"]

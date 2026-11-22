@@ -32,6 +32,7 @@ from tradingagents.financial_observations import (
     FinancialObservation,
     bind_current_statement_observation,
 )
+from tradingagents.dataflows.finite_disclosure_contracts import FiniteDisclosureCacheEvidence
 
 if TYPE_CHECKING:
     from tradingagents.asset_configuration import RunAssetConfiguration
@@ -2381,10 +2382,14 @@ def _canonicalize_source_facts(
     return tuple(canonical)
 
 
+
+
 class EvidenceState(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
     contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    finite_cache_reads: tuple[FiniteDisclosureCacheEvidence, ...] = Field(
+        default=(), exclude_if=lambda value: not value)
     financial_eligibility_binding: (
         MainlandFinancialEligibilityProjectionBinding | None
     ) = Field(default=None, exclude_if=lambda value: value is None)
@@ -2546,6 +2551,12 @@ def _validated_tool_execution_evidence(
 ) -> ToolExecutionEvidenceEnvelope | _ToolExecutionEvidenceView:
     """Validate either the ordinary or duplicate-aware financial envelope."""
 
+    if isinstance(raw_envelope, Mapping) and raw_envelope.get('contract') == 'finite-disclosure-cache-evidence-v2':
+        from tradingagents.finite_disclosure_runtime import validate_finite_envelope
+        finite = validate_finite_envelope(raw_envelope)
+        return _ToolExecutionEvidenceView(
+            finite.tool_call_id, finite.tool_name, finite.source_ref,
+            finite.capability, (), SourceArtifact.model_validate(finite.selected_artifact))
     try:
         return ToolExecutionEvidenceEnvelope.model_validate(raw_envelope)
     except ValidationError as ordinary_error:
@@ -2774,6 +2785,12 @@ def build_tool_evidence_state(
 ) -> EvidenceState:
     """Materialize immutable source facts and per-claim validation results."""
     message_list = tuple(messages)
+    finite_reads = []
+    for message in message_list:
+        raw = getattr(message, 'artifact', None)
+        if isinstance(raw, Mapping) and raw.get('contract') == 'finite-disclosure-cache-evidence-v2':
+            from tradingagents.finite_disclosure_runtime import validate_finite_envelope
+            finite_reads.append(validate_finite_envelope(raw))
     claim_list = tuple(claims)
     note_list = tuple(notes)
     call_catalog = tool_calls_by_id or {}
@@ -2907,7 +2924,7 @@ def build_tool_evidence_state(
             message_tool_name = str(getattr(message, "name", ""))
             expected_capability = (
                 envelope.capability
-                if source_ref.startswith(("acq.v1:", "financial-request:v1:"))
+                if source_ref.startswith(("acq.v1:", "financial-request:v1:", "finite-cache:v2:"))
                 else (
                     EvidenceCapability.MARKET_SNAPSHOT.value
                     if source_kind == "snapshot"
@@ -3224,6 +3241,7 @@ def build_tool_evidence_state(
             validated_messages_by_source.get(note.source_ref, ())), match_count=len(matches))
         bound_notes.append(bound_note)
     return EvidenceState(
+        finite_cache_reads=tuple(finite_reads),
         material_claims=tuple(enriched_claims),
         evidence_notes=tuple(bound_notes),
         source_facts=tuple({fact.fact_id: fact for fact in facts}.values()),

@@ -157,6 +157,11 @@ class AgentState(MessagesState):
         ]
     ]
 
+    finite_disclosure_context: NotRequired[dict[str, Any]]
+    finite_analyst_selections: NotRequired[dict[str, Any]]
+    finite_advisory_trace: NotRequired[list[dict[str, Any]]]
+    finite_disclosure_limits: NotRequired[dict[str, Any]]
+    portfolio_advisory: NotRequired[str]
     sender: Annotated[str, "Agent that sent this message"]
 
     # research step

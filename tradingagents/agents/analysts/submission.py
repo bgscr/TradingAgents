@@ -153,6 +153,15 @@ def _source_ref(
     raw_envelope = getattr(message, "artifact", None)
     if raw_envelope is None and isinstance(message, Mapping):
         raw_envelope = message.get("artifact")
+    if isinstance(raw_envelope, Mapping) and raw_envelope.get('contract') == 'finite-disclosure-cache-evidence-v2':
+        from tradingagents.finite_disclosure_runtime import validate_finite_envelope
+        try:
+            finite = validate_finite_envelope(raw_envelope)
+        except (TypeError, ValueError):
+            return None
+        if finite.tool_call_id != str(tool_call_id) or finite.tool_name != tool_name:
+            return None
+        return finite.source_ref
     if raw_envelope is not None:
         try:
             envelope = ToolExecutionEvidenceEnvelope.model_validate(raw_envelope)
@@ -774,6 +783,8 @@ def build_analyst_update(
             "source_status": sources[note.source_ref].status,
             "source_required": sources[note.source_ref].required,
         }) for note in tool_evidence.evidence_notes)
+        from tradingagents.finite_disclosure_runtime import merge_finite_reads
+        evidence = merge_finite_reads(evidence, tool_evidence)
         evidence = merge_material_claims(
             evidence,
             tool_evidence.material_claims,

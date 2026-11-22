@@ -402,6 +402,8 @@ def prepare_decision_audit(
     publication=None,
 ) -> dict[str, Any]:
     """Persist source artifacts before authorizing a safe decision audit."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
 
     if publication is not None and Path(directory) != publication.root:
         raise ValueError("audit directory differs from its pinned report root")
@@ -412,8 +414,8 @@ def prepare_decision_audit(
 
     evidence = refresh_active_evidence_physical_attempts(evidence)
     final_state["evidence_state"] = evidence.model_dump(mode="python")
-    manifest = persist_source_artifacts(evidence, Path(directory), publication=publication)
-    projection = project_evidence_for_audit(evidence, manifest)
+    manifest = persist_source_artifacts(evidence, Path(directory), publication=publication, state=final_state, config=config)
+    projection = project_evidence_for_audit(evidence, manifest, state=final_state, config=config)
     payload = build_decision_audit(
         final_state,
         config=config,
@@ -430,6 +432,8 @@ def build_decision_audit(
     _evidence_projection: AuditEvidenceProjection | None = None,
 ) -> dict[str, Any]:
     """Build an audit only for a validated terminal contract."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
 
     if _evidence_projection is None:
         raise ValueError(
@@ -664,7 +668,7 @@ def build_decision_audit(
             **terminal.model_dump(mode="json"),
             "output_sha256": sha256(_canonical_json(terminal_output)).hexdigest(),
         },
-        "telemetry": telemetry.model_dump(mode="json"),
+        "telemetry": telemetry.model_dump(mode="json", exclude={'finite_cache_reads'} if final_state.get('finite_disclosure_context') is not None else set()),
         "financial_dispatch": (
             financial_dispatch.model_dump(mode="json")
             if financial_dispatch is not None
@@ -750,6 +754,10 @@ def build_decision_audit(
         ),
         "analysis_outcome_contract": analysis_outcome_contract,
     }
+    from tradingagents.dataflows.finite_disclosure_output import publication_projection
+    finite_projection = publication_projection(final_state, config)
+    if finite_projection is not None:
+        payload["finite_publication"] = finite_projection
     payload["audit_sha256"] = sha256(_canonical_json(payload)).hexdigest()
     apply_terminal_contract(
         final_state,
@@ -769,6 +777,8 @@ def write_immutable_decision_audit(
     publication=None,
 ) -> Path:
     """Publish a complete audit atomically and never overwrite different data."""
+    from tradingagents.dataflows.finite_disclosure_output import validate_publication
+    validate_publication(final_state, config, terminal=True)
     directory = Path(directory)
     if publication is None:
         directory.mkdir(parents=True, exist_ok=True)
