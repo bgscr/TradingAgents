@@ -118,6 +118,21 @@ class AgentState(MessagesState):
         dict[str, Any] | None, "Published structured trading decision when permitted"
     ]
     trade_date: Annotated[str, "What date we are trading at"]
+    research_advisory_direction: NotRequired[Annotated[
+        dict[str, Any] | None, "Optional structured advisory display binding, not decision evidence"
+    ]]
+    trader_advisory_direction: NotRequired[Annotated[
+        dict[str, Any] | None, "Optional structured advisory display binding, not decision evidence"
+    ]]
+    moneyflow_observation: NotRequired[Annotated[
+        dict[str, Any], "Normalized, optional moneyflow observation; outside decision evidence"
+    ]]
+    margin_balance_observation: NotRequired[Annotated[
+        dict[str, Any], "Optional one-day financing balance; outside decision evidence"
+    ]]
+    eastmoney_fundflow_observation: NotRequired[Annotated[
+        dict[str, Any], "Eastmoney percentage-only auxiliary flow; not statement or decision facts"
+    ]]
     run_id: Annotated[str, "Stable identity for this resumable analysis run"]
     admitted_evidence_binding: Annotated[
         dict[str, Any] | None,

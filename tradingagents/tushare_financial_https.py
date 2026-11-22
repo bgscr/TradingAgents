@@ -65,6 +65,11 @@ class _Client:
         self._failure_metadata = failure_metadata
 
     def query(self, endpoint, **params):
+        if self._failure_metadata is not None:
+            # A caller can share this sink across different table requests.
+            # Never attribute an earlier response's observations to this query.
+            for key in ("response_completeness", "response_values"):
+                self._failure_metadata.pop(key, None)
         if (
             endpoint not in ENDPOINTS
             or set(params) != {"ts_code", "start_date", "end_date", "report_type"}
@@ -99,13 +104,20 @@ class _Client:
             if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
                 raise ValueError("verification required")
             connection = http.client.HTTPSConnection(host, timeout=30, context=context)
-            if self._before_request is not None:
-                self._before_request(endpoint)
             if self._exchange_guard is not None:
                 permission.enter_context(self._exchange_guard(connection, endpoint))
-            remaining = permission.enter_context(admitted_transport("data"))
+            from tradingagents.full_session_ledger import owner,finance
+            flag=finance.set(True)
+            try:
+                remaining = permission.enter_context(admitted_transport("data"))
+                if remaining is None and owner() is not None:
+                    remaining=owner().reserve("financial")
+            finally:
+                finance.reset(flag)
             if remaining is not None:
-                connection.timeout = min(30, remaining)
+                connection.timeout = min(getattr(connection, "timeout", 30), remaining)
+            if self._before_request is not None:
+                self._before_request(endpoint)
             connection.request(
                 "POST",
                 path,
@@ -156,23 +168,37 @@ class _Client:
                     elif any(term in message for term in ("token", "认证", "authentication")):
                         classification_basis = "message_heuristic_authentication"
                 else:
-                    data = decoded.get("data")
-                    if (
-                        type(data) is not dict
-                        or type(data.get("fields")) is not list
-                        or not data["fields"]
-                        or any(type(f) is not str for f in data["fields"])
-                        or len(data["fields"]) != len(set(data["fields"]))
-                        or type(data.get("items")) is not list
-                        or any(
-                            type(row) is not list or len(row) != len(data["fields"])
-                            for row in data["items"]
-                        )
-                    ):
-                        raise ValueError("invalid response table")
                     # Object dtype avoids implicit optional Arrow inference in
                     # pandas 3 and retains original provider scalar values.
+                    from tradingagents.financial_response_completeness import (
+                        FinancialResponseIncomplete,
+                        FinancialResponseValueInvalid,
+                        inspect_response_completeness,
+                        inspect_response_values,
+                    )
+
+                    try:
+                        completeness = inspect_response_completeness(decoded)
+                    except FinancialResponseIncomplete as exc:
+                        error_code = str(exc)  # Fixed local reason; never response text.
+                        if self._failure_metadata is not None:
+                            self._failure_metadata["response_completeness"] = exc.summary
+                        raise
+                    data = decoded["data"]  # Table shape was checked above, without a fixed column order.
+                    if self._failure_metadata is not None:
+                        self._failure_metadata["response_completeness"] = completeness
+                    try:
+                        values = inspect_response_values(data["fields"], data["items"])
+                    except FinancialResponseValueInvalid as exc:
+                        error_code = str(exc)  # Fixed local reason, not cell content.
+                        if self._failure_metadata is not None:
+                            self._failure_metadata["response_values"] = exc.summary
+                        raise
                     frame = pd.DataFrame(data["items"], columns=data["fields"], dtype=object)
+                    frame.attrs["response_completeness"] = completeness
+                    frame.attrs["response_values"] = values
+                    if self._failure_metadata is not None:
+                        self._failure_metadata["response_values"] = values
         except KeyboardInterrupt:
             failure = PhysicalAttemptOutcome.PROVIDER_ERROR
             error_code = "financial_https_interrupted"
@@ -200,7 +226,10 @@ class _Client:
             # No raw exception or response text crosses this boundary.
             if self._failure_metadata is not None:
                 self._failure_metadata.update(
-                    provider_code=provider_code, classification_basis=classification_basis
+                    provider_code=provider_code,
+                    classification_basis=classification_basis,
+                    http_status=status,
+                    error_code=error_code or "financial_https_" + failure.value,
                 )
             raise PhysicalAttemptFailure(
                 outcome=failure,

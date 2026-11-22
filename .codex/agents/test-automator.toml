@@ -1,6 +1,6 @@
 name = "test-automator"
 description = "Implement substantial regression tests, fixtures or test-harness changes."
-model = "gpt-5.6-terra"
+model = "gpt-6.2-astra"
 model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
 developer_instructions = """

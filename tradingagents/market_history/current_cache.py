@@ -28,11 +28,15 @@ from tradingagents.market_history.store import MarketHistoryStore, _unique_json_
 
 CONTRACT = "mainland-current-cache-v1"
 SSE_CALENDAR_PROOF = "tushare-sse-current-calendar-v1"
+SSE_EXCHANGE_CALENDAR_PROOF = "tushare-sse-exchange-calendar-v2"
 SSE_CALENDAR_SYMBOL = "601328.SS"
 MANIFEST_CONTRACT = "current-cache-compatibility-manifest-v1"
 MANIFEST_PATH = Path(__file__).with_name("current_cache_compatibility.json")
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_FILES = (
+    "tradingagents/asset_configuration.py",
+    "tradingagents/dataflows/instrument_identity.py",
+    "tradingagents/budget_readiness.py",
     "tradingagents/market_history/current_cache.py",
     "tradingagents/market_history/current_incremental.py",
     "tradingagents/market_history/config.py",
@@ -41,6 +45,8 @@ SOURCE_FILES = (
     "tradingagents/market_history/current.py",
     "tradingagents/market_history/calendar_discovery.py",
     "tradingagents/market_history/calendar.py",
+    "tradingagents/market_history/calendar_preparation.py",
+    "tradingagents/market_history/calendar_preparation_runtime.py",
     "tradingagents/market_history/frames.py",
     "tradingagents/market_history/models.py",
     "tradingagents/market_history/revisions.py",
@@ -64,8 +70,14 @@ SOURCE_FILES = (
     "tradingagents/decision_policy.py",
     "tradingagents/agents/schemas.py",
     "tradingagents/evidence.py",
+    "tradingagents/comparison_evidence.py",
 )
 VERIFICATION_FILES = (
+    "tests/test_calendar_exchange_entry.py",
+    "tests/test_tushare_sse_prepared_calendar.py",
+    "tests/test_mainland_budget_repairs.py",
+    "tests/test_mainland_physical_attempt_coordination.py",
+    "tests/test_acquisition_controller.py",
     "tests/test_tushare_current_incremental.py",
     "tests/test_tushare_current_acceptance.py",
     "scripts/accept_tushare_current.py",
@@ -79,6 +91,10 @@ SCENARIOS = (
     "confirmed_suspension", "representation_noise", "in_range_gap", "factor_revision",
     "rate_limit_fallback", "store_corruption_degradation", "concurrent_write", "crash_recovery",
 )
+
+
+class PreparedExchangeCalendarError(ValueError):
+    """A known exchange-calendar source failure is terminal before any price request."""
 
 
 def canonical(value):
@@ -195,7 +211,15 @@ class _StoredSSECalendar(MarketSessionCalendarPublication):
     calendar_revision_id: str = ""
 
 
+SZSE_EXCHANGE_CALENDAR_PROOF = "tushare-szse-exchange-calendar-v2"
+EXCHANGE_PROOFS = {"SSE": SSE_EXCHANGE_CALENDAR_PROOF, "SZSE": SZSE_EXCHANGE_CALENDAR_PROOF}
+
+
 def prepared_sse_calendar_provider():
+    return prepared_exchange_calendar_provider("SSE")
+
+
+def prepared_exchange_calendar_provider(exchange):
     """Exact source family; identifying it does not admit it to other readers."""
     from tradingagents.dataflows.tushare_market_history import (
         CALENDAR_DATASET_NAME,
@@ -203,13 +227,51 @@ def prepared_sse_calendar_provider():
         _identity,
     )
 
+    if exchange not in EXCHANGE_PROOFS:
+        raise ValueError("unsupported calendar exchange")
+    dataset = CALENDAR_DATASET_NAME if exchange=="SSE" else "tushare-szse-prepared-trade-cal-v1"
     upstream, service = upstream_service_identity_for_provider("tushare")
     return ProviderDatasetSpec(upstream, service, _identity("provider-dataset", upstream,
-        CALENDAR_DATASET_NAME, "not-applicable", NORMALIZER_VERSION, "SSE"),
-        "tushare", CALENDAR_DATASET_NAME, "not-applicable", False)
+        dataset, "not-applicable", NORMALIZER_VERSION, exchange),
+        "tushare", dataset, "not-applicable", False)
 
 
-def verify_prepared_sse_revision(store, revision_id):
+def native_szse_calendar_provider():
+    from tradingagents.dataflows.tushare_market_history import CALENDAR_DATASET_NAME, NORMALIZER_VERSION, _identity
+    from dataclasses import replace
+    provider = prepared_exchange_calendar_provider("SZSE")
+    return replace(provider, dataset_name=CALENDAR_DATASET_NAME,
+        provider_dataset_id=_identity("provider-dataset", provider.upstream_service_id,
+            CALENDAR_DATASET_NAME, "not-applicable", NORMALIZER_VERSION, "SZSE"))
+
+
+def bind_prepared_publication(publication, exchange):
+    """Keep original upstream bytes; distinguish the SZSE catalog from the legacy SSE family."""
+    from dataclasses import replace
+    from tradingagents.dataflows.tushare_market_history import CALENDAR_DATASET_NAME, NORMALIZER_VERSION, _identity
+    provider=prepared_exchange_calendar_provider(exchange)
+    expected=replace(provider, dataset_name=CALENDAR_DATASET_NAME,
+        provider_dataset_id=_identity("provider-dataset",provider.upstream_service_id,CALENDAR_DATASET_NAME,
+                                     "not-applicable",NORMALIZER_VERSION,exchange))
+    if publication.provider!=expected:
+        raise ValueError("unexpected native trade_cal family")
+    return replace(publication,provider=provider)
+
+
+def verify_prepared_sse_revision(store, revision_id, *, exchange_scoped=False):
+    return verify_prepared_exchange_revision(store, revision_id, "SSE", exchange_scoped=exchange_scoped)
+
+
+def verify_prepared_exchange_revision(store, revision_id, exchange, *, exchange_scoped=True):
+    return _verify_exchange_source(store, revision_id, exchange, exchange_scoped=exchange_scoped)
+
+
+def verify_and_exclude_native_szse(store, revision_id):
+    # Old native SZSE is authenticated for exclusion only, never returned as prepared data.
+    _verify_exchange_source(store, revision_id, "SZSE", exchange_scoped=True, native_szse=True)
+
+
+def _verify_exchange_source(store, revision_id, exchange, *, exchange_scoped, native_szse=False):
     """Authenticate one immutable source before admission OR source exclusion.
 
     This integrity check grants no instrument/mode eligibility. Callers must
@@ -222,7 +284,10 @@ def verify_prepared_sse_revision(store, revision_id):
     from tradingagents.market_history.calendar import MarketSession, MarketSessionStatus
     from tradingagents.market_history.revisions import RevisionKind, revision_identity
 
-    expected = prepared_sse_calendar_provider()
+    if type(exchange_scoped) is not bool:
+        raise ValueError("exchange proof mode must be boolean")
+    if not exchange_scoped and exchange != "SSE":raise ValueError("invalid legacy calendar scope")
+    expected = native_szse_calendar_provider() if native_szse else prepared_exchange_calendar_provider(exchange)
     upstream, service = expected.upstream_service_id, expected.upstream_service_name
     connection = store._connection
     row = connection.execute(
@@ -238,7 +303,7 @@ def verify_prepared_sse_revision(store, revision_id):
     if (row is None or row[15] != expected.provider_dataset_id
             or row[1:3] != ("mainland-cn", "Asia/Shanghai") or row[4] != row[3]
             or row[5] != "retrospective_backfill"
-            or row[8:15] != ("tushare", upstream, CALENDAR_DATASET_NAME,
+            or row[8:15] != ("tushare", upstream, expected.dataset_name,
                            "not-applicable", 0, service, "")):
         raise ValueError("prepared SSE calendar source mismatch")
     raw = store.read_payload(row[6])
@@ -272,10 +337,11 @@ def verify_prepared_sse_revision(store, revision_id):
     dates = {item.session_date for item in sessions}
     first, last = sessions[0].session_date, sessions[-1].session_date
     if (len(dates) != (last-first).days+1):
-        raise ValueError("prepared SSE calendar range incomplete")
+        raise ValueError(f"prepared {exchange} calendar range incomplete")
     calendar = _StoredSSECalendar(provider=expected, reference_market=row[1], timezone_name=row[2],
         observed_at=datetime.fromisoformat(row[3]), provenance_class=ProvenanceClass.RETROSPECTIVE_BACKFILL,
-        raw_payload=raw, sessions=sessions, payload_contract=SSE_CALENDAR_PROOF,
+        raw_payload=raw, sessions=sessions,
+        payload_contract=("tushare-response-v1" if native_szse else EXCHANGE_PROOFS[exchange] if exchange_scoped else SSE_CALENDAR_PROOF),
         endpoint="trade_cal", normalizer_version=NORMALIZER_VERSION, calendar_revision_id=row[0])
     validate_calendar_evidence(calendar_evidence(calendar))
     return calendar
@@ -296,22 +362,73 @@ def read_prepared_sse_calendar(store, symbol, start, end):
         raise ValueError("prepared SSE calendar usage not entitled")
     if type(start) is not date or type(end) is not date or start > end:
         raise ValueError("prepared SSE calendar range invalid")
+    return _read_prepared_sse_window(store, start, end, exchange_scoped=False)
+
+
+def _read_prepared_sse_window(store, start, end, *, exchange_scoped, exchange="SSE"):
     rows = store._connection.execute(
         "SELECT calendar_revision_id,observed_at FROM market_session_calendars "
         "WHERE provider_dataset_id=? ORDER BY observed_at DESC,calendar_revision_id",
-        (prepared_sse_calendar_provider().provider_dataset_id,),
+        (prepared_exchange_calendar_provider(exchange).provider_dataset_id,),
     ).fetchall()
     selected = None
     for revision_id, observed_at in rows:
         if selected is not None and observed_at != rows[0][1]:
             break
-        calendar = verify_prepared_sse_revision(store, revision_id)
+        calendar = verify_prepared_exchange_revision(store, revision_id, exchange, exchange_scoped=exchange_scoped)
         if calendar.sessions[0].session_date > start or calendar.sessions[-1].session_date < end:
-            raise ValueError("prepared SSE calendar range incomplete")
+            raise ValueError(f"prepared {exchange} calendar range incomplete")
         if selected is not None and calendar.sessions != selected.sessions:
             raise ValueError("prepared SSE calendar equally recent conflict")
         selected = calendar
     return selected
+
+
+def _trusted_calendar_exchange(symbol, config):
+    """Resolve pinned run identity, never infer authority from a suffix alone."""
+    from tradingagents.asset_configuration import resolve_run_asset_configuration
+    from tradingagents.evidence import InstrumentKind
+
+    parsed = resolve_mainland_instrument(symbol) if symbol else None
+    if parsed is None or parsed.instrument_kind != "equity":
+        raise ValueError("prepared exchange calendar requires a mainland equity")
+    identity = resolve_run_asset_configuration(symbol, config=config).instrument_identity
+    expected_venue = {"shanghai": "XSHG", "shenzhen": "XSHE"}.get(parsed.exchange)
+    if (not identity.is_authoritative or identity.instrument_kind is not InstrumentKind.EQUITY
+            or identity.currency != "CNY" or identity.venue != expected_venue
+            or identity.symbol != parsed.yahoo_symbol):
+        raise ValueError("prepared exchange calendar authoritative identity mismatch")
+    return parsed, identity
+
+
+def read_prepared_exchange_calendar(store, symbol, start, end, *, config=None):
+    """An authenticated exchange calendar; not a security-price cache or PIT grant.
+
+    Legacy symbol-scoped cache proofs remain narrow. New consumers derive a
+    separate v2 exchange proof from the unchanged trade_cal raw publication,
+    whose ingestion instrument_id is required to be NULL.
+    """
+    if store.config.mode is not MarketHistoryMode.CURRENT:
+        return None
+    if store.config.data_usage_mode.value != "personal_research":
+        raise ValueError("prepared exchange calendar usage not entitled")
+    if type(start) is not date or type(end) is not date or start > end:
+        raise ValueError("prepared exchange calendar range invalid")
+    parsed = resolve_mainland_instrument(symbol) if symbol else None
+    if parsed is None or parsed.exchange not in {"shanghai","shenzhen"} or parsed.instrument_kind != "equity":
+        return None
+    exchange = "SZSE" if parsed.exchange=="shenzhen" else "SSE"
+    if store._connection.execute(
+        "SELECT 1 FROM market_session_calendars WHERE provider_dataset_id=? LIMIT 1",
+        (prepared_exchange_calendar_provider(exchange).provider_dataset_id,),
+    ).fetchone() is None:
+        return None
+    _trusted_calendar_exchange(symbol, get_config() if config is None else config)
+    # Preserve the mixed-source integrity check: selecting SSE never hides a
+    # damaged relevant BaoStock revision or relabeled source in the same store.
+    from tradingagents.market_history.calendar_discovery import read_mainland_calendar_window
+    read_mainland_calendar_window(store, start, end)
+    return _read_prepared_sse_window(store, start, end, exchange_scoped=True, exchange=exchange)
 
 
 def calendar_evidence(calendar):
@@ -325,6 +442,9 @@ def calendar_evidence(calendar):
                  "raw_payload": calendar.raw_payload.decode("utf-8")}
         if calendar.payload_contract == SSE_CALENDAR_PROOF:
             proof.update(kind=SSE_CALENDAR_PROOF, symbol_scope=SSE_CALENDAR_SYMBOL)
+        elif calendar.payload_contract in EXCHANGE_PROOFS.values():
+            exchange = "SZSE" if calendar.payload_contract==SZSE_EXCHANGE_CALENDAR_PROOF else "SSE"
+            proof.update(kind=calendar.payload_contract, exchange_scope=exchange)
     else:
         proof = {"kind": "verified-calendar-view-v1", "manifest": calendar.view_manifest_json,
                  "provenance": calendar.provenance_class.value}
@@ -365,21 +485,32 @@ def validate_calendar_evidence(evidence):
                 date.fromisoformat(manifest["start"]), date.fromisoformat(manifest["end"]))
         if calendar_evidence(restored.calendar) != evidence:
             raise ValueError("CURRENT view immutable source closure mismatch")
-    elif proof["kind"] in {"tushare-response-v1", SSE_CALENDAR_PROOF}:
+    elif proof["kind"] in {"tushare-response-v1", SSE_CALENDAR_PROOF, *EXCHANGE_PROOFS.values()}:
         from tradingagents.dataflows.tushare_market_history import (
             ADJUSTMENT_METHODOLOGY,
             CALENDAR_DATASET_NAME,
             NORMALIZER_VERSION,
             _identity,
         )
-        scoped = proof["kind"] == SSE_CALENDAR_PROOF
-        keys = {"kind", "provider", "provenance", "raw_payload"} | ({"symbol_scope"} if scoped else set())
+        legacy_scoped = proof["kind"] == SSE_CALENDAR_PROOF
+        exchange_scoped = proof["kind"] in EXCHANGE_PROOFS.values()
+        scoped = legacy_scoped or exchange_scoped
+        keys = ({"kind", "provider", "provenance", "raw_payload"}
+                | ({"symbol_scope"} if legacy_scoped else set())
+                | ({"exchange_scope"} if exchange_scoped else set()))
         if set(proof) != keys or proof["provenance"] != "retrospective_backfill":
             raise ValueError("Tushare calendar provenance")
         raw = proof["raw_payload"].encode("utf-8")
         if sha256(raw).hexdigest() != evidence["payload_sha256"]:
             raise ValueError("Tushare raw evidence digest")
         payload = json.loads(raw, object_pairs_hook=_unique_json_object)
+        if exchange_scoped and (set(payload) != {"calendar", "normalizer_version", "adjustment_methodology"}
+                or not isinstance(payload["calendar"], list)
+                or any(not isinstance(row, dict)
+                       or not {"exchange", "cal_date", "is_open"} <= set(row)
+                       or not set(row) <= {"exchange", "cal_date", "is_open", "pretrade_date"}
+                       for row in payload["calendar"])):
+            raise ValueError("exchange calendar raw contract")
         if payload["normalizer_version"] != NORMALIZER_VERSION or payload["adjustment_methodology"] != ADJUSTMENT_METHODOLOGY:
             raise ValueError("Tushare normalization version")
         dates = {}
@@ -389,6 +520,11 @@ def validate_calendar_evidence(evidence):
             if not isinstance(text, str) or len(text) != 8 or not text.isascii() or not text.isdigit():
                 raise ValueError("Tushare calendar date")
             day = datetime.strptime(row["cal_date"], "%Y%m%d").date().isoformat()
+            if exchange_scoped and row.get("pretrade_date") not in (None, ""):
+                prior = row["pretrade_date"]
+                if not isinstance(prior, str) or len(prior) != 8 or not prior.isascii() or not prior.isdigit():
+                    raise ValueError("exchange calendar optional predecessor shape")
+                datetime.strptime(prior, "%Y%m%d")  # descriptive only; never membership evidence
             flag = Decimal(str(row["is_open"]))
             if day in dates or flag not in {Decimal(0), Decimal(1)}:
                 raise ValueError("Tushare calendar membership")
@@ -396,12 +532,17 @@ def validate_calendar_evidence(evidence):
             exchanges.add(row["exchange"])
         if len(exchanges) != 1 or next(iter(exchanges)) not in {"SSE", "SZSE", "BSE"}:
             raise ValueError("Tushare calendar exchange")
-        if scoped and (exchanges != {"SSE"} or proof["symbol_scope"] != SSE_CALENDAR_SYMBOL):
+        if legacy_scoped and (exchanges != {"SSE"} or proof["symbol_scope"] != SSE_CALENDAR_SYMBOL):
             raise ValueError("prepared SSE calendar scope")
+        if exchange_scoped and (exchanges != {proof["exchange_scope"]} or EXCHANGE_PROOFS.get(proof["exchange_scope"]) != proof["kind"]
+                or not dates or len(dates) != (date.fromisoformat(max(dates)) - date.fromisoformat(min(dates))).days + 1):
+            raise ValueError("exchange calendar scope or complete membership")
         upstream, service = upstream_service_identity_for_provider("tushare")
         expected = ProviderDatasetSpec(upstream, service, _identity("provider-dataset", upstream,
             CALENDAR_DATASET_NAME, "not-applicable", NORMALIZER_VERSION, next(iter(exchanges))),
             "tushare", CALENDAR_DATASET_NAME, "not-applicable", False)
+        if exchange_scoped:
+            expected=prepared_exchange_calendar_provider(proof["exchange_scope"])
         if (proof["provider"] != asdict(expected) or evidence["provider_dataset_id"] != expected.provider_dataset_id
                 or evidence["sessions"] != [[day, dates[day], None] for day in sorted(dates)]):
             raise ValueError("Tushare calendar source binding")
@@ -447,10 +588,37 @@ def validate_coverage(frame, evidence, start, end, *, symbol=None):
             or not evidence["provider_dataset_id"] or len(evidence["payload_sha256"]) != 64):
         raise ValueError("calendar identity")
     validate_calendar_evidence(evidence)
+    if symbol and evidence["proof"]["kind"] == "tushare-response-v1":
+        parsed=resolve_mainland_instrument(symbol)
+        if parsed is None or parsed.instrument_kind!="equity":
+            raise ValueError("Tushare calendar instrument scope")
+        source=json.loads(evidence["proof"]["raw_payload"],object_pairs_hook=_unique_json_object)
+        if {row["exchange"] for row in source["calendar"]}!={{"shanghai":"SSE","shenzhen":"SZSE"}.get(parsed.exchange)}:
+            raise ValueError("Tushare calendar venue mismatch")
     if evidence["proof"]["kind"] == SSE_CALENDAR_PROOF:
         instrument = resolve_mainland_instrument(symbol) if symbol else None
         if instrument is None or instrument.yahoo_symbol != SSE_CALENDAR_SYMBOL:
             raise ValueError("prepared SSE calendar instrument scope")
+    elif evidence["proof"]["kind"] in EXCHANGE_PROOFS.values():
+        try:
+            parsed, _ = _trusted_calendar_exchange(symbol, get_config())
+            if {"shanghai":"SSE","shenzhen":"SZSE"}.get(parsed.exchange) != evidence["proof"]["exchange_scope"]:
+                raise ValueError("exchange calendar instrument scope")
+            # An embedded proof cannot bypass a deleted/corrupt/latest partial source.
+            # Reopen its immutable publication lifecycle before accepting a price-cache hit.
+            with MarketHistoryStore.open(MarketHistoryConfig.from_mapping(get_config())) as store:
+                retained = read_prepared_exchange_calendar(
+                    store, symbol, date.fromisoformat(start), date.fromisoformat(end), config=get_config())
+            if retained is None:
+                raise ValueError("exchange calendar retained source missing")
+        except Exception as exc:
+            raise PreparedExchangeCalendarError(
+                "prepared exchange calendar retained source validation failed"
+            ) from exc
+        if calendar_evidence(retained) != evidence:
+            # The latest source was fully validated. An older cached proof is a
+            # normal miss, not permission to reuse it or a terminal source failure.
+            raise ValueError("exchange calendar cached proof is superseded")
     as_of = _analysis_as_of(date.fromisoformat(end), timezone_name=evidence["timezone"])
     sessions = {}
     for day, status, closes_at in evidence["sessions"]:
@@ -584,8 +752,12 @@ def try_read(symbol, start, end, provider_chain, descriptors, minimum_rows):
                         minimum_history_rows=minimum_rows, provider=provider, instrument=instrument,
                         adjustment_basis=descriptor.adjustment_basis)
                     return decode(loaded, descriptor, symbol, start, end, minimum_rows), None
+                except PreparedExchangeCalendarError:
+                    raise
                 except Exception as exc:
                     diagnostics.append(f"{name}:{type(exc).__name__}:{exc}")
+    except PreparedExchangeCalendarError:
+        raise
     except Exception as exc:
         diagnostics.append(f"store:{type(exc).__name__}:{exc}")
     return None, "current_cache_miss:" + ";".join(diagnostics) if diagnostics else None

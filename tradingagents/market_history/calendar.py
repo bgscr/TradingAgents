@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -279,9 +280,16 @@ def publication_from_baostock_session_calendar_acquisition(
     )
 
 
+class CalendarPublicationConflictError(RuntimeError):
+    """The immutable calendar source changed after the caller's verified read."""
+
+
 def publish_session_calendar(
     store: MarketHistoryStore,
     publication: MarketSessionCalendarPublication,
+    *,
+    expected_head: tuple[tuple[str, str], ...] | None = None,
+    precommit_guard: Callable[[], object] | None = None,
 ) -> PublishedSessionCalendar:
     publication = canonical_session_calendar_publication(publication)
     from tradingagents.market_history.store import MarketHistoryCorruptionError
@@ -322,6 +330,14 @@ def publish_session_calendar(
     connection = store._connection
     connection.execute("BEGIN IMMEDIATE")
     try:
+        if expected_head is not None:
+            head = tuple(connection.execute(
+                "SELECT calendar_revision_id,observed_at FROM market_session_calendars "
+                "WHERE provider_dataset_id=? ORDER BY observed_at DESC,calendar_revision_id",
+                (provider.provider_dataset_id,),
+            ).fetchall())
+            if head != expected_head:
+                raise CalendarPublicationConflictError("calendar_concurrent_publication")
         connection.execute(
             "INSERT OR IGNORE INTO upstream_services "
             "(upstream_service_id, service_name, account_scope, created_at) "
@@ -489,6 +505,8 @@ def publish_session_calendar(
             "calendar_before_commit",
             calendar_revision_id,
         )
+        if precommit_guard is not None:
+            precommit_guard()
         connection.commit()
     except BaseException:
         with suppress(BaseException):

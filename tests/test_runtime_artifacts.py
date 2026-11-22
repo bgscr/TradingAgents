@@ -298,7 +298,8 @@ def test_terminal_metrics_round_trip_bounded_model_transport_projection(tmp_path
     assert terminal["model_transport"] == projection.model_transport.model_dump(
         mode="json"
     )
-    assert terminal["model_transport"]["contract_version"] == "1.0"
+    assert terminal["model_transport"]["contract_version"] == "1.1"
+    assert terminal["model_transport"]["attempts"][0]["send_limits"] is None
     assert terminal["model_transport"]["retention_limit"] == 256
     assert terminal["model_transport"]["summary"]["physical_attempts"] == 1
     assert terminal["model_transport"]["attempts"][0]["logical_call_id"] == (

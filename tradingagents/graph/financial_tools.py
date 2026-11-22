@@ -293,6 +293,8 @@ class FinancialDispatchToolNode:
                     "financial tool node Capability Routing Plan is immutable"
                 )
         self._config = dict(config) if config is not None else None
+        from tradingagents.powershell_fundflow import configured_owner
+        self._fundflow_owner = configured_owner(self._config or {})
         self._vendor_methods = vendor_methods
         self._retry_policy = retry_policy
         self._clock = clock
@@ -595,6 +597,10 @@ class FinancialDispatchToolNode:
             "evidence_state": evidence.model_dump(mode="json"),
             "financial_dispatch_ledger": dispatcher.checkpoint_ledger(),
         }
+        if self._fundflow_owner is not None:
+            observation = self._fundflow_owner.summary()['observation']
+            if observation is not None:
+                result['eastmoney_fundflow_observation'] = observation
         if shadow_checkpoint_dispatcher is not None:
             try:
                 shadow_ledger = shadow_checkpoint_dispatcher.checkpoint_ledger()
@@ -939,6 +945,7 @@ class FinancialDispatchToolNode:
         )
         dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=identity,
+            powershell_fundflow_owner=self._fundflow_owner,
             run_asset_configuration=asset_configuration,
             config=effective_config,
             vendor_methods=self._vendor_methods,

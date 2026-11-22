@@ -33,7 +33,7 @@ def is_valid_ticker_input(value: str) -> bool:
     allowed (it defaults to SPY downstream).
     """
     v = value.strip()
-    return not v or (all(ch.isalnum() or ch in "._-^=" for ch in v) and len(v) <= 32)
+    return not v or (v.isascii() and all(ch.isalnum() or ch in "._-^=" for ch in v) and len(v) <= 32)
 
 
 def get_ticker() -> str:
@@ -59,9 +59,11 @@ def get_ticker() -> str:
 
     if ticker is None:
         console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
-        exit(1)
+        raise SystemExit(1)
 
-    return normalize_ticker_symbol(ticker) if ticker.strip() else "SPY"
+    selected = normalize_ticker_symbol(ticker) if ticker.strip() else "SPY"
+    console.print(f"Selected symbol: {selected}", markup=False)
+    return selected
 
 
 def normalize_ticker_symbol(ticker: str) -> str:

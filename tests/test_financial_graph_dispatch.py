@@ -844,15 +844,14 @@ def test_compiled_mainland_financial_transport_has_exact_published_cardinality(
     assert transport_calls == [
         "stock_zyjs_ths",
         "stock_financial_abstract",
-        "stock_individual_fund_flow",
     ]
-    assert persisted_count == (3,)
-    assert graph_evidence.physical_attempt_count == 3
-    assert len(graph_evidence.physical_attempt_events) == 3
-    assert audit["evidence_state"]["physical_attempt_count"] == 3
-    assert len(audit["evidence_state"]["physical_attempt_events"]) == 3
-    assert report.count("### Physical attempt") == 3
-    assert "**Total physical-attempt count:** 3" in report
+    assert persisted_count == (2,)
+    assert graph_evidence.physical_attempt_count == 2
+    assert len(graph_evidence.physical_attempt_events) == 2
+    assert audit["evidence_state"]["physical_attempt_count"] == 2
+    assert len(audit["evidence_state"]["physical_attempt_events"]) == 2
+    assert report.count("### Physical attempt") == 2
+    assert "**Total physical-attempt count:** 2" in report
 
 
 def test_compiled_financial_duplicate_after_checkpoint_resume_uses_zero_provider_io(

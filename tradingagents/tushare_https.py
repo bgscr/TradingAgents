@@ -11,6 +11,7 @@ import importlib
 import json
 import math
 import ssl
+from contextlib import ExitStack
 from dataclasses import dataclass
 from types import FunctionType, MethodType
 
@@ -47,9 +48,17 @@ def validate_request(url, payload, timeout):
         raise TushareHTTPSFailure("request_rejected")
 
 
-def send_once(url, payload, timeout):
+def send_once(url, payload, timeout, *, coordinated_intake=False):
     """One HTTPS exchange; no redirect following, retry, proxy or netrc lookup."""
     validate_request(url, payload, timeout)
+    from tradingagents.analysis_budget import active_budget, admitted_transport
+
+    budget = active_budget()
+    if budget is not None and payload["api_name"] not in {
+        "daily", "adj_factor", "suspend_d", "trade_cal"
+    }:
+        budget.stop("uncovered_tushare_endpoint")
+    permission = ExitStack()
     connection = None
     failure = None
     result = None
@@ -63,6 +72,20 @@ def send_once(url, payload, timeout):
             connection = http.client.HTTPSConnection(
                 "api.waditu.com", timeout=timeout, context=context,
             )
+            remaining = permission.enter_context(admitted_transport("data"))
+            if remaining is None and budget is None:
+                from tradingagents.full_session_ledger import owner
+                if owner() is not None:
+                    remaining=owner().reserve("data")
+            if remaining is not None:
+                connection.timeout = min(timeout, remaining)
+            from tradingagents.full_session_ledger import owner
+            active=owner()
+            if coordinated_intake:
+                if active is None or active.child_role!="calendar" or active.params.get("contract")!="default-full-latest-intake-v1" or payload["api_name"] not in ("trade_cal","daily"):
+                    raise ValueError("unexpected_intake_transport")
+                from tradingagents.market_history.coordinator import record_active_physical_attempt_io
+                record_active_physical_attempt_io()
             connection.request(
                 "POST", "/dataapi/" + payload["api_name"], body=body,
                 headers={"Content-Type": "application/json", "Connection": "close"},
@@ -95,6 +118,7 @@ def send_once(url, payload, timeout):
                 connection.close()
             except Exception:
                 failure = ("transport_failed", None)
+        permission.close()
     # Raise outside handlers: raw failures do not survive in exception context.
     if failure is not None:
         raise TushareHTTPSFailure(*failure)
@@ -109,10 +133,27 @@ class _Response:
 class HTTPSPost:
     """The small Requests interface used by the supported SDK query method."""
 
+    def __init__(self, calendar_gate=None):
+        self.calendar_gate = calendar_gate
+
     def post(self, url, *, json, timeout=30, **kwargs):
         if kwargs:
             raise TushareHTTPSFailure("request_rejected")
-        _, content = send_once(url, json, timeout)
+        if self.calendar_gate is None:
+            _, content = send_once(url, json, timeout)
+        else:
+            validate_request(url, json, timeout)
+            params = json["params"]
+            if (json["api_name"] != "trade_cal"
+                    or json["fields"] != "exchange,cal_date,is_open,pretrade_date"
+                    or set(params) != {"exchange", "start_date", "end_date", "limit", "offset", "ts_type_name"}):
+                self.calendar_gate.stop("calendar_request_scope_mismatch")
+            _, content = self.calendar_gate.send(
+                destination=url, exchange=params["exchange"], start=params["start_date"],
+                end=params["end_date"], limit=params["limit"], offset=params["offset"],
+                operation=lambda remaining: send_once(url, json, min(timeout, remaining),
+                    coordinated_intake=getattr(self.calendar_gate,"record_at_send",False)),
+            )
         failure = None
         text = None
         try:
@@ -154,7 +195,7 @@ class _Client:
         raise TushareHTTPSFailure(*failure)
 
 
-def create_https_client(token):
+def create_https_client(token, *, calendar_gate=None):
     """Bind a client instance; unsupported SDK layouts fail before any request."""
     if type(token) is not str or not token:
         raise TushareHTTPSFailure("token_required")
@@ -170,7 +211,7 @@ def create_https_client(token):
         raise TushareHTTPSFailure("unsupported_sdk_layout")
     client._DataApi__http_url = HTTPS_BASE
     private_query = FunctionType(
-        query.__code__, {**query.__globals__, "requests": HTTPSPost()},
+        query.__code__, {**query.__globals__, "requests": HTTPSPost(calendar_gate)},
         query.__name__, query.__defaults__,
     )
     private_query.__kwdefaults__ = query.__kwdefaults__

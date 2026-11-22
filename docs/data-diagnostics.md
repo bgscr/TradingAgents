@@ -12,8 +12,14 @@ are the authority source; the operator's runtime identity configuration is not r
 From the checkout, an entirely offline example is:
 
 ```powershell
-& 'D:/prj/TradingAgents/TradingAgents/.venv/Scripts/python.exe' -I -S -B scripts/accept_financial_statements.py --output 'C:/Users/56922/Documents/Codex/2026-10-14/task-3/EXAMPLE-NEW-OFFLINE-RUN' --destination https://api.tushare.pro --account synthetic-offline --as-of 2026-10-15
+$diagnosticParent = (Get-Item -LiteralPath .).Parent.FullName
+$offlineOutput = Join-Path $diagnosticParent 'EXAMPLE-NEW-OFFLINE-RUN'
+& ./.venv/Scripts/python.exe -I -S -B scripts/accept_financial_statements.py --output $offlineOutput --destination https://api.tushare.pro --account synthetic-offline --as-of 2026-10-15 --ticker 600895.SH
 ```
+
+Choose an approved, writable external parent and a new output name. The example
+derives an absolute sibling path without a `..` component; the output directory
+must not already exist. The ticker labels synthetic inputs in this offline mode.
 
 Without `--authorize-live`, the first worker substitutes only the HTTPS connection
 with synthetic statement responses. It exercises the production HTTPS JSON parser,
@@ -57,147 +63,315 @@ in the new output directory. No runtime configuration is adopted automatically.
 
 ## News response diagnosis
 
+An explicitly authorized live run may instead select
+`--authorize-one-public-get-metadata-only`. This is a live GET, not offline replay.
+The default capture and replay modes are unchanged and mutually exclusive with
+this option. The exit-status goal defaults to `metadata-only` for this mode.
+Its separate `news-live-metadata-only-v1` receipt records closed status/shape
+categories, selection counts, source bindings and public request metadata. It
+does not retain response bytes, article text, arbitrary fields or their hashes,
+response/frame/artifact digests, or replayable content. A passing metadata run
+does not pass the original-byte or news-content replay goals. Failed eligibility
+still stops before production parsing; retention rules are not bypassed merely
+because writing is disabled. Existing size, stock/date/business and close rules
+continue to apply. Response length means decoded `response.content` bytes; the
+existing size rejection happens after Requests has read the response, not as a
+streaming download cap.
+
+Metadata-only receipts additionally carry `closed_shape` (`news-closed-shape-v1`).
+It labels strict production-decoded JSONP as `expected_jsonp` or
+`other_valid_jsonp`; otherwise only a complete plain-JSON syntax check is tried
+for observation, with the same duplicate-key/nonfinite-number rejection. That
+fallback never admits plain JSON to the production parser. Unsupported/malformed
+wrappers are `invalid_or_unknown`. This classification does not identify actual
+callback text, error responsibility, access restrictions or supplier success.
+
+The only inspected locations are root, root.result and root.data. At each, a
+fixed set of known fields receives presence/type labels; code receives only
+zero/nonzero/wrong-type/absent categories, msg/bizMsg only exact `OK`, empty string,
+unknown/wrong-type/absent categories. No normalization or error-message inference
+is used. Each location's cmsArticleWebOld array length is capped at 65535. No
+unknown key, value, callback, raw path or content digest is retained. `error`
+presence/type is descriptive only, not proof of a provider error contract.
+The metadata classifier never recursively projects unknown nesting; the JSON
+decoder still parses the complete size-bounded input in memory. Limits remain
+the existing 1 MiB post-read boundary and strict decoder; recursion errors or malformed syntax produce unavailable
+classification. An unexpected optional-observer failure yields fixed unavailable
+metadata with empty scopes and does not change admission or the first error;
+cancellation remains terminal and response ownership is closed before propagation.
+
+The separate opt-in `--public-structure-metadata` adds `news-public-structure-v1`
+to the metadata-only receipt and is recorded in its reservation. It is limited
+to the fixed production request or the single `_` variant below, `%20` URL and
+`600919.SH`; no header variant is combined with it. The actual PreparedRequest must pass the existing URL/parameter,
+no-body and no-credential-header checks, plus GET, empty session auth/cookies,
+verified TLS and disabled environment/proxy discovery checks, before observation.
+The default modes and all production admission rules are unchanged.
+
+Only after the strict decoder accepts the complete JSONP wrapper may this view
+retain a common `jQuery` identifier with 6–25 digits, underscore and a 13-digit
+2000–2100 timestamp. This is an explicitly permitted public correlation identifier,
+not authentication, proof of source, or a guarantee that any numeric string is
+non-sensitive. The format is grounded in jQuery 3.5.1's
+[JSONP callback generation](https://raw.githubusercontent.com/jquery/jquery/3.5.1/src/ajax/jsonp.js),
+[expando](https://raw.githubusercontent.com/jquery/jquery/3.5.1/src/core.js), and
+[nonce](https://raw.githubusercontent.com/jquery/jquery/3.5.1/src/ajax/var/nonce.js).
+Other callback forms remain hidden. Observing the name does not repair a callback
+mismatch. Existing profile-specific checks remain unchanged: the observed public
+profile rejects a mismatch; the legacy profile records it without that rejection.
+
+For `result`, at most 32 direct fields are inspected. Names must be ASCII business
+identifiers of at most 40 characters and in the explicit reviewed-name set;
+credential-like and unreviewed names are hidden in fixed counters. Nonempty direct
+string values hide their entire field. Allowed fields expose only name, built-in
+JSON type and empty/nonempty/not-applicable labels. No values, unknown-name hashes,
+article counts or nested fields are copied by this view; container contents are
+not inspected or certified safe. An oversized object exposes no sampled names.
+Fixed business-status categories remain in `closed_shape`. No body/digest is kept,
+so this observation cannot provide byte replay, establish cache identity, or
+reconstruct an earlier rejected response. All prior read/size/cleanup limitations
+above still apply.
+
+`--request-variant fresh-cachebuster-v1` additionally requires that public-structure
+opt-in. It changes only the final `_` query value to one freshly generated local
+UTC millisecond value, with a fixed numeric range and rejection of the baseline
+value. It never changes `cb`, `param`, query order/encoding, headers, method, body,
+TLS, redirects, retries or timeout. It does not reserialize the whole query.
+The actual changed URL and fixed query delta are recorded; `decoded_query_equal`
+is false by design for this variant. The request fingerprint explicitly remains
+the production request **before** the diagnostic variant. There is no automatic
+iteration, retry, arbitrary query input or change to production defaults.
+
+The production adapter already sets both `Cache-Control: no-cache` and
+`Pragma: no-cache`. [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.1.4)
+defines request no-cache as a preference for origin validation before reuse;
+request directives are advisory. Pragma is deprecated HTTP/1.0 compatibility.
+Cache keys normally include the target URI, but this does not prove a particular
+server or intermediary implements that correctly or that a new URI clears every
+cache. [jQuery 3.5.1](https://raw.githubusercontent.com/jquery/jquery/3.5.1/src/ajax.js)
+uses a fresh `_` for its cache=false option. This supports a normal single-variable
+observation, not a verified Eastmoney server contract or a cache-bypass guarantee.
+Changing response shape supports a possible relationship to query/URL variation;
+no change does not determine the cause or eliminate caching. Neither outcome alone
+establishes a fix, cache hit/miss, equivalent route or long-term reliability.
+
+Only this variant adds `news-cache-metadata-v1`: Date/Expires/Last-Modified must be
+exact valid IMF-fixdate/GMT; Age must be a bounded nonnegative decimal. Cache-Control
+is limited to 256 characters and 16 recognized directives with bounded numeric
+arguments. Unsupported/quoted/duplicate or public+private directives hide the
+whole field. ETag/Vary/Via/Cache-Status/X-Cache/CF-Cache-Status disclose presence
+only, never values, hosts, validator identifiers or hashes. Unexpected observer
+failure is unavailable; terminal errors close owned responses and propagate.
+No content or arbitrary headers are retained. Old receipts did not retain these
+headers, so their values are unknown rather than evidence of server absence.
+
+Only in this mode, `--percent-encoded-spaces` compares a public browser link by
+replacing the prepared query's space encoding (`+` to `%20`). The fixed decoded
+parameters and absence of credentials/body are checked before the sole send.
+Both public URLs and their semantic/byte equality are recorded. Production
+headers, verified TLS, `trust_env=False`, timeout 15, zero retries and disabled
+redirects remain unchanged. This option does not imitate a browser or identify
+the actual network route. Only closed response negotiation fields are retained;
+unknown values are labeled `other`. No browser access or second request occurs.
+
+A separate explicit `--request-variant omit-referer-v1` is restricted to live
+metadata-only mode, `%20` encoding and `600919.SH`. It deletes only the existing
+stock Referer from the PreparedRequest, verifies every other header plus method,
+URL and body are unchanged, and records that fixed deletion. It does not copy a
+browser identity, change TLS or provide an arbitrary-header interface. The default
+`production` variant leaves all headers unchanged. The existing request fingerprint
+still binds the production input before the diagnostic deletion; the variant name,
+verified delta and tool/CLI source bindings describe the actual diagnostic change.
+Each invocation still has its own single-send limit; this option grants no request
+authority and never schedules subsequent variants. A changed result cannot alone
+prove causality across different acquisition times or unconfirmed network routes.
+
+`--request-variant accept-javascript-v1` has the same explicit scope restrictions
+and replaces only `Accept: */*` with `Accept: text/javascript` relative to the
+unchanged production-header baseline, including its Referer. It cannot be combined
+with omit-referer-v1. This expresses response media preference, not a browser
+identity. [RFC 9110 sections 12.4.1 and 12.5.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-12.5.1)
+define this negotiation and permit a server to ignore it or return406 if unavailable.
+Neither a media-type match nor HTTP200 overrides the existing JSONP, business,
+stock/date or retention requirements. An unchanged result does not prove that all
+content negotiation is irrelevant; a changed result is not a supplier-wide fix.
+
+`--request-variant accept-edge-value-v1` instead selects the user's observed full
+Accept value, exactly:
+
+```text
+text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+```
+
+This is a separate single-field experiment against the original production
+baseline, not the earlier `text/javascript` preference. The same metadata-only,
+`%20`, ticker and one-send restrictions apply. Referer, UA, client hints, fetch
+context, encoding, language, callback, timestamp, verified TLS and proxy settings
+are unchanged; no other variant can be combined. Matching this one header does
+not recreate Edge or prove a common network route. HTML/error responses remain
+subject to the original decode/JSONP/schema admission and are never news merely
+because the request accepts HTML. Body, arbitrary fields and their digests remain
+unretained on both success and failure; only the fixed Accept delta is recorded.
+
 The original one-shot GET returned HTTP 200 and 706 bytes but parsing failed. Its
 raw body was not retained. That exhausted attempt cannot be replayed or treated as
 production recovery. These successor tools do not renew its request budget.
 
-`scripts/diagnose_public_news.py` accepts either `--replay CAPTURE_DIRECTORY` or
-the explicit future authorization flag `--authorize-one-public-get-and-save`.
-Both require `--output NEW_DIRECTORY --start YYYY-MM-DD --end YYYY-MM-DD`.
+In addition to metadata-only mode, `scripts/diagnose_public_news.py` retains
+`--replay CAPTURE_DIRECTORY` and `--authorize-one-public-get-and-save`.
+All three modes require `--output NEW_DIRECTORY --start YYYY-MM-DD --end YYYY-MM-DD`
+and explicit `--ticker 600895.SH|600919.SH` and `--transport direct`;
+there is no default stock or transport choice.
+The target choices do not grant live authorization for either instrument.
 Select the exit-status goal with `--acceptance-mode news-content|original-text`.
-Omitting this option preserves the legacy `original-text` behavior.
+Omitting this option defaults to `original-text` within the current receipt contract.
 Offline regression uses synthetic captures and replay. Live mode requires its own
 explicit authorization; neither this tool nor an offline pass grants one.
 
-The live adapter, when separately authorized, is constrained to one GET of
-`https://search-api-web.eastmoney.com/search/jsonp`, keyword `600895`, page 1,
-size 10, zero redirects/retries/details/model calls. It uses the installed SDK's
-curl transport, parameters, fixed `_` value, static SDK headers and Response.text
-decoding, with an explicit 20-second timeout and redirects disabled. Static SDK
-cookies are not operator credentials; no browser cookies or user credential store
-are consulted. Request and SDK hashes are saved, not the headers/cookies themselves.
-The real SDK parser and production private pandas binding/news acquisition route
-are executed; article links come from `code`, not a required wire `url` column.
+Current receipts use `news-production-diagnostic-v4`. The helper exercises the
+actual `route_to_vendor_acquired -> get_news -> _stock_news_em -> parse_news_page`
+chain. It intercepts the adapter's requests namespace, not the obsolete SDK call.
+The CLI source hash and explicit transport choice are bound in v4 receipts.
+Live capture creates a fresh Requests Session with `trust_env=False`, empty
+proxies and `verify=True`. It does not discover system/environment proxies,
+netrc credentials or environment CA overrides. The installed default HTTPS
+retry count must remain zero; timeout 15 and redirects disabled are unchanged.
+The session closes after the attempt, without fallback or global changes.
+The production Requests path advertises only `gzip, deflate`, whose decoding
+does not require optional Brotli/Zstandard packages. This is an encoding-policy
+fix, not a switch to the SDK's curl transport. Plain responses remain supported.
+Requests decodes content before `response.content` is inspected: retained bytes,
+lengths and hashes describe that body, not compressed bytes on the connection.
+Synthetic compatibility tests keep real Requests/urllib3 decoding and replace
+only the network send. They do not replay the missing historical response or
+establish why that response lacked the target news collection.
+Replay is offline; the transport field describes the bound capture policy,
+not a network replay or independent proof of network delivery.
+The selected ticker binds the request keyword, production symbol, capture,
+reservation and replay. Only `600895.SH` and `600919.SH` are supported.
+The existing transport scope remains page 1, size 10, one supplied GET, no redirects, no additional details/model calls, and the production 15-second
+timeout. No default live getter exists in the library. The CLI still requires
+separate explicit authorization for capture, `-I -S -B`, and a fresh directory
+outside the source tree. Offline replay retains the original network guard.
 
-Independent `checks` record network, HTTP, decoding/size, retention, SDK,
-production window/admission, capture-receipt writing and replay status. Each failed
-check keeps its safe reason and exception type, without exception messages or
-response excerpts. `stage` identifies the first failed check even when production
-returns an available artifact. `capture_passed` requires production, body retention
-and receipt writing; it does not imply replay acceptance. `acceptance_passed` is
-false until a successful offline replay of a passed exact-text capture. These
-original-text fields retain their meanings in both acceptance modes.
-Import/dependency or guard failure remains a setup failure and can stop
-before a normal receipt. HTTP 200 alone never means recovery.
+The installed production parser, not HTTP 200 or the SDK's article shape, decides
+business status, dates and instrument association. No authoritative success-code
+contract is established here: `code=0` alone remains `business_status_unverified`.
 
-The CLI records `acceptance.mode`, `acceptance.passed` and both independent
-`acceptance.goals` in its new `result.json` and stdout. The reservation records
-`acceptance_mode`. Exit 0 means the selected goal passed for this invocation's
-capture/replay phase; exit 1 means it failed. Invalid arguments exit 2. Failure
-reasons and original-text flags are never rewritten to match the selected goal.
-`acceptance.content_source_passed` separately reports whether the source's network,
-HTTP, decode, SDK, production, receipt and selected-representation retention stages
-all passed. The content goal requires this for both capture and replay; a failed or
-missing source stage cannot be rescued by matching output hashes. For projection
-replay, the selected source retention stage is `projection`, not failed exact-text
-`retention`. The original-text mode keeps its legacy contract.
+The 2026-11-13 local compatibility profile additionally recognizes the complete
+shape observed in two user-pasted browser responses: exactly `bizCode`, `bizMsg`,
+`code`, `extra`, `hitsTotal`, `msg`, `result`, `searchId`; integer code zero, exact
+`OK`, empty business strings and extra object, bounded integer hit count, UUIDv4
+search ID, matching callback, and only the target collection of 1–10 articles.
+All seven observed article fields must have the checked types; image is empty,
+article ID/date formats are checked, sensitive text is rejected, and each URL
+must match that article ID on the observed stock/finance/bank Eastmoney hosts.
+Unknown extensions, other status combinations and mismatching callbacks do not
+gain this compatibility exception. The shared parser/retention validator does
+not remove metadata or re-encode the original body. Existing legacy status-absent
+behavior is unchanged; partial observed-profile markers remain unverified.
 
-| Mode | Capture phase | Offline replay phase |
-| --- | --- | --- |
-| `original-text` | Existing `capture_passed`: exact text, production and receipt saved | Existing `acceptance_passed`: successful exact-text capture and replay |
-| `news-content` | Validated exact text or projection, SDK/production/receipt success and full SDK frame fingerprint | Successful exact-text or projection replay with matching full SDK frame and production artifact |
+This is a closed local compatibility policy, not an authoritative supplier-wide
+success protocol. Date and stock selection still follow independently; the two
+browser pastes each contain ten rows but only one in the October 31–November 7
+window, with unknown coverage despite hitsTotal=196. They are user-supplied chat
+text, not program captures: browser acquisition time, HTTP status and headers
+are unknown. Local sample tests use explicitly simulated transports with origin
+sidecars, and cannot qualify those simulated HTTP statuses as live observations.
+Explicit failure signals remain failures. Query keywords and article IDs cannot
+prove stock association. Inclusive Shanghai calendar dates and authoritative
+symbol/alias checks are unchanged. One page leaves `news_window_coverage_unknown`;
+publication dates alone do not establish historical availability or strict PIT.
 
-A capture success does not claim that offline replay has happened. A projection
-can pass the content goal while `body_saved=false`, exact retention failed and
-`acceptance_passed=false`; inspect the selected goal and each stage separately.
-Missing frame evidence fails the new content goal. Old exact-text receipts without
-that optional historical fingerprint keep their original-text behavior. Existing
-receipts are read without requiring new mode fields and are never edited in place.
+The retention check distinguishes the target `result.cmsArticleWebOld` collection:
+`articles_missing` means the field is absent, `articles_null` means an explicit
+JSON null, and `articles_not_list` means a present non-null value has another
+type. These remain failed capture outcomes, with no accepted-count or coverage
+claim. An empty array is distinct from a missing collection; it still must pass
+the independent business-status and production-parser checks. An unrelated
+collection must never be substituted for the target or reported as zero news.
 
-Only a recognized public envelope containing `result.cmsArticleWebOld` and at most
-ten rows of public `date/mediaName/code/title/content/image` string fields is saved
-as exact UTF-8 SDK-decoded text (`image` is optional). The SDK itself reads that
-article list, selects/renames columns and derives links from `code`; it does not
-enforce the helper's closed field sets. The helper now also permits integer
-`code/hits/total/count` metadata from 0 through 2^53 at the top and result levels,
-and an optional top-level `success: true`. These are bounded supported variations,
-not a reconstruction of any lost live response. String metadata, unknown fields,
-duplicate JSON keys, recognizable credential markers in article text and unexpected
-bodies are rejected for exact retention. No arbitrary response, header, exception
-text, or transformed body is written as the original. Text screening is conservative and does
-not establish that every possible secret embedded in public fields is detectable.
-Empty recognized arrays are retained even if the SDK subsequently fails. Existing
-files are never overwritten; a failed/partial write is not a retained replay body.
+CLI stdout includes the existing `callback_matches` metadata: true/false after
+successful decoding, or null when decoding has not established a comparison.
+The callback name is not printed. Legacy status-absent envelopes retain their
+existing callback observation behavior; the closed browser-observed profile
+requires a match. Neither behavior overrides failed business, schema, date,
+stock-association or source checks.
+Old receipts and their reason labels are preserved. When original response bytes
+were not saved, new diagnostics cannot reconstruct them or provide a real replay;
+code-defined synthetic fixtures establish only the tested behavior.
 
-When exact validation rejects a parsed article list, the helper can separately
-save `public-projection.txt`: newly serialized JSONP containing only
-`result.cmsArticleWebOld`. Its field policy is derived from all parser/output
-operations in the pinned SDK, not a gradually expanded exact-body whitelist:
+Transport exceptions now add an optional `transport_detail` block under the
+network check, with sub-contract `news-transport-error-v1`. The outer v4 capture
+contract and all admission/retention rules remain unchanged. This diagnostic
+block is not evidence of supplier success or the root cause of a historical run.
+It records only exact known class identities as fixed labels/categories and
+whitelisted integer errno/winerror values. Unknown types become `other`;
+unknown codes, booleans and strings become null. No messages, traceback, host,
+URL, request, response, credentials, unknown class names or arbitrary attributes
+are serialized. DNS/TLS errno allowlists remain distinct from OS error codes.
 
-| Input field | SDK use | Projection |
-| --- | --- | --- |
-| `date`, `mediaName` | Renamed and selected | Retain required safe strings |
-| `title`, `content` | Renamed, selected and text-cleaned | Retain required safe strings |
-| `code` | Builds the output news URL, then discarded | Retain required safe string |
-| `url` | Overwritten from `code` before selection | Omit original value |
-| `关键词` | Overwritten with the symbol before selection | Omit original value |
-| `image` | Renamed to an unselected intermediate column | Omit original value |
-| Other row columns | Can collide with renamed output columns | Reject |
-| Other top/result metadata | Not read by this SDK | Omit, without endorsing original status |
+The selected chain follows explicit cause, known wrapper exception reason,
+exception-valued argument, then unsuppressed context, in that order. Traversal
+is capped at eight nodes, the first four arguments and eight fields of an exact
+ordinary wrapper dictionary. Dictionary subclasses and hash-based lookups are
+not used; unavailable references, cycles and stopping reasons are explicit.
+Known wrapper references include Requests/urllib3 args,
+MaxRetryError.reason, ProxyError.original_error and NameResolutionError._reason.
+This is one bounded path, not an exhaustive exception graph. MaxRetryError does
+not prove retries occurred: it can wrap a failed first attempt when retries=0.
+Metadata failure leaves a fixed unavailable detail and the original failure;
+it does not change the request, timeout, retry, TLS, budget or acceptance result.
+Previously lost exception chains cannot be reconstructed from outer type alone,
+and old captures/packets remain unchanged. Changed tool-source hashes continue
+to prevent old receipts from being silently qualified against new code.
 
-The SDK builds a DataFrame from row dictionaries and selects six output names;
-there is no fixed input column-count/order requirement. Unknown columns are not
-generally safe to drop: for example, an incoming `新闻标题` can duplicate a renamed
-column. Only `url/image/关键词` are removed, then the existing field, string,
-sensitive-text and count validator checks the remaining five-field core. Original
-values of these three omitted fields, including suspicious URLs or nested values,
-are never serialized. Sensitive or malformed retained fields still reject the
-projection. Exact-body validation is unchanged and never admits new URL values.
+Independent checks record network, HTTP, decoder, retention, parser, adapter,
+production admission, receipt and replay outcomes. Safe exception types/reasons
+and existing bounded business-status diagnostics contain no exception messages,
+headers, request bodies, addresses or article text. A later successful check
+cannot erase an earlier failed check. Setup/import/guard failures remain distinct.
 
-The fallback is pinned to the reviewed SDK function SHA256. It does not depend on
-guessing envelope field names or allowing their values. Rejected metadata or status
-flags remain failed exact-retention evidence; projected replay only compares SDK
-output after original SDK/production success. Changed SDK code, duplicate/invalid
-JSON, invalid core rows, other unknown columns or an expanded projection over 1 MiB
-cannot produce a usable projection. `projection_saved` and its distinct digest
-never imply `body_saved`, `capture_passed` or exact acceptance.
+`selection.excluded_counts` comes from the actual parser in validation order:
+`malformed`, `undated`, `outside_window`, then `wrong_stock`. Counts are mutually
+exclusive, saturate at 65535 with an explicit flag, and accompany accepted counts.
+They are unavailable (null, not zero) when parsing fails before article selection.
+The observed raw count is separate from the requested page size. The safe shape
+summary remains bounded to 32 fields per known object and 10 article shapes;
+unknown names are hashed and values are not copied.
 
-New receipts also retain a bounded `structure` summary: known diagnostic labels,
-JSON types, field counts, sizes and hashes/lengths of unknown names. No unknown
-literal names or field values are copied. At most 32 fields per known object and
-ten article-row shapes are shown; truncation is explicit, and arbitrary nested
-metadata is not traversed. JSONP prefix/suffix checks are booleans only. The existing
-older failed live receipts predate this summary and cannot be retroactively supplemented.
+Exact retention uses unchanged `response.content` bytes in `public-response.bin`,
+not re-encoded `Response.text` and not compressed wire bytes. The production
+nonexecuting decoder validates JSONP, duplicate keys, nonfinite numbers and UTF-8.
+The separate conservative public-data whitelist still requires at most ten rows
+of known string fields, screens sensitive text and rejects unknown envelope/row
+fields. Optional fields accepted by production do not relax retention. Recognized
+negative responses may be retained but cannot pass capture or replay acceptance.
+Existing files are never overwritten; failed or partial writes are not retained
+evidence. Text screening cannot identify every possible embedded secret.
 
-`articles.raw`, `articles.sdk` and `articles.filtered` record observed counts,
-invalid-date counts and valid timestamp minima/maxima. Raw observations come from
-the JSON article list even when metadata is rejected. SDK observations come from
-the real returned DataFrame; filtered observations wrap the actual production
-date filter, including its inclusive end day. Dates use production pandas coercion;
-unknown observations remain null and empty observed sets have count zero. Requested
-page size is never used as an observed count. Summary failure does not change the
-production result.
+No projected body is generated or accepted by v4. Removing a business-status field
+would change an input the current production parser evaluates. The compatibility
+flags `projection_saved` and `projection_replay_passed` therefore remain false.
+Earlier v2/v3, legacy SDK and projection receipts fail with an unsupported-contract
+reason and remain unchanged; success cannot be retroactively manufactured.
 
-Public content remains local. Content bytes are curl-decoded/decompressed bytes,
-not compressed wire bytes. Replay checks the retained text digest, reruns the SDK
-and production route with offline transport, and compares SDK, request, window and
-artifact fingerprints. A new full SDK DataFrame fingerprint additionally covers
-all rows, index/column order and dtypes, including out-of-window data. A projection
-replay must match that fingerprint as well as the SDK, request, window and rendered
-artifact, and requires successful original SDK/production observations. Only then
-is `projection_replay_passed` true. This is equivalence of the tested parsed output,
-not original-text preservation or proof about ignored envelope semantics. Projection
-replay always leaves `acceptance_passed` false. With `--acceptance-mode news-content`,
-successful projection replay exits 0; `original-text` still exits 1. Inspect
-`replay_kind`, `projection_replay_passed` and `acceptance` for the separate outcomes. Missing full-frame
-evidence, changed code, or changed rows cannot be rescued by a matching final article.
+Replay checks original-byte digest plus current tool, adapter, parser, acquisition,
+route and diagnostic-source bindings, explicit ticker, request settings, date window, adapter frame
+and rendered artifact fingerprints. Missing or failed source checks cannot be
+rescued by matching output. `capture_passed` requires original retention,
+production and receipt success; it does not claim replay occurred.
+`acceptance_passed` requires a passed source capture and successful bound replay.
 
-`--replay` selects only the fixed exact-body or projection filename declared in an
-approved capture receipt. No supplier request is needed. A future separately
-authorized single capture can thus retain safe structure and a validated projection
-before original production parsing, then compare it in the offline guarded worker.
-Unexpected article structure may still prevent projection; retain that precise
-reason and summary rather than guessing fields through repeated live requests.
+The CLI retains `--acceptance-mode original-text|news-content` for compatibility.
+Despite its legacy spelling, `original-text` now concerns the original bytes in
+the v4 contract. The content goal additionally requires the adapter frame hash.
+Neither mode accepts a projection or bypasses production/retention failure.
+Exit 0 means the selected goal passed for this phase; 1 means a failed diagnostic;
+2 means invalid invocation/input. Results retain explicit missing-data/PIT limits.
+
+Historical SDK-era observations below describe their original contracts only.
+They are not evidence that the current pipeline or a future supplier request works.
 
 Missing bindings or a failed source capture cannot pass exact acceptance. These
 checks do not prove an identical environment or qualify native
@@ -219,5 +393,12 @@ Old failed evidence is never overwritten, and this repair grants no further GETs
 Example replay of an already approved capture:
 
 ```powershell
-& 'D:/prj/TradingAgents/TradingAgents/.venv/Scripts/python.exe' -I -S -B scripts/diagnose_public_news.py --replay 'C:/path/to/approved-capture' --output 'C:/path/to/NEW-replay' --start 2026-10-05 --end 2026-10-12 --acceptance-mode news-content
+$diagnosticParent = (Get-Item -LiteralPath .).Parent.FullName
+$captureRoot = Join-Path $diagnosticParent 'approved-capture'
+$replayOutput = Join-Path $diagnosticParent 'NEW-replay'
+& ./.venv/Scripts/python.exe -I -S -B scripts/diagnose_public_news.py --replay $captureRoot --output $replayOutput --start 2026-10-05 --end 2026-10-12 --ticker 600895.SH --transport direct --acceptance-mode news-content
 ```
+
+Replace the capture path with an existing, permitted retained capture; this
+example does not download one. Use a fresh output path in an approved external
+directory, with no `..` components or links. All replay acceptance checks remain.

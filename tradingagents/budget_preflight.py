@@ -80,6 +80,7 @@ def inspect_budget_routes(config, *, selected_analysts=tuple(ANALYST_TOOLS), sym
               for field, reason in inspect_budget_config(config if budget_config is None else budget_config)]
     policy = config if budget_config is None else budget_config
     disable_alpha = policy.get("analysis_disable_alpha_vantage", False) is True
+    allowed_vendors = policy.get("analysis_allowed_data_vendors")
     chains, dependencies = [], []
     known = set(SNAPSHOT_PROVIDERS) | {"tushare", "stocktwits", "reddit"}
     known.update(name for vendors in VENDOR_METHODS.values() for name in vendors)
@@ -124,15 +125,23 @@ def inspect_budget_routes(config, *, selected_analysts=tuple(ANALYST_TOOLS), sym
         for index, vendor in enumerate(chain, 1):
             if vendor not in available:
                 add(location, index, vendor, "provider_not_implemented")
+            elif allowed_vendors is not None and vendor not in allowed_vendors:
+                if method not in {"get_global_news", "get_insider_transactions", "get_macro_indicators", "get_prediction_markets"}:
+                    add(location, index, vendor, "disabled_provider_requires_explicit_alternative")
             elif available[vendor] in (get_akshare_placeholder, get_baostock_placeholder):
                 add(location, index, vendor, "placeholder_implementation")
             elif (disable_alpha and vendor == "alpha_vantage"
                   and method not in {"get_global_news", "get_insider_transactions"}):
                 add(location, index, vendor, "disabled_provider_requires_explicit_alternative")
             elif vendor != "akshare":
-                from tradingagents.budget_data import supports_budget_data
+                from tradingagents.budget_data import supports_budget_data, supports_budget_snapshot
 
-                if not supports_budget_data(method, vendor, available[vendor]):
+                covered = (
+                    supports_budget_snapshot(vendor, available[vendor])
+                    if location == "market_snapshot"
+                    else supports_budget_data(method, vendor, available[vendor])
+                )
+                if not covered:
                     add(location, index, vendor, "uncovered_data_vendor")
 
     if symbol is None:
@@ -153,6 +162,8 @@ def inspect_budget_routes(config, *, selected_analysts=tuple(ANALYST_TOOLS), sym
             add("analysts", 0, "", "unknown_analyst")
             continue
         for method in ANALYST_TOOLS[analyst]:
+            if mainland and analyst == "news" and method == "get_insider_transactions":
+                continue  # Not bound by the news analyst; no qualified mainland source.
             location = analyst + "." + method
             method_tools = financial_tools if analyst == "fundamentals" else tools
             method_data = financial_data if analyst == "fundamentals" else data
@@ -224,7 +235,9 @@ def validate_budget_preflight(config, *, ticker, as_of_date,
             BudgetReadinessCheck("provider.alpha_vantage", "user_disabled"),
         ))
     required = sorted({names[provider] for _, chain in routes.chains
-                       for provider in chain if provider in names})
+                       for provider in chain if provider in names
+                       and (policy.get("analysis_allowed_data_vendors") is None
+                            or provider in policy["analysis_allowed_data_vendors"])})
     readiness = replace(readiness, checked=readiness.checked + tuple(
         BudgetReadinessCheck("credential." + name, "presence_and_service_not_checked")
         for name in required
@@ -234,3 +247,35 @@ def validate_budget_preflight(config, *, ticker, as_of_date,
     if readiness.issues:
         raise BudgetReadinessError(readiness)
     return routes, readiness
+
+
+def apply_mainland_budget_sources(config, *, ticker, include_macro_sources=True):
+    """Explicit process overlay; no profile write or automatic source reset."""
+    from copy import deepcopy
+
+    from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
+
+    instrument = resolve_mainland_instrument(ticker)
+    if (instrument is None or instrument.instrument_kind != "equity"
+            or config.get("analysis_budget_enabled") is not True
+            or config.get("financial_cache_only") is not True
+            or include_macro_sources and config.get("analysis_disable_alpha_vantage", False) is not False):
+        raise ValueError("mainland budget sources require equity, budget, cache-only and macro sources")
+    result = deepcopy(config)
+    market = result.setdefault("market_data_vendors", {}).setdefault("cn_a", {})
+    market["core_stock_apis"] = "tushare"
+    result.setdefault("tool_vendors", {}).update({
+        "get_news": "akshare",
+        "get_fundamentals": "akshare",
+        "get_balance_sheet": "tushare",
+        "get_income_statement": "tushare",
+        "get_cashflow": "tushare",
+        "get_global_news": "alpha_vantage",
+        "get_macro_indicators": "fred",
+        "get_prediction_markets": "polymarket",
+    })
+    result["budget_require_macro_sources"] = include_macro_sources
+    if not include_macro_sources:
+        result["analysis_disable_alpha_vantage"] = True
+        result["analysis_allowed_data_vendors"] = ["tushare", "akshare"]
+    return result

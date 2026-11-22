@@ -120,7 +120,7 @@ def test_real_news_failure_fallback_and_terminal_stop(monkeypatch, allowed):
         assert pool.host == 'search-api-web.eastmoney.com'
         return HTTPResponse(body=io.BytesIO(('jQuery35101792940631092459_1764599530165(' + json.dumps({"result": {"cmsArticleWebOld": [{
             "date": "2026-10-14 12:00:00", "mediaName": "Synthetic", "code": "synthetic",
-            "title": "Synthetic news", "content": "Synthetic", "image": ""}]}}) + ')').encode()),
+            "title": "601328 Synthetic news", "content": "Synthetic", "image": ""}]}}) + ')').encode()),
                             status=200, preload_content=False)
     sends = fake_wire(monkeypatch, fail_alpha)
     if allowed:

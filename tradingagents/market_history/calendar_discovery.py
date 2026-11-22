@@ -145,8 +145,8 @@ def _read_verified_membership(
     store: MarketHistoryStore, start: date, end: date,
 ) -> dict[date, tuple[MarketSession, StoredSessionCalendar]]:
     from tradingagents.market_history.current_cache import (
-        prepared_sse_calendar_provider,
-        verify_prepared_sse_revision,
+        prepared_exchange_calendar_provider, native_szse_calendar_provider, verify_and_exclude_native_szse,
+        verify_prepared_exchange_revision,
     )
 
     # Preserve all relevant candidates before selecting source families. Request
@@ -162,14 +162,20 @@ def _read_verified_membership(
         "ORDER BY c.observed_at DESC,c.calendar_revision_id DESC",
         (MAINLAND_REFERENCE_MARKET, start.isoformat(), end.isoformat(), end.isoformat(), start.isoformat()),
     ).fetchall()
-    separate_sse_dataset = prepared_sse_calendar_provider().provider_dataset_id
+    separate = {prepared_exchange_calendar_provider(ex).provider_dataset_id:ex for ex in ("SSE","SZSE")}
     membership: dict[date, tuple[MarketSession, StoredSessionCalendar]] = {}
     for revision_id, dataset_id in revisions:
-        if dataset_id == separate_sse_dataset:
+        if dataset_id == native_szse_calendar_provider().provider_dataset_id:
+            try:
+                verify_and_exclude_native_szse(store, revision_id)
+            except (ValueError, TypeError, KeyError, IndexError) as exc:
+                raise _integrity_failure() from exc
+            continue
+        if dataset_id in separate:
             # Validate BEFORE excluding: relabeling a corrupt BaoStock record as
             # Tushare must not hide it. This never adds SSE sessions to this view.
             try:
-                verify_prepared_sse_revision(store, revision_id)
+                verify_prepared_exchange_revision(store, revision_id, separate[dataset_id])
             except (ValueError, TypeError, KeyError, IndexError) as exc:
                 raise _integrity_failure() from exc
             continue

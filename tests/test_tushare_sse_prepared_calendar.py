@@ -282,9 +282,20 @@ def test_mixed_sources_preflight_actual_snapshot_and_cache(settings, monkeypatch
         old_view = calendar_discovery.read_mainland_calendar_window(store, START, END)
         assert old_view.source_calendar_revision_ids == (bao.calendar_revision_id,)
         assert sse.calendar_revision_id not in old_view.source_calendar_revision_ids
+    if symbol == "600519.SS":
+        # An exchange suffix is not authority: this synthetic registry has no identity.
+        with pytest.raises(ValueError, match="identity"):
+            market_snapshot._ensure_analysis_calendar(str(START), str(END), symbol=symbol)
+        issues, checked = [], []
+        budget_readiness._inspect_market(settings[0], symbol, START, END, issues, checked)
+        assert any(item.location == "calendar" for item in issues)
+        assert not any(item.location == "calendar" for item in checked)
+        return
+    uses_prepared_sse = symbol in {"601328.SS", "600895.SS"}
     selected = market_snapshot._ensure_analysis_calendar(str(START), str(END), symbol=symbol)
-    if symbol == SYMBOL:
+    if uses_prepared_sse:
         assert selected.calendar_revision_id == sse.calendar_revision_id
+        assert cache.calendar_evidence(selected)["proof"]["kind"] == cache.SSE_EXCHANGE_CALENDAR_PROOF
     else:
         assert selected.source_calendar_revision_ids == (bao.calendar_revision_id,)
     issues, checked = [], []
@@ -293,7 +304,7 @@ def test_mixed_sources_preflight_actual_snapshot_and_cache(settings, monkeypatch
     assert any(item.location == "calendar" and item.requires_provider_request is False for item in checked)
 
     days = pd.bdate_range(START, END)
-    if symbol == SYMBOL:
+    if uses_prepared_sse:
         days = days[days != pd.Timestamp("2026-09-08")]
     frame = pd.DataFrame({"Date": days, "Open": 10., "High": 12., "Low": 9., "Close": 11., "Volume": 100.})
     calls = []
@@ -358,7 +369,7 @@ def test_mixed_store_does_not_hide_damaged_baostock(settings, monkeypatch, defec
         market_snapshot._ensure_analysis_calendar(str(START), str(END), symbol="600895.SS")
 
 
-def test_tushare_only_does_not_admit_calendar_to_other_symbols(settings):
+def test_exchange_reader_is_separate_from_generic_baostock_reader(settings):
     from tradingagents.market_history.calendar_discovery import read_mainland_calendar_window
 
     persist(settings)
@@ -366,7 +377,10 @@ def test_tushare_only_does_not_admit_calendar_to_other_symbols(settings):
         assert read_mainland_calendar_window(store, START, END) is None
     issues, checked = [], []
     budget_readiness._inspect_market(settings[0], "600895.SS", START, END, issues, checked)
-    assert any(item.location == "calendar" and item.reason == "incomplete_natural_date_window" for item in issues)
+    assert not issues
+    assert any(item.location == "calendar" and item.status == "verified_full_natural_date_window" for item in checked)
+    with MarketHistoryStore.open(settings[1]) as store:
+        assert cache.read_prepared_sse_calendar(store, "600895.SS", START, END) is None
 
 
 @pytest.mark.parametrize("mode", [MarketHistoryMode.CURRENT, MarketHistoryMode.AUTHORITATIVE])
@@ -397,7 +411,11 @@ def test_legacy_baostock_calendar_coexists_without_readmission(settings, mode):
         view = read_mainland_calendar_window(store, START, END)
         assert view.source_calendar_revision_ids == (revision.calendar_revision_id,)
     selected = market_snapshot._ensure_analysis_calendar(str(START), str(END), symbol="600895.SS")
-    assert selected.source_calendar_revision_ids == (revision.calendar_revision_id,)
+    if mode is MarketHistoryMode.CURRENT:
+        assert cache.calendar_evidence(selected)["proof"]["kind"] == cache.SSE_EXCHANGE_CALENDAR_PROOF
+        assert selected.calendar_revision_id != revision.calendar_revision_id
+    else:
+        assert selected.source_calendar_revision_ids == (revision.calendar_revision_id,)
     if mode is MarketHistoryMode.CURRENT:
         issues, checked = [], []
         budget_readiness._inspect_market(settings[0], "600895.SS", START, END, issues, checked)

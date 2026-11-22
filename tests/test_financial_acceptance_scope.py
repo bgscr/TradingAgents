@@ -96,6 +96,8 @@ def fake_https(monkeypatch, make_frame, *, response=None, status=200):
                     "data": {
                         "fields": list(frame.columns),
                         "items": frame.values.tolist(),
+                        "has_more": False,
+                        "total": len(frame),
                     },
                 }
             ).encode()
@@ -254,11 +256,25 @@ def test_unsupported_company_type_is_explicit_and_stops(tmp_path, monkeypatch, c
 
 def test_cli_failure_writes_terminal_receipt_and_does_not_launch_reuse(tmp_path, monkeypatch):
     import sys
+    from functools import partial
     from types import SimpleNamespace
 
     from scripts import accept_financial_statements as cli
 
-    output = tmp_path / "reservation"
+    project = tmp_path / "synthetic-project"
+    project.mkdir()
+    validate_output = partial(cli.output_path_allowed, source=project)
+    monkeypatch.setattr(cli, "output_path_allowed", validate_output)
+    assert not validate_output(project / "unowned-output")
+    session = project / "reports" / "bounded-runs" / ("a" * 32)
+    session.mkdir(parents=True)
+    output = session / "refresh"
+    assert not validate_output(output)
+    (session / "session.json").write_text(json.dumps({
+        "contract": "bounded-mainland-session-v1", "run_id": session.name,
+        "root": str(session), "resume": False,
+    }), encoding="utf-8")
+    assert validate_output(output)
     calls = []
 
     def failed_child(command, **kwargs):
@@ -295,6 +311,7 @@ def test_cli_failure_writes_terminal_receipt_and_does_not_launch_reuse(tmp_path,
         ],
     )
     assert cli.main() == 1
+    assert not validate_output(output)
     result = json.loads((output / "result.json").read_text())
     assert result["status"] == "stopped"
     assert result["failed_phase"] == "synthetic"
@@ -503,36 +520,36 @@ def test_hidden_prompt_failure_cannot_fall_back_to_visible_input(tmp_path, monke
 
 
 @pytest.mark.parametrize(
-    "response,status,error,provider_code,basis",
+    "response,status,error_code,provider_code,basis",
     [
         ({"code": -1, "msg": "synthetic token service unavailable"}, 200,
-         "upstream_rejection", -1, "message_heuristic_authentication"),
+         "financial_https_upstream_rejection", -1, "message_heuristic_authentication"),
         ({"code": 2002, "msg": "synthetic 权限不足"}, 200,
-         "upstream_rejection", 2002, "message_heuristic_permission"),
+         "financial_https_upstream_rejection", 2002, "message_heuristic_permission"),
         ({"code": 2002, "msg": "synthetic unknown rejection"}, 200,
-         "upstream_rejection", 2002, "provider_code_unmapped"),
+         "financial_https_upstream_rejection", 2002, "provider_code_unmapped"),
         ({"code": -1, "msg": {"token": "synthetic non-text"}}, 200,
-         "upstream_rejection", -1, "provider_code_unmapped"),
+         "financial_https_upstream_rejection", -1, "provider_code_unmapped"),
         ({"code": -1, "msg": "synthetic 每分钟"}, 200,
-         "rate_limited", -1, "message_heuristic_rate_limit"),
+         "financial_https_rate_limited", -1, "message_heuristic_rate_limit"),
         ({"code": 2147483647, "msg": "synthetic unknown"}, 200,
-         "upstream_rejection", 2147483647, "provider_code_unmapped"),
+         "financial_https_upstream_rejection", 2147483647, "provider_code_unmapped"),
         ({"code": -2147483648, "msg": "synthetic unknown"}, 200,
-         "upstream_rejection", -2147483648, "provider_code_unmapped"),
+         "financial_https_upstream_rejection", -2147483648, "provider_code_unmapped"),
         ({"code": 2147483648, "msg": "synthetic token"}, 200,
-         "malformed_response", None, "response_schema"),
+         "financial_https_malformed_response", None, "response_schema"),
         ({"code": True, "msg": "synthetic token"}, 200,
-         "malformed_response", None, "response_schema"),
-        ({"code": 0, "data": {}}, 200, "malformed_response", 0, "response_schema"),
-        ({"code": 0}, 401, "authentication", None, "http_status"),
-        ({"code": 0}, 403, "permission_denied", None, "http_status"),
+         "financial_https_malformed_response", None, "response_schema"),
+        ({"code": 0, "data": {}}, 200, "financial_response_invalid_table", 0, "response_schema"),
+        ({"code": 0}, 401, "financial_https_authentication", None, "http_status"),
+        ({"code": 0}, 403, "financial_https_permission_denied", None, "http_status"),
     ],
     ids=["ambiguous-auth", "permission-hint", "unmapped", "nontext-message", "rate-limit",
          "upper-bound", "lower-bound", "oversize-code", "boolean-code", "invalid-data",
          "http-auth", "http-permission"],
 )
 def test_upstream_failure_receipt_preserves_only_safe_classification(
-    tmp_path, monkeypatch, response, status, error, provider_code, basis
+    tmp_path, monkeypatch, response, status, error_code, provider_code, basis
 ):
     from tradingagents import statement_acceptance as acceptance
 
@@ -543,11 +560,21 @@ def test_upstream_failure_receipt_preserves_only_safe_classification(
     )
     assert result["status"] == "stopped" and result["physical_requests"] == len(calls) == 1
     assert result["views"] == {} and result["completed_tools"] == []
+    assert result["endpoints"] == ["balancesheet"]
     failure = result["failure"]
-    assert failure["error_code"] == "financial_https_" + error
+    assert failure["error_code"] == error_code
     assert failure["provider_code"] == provider_code
     assert failure["classification_basis"] == basis
     assert failure["http_status"] == status and not failure["retryable"]
     serialized = json.dumps(result)
     assert "synthetic" not in serialized and "offline-receipt-sentinel" not in serialized
     assert "msg" not in failure
+    if error_code == "financial_response_invalid_table":
+        # A valid business envelope with an invalid table retains the current
+        # completeness error; it is still a terminal malformed response.
+        assert failure["reason"] == "malformed_response"
+        summary = failure["response_completeness"]
+        assert summary["contract"] == "financial-response-assessment-v2"
+        assert summary["coverage"] == "query_response_only"
+        assert summary["status"] == "unresolved"
+        assert summary["row_count"] is None and summary["total"] is None

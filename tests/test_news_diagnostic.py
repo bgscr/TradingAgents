@@ -1,911 +1,657 @@
+"""Current production route with code-defined responses, never live captures."""
 import hashlib
-import inspect
 import json
+import os
 import sys
 from pathlib import Path
-from types import FunctionType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
-from tests.fixtures.akshare_news_parser import stock_news_em
+from tradingagents import news_diagnostic as diagnostic
 
-# Fixed source identity, not a hash computed from whichever SDK is installed.
-TEST_PARSER_SHA256 = "fc1515244d5cc2afc16603b3f655820e0903ded18745c6221ffd7f299dde77ee"
+START, END = "2026-10-05", "2026-10-12"
 
 
 @pytest.fixture(autouse=True)
-def reviewed_parser(monkeypatch):
-    """These unit tests use a reviewed, sanitized parser; no live SDK approval."""
-    from tradingagents import news_diagnostic as diagnostic
+def no_sdk_or_default_network(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unmocked transport or obsolete SDK")
 
-    assert hashlib.sha256(inspect.getsource(stock_news_em).encode()).hexdigest() == TEST_PARSER_SHA256
-    # Preserve the SDK namespace dispatch so the real production adapter still
-    # supplies its per-call pandas string handling. Do not change global options.
-    parser = FunctionType(
-        stock_news_em.__code__,
-        {**stock_news_em.__globals__, "__name__": "akshare.news.reviewed_test_fixture"},
-        stock_news_em.__name__, stock_news_em.__defaults__,
-    )
-    monkeypatch.setattr(diagnostic.akshare_data.ak, "stock_news_em", parser)
-    monkeypatch.setattr(diagnostic, "PROJECTION_SDK_SHA256", TEST_PARSER_SHA256)
+    monkeypatch.setattr(diagnostic.akshare_data.ak, "stock_news_em", forbidden)
+    import requests
+    monkeypatch.setattr(requests, "get", forbidden)
 
 
-def synthetic_get(*, extra=None, dates=None, mutate=None):
-    """Code-defined public fixture, never a reconstruction of a live response."""
+def synthetic_get(*, symbol="600895", extra=None, dates=None, mutate=None, closed=None):
     def get(url, *, params, **kwargs):
-        rows = [
-            {
-                "date": date,
-                "mediaName": "Synthetic public fixture",
-                "code": "202610100000",
-                "title": "Synthetic title",
-                "content": "Synthetic content",
-            }
-            for date in (
-                dates if dates is not None else
-                ("2026-10-01 12:00:00", "2026-10-10 12:00:00", "invalid-date")
-            )
-        ]
+        rows = [{"date": date, "mediaName": "Synthetic public fixture", "code": "202610100000",
+                 "title": symbol + " synthetic title", "content": "Synthetic content"}
+                for date in (dates if dates is not None else (
+                    "2026-10-01 12:00:00", "2026-10-10 12:00:00", "invalid-date"))]
         value = {"result": {"cmsArticleWebOld": rows}, **(extra or {})}
         if mutate:
             mutate(value)
-        text = params["cb"] + "(" + json.dumps(value) + ")"
-        return SimpleNamespace(status_code=200, text=text, content=text.encode(), headers={})
+        body = (params["cb"] + "(" + json.dumps(value) + ")").encode()
+        return SimpleNamespace(status_code=200, content=body,
+                               close=lambda: closed.append(True) if closed is not None else None)
     return get
 
 
-def test_public_metadata_capture_keeps_production_counts_and_replays(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"code": 0, "hits": 3, "success": True}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["artifact_sha256"]  # fixed parser + get_news + acquisition succeeded
-    assert result["body_saved"], "public envelope metadata must not lose the replay body"
-    assert result["checks"]["retention"]["status"] == "passed"
-    assert result["articles"]["raw"]["count"] == 3
-    assert result["articles"]["raw"]["invalid_dates"] == 1
-    assert result["articles"]["raw"]["date_min"] == "2026-10-01T12:00:00"
-    assert result["articles"]["raw"]["date_max"] == "2026-10-10T12:00:00"
-    assert result["articles"]["sdk"]["count"] == 3
-    assert result["articles"]["filtered"]["count"] == 1
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["acceptance_passed"]
-    assert replay["artifact_sha256"] == result["artifact_sha256"]
+def capture(root, **kwargs):
+    return diagnostic.capture(root, transport="direct", ticker="600895.SH", get=synthetic_get(**kwargs), start=START, end=END)
 
 
-def test_public_schema_rejection_survives_production_success(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"private_token": "SYNTHETIC-DO-NOT-RETAIN"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["artifact_sha256"]
-    assert not result["body_saved"]
-    assert result["stage"] != "available", "production must not overwrite retention failure"
-    assert result["checks"]["retention"]["reason"] == "unknown_envelope_fields"
-    assert result["checks"]["production"]["status"] == "passed"
-    assert not result["capture_passed"]
-    assert "SYNTHETIC-DO-NOT-RETAIN" not in (tmp_path / "capture.json").read_text()
+def replay(root):
+    return diagnostic.replay(root, transport="direct", ticker="600895.SH", start=START, end=END)
 
 
-def test_unknown_envelope_retains_only_validated_projection_and_safe_shape(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={
-            "message": "SYNTHETIC-PRIVATE-VALUE",
-            "SYNTHETIC-PRIVATE-KEY": {"token": "SYNTHETIC-PRIVATE-VALUE"},
-        }), start="2026-10-05", end="2026-10-12",
-    )
-    assert result["checks"]["retention"]["reason"] == "unknown_envelope_fields"
-    assert not result["body_saved"]
-    assert not result["capture_passed"]
-    assert result["projection_saved"]
-    assert not (tmp_path / "public-response.txt").exists()
-    projection = (tmp_path / "public-projection.txt").read_text(encoding="utf-8")
-    receipt = (tmp_path / "capture.json").read_text(encoding="utf-8")
-    assert "SYNTHETIC-PRIVATE" not in projection + receipt
-    fields = result["structure"]["envelope"]["fields"]
-    assert any(field.get("name") == "message" and field["type"] == "string" for field in fields)
-    assert any("name_sha256" in field and field["type"] == "object" for field in fields)
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["replay_kind"] == "validated_projection"
-    assert replay["same_sdk_frame"]
-    assert replay["same_artifact"]
-    assert replay["projection_replay_passed"]
-    assert not replay["acceptance_passed"]  # no exact original was retained
+def test_capture_current_parser_counts_and_exact_byte_replay(tmp_path):
+    closed = []
+    result = capture(tmp_path, extra={"hits": 3}, closed=closed)
+    assert result["contract"] == "news-production-diagnostic-v4"
+    assert result["capture_passed"] and closed == [True]
+    assert result["request_count"] == 1 and result["raw_count"] == 3
+    assert result["selection"] == {
+        "status": "observed", "excluded_counts": {"malformed": 0, "undated": 1, "outside_window": 1, "wrong_stock": 0},
+        "accepted_count": 1, "coverage": "unknown", "counts_saturated": False,
+    }
+    original = (tmp_path / "capture.json").read_bytes()
+    replayed = replay(tmp_path)
+    assert replayed["acceptance_passed"]
+    assert replayed["same_source_bindings"] and replayed["same_adapter_frame_sha256"]
+    assert replayed["same_artifact_sha256"]
+    assert replayed["data_gaps"] == ["news_window_coverage_unknown"]
+    assert replayed["historical_availability"] == "not_established_by_publication_date"
+    assert (tmp_path / "capture.json").read_bytes() == original
 
 
-def test_unknown_result_metadata_can_be_projected_without_guessing_field_names(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(mutate=lambda v: v["result"].update(
-            opaque_future_data={"password": "SYNTHETIC-PRIVATE"},
-        )), start="2026-10-05", end="2026-10-12",
-    )
-    assert result["checks"]["retention"]["reason"] == "unknown_result_fields"
-    assert result["projection_saved"]
-    assert diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")["projection_replay_passed"]
-    assert "SYNTHETIC-PRIVATE" not in (tmp_path / "public-projection.txt").read_text()
-
-
-def test_observed_seven_field_shape_retains_core_and_replays_all_sdk_rows(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    # Only counts, field roles and date bounds came from a safe live receipt.
-    # All contents, URLs and unobserved envelope names are invented, not a live fixture.
-    dates = ["2026-08-20 09:29:18", "2026-10-14 17:47:00"] + ["2026-09-01 12:00:00"] * 8
-
-    def add_fields(value):
-        for row in value["result"]["cmsArticleWebOld"]:
-            row.update(image="", url="https://synthetic.invalid/article?token=SYNTHETIC-OMITTED")
-
-    fixture = synthetic_get(dates=dates, mutate=add_fields, extra={
-        "code": 0, "msg": "SYNTHETIC-OMITTED",
-        "synthetic_empty_a": "", "synthetic_empty_b": "", "synthetic_object": {},
-        "synthetic_number": 1, "synthetic_string": "SYNTHETIC-OMITTED",
-    })
-    calls = []
-
-    def get(*args, **kwargs):
-        calls.append(1)
-        return fixture(*args, **kwargs)
-
-    captured = diagnostic.capture(tmp_path, get=get, start="2026-10-09", end="2026-10-15")
-    assert captured["checks"]["sdk"]["status"] == "passed"
-    assert captured["checks"]["production"]["status"] == "passed"
-    assert captured["projection_saved"]
-    assert not captured["body_saved"]
-    assert captured["checks"]["retention"]["reason"] == "unknown_envelope_fields"
-    assert captured["articles"]["raw"]["count"] == captured["articles"]["sdk"]["count"] == 10
-    assert captured["articles"]["filtered"]["count"] == 1
-    assert captured["articles"]["raw"]["date_min"] == "2026-08-20T09:29:18"
-    assert captured["articles"]["filtered"]["date_max"] == "2026-10-14T17:47:00"
-    projection = (tmp_path / "public-projection.txt").read_text(encoding="utf-8")
-    rows = json.loads(projection[projection.index("(") + 1:-1])["result"]["cmsArticleWebOld"]
-    assert all(set(row) == {"date", "mediaName", "code", "title", "content"} for row in rows)
-    assert "SYNTHETIC-OMITTED" not in projection + (tmp_path / "capture.json").read_text()
-    replay = diagnostic.replay(tmp_path, start="2026-10-09", end="2026-10-15")
-    assert calls == [1]  # one fixture response supplies capture and offline replay
-    assert replay["same_sdk_frame"] and replay["same_artifact"]
-    assert replay["articles"] == captured["articles"]
-    assert replay["projection_replay_passed"] and not replay["acceptance_passed"]
-
-
-@pytest.mark.parametrize("omitted", [
-    {"url": "https://synthetic.invalid/?token=SYNTHETIC-OMITTED"},
-    {"url": {"Authorization": "Basic SYNTHETIC-OMITTED"}},
-    {"url": None},
-    {"image": "api_key=SYNTHETIC-OMITTED"},
-    {"image": ["SYNTHETIC-OMITTED"]},
-    {"关键词": {"secret": "SYNTHETIC-OMITTED"}},
-    {"url": False, "image": None, "关键词": "SYNTHETIC-OMITTED"},
-], ids=["url-secret", "url-object", "url-null", "image-secret", "image-list", "keyword-object", "all"])
-def test_projection_omits_only_sdk_overwritten_or_discarded_fields(tmp_path, omitted):
-    from tradingagents import news_diagnostic as diagnostic
-
+@pytest.mark.parametrize("marker,reason", [
+    ({"code": 0}, "business_status_unverified"), ({"code": 200}, "business_status_unverified"),
+    ({"success": True}, "business_status_unverified"), ({"status": "ok"}, "business_status_unverified"),
+    ({"error": None}, "business_status_unverified"), ({"success": False}, "business_failure"),
+    ({"error": "SYNTHETIC-PRIVATE"}, "business_failure"), ({"status": "failed"}, "business_failure"),
+])
+@pytest.mark.parametrize("scope", ["root", "result"])
+def test_business_status_never_becomes_success_from_http_200(tmp_path, marker, reason, scope):
     def mutate(value):
-        rows = value["result"]["cmsArticleWebOld"]
-        rows[0].update(omitted)
-        rows[0] = dict(reversed(list(rows[0].items())))  # SDK selects names, not positions
+        (value if scope == "root" else value["result"]).update(marker)
+    # Keep the parser's status semantics covered independently of retention.
+    body = synthetic_get(mutate=mutate)(None, params={"cb": "synthetic"}).content
+    with pytest.raises(diagnostic.eastmoney_news.NewsResponseError) as error:
+        diagnostic.eastmoney_news.parse_news_page(
+            body, expected_callback="synthetic", ticker="600895", start_date=START, end_date=END)
+    assert error.value.reason == reason
+    result = capture(tmp_path, mutate=mutate)
+    assert result["checks"]["http"]["status"] == "passed"
+    retained = "code" in marker or (scope == "root" and marker == {"success": True})
+    assert result["body_saved"] is retained
+    if retained:
+        assert result["checks"]["parser"]["reason"] == reason
+    else:
+        assert result["checks"]["retention"]["status"] == "failed"
+        assert result["checks"]["parser"]["status"] == "not_started"
+    assert not result.get("artifact_sha256")
+    assert result["selection"]["status"] == "not_observed"
+    assert not result["capture_passed"] and not result["projection_saved"]
+    assert "SYNTHETIC-PRIVATE" not in (tmp_path / "capture.json").read_text()
+    assert not replay(tmp_path)["acceptance_passed"]
 
-    captured = diagnostic.capture(
-        tmp_path, get=synthetic_get(mutate=mutate), start="2026-10-05", end="2026-10-12",
-    )
-    assert captured["checks"]["sdk"]["status"] == "passed"
-    assert captured["checks"]["production"]["status"] == "passed"
-    assert captured["projection_saved"] and not captured["body_saved"]
-    projection = (tmp_path / "public-projection.txt").read_text()
-    assert "SYNTHETIC-OMITTED" not in projection + (tmp_path / "capture.json").read_text()
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["same_sdk_frame"] and replay["same_artifact"]
-    assert replay["projection_replay_passed"] and not replay["acceptance_passed"]
+
+def test_code_zero_diagnostic_keeps_only_safe_metadata(tmp_path):
+    result = capture(tmp_path, extra={"code": 0})
+    event = next(x for x in result["diagnostics"] if x["kind"] == "news_business_status")
+    assert event["payload"]["fields"] == [{"field": "code", "scope": "root", "type": "integer", "value_class": "zero"}]
+    assert event["qualification_authority"] is False
+    assert result["body_saved"]  # Retain the recognized negative, never qualify it.
 
 
-@pytest.mark.parametrize("extra,reason", [
-    ({"hits": "token=SYNTHETIC-OMITTED"}, "invalid_public_metadata"),
-    ({"success": False}, "unsuccessful_envelope"),
+@pytest.mark.parametrize("status,collection,reason,retention", [
+    ({"code": 0, "msg": "OK"}, {"passportWeb": []}, "business_status_unverified", "articles_missing"),
+    ({"code": 0}, {"passportWeb": [{}]}, "business_status_unverified", "articles_missing"),
+    ({"code": 0, "msg": "OK"}, {"cmsArticleWebOld": []}, "business_status_unverified", "unknown_envelope_fields"),
+    ({}, {"passportWeb": []}, "schema_invalid", "articles_missing"),
+    ({}, {}, "schema_invalid", "articles_missing"),
+    ({}, {"cmsArticleWebOld": None}, "schema_invalid", "articles_null"),
+    ({}, {"cmsArticleWebOld": {}}, "schema_invalid", "articles_not_list"),
+    ({}, {"cmsArticleWebOld": "SYNTHETIC-PRIVATE"}, "schema_invalid", "articles_not_list"),
+    ({}, {"cmsArticleWebOld": False}, "schema_invalid", "articles_not_list"),
+    ({}, {"cmsArticleWebOld": 0}, "schema_invalid", "articles_not_list"),
 ])
-def test_projection_ignores_metadata_without_endorsing_original_status(tmp_path, extra, reason):
-    from tradingagents import news_diagnostic as diagnostic
-
-    captured = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra=extra), start="2026-10-05", end="2026-10-12",
-    )
-    assert captured["checks"]["retention"]["reason"] == reason
-    assert captured["projection_saved"] and not captured["capture_passed"]
-    assert "SYNTHETIC-OMITTED" not in (tmp_path / "public-projection.txt").read_text()
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["projection_replay_passed"] and not replay["acceptance_passed"]
-
-
-@pytest.mark.parametrize("name", ["opaque", "-", "新闻标题", "新闻内容", "发布时间", "文章来源", "新闻链接"])
-def test_projection_rejects_other_columns_including_sdk_output_aliases(tmp_path, name):
-    from tradingagents import news_diagnostic as diagnostic
-
-    captured = diagnostic.capture(
-        tmp_path, get=synthetic_get(mutate=lambda value: value["result"]["cmsArticleWebOld"][0].update(
-            {"url": "SYNTHETIC-OMITTED", name: "SYNTHETIC-OMITTED"},
-        )), start="2026-10-05", end="2026-10-12",
-    )
-    assert not captured["body_saved"] and not captured["projection_saved"]
-    assert captured["checks"]["projection"]["reason"] == "unknown_or_missing_article_fields"
-    assert "SYNTHETIC-OMITTED" not in (tmp_path / "capture.json").read_text()
-
-
-@pytest.mark.parametrize("field", ["date", "mediaName", "code", "title", "content"])
-def test_omitted_url_never_bypasses_sensitive_core_validation(tmp_path, field):
-    from tradingagents import news_diagnostic as diagnostic
-
-    captured = diagnostic.capture(
-        tmp_path, get=synthetic_get(mutate=lambda value: value["result"]["cmsArticleWebOld"][0].update(
-            {"url": "SYNTHETIC-OMITTED", field: 'Authorization: Basic SYNTHETIC-CORE'},
-        )), start="2026-10-05", end="2026-10-12",
-    )
-    assert not captured["body_saved"] and not captured["projection_saved"]
-    assert captured["checks"]["projection"]["reason"] == "sensitive_article_text"
-    assert "SYNTHETIC-CORE" not in (tmp_path / "capture.json").read_text()
-
-
-@pytest.mark.parametrize("change,reason", [
-    ({"新闻标题": "SDK column alias"}, "unknown_or_missing_article_fields"),
-    ({"content": "token=SYNTHETIC-PRIVATE"}, "sensitive_article_text"),
-    ({"content": None}, "non_string_article_field"),
-])
-def test_projection_does_not_drop_or_weaken_article_validation(tmp_path, change, reason):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"message": "extra envelope"}, mutate=lambda v: v["result"]["cmsArticleWebOld"][0].update(change)),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert not result["projection_saved"]
-    assert not (tmp_path / "public-projection.txt").exists()
-    assert result["checks"]["projection"]["reason"] == reason
+def test_status_and_target_collection_fail_independently_not_as_no_news(tmp_path, status, collection, reason, retention):
+    # Synthetic shape from the supplied issue clue, not a retained response or
+    # authority for the provider's current business-code semantics.
+    def get(url, *, params, **kwargs):
+        body = (params["cb"] + "(" + json.dumps({**status, "result": collection}) + ")").encode()
+        return SimpleNamespace(status_code=200, content=body, close=lambda: None)
+    with pytest.raises(diagnostic.eastmoney_news.NewsResponseError) as error:
+        diagnostic.eastmoney_news.parse_news_page(
+            get(None, params={"cb": "synthetic"}).content, expected_callback="synthetic",
+            ticker="600895", start_date=START, end_date=END)
+    assert error.value.reason == reason
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+    assert result["request_count"] == 1
+    assert result["checks"]["retention"]["reason"] == retention
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert result["selection"]["excluded_counts"] is None
+    assert result["selection"]["accepted_count"] is None
+    assert result["selection"]["coverage"] == "unknown"
+    assert result["raw_count"] == (0 if isinstance(collection.get("cmsArticleWebOld"), list) else None)
+    assert not result["body_saved"] and not result["projection_saved"]
+    assert not result["capture_passed"] and not result.get("artifact_sha256")
+    assert not (tmp_path / diagnostic.BODY_NAME).exists()
     assert "SYNTHETIC-PRIVATE" not in (tmp_path / "capture.json").read_text()
 
 
-def test_projection_requires_reviewed_sdk(tmp_path, monkeypatch):
-    from tradingagents import news_diagnostic as diagnostic
-
-    captured = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"message": "fixture"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert captured["projection_saved"]
-    monkeypatch.setattr(diagnostic, "PROJECTION_SDK_SHA256", "0" * 64)
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["same_sdk"] and replay["same_sdk_frame"] and replay["same_artifact"]
-    assert replay["checks"]["replay"]["reason"] == "sdk_projection_not_reviewed"
-    assert not replay["projection_replay_passed"]
-    assert not replay["acceptance_passed"]
-    output = tmp_path / "unreviewed"
-    output.mkdir()
-    result = diagnostic.capture(
-        output, get=synthetic_get(extra={"message": "fixture"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert not result["projection_saved"]
-    assert result["checks"]["projection"]["reason"] == "sdk_projection_not_reviewed"
-    assert not (output / "public-projection.txt").exists()
-
-
-def test_structure_summary_is_bounded_and_never_copies_unknown_names_or_values(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={f"PRIVATE-NAME-{i}": "PRIVATE-VALUE" for i in range(100)}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    summary = result["structure"]["envelope"]
-    assert summary["field_count"] == 101
-    assert len(summary["fields"]) == 32
-    assert summary["truncated"]
-    receipt = (tmp_path / "capture.json").read_text()
-    assert "PRIVATE-NAME" not in receipt
-    assert "PRIVATE-VALUE" not in receipt
-
-
-def test_projection_replay_compares_full_sdk_frame_not_just_in_window_artifact(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"message": "fixture"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    path = tmp_path / "public-projection.txt"
-    changed = path.read_text(encoding="utf-8").replace("Synthetic title", "Changed outside window", 1)
-    path.write_text(changed, encoding="utf-8")
-    receipt_path = tmp_path / "capture.json"
-    captured = json.loads(receipt_path.read_text(encoding="utf-8"))
-    captured["projection_sha256"] = hashlib.sha256(changed.encode()).hexdigest()
-    receipt_path.write_text(json.dumps(captured), encoding="utf-8")
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["same_artifact"]  # only an out-of-window row was changed
-    assert not replay["same_sdk_frame"]
-    assert replay["checks"]["replay"]["reason"] == "sdk_frame_mismatch"
-    assert not replay["projection_replay_passed"]
-    assert not replay["acceptance_passed"]
+def test_empty_target_list_is_distinct_from_missing_null_or_wrong_type(tmp_path):
+    result = capture(tmp_path, dates=[])
+    assert result["checks"]["retention"]["status"] == "passed"
+    assert result["raw_count"] == 0
+    assert result["checks"]["parser"]["reason"] == "no_usable_articles"
+    assert result["selection"]["coverage"] == "unknown"
+    assert not result["capture_passed"] and not result.get("artifact_sha256")
 
 
 @pytest.mark.parametrize("change,reason", [
-    ({"sdk_frame_sha256": None}, "sdk_frame_mismatch"),
-    ({"checks": {}}, "source_production_unverified"),
+    (lambda v: v.update(private_field="SYNTHETIC-PRIVATE"), "unknown_envelope_fields"),
+    (lambda v: v["result"].update(private_field="SYNTHETIC-PRIVATE"), "unknown_result_fields"),
+    (lambda v: v.update(hits="SYNTHETIC-PRIVATE"), "invalid_public_metadata"),
+    (lambda v: v["result"]["cmsArticleWebOld"][0].update(private_field="SYNTHETIC-PRIVATE"), "unknown_or_missing_article_fields"),
+    (lambda v: v["result"]["cmsArticleWebOld"][0].update(url={"hidden": "SYNTHETIC-PRIVATE"}), "unknown_or_missing_article_fields"),
+    (lambda v: v["result"]["cmsArticleWebOld"][0].update(content={"hidden": "SYNTHETIC-PRIVATE"}), "non_string_article_field"),
 ])
-def test_projection_replay_needs_original_execution_evidence(tmp_path, change, reason):
-    from tradingagents import news_diagnostic as diagnostic
-
-    diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"message": "fixture"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    receipt_path = tmp_path / "capture.json"
-    captured = json.loads(receipt_path.read_text(encoding="utf-8"))
-    captured.update(change)
-    receipt_path.write_text(json.dumps(captured), encoding="utf-8")
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["checks"]["replay"]["reason"] == reason
-    assert not replay["projection_replay_passed"]
-
-
-def test_projection_write_failure_preserves_existing_file(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    path = tmp_path / "public-projection.txt"
-    path.write_text("existing evidence", encoding="utf-8")
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(extra={"message": "fixture"}),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert path.read_text() == "existing evidence"
-    assert result["checks"]["projection"]["reason"] == "projection_write_failed"
-    assert not result["projection_saved"]
-
-
-def test_projection_expansion_respects_replay_size_limit(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    def get(*args, **kwargs):
-        response = synthetic_get(extra={"message": "fixture"}, dates=["2026-10-10 12:00:00"])(*args, **kwargs)
-        response.text = response.text.replace("Synthetic content", "文" * (diagnostic.LIMIT // 6 + 1))
-        response.content = response.text.encode()
-        return response
-
-    result = diagnostic.capture(tmp_path, get=get, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["decode"]["status"] == "passed"
-    assert result["checks"]["projection"]["reason"] == "projection_size_limit"
-    assert not result["projection_saved"]
-
-
-@pytest.mark.parametrize("mutate,reason", [
-    (lambda v: v.update(hits="SYNTHETIC-SECRET"), "invalid_public_metadata"),
-    (lambda v: v.update(success=False), "unsuccessful_envelope"),
-    (lambda v: v["result"].update(private_token="SYNTHETIC-SECRET"), "unknown_result_fields"),
-    (lambda v: v["result"]["cmsArticleWebOld"][0].update(token="SYNTHETIC-SECRET"), "unknown_or_missing_article_fields"),
-    (lambda v: v["result"]["cmsArticleWebOld"][0].pop("title"), "unknown_or_missing_article_fields"),
-    (lambda v: v["result"]["cmsArticleWebOld"][0].update(content={"secret": "SYNTHETIC-SECRET"}), "non_string_article_field"),
-    (lambda v: v["result"]["cmsArticleWebOld"][0].update(content="api_key=SYNTHETIC-SECRET"), "sensitive_article_text"),
-    (lambda v: v["result"].update(cmsArticleWebOld={}), "articles_not_list"),
-    (lambda v: v.update(result=[]), "invalid_envelope"),
-])
-def test_unrecognized_or_sensitive_response_is_never_saved(tmp_path, mutate, reason):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(mutate=mutate), start="2026-10-05", end="2026-10-12",
-    )
+def test_rejected_original_has_no_projection_or_secret_receipt(tmp_path, change, reason):
+    result = capture(tmp_path, mutate=change)
     assert result["checks"]["retention"]["reason"] == reason
-    assert not result["body_saved"]
-    assert not result["capture_passed"]
-    assert not (tmp_path / "public-response.txt").exists()
-    assert "SYNTHETIC-SECRET" not in (tmp_path / "capture.json").read_text()
-
-
-@pytest.mark.parametrize("extra", [None, {"message": "unknown envelope"}], ids=["exact", "projection"])
-@pytest.mark.parametrize("content", [
-    'Authorization: Basic SYNTHETIC-CREDENTIAL',
-    '{"Authorization": "Basic SYNTHETIC-CREDENTIAL"}',
-    "{'aUtHoRiZaTiOn' : 'Basic SYNTHETIC-CREDENTIAL'}",
-], ids=["header", "json", "single-quoted"])
-def test_authorization_markers_never_enter_retained_text(tmp_path, extra, content):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path,
-        get=synthetic_get(
-            extra=extra, dates=["2026-10-10 12:00:00"],
-            mutate=lambda value: value["result"]["cmsArticleWebOld"][0].update(content=content),
-        ),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["checks"]["sdk"]["status"] == "passed"
-    assert result["checks"]["production"]["status"] == "passed"
-    check = "projection" if extra else "retention"
-    assert result["checks"][check]["reason"] == "sensitive_article_text"
-    assert not result["body_saved"]
-    assert not result["projection_saved"]
-    assert not result["capture_passed"]
-    assert not (tmp_path / "public-response.txt").exists()
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert not result.get("artifact_sha256")
+    assert not result["capture_passed"] and not result["body_saved"] and not result["projection_saved"]
     assert not (tmp_path / "public-projection.txt").exists()
-    assert "SYNTHETIC-CREDENTIAL" not in (tmp_path / "capture.json").read_text()
+    assert not (tmp_path / diagnostic.BODY_NAME).exists()
+    assert "SYNTHETIC-PRIVATE" not in (tmp_path / "capture.json").read_text()
 
 
-def test_raw_count_is_observed_even_when_response_exceeds_requested_page_size(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(dates=["2026-10-10 12:00:00"] * 11),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["articles"]["raw"]["count"] == 11
-    assert result["checks"]["retention"]["reason"] == "article_limit"
-    assert result["checks"]["production"]["status"] == "passed"
-    assert not result["body_saved"]
-
-
-@pytest.mark.parametrize("dates,filtered,invalid", [
-    (["2026-10-05 00:00:00", "2026-10-12 23:59:59", "2026-10-13 00:00:00"], 2, 0),
-    (["2026-10-01 00:00:00"], 0, 0),
-    (["", "invalid-date"], 0, 2),
+@pytest.mark.parametrize("text", [
+    "token=SYNTHETIC-PRIVATE", "Authorization: Bearer SYNTHETIC-PRIVATE",
+    "cookie=SYNTHETIC-PRIVATE", "sk-SYNTHETIC-PRIVATE", "https://synthetic.invalid/private",
+    "-----BEGIN RSA PRIVATE KEY-----",
 ])
-def test_counts_observe_actual_production_window(tmp_path, dates, filtered, invalid):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(dates=dates), start="2026-10-05", end="2026-10-12",
-    )
-    assert result["articles"]["raw"]["count"] == len(dates)
-    assert result["articles"]["sdk"]["invalid_dates"] == invalid
-    assert result["articles"]["filtered"]["count"] == filtered
-    assert result["capture_passed"] == bool(filtered)
-    assert result["body_saved"]  # capture precedes production date admission
-    assert not result["acceptance_passed"]  # capture alone is not replay acceptance
-    if not filtered:
-        assert result["articles"]["filtered"]["date_min"] is None
-        assert result["checks"]["production"]["status"] == "failed"
-        assert result["outcomes"] == ["no_data"]
-
-
-@pytest.mark.parametrize("status", [302, 403, 500])
-def test_http_failure_never_claims_sdk_or_capture_success(tmp_path, status):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=lambda *a, **k: SimpleNamespace(status_code=status),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["checks"]["network"]["status"] == "passed"
-    assert result["checks"]["http"]["reason"] == "http_failure_or_redirect"
-    assert result["stage"] == "http"
-    assert result["request_count"] == 1
-    assert result["articles"]["raw"]["count"] is None
+def test_sensitive_article_text_is_never_retained(tmp_path, text):
+    result = capture(tmp_path, mutate=lambda v: v["result"]["cmsArticleWebOld"][0].update(content=text))
+    assert result["checks"]["retention"]["reason"] == "sensitive_article_text"
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert not result.get("artifact_sha256")
     assert not result["body_saved"]
+    assert text not in (tmp_path / "capture.json").read_text()
 
 
-def test_transport_failure_retains_safe_reason_without_exception_text(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    def get(*a, **k):
-        raise TimeoutError("SYNTHETIC-SECRET")
-
-    result = diagnostic.capture(tmp_path, get=get, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["network"]["exception_type"] == "TimeoutError"
-    assert result["stage"] == "transport"
-    assert result["request_count"] == 1
-    assert "SYNTHETIC-SECRET" not in (tmp_path / "capture.json").read_text()
-
-
-def test_response_size_limit_is_independent_of_sdk_failure(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    text = "x" * (diagnostic.LIMIT + 1)
-    result = diagnostic.capture(
-        tmp_path, get=lambda *a, **k: SimpleNamespace(
-            status_code=200, text=text, content=text.encode(), headers={},
-        ), start="2026-10-05", end="2026-10-12",
-    )
-    assert result["stage"] == "response_limit"
-    assert result["checks"]["decode"]["reason"] == "response_limit"
-    assert not result["body_saved"]
-
-
-@pytest.mark.parametrize("name,check,reason", [
-    ("public-response.txt", "retention", "body_write_failed"),
-    ("capture.json", "receipt", "capture_receipt_write_failed"),
+@pytest.mark.parametrize("close_failure", [False, True])
+@pytest.mark.parametrize("problem,stage,reason", [
+    ("sensitive", "retention", "sensitive_article_text"),
+    ("unknown", "retention", "unknown_envelope_fields"),
+    ("invalid", "decode", "wrapper_invalid"),
+    ("oversize", "decode", "response_limit_or_type"),
+    ("read", "decode", "body_read_exception"),
+    ("write", "retention", "body_write_failed"),
 ])
-def test_persistence_failure_does_not_overwrite_existing_evidence(tmp_path, name, check, reason):
-    from tradingagents import news_diagnostic as diagnostic
+def test_rejected_response_stops_real_route_before_parser(
+        tmp_path, monkeypatch, problem, stage, reason, close_failure):
+    calls, closes, parses = [], [], []
 
-    path = tmp_path / name
-    path.write_text("existing synthetic evidence", encoding="utf-8")
-    result = diagnostic.capture(tmp_path, get=synthetic_get(), start="2026-10-05", end="2026-10-12")
-    assert path.read_text(encoding="utf-8") == "existing synthetic evidence"
-    assert result["checks"][check]["reason"] == reason
-    assert result["checks"][check]["exception_type"] == "FileExistsError"
-    assert result["checks"]["production"]["status"] == "passed"
+    def forbidden_parser(*args, **kwargs):
+        parses.append(True)
+        raise AssertionError("rejected response reached business parser")
+
+    monkeypatch.setattr(diagnostic.eastmoney_news, "parse_news_page", forbidden_parser)
+    if problem == "write":
+        (tmp_path / diagnostic.BODY_NAME).write_bytes(b"existing synthetic evidence")
+
+    def get(url, *, params, **kwargs):
+        calls.append(True)
+        def mutate(value):
+            if problem == "sensitive":
+                value["result"]["cmsArticleWebOld"][0]["content"] = "token=SYNTHETIC-PRIVATE"
+            elif problem == "unknown":
+                value["unreviewed"] = "SYNTHETIC-PRIVATE"
+        body = synthetic_get(dates=["2026-10-10"], mutate=mutate)(url, params=params).content
+        if problem == "invalid":
+            body = b"bad"
+        elif problem == "oversize":
+            body = b"x" * (diagnostic.LIMIT + 1)
+
+        class Response:
+            status_code = 200
+
+            @property
+            def content(self):
+                if problem == "read":
+                    raise OSError("SYNTHETIC-PRIVATE body read")
+                return body
+
+            def close(self):
+                closes.append(True)
+                if close_failure:
+                    raise OSError("SYNTHETIC-PRIVATE cleanup")
+
+        return Response()
+
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH",
+                                get=get, start=START, end=END)
+    assert calls == closes == [True] and parses == []
+    assert result["request_count"] == 1
+    assert result["checks"][stage]["reason"] == reason
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert result["checks"]["production"]["status"] == "failed"
+    assert not result["body_saved"] and not result["capture_passed"]
+    assert not result.get("artifact_sha256") and not result.get("adapter_frame_sha256")
+    primary = [event["payload"] for event in result["diagnostics"]
+               if event["payload"].get("role") == "primary"]
+    expected_stage = "body_read" if problem == "read" else stage
+    expected_type = {"read": "OSError", "write": "FileExistsError"}.get(problem, "ValueError")
+    assert primary and all(event["stage"] == expected_stage for event in primary)
+    assert all(event["error_type"] == expected_type and event["http_status"] == 200 for event in primary)
+    first_exception = next(event for event in result["diagnostics"] if event["kind"] == "news_exception")
+    assert first_exception["payload"]["role"] == "primary"
+    cleanup = [event for event in result["diagnostics"]
+               if event["payload"].get("role") == "cleanup"]
+    assert len(cleanup) == int(close_failure)
+    if close_failure:
+        assert cleanup[0]["payload"]["stage"] == "response_close"
+    if problem == "write":
+        assert (tmp_path / diagnostic.BODY_NAME).read_bytes() == b"existing synthetic evidence"
+    else:
+        assert not (tmp_path / diagnostic.BODY_NAME).exists()
+    assert "SYNTHETIC-PRIVATE" not in (tmp_path / "capture.json").read_text()
+
+
+@pytest.mark.parametrize("field", ["content", "mediaName"])
+def test_optional_parser_fields_do_not_relax_exact_retention(tmp_path, field):
+    def mutate(value):
+        for row in value["result"]["cmsArticleWebOld"]:
+            row.pop(field)
+    page = diagnostic.eastmoney_news.parse_news_page(
+        synthetic_get(mutate=mutate)(None, params={"cb": "synthetic"}).content,
+        expected_callback="synthetic", ticker="600895", start_date=START, end_date=END)
+    assert len(page.rows) == 1  # Still optional for the parser, required for retention.
+    result = capture(tmp_path, mutate=mutate)
+    assert result["checks"]["retention"]["status"] == "failed"
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert result["checks"]["production"]["status"] == "failed"
+    assert not result.get("artifact_sha256")
     assert not result["capture_passed"]
 
 
-@pytest.mark.parametrize("mutation,reason", [
-    ("body", "retained_text_digest_mismatch"),
-    ("sdk_sha256", "sdk_mismatch"),
-    ("request_fingerprint", "request_mismatch"),
-    ("artifact_sha256", "artifact_mismatch"),
-    ("window", "window_mismatch"),
+@pytest.mark.parametrize("dates,counts", [
+    ([], (0, 0, 0)), (["bad-date"], (1, 0, 0)), (["2026-10-13"], (0, 1, 0)),
+    (["2026-10-12T16:00:00Z"], (0, 1, 0)),
 ])
-def test_replay_rejects_changed_evidence_or_bindings(tmp_path, mutation, reason):
-    from tradingagents import news_diagnostic as diagnostic
+def test_no_usable_articles_keeps_date_exclusions(tmp_path, dates, counts):
+    result = capture(tmp_path, dates=dates)
+    assert result["checks"]["parser"]["reason"] == "no_usable_articles"
+    assert result["selection"]["accepted_count"] == 0
+    assert result["selection"]["excluded_counts"] == dict(zip(diagnostic.EXCLUSIONS, (0, *counts), strict=True))
+    assert not result["capture_passed"]
 
-    diagnostic.capture(tmp_path, get=synthetic_get(), start="2026-10-05", end="2026-10-12")
+
+def test_shanghai_cutoff_and_visible_stock_association(tmp_path):
+    result = capture(tmp_path, dates=["2026-10-12T15:59:59Z", "2026-10-12T16:00:00Z", "2026-10-10"],
+                     mutate=lambda v: v["result"]["cmsArticleWebOld"][2].update(
+                         title="600919 unrelated", content="query keyword is insufficient"))
+    assert result["selection"]["excluded_counts"] == {"malformed": 0, "undated": 0, "outside_window": 1, "wrong_stock": 1}
+    assert result["selection"]["accepted_count"] == 1
+
+
+def test_local_keyword_does_not_prove_stock_association():
+    body = synthetic_get(dates=["2026-10-10"], mutate=lambda v:
+                         v["result"]["cmsArticleWebOld"][0].update(
+                             title="600919 unrelated", keyword="600895"))(None, params={"cb": "synthetic"}).content
+    with pytest.raises(diagnostic.eastmoney_news.NewsResponseError) as error:
+        diagnostic.eastmoney_news.parse_news_page(
+            body, expected_callback="synthetic", ticker="600895", start_date=START, end_date=END)
+    assert error.value.reason == "no_usable_articles"
+    assert error.value.excluded_counts["wrong_stock"] == 1
+
+
+def test_raw_count_and_structure_are_observed_and_bounded(tmp_path):
+    result = capture(tmp_path, dates=["2026-10-10"] * 11,
+                     extra={"SYNTHETIC-PRIVATE-" + str(i): "SYNTHETIC-PRIVATE" for i in range(40)})
+    assert result["raw_count"] == 11
+    assert result["structure"]["envelope"]["truncated"]
+    assert len(result["structure"]["envelope"]["fields"]) == 32
+    assert result["structure"]["articles"]["truncated"]
+    assert "SYNTHETIC-PRIVATE" not in (tmp_path / "capture.json").read_text()
+    assert not result["body_saved"]
+
+
+def test_production_decoder_preserves_bom_whitespace_callback_and_semicolon_bytes(tmp_path):
+    bodies = []
+    def get(url, *, params, **kwargs):
+        response = synthetic_get()(url, params=params, **kwargs)
+        body = b"\xef\xbb\xbf \n" + response.content.replace(params["cb"].encode(), b"otherCallback", 1) + b" ; \r\n"
+        bodies.append(body)
+        class Response:
+            status_code = 200
+            content = body
+            @property
+            def text(self):
+                raise AssertionError("Response.text must not be consulted")
+            def close(self):
+                pass
+        return Response()
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+    assert result["capture_passed"] and result["callback_matches"] is False
+    assert (tmp_path / diagnostic.BODY_NAME).read_bytes() == bodies[0]
+    assert replay(tmp_path)["acceptance_passed"]
+
+
+@pytest.mark.parametrize("body,reason", [
+    (b"bad", "wrapper_invalid"), (b"\xff", "encoding_invalid"),
+    (b'cb({"result":{},"result":{}})', "duplicate_json_key"),
+    (b'cb({"value":NaN})', "nonfinite_json_number"),
+    (b'cb({}); evil()', "trailing_syntax"),
+])
+def test_invalid_bytes_have_safe_parser_failure_and_no_retention(tmp_path, body, reason):
+    with pytest.raises(diagnostic.eastmoney_news.NewsResponseError) as error:
+        diagnostic.eastmoney_news.parse_news_page(
+            body, expected_callback="synthetic", ticker="600895", start_date=START, end_date=END)
+    assert error.value.reason == reason
+    closed = []
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=lambda *a, **k: SimpleNamespace(
+        status_code=200, content=body, close=lambda: closed.append(True)), start=START, end=END)
+    assert result["checks"]["decode"]["reason"] == reason
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert not result["body_saved"] and closed == [True]
+
+
+def test_response_limit_and_body_read_failures_preserve_close(tmp_path):
+    closed = []
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=lambda *a, **k: SimpleNamespace(
+        status_code=200, content=b" " * (diagnostic.LIMIT + 1), close=lambda: closed.append(True)), start=START, end=END)
+    assert result["checks"]["decode"]["reason"] == "response_limit_or_type"
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert closed == [True] and not result["body_saved"]
+
+
+@pytest.mark.parametrize("status", [301, 403, 429, 500])
+def test_http_failures_are_closed_and_do_not_claim_parser_success(tmp_path, status):
+    closed = []
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=lambda *a, **k: SimpleNamespace(
+        status_code=status, close=lambda: closed.append(True)), start=START, end=END)
+    assert result["checks"]["http"]["status"] == "failed"
+    assert result["checks"]["parser"]["status"] == "not_started"
+    assert closed == [True] and not result["capture_passed"]
+
+
+def test_transport_exception_message_and_dynamic_class_name_are_not_retained(tmp_path):
+    def get(*args, **kwargs):
+        raise type("SYNTHETIC_PRIVATE_CLASS", (RuntimeError,), {})("SYNTHETIC-PRIVATE")
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+    assert result["checks"]["network"]["reason"] == "transport_exception"
+    assert result["checks"]["network"]["exception_type"] == "OtherError"
+    assert "SYNTHETIC" not in (tmp_path / "capture.json").read_text()
+
+
+@pytest.mark.parametrize("name", ["public-response.bin", "capture.json"])
+def test_existing_evidence_is_preserved_on_write_failure(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b"existing evidence")
+    result = capture(tmp_path)
+    assert not result["capture_passed"]
+    assert path.read_bytes() == b"existing evidence"
+
+
+@pytest.mark.parametrize("field", ["source_bindings", "request_fingerprint", "window", "adapter_frame_sha256", "artifact_sha256"])
+def test_replay_rejects_binding_tampering(tmp_path, field):
+    capture(tmp_path)
+    path = tmp_path / "capture.json"
+    value = json.loads(path.read_text())
+    value[field] = {"changed": True} if field in {"source_bindings", "window"} else "0" * 64
+    path.write_text(json.dumps(value))
+    result = replay(tmp_path)
+    assert not result["acceptance_passed"]
+    assert result["checks"]["replay"]["reason"] == field + "_mismatch"
+
+
+@pytest.mark.parametrize("mutation", ["body", "missing-body", "legacy", "projection-only"])
+def test_replay_rejects_changed_missing_or_historical_inputs(tmp_path, mutation):
+    capture(tmp_path)
     if mutation == "body":
-        with (tmp_path / "public-response.txt").open("a", encoding="utf-8") as handle:
-            handle.write(" ")
+        with (tmp_path / diagnostic.BODY_NAME).open("ab") as handle:
+            handle.write(b" ")
+    elif mutation == "missing-body":
+        (tmp_path / diagnostic.BODY_NAME).unlink()
     else:
         path = tmp_path / "capture.json"
-        receipt = json.loads(path.read_text(encoding="utf-8"))
-        receipt[mutation] = {} if mutation == "window" else "0" * 64
-        path.write_text(json.dumps(receipt), encoding="utf-8")
-    result = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["replay"]["reason"] == reason
-    assert not result["acceptance_passed"]
+        value = json.loads(path.read_text())
+        if mutation == "legacy":
+            value.pop("contract")
+        else:
+            value.update(body_saved=False, projection_saved=True, projection_replay_passed=True)
+        path.write_text(json.dumps(value))
+    assert not replay(tmp_path)["acceptance_passed"]
 
 
-def test_replay_missing_body_is_a_reported_failure(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["replay"]["reason"] == "invalid_replay_file"
-    assert result["request_count"] == 0
-    assert not result["acceptance_passed"]
-
-
-def test_duplicate_json_keys_cannot_hide_unretained_data(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    def get(*args, **kwargs):
-        response = synthetic_get()(*args, **kwargs)
-        response.text = response.text.replace(
-            '"content": "Synthetic content"',
-            '"content": "token=SYNTHETIC-SECRET", "content": "Synthetic content"',
-        )
-        response.content = response.text.encode()
-        return response
-
-    result = diagnostic.capture(tmp_path, get=get, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["retention"]["reason"] == "invalid_json_or_duplicate_fields"
-    assert result["checks"]["production"]["status"] == "passed"
-    assert not result["body_saved"]
-
-
-def test_decode_failure_is_not_reported_as_json_or_sdk_failure(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    class Response:
-        status_code = 200
-        headers = {}
-        content = b"synthetic undecodable bytes"
-
-        @property
-        def text(self):
-            raise UnicodeError("SYNTHETIC-SECRET")
-
-    result = diagnostic.capture(
-        tmp_path, get=lambda *a, **k: Response(), start="2026-10-05", end="2026-10-12",
-    )
-    assert result["stage"] == "decode"
-    assert result["checks"]["decode"]["reason"] == "decode_exception"
-    assert result["checks"]["decode"]["exception_type"] == "UnicodeError"
-    assert not result["body_saved"]
-    assert "SYNTHETIC-SECRET" not in (tmp_path / "capture.json").read_text()
-
-
-def test_production_filter_exception_preserves_reason(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path, get=synthetic_get(dates=["2026-10-10 12:00:00+08:00"]),
-        start="2026-10-05", end="2026-10-12",
-    )
-    assert result["body_saved"]
-    assert result["checks"]["sdk"]["status"] == "passed"
-    assert result["checks"]["production"]["reason"] == "date_window_exception"
-    assert result["checks"]["production"]["exception_type"] == "TypeError"
-    assert result["articles"]["filtered"]["count"] is None
-
-
-def test_unrecognized_headers_are_not_copied_into_receipts(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    def get(*args, **kwargs):
-        response = synthetic_get()(*args, **kwargs)
-        response.headers = {
-            "Content-Type": "application/javascript; token=SYNTHETIC-SECRET",
-            "Content-Encoding": "SYNTHETIC-SECRET",
-        }
-        return response
-
-    result = diagnostic.capture(tmp_path, get=get, start="2026-10-05", end="2026-10-12")
-    assert result["content_type"] == "application/javascript"
-    assert result["content_encoding"] == "unrecognized"
-    assert "SYNTHETIC-SECRET" not in (tmp_path / "capture.json").read_text()
-
-
-def test_replay_cannot_pass_acceptance_for_failed_source_capture(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    diagnostic.capture(tmp_path, get=synthetic_get(), start="2026-10-05", end="2026-10-12")
+@pytest.mark.parametrize("stage", ["network", "http", "decode", "retention", "parser", "adapter", "production", "receipt"])
+@pytest.mark.parametrize("change", ["failed", "missing"])
+def test_failed_or_missing_source_checks_cannot_be_rescued_by_replay(tmp_path, stage, change):
+    capture(tmp_path)
     path = tmp_path / "capture.json"
-    receipt = json.loads(path.read_text(encoding="utf-8"))
-    receipt["capture_passed"] = False
-    path.write_text(json.dumps(receipt), encoding="utf-8")
-    result = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert result["checks"]["production"]["status"] == "passed"
-    assert not result["source_capture_passed"]
-    assert not result["acceptance_passed"]
+    value = json.loads(path.read_text())
+    if change == "missing":
+        value["checks"].pop(stage)
+    else:
+        value["checks"][stage] = {"status": "failed"}
+    path.write_text(json.dumps(value))
+    assert not replay(tmp_path)["acceptance_passed"]
 
 
-def test_news_diagnostic_replays_fixed_parser_and_production_path(tmp_path):
-    from tradingagents import news_diagnostic as diagnostic
-
-    calls = []
-
-    def get(url, *, params, headers, **options):
-        calls.append((url, params, options))
-        assert params["_"] == "1764599530176"
-        assert "referer" in headers and "cookie" in headers
-        assert options == {"allow_redirects": False, "timeout": 20}
-        text = (
-            params["cb"]
-            + "("
-            + json.dumps(
-                {
-                    "result": {
-                        "cmsArticleWebOld": [
-                            {
-                                "date": "2026-10-10 12:00:00",
-                                "mediaName": "Synthetic public fixture",
-                                "code": "202610101234",
-                                "title": "<em>Title</em>",
-                                "content": "Content\u3000fixture",
-                                "image": "",
-                            }
-                        ]
-                    }
-                }
-            )
-            + ")"
-        )
-        return SimpleNamespace(
-            status_code=200,
-            text=text,
-            content=text.encode(),
-            headers={"Content-Type": "application/javascript", "Content-Encoding": "gzip"},
-        )
-
-    result = diagnostic.capture(tmp_path, get=get, start="2026-10-05", end="2026-10-12")
-    assert result["stage"] == "available"
+def test_attempt_budget_stays_one(tmp_path, monkeypatch):
+    original = diagnostic.akshare_data._stock_news_em
+    def duplicate(symbol, start, end, *, instrument_aliases=()):
+        original(symbol, start, end, instrument_aliases=instrument_aliases)
+        return original(symbol, start, end, instrument_aliases=instrument_aliases)
+    monkeypatch.setattr(diagnostic.akshare_data, "_stock_news_em", duplicate)
+    result = capture(tmp_path)
     assert result["request_count"] == 1
-    assert result["body_saved"]
-    replay = diagnostic.replay(tmp_path, start="2026-10-05", end="2026-10-12")
-    assert replay["stage"] == "available"
-    assert replay["artifact_sha256"] == result["artifact_sha256"]
-    assert len(calls) == 1
-    saved = (tmp_path / "public-response.txt").read_text(encoding="utf-8")
-    assert "202610101234" in saved
-    assert "cookie" not in saved
+    assert result["checks"]["network"]["reason"] == "request_scope_or_budget"
+    assert not result["capture_passed"]
 
 
-@pytest.mark.parametrize(
-    "text,stage",
-    [
-        ("<html>not news</html>", "jsonp"),
-        ("jQuery35101792940631092459_1764599530165(not json)", "json"),
-        (
-            'jQuery35101792940631092459_1764599530165({"result":{"cmsArticleWebOld":[]}})',
-            "sdk_dataframe",
-        ),
-    ],
-)
-def test_news_diagnostic_names_failure_stage_without_claiming_recovery(tmp_path, text, stage):
-    from tradingagents import news_diagnostic as diagnostic
-
-    result = diagnostic.capture(
-        tmp_path,
-        get=lambda *a, **k: SimpleNamespace(
-            status_code=200, text=text, content=text.encode(), headers={}
-        ),
-        start="2026-10-05",
-        end="2026-10-12",
-    )
-    assert result["stage"] == stage
-    assert result["request_count"] == 1
-    assert result["body_saved"] == (stage == "sdk_dataframe")
-
-
-def _news_cli(monkeypatch, output, *, replay=None, mode=None):
+def _news_cli(monkeypatch, output, *, source=None, mode="original-text"):
     from scripts import diagnose_public_news as cli
-
-    args = ["diagnose_public_news.py", "--output", str(output),
-            "--start", "2026-10-05", "--end", "2026-10-12"]
-    args += ["--replay", str(replay)] if replay else ["--authorize-one-public-get-and-save"]
-    if mode is not None:
-        args += ["--acceptance-mode", mode]
-    # Acceptance logic is a unit seam: control only this module's view of the
-    # runtime. Real interpreter flags/guard are tested in a separate subprocess.
-    with monkeypatch.context() as patch:
-        patch.setattr(cli, "sys", SimpleNamespace(
-            flags=SimpleNamespace(isolated=1, no_site=1), dont_write_bytecode=True,
-        ))
-        patch.setattr(cli, "install", lambda *a, **k: ({}, []))
-        patch.setattr(sys, "argv", args)
+    args = ["diagnose_public_news.py", "--output", str(output), "--start", START,
+            "--end", END, "--acceptance-mode", mode, "--ticker", "600895.SH", "--transport", "direct"]
+    args += ["--replay", str(source)] if source else ["--authorize-one-public-get-and-save"]
+    with monkeypatch.context() as scoped:
+        scoped.setattr(cli, "sys", SimpleNamespace(flags=SimpleNamespace(isolated=1, no_site=1), dont_write_bytecode=True))
+        scoped.setattr(cli, "SOURCE", output.parent / "synthetic-source")
+        scoped.setattr(cli, "install", lambda *a, **k: ({}, []))
+        scoped.setattr(sys, "argv", args)
         code = cli.main()
-    return code, json.loads((output / "result.json").read_text(encoding="utf-8"))
+    return code, json.loads((output / "result.json").read_text())
 
 
-@pytest.mark.parametrize("mode", [None, "original-text", "news-content"], ids=["legacy", "original", "content"])
-@pytest.mark.parametrize("projection", [False, True], ids=["exact", "projection"])
+@pytest.mark.parametrize("mode", ["original-text", "news-content"])
 @pytest.mark.parametrize("phase", ["capture", "replay"])
-def test_cli_acceptance_modes(tmp_path, monkeypatch, mode, projection, phase):
-    from curl_cffi import requests
-
-    from tradingagents import news_diagnostic as diagnostic
-
-    get = synthetic_get(extra={"message": "synthetic metadata"} if projection else None)
-    monkeypatch.setattr(requests, "get", get)
+@pytest.mark.parametrize("marker", [None, {"code": 0}, {"success": False}])
+def test_cli_modes_preserve_production_and_retention_failure(tmp_path, monkeypatch, mode, phase, marker):
+    import requests
+    get = synthetic_get(extra=marker)
+    monkeypatch.setattr(requests.Session, "get", lambda self, *a, **k: get(*a, **k))
     source = None
     if phase == "replay":
         source = tmp_path / "input"
         source.mkdir()
-        diagnostic.capture(source, get=get, start="2026-10-05", end="2026-10-12")
-        before = (source / "capture.json").read_bytes()  # legacy receipt has no mode fields
-    code, result = _news_cli(monkeypatch, tmp_path / "output", replay=source, mode=mode)
-    expected = not projection or mode == "news-content"
-    assert code == (0 if expected else 1)
-    assert result["acceptance"] == {
-        "mode": mode or "original-text", "passed": expected,
-        "goals": {"original-text": not projection, "news-content": True},
-        "content_source_passed": True,
-    }
-    reservation = json.loads((tmp_path / "output/reservation.json").read_text())
-    assert reservation["acceptance_mode"] == (mode or "original-text")
-    assert result["capture_passed" if phase == "capture" else "acceptance_passed"] is not projection
-    if projection and phase == "capture":
-        assert not result["body_saved"]
-        assert result["checks"]["retention"]["reason"] == "unknown_envelope_fields"
-    if phase == "replay":
-        assert result["same_sdk_frame"] and result["same_artifact"]
-        assert (source / "capture.json").read_bytes() == before
+        captured = diagnostic.capture(source, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+        if not captured["body_saved"]:
+            with pytest.raises(SystemExit) as error:
+                _news_cli(monkeypatch, tmp_path / "output", source=source, mode=mode)
+            assert error.value.code == 2
+            return
+    code, result = _news_cli(monkeypatch, tmp_path / "output", source=source, mode=mode)
+    assert code == (0 if marker is None else 1)
+    assert result["acceptance"]["passed"] is (marker is None)
+    assert not result["projection_replay_passed"]
 
 
-@pytest.mark.parametrize("mode", ["original-text", "news-content"])
-@pytest.mark.parametrize("failure", [
-    "transport", "http", "sdk-empty", "no-data", "sensitive", "body-write", "projection-write", "receipt-write",
-])
-def test_cli_modes_keep_capture_failures(tmp_path, monkeypatch, mode, failure):
-    from curl_cffi import requests
+def test_cli_invalid_mode_fails_before_output(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit) as error:
+        _news_cli(monkeypatch, tmp_path / "output", mode="all-success")
+    assert error.value.code == 2
+    assert not (tmp_path / "output").exists()
 
-    def unavailable(*a, **k):
-        raise TimeoutError("SYNTHETIC-PRIVATE")
 
-    get = synthetic_get()
-    if failure == "transport":
-        get = unavailable
-    elif failure == "http":
-        def get(*a, **k):
-            return SimpleNamespace(status_code=500)
-    elif failure in {"sdk-empty", "no-data"}:
-        get = synthetic_get(dates=[] if failure == "sdk-empty" else ["2026-09-01"])
-    elif failure == "sensitive":
-        get = synthetic_get(mutate=lambda v: v["result"]["cmsArticleWebOld"][0].update(content="token=SYNTHETIC-PRIVATE"))
-    elif failure in {"projection-write", "receipt-write"}:
-        get = synthetic_get(extra={"message": "synthetic metadata"})
-    monkeypatch.setattr(requests, "get", get)
-    output = tmp_path / "output"
-    denied = {"body-write": "public-response.txt", "projection-write": "public-projection.txt", "receipt-write": "capture.json"}.get(failure)
-    if denied:
-        original_open = Path.open
+@pytest.mark.parametrize("matches", [True, False])
+def test_cli_stdout_shows_callback_boolean_without_rescuing_unrelated_collection(tmp_path, monkeypatch, capsys, matches):
+    import requests
 
-        def fail_write(path, mode="r", *args, **kwargs):
-            if path == output / denied and mode == "x":
-                raise PermissionError("SYNTHETIC-PRIVATE")
-            return original_open(path, mode, *args, **kwargs)
+    def get(_session, _url, *, params, **kwargs):
+        callback = params["cb"] if matches else "syntheticOtherCallback"
+        # Synthetic shape only; the real manual response bytes were not retained.
+        body = (callback + "(" + json.dumps({"code": 0, "result": {"passportWeb": [{}]}}) + ")").encode()
+        return SimpleNamespace(status_code=200, content=body, close=lambda: None)
 
-        monkeypatch.setattr(Path, "open", fail_write)
-    code, result = _news_cli(monkeypatch, output, mode=mode)
+    monkeypatch.setattr(requests.Session, "get", get)
+    code, result = _news_cli(monkeypatch, tmp_path / "output", mode="news-content")
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["callback_matches"] is matches
+    assert summary["callback_matches"] is result["callback_matches"]
+    assert code == 1 and not summary["acceptance"]["passed"]
+    assert summary["checks"]["retention"]["reason"] == "articles_missing"
+    assert summary["checks"]["parser"]["status"] == "not_started"
+    assert summary["selection"]["status"] == "not_observed"
+    assert summary["selection"]["coverage"] == "unknown"
+    assert not summary["body_saved"] and not summary["projection_saved"]
+    assert "syntheticOtherCallback" not in json.dumps(summary)
+
+
+def test_cli_stdout_callback_is_unknown_before_response_decode(tmp_path, monkeypatch, capsys):
+    import requests
+
+    def get(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("SYNTHETIC-PRIVATE")
+
+    monkeypatch.setattr(requests.Session, "get", get)
+    code, result = _news_cli(monkeypatch, tmp_path / "output")
+    printed = capsys.readouterr().out
+    summary = json.loads(printed)
     assert code == 1
-    assert not result["acceptance"]["passed"]
-    assert result["acceptance"]["goals"] == {"original-text": False, "news-content": False}
-    assert any(check["status"] == "failed" for check in result["checks"].values())
-    assert "SYNTHETIC-PRIVATE" not in (output / "result.json").read_text()
+    assert summary["callback_matches"] is None and result.get("callback_matches") is None
+    assert summary["request_count"] == 1 and not summary["capture_passed"]
+    assert "SYNTHETIC-PRIVATE" not in printed
 
 
-@pytest.mark.parametrize("mode", ["original-text", "news-content"])
-@pytest.mark.parametrize("projection", [False, True], ids=["exact", "projection"])
-@pytest.mark.parametrize("mutation", ["body", "sdk_frame_sha256", "artifact_sha256", "window"])
-def test_cli_modes_reject_replay_tampering(tmp_path, monkeypatch, mode, projection, mutation):
-    from tradingagents import news_diagnostic as diagnostic
-
-    source = tmp_path / "input"
-    source.mkdir()
-    diagnostic.capture(
-        source, get=synthetic_get(extra={"message": "synthetic metadata"} if projection else None),
-        start="2026-10-05", end="2026-10-12",
-    )
-    if mutation == "body":
-        with (source / ("public-projection.txt" if projection else "public-response.txt")).open("a") as handle:
-            handle.write(" ")
-    else:
-        path = source / "capture.json"
-        receipt = json.loads(path.read_text())
-        receipt[mutation] = {} if mutation == "window" else "0" * 64
-        path.write_text(json.dumps(receipt))
-    code, result = _news_cli(monkeypatch, tmp_path / "output", replay=source, mode=mode)
-    assert code == 1
-    assert result["acceptance"]["goals"] == {"original-text": False, "news-content": False}
-    assert result["checks"]["replay"]["status"] == "failed"
+def test_retained_digest_is_original_bytes(tmp_path):
+    result = capture(tmp_path)
+    assert result["saved_body_sha256"] == hashlib.sha256((tmp_path / diagnostic.BODY_NAME).read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize("mode", [None, "original-text", "news-content"])
-@pytest.mark.parametrize("phase", ["capture", "replay"])
-def test_cli_legacy_exact_success_without_full_frame_cannot_pass_content_goal(tmp_path, monkeypatch, mode, phase):
-    from curl_cffi import requests
-
-    from tradingagents import news_diagnostic as diagnostic
-
-    def no_digest(frame):
-        raise ValueError("synthetic missing frame evidence")
-
-    monkeypatch.setattr(requests, "get", synthetic_get())
-    source = None
-    with monkeypatch.context() as patch:
-        patch.setattr(diagnostic, "_sdk_frame_digest", no_digest)
-        if phase == "replay":
-            source = tmp_path / "input"
-            source.mkdir()
-            diagnostic.capture(source, get=synthetic_get(), start="2026-10-05", end="2026-10-12")
-        else:
-            code, result = _news_cli(monkeypatch, tmp_path / "output", mode=mode)
-    if phase == "replay":
-        code, result = _news_cli(monkeypatch, tmp_path / "output", replay=source, mode=mode)
-    assert code == (1 if mode == "news-content" else 0)
-    assert result["acceptance"]["goals"] == {"original-text": True, "news-content": False}
+@pytest.mark.parametrize("start,end", [("SYNTHETIC-PRIVATE", END), (END, START), (None, END)])
+def test_invalid_date_request_is_rejected_before_transport_and_not_retained(tmp_path, start, end):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid date must not reach supplied transport")
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=forbidden, start=start, end=end)
+    assert result["request_count"] == 0
+    assert result["checks"]["parser"]["reason"] == "request_invalid"
+    assert result["window"] == {"start": None, "end": None}
+    assert "SYNTHETIC" not in (tmp_path / "capture.json").read_text()
 
 
-def test_cli_invalid_acceptance_mode_fails_before_output_or_transport(tmp_path, monkeypatch):
-    output = tmp_path / "output"
-    with pytest.raises(SystemExit) as exc:
-        _news_cli(monkeypatch, output, mode="all-success")
-    assert exc.value.code == 2
-    assert not output.exists()
+def test_body_read_failure_keeps_safe_stage_and_closes_response(tmp_path):
+    closed = []
+    class Response:
+        status_code = 200
+        @property
+        def content(self):
+            raise OSError("SYNTHETIC-PRIVATE")
+        def close(self):
+            closed.append(True)
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=lambda *a, **k: Response(), start=START, end=END)
+    assert result["checks"]["decode"]["reason"] == "body_read_exception"
+    assert closed == [True] and not result["capture_passed"]
+    assert "SYNTHETIC" not in (tmp_path / "capture.json").read_text()
 
 
-@pytest.mark.parametrize("projection", [False, True], ids=["exact", "projection"])
-@pytest.mark.parametrize("change", ["failed", "missing"])
-@pytest.mark.parametrize("stage", ["network", "http", "decode", "sdk", "production", "receipt", "retained-representation"])
-def test_cli_content_replay_rejects_failed_or_missing_source_stage(tmp_path, monkeypatch, projection, change, stage):
-    from tradingagents import news_diagnostic as diagnostic
+def test_close_error_does_not_erase_primary_business_status_failure(tmp_path):
+    def get(url, *, params, **kwargs):
+        response = synthetic_get(extra={"code": 0})(url, params=params, **kwargs)
+        def close():
+            raise OSError("SYNTHETIC-PRIVATE")
+        response.close = close
+        return response
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+    assert result["checks"]["parser"]["reason"] == "business_status_unverified"
+    events = [x["payload"] for x in result["diagnostics"] if x["kind"] == "news_exception"]
+    assert any(x["role"] == "primary" and x["error_code"] == "news_business_status_unverified" for x in events)
+    assert any(x["role"] == "cleanup" and x["stage"] == "response_close" for x in events)
+    assert not result["capture_passed"]
 
-    source = tmp_path / "input"
-    source.mkdir()
-    diagnostic.capture(
-        source, get=synthetic_get(extra={"message": "synthetic metadata"} if projection else None),
-        start="2026-10-05", end="2026-10-12",
-    )
-    path = source / "capture.json"
-    receipt = json.loads(path.read_text())
-    if stage == "retained-representation":
-        stage = "projection" if projection else "retention"
-    if change == "missing":
-        del receipt["checks"][stage]
-    else:
-        receipt["checks"][stage] = {"status": "failed", "reason": "synthetic_source_failure"}
-    path.write_text(json.dumps(receipt))
-    code, result = _news_cli(monkeypatch, tmp_path / "output", replay=source, mode="news-content")
-    assert code == 1
-    assert not result["acceptance"]["passed"]
-    assert not result["acceptance"]["goals"]["news-content"]
-    assert not result["acceptance"]["content_source_passed"]
+
+def test_selection_counter_saturation_is_explicit():
+    value = diagnostic._observation(START, END, retain=True)
+    diagnostic._observe_selection(value, dict.fromkeys(diagnostic.EXCLUSIONS, 70000), 70000)
+    assert value["selection"]["counts_saturated"]
+    assert value["selection"]["accepted_count"] == 65535
+    assert set(value["selection"]["excluded_counts"].values()) == {65535}
+
+
+def test_raw_count_saturation_is_explicit(tmp_path):
+    def get(url, *, params, **kwargs):
+        body = (params["cb"] + "(" + json.dumps({"result": {"cmsArticleWebOld": [{}] * 65536}}) + ")").encode()
+        return SimpleNamespace(status_code=200, content=body, close=lambda: None)
+    result = diagnostic.capture(tmp_path, transport="direct", ticker="600895.SH", get=get, start=START, end=END)
+    assert result["raw_count"] == 65535 and result["raw_count_saturated"] is True
+    assert result["selection"]["status"] == "not_observed"
+    assert result["selection"]["excluded_counts"] is None
+    assert not result["body_saved"] and not result["capture_passed"]
+
+
+def test_cli_read_replay_input_preserves_exact_original(tmp_path):
+    from scripts import diagnose_public_news as cli
+    path = tmp_path / "public-response.bin"
+    data = b"synthetic exact bytes\r\n"
+    path.write_bytes(data)
+    assert cli._read_replay_input(tmp_path, path.name) == data
+
+
+def test_cli_rejects_original_hardlink_before_copy(tmp_path):
+    from scripts import diagnose_public_news as cli
+    original = tmp_path / "original"
+    original.write_bytes(b"synthetic input")
+    linked = tmp_path / "public-response.bin"
+    os.link(original, linked)
+    with pytest.raises(ValueError, match="invalid retained input"):
+        cli._read_replay_input(tmp_path, linked.name)
+    assert original.read_bytes() == b"synthetic input"
+
+
+@pytest.mark.parametrize("target", ["root", "file"])
+def test_cli_rejects_original_reparse_metadata_before_open(tmp_path, monkeypatch, target):
+    from scripts import diagnose_public_news as cli
+    path = tmp_path / "public-response.bin"
+    path.write_bytes(b"synthetic input")
+    actual = Path.lstat
+    selected = tmp_path if target == "root" else path
+    def lstat(item):
+        result = actual(item)
+        if item == selected:
+            return SimpleNamespace(st_mode=result.st_mode, st_file_attributes=1024)
+        return result
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(ValueError, match="linked retained input"):
+        cli._read_replay_input(tmp_path, path.name)
+
+
+def test_cli_rejects_handle_identity_mismatch_before_read(tmp_path, monkeypatch):
+    from scripts import diagnose_public_news as cli
+    path = tmp_path / "public-response.bin"
+    path.write_bytes(b"synthetic input")
+    actual = os.fstat
+    def mismatch(fd):
+        info = actual(fd)
+        return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1,
+                               st_size=info.st_size, st_mtime_ns=info.st_mtime_ns,
+                               st_nlink=info.st_nlink, st_mode=info.st_mode)
+    monkeypatch.setattr(os, "fstat", mismatch)
+    with pytest.raises(ValueError, match="changed retained input"):
+        cli._read_replay_input(tmp_path, path.name)

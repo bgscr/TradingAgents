@@ -27,18 +27,22 @@ The pinned source records provenance, not an instruction to overwrite local chan
 Descriptions and prompts are locally maintained for narrow roles, bounded verification,
 evidence integrity and an unambiguous read-only/writing split. The upstream license is retained.
 
-The committed migration `d50d7434f7fea4b5877014dd2aeb60d2f156ddd4` changed the primary
-roles to Astra but left this document's former GPT-5.6-only restriction stale. That
-restriction is superseded by the recorded migration and the present tooling refresh.
-The refresh retains every role's existing model, effort, sandbox mode and MCP settings:
+The current project roles use GPT-6.2 with these reasoning efforts:
 
-- `gpt-6-astra`: CLI at `medium`, reviewer at `xhigh`, other primary specialists at `high`.
-- `gpt-5.6-terra`: test automation and documentation research at `medium`.
-- `gpt-5.6-luna`: prompt regression assessment at `medium`.
+| Model | Effort | Roles |
+|---|---|---|
+| `gpt-6.2-astra` | `medium` | `cli-developer`, `prompt-regression-tester`, `test-automator` |
+| `gpt-6.2-astra` | `high` | `data-engineer`, `debugger`, `llm-architect`, `model-risk-manager`, `python-pro`, `quant-analyst`, `security-auditor` |
+| `gpt-6.2-astra` | `xhigh` | `reviewer` |
+| `gpt-6.2-sol` | `medium` | `docs-researcher` |
 
-The 2026-09-12 tooling review checked these identifiers/efforts against Codex CLI
-0.153.4's bundled catalog. This is historical validation, not a claim about the
-current account's model availability or the effective settings of a new session.
+These role files inherit the session's speed setting. For normal speed, leave Fast mode off.
+The 6.2 assignments were checked against the local model catalogs and the roles
+advertised by the desktop session. No role invocation was needed for that check.
+
+Historically, commit `d50d7434f7fea4b5877014dd2aeb60d2f156ddd4` moved the primary
+roles to Astra. The 2026-09-12 review used CLI 0.153.4's bundled catalog to validate
+the earlier model assignments.
 The individual TOML files are the source of truth. Model choice never relaxes
 review or execution requirements.
 

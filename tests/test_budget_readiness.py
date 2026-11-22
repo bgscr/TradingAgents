@@ -91,8 +91,17 @@ def inspect(config, **kwargs):
 
 
 def tree_bytes(root):
+    # Read-only WAL snapshots can create SQLite coordination sidecars. Business
+    # DB/payload bytes remain invariant; committed WAL and snapshot races have
+    # separate positive/negative coverage in test_analysis_resume_compat.
+    coordination = {
+        "history.sqlite3-wal": 0, "history.sqlite3-shm": 32768,
+        "current-financial-statements.sqlite3-wal": 0,
+        "current-financial-statements.sqlite3-shm": 32768,
+    }
     return {str(path.relative_to(root)): sha256(path.read_bytes()).hexdigest()
-            for path in root.rglob("*") if path.is_file()}
+            for path in root.rglob("*") if path.is_file()
+            and not (path.name in coordination and path.stat().st_size == coordination[path.name])}
 
 
 def forbid_runtime_io(monkeypatch):
@@ -146,9 +155,9 @@ def test_calendar_payload_membership_corruption_is_blocking(config, monkeypatch)
 
 
 @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
-def test_sidecars_are_rejected_even_when_empty(config, suffix, monkeypatch):
+def test_invalid_or_uncertain_sidecars_are_rejected(config, suffix, monkeypatch):
     publish_calendar(config)
-    Path(config["market_history_database_path"] + suffix).write_bytes(b"")
+    Path(config["market_history_database_path"] + suffix).write_bytes(b"invalid" if suffix == "-wal" else b"")
     forbid_runtime_io(monkeypatch)
     assert readiness.BudgetReadinessIssue("calendar", "concurrent_database_state") in inspect(config).issues
 
@@ -291,7 +300,11 @@ def publish_statements(config, identity, *, age=timedelta(minutes=1), gap=False,
         if empty:
             frame = frame.iloc[:0]
         response_at = now + timedelta(seconds=1)
-        payload = encode_provider_artifact(endpoint_id=endpoint, frame=frame, retrieved_at=response_at, observed_at=response_at)
+        from tradingagents.financial_response_completeness import inspect_response_completeness
+        completeness = inspect_response_completeness({"code": 0, "data": {
+            "fields": list(frame.columns), "items": frame.values.tolist(), "has_more": False, "total": len(frame)}})
+        payload = encode_provider_artifact(endpoint_id=endpoint, frame=frame, retrieved_at=response_at,
+            observed_at=response_at, adapter_metadata={"response_completeness": completeness})
         cache.read_through(scope=statement_scope(config, identity, endpoint),
                            range_start=date(END.year - 6, 1, 2 if gap else 1), range_end=END,
                            now=now, fetch=lambda *args, result=payload: result)

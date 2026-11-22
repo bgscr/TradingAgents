@@ -29,12 +29,18 @@ def encode_coordinated_result(value: object) -> bytes:
     return payload
 
 
-def decode_coordinated_result(payload: bytes) -> object:
+def _projection_node(node):
+    if node.get("type") not in ("scalar", "list", "tuple", "dict"):
+        raise ValueError("unexpected projection type")
+    return node
+
+
+def decode_coordinated_result(payload: bytes, *, projection_only: bool = False) -> object:
     """Decode only the closed result types emitted by encode_coordinated_result."""
 
     if len(payload) > _MAX_RESULT_BYTES:
         raise ValueError("persisted coordinated result exceeds the handoff limit")
-    value = json.loads(payload.decode("utf-8"))
+    value = json.loads(payload.decode("utf-8"), object_hook=_projection_node if projection_only else None)
     return _decode(value, depth=0)
 
 

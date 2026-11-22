@@ -236,12 +236,23 @@ def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:
     consumer is never forced to make a yfinance call mid-graph.
     """
     context = state.get("instrument_context")
-    if isinstance(context, str) and context.strip():
-        return context
-    return build_instrument_context(
-        str(state["company_of_interest"]),
-        state.get("asset_type", "stock"),
-    )
+    if not isinstance(context, str) or not context.strip():
+        context = build_instrument_context(
+            str(state["company_of_interest"]),
+            state.get("asset_type", "stock"),
+        )
+    if state.get("moneyflow_observation") is not None:
+        # Recompute only from the strictly validated observation. Prior analyst
+        # prose cannot supply totals, window labels, or decision facts here.
+        from tradingagents.dataflows.config import get_config
+        from tradingagents.moneyflow import moneyflow_markdown
+        context += "\n\n" + moneyflow_markdown(
+            state, language=get_config().get("output_language", "English"), include_rows=False,
+        )
+    if state.get("eastmoney_fundflow_observation") is not None:
+        from tradingagents.powershell_fundflow import fundflow_markdown
+        context += "\n\n" + fundflow_markdown(state)
+    return context
 
 
 def create_msg_delete():

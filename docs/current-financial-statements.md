@@ -86,6 +86,16 @@ field with an empty value. Missing optional fields can still be absent from CSV.
 The existing completeness gate remains binding: all critical fields and at least
 90% of declared core fields. This is not a claim that every requested period exists.
 
+Typed terminal failures from the financial dispatcher also enter the evidence
+and acquisition-status report when the model does not cite them. Call identity,
+tool name, stock and cutoff bindings are checked first; repeated messages reusing
+the same terminal outcome do not add another source attempt. These are operational
+records, excluded from the model's factual source catalog, and cannot establish a
+financial value or investment premise. `empty_frame` describes an unusable/empty
+result, not a zero balance or absence of a filing; `disconnect` does not identify
+the party responsible for a connection failure. This visibility does not trigger
+another request, change the completeness gate or fill missing financial fields.
+
 Bank output explicitly labels gross margin, current/quick ratios and inventory
 turnover as not applicable. Net interest margin, nonperforming-loan ratio, capital
 adequacy and provision coverage require a separate source; this three-statement
@@ -164,3 +174,32 @@ account limits or bans; do not combine the two budgets.
 Official API field references: [income](https://tushare.pro/document/2?doc_id=33),
 [balance sheet](https://tushare.pro/document/2?doc_id=36),
 [cash flow](https://tushare.pro/document/2?doc_id=44).
+
+### Conversion diagnostics for new CURRENT responses
+
+The explicit HTTPS client checks decoded JSON table cells before constructing a
+DataFrame. Null, finite integers/floats (including zero), text and booleans retain
+their types. Nonfinite numbers (including JSON numeric overflow) and nested or
+unsupported values stop through the existing malformed-response path, with one
+physical attempt and no retry. No amount is replaced with zero or another field.
+This does not change financial completeness thresholds, cutoffs or gap policy.
+
+New successful artifacts may carry `adapter_metadata.response_values`, contract
+`financial-response-values-v1`, beside the existing completeness assessment.
+The closed projection contains row/column counts, six type counts (`null`,
+`number`, `text`, `boolean`, `nonfinite`, `unsupported`), and per-field counts only
+for `cost_fin_assets` and `fair_value_fin_assets`. A missing tracked field is null;
+a present empty field has zero counts. Every count saturates at 65535, meaning
+65535 or more. Arbitrary column names, scalar values, response messages, request
+content, credentials and destinations are excluded. Failed value checks expose
+only the same bounded projection and the fixed reason
+`financial_response_values_invalid` through the existing failure metadata hook.
+Response diagnostic keys in that hook are cleared at each query start so a later
+early failure cannot inherit counts or completeness observations from another table.
+
+Acquisition and cache decoding validate a present projection against retained
+scalar types. It is diagnostic evidence about JSON values before conversion,
+not HTTP wire bytes, coverage, report availability or financial qualification.
+Old artifacts without this optional projection remain readable and unchanged;
+their pre-conversion types remain unknown. No migration, forced refresh,
+timestamp rewrite or historical diagnosis is implied by this addition.

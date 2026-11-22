@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.analysts.submission import (
+    ANALYST_OUTPUT_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
     process_analyst_response,
@@ -33,11 +34,13 @@ def create_fundamentals_analyst(llm):
         tools = [*data_tools, AnalystEvidenceReport]
 
         system_message = (
-            "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
-            + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
+            "You analyze company fundamentals as of the requested analysis date, using the full requested financial window available in the tools. Review the statements and available company information for decision-relevant changes, risks, and limitations. Summarize the findings instead of reproducing financial history or every table row."
+            + " Use one compact summary table only if it adds information without repeating the prose. "
+            + ANALYST_OUTPUT_GUIDANCE
             + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
             + " For mainland China A-shares, fundamentals may include source-labeled disclosure snapshots; treat them as supplemental company-event context and do not invent missing filing details."
             + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote."
+            + " Record synthetic-data warnings and missing or inapplicable bank metrics as evidence_notes, not as financial premises. Preserve their limitations in the report. An available financial table does not make every metric available; omitted business, summary or fund-flow sources provide no financial evidence. Notes never satisfy the evidence required for a financial conclusion."
             + get_language_instruction()
         )
         system_message += "\n\n" + render_allowed_source_ref_catalog(

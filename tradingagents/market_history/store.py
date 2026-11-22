@@ -1451,6 +1451,9 @@ class MarketHistoryStore:
     def publish_session_calendar(
         self,
         publication: MarketSessionCalendarPublication,
+        *,
+        expected_head: tuple[tuple[str, str], ...] | None = None,
+        precommit_guard: Callable[[], object] | None = None,
     ) -> PublishedSessionCalendar:
         self._require_open()
         from tradingagents.market_history.calendar import (
@@ -1463,7 +1466,8 @@ class MarketHistoryStore:
         mutex_timed_out = False
         try:
             with self._payload_mutation_scope("publisher", digest):
-                published = publish_session_calendar(self, publication)
+                published = publish_session_calendar(
+                    self, publication, expected_head=expected_head, precommit_guard=precommit_guard)
                 if publication.payload_contract != "mainland-session-calendar-payload-v1":
                     self._phase_hook("publisher_references_committed", digest)
                     self._verify_registered_payload_digest(digest)

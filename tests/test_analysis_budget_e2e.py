@@ -222,7 +222,7 @@ class FakeWire:
         elif pool.host == "search-api-web.eastmoney.com":
             payload = ("jQuery35101792940631092459_1764599530165(" + json.dumps({"result": {
                 "cmsArticleWebOld": [{"date": "2026-10-14 12:00:00", "mediaName": "Synthetic",
-                    "code": "synthetic", "title": "Synthetic fixture news", "content": "Synthetic content", "image": ""}],
+                    "code": "synthetic", "title": "601328 synthetic fixture news", "content": "Synthetic content", "image": ""}],
             }}) + ")").encode()
         elif pool.host in {"emappdata.eastmoney.com", "datacenter-web.eastmoney.com", "datacenter.eastmoney.com"}:
             # Fixed empty optional sentiment data exercises the actual SDK parser
@@ -299,7 +299,7 @@ def prepare(tmp_path, monkeypatch, *, enabled=True, cache_only=True, cache_damag
                                         "NO_PROXY": "*", "PYTHON_DOTENV_DISABLED": "1"})
     wire = FakeWire()
     # Cover one schema repair in the unlimited legacy run. The budgeted run
-    # invokes every bound tool and fits exactly 30 physical attempts without it;
+    # invokes every bound tool and fits within 30 physical attempts without it;
     # repair/count exhaustion are separately exercised by budget unit tests.
     wire.repair_finalizer = not enabled
     for module in httpx_families():
@@ -411,7 +411,7 @@ def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled, alph
         assert wire.phases["fundamentals_finalizer"] == (1 if enabled else 2)
         assert wire.phases["research_plan"] == wire.phases["trader"] == 1
         assert any(host == "search-api-web.eastmoney.com" for host, _, _ in wire.data_calls)
-        assert wire.legacy_news_calls == (0 if enabled else 2)
+        assert wire.legacy_news_calls == 0  # Safe local news decoder now uses Requests in both modes.
         assert all(state.get(name) for name in ("market_report", "sentiment_report", "news_report", "fundamentals_report"))
         investment = state["investment_debate_state"]
         assert all(investment.get(key) for key in ("bull_history", "bear_history", "judge_decision"))
@@ -441,14 +441,17 @@ def test_complete_graph_and_rendered_report(tmp_path, monkeypatch, enabled, alph
             assert receipt["data_attempts"] == len(wire.data_calls)
             assert len(receipt["financial_cache_hits"]) == 3
             assert receipt["stop_reason"] is None
-            assert receipt["admitted_attempts"] == (30 if alpha == "configured" else 29)
+            assert receipt["admitted_attempts"] == (29 if alpha == "configured" else 28)
+            assert all("/fflow/" not in url for _, _, url in wire.data_calls)
             if alpha != "configured":
                 reason = "not_configured" if alpha == "missing" else "user_disabled"
-                assert receipt["data_gaps"] == [{"tool": "get_global_news", "provider": "alpha_vantage", "reason": reason}]
+                assert [gap for gap in receipt["data_gaps"] if gap["provider"] == "alpha_vantage"] == [
+                    {"tool": "get_global_news", "provider": "alpha_vantage", "reason": reason}]
                 assert all(host != "www.alphavantage.co" for host, _, _ in wire.data_calls)
                 assert "DATA_UNAVAILABLE" in rendered and reason in rendered
                 assert any("DATA_UNAVAILABLE" in str(message.get("content", ""))
                            for call in wire.model_calls for message in call["messages"] if message.get("role") == "tool")
+            assert {"tool": "get_news.coverage", "provider": "akshare", "reason": "news_window_coverage_unknown"} in receipt["data_gaps"]
         else:
             assert graph.last_analysis_budget is None
         _assert_cache_unchanged(path, before)

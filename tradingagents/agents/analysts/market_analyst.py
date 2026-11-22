@@ -1,6 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.analysts.submission import (
+    ANALYST_OUTPUT_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
     process_analyst_response,
@@ -14,6 +15,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_verified_market_snapshot,
 )
 from tradingagents.evidence import AnalystEvidenceReport
+from tradingagents.multiyear_trend import multiyear_trend_markdown
 
 
 def create_market_analyst(llm):
@@ -22,6 +24,12 @@ def create_market_analyst(llm):
     def market_analyst_node(state):
         current_date = state["trade_date"]
         instrument_context = get_instrument_context_from_state(state)
+        from tradingagents.dataflows.config import get_config
+
+        trend = multiyear_trend_markdown(
+            state.get("evidence_state", {}), symbol=state["company_of_interest"],
+            as_of=current_date, language=get_config().get("output_language", "English"),
+        )
 
         data_tools = [
             get_stock_data,
@@ -59,10 +67,16 @@ Volume-Based Indicators:
 
 Before writing the final report, call get_verified_market_snapshot for this ticker and the current date, and treat it as the source of truth for any exact OHLCV, price-level, or indicator-value claim. If another tool's output conflicts with the verified snapshot, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless they are directly supported by tool output with concrete dates and prices. For mainland China A-shares, get_stock_data may include a source-labeled China A-share enhancement snapshot; treat it as supplemental short-term flow and attention context, not as a replacement for OHLCV or verified indicator values.
 
-Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions.
+Summarize decision-relevant trends and uncertainty with supporting evidence. Retain the requested data window and all required evidence checks.
 
 When the analysis is complete, submit it through AnalystEvidenceReport. Put the human-readable Markdown in report_markdown and list every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote. The application derives fact IDs and indicator history requirements deterministically. Do not submit an unavailable calculation as a material claim, and do not submit unsupported claims or precision."""
-            + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+            + " Use a compact table only if it avoids repeating the same findings. "
+            + "Separate observations from interpretation: a material RSI claim must quote "
+            "the observed reading alone. The 70/30 thresholds and bullish/bearish interpretations "
+            "are advisory rule commentary, not numbers measured by the source. Keep them in "
+            "report commentary unless an applicable registered Strategy Rule establishes the assertion; "
+            "do not combine an unregistered threshold with an observed value in a material claim. "
+            + ANALYST_OUTPUT_GUIDANCE
             + get_language_instruction()
         )
         system_message += "\n\n" + render_allowed_source_ref_catalog(
@@ -70,6 +84,18 @@ When the analysis is complete, submit it through AnalystEvidenceReport. Put the 
             state["company_of_interest"],
             current_date,
         )
+        if trend:
+            system_message += (
+                "\n\nUse the following deterministic multi-year observations in report commentary. "
+                "They are auxiliary context, not new material_claims, evidence_notes, source refs "
+                "or decision premises. Include a concise multi-year commentary section in "
+                "report_markdown: when available, retain the cumulative adjusted-price return, "
+                "annual-return pattern with its baseline and partial-period labels, and maximum "
+                "drawdown with peak/trough dates. Preserve coverage and retrospective limitations. "
+                "If the context is unavailable, report that limitation without inventing values. "
+                "A get_stock_data subwindow may contain fewer rows than the full bound snapshot; "
+                "compare their date windows before alleging a row-count conflict.\n" + trend
+            )
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -107,6 +133,7 @@ When the analysis is complete, submit it through AnalystEvidenceReport. Put the 
             ticker=state["company_of_interest"],
             trade_date=current_date,
             messages=state["messages"],
+            auxiliary_context=trend,
         )
         return build_analyst_update(state, result, "market_report")
 

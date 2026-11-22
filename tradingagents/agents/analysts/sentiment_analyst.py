@@ -257,13 +257,18 @@ def _evidence_for_blocks(
     )
 
 
-def create_sentiment_analyst(llm):
+def create_sentiment_analyst(llm, *, external_sources: bool = True, structured_max_attempts: int = 2):
     """Create a sentiment analyst node for the trading graph.
 
     Pre-fetches news + StockTwits + Reddit data, injects them into the
     prompt as structured blocks, and produces a deterministic sentiment
-    report via required structured output.
+    report via required structured output. Explicitly disabling external sources
+    permits auxiliary-observation commentary only, never an assessed sentiment.
     """
+    if type(external_sources) is not bool:
+        raise ValueError("external_sources must be a boolean")
+    if type(structured_max_attempts) is not int or structured_max_attempts not in (1, 2):
+        raise ValueError("structured_max_attempts must be 1 or 2")
     structured_llm = bind_required_structured(
         llm,
         SentimentReport,
@@ -295,9 +300,12 @@ def create_sentiment_analyst(llm):
             source_ref=news_source_ref,
             capability="sentiment_news",
             instrument_identity=instrument_identity,
+        ) if external_sources else None
+        news_block = news_acquisition.value if news_acquisition is not None else (
+            "DATA_UNAVAILABLE: news not collected in this run (explicitly disabled). "
+            "This is not evidence of no news."
         )
-        news_block = news_acquisition.value
-        if news_block is None:
+        if news_acquisition is not None and news_block is None:
             reason = (
                 news_acquisition.outcomes[-1].reason.value
                 if news_acquisition.outcomes
@@ -307,7 +315,7 @@ def create_sentiment_analyst(llm):
 
         stocktwits_acquisition = None
         stocktwits_block = None
-        if resolve_china_a_symbol(ticker) is None:
+        if external_sources and resolve_china_a_symbol(ticker) is None:
             stocktwits_source_ref = stable_acquisition_source_ref(
                 "sentiment.stocktwits", ticker, 30
             )
@@ -332,7 +340,7 @@ def create_sentiment_analyst(llm):
 
         reddit_acquisition = None
         reddit_block = None
-        if resolve_china_a_symbol(ticker) is None:
+        if external_sources and resolve_china_a_symbol(ticker) is None:
             reddit_source_ref = stable_acquisition_source_ref(
                 "sentiment.reddit", ticker, *DEFAULT_SUBREDDITS, 5
             )
@@ -366,7 +374,12 @@ def create_sentiment_analyst(llm):
             news_block,
             stocktwits_block,
             reddit_block,
-        )
+        ) if external_sources else {
+            "news_block": news_block,
+            "stocktwits_block": "DATA_UNAVAILABLE: social sources not collected in this run.",
+            "reddit_block": "DATA_UNAVAILABLE: social sources not collected in this run.",
+            "local_sentiment_block": "DATA_UNAVAILABLE: local sentiment and legacy enhancements not collected in this run.",
+        }
 
         system_message = _build_system_message(
             ticker=ticker,
@@ -377,7 +390,37 @@ def create_sentiment_analyst(llm):
             reddit_block=blocks["reddit_block"],
             local_sentiment_block=blocks["local_sentiment_block"],
         )
+        if not external_sources:
+            system_message += (
+                "\nExternal sentiment sources are explicitly disabled for this run. "
+                "Sentiment direction and score are NOT ASSESSED; any schema-required band/score "
+                "will not be used or displayed as an assessment. Describe only the separate validated "
+                "auxiliary observations below, with their units, dates and limitations. "
+                "Do not infer silence, absence of risk or sentiment from sources not collected."
+            )
 
+        from tradingagents.moneyflow import moneyflow_for_state, moneyflow_markdown
+
+        moneyflow = moneyflow_for_state(state)
+        if moneyflow is not None:
+            system_message += (
+                "\n\nSeparate auxiliary trading-flow observation; this is NOT news or social sentiment. "
+                "Discuss only returned values and stated coverage. Do not create material claims, SourceFacts "
+                "or directional decision assertions from this block; it cannot determine the rating.\n"
+                + moneyflow_markdown({**state, "moneyflow_observation": moneyflow},
+                                     language=get_config().get("output_language", "English"))
+            )
+        from tradingagents.margin_balance import margin_balance_for_state, margin_balance_markdown
+
+        margin_balance = margin_balance_for_state(state)
+        if margin_balance is not None:
+            system_message += (
+                "\n\nSeparate one-day financing balance, NOT news or social sentiment, net flow or a trend. "
+                "Use only validated values with their date, unit and retrospective limits. Do not create "
+                "material claims, SourceFacts or decision assertions from this block; rating rules are unchanged.\n"
+                + margin_balance_markdown({**state, "margin_balance_observation": margin_balance},
+                                          language=get_config().get("output_language", "English"))
+            )
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -404,12 +447,23 @@ def create_sentiment_analyst(llm):
             formatted_messages,
             "Sentiment Analyst",
             validator=_normalize_sentiment_submission,
+            **({"max_attempts": structured_max_attempts} if structured_max_attempts != 2 else {}),
         )
         material_claims = ()
         failure_reason = structured_result.reason
         if structured_result.value is not None:
             report, material_claims = structured_result.value
-            report_text = render_sentiment_report(report)
+            report_text = render_sentiment_report(
+                report, output_language=get_config().get("output_language", "English"),
+            )
+            if not external_sources:
+                label = (
+                    "情绪方向及评分：未评估（本次未采集新闻或社会情绪来源）。以下仅为模型辅助观察，不影响投资评级。"
+                    if str(get_config().get("output_language", "English")).lower() == "chinese"
+                    else "Sentiment direction and score: NOT ASSESSED (news/social sources not collected). "
+                         "The following model commentary is auxiliary and does not affect the investment rating."
+                )
+                report_text = label + "\n\n" + report.narrative
         if failure_reason is not None:
             report_text = (
                 "ANALYSIS_UNAVAILABLE: The Sentiment Analyst did not produce a "
@@ -421,15 +475,19 @@ def create_sentiment_analyst(llm):
             "messages": [AIMessage(content=report_text)],
             "sentiment_report": report_text,
         }
+        if moneyflow is not None:
+            update["moneyflow_observation"] = moneyflow
+        if margin_balance is not None:
+            update["margin_balance_observation"] = margin_balance
         submission_source = EvidenceSource(
             source_id="analyst.sentiment.submission",
             status=(
                 EvidenceStatus.UNAVAILABLE
-                if failure_reason is not None
+                if failure_reason is not None or not external_sources
                 else EvidenceStatus.AVAILABLE
             ),
             required=True,
-            detail=failure_reason or "direct_structured",
+            detail=failure_reason or ("direct_structured" if external_sources else "external_sources_disabled"),
         )
         inline_evidence = _evidence_for_blocks(
             ticker,
@@ -439,6 +497,14 @@ def create_sentiment_analyst(llm):
             news_acquisition=news_acquisition,
             stocktwits_acquisition=stocktwits_acquisition,
             reddit_acquisition=reddit_acquisition,
+        ) if external_sources else build_inline_evidence_state({}, material_claims).model_copy(
+            update={"sources": tuple(
+                EvidenceSource(source_id=source_id, status=EvidenceStatus.UNAVAILABLE,
+                    required=source_id in _required_sentiment_source_ids(state),
+                    detail="not collected: external sentiment sources explicitly disabled")
+                for source_id in ("sentiment.news", "sentiment.stocktwits", "sentiment.reddit")
+                if source_id == "sentiment.news" or resolve_china_a_symbol(ticker) is None
+            )}
         )
         if material_claims or inline_evidence.sources:
             try:

@@ -244,6 +244,19 @@ class RuntimeArtifactWriter:
     def record_tool_result(self, timestamp: str, payload: Any) -> None:
         self._enqueue(_QueuedEvent("tool_result", (timestamp, payload)))
 
+    def record_diagnostic(self, timestamp: str, payload: Any, *, critical: bool = False) -> None:
+        """Sanitized private payload; primary logs contain only its reference.
+
+        Normal observations use the existing bounded queue/drop accounting.
+        Failed verdicts flush preceding events and persist synchronously.
+        """
+        event = _QueuedEvent("diagnostic", (timestamp, payload))
+        if critical:
+            self.flush()
+            self._process_batch([event])
+        else:
+            self._enqueue(event)
+
     def record_critical(
         self,
         timestamp: str,
@@ -602,6 +615,14 @@ class RuntimeArtifactWriter:
                     f"{timestamp} [Tool Result] preview={preview} "
                     f"artifact=sha256:{digest} bytes={len(encoded)} "
                     f"compressed_bytes={compressed_size}\n"
+                )
+            elif event.kind == "diagnostic":
+                timestamp, payload = event.values
+                encoded, digest = self._encode_payload(payload)
+                compressed_size = self._persist_payload(encoded, digest)
+                log_lines.append(
+                    f"{timestamp} [Diagnostic] artifact=sha256:{digest} "
+                    f"bytes={len(encoded)} compressed_bytes={compressed_size}\n"
                 )
             elif event.kind == "flush" and event.barrier is not None:
                 barriers.append(event.barrier)

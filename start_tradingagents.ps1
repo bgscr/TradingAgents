@@ -12,6 +12,48 @@ else {
 }
 
 $AppDir = (Resolve-Path -LiteralPath $ScriptDir).Path
+# Only explicit -Full selects the mainland runner; legacy arguments remain untouched.
+if ($args.Count -gt 0 -and $args[0] -ieq '-Full') {
+    $options = @{ Full = $true; SessionMaxCalls = 60 }
+    $seen = @{}
+    $switches = @{'-CheckOnly'='CheckOnly'; '-UseProjectEnv'='UseProjectEnv'; '-Run'='Run'; '-CalendarOnly'='CalendarOnly'}
+    $values = @{'-Ticker'='Ticker'; '-AnalysisDate'='AnalysisDate'; '-SessionMaxCalls'='SessionMaxCalls'}
+    for ($n = 1; $n -lt $args.Count; $n++) {
+        $flag = [string]$args[$n]
+        if ($seen.ContainsKey($flag)) { throw "Duplicate Full option: $flag" }
+        $seen[$flag] = $true
+        if ($switches.ContainsKey($flag)) { $options[$switches[$flag]] = $true; continue }
+        if (-not $values.ContainsKey($flag)) { throw "Unknown Full option: $flag" }
+        if ($n + 1 -ge $args.Count -or ([string]$args[$n + 1]).StartsWith('-')) { throw "Missing value for $flag" }
+        $n++
+        $options[$values[$flag]] = [string]$args[$n]
+    }
+    if ([string]::IsNullOrWhiteSpace($options.Ticker)) { throw 'Full requires -Ticker (for example 600919.SH).' }
+    [int]$cap = 0
+    if (-not [int]::TryParse([string]$options.SessionMaxCalls, [ref]$cap) -or $cap -lt 1 -or $cap -gt 60) {
+        throw 'SessionMaxCalls must be between 1 and 60.'
+    }
+    $options.SessionMaxCalls = $cap
+    if ($DryRun) { $options.CheckOnly = $true }
+    if ($options.Run -and ($options.CheckOnly -or -not $options.UseProjectEnv -or $options.ContainsKey('AnalysisDate'))) {
+        throw '-Run requires -UseProjectEnv and automatic latest date; do not combine it with -CheckOnly or -DryRun.'
+    }
+    if (-not $options.CheckOnly -and -not $options.ContainsKey('AnalysisDate') -and -not $options.Run) {
+        throw 'Add -Run -UseProjectEnv to start latest Full, or use -CheckOnly for an offline check.'
+    }
+    if ($options.CalendarOnly) {
+        if (-not $options.Run -or $seen.ContainsKey('-SessionMaxCalls')) {
+            throw '-CalendarOnly requires -Run and fixes the request budget at 1.'
+        }
+        $options.SessionMaxCalls = 1
+    }
+    $route = Join-Path $AppDir 'scripts/Start-MainlandAnalysis.ps1'
+    if (-not (Test-Path -LiteralPath $route -PathType Leaf)) { throw 'This installation does not include the bounded mainland Full launcher.' }
+    $LASTEXITCODE = 0
+    & $route @options
+    exit $LASTEXITCODE
+}
+
 $TradingAgentsExe = Join-Path $AppDir "tradingagents.exe"
 $VenvActivate = Join-Path $AppDir ".venv\Scripts\Activate.ps1"
 $VenvPython = Join-Path $AppDir ".venv\Scripts\python.exe"

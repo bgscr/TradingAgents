@@ -131,7 +131,7 @@ def statement_rows(endpoint):
             "c_cash_equ_beg_period": 80,
         },
     }[endpoint]
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "ts_code": "600895.SH",
@@ -146,6 +146,15 @@ def statement_rows(endpoint):
             for period, announced in (("20251231", "20260420"), ("20260630", "20260820"))
         ]
     )
+    return complete_frame(frame)
+
+
+def complete_frame(frame):
+    from tradingagents.financial_response_completeness import inspect_response_completeness
+    frame.attrs["response_completeness"] = inspect_response_completeness({
+        "code": 0, "data": {"fields": list(frame.columns),
+                           "items": frame.values.tolist()}})
+    return frame
 
 
 def test_production_three_tables_reuse_raw_response_across_frequencies_and_analyses(
@@ -273,10 +282,13 @@ def test_only_missing_announcement_tail_is_fetched(tmp_path, monkeypatch):
     "change",
     [
         {"ts_code": "000001.SZ"},
+        {"ts_code": None},
         {"unit": "unsupported-unit"},
         {"ann_date": "20261016"},
         {"ann_date": None},
         {"end_date": "20261231"},
+        {"end_date": None},
+        {"comp_type": None},
         {"f_ann_date": "20261016"},
         {"total_assets": None},
         {"report_type": "2"},
@@ -435,7 +447,7 @@ def test_empty_response_and_malformed_response_never_fabricate_artifact(tmp_path
     config = runtime_config(tmp_path)
     config["tushare_financial_https_endpoint"] = "https://api.tushare.pro"
     calls = []
-    frame = [pd.DataFrame(columns=["ts_code", "ann_date", "end_date"])]
+    frame = [complete_frame(pd.DataFrame(columns=["ts_code", "ann_date", "end_date"]))]
 
     class Client:
         def query(self, endpoint, **params):

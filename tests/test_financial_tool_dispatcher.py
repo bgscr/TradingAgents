@@ -1540,13 +1540,13 @@ def test_configured_akshare_financial_dispatch_does_not_expand_to_yahoo(
     assert result.artifact is not None
     assert result.provider == "akshare"
     assert yahoo_calls == 0
-    assert len(events) == 3
+    assert len(events) == 2
     assert all(
         event.outcome is PhysicalAttemptOutcome.AVAILABLE for event in events
     )
 
 
-def test_dispatcher_owned_akshare_preserves_received_sections_after_disconnect(
+def test_dispatcher_owned_akshare_retains_business_and_finance_without_fund_flow(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1589,17 +1589,16 @@ def test_dispatcher_owned_akshare_preserves_received_sections_after_disconnect(
         ))
         events = tuple(run.physical_attempt_events)
 
-    assert calls == [("business", "600895"), ("abstract", "600895"), ("fund_flow", "600895", "sh")]
+    assert calls == [("business", "600895"), ("abstract", "600895")]
     assert [event.outcome for event in events] == [
         PhysicalAttemptOutcome.AVAILABLE,
         PhysicalAttemptOutcome.AVAILABLE,
-        PhysicalAttemptOutcome.DISCONNECT,
     ]
     assert result.artifact is not None
     assert result.provider == "akshare"
     assert "主营业务: 园区开发" in result.artifact.raw_text
     assert "营业总收入,180.0,80.0,410.0,200.0" in result.artifact.raw_text
-    assert "stock_individual_fund_flow unavailable (disconnect)" in result.artifact.raw_text
+    assert "stock_individual_fund_flow" not in result.artifact.raw_text
     assert "credential=" not in result.model_dump_json()
 
 

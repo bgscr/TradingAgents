@@ -4,10 +4,13 @@ import contextlib
 import hashlib
 import io
 import json
+import math
+import re
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import akshare as ak
@@ -64,15 +67,19 @@ def _cache_root() -> Path:
 
 
 def _cache_path(ticker: str, curr_date: str, preset: str, categories: set[str]) -> Path:
-    key = json.dumps(
-        {
-            "ticker": ticker,
-            "curr_date": curr_date,
-            "preset": preset,
-            "categories": sorted(categories),
-        },
-        sort_keys=True,
-    )
+    identity = {
+        "ticker": ticker,
+        "curr_date": curr_date,
+        "preset": preset,
+        "categories": sorted(categories),
+    }
+    if CATEGORY_ANNOUNCEMENTS in categories:
+        # Old rendered CNINFO entries may lack validated dates. Preserve those
+        # files, but do not reuse them under the corrected date policy.
+        identity["announcement_date_policy"] = "cninfo-dates-v1"
+    if CATEGORY_FLOW_SENTIMENT in categories:
+        identity["individual_fund_flow_projection"] = "percent-only-v1"
+    key = json.dumps(identity, sort_keys=True)
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return _cache_root() / f"{digest}.md"
 
@@ -309,6 +316,35 @@ def _market_arg(instrument) -> str:
     return "sh" if instrument.exchange == "shanghai" else "sz"
 
 
+def _individual_flow_percentages(frame: pd.DataFrame, curr_date: str) -> SourceResult:
+    source = "stock_individual_fund_flow"
+    end = date.fromisoformat(curr_date)
+    observations = {}
+    for _, row in frame.iterrows():
+        parsed = _local_date_value(_first_present(row, ("date", "日期", "鏃ユ湡")))
+        if parsed is None or not end - timedelta(days=7) <= parsed[1] <= end:
+            continue
+        fields = []
+        for label, names in (
+            ("pct_change", ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
+            ("main_net_ratio", ("main_net_ratio", "主力净流入-净占比", "涓诲姏鍑€娴佸叆-鍑€鍗犳瘮")),
+        ):
+            value = _first_present(row, names).removesuffix("%")
+            if re.fullmatch(r"[+-]?[0-9]{1,12}(?:\.[0-9]{1,16})?", value):
+                number = Decimal(value).normalize() or Decimal(0)
+                fields.append(f"{label}={number:f}%")
+        if fields:
+            day = parsed[1].isoformat()
+            record = "; ".join([f"date={day}", *fields])
+            if day in observations and observations[day] != record:
+                return SourceResult(source, "unavailable", None, error="conflicting percentage rows")
+            observations[day] = record
+    if not observations:
+        return SourceResult(source, "unavailable", None, error="no dated percentage rows in window")
+    dates = sorted(observations)[-5:]
+    return SourceResult(source, "ok", dates[-1], tuple(observations[day] for day in dates))
+
+
 def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
     results: list[SourceResult] = []
 
@@ -319,28 +355,7 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
             market=_market_arg(instrument),
         ),
     )
-    if error:
-        results.append(error)
-    else:
-        records = []
-        for _, row in frame.tail(5).iterrows():
-            records.append(
-                "date={date}; close={close}; pct_change={pct}; main_net_inflow={net}; "
-                "main_net_ratio={ratio}".format(
-                    date=_first_present(row, ("date", "日期", "鏃ユ湡")),
-                    close=_first_present(row, ("close", "收盘价", "鏀剁洏浠�")),
-                    pct=_first_present(row, ("pct_change", "涨跌幅", "娑ㄨ穼骞�")),
-                    net=_first_present(
-                        row,
-                        ("main_net_inflow", "主力净流入-净额", "涓诲姏鍑€娴佸叆-鍑€棰�"),
-                    ),
-                    ratio=_first_present(
-                        row,
-                        ("main_net_ratio", "主力净流入-净占比", "涓诲姏鍑€娴佸叆-鍑€鍗犳瘮"),
-                    ),
-                )
-            )
-        results.append(SourceResult("stock_individual_fund_flow", "ok", curr_date, tuple(records)))
+    results.append(error or _individual_flow_percentages(frame, curr_date))
 
     end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     start = (end_dt - timedelta(days=14)).strftime("%Y%m%d")
@@ -448,9 +463,59 @@ def _collect_flow_sentiment(instrument, curr_date: str) -> list[SourceResult]:
     return results
 
 
+def _announcement_window(curr_date: str) -> tuple[datetime, datetime]:
+    if not isinstance(curr_date, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", curr_date) is None:
+        raise ValueError("invalid announcement analysis date")
+    try:
+        end = datetime.strptime(curr_date, "%Y-%m-%d")
+        return end - timedelta(days=90), end
+    except (ValueError, OverflowError):
+        raise ValueError("invalid announcement analysis date") from None
+
+
+def _local_date_value(value) -> tuple[str, date] | None:
+    # The installed SDK renders Shanghai-local timestamps as naive strings.
+    # Preserve date/date-time compatibility without guessing offsets or epochs.
+    if isinstance(value, datetime):
+        if pd.isna(value) or value.tzinfo is not None or value.microsecond or getattr(value, "nanosecond", 0):
+            return None
+        text = value.isoformat(sep=" ")
+    elif isinstance(value, date):
+        text = value.isoformat()
+    elif isinstance(value, str):
+        text = value
+    else:
+        return None
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?: [0-9]{2}:[0-9]{2}:[0-9]{2})?", text) is None:
+        return None
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d" if len(text) == 10 else "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return text, parsed.date()
+
+
+def _cninfo_row_date(row: pd.Series) -> tuple[str, date] | None:
+    selected = None
+    for column in ("公告时间", "date", "公告日期", "披露日期", "鍏憡鏃ユ湡", "鎶湶鏃ユ湡"):
+        if column not in row:
+            continue
+        value = row[column]
+        if (value is None or value is pd.NA or value is pd.NaT
+                or (isinstance(value, str) and value == "")
+                or (isinstance(value, float) and math.isnan(value))):
+            continue
+        parsed = _local_date_value(value)
+        if parsed is None or (selected is not None and parsed[1] != selected[1]):
+            return None
+        if selected is None:
+            selected = parsed
+    return selected
+
+
 def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
-    end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-    begin = (end_dt - timedelta(days=90)).strftime("%Y%m%d")
+    begin_dt, end_dt = _announcement_window(curr_date)
+    begin = begin_dt.strftime("%Y%m%d")
     end = end_dt.strftime("%Y%m%d")
     results: list[SourceResult] = []
 
@@ -507,8 +572,8 @@ def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
             market="沪深京",
             keyword="",
             category="",
-            start_date=(end_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
-            end_date=curr_date,
+            start_date=begin,
+            end_date=end,
         ),
     )
     if error:
@@ -516,15 +581,22 @@ def _collect_announcements(instrument, curr_date: str) -> list[SourceResult]:
     else:
         records = []
         for _, row in frame.head(5).iterrows():
+            published = _cninfo_row_date(row)
+            if published is None or not begin_dt.date() <= published[1] <= end_dt.date():
+                continue
             records.append(
                 "date={date}; title={title}".format(
-                    date=_first_present(row, ("date", "公告日期", "披露日期", "鍏憡鏃ユ湡", "鎶湶鏃ユ湡")),
+                    date=published[0],
                     title=_first_present(row, ("title", "公告标题", "标题", "鍏憡鏍囬", "鏍囬")),
                 )
             )
         if not records:
-            records = ["no cninfo disclosures found in the lookback window"]
-        results.append(SourceResult("stock_zh_a_disclosure_report_cninfo", "ok", curr_date, tuple(records)))
+            results.append(SourceResult(
+                "stock_zh_a_disclosure_report_cninfo", "unavailable", None,
+                error="no valid dated disclosures in the requested window",
+            ))
+        else:
+            results.append(SourceResult("stock_zh_a_disclosure_report_cninfo", "ok", curr_date, tuple(records)))
 
     return results
 
@@ -654,6 +726,8 @@ def get_china_a_enhancements_for_categories(
     if not allowed:
         return ""
 
+    if CATEGORY_ANNOUNCEMENTS in allowed:
+        _announcement_window(curr_date)
     cache_path = _cache_path(ticker, curr_date, preset, allowed)
     cached = _read_cache(cache_path)
     if cached is not None:

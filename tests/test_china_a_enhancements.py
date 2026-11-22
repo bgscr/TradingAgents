@@ -54,6 +54,23 @@ def test_flow_sentiment_snapshot_limits_records(monkeypatch, tmp_path):
     assert "Preset: flow_sentiment" in out
     assert "stock_individual_fund_flow" in out
     assert out.count("Source:") <= 8
+    assert "main_net_ratio=2.5" in out
+    assert "main_net_inflow=" not in out and "close=" not in out
+
+
+def test_individual_flow_keeps_only_dated_finite_percentages():
+    from tradingagents.dataflows.china_a_enhancements import _individual_flow_percentages
+
+    rows = pd.DataFrame([
+        {"date": "2026-11-14", "pct_change": 42},
+        {"date": "2026-11-13", "main_net_ratio": "3.5%", "close": 987654321},
+        {"date": "2026-11-13", "main_net_ratio": "3.50%"},
+        {"date": "2026-11-12", "main_net_ratio": "nan", "main_net_inflow": 987654321},
+        {"date": "2026-11-05", "pct_change": 41},
+    ])
+    result = _individual_flow_percentages(rows, "2026-11-13")
+    assert result.records == ("date=2026-11-13; main_net_ratio=3.5%",)
+    assert _individual_flow_percentages(rows.drop([1, 2]), "2026-11-13").status == "unavailable"
 
 
 @pytest.mark.unit

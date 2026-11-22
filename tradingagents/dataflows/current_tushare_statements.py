@@ -27,6 +27,11 @@ from tradingagents.dataflows.current_statement_cache import (
     CurrentStatementCache,
     StatementCacheScope,
 )
+from tradingagents.dataflows.current_statement_diagnostics import (
+    CONTRACT as DIAGNOSTIC_CONTRACT,
+    gap_eligible,
+    record_statement_diagnostic,
+)
 from tradingagents.dataflows.financial_contracts import (
     FinancialCapability,
     FinancialCompanyType,
@@ -40,6 +45,7 @@ from tradingagents.dataflows.financial_contracts import (
 )
 from tradingagents.dataflows.provider_subrequests import ProviderSubrequestInstrumentIdentity
 from tradingagents.evidence import AcquisitionUnavailableReason, InstrumentKind
+from tradingagents.financial_response_completeness import RESPONSE_ASSESSMENT_CONTRACT
 from tradingagents.market_history.config import MarketHistoryConfig
 from tradingagents.market_history.coordinator import (
     PhysicalAttemptBudgetExhausted,
@@ -100,7 +106,13 @@ class CurrentTushareStatements:
         self._responses = {}
         binding = {
             "presentation": "current-statement-applicability-v2",
+            "filing_context": "current-statement-filing-context-v1",
+            "preparation_diagnostics": DIAGNOSTIC_CONTRACT,
             "normalizer": NORMALIZER_VERSION,
+            # A new operational selection must not reuse an old checkpoint's
+            # interpretation. Raw cache scope/timestamps remain unchanged and
+            # retained v1 observations are validated under their original rules.
+            "response_assessment": RESPONSE_ASSESSMENT_CONTRACT,
             "endpoint": self._config["tushare_financial_https_endpoint"],
             "account": self._config["tushare_account_scope_label"],
             "mode": self._config["market_history_mode"],
@@ -157,6 +169,8 @@ class CurrentTushareStatements:
                 max_age=timedelta(seconds=self._max_age_seconds),
                 read_only=cache_only,
             )
+            # Cache coverage records a response to this announcement-window query.
+            # It does not prove provider exhaustiveness or report-period coverage.
             self._responses[memo_key] = cache.read_through(
                 scope=scope,
                 range_start=start,
@@ -174,8 +188,31 @@ class CurrentTushareStatements:
                 for chunk in result.chunks:
                     budget.record_cache_hit(endpoint, chunk)
         candidates, rejected, unsupported = [], 0, 0
+        diagnostic = {
+            "contract": DIAGNOSTIC_CONTRACT, "ticker": self._identity.symbol,
+            "tool_name": request.tool_name, "endpoint": endpoint,
+            "frequency": request.frequency.value, "as_of": request.as_of_date.isoformat(),
+            "cache_scope": scope.key, "row_count": 0, "filtered_rows": 0,
+            "row_rejections": 0, "unsupported_rows": 0, "cutoff_rejections": 0,
+            "revision_conflict": False, "selected_periods": 0,
+            "cache_complete": not (result.failure or result.cache_failure or result.missing_ranges or result.stale_ranges),
+            "cache_observations": [], "periods": [],
+        }
+        revision_values = defaultdict(set)
         for chunk in result.chunks:
-            payload = decode_provider_artifact(chunk.payload, endpoint_id=endpoint)
+            payload = decode_current_statement_artifact(chunk.payload, endpoint_id=endpoint)
+            diagnostic["row_count"] += len(payload["rows"])
+            diagnostic["cache_observations"].append({
+                "payload_sha256": chunk.payload_sha256,
+                "announcement_start": chunk.range_start.isoformat(),
+                "announcement_end": chunk.range_end.isoformat(),
+                "checked_at": chunk.checked_at.isoformat(),
+                "retrieved_at": payload["retrieved_at"], "observed_at": payload["observed_at"],
+            })
+            diagnostic["filtered_rows"] += sum(
+                not _announcement_in_range(row, chunk.range_start, chunk.range_end)
+                for row in payload["rows"]
+            )
             # A refreshed subinterval can split an older response. Project only
             # its still-active rows; never resurrect superseded observations.
             payload = {
@@ -203,11 +240,13 @@ class CurrentTushareStatements:
                 expected_provider_symbol=self._provider_symbol,
             )
             rejected += len(row_rejections)
+            diagnostic["row_rejections"] += len(row_rejections)
             for candidate in annual if request.frequency.value == "annual" else reporting:
                 if candidate.period_identity.company_type not in {
                     FinancialCompanyType.BANK, FinancialCompanyType.INDUSTRIAL_NON_BANK
                 }:
                     unsupported += 1
+                    diagnostic["unsupported_rows"] += 1
                     rejected += 1
                     continue
                 if candidate.period_identity.period_end > request.as_of_date or (
@@ -215,6 +254,7 @@ class CurrentTushareStatements:
                     and candidate.filing_metadata.f_ann_date > request.as_of_date
                 ):
                     rejected += 1
+                    diagnostic["cutoff_rejections"] += 1
                     continue
                 assessment = assess_financial_period_candidate(
                     candidate,
@@ -228,6 +268,26 @@ class CurrentTushareStatements:
                     pit_as_of_date=request.as_of_date,
                     eligibility_policy_version="mainland-financial-period-eligibility-v2",
                 )
+                diagnostic["periods"].append({
+                    "candidate_identity": candidate.candidate_identity,
+                    "company_type": candidate.period_identity.company_type.value,
+                    "period_end": candidate.period_identity.period_end.isoformat(),
+                    "ann_date": candidate.filing_metadata.ann_date.isoformat() if candidate.filing_metadata.ann_date else None,
+                    "f_ann_date": candidate.filing_metadata.f_ann_date.isoformat() if candidate.filing_metadata.f_ann_date else None,
+                    "disposition": assessment.disposition.value,
+                    "rejection_reasons": [r.value for r in assessment.rejection_reasons],
+                    "critical_coverage": str(assessment.critical_coverage),
+                    "core_coverage": str(assessment.core_coverage),
+                    "declared_core_count": len(assessment.declared_core_fields),
+                    "missing_critical_fields": list(assessment.missing_critical_fields),
+                    "missing_core_fields": list(assessment.missing_core_fields),
+                })
+                revision_values[(candidate.period_identity.period_end,
+                                 candidate.filing_metadata.ann_date,
+                                 candidate.artifact.observed_at)].add(tuple(
+                    (f.normalized_field, f.normalized_value, f.normalized_unit)
+                    for f in candidate.fields
+                ))
                 if assessment.disposition is FinancialPeriodDisposition.REJECTED:
                     rejected += 1
                 else:
@@ -264,6 +324,10 @@ class CurrentTushareStatements:
             selected.append(top)
         selected.sort(key=lambda c: c.period_identity.period_end, reverse=True)
         selected = selected[: 5 if request.frequency.value == "annual" else 8]
+        diagnostic["selected_periods"] = len(selected)
+        diagnostic["revision_conflict"] = any(len(values) > 1 for values in revision_values.values())
+        diagnostic["gap_eligible"] = gap_eligible(diagnostic)
+        record_statement_diagnostic(diagnostic)
         if not selected:
             if result.failure is not None:
                 _raise_acquisition_failure(result.failure)
@@ -371,9 +435,24 @@ class CurrentTushareStatements:
                     raise ValueError("invalid statement response")
                 if not {"ts_code", "ann_date", "end_date"}.issubset(frame.columns):
                     raise ValueError("invalid statement columns")
+                from tradingagents.financial_response_completeness import (
+                    validate_retained_completeness,
+                    validate_retained_values,
+                )
+
+                completeness = validate_retained_completeness(
+                    frame.attrs.get("response_completeness"), len(frame)
+                )
+                metadata = {"response_completeness": completeness}
+                if "response_values" in frame.attrs:
+                    metadata["response_values"] = validate_retained_values(
+                        frame.attrs["response_values"], list(frame.columns),
+                        [list(row) for row in frame.itertuples(index=False, name=None)],
+                    )
                 now = self._clock()
                 return encode_provider_artifact(
-                    endpoint_id=scope.endpoint_id, frame=frame, retrieved_at=now, observed_at=now
+                    endpoint_id=scope.endpoint_id, frame=frame, retrieved_at=now, observed_at=now,
+                    adapter_metadata=metadata,
                 )
 
             try:
@@ -429,6 +508,11 @@ def _raise_acquisition_failure(failure):
 
 
 def _render(symbol, request, selected, result, rejected):
+    from tradingagents.financial_observations import (
+        CURRENT_OBSERVATION_MARKER,
+        filing_context_header,
+    )
+
     titles = {
         "get_balance_sheet": "Balance Sheet",
         "get_income_statement": "Income Statement",
@@ -439,6 +523,13 @@ def _render(symbol, request, selected, result, rejected):
     buffer.write(f"# {titles[request.tool_name]} data for {symbol} ({request.frequency.value})\n")
     buffer.write(f"# Data retrieved on: {latest}\n")
     buffer.write("# CURRENT-only; source=tushare; not strict PIT evidence.\n")
+    buffer.write(CURRENT_OBSERVATION_MARKER + "\n")
+    context_header = filing_context_header(
+        (item.artifact.artifact_identity, item.filing_metadata.report_type,
+         item.period_identity.consolidation_scope.value, item.filing_metadata.update_flag)
+        for item in selected)
+    if context_header is not None:
+        buffer.write(context_header + "\n")
     company_types = {item.period_identity.company_type for item in selected}
     buffer.write("# company_types=" + ",".join(sorted(t.value for t in company_types)) + "\n")
     buffer.write("# value_status=reported includes true zero; missing has no numeric value.\n")
@@ -531,3 +622,25 @@ def _render(symbol, request, selected, result, rejected):
         for name in sorted(missing):
             writer.writerow({**provenance, "field": name, "value_status": "missing"})
     return buffer.getvalue()
+
+
+def decode_current_statement_artifact(value, *, endpoint_id):
+    from tradingagents.financial_response_completeness import (
+        validate_retained_completeness,
+        validate_retained_values,
+    )
+
+    raw = json.loads(value)
+    metadata = raw.get("adapter_metadata") if isinstance(raw, dict) else None
+    if type(metadata) is not dict or set(metadata) not in (
+        {"response_completeness"}, {"response_completeness", "response_values"},
+    ):
+        raise ValueError("financial_completeness_evidence_missing_or_invalid")
+    payload = decode_provider_artifact(value, endpoint_id=endpoint_id, adapter_metadata=metadata)
+    validate_retained_completeness(metadata["response_completeness"], len(payload["rows"]))
+    if "response_values" in metadata:
+        validate_retained_values(
+            metadata["response_values"], payload["columns"],
+            [[row[column] for column in payload["columns"]] for row in payload["rows"]],
+        )
+    return payload

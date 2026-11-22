@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from tradingagents.comparison_evidence import NumericComparisonEvidence, bound_comparison
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
 )
@@ -27,6 +28,7 @@ from tradingagents.evidence import (
     SourceAcquisitionAvailable,
     SourceAcquisitionUnavailable,
     SourceArtifact,
+    verified_financial_observations,
 )
 from tradingagents.evidence_diagnostics import (
     EvidenceDiagnosticCode,
@@ -34,6 +36,7 @@ from tradingagents.evidence_diagnostics import (
     claim_diagnostic,
     source_diagnostic,
 )
+from tradingagents.financial_observations import FinancialFilingContext
 
 SOURCE_ARTIFACT_MANIFEST_VERSION = "1.0"
 _CLOSED_MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -181,6 +184,48 @@ class AuditMaterialClaim(BaseModel):
     minimum_history_rows: int = Field(ge=1)
 
 
+class AuditFinancialContext(BaseModel):
+    """Reverified row metadata, without source prose or a decision upgrade."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+    observation_id: str = Field(pattern=r"^finobs:[0-9a-f]{64}$")
+    field: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    provider_field: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    unit: Literal["CNY"] = "CNY"
+    source_unit: Literal["CNY_BASE_UNIT"] = "CNY_BASE_UNIT"
+    scale: Literal["1"] = "1"
+    period_end: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    ann_date: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    f_ann_date: str = Field(pattern=r"^(?:[0-9]{4}-[0-9]{2}-[0-9]{2})?$")
+    period_basis: Literal["period_end_balance", "cumulative_report_type_1"]
+    filing_context: FinancialFilingContext | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    semantic_scope: Literal["source_row_only"] = "source_row_only"
+    decision_qualified: Literal[False] = False
+
+
+def _audit_financial_context(fact, evidence):
+    if fact.financial_observation is None:
+        return None
+    observations = verified_financial_observations(
+        evidence.model_copy(update={"source_facts": (fact,)})
+    )
+    if len(observations) != 1:
+        return None
+    observation = observations[0]
+    return AuditFinancialContext(
+        observation_id=observation.observation_id,
+        field=observation.field,
+        provider_field=observation.provider_field,
+        period_end=observation.period_end,
+        ann_date=observation.ann_date,
+        f_ann_date=observation.f_ann_date,
+        period_basis=observation.period_basis,
+        filing_context=observation.filing_context,
+    )
+
+
 class AuditSourceFact(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
@@ -199,6 +244,9 @@ class AuditSourceFact(BaseModel):
     instrument_symbol: str
     effective_date: str
     calculation_lineage: CalculationLineage | None = None
+    financial_context: AuditFinancialContext | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AuditClaimValidation(BaseModel):
@@ -209,6 +257,9 @@ class AuditClaimValidation(BaseModel):
     status: ClaimValidationStatus
     fact_ids: tuple[str, ...] = ()
     diagnostic_code: EvidenceDiagnosticCode | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    comparison_evidence: NumericComparisonEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -533,6 +584,7 @@ def project_evidence_for_audit(
             instrument_symbol=fact.instrument_symbol,
             effective_date=fact.effective_date,
             calculation_lineage=fact.calculation_lineage,
+            financial_context=_audit_financial_context(fact, evidence),
         )
         for fact in sorted(evidence.source_facts, key=lambda item: item.fact_id)
     )
@@ -545,6 +597,7 @@ def project_evidence_for_audit(
                 claim_diagnostic(validation)
                 if validation.status is ClaimValidationStatus.UNSUPPORTED else None
             ),
+            comparison_evidence=bound_comparison(validation, evidence.source_facts, evidence.source_artifacts),
         )
         for validation in sorted(
             evidence.claim_validations,

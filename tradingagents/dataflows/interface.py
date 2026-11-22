@@ -313,6 +313,12 @@ def get_vendor(category: str, method: str = None, market: str | None = None) -> 
 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
+    if method == 'get_news' and _powershell_news_selected():
+        from tradingagents.powershell_news import acquire_powershell_news
+
+        result = acquire_powershell_news(*args, **kwargs, tool_call_id='powershell-legacy-news',
+                                        source_ref='powershell-legacy-news', capability='get_news')
+        return result.value or 'DATA_UNAVAILABLE: eastmoney_powershell unavailable; no fallback request.'
     category = get_category_for_method(method)
     symbol = _first_symbol_arg(args, kwargs)
     mainland = (
@@ -434,6 +440,12 @@ def route_to_vendor(method: str, *args, **kwargs):
     raise RuntimeError(f"No available vendor for '{method}'")
 
 
+def _powershell_news_selected():
+    from tradingagents.powershell_news import active_powershell_news
+
+    return active_powershell_news() is not None or get_config().get('bounded_powershell_news_enabled') is True
+
+
 def route_to_vendor_acquired(
     method: str,
     *args,
@@ -444,6 +456,12 @@ def route_to_vendor_acquired(
     **kwargs,
 ):
     """Acquire through the run controller without invoking the legacy router."""
+    if method == 'get_news' and _powershell_news_selected():
+        from tradingagents.powershell_news import acquire_powershell_news
+
+        return acquire_powershell_news(*args, **kwargs, tool_call_id=tool_call_id,
+                                      source_ref=source_ref, capability=capability,
+                                      instrument_identity=instrument_identity)
     category = get_category_for_method(method)
     market = _get_market_for_call(method, args, kwargs)
     configured = get_vendor(category, method, market)
@@ -464,6 +482,9 @@ def route_to_vendor_acquired(
                         _acquired=True,
                         instrument_identity=instrument_identity,
                     )
+                if method == "get_news" and impl is get_akshare_news:
+                    return invoke_budget_data(method, vendor_name, impl, *args, **kwargs,
+                                              instrument_identity=instrument_identity)
                 return invoke_budget_data(method, vendor_name, impl, *args, **kwargs)
             except VendorRateLimitError as error:
                 raise AcquisitionFailure(
@@ -511,7 +532,7 @@ def route_to_vendor_acquired(
             reason=AcquisitionUnavailableReason.MALFORMED_RESPONSE
         )
 
-    return controller.acquire(
+    result = controller.acquire(
         AcquisitionRequest(
             capability=capability,
             source_ref=source_ref,
@@ -523,3 +544,10 @@ def route_to_vendor_acquired(
         validator=validate_news,
         serializer=lambda value: value,
     )
+    if method == "get_news" and vendor_names == ["akshare"] and result.artifact is None:
+        from tradingagents.analysis_budget import active_budget
+
+        budget = active_budget()
+        if budget is not None:
+            budget.record_data_gap("get_news", "news_unavailable", provider="akshare")
+    return result

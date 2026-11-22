@@ -23,7 +23,7 @@ from tradingagents.evidence import (
 
 RUN_TELEMETRY_CONTRACT_VERSION = "1.1"
 ACQUISITION_TELEMETRY_EVENT_CONTRACT_VERSION = "1.0"
-MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION = "1.0"
+MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION = "1.1"
 MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS = 256
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 RunTelemetryTerminalRoute = Literal[
@@ -39,12 +39,37 @@ ModelTransportAttemptDisposition = Literal[
 ]
 
 
+class ModelTransportSendLimits(BaseModel):
+    """Versioned, local-only send limits; no request body, URL, headers or values."""
+
+    model_config = _CLOSED_MODEL_CONFIG
+    contract_version: Literal['1.0'] = '1.0'
+    httpx_timeout_seconds: dict[Literal['connect', 'read', 'write', 'pool'], float | None] | None = None
+    budget_remaining_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    budget_deadline_epoch: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    stage: Literal['analysis', 'research_debate', 'trading', 'risk_debate', 'portfolio_synthesis'] | None = None
+    graph_node: Literal['Market Analyst', 'Sentiment Analyst', 'News Analyst', 'Fundamentals Analyst',
+                        'Bull Researcher', 'Bear Researcher', 'Research Manager', 'Trader',
+                        'Aggressive Analyst', 'Conservative Analyst', 'Neutral Analyst', 'Portfolio Manager'] | None = None
+
+    @model_validator(mode='after')
+    def _complete_timeout_shape(self):
+        import math
+        value = self.httpx_timeout_seconds
+        if value is not None and (set(value) != {'connect', 'read', 'write', 'pool'}
+                or any(v is not None and (not math.isfinite(v) or v < 0) for v in value.values())):
+            raise ValueError('timeout snapshot must have four finite nonnegative components')
+        return self
+
+
 class ModelTransportAttempt(BaseModel):
     """Closed safe projection of one physical OpenAI-compatible request."""
 
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
+    contract_version: Literal["1.0", "1.1", "1.2"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
+    controlled_regeneration: bool = False
+    send_limits: ModelTransportSendLimits | None = None
     logical_call_id: str = Field(pattern=r"^model-call-[0-9]{6,}$")
     attempt_ordinal: int = Field(ge=0)
     configured_max_retries: int = Field(ge=0)
@@ -85,6 +110,8 @@ class ModelTransportAttempt(BaseModel):
 
     @model_validator(mode="after")
     def _failure_fields_match_disposition(self) -> ModelTransportAttempt:
+        if self.contract_version == '1.0' and self.send_limits is not None:
+            raise ValueError('historical transport records cannot acquire new send-limit evidence')
         is_transport_failure = self.disposition in {
             "retryable_transport_failure",
             "terminal_transport_failure",
@@ -102,7 +129,12 @@ class ModelTransportAttempt(BaseModel):
             self.http_status is not None and self.http_status >= 400
         ):
             raise ValueError("successful transport attempt cannot carry failure status")
-        if self.attempt_ordinal > self.configured_max_retries:
+        if self.controlled_regeneration and (
+            self.contract_version != "1.2" or self.configured_max_retries != 0
+            or self.attempt_ordinal != 1 or self.retry_index not in (None, 0)
+        ):
+            raise ValueError("controlled regeneration requires its own zero-SDK-retry contract")
+        if self.attempt_ordinal > self.configured_max_retries + int(self.controlled_regeneration):
             raise ValueError("attempt ordinal exceeds configured retry budget")
         if (
             self.retry_index is not None
@@ -173,7 +205,7 @@ class ModelTransportAttemptSummary(BaseModel):
 class ModelTransportAttemptProjection(BaseModel):
     model_config = _CLOSED_MODEL_CONFIG
 
-    contract_version: Literal["1.0"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
+    contract_version: Literal["1.0", "1.1"] = MODEL_TRANSPORT_ATTEMPT_CONTRACT_VERSION
     retention_limit: Literal[256] = MAX_RETAINED_MODEL_TRANSPORT_ATTEMPTS
     attempts: tuple[ModelTransportAttempt, ...] = ()
     summary: ModelTransportAttemptSummary

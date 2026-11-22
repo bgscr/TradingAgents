@@ -440,7 +440,7 @@ def test_disabled_retains_unlimited_transport_and_restores_hooks(monkeypatch, ht
 @pytest.mark.parametrize("overrides", [
     {"analysis_max_calls": True}, {"analysis_max_calls": 0},
     {"analysis_timeout_seconds": float("nan")}, {"analysis_timeout_seconds": -1},
-    {"llm_provider": "openai"}, {"checkpoint_enabled": True},
+    {"llm_provider": "openai"}, {"checkpoint_enabled": "true"},
     {"financial_cache_only": True}, {"analysis_budget_enabled": "false"},
 ])
 def test_invalid_configuration_rejected(overrides):
@@ -677,7 +677,8 @@ def test_explicit_financial_https_stops_before_second_post(monkeypatch):
         status = 200
 
         def read(self, limit):
-            return json.dumps({"code": 0, "data": {"fields": ["ts_code", "ann_date", "end_date"], "items": []}}).encode()
+            return json.dumps({"code": 0, "data": {"fields": ["ts_code", "ann_date", "end_date"],
+                "items": [], "has_more": False, "total": 0}}).encode()
 
     class Connection:
         def __init__(self, *args, **kwargs):

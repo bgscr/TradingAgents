@@ -55,7 +55,9 @@ from tradingagents.evidence import (
     SourceArtifact,
     SubmittedMaterialClaim,
     ToolExecutionEvidenceEnvelope,
+    decision_ready_material_claims,
     make_source_acquisition_outcome,
+    verified_financial_observations,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,38 @@ def test_analyst_prompts_do_not_expose_final_transaction_proposal_signal():
 
     for factory in analyst_factories:
         assert "FINAL TRANSACTION PROPOSAL" not in inspect.getsource(factory)
+
+
+def _assert_sources_by_id(evidence, expected):
+    # Ordering is not a source identity or admission contract. Reject duplicates,
+    # omissions, extra sources, or any status/necessity/detail change.
+    actual_by_id = {source.source_id: source for source in evidence.sources}
+    expected_by_id = {source.source_id: source for source in expected}
+    assert len(actual_by_id) == len(evidence.sources)
+    assert len(expected_by_id) == len(expected)
+    assert actual_by_id == expected_by_id
+
+
+def _assert_unbound_financial_commentary(report, original):
+    assert report == (
+        "## Advisory commentary / 咨询性文字\n"
+        "Source quotation support does not verify this prose's financial meaning. "
+        "引用一致不等于字段、币种或期间语义已核验。\n\n"
+        + original
+        + "\n\n## Source-bound CURRENT observations / 来源绑定的财务观测\n"
+        "Only the following source-row values are deterministically bound. "
+        "They are not PIT evidence, canonical facts or investment-qualified premises; "
+        "quarterly income/cashflow retain cumulative report_type=1 semantics.\n"
+        "- No uniquely bound complete financial row / 无唯一完整财务行绑定。"
+    )
+
+
+def _assert_financial_excerpt_is_not_a_decision_premise(evidence):
+    assert evidence.source_facts
+    assert all(fact.fact_kind == "excerpt" for fact in evidence.source_facts)
+    assert all(fact.financial_observation is None for fact in evidence.source_facts)
+    assert verified_financial_observations(evidence) == ()
+    assert decision_ready_material_claims(evidence) == ()
 
 
 def _tool_exchange(tool_name, args, content, call_id):
@@ -253,7 +287,7 @@ def test_market_analyst_submits_typed_claims_to_shared_evidence():
         for item in evidence.material_claims
     ) == (claim, indicator_claim)
     assert all(item.fact_ids for item in evidence.material_claims)
-    assert evidence.sources == (
+    expected_sources = (
         EvidenceSource(
             source_id="analyst.market.submission",
             status=EvidenceStatus.AVAILABLE,
@@ -271,6 +305,7 @@ def test_market_analyst_submits_typed_claims_to_shared_evidence():
             required=False,
         ),
     )
+    _assert_sources_by_id(evidence, expected_sources)
 
 
 @pytest.mark.unit
@@ -366,7 +401,7 @@ def test_market_analyst_marks_claim_without_matching_tool_result_unavailable():
     )
 
     evidence = EvidenceState.model_validate(result["evidence_state"])
-    assert evidence.sources == (
+    expected_sources = (
         EvidenceSource(
             source_id="analyst.market.submission",
             status=EvidenceStatus.AVAILABLE,
@@ -380,6 +415,13 @@ def test_market_analyst_marks_claim_without_matching_tool_result_unavailable():
             detail="source ref is not in allowed catalog",
         ),
     )
+    _assert_sources_by_id(evidence, expected_sources)
+    assert len(evidence.claim_validations) == 1
+    validation = evidence.claim_validations[0]
+    assert validation.claim_id == claim.claim_id
+    assert validation.status is not ClaimValidationStatus.SUPPORTED
+    assert not evidence.source_facts
+    assert decision_ready_material_claims(evidence) == ()
 
 
 @pytest.mark.unit
@@ -436,7 +478,7 @@ def test_news_analyst_submits_typed_claims_to_shared_evidence():
         for item in evidence.material_claims
     ) == (claim,)
     assert evidence.material_claims[0].fact_ids
-    assert evidence.sources == (
+    expected_sources = (
         EvidenceSource(
             source_id="analyst.news.submission",
             status=EvidenceStatus.AVAILABLE,
@@ -449,6 +491,7 @@ def test_news_analyst_submits_typed_claims_to_shared_evidence():
             required=False,
         ),
     )
+    _assert_sources_by_id(evidence, expected_sources)
 
 
 @pytest.mark.unit
@@ -493,17 +536,21 @@ def test_fundamentals_analyst_submits_typed_claims_to_shared_evidence():
         }
     )
 
-    assert result["fundamentals_report"] == (
+    _assert_unbound_financial_commentary(
+        result["fundamentals_report"],
+        "## Fundamentals\n\nRevenue growth remained strong.",
+    )
+    # Preserve the original model message separately from the advisory rendering.
+    assert result["messages"][0].content == (
         "## Fundamentals\n\nRevenue growth remained strong."
     )
-    assert result["messages"][0].content == result["fundamentals_report"]
     evidence = EvidenceState.model_validate(result["evidence_state"])
     assert tuple(
         item.model_copy(update={"fact_ids": ()})
         for item in evidence.material_claims
     ) == (claim,)
     assert evidence.material_claims[0].fact_ids
-    assert evidence.sources == (
+    expected_sources = (
         EvidenceSource(
             source_id="analyst.fundamentals.submission",
             status=EvidenceStatus.AVAILABLE,
@@ -516,6 +563,8 @@ def test_fundamentals_analyst_submits_typed_claims_to_shared_evidence():
             required=False,
         ),
     )
+    _assert_sources_by_id(evidence, expected_sources)
+    _assert_financial_excerpt_is_not_a_decision_premise(evidence)
 
 
 @pytest.mark.unit
@@ -584,7 +633,18 @@ def test_tool_analyst_plain_text_gets_one_structured_finalization(
         }
     )
 
-    assert result[report_key] == f"## {analyst_name.title()} Analysis\n\nValidated report."
+    # Check the real production finalization count before presentation assertions.
+    structured.invoke.assert_called_once()
+    finalization_prompt = structured.invoke.call_args.args[0]
+    assert "UNVALIDATED DIRECTIONAL DRAFT" in finalization_prompt
+    assert source_ref in finalization_prompt
+    expected_report = f"## {analyst_name.title()} Analysis\n\nValidated report."
+    if analyst_name == "fundamentals":
+        _assert_unbound_financial_commentary(result[report_key], expected_report)
+    else:
+        assert result[report_key] == expected_report
+    # The message is the original structured reply, not a financial qualification.
+    assert result["messages"][0].content == expected_report
     assert "UNVALIDATED DIRECTIONAL DRAFT" not in result[report_key]
     evidence = EvidenceState.model_validate(result["evidence_state"])
     assert evidence.material_claims[0].analyst == analyst_name
@@ -594,10 +654,24 @@ def test_tool_analyst_plain_text_gets_one_structured_finalization(
         required=True,
         detail="finalized_structured",
     ) in evidence.sources
-    structured.invoke.assert_called_once()
-    finalization_prompt = structured.invoke.call_args.args[0]
-    assert "UNVALIDATED DIRECTIONAL DRAFT" in finalization_prompt
-    assert source_ref in finalization_prompt
+    _assert_sources_by_id(
+        evidence,
+        (
+            EvidenceSource(
+                source_id=f"analyst.{analyst_name}.submission",
+                status=EvidenceStatus.AVAILABLE,
+                required=True,
+                detail="finalized_structured",
+            ),
+            EvidenceSource(
+                source_id=source_ref,
+                status=EvidenceStatus.AVAILABLE,
+                required=False,
+            ),
+        ),
+    )
+    if analyst_name == "fundamentals":
+        _assert_financial_excerpt_is_not_a_decision_premise(evidence)
 
 
 @pytest.mark.unit
@@ -1302,6 +1376,22 @@ class TestResearchManagerAgent:
 
 @pytest.mark.unit
 class TestRenderSentimentReport:
+    @pytest.mark.parametrize("confidence,label", [("low", "低"), ("medium", "中"), ("high", "高")])
+    def test_chinese_header_preserves_schema_and_verbatim_narrative(self, confidence, label):
+        expected = ["看多", "偏多", "中性", "分歧", "偏空", "看空"]
+        narrative = '合成正文\n> **Overall Sentiment:** Neutral; exact source quotation.'
+        for band, translated in zip(SentimentBand, expected, strict=True):
+            report = SentimentReport(overall_band=band, overall_score=5.5,
+                                     confidence=confidence, narrative=narrative)
+            before = report.model_dump_json()
+            for language in ("Chinese", "zh-CN", "中文"):
+                text = render_sentiment_report(report, output_language=language)
+                assert text.startswith(f"**总体情绪：** **{translated}** （评分：5.5/10）")
+                assert f"**置信度：** {label}" in text
+                assert text.split('\n\n', 1)[1] == narrative
+            assert report.model_dump_json() == before
+            assert render_sentiment_report(report) == render_sentiment_report(report, output_language="English")
+
     def test_header_contains_band_and_score(self):
         report = SentimentReport(
             overall_band=SentimentBand.BULLISH,
@@ -1391,6 +1481,24 @@ def _structured_sentiment_llm(captured: dict, report: SentimentReport | None = N
 
 @pytest.mark.unit
 class TestSentimentAnalystAgent:
+    @pytest.mark.parametrize("language,chinese", [("Chinese", True), ("zh-CN", True), ("English", False)])
+    def test_node_propagates_language_to_fixed_header(self, monkeypatch, language, chinese):
+        from tradingagents.dataflows import config
+
+        monkeypatch.setitem(config._config, "output_language", language)
+        captured = {}
+        report = SentimentReport(overall_band=SentimentBand.MILDLY_BULLISH,
+                                 overall_score=6.0, confidence="low", narrative="合成正文；原文保持。")
+        before = report.model_dump_json()
+        llm = _structured_sentiment_llm(captured, report)
+        result = create_sentiment_analyst(llm)(_make_sentiment_state())
+        text = result["sentiment_report"]
+        assert text.startswith("**总体情绪：** **偏多**" if chinese else "**Overall Sentiment:** **Mildly Bullish**")
+        assert text.split('\n\n', 1)[1] == report.narrative
+        assert result["messages"][0].content == text
+        assert llm.with_structured_output.return_value.invoke.call_count == 1
+        assert report.model_dump_json() == before
+
     @pytest.fixture(autouse=True)
     def sentiment_acquisition_blocks(self, monkeypatch):
         blocks: dict[str, str | None] = {

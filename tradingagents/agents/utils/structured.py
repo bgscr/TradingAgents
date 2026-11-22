@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from langchain_core.messages import HumanMessage
@@ -34,6 +34,7 @@ class RequiredStructuredResult:
     value: Any | None
     reason: str | None = None
     attempts: int = 0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -103,8 +104,11 @@ def invoke_required_structured(
     agent_name: str,
     *,
     validator: Callable[[Any], Any] | None = None,
+    max_attempts: int = 2,
 ) -> RequiredStructuredResult:
-    """Invoke a required schema with one bounded fail-closed repair attempt."""
+    """Invoke a required schema, optionally allowing one fail-closed repair."""
+    if type(max_attempts) is not int or max_attempts not in (1, 2):
+        raise ValueError("structured max_attempts must be 1 or 2")
     if structured_llm is None:
         return RequiredStructuredResult(value=None, reason="unsupported", attempts=0)
 
@@ -112,13 +116,17 @@ def invoke_required_structured(
     model_name = getattr(structured_llm, "model_name", "unknown")
     current_prompt = prompt
     last_reason = "none_parsed"
-    for attempt in (1, 2):
+    for attempt in range(1, max_attempts + 1):
         try:
             raw_result = structured_llm.invoke(current_prompt)
             value, reason, diagnostics = _unwrap_required_result(raw_result)
             if value is not None and validator is not None:
                 value = validator(value)
             if value is not None:
+                from tradingagents.run_diagnostics import record_output
+
+                record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
+                              diagnostics, outcome="success")
                 logger.info(
                     "%s: required structured output succeeded "
                     "(schema=%s model=%s attempt=%d%s)",
@@ -134,6 +142,10 @@ def invoke_required_structured(
             last_reason = _structured_failure_reason(exc)
             diagnostics = _safe_exception_diagnostics(exc)
 
+        from tradingagents.run_diagnostics import record_output
+
+        record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
+                      diagnostics, outcome=last_reason)
         logger.warning(
             "%s: required structured output failed "
             "(schema=%s model=%s attempt=%d reason=%s%s)",
@@ -144,11 +156,12 @@ def invoke_required_structured(
             last_reason,
             _format_safe_diagnostics(diagnostics),
         )
-        if attempt == 2 or last_reason not in {"none_parsed", "validation_error"}:
+        if attempt == max_attempts or last_reason not in {"none_parsed", "validation_error"}:
             return RequiredStructuredResult(
                 value=None,
                 reason=last_reason,
                 attempts=attempt,
+                diagnostics=safe_output_diagnostics(diagnostics),
             )
         current_prompt = _repair_prompt(prompt, schema_name)
 
@@ -156,11 +169,23 @@ def invoke_required_structured(
 
 
 def _structured_failure_reason(exc: Exception) -> str:
+    if _is_output_limit(exc):
+        return "output_limit"
     return (
         "validation_error"
         if isinstance(exc, (ValidationError, ValueError, TypeError))
         else "transport_error"
     )
+
+
+def _is_output_limit(exc: Exception) -> bool:
+    # Lazy: pure classification users need not initialize an additional SDK.
+    # An actual SDK length exception already implies that OpenAI was imported.
+    import sys
+
+    sdk = sys.modules.get("openai")
+    length_error = getattr(sdk, "LengthFinishReasonError", None)
+    return isinstance(length_error, type) and isinstance(exc, length_error)
 
 
 def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[str, Any]]:
@@ -177,12 +202,16 @@ def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[s
     parsing_error = result.get("parsing_error")
     metadata = getattr(raw, "response_metadata", {}) or {}
     tool_calls = getattr(raw, "tool_calls", ()) or ()
-    diagnostics: dict[str, Any] = {
-        "finish_reason": metadata.get("finish_reason"),
-        "tool_call_count": len(tool_calls),
-    }
+    diagnostics = response_output_diagnostics(raw)
+    diagnostics["tool_call_count"] = len(tool_calls)
     if parsing_error is not None:
         diagnostics.update(_safe_exception_diagnostics(parsing_error))
+    if metadata.get("finish_reason") == "length" or (
+        parsing_error is not None and _is_output_limit(parsing_error)
+    ):
+        # A partially parsed object is not complete evidence. Do not spend an
+        # automatic repair attempt or silently raise the configured output cap.
+        return None, "output_limit", diagnostics
     if parsed is not None:
         return parsed, None, diagnostics
     return (
@@ -194,6 +223,16 @@ def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[s
 
 def _safe_exception_diagnostics(exc: Exception) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {"error_type": type(exc).__name__}
+    if _is_output_limit(exc):
+        diagnostics["finish_reason"] = "length"
+        usage = getattr(getattr(exc, "completion", None), "usage", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if type(completion_tokens) is int and completion_tokens >= 0:
+            diagnostics["completion_tokens"] = completion_tokens
+            details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(details, "reasoning_tokens", None)
+            if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= completion_tokens:
+                diagnostics["reasoning_tokens"] = reasoning_tokens
     if isinstance(exc, ValidationError):
         fields = []
         for error in exc.errors(include_url=False, include_input=False)[:8]:
@@ -201,6 +240,46 @@ def _safe_exception_diagnostics(exc: Exception) -> dict[str, Any]:
             fields.append(f"{location}:{error.get('type', 'validation_error')}")
         diagnostics["validation_fields"] = tuple(fields)
     return diagnostics
+
+
+def safe_output_diagnostics(value: Any) -> dict[str, Any]:
+    """Whitelist observed output metadata; never infer usage from the configured cap."""
+    if not isinstance(value, Mapping):
+        return {}
+    safe = {}
+    finish = value.get("finish_reason")
+    if isinstance(finish, str) and finish in {
+        "stop", "length", "tool_calls", "function_call", "content_filter",
+    }:
+        safe["finish_reason"] = finish
+    completion = value.get("completion_tokens")
+    if type(completion) is int and completion >= 0:
+        safe["completion_tokens"] = completion
+        reasoning = value.get("reasoning_tokens")
+        if type(reasoning) is int and 0 <= reasoning <= completion:
+            safe["reasoning_tokens"] = reasoning
+    return safe
+
+
+def response_output_diagnostics(response: Any) -> dict[str, Any]:
+    """Read only SDK/LangChain usage counters, not response or reasoning content."""
+    metadata = getattr(response, "response_metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    usage = getattr(response, "usage_metadata", None)
+    usage = usage if isinstance(usage, Mapping) else {}
+    provider_usage = metadata.get("token_usage")
+    provider_usage = provider_usage if isinstance(provider_usage, Mapping) else {}
+    completion = usage.get("output_tokens", provider_usage.get("completion_tokens"))
+    details = usage.get("output_token_details")
+    details = details if isinstance(details, Mapping) else {}
+    provider_details = provider_usage.get("completion_tokens_details")
+    provider_details = provider_details if isinstance(provider_details, Mapping) else {}
+    reasoning = details.get("reasoning", provider_details.get("reasoning_tokens"))
+    return safe_output_diagnostics({
+        "finish_reason": metadata.get("finish_reason"),
+        "completion_tokens": completion,
+        "reasoning_tokens": reasoning,
+    })
 
 
 def _format_safe_diagnostics(diagnostics: Mapping[str, Any]) -> str:

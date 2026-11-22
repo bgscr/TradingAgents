@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from functools import partial
 from hashlib import sha256
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
@@ -3590,6 +3591,7 @@ class FinancialToolDispatcher:
             FinancialEligibilityAcquisitionContext | None
         ) = None,
         checkpoint_thread_id: str | None = None,
+        powershell_fundflow_owner=None,
     ) -> FinancialToolDispatcher:
         """Snapshot existing vendor precedence into one immutable run plan."""
 
@@ -3598,6 +3600,14 @@ class FinancialToolDispatcher:
 
             config = get_config()
         builtin_vendors = vendor_methods is None
+        from tradingagents.powershell_fundflow import configured_owner
+        fundflow_owner = configured_owner(config) if powershell_fundflow_owner is None else powershell_fundflow_owner
+        if powershell_fundflow_owner is not None and (config.get('bounded_powershell_fundflow_enabled') is not True
+                or config.get('analysis_skip_optional_fundamentals') is not True):
+            from tradingagents.powershell_fundflow import FundflowStop
+            raise FundflowStop('fundflow_configuration_changed')
+        if fundflow_owner is not None:
+            fundflow_owner.bind_identity(instrument_identity)
         if vendor_methods is None:
             from tradingagents.dataflows.interface import VENDOR_METHODS
 
@@ -3679,6 +3689,8 @@ class FinancialToolDispatcher:
                     tool_name=tool_name,
                     implementation=available[provider_name],
                     canonical_symbol=instrument_identity.symbol.strip().upper(),
+                    fundflow_owner=fundflow_owner,
+                    fundflow_config=dict(config) if fundflow_owner is not None else None,
                 )
                 for provider_name in vendor_names
             )
@@ -7989,22 +8001,35 @@ def _financial_provider_from_implementation(
     tool_name: str,
     implementation: object,
     canonical_symbol: str,
+    fundflow_owner=None,
+    fundflow_config=None,
 ) -> FinancialProvider:
+    from tradingagents.powershell_fundflow import VERSION as fundflow_version
+
     implementations = implementation if isinstance(implementation, list) else [implementation]
     if not implementations or any(not callable(item) for item in implementations):
         raise TypeError(
             f"financial provider {provider_name!r} has an invalid implementation"
         )
     multiple_variants = isinstance(implementation, list)
+    default_variant = "default"
+    individual_fundamentals = tool_name == "get_fundamentals" and provider_name == "akshare"
+    if individual_fundamentals and fundflow_owner is not None:
+        default_variant = fundflow_version
+    elif individual_fundamentals and getattr(implementation, "__module__", "") == "tradingagents.dataflows.akshare_data":
+        # Pre-isolation artifacts could contain prices and net amounts.
+        default_variant = "company-fundamentals-v2"
     return FinancialProvider(
         name=provider_name,
         variants=tuple(
             FinancialProviderVariant(
-                variant_id=f"variant-{index}" if multiple_variants else "default",
+                variant_id=f"variant-{index}" if multiple_variants else default_variant,
                 invoke=_configured_financial_invoker(
                     item,
                     tool_name=tool_name,
                     canonical_symbol=canonical_symbol,
+                    fundflow_owner=fundflow_owner if individual_fundamentals else None,
+                    fundflow_config=fundflow_config,
                 ),
             )
             for index, item in enumerate(implementations, 1)
@@ -8017,6 +8042,8 @@ class _ConfiguredFinancialInvoker:
     implementation: Callable[..., object]
     tool_name: str
     canonical_symbol: str
+    fundflow_owner: object = None
+    fundflow_config: dict | None = None
 
     def __call__(self, request: FinancialToolRequest) -> object:
         return self._invoke(request, canonical_request_key=None)
@@ -8053,13 +8080,24 @@ class _ConfiguredFinancialInvoker:
             and implementation_name == "get_fundamentals"
             and canonical_request_key is not None
         ):
-            return _invoke_dispatcher_owned_akshare_fundamentals(
+            acquire = partial(_invoke_dispatcher_owned_akshare_fundamentals,
                 self.implementation,
                 canonical_symbol=self.canonical_symbol,
                 current_date=current_date,
                 material_arguments=material_arguments,
                 canonical_request_key=canonical_request_key,
+                fundflow_owner=self.fundflow_owner,
+                fundflow_config=self.fundflow_config,
             )
+            if self.fundflow_owner is not None and self.fundflow_owner.after_report:
+                if material_arguments:
+                    from tradingagents.powershell_fundflow import FundflowStop
+                    raise FundflowStop("fundflow_arguments_invalid")
+                self.fundflow_owner.schedule_after_report(canonical_request_key, acquire)
+                # The current tool reports only admitted company/financial data.
+                # Its existing omission policy records both gaps when disabled.
+                return acquire(fundflow_owner=None)
+            return acquire()
         elif (
             implementation_module
             in {
@@ -8092,6 +8130,8 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
     current_date: str,
     material_arguments: Mapping[str, object],
     canonical_request_key: str,
+    fundflow_owner=None,
+    fundflow_config=None,
 ) -> object:
     from tradingagents.dataflows.config import get_config
     from tradingagents.dataflows.market_snapshot import (
@@ -8111,7 +8151,8 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
     from tradingagents.market_history.config import DataUsageMode
 
     try:
-        history_config = MarketHistoryConfig.from_mapping(get_config())
+        config = fundflow_config if fundflow_owner is not None and fundflow_config is not None else get_config()
+        history_config = MarketHistoryConfig.from_mapping(config)
     except Exception as exc:
         raise AcquisitionFailure(
             reason=AcquisitionUnavailableReason.NOT_CONFIGURED
@@ -8120,6 +8161,9 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
         raise AcquisitionFailure(
             reason=AcquisitionUnavailableReason.USAGE_NOT_ENTITLED
         )
+    if fundflow_owner is not None and config.get("bounded_observation_cache_mode") == "as_known_on_date":
+        raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NO_DATA, retryable=False,
+                                 error_code="fundflow_historical_availability_unverified")
     try:
         store = MarketHistoryStore.open_provider_request_authority(history_config)
     except Exception as exc:
@@ -8148,6 +8192,21 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
                 str(physical_request_index),
                 operation,
             )
+            if (fundflow_owner is not None and config.get("bounded_observation_cache_mode") == "retrospective"
+                    and operation == "stock_individual_fund_flow.powershell"):
+                from tradingagents.retrospective_observations import retrospective_observation
+
+                cached = retrospective_observation(store.config,
+                    request_key=subrequest_key, provider="akshare",
+                    operation="financial-fundamentals:" + operation, as_of=date.fromisoformat(current_date),
+                    receipt_time=lambda result: fundflow_owner.cached_receipt_time(
+                        result, config.get("bounded_fundflow_observation_sha256")),
+                )
+                if cached is not None:
+                    fundflow_owner.metadata = {"status": "retrospective_cache_hit", "attempted": False}
+                    if "normalized_sha256" not in cached:
+                        return {**cached, "normalized_sha256": config["bounded_fundflow_observation_sha256"]}
+                    return cached
 
             def typed_physical_request() -> object:
                 value = _typed_mainland_physical_request(physical_request)
@@ -8170,6 +8229,7 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
                     operation=f"financial-fundamentals:{operation}",
                     physical_request=typed_physical_request,
                     cooldown_scope="market-snapshot",
+                    record_at_physical_io=fundflow_owner is not None and fundflow_owner.after_report,
                 )
             except PhysicalAttemptBudgetExhausted as exc:
                 record_active_physical_attempt_events(exc.attempt_events)
@@ -8177,6 +8237,14 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
             record_active_physical_attempt_events(result.attempt_events)
             return result.value
 
+        if fundflow_owner is not None:
+            # Explicit bounded mode omits business/abstract endpoints. Reuse
+            # the same coordinator, but never also invoke the legacy GET.
+            if material_arguments:
+                from tradingagents.powershell_fundflow import FundflowStop
+                raise FundflowStop("fundflow_arguments_invalid")
+            return fundflow_owner.acquire(canonical_symbol, current_date,
+                                         physical_request=execute_physical_request)
         value = implementation(
             canonical_symbol,
             current_date,
@@ -8196,11 +8264,15 @@ def _configured_financial_invoker(
     *,
     tool_name: str,
     canonical_symbol: str,
+    fundflow_owner=None,
+    fundflow_config=None,
 ) -> Callable[[FinancialToolRequest], object]:
     return _ConfiguredFinancialInvoker(
         implementation=implementation,
         tool_name=tool_name,
         canonical_symbol=canonical_symbol,
+        fundflow_owner=fundflow_owner,
+        fundflow_config=fundflow_config,
     )
 
 

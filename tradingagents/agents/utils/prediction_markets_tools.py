@@ -1,11 +1,13 @@
 from typing import Annotated
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
+from tradingagents.budget_data import policy_disabled_tool_result
 from tradingagents.dataflows.interface import route_to_vendor
 
 
-@tool
+@tool(response_format="content_and_artifact")
 def get_prediction_markets(
     topic: Annotated[
         str,
@@ -13,7 +15,8 @@ def get_prediction_markets(
         "'US election', or a sector/company event.",
     ],
     limit: Annotated[int | None, "Max markets to return; omit for a default of 6"] = None,
-) -> str:
+    runtime: ToolRuntime = None,
+) -> tuple[str, dict[str, object] | None]:
     """
     Retrieve live, market-implied probabilities for forward-looking events from
     prediction markets (Polymarket): Fed decisions, recession, elections,
@@ -28,4 +31,6 @@ def get_prediction_markets(
     Returns:
         str: A formatted markdown report of matching prediction markets
     """
-    return route_to_vendor("get_prediction_markets", topic, limit)
+    result = route_to_vendor("get_prediction_markets", topic, limit)
+    return policy_disabled_tool_result(result, method="get_prediction_markets",
+                                       tool_call_id=runtime.tool_call_id if runtime is not None else None)
