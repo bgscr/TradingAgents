@@ -1,24 +1,7 @@
-# RTK - Rust Token Killer (Codex CLI)
+# Shell output with RTK
 
-Token-optimized CLI proxy for shell commands.
+Use RTK for supported routine commands, for example `rtk git status` or `rtk ruff check <paths>`. This is an output-efficiency preference, not an execution permission or evidence transformation rule.
 
-## Core Rule
-ALWAYS prefix shell commands with `rtk`.
-*If `rtk` is not available/installed in the system, fall back to standard commands.*
+Use `rtk proxy <command> <arguments>` when raw output matters. Use the underlying command directly if RTK is unavailable, cannot represent the invocation, or would affect an exact byte/protocol/exit-status observation. Preserve raw evidence independently of display filtering. Do not install or modify tools merely to satisfy this preference.
 
-**Examples:**
-`rtk git status` | `rtk cargo test` | `rtk npm run build` | `rtk pytest -q` | `rtk pwsh -c "Get-Process"`
-
-## Shell Environment
-* Use `pwsh` instead of `powershell` for PowerShell commands.
-* For complex pipelines, quotes, or subshells where `rtk` parsing fails, use `rtk proxy "<cmd>"`.
-
-## Meta Commands
-* `rtk gain` — Token savings analytics
-* `rtk gain --history` — Recent command savings history
-* `rtk proxy <cmd>` — Run raw command without filtering
-
-## Verification
-* `rtk --version`
-* `rtk gain`
-* `which rtk`
+Use `pwsh` for ordinary Windows shell work. A contract-bound executable/version (including Windows PowerShell 5.1) takes precedence. Keep filesystem operations within one shell using literal, verified paths. A wrapper/setup failure is not an underlying experiment result: establish whether the target launched before deciding whether another invocation is permitted.
