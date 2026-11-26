@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -15,10 +16,17 @@ from pydantic import PrivateAttr
 
 from tradingagents.analysis_budget import (
     active_budget,
+    coerce_deepseek_reasoning_effort,
     httpx_transport_modules,
+    model_regeneration_is_admitted,
     transport_is_admitted,
 )
-from tradingagents.run_telemetry import ModelTransportAttempt, RunTelemetryLedger
+from tradingagents.run_telemetry import (
+    ModelTransportAttempt,
+    ModelTransportSendLimits,
+    RunTelemetryLedger,
+    telemetry_stage_from_callback_metadata,
+)
 
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
@@ -40,11 +48,39 @@ class _ModelTransportCallContext:
     provider_family: str
     model_id: str
     configured_max_retries: int
+    graph_node: str | None = None
 
 
 _ACTIVE_MODEL_TRANSPORT_CALL: ContextVar[_ModelTransportCallContext | None] = (
     ContextVar("active_model_transport_call", default=None)
 )
+
+_KNOWN_GRAPH_NODES = frozenset(('Market Analyst', 'Sentiment Analyst', 'News Analyst',
+    'Fundamentals Analyst', 'Bull Researcher', 'Bear Researcher', 'Research Manager', 'Trader',
+    'Aggressive Analyst', 'Conservative Analyst', 'Neutral Analyst', 'Portfolio Manager'))
+
+
+def _send_limits(context, request):
+    """Snapshot after budget clipping and before send; ignore arbitrary metadata."""
+    def finite(value, *, positive=False):
+        try:
+            return type(value) in {int, float} and math.isfinite(value) and value >= 0 and (not positive or value > 0)
+        except OverflowError:
+            return False
+    raw = request.extensions.get('timeout')
+    timeout = None
+    if (type(raw) is dict and set(raw) == {'connect', 'read', 'write', 'pool'}
+            and all(v is None or finite(v) for v in raw.values())):
+        timeout = dict(raw)
+    remaining = deadline = None
+    admitted = request.extensions.get('tradingagents.admitted_deadline')
+    if type(admitted) is tuple and len(admitted) == 2:
+        remaining = admitted[0] if finite(admitted[0]) else None
+        deadline = admitted[1] if finite(admitted[1], positive=True) else None
+    node = context.graph_node if context.graph_node in _KNOWN_GRAPH_NODES else None
+    return ModelTransportSendLimits(httpx_timeout_seconds=timeout, budget_remaining_seconds=remaining,
+        budget_deadline_epoch=deadline, graph_node=node,
+        stage=telemetry_stage_from_callback_metadata({'langgraph_node': node}) if node else None)
 
 
 def _safe_transport_value(
@@ -115,6 +151,7 @@ def _model_transport_attempt(
     disposition: str,
     response: httpx.Response | None = None,
     exception: Exception | None = None,
+    send_limits: ModelTransportSendLimits | None = None,
 ) -> ModelTransportAttempt:
     response_metadata = request.extensions.get(_RESPONSE_METADATA_EXTENSION)
     http_status: int | None = None
@@ -141,6 +178,8 @@ def _model_transport_attempt(
         )
         exception_family = _transport_exception_family(exception)
     return ModelTransportAttempt(
+        **({"contract_version": "1.2", "controlled_regeneration": True}
+           if model_regeneration_is_admitted() else {}),
         logical_call_id=context.logical_call_id,
         attempt_ordinal=attempt_ordinal,
         configured_max_retries=context.configured_max_retries,
@@ -158,6 +197,7 @@ def _model_transport_attempt(
         exception_family=exception_family,
         http_status=http_status,
         provider_request_id=provider_request_id,
+        send_limits=send_limits,
     )
 
 
@@ -177,6 +217,7 @@ def _record_sync_transport_send(
     if attempt_ordinal is None:
         return original_send(request, *args, **kwargs)
     started_at = time.monotonic()
+    limits = _send_limits(context, request)
     try:
         response = original_send(request, *args, **kwargs)
     except Exception as exc:
@@ -186,6 +227,7 @@ def _record_sync_transport_send(
             attempt_ordinal,
             started_at,
             exc,
+            limits,
         )
         raise
     _settle_transport_response(
@@ -194,6 +236,7 @@ def _record_sync_transport_send(
         attempt_ordinal,
         started_at,
         response,
+        limits,
     )
     return response
 
@@ -213,6 +256,7 @@ async def _record_async_transport_send(
     if attempt_ordinal is None:
         return await original_send(request, *args, **kwargs)
     started_at = time.monotonic()
+    limits = _send_limits(context, request)
     try:
         response = await original_send(request, *args, **kwargs)
     except Exception as exc:
@@ -222,6 +266,7 @@ async def _record_async_transport_send(
             attempt_ordinal,
             started_at,
             exc,
+            limits,
         )
         raise
     _settle_transport_response(
@@ -230,6 +275,7 @@ async def _record_async_transport_send(
         attempt_ordinal,
         started_at,
         response,
+        limits,
     )
     return response
 
@@ -247,6 +293,7 @@ def _settle_transport_failure(
     attempt_ordinal: int,
     started_at: float,
     exc: Exception,
+    limits: ModelTransportSendLimits | None = None,
 ) -> None:
     with suppress(Exception):
         context.ledger.record_model_transport_failure(
@@ -257,6 +304,7 @@ def _settle_transport_failure(
                 elapsed_seconds=time.monotonic() - started_at,
                 disposition="terminal_transport_failure",
                 exception=exc,
+                send_limits=limits,
             )
         )
 
@@ -267,6 +315,7 @@ def _settle_transport_response(
     attempt_ordinal: int,
     started_at: float,
     response: httpx.Response,
+    limits: ModelTransportSendLimits | None = None,
 ) -> None:
     disposition = "status_failure" if response.status_code >= 400 else "success"
     with suppress(Exception):
@@ -278,6 +327,7 @@ def _settle_transport_response(
                 elapsed_seconds=time.monotonic() - started_at,
                 disposition=disposition,
                 response=response,
+                send_limits=limits,
             )
         )
 
@@ -350,6 +400,7 @@ class NormalizedChatOpenAI(ChatOpenAI):
 
     def _activate_model_transport_call(
         self,
+        run_manager=None,
     ) -> tuple[_ModelTransportCallContext, Token] | None:
         try:
             from tradingagents.dataflows.market_snapshot import (
@@ -359,6 +410,10 @@ class NormalizedChatOpenAI(ChatOpenAI):
             ledger = get_active_run_telemetry()
             if ledger is None:
                 return None
+            metadata = getattr(run_manager, 'metadata', None)
+            node = metadata.get('langgraph_node') if type(metadata) is dict else None
+            normalized = node.replace('_', ' ').casefold() if type(node) is str else ''
+            node = next((item for item in _KNOWN_GRAPH_NODES if item.casefold() == normalized), None)
             context = _ModelTransportCallContext(
                 ledger=ledger,
                 logical_call_id=ledger.begin_model_transport_call(),
@@ -373,6 +428,7 @@ class NormalizedChatOpenAI(ChatOpenAI):
                     maximum_chars=200,
                 ),
                 configured_max_retries=self._model_transport_configured_max_retries,
+                graph_node=node,
             )
             return context, _ACTIVE_MODEL_TRANSPORT_CALL.set(context)
         except Exception:
@@ -389,17 +445,17 @@ class NormalizedChatOpenAI(ChatOpenAI):
             context.ledger.finish_model_transport_call(context.logical_call_id)
         _ACTIVE_MODEL_TRANSPORT_CALL.reset(token)
 
-    def _generate(self, *args: Any, **kwargs: Any):
-        activation = self._activate_model_transport_call()
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs: Any):
+        activation = self._activate_model_transport_call(run_manager)
         try:
-            return super()._generate(*args, **kwargs)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         finally:
             self._deactivate_model_transport_call(activation)
 
-    async def _agenerate(self, *args: Any, **kwargs: Any):
-        activation = self._activate_model_transport_call()
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs: Any):
+        activation = self._activate_model_transport_call(run_manager)
         try:
-            return await super()._agenerate(*args, **kwargs)
+            return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
         finally:
             self._deactivate_model_transport_call(activation)
 
@@ -503,6 +559,27 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if self.reasoning_effort is not None:
+            effort = coerce_deepseek_reasoning_effort(self.reasoning_effort)
+            extra = payload.get("extra_body") or {}
+            expected_thinking = {"type": "disabled" if effort == "none" else "enabled"}
+            # DeepSeek gives an explicit thinking.type precedence over effort.
+            # A per-call/extra-body override must not change the bound policy.
+            if (payload.get("reasoning_effort") != effort or "reasoning_effort" in extra
+                    or any(body.get("thinking", expected_thinking) != expected_thinking
+                           for body in (payload, extra))):
+                raise ValueError("DeepSeek reasoning policy cannot be overridden")
+        if self.max_tokens is not None:
+            from tradingagents.analysis_budget import coerce_output_token_limit
+
+            limit = coerce_output_token_limit(self.max_tokens)
+            # LangChain emits OpenAI's new name; DeepSeek documents max_tokens.
+            value = payload.pop("max_completion_tokens", payload.get("max_tokens"))
+            extra = payload.get("extra_body") or {}
+            if (type(value) is not int or not 1 <= value <= limit
+                    or any(key in extra for key in ("max_tokens", "max_completion_tokens"))):
+                raise ValueError("DeepSeek output limit cannot be overridden")
+            payload["max_tokens"] = value
         outgoing = payload.get("messages", [])
         for message_dict, message in zip(outgoing, _input_to_messages(input_), strict=False):
             if not isinstance(message, AIMessage):
@@ -565,7 +642,7 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
 
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
-    "timeout", "max_retries", "reasoning_effort", "temperature",
+    "timeout", "max_retries", "reasoning_effort", "temperature", "max_tokens",
     "api_key", "callbacks", "http_client", "http_async_client",
 )
 
@@ -726,8 +803,17 @@ class OpenAIClient(BaseLLMClient):
         for key in _PASSTHROUGH_KWARGS:
             if key not in self.kwargs:
                 continue
-            if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
-                continue
+            if key == "reasoning_effort":
+                if self.provider == "deepseek" and self.model in {"deepseek-flash", "deepseek-v4-pro"}:
+                    try:
+                        coerce_deepseek_reasoning_effort(self.kwargs[key])
+                    except ValueError as exc:
+                        label = "Flash" if self.model == "deepseek-flash" else "V4 Pro"
+                        raise ValueError(f"Invalid DeepSeek {label} reasoning_effort") from exc
+                elif self.provider == "deepseek" and self.kwargs[key] is not None:
+                    raise ValueError("Explicit DeepSeek reasoning_effort requires Flash or V4 Pro")
+                elif not _supports_reasoning_effort(self.model):
+                    continue
             llm_kwargs[key] = self.kwargs[key]
 
         # The subclass (provider quirks) comes from the registry spec.

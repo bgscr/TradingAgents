@@ -1,7 +1,8 @@
 from typing import Annotated
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId, tool
 
+from tradingagents.agents.utils.market_data_validation_tools import market_projection_envelope
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.market_snapshot import build_authoritative_indicator_window
 from tradingagents.dataflows.symbol_utils import resolve_china_a_symbol
@@ -46,3 +47,23 @@ def get_indicators(
         except ValueError as e:
             results.append(str(e))
     return "\n\n".join(results)
+
+
+@tool("get_indicators", response_format="content_and_artifact")
+def get_indicators_with_evidence(
+    symbol: str, indicator: str, curr_date: str,
+    tool_call_id: Annotated[str, InjectedToolCallId()], look_back_days: int = 30,
+) -> tuple[str, dict[str, object]]:
+    """Return comma-separated indicator projections with run-owned provenance."""
+    from tradingagents.dataflows.akshare_data import INDICATOR_DESCRIPTIONS
+
+    requested = [item.strip().lower() for item in indicator.split(",") if item.strip()]
+    # The legacy string API includes user input in unsupported-indicator errors.
+    # Never mistake copied provenance markers in an error for a projection.
+    complete = bool(requested) and all(item in INDICATOR_DESCRIPTIONS for item in requested)
+    content = get_indicators.func(symbol, indicator, curr_date, look_back_days)
+    return content, market_projection_envelope(
+        content, symbol=symbol, curr_date=curr_date, tool_name="get_indicators",
+        tool_call_id=tool_call_id, capability="get_indicators",
+        segment_count=len(requested) if complete else 0,
+    )

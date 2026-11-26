@@ -169,7 +169,7 @@ def test_get_news_filters_to_requested_window(monkeypatch):
         "\u6587\u7ae0\u6765\u6e90": ["source a", "source b"],
         "\u65b0\u95fb\u94fe\u63a5": ["https://example.test/1", "https://example.test/2"],
     })
-    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+    monkeypatch.setattr(akshare_data, "_stock_news_em", lambda *args, **kwargs: news)
 
     out = akshare_data.get_news("601138.SH", "2026-06-20", "2026-06-29")
 
@@ -189,7 +189,7 @@ def test_get_news_excludes_next_day_midnight(monkeypatch):
         "\u6587\u7ae0\u6765\u6e90": ["source a", "source b"],
         "\u65b0\u95fb\u94fe\u63a5": ["https://example.test/1", "https://example.test/2"],
     })
-    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+    monkeypatch.setattr(akshare_data, "_stock_news_em", lambda *args, **kwargs: news)
 
     out = akshare_data.get_news("601138.SH", "2026-06-20", "2026-06-29")
 
@@ -206,7 +206,7 @@ def test_get_news_exposes_structured_monetary_facts_before_llm_consumption(monke
         "文章来源": ["source a"],
         "新闻链接": ["https://example.test/monetary"],
     })
-    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+    monkeypatch.setattr(akshare_data, "_stock_news_em", lambda *args, **kwargs: news)
 
     out = akshare_data.get_news("000725.SZ", "2026-06-20", "2026-06-29")
 
@@ -225,7 +225,7 @@ def test_get_news_extracts_monetary_fact_from_headline(monkeypatch):
         "文章来源": ["source a"],
         "新闻链接": ["https://example.test/headline"],
     })
-    monkeypatch.setattr(akshare_data.ak, "stock_news_em", lambda symbol: news)
+    monkeypatch.setattr(akshare_data, "_stock_news_em", lambda *args, **kwargs: news)
 
     out = akshare_data.get_news("000725.SZ", "2026-06-20", "2026-06-29")
 

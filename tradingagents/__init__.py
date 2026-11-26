@@ -1,4 +1,5 @@
 import contextlib
+import os
 import warnings
 
 # Load .env files at package import so DEFAULT_CONFIG's env-var overlay
@@ -11,8 +12,9 @@ import warnings
 try:
     from dotenv import find_dotenv, load_dotenv
 
-    load_dotenv(find_dotenv(usecwd=True))
-    load_dotenv(find_dotenv(".env.enterprise", usecwd=True), override=False)
+    if os.environ.get('PYTHON_DOTENV_DISABLED', '').lower() not in {'1', 'true', 't', 'yes', 'y'}:
+        load_dotenv(find_dotenv(usecwd=True))
+        load_dotenv(find_dotenv(".env.enterprise", usecwd=True), override=False)
 except ImportError:
     pass
 

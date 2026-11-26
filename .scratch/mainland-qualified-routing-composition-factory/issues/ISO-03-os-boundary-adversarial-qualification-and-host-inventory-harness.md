@@ -63,7 +63,7 @@ baseline and does not itself authorize ISO-04.
   ISO-02 runtime-bundle identities with networking disabled and only the one
   bounded writable result-export mapping.
 - The canonical protected set includes the full
-  `C:\Users\56922\.tradingagents` tree; provider/coordinator ledger and SQLite
+  `%USERPROFILE%\.tradingagents` tree; provider/coordinator ledger and SQLite
   sidecars; production Market Session Calendar state and payloads; production
   checkpoints; production reports/logs; historical Ticket 07 evidence; all
   prior baselines/inventories/incidents; `isolated-python-write-probe`; and

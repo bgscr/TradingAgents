@@ -293,6 +293,8 @@ class FinancialDispatchToolNode:
                     "financial tool node Capability Routing Plan is immutable"
                 )
         self._config = dict(config) if config is not None else None
+        from tradingagents.powershell_fundflow import configured_owner
+        self._fundflow_owner = configured_owner(self._config or {})
         self._vendor_methods = vendor_methods
         self._retry_policy = retry_policy
         self._clock = clock
@@ -353,6 +355,25 @@ class FinancialDispatchToolNode:
             )
             for tool_call in tool_calls
         ]
+        # Research observations are written only by the authoritative dispatcher.
+        # A normal tool turn has no research registration or storage effects.
+        from tradingagents.full_session_ledger import owner as full_owner
+        from tradingagents.portfolio_research_run import MODE, current_research_run
+
+        research = current_research_run()
+        current = full_owner()
+        previous = state.get("financial_dispatch_ledger")
+        if research is not None or (current is not None and current.params.get("decision_mode") == MODE):
+            if (research is None or current is None or current.key != research.run_id
+                    or current.child_role is not None or current.params.get("decision_mode") != MODE
+                    or state.get("company_of_interest") != research.symbol
+                    or evidence.instrument_identity.symbol != research.symbol
+                    or state.get("trade_date") != research.as_of
+                    or any(request.as_of_date.isoformat() != research.as_of for request in requests)):
+                raise ValueError("financial_research_owner_selection_mismatch")
+            from tradingagents.portfolio_research_inputs.storage import check_previous
+
+            check_previous("financial", previous, symbol=research.symbol, day=research.as_of)
         qualified_routing: QualifiedFinancialRoutingComposition | None = None
         shadow_dispatcher = None
         shadow_checkpoint_dispatcher = None
@@ -595,6 +616,10 @@ class FinancialDispatchToolNode:
             "evidence_state": evidence.model_dump(mode="json"),
             "financial_dispatch_ledger": dispatcher.checkpoint_ledger(),
         }
+        if self._fundflow_owner is not None:
+            observation = self._fundflow_owner.summary()['observation']
+            if observation is not None:
+                result['eastmoney_fundflow_observation'] = observation
         if shadow_checkpoint_dispatcher is not None:
             try:
                 shadow_ledger = shadow_checkpoint_dispatcher.checkpoint_ledger()
@@ -637,6 +662,11 @@ class FinancialDispatchToolNode:
                     failures=tuple(shadow_failures),
                 ).model_dump(mode="json")
             )
+        if research is not None:
+            from tradingagents.portfolio_research_inputs.storage import seal
+
+            seal("financial", result["financial_dispatch_ledger"],
+                 symbol=research.symbol, day=research.as_of, previous=previous)
         return result
 
     @staticmethod
@@ -939,6 +969,7 @@ class FinancialDispatchToolNode:
         )
         dispatcher = FinancialToolDispatcher.from_configured_vendors(
             instrument_identity=identity,
+            powershell_fundflow_owner=self._fundflow_owner,
             run_asset_configuration=asset_configuration,
             config=effective_config,
             vendor_methods=self._vendor_methods,

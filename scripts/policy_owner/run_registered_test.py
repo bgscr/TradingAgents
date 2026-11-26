@@ -22,17 +22,21 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[2]
 OWNER = Path(r"C:\ProgramData\TA-PolicyOwner-test-20260915-002")
-DEPENDENCIES = Path(r"D:\prj\TradingAgents\TradingAgents\.venv\Lib\site-packages")
+DEPENDENCIES = SOURCE / ".venv" / "Lib" / "site-packages"
 EVIDENCE = Path(r"D:\TA-PolicyOperationalIntegration-Evidence-20260914-001")
 INSTANCE = "test-20260915-002"
 EXPECTED = {
     "instance": INSTANCE,
-    "storage_binding_identity": "policy-owner-storage-binding:v1:sha256:9cd6bbf08c31ff81838d14cd4d3b8861ba1afce3b3780380e0c6a7c62354b123",
-    "ledger_identity": "policy-owner-durable-ledger-registration:v1:sha256:1205fd980d3f78a788e91e3ecf48a3c61c55e37fd501491630b5ff3bf59361e3",
     "native_sha256": "9abb15bf5b29d12d039715e9297643e03c9a14fbdf27d3ed979ef7bb923f6e91",
     "worker_manifest_sha256": "c8a22299fab71c598eaf66a42e9e0fc5ba2f2a66f8b455689101fde858b9f292",
 }
-AUTHENTICATION_ID = "policy-owner-authenticated-human-record:v1:sha256:c392b23758af2521fa951153ef9f0d39307a2d07943753e35c4747069f4f27da"
+LEGACY_BINDING_PINS = {
+    "storage_binding_identity": "c36bab701aa2e39ecf264ebc7c72ad455066012ecbdb8ef03f307570fcff2252",
+    "ledger_identity": "73734072f41dbcea3adb04a26823b07c378bfc8126fac814354ef32eedd53164"
+}
+LEGACY_ENROLLMENT_PIN = "45d307857ade311f6cc98e01535df8bf44e6f5ca1153995103fe739488081993"
+LEGACY_OPERATOR_PIN = "2036896f8d26e842aa432990cd3436e67576801a6e60d2d12e28fe00a187f2e0"
+AUTHENTICATION_ID = None
 CONSUMER_SHA256 = "87785d37701d16aa6a409cc9ebbba6367fa8ca5d25fb6dccc7b317503e4efc3d"
 POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 CLIENT_PYTHON = Path(r"D:\Program Files\Python313\python.exe")
@@ -408,7 +412,26 @@ def client_native_images(dependencies=None, reviewed_client_images=()):
     }
 
 
-def write_human_action(root):
+def matches_text_pin(value, expected):
+    return isinstance(value, str) and sha256(value.encode("utf-8")).hexdigest() == expected
+
+
+def verified_legacy_bindings(anchor):
+    if not all(matches_text_pin(anchor.get(key), digest) for key, digest in LEGACY_BINDING_PINS.items()):
+        raise ValueError("legacy owner binding differs from the reviewed successor")
+    return {key: anchor[key] for key in LEGACY_BINDING_PINS}
+
+
+def checked_operator_sid(operator_sid):
+    if DEPLOYMENT_PATH is None:
+        if not matches_text_pin(operator_sid, LEGACY_OPERATOR_PIN):
+            raise ValueError("unexpected legacy issuing operator")
+    elif operator_sid != EXPECTED["operator_sid"]:
+        raise ValueError("unexpected issuing operator")
+    return operator_sid
+
+
+def write_human_action(root, *, operator_sid):
     """Create a byte-pinned, one-shot bootstrap; generating it executes nothing."""
 
     def literal(value):
@@ -483,7 +506,7 @@ finally {for ($index=$pins.Count-1;$index -ge 0;$index--) {$pins[$index].Dispose
             "$outputRoot=" + literal(root),
             "$expectedInstance=" + literal(INSTANCE),
             "$operatorSid="
-            + literal(EXPECTED.get("operator_sid", "S-1-5-21-3778926318-16405171-1220131840-1001")),
+            + literal(checked_operator_sid(operator_sid)),
             "$deploymentPath=" + (literal(DEPLOYMENT_PATH) if DEPLOYMENT_PATH else "$null"),
             "$deploymentSha256=" + (literal(DEPLOYMENT_SHA256) if DEPLOYMENT_PATH else "$null"),
         )
@@ -789,6 +812,8 @@ def anchor_and_enrollment(client):
         winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
     ) as key:
         anchor = strict_json(winreg.QueryValueEx(key, "AnchorJson")[0])
+    if DEPLOYMENT_PATH is None:
+        EXPECTED.update(verified_legacy_bindings(anchor))
     if (
         any(anchor.get(key) != value for key, value in EXPECTED.items())
         or anchor["operational"] is not False
@@ -844,6 +869,7 @@ def anchor_and_enrollment(client):
     record = strict_json(records[0].read_bytes())
     if (
         (AUTHENTICATION_ID is not None and record["identity"] != AUTHENTICATION_ID)
+        or (DEPLOYMENT_PATH is None and not matches_text_pin(record.get("identity"), LEGACY_ENROLLMENT_PIN))
         or record["purpose"] != "ENROLL_PROJECT_ROLE"
         or record["document"] != role.model_dump(mode="json")
         or record["instance"] != INSTANCE
@@ -1063,7 +1089,7 @@ def prepare_or_run(args):
                 "last_action_sequence": client.sequence,
             }
             write_new(root / "TEST-package.json", canonical(package))
-            action = write_human_action(root)
+            action = write_human_action(root, operator_sid=role.operator_sid)
             return {
                 "status": "PREPARED_UNEXECUTED",
                 "output": str(root),

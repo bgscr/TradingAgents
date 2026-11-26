@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from functools import lru_cache, partial
-from types import FunctionType
+from functools import lru_cache
 from typing import cast
 
 import akshare as ak
@@ -400,41 +400,116 @@ def _safe_frame(
     return data, None
 
 
-class _NewsPandas:
-    """Keep the SDK news frame on Python strings without changing pandas options."""
+def _stock_news_em(symbol: str, start_date: str, end_date: str, *, instrument_aliases=()) -> pd.DataFrame:
+    """One existing endpoint request, followed by a non-executable local decoder."""
+    import json
 
-    DataFrame = staticmethod(partial(pd.DataFrame, dtype=object))
+    from tradingagents.evidence import AcquisitionUnavailableReason
 
-    def __getattr__(self, name):
-        return getattr(pd, name)
+    from .acquisition import AcquisitionFailure
+    from .eastmoney_news import NewsResponseError, parse_transport_news_page
 
+    # Internal callers supply the resolver's bare ASCII code. Validate before
+    # constructing any query/header, including when called directly by diagnostics.
+    if not isinstance(symbol, str) or re.fullmatch(r"[0-9]{6}", symbol) is None:
+        raise NewsResponseError("request_invalid")
+    callback = "jQuery35101792940631092459_1764599530165"
+    parameters = {
+        "uid": "", "keyword": symbol, "type": ["cmsArticleWebOld"],
+        "client": "web", "clientType": "web", "clientVersion": "curr",
+        "param": {"cmsArticleWebOld": {
+            "searchScope": "default", "sort": "default", "pageIndex": 1,
+            "pageSize": 10, "preTag": "<em>", "postTag": "</em>",
+        }},
+    }
+    # Keep the public query shape. No SDK Cookie or new auth source.
+    # Requests/urllib3 decode gzip and deflate without optional codec packages;
+    # do not advertise the SDK's br/zstd support on this Requests transport.
+    headers = {
+        "accept": "*/*", "accept-encoding": "gzip, deflate",
+        "accept-language": "en,zh-CN;q=0.9,zh;q=0.8", "cache-control": "no-cache",
+        "connection": "keep-alive", "host": "search-api-web.eastmoney.com",
+        "pragma": "no-cache", "referer": f"https://so.eastmoney.com/news/s?keyword={symbol}",
+        "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+        "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-site",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    }
+    from tradingagents.run_diagnostics import DiagnosticPersistenceError, record_news_exception
 
-def _stock_news_em(symbol: str) -> pd.DataFrame:
-    implementation = ak.stock_news_em
-    if (
-        not isinstance(implementation, FunctionType)
-        or not implementation.__module__.startswith("akshare.")
-        or implementation.__globals__.get("pd") is not pd
-    ):
-        return implementation(symbol=symbol)
-    # AKShare's news cleanup uses a Unicode regex escape unsupported by Arrow.
-    # Bind only this invocation's DataFrame constructor. Shared module globals
-    # and pandas settings are never patched while network I/O is pending.
-    local_globals = {**implementation.__globals__, "pd": _NewsPandas()}
-    from tradingagents.analysis_budget import active_budget
-
-    if (active_budget() is not None
-            and getattr(local_globals.get("requests"), "__name__", None) == "curl_cffi.requests"):
-        # This SDK endpoint uses only the Requests-compatible get/text API.
-        # Keep its request and parser, but use the admitted standard transport
-        # for this budgeted invocation. Native curl remains fail-closed elsewhere.
-        local_globals["requests"] = requests
-    local_call = FunctionType(
-        implementation.__code__, local_globals, implementation.__name__,
-        implementation.__defaults__, implementation.__closure__,
-    )
-    local_call.__kwdefaults__ = implementation.__kwdefaults__
-    return local_call(symbol=symbol)
+    try:
+        response = requests.get(
+            "https://search-api-web.eastmoney.com/search/jsonp",
+            params={"cb": callback, "param": json.dumps(parameters, ensure_ascii=False), "_": "1764599530176"},
+            headers=headers, allow_redirects=False, timeout=15,
+        )
+    except DiagnosticPersistenceError:
+        # A supplied diagnostic transport can reject local retention after HTTP.
+        # Its terminal write failure is not a network/remote HTTP failure.
+        raise
+    except BaseException as error:
+        record_news_exception(error, stage="http_request")
+        raise
+    diagnostic_stage = "http_status"
+    diagnostic_failure = None
+    primary_failure = None
+    try:
+        if response.status_code != 200:
+            raise AcquisitionFailure(reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+                                     status_code=response.status_code, error_code="news_http_status")
+        diagnostic_stage = "response_parse"
+        try:
+            page = parse_transport_news_page(
+                response.content, expected_callback=callback, ticker=symbol,
+                start_date=start_date, end_date=end_date, instrument_aliases=tuple(instrument_aliases),
+            )
+        except NewsResponseError as error:
+            reason = (AcquisitionUnavailableReason.NO_DATA if error.reason == "no_usable_articles"
+                      else AcquisitionUnavailableReason.PROVIDER_ERROR if error.reason in {
+                          "business_failure", "business_status_unverified",
+                      } else AcquisitionUnavailableReason.MALFORMED_RESPONSE)
+            raise AcquisitionFailure(reason=reason, error_code="news_" + error.reason) from None
+    except BaseException as error:
+        primary_failure = error
+        if isinstance(error, DiagnosticPersistenceError):
+            # The parser may fail to retain a diagnostic before this handler.
+            # A successful exception record cannot make that failure recoverable.
+            diagnostic_failure = error
+        try:
+            record_news_exception(error, stage=diagnostic_stage, status=response.status_code)
+        except DiagnosticPersistenceError as failure:
+            diagnostic_failure = failure
+            raise
+        raise
+    finally:
+        try:
+            response.close()
+        except BaseException as error:
+            if isinstance(error, DiagnosticPersistenceError) and diagnostic_failure is None:
+                diagnostic_failure = error
+            try:
+                record_news_exception(error, stage="response_close", role="cleanup", status=response.status_code)
+            except DiagnosticPersistenceError as failure:
+                if diagnostic_failure is None:
+                    diagnostic_failure = failure
+            finally:
+                if diagnostic_failure is not None:
+                    # Local retention is terminal even when cleanup also fails.
+                    # Never turn it into a retryable provider/ordinary exception.
+                    raise diagnostic_failure from None
+                if primary_failure is not None:
+                    # Cleanup must not replace the original status/parser failure
+                    # or supply its own retryability to the acquisition controller.
+                    raise primary_failure from None
+            raise
+    frame = pd.DataFrame(page.rows, dtype=object).rename(columns={
+        "date": "发布时间", "mediaName": "文章来源", "title": "新闻标题",
+        "content": "新闻内容", "url": "新闻链接",
+    })
+    frame.attrs["news_coverage"] = page.coverage_status
+    frame.attrs["business_status"] = page.business_status
+    frame.attrs["excluded_counts"] = page.excluded_counts
+    return frame
 
 
 def _news_in_window(raw: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -446,9 +521,23 @@ def _news_in_window(raw: pd.DataFrame, start_date: str, end_date: str) -> pd.Dat
     return frame[(frame["发布时间"] >= start) & (frame["发布时间"] < end)]
 
 
-def get_news(ticker: str, start_date: str, end_date: str) -> str:
+def get_news(ticker: str, start_date: str, end_date: str, *, instrument_identity=None) -> str:
+    from .eastmoney_news import NewsResponseError
+
+    # Keep existing space/case/suffix/broker-plus normalization, but reject
+    # controls and URL syntax before the resolver can strip surrounding text.
+    if not isinstance(ticker, str) or re.fullmatch(
+        r" *[0-9]{6}(?:\.(?:SS|SH|SZ))?\+* *", ticker, flags=re.ASCII | re.IGNORECASE,
+    ) is None:
+        raise NewsResponseError("request_invalid")
     instrument = _require_china_a(ticker)
-    raw = _stock_news_em(symbol=instrument.akshare_code)
+    aliases = ()
+    if instrument_identity is not None:
+        if _require_china_a(instrument_identity.symbol).yahoo_symbol != instrument.yahoo_symbol:
+            raise ValueError("news_identity_mismatch")
+        if instrument_identity.display_name:
+            aliases = (instrument_identity.display_name,)
+    raw = _stock_news_em(instrument.akshare_code, start_date, end_date, instrument_aliases=aliases)
     if raw is None or raw.empty:
         raise NoMarketDataError(
             ticker, instrument.yahoo_symbol, "AKShare returned no news rows"
@@ -465,9 +554,16 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     lines = [
         f"## {instrument.yahoo_symbol} News, from {start_date} to {end_date}:",
         "",
-        "Source: AKShare stock_news_em",
+        "Source: AKShare stock_news_em (validated local JSONP adapter)",
+        "DATA_GAP: news_window_coverage_unknown; one response page is not full historical coverage.",
+        "Business status: " + raw.attrs.get("business_status", "unverified"),
         "",
     ]
+    from tradingagents.analysis_budget import active_budget
+
+    budget = active_budget()
+    if budget is not None:
+        budget.record_data_gap("get_news.coverage", "news_window_coverage_unknown", provider="akshare")
     monetary_facts = []
     for _, row in frame.iterrows():
         title = row.get("新闻标题", "No title")
@@ -558,29 +654,23 @@ def _financial_abstract_section(
     return _financial_abstract_section_from_frame(data)
 
 
-def _fund_flow_section(
-    code: str,
-    exchange: str,
-    *,
-    physical_request: Callable[[str, Callable[[], object]], object] | None = None,
-) -> tuple[list[str], list[str]]:
-    market = "sh" if exchange == "shanghai" else "sz"
-    data, error = _safe_frame(
-        "stock_individual_fund_flow",
-        lambda: ak.stock_individual_fund_flow(stock=code, market=market),
-        physical_request=physical_request,
-    )
-    if error:
-        return [], [error]
-    keep = [
-        col
-        for col in ("日期", "收盘价", "涨跌幅", "主力净流入-净额", "主力净流入-净占比")
-        if col in data.columns
-    ]
-    if not keep:
-        return [], ["DATA_DEGRADED: AKShare stock_individual_fund_flow returned no expected columns."]
-    lines = ["## Recent Fund Flow", data[keep].tail(10).to_csv(index=False)]
-    return lines, []
+def _optional_fundamentals_policy():
+    """Use the captured run policy before any optional descriptive request."""
+    from tradingagents.analysis_budget import AnalysisBudgetStopped, active_budget
+
+    from .config import get_config
+
+    skip_optional = get_config().get("analysis_skip_optional_fundamentals", False)
+    if type(skip_optional) is not bool:
+        raise ValueError("analysis_skip_optional_fundamentals must be boolean")
+    budget = active_budget()
+    if skip_optional and budget is None:
+        raise AnalysisBudgetStopped("optional_sources_require_budget")
+    if budget is not None:
+        budget.check()
+        if skip_optional != budget.skip_optional_fundamentals:
+            budget.stop("source_policy_changed")
+    return skip_optional, budget
 
 
 def get_fundamentals(
@@ -591,6 +681,14 @@ def get_fundamentals(
     _physical_request: Callable[[str, Callable[[], object]], object] | None = None,
 ) -> str:
     instrument = _require_china_a(ticker)
+    skip_optional, budget = _optional_fundamentals_policy()
+    if skip_optional:
+        for section, reason in (
+            ("business", "optional_business_omitted"),
+            ("financial_summary", "optional_financial_summary_omitted"),
+        ):
+            budget.record_data_gap("get_fundamentals." + section, reason, provider="akshare")
+        raise NoMarketDataError(ticker, instrument.yahoo_symbol, "descriptive fundamentals disabled")
     sections = [
         f"# Company Fundamentals for {instrument.yahoo_symbol}",
         "# Primary source: AKShare",
@@ -613,14 +711,6 @@ def get_fundamentals(
             f"AKShare stock_financial_abstract:{instrument.akshare_code}:{curr_date or 'unknown'}",
             lambda: _financial_abstract_section(
                 instrument.akshare_code,
-                physical_request=_physical_request,
-            ),
-        ),
-        (
-            f"AKShare stock_individual_fund_flow:{instrument.akshare_code}:{curr_date or 'unknown'}",
-            lambda: _fund_flow_section(
-                instrument.akshare_code,
-                instrument.exchange,
                 physical_request=_physical_request,
             ),
         ),
@@ -683,6 +773,10 @@ def get_china_a_identity(ticker: str) -> dict[str, str]:
         return {}
 
     identity = {"exchange": instrument.exchange}
+    skip_optional, budget = _optional_fundamentals_policy()
+    if skip_optional:
+        budget.record_data_gap("get_fundamentals.business", "optional_business_omitted", provider="akshare")
+        return identity
     data, error = _safe_frame("stock_zyjs_ths", lambda: ak.stock_zyjs_ths(symbol=instrument.akshare_code))
     if error or data is None:
         return identity

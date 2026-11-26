@@ -78,6 +78,12 @@ class AgentState(MessagesState):
         ]
     ]
     instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
+    moneyflow_observation: NotRequired[Annotated[
+        dict[str, Any], "Normalized, optional moneyflow observation; outside decision evidence"
+    ]]
+    margin_balance_observation: NotRequired[Annotated[
+        dict[str, Any], "Optional one-day financing balance; outside decision evidence"
+    ]]
     evidence_state: Annotated[dict[str, Any], "Validated shared evidence for gates"]
     evidence_preflight: Annotated[
         dict[str, Any], "Deterministic baseline-evidence preflight result"
@@ -118,11 +124,27 @@ class AgentState(MessagesState):
         dict[str, Any] | None, "Published structured trading decision when permitted"
     ]
     trade_date: Annotated[str, "What date we are trading at"]
+    research_advisory_direction: NotRequired[Annotated[
+        dict[str, Any] | None, "Optional structured advisory display binding, not decision evidence"
+    ]]
+    trader_advisory_direction: NotRequired[Annotated[
+        dict[str, Any] | None, "Optional structured advisory display binding, not decision evidence"
+    ]]
+    moneyflow_observation: NotRequired[Annotated[
+        dict[str, Any], "Normalized, optional moneyflow observation; outside decision evidence"
+    ]]
+    margin_balance_observation: NotRequired[Annotated[
+        dict[str, Any], "Optional one-day financing balance; outside decision evidence"
+    ]]
+    eastmoney_fundflow_observation: NotRequired[Annotated[
+        dict[str, Any], "Eastmoney percentage-only auxiliary flow; not statement or decision facts"
+    ]]
     run_id: Annotated[str, "Stable identity for this resumable analysis run"]
     admitted_evidence_binding: Annotated[
         dict[str, Any] | None,
         "Checkpoint-safe binding for evidence accepted at Evidence Admission",
     ]
+    portfolio_research_terminal: NotRequired[str]
     financial_dispatch_ledger: NotRequired[
         Annotated[
             dict[str, Any],

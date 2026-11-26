@@ -393,7 +393,9 @@ def synthetic_deployment(tmp_path, monkeypatch):
     return path, value
 
 
-def test_successor_deployment_binds_setup_without_transferring_authentication(synthetic_deployment):
+def test_successor_deployment_binds_setup_without_transferring_authentication(synthetic_deployment, monkeypatch):
+    # A verified predecessor may have an enrollment in memory before the handoff.
+    monkeypatch.setattr(driver, "AUTHENTICATION_ID", "SYNTHETIC-PREVIOUS-ENROLLMENT")
     path, value = synthetic_deployment
     old_authentication = driver.AUTHENTICATION_ID
     driver.configure_deployment(path, driver.pin(path)["sha256"], staging_only=True)

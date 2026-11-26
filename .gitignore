@@ -228,3 +228,19 @@ reports/
 
 .codegraph/
 .worktrees/
+
+# Local installation inputs and retained provider responses
+/config/bounded_mainland_release.json
+/config/full_evidence/
+/tests/fixtures/[0-9]*_financial_response_*.json
+/tests/fixtures/[0-9]*_retained_identity_registry.json
+/tests/fixtures/run[0-9][0-9]_market.json
+/tests/fixtures/run[0-9][0-9]_retained.json
+
+# Superseded target-specific maintenance utility kept with its local history
+/scripts/prepare_ordinary_full_transition.py
+/tests/test_ordinary_full_transition.py
+
+# Exact historical qualification inputs remain local.
+/tests/fixtures/policy_owner_admission_v2/role-proposal.json
+/.scratch/mainland-qualified-routing-composition-factory/temporal-fresh-acquisition-policy-research-20260825.md

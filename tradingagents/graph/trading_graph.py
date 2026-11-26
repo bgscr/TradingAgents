@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from hashlib import sha256
@@ -18,16 +18,23 @@ from langgraph.prebuilt import ToolNode
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_global_news,
-    get_indicators,
     get_insider_transactions,
     get_macro_indicators,
     get_news,
     get_prediction_markets,
-    get_stock_data,
-    get_verified_market_snapshot,
     resolve_instrument_identity,
 )
+from tradingagents.agents.utils.core_stock_tools import (
+    get_stock_data_with_evidence as get_stock_data,
+)
+from tradingagents.agents.utils.market_data_validation_tools import (
+    get_verified_market_snapshot_with_evidence as get_verified_market_snapshot,
+)
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.technical_indicators_tools import (
+    get_indicators_with_evidence as get_indicators,
+)
+from tradingagents.analysis_budget import checkpoint_storage_directory
 from tradingagents.asset_configuration import (
     RunAssetConfiguration,
     RunAssetConfigurationError,
@@ -76,7 +83,7 @@ from tradingagents.decision_policy import (
     is_canonical_run_id,
     stable_evidence_semantic_digest,
 )
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.default_config import DEFAULT_CONFIG, require_runtime_profile_loading
 from tradingagents.evidence import (
     EvidenceState,
     InstrumentKind,
@@ -209,6 +216,7 @@ class TradingAgentsGraph:
             instrument_symbol: Programmatic resolution boundary used to resolve the
                 run asset before clients, workflow, or checkpoint state are built.
         """
+        require_runtime_profile_loading()
         resolved_config = config or DEFAULT_CONFIG
         from tradingagents.analysis_budget import validate_budget_config
 
@@ -657,6 +665,13 @@ class TradingAgentsGraph:
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
 
+        elif provider == "deepseek":
+            from tradingagents.analysis_budget import coerce_deepseek_reasoning_effort
+
+            effort = coerce_deepseek_reasoning_effort(self.config.get("deepseek_reasoning_effort"))
+            if effort is not None:
+                kwargs["reasoning_effort"] = effort
+
         elif provider == "anthropic":
             effort = self.config.get("anthropic_effort")
             if effort:
@@ -674,6 +689,14 @@ class TradingAgentsGraph:
         max_retries = self.config.get("llm_max_retries")
         if max_retries is not None and max_retries != "":
             kwargs["max_retries"] = _coerce_max_retries(max_retries)
+
+        output_limit = self.config.get("llm_max_output_tokens")
+        if output_limit is not None:
+            from tradingagents.analysis_budget import coerce_output_token_limit
+
+            if provider != "deepseek":
+                raise ValueError("llm_max_output_tokens currently requires DeepSeek")
+            kwargs["max_tokens"] = coerce_output_token_limit(output_limit)
 
         return kwargs
 
@@ -738,7 +761,12 @@ class TradingAgentsGraph:
                     # News and insider information
                     get_news,
                     get_global_news,
-                    get_insider_transactions,
+                    *(
+                        [] if (
+                            getattr(self, "asset_configuration", None) is not None
+                            and self.asset_configuration.instrument_identity.venue in {"XSHG", "XSHE"}
+                        ) else [get_insider_transactions]
+                    ),
                     get_macro_indicators,
                     get_prediction_markets,
                 ]
@@ -1269,13 +1297,19 @@ class TradingAgentsGraph:
                 as_of_date=trade_date, financial_config=self.config, budget_config=self.config,
                 instrument_identity=getattr(getattr(self, "asset_configuration", None), "instrument_identity", None),
             )
-        return acquire_run_evidence(
+        evidence = acquire_run_evidence(
             ticker,
             trade_date,
             decision_policy=self.decision_policy,
             decision_horizon=getattr(self, "decision_horizon", None),
             asset_configuration=getattr(self, "asset_configuration", None),
         )
+
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_inputs.storage import seal
+            seal("market", evidence.model_dump(mode="json"), symbol=ticker, day=trade_date)
+        return evidence
 
     def create_initial_state(
         self,
@@ -1319,6 +1353,10 @@ class TradingAgentsGraph:
                 run_id = f"run:{sha256(run_seed.encode('utf-8')).hexdigest()}"
         if not is_canonical_run_id(run_id):
             raise ValueError("run_id must be a canonical run ID")
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_terminal import bind_graph
+            bind_graph(run_id,company_name,trade_date)
         checkpoint_graph_identity = self._run_signature(asset_type)
         capability_routing_plan = getattr(self, "capability_routing_plan", None)
         if (
@@ -1408,6 +1446,8 @@ class TradingAgentsGraph:
             # Keep policy identity in the routing-neutral identity too: a
             # different policy must not match an existing checkpoint/run.
             signature_fields.append("cninfo_profile=" + binding.profile.profile_identity)
+        # Storage is bound by checkpoint_budget_binding, not the thread ID:
+        # moving a database must expose a policy mismatch, not a fresh budget.
         return "|".join(signature_fields)
 
     @contextmanager
@@ -1419,12 +1459,18 @@ class TradingAgentsGraph:
     ):
         """Compile this run with its compatible checkpoint and yield graph config."""
         self.ticker = company_name
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_checkpoint import research_checkpoint
+            with research_checkpoint(self, company_name, trade_date, asset_type) as (config, signature):
+                yield CheckpointSession(config, False, run_signature=signature)
+            return
         if not self.config.get("checkpoint_enabled"):
             yield CheckpointSession({}, False)
             return
 
         signature = self._run_signature(asset_type)
-        with get_checkpointer(self.config["data_cache_dir"], company_name) as saver:
+        with get_checkpointer(checkpoint_storage_directory(self.config), company_name) as saver:
             self._active_checkpointer = saver
             self.graph = self.workflow.compile(checkpointer=saver)
             try:
@@ -1638,13 +1684,29 @@ class TradingAgentsGraph:
                         company_name,
                         trade_date,
                     )
-                yield CheckpointSession(
-                    graph_config=graph_config,
-                    resume_from_checkpoint=step is not None,
-                    routing_compatibility=routing_compatibility,
-                    run_signature=selected_signature,
-                    checkpoint_state=checkpoint_state,
+                from tradingagents.analysis_budget import AnalysisBudgetStopped, active_budget, checkpoint_budget_binding
+
+                budget = active_budget()
+                if self.config.get("analysis_budget_enabled") and budget is None:
+                    raise RuntimeError("checkpoint requires its active analysis budget")
+                selected_checkpoint = saver.get_tuple(graph_config) if budget is not None else None
+                if selected_checkpoint is not None and type(selected_checkpoint.metadata.get("step")) is not int:
+                    raise AnalysisBudgetStopped("checkpoint_state_invalid")
+                budget_session = (
+                    budget.checkpoint_session(
+                        saver.conn, saver.lock, graph_config["configurable"]["thread_id"],
+                        checkpoint_budget_binding(self.config, selected_signature),
+                        has_checkpoint=selected_checkpoint is not None,
+                    ) if budget is not None else nullcontext()
                 )
+                with budget_session:
+                    yield CheckpointSession(
+                        graph_config=graph_config,
+                        resume_from_checkpoint=step is not None,
+                        routing_compatibility=routing_compatibility,
+                        run_signature=selected_signature,
+                        checkpoint_state=checkpoint_state,
+                    )
             finally:
                 self._active_checkpointer = None
                 self.graph = self.workflow.compile()
@@ -1658,14 +1720,27 @@ class TradingAgentsGraph:
         run_signature: str | None = None,
     ) -> None:
         """Clear the compatible checkpoint after a completed terminal run."""
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_checkpoint import validate_cleanup
+            run_signature = validate_cleanup(self, company_name, trade_date, asset_type, run_signature)
         if not self.config.get("checkpoint_enabled"):
             return
-        clear_checkpoint(
-            self.config["data_cache_dir"],
-            company_name,
-            str(trade_date),
-            run_signature or self._run_signature(asset_type),
-        )
+        def cleanup():
+            clear_checkpoint(
+                checkpoint_storage_directory(self.config),
+                company_name,
+                str(trade_date),
+                run_signature or self._run_signature(asset_type),
+            )
+
+        from tradingagents.analysis_budget import active_budget
+
+        budget = active_budget()
+        if budget is not None:
+            budget.complete_before_cleanup(cleanup)
+        else:
+            cleanup()
 
     def propagate(
         self,
@@ -1730,7 +1805,7 @@ class TradingAgentsGraph:
             self.last_analysis_budget = budget.receipt() if budget is not None else None
             self.close_qualified_routing_runtime()
 
-    def save_reports(self, final_state, ticker, save_path=None) -> Path:
+    def save_reports(self, final_state, ticker, save_path=None, *, supplemental_statement=None) -> Path:
         """Write the markdown report tree for a completed run, like the CLI does.
 
         Programmatic callers get the same on-disk reports the CLI produces. Pass
@@ -1746,6 +1821,7 @@ class TradingAgentsGraph:
         return write_report_tree(
             final_state, ticker, save_path,
             output_language=getattr(self, "config", {}).get("output_language", "English"),
+            supplemental_statement=supplemental_statement,
         )
 
     def _run_graph(
@@ -1762,6 +1838,14 @@ class TradingAgentsGraph:
         checkpoint_run_signature: str | None = None,
     ):
         """Execute the graph and write the resulting state to disk and memory log."""
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_checkpoint import validate_cleanup
+            signature = validate_cleanup(self, company_name, trade_date, asset_type, checkpoint_run_signature)
+            from .checkpointer import thread_id as checkpoint_thread
+            if (resume_from_checkpoint or routing_checkpoint_compatibility is not None or
+                    checkpoint_graph_config != {"configurable":{"thread_id":checkpoint_thread(company_name, str(trade_date), signature)}}):
+                raise ValueError("research_checkpoint_replay_forbidden")
         # Acquire trusted baseline evidence before any optional provider enrichment
         # or model-mediated work.  A missing registry identity must reach Evidence
         # Preflight without first spending Yahoo/AKShare or reflection calls.
@@ -1873,6 +1957,14 @@ class TradingAgentsGraph:
             "evidence_gate_mode",
             "enforce",
         )
+        from tradingagents.portfolio_research_run import active_selection
+        if active_selection() is not None:
+            from tradingagents.portfolio_research_terminal import finish
+            finish(final_state)
+            if telemetry_ledger is not None:
+                final_state["run_telemetry"]=telemetry_ledger.finalize(terminal_route=None).model_dump(mode="json")
+            self.curr_state=final_state
+            return final_state,None
         if telemetry_ledger is not None:
             terminal_route = (
                 "trading_decision"
@@ -1945,8 +2037,9 @@ class TradingAgentsGraph:
             )
 
         if budget is not None:
-            budget.check()
             # Include deferred reflections in the returned whole-run receipt.
+            if not budget.completion_committed:
+                budget.check()
             final_state["analysis_budget"] = budget.receipt()
         return final_state, processed_signal
 

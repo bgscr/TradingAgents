@@ -11,6 +11,7 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.report_presentation import advisory_direction_projection
 
 
 def create_research_manager(llm):
@@ -42,11 +43,19 @@ Commit to a clear stance whenever the debate's strongest arguments warrant one; 
 **Debate History:**
 {history}""" + get_language_instruction()
 
+        projection = None
+
+        def render_and_capture(plan):
+            nonlocal projection
+            body = render_research_plan(plan)
+            projection = advisory_direction_projection(state, "research", plan.recommendation.value, body)
+            return body
+
         investment_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
             prompt,
-            render_research_plan,
+            render_and_capture,
             "Research Manager",
         )
 
@@ -62,6 +71,7 @@ Commit to a clear stance whenever the debate's strongest arguments warrant one; 
         return {
             "investment_debate_state": new_investment_debate_state,
             "investment_plan": investment_plan,
+            "research_advisory_direction": projection,
         }
 
     return research_manager_node

@@ -37,7 +37,6 @@ def test_all_four_reports_every_uncovered_capability_without_spend():
     actual = {(item.location, item.provider, item.reason) for item in report.issues}
     assert actual == {
         ('news.get_global_news', 'yfinance', 'uncovered_data_vendor'),
-        ('news.get_insider_transactions', 'akshare', 'placeholder_implementation'),
     }
     assert dict(report.chains)['market_snapshot'] == ('akshare',)
     assert 'verified_mainland_calendar_window_or_uncovered_baostock_acquisition' in report.dependencies
@@ -57,7 +56,7 @@ def test_every_snapshot_fallback_is_checked_and_matches_actual_resolver(chain):
     runtime.set_config(config)
     report = inspect_budget_routes(runtime.get_config(), symbol='601328.SH', selected_analysts=('market',))
     assert dict(report.chains)['market_snapshot'] == tuple(_provider_chain('601328.SH'))
-    assert report.issues
+    assert bool(report.issues) is (chain != 'tushare,akshare')
     assert all(item.location == 'market_snapshot' for item in report.issues)
 
 
@@ -123,7 +122,7 @@ def test_akshare_names_do_not_create_missing_implementations():
     config['tool_vendors'].update(dict.fromkeys(ANALYST_TOOLS['news'], 'akshare'))
     report = inspect_budget_routes(config, selected_analysts=('news',), symbol='601328.SH')
     assert {i.location for i in report.issues} == {
-        'news.get_global_news', 'news.get_insider_transactions',
+        'news.get_global_news',
         'news.get_macro_indicators', 'news.get_prediction_markets'}
 
 
@@ -263,7 +262,7 @@ def test_config_routes_and_context_failures_are_reported_together(tmp_path, monk
     import cli.main as cli
 
     config = settings()
-    config.update(analysis_max_calls=0, analysis_timeout_seconds=-1, checkpoint_enabled=True,
+    config.update(analysis_max_calls=0, analysis_timeout_seconds=-1, checkpoint_enabled="true",
                   tool_vendors=None, market_history_database_path=str(tmp_path / 'absent.sqlite3'),
                   data_cache_dir=str(tmp_path / 'cache'))
     monkeypatch.setattr(cli, 'DEFAULT_CONFIG', config)
@@ -274,7 +273,7 @@ def test_config_routes_and_context_failures_are_reported_together(tmp_path, monk
             'analysts': list(ANALYST_TOOLS)}, None)
     locations = {item.location for item in captured.value.report.issues}
     assert {'config.analysis_max_calls', 'config.analysis_timeout_seconds', 'config.checkpoint_enabled',
-            'config.tool_vendors', 'news.get_global_news', 'news.get_insider_transactions'} <= locations
+            'config.tool_vendors', 'news.get_global_news'} <= locations
     assert any(item.location == 'calendar' for item in captured.value.readiness_report.issues)
 
 

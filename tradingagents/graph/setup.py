@@ -122,6 +122,20 @@ class GraphSetup:
         )
 
         # Create workflow
+        from tradingagents.portfolio_research_run import active_selection
+        research = active_selection() is not None
+        if research:
+            if self.evidence_gate_mode != "enforce":
+                raise ValueError("research_requires_enforced_gates")
+            from tradingagents.portfolio_research_terminal import capture, decide, record_admission
+            bull_researcher_node = capture("bull", bull_researcher_node)
+            bear_researcher_node = capture("bear", bear_researcher_node)
+            research_manager_node = capture("manager", research_manager_node)
+            trader_node = capture("trader", trader_node)
+            aggressive_analyst = capture("aggressive", aggressive_analyst)
+            neutral_analyst = capture("neutral", neutral_analyst)
+            conservative_analyst = capture("conservative", conservative_analyst)
+            portfolio_manager_node = decide(self.deep_thinking_llm,self.decision_policy)
         workflow = StateGraph(AgentState)
 
         # Add analyst nodes to the graph
@@ -145,7 +159,8 @@ class GraphSetup:
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
-        workflow.add_node("Decision Gate", decision_gate_node)
+        if not research:
+            workflow.add_node("Decision Gate", decision_gate_node)
         workflow.add_node(
             "Evidence Preflight",
             create_preflight_gate_node(
@@ -153,13 +168,8 @@ class GraphSetup:
                 self.decision_horizon,
             ),
         )
-        workflow.add_node(
-            "Evidence Admission",
-            create_admission_gate_node(
-                self.decision_policy,
-                self.decision_horizon,
-            ),
-        )
+        admission=create_admission_gate_node(self.decision_policy,self.decision_horizon)
+        workflow.add_node("Evidence Admission",record_admission(admission) if research else admission)
 
         # Define edges
         # Validate authoritative baseline evidence before invoking any model.
@@ -213,7 +223,10 @@ class GraphSetup:
                 RISK_ANALYSIS_PATH_MAP,
             )
 
-        workflow.add_edge("Portfolio Manager", "Decision Gate")
-        workflow.add_edge("Decision Gate", END)
+        if research:
+            workflow.add_edge("Portfolio Manager", END)
+        else:
+            workflow.add_edge("Portfolio Manager", "Decision Gate")
+            workflow.add_edge("Decision Gate", END)
 
         return workflow

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import stat
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -54,29 +55,86 @@ def _file_stamp(path):
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
-def _no_sidecars(path):
-    if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+def _regular_file(path, *, required=False):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise _ReadFailure("missing") from None
+        return None
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & 0x400):
+        raise _ReadFailure("unsafe_database_path")
+    return _file_stamp(path)
+
+
+def _database_state(path):
+    for parent in path.parents:
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise _ReadFailure("unsafe_database_path")
+    state = {suffix: _regular_file(Path(str(path) + suffix), required=(suffix == ""))
+             for suffix in ("", "-wal", "-shm", "-journal")}
+    if state["-journal"] is not None:
         raise _ReadFailure("concurrent_database_state")
+    if (state["-wal"] is not None and 0 < state["-wal"][2] < 32
+            or state["-shm"] is not None and (state["-shm"][2] == 0 or state["-shm"][2] % 32768)):
+        raise _ReadFailure("concurrent_database_state")
+    return state
 
 
 @contextmanager
 def _stable_database(path):
-    """Reject concurrent/uncertain SQLite state instead of ignoring a WAL.
+    """Accept WAL snapshots, reject changed content/identity and uncertain journals.
 
-This observes an immutable read interval, not a lock or promise about future
-runtime use. Runtime readers must revalidate after this preflight returns.
-"""
-    path = Path(path).expanduser().resolve()
-    _no_sidecars(path)
-    if not path.is_file():
-        raise _ReadFailure("missing")
-    before = _file_stamp(path)
+    SQLite may create empty WAL/SHM coordination files; never remove them here.
+    This is an observed interval, not an authorization for later runtime use.
+    """
+    path = Path(path).expanduser().absolute()
+    before = _database_state(path)
     try:
         yield path
     finally:
-        _no_sidecars(path)
-        if _file_stamp(path) != before:
+        after = _database_state(path)
+        if after[""] != before[""]:
             raise _ReadFailure("concurrent_database_state")
+        for suffix in ("-wal", "-shm"):
+            old, new = before[suffix], after[suffix]
+            if old is None and new is not None:
+                if new[2] != (0 if suffix == "-wal" else 32768):
+                    raise _ReadFailure("concurrent_database_state")
+            elif old is not None:
+                # SHM lock/read-mark bytes may change while serving a snapshot.
+                if new is None or (old != new if suffix == "-wal" else old[:3] != new[:3]):
+                    raise _ReadFailure("concurrent_database_state")
+
+
+@contextmanager
+def _readonly_database(path):
+    """Read one WAL-aware snapshot. Never create a DB, migrate, or checkpoint."""
+    with _stable_database(path) as path:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            mode = connection.execute("PRAGMA journal_mode").fetchone()
+            if mode != ("wal",) and any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
+                raise _ReadFailure("concurrent_database_state")
+            version = connection.execute("PRAGMA data_version").fetchone()
+            connection.execute("BEGIN")
+            allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+            connection.set_authorizer(lambda action, *_: (
+                sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+            ))
+            # Pin the snapshot now, before any multi-query store validation.
+            connection.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
+            yield connection
+            connection.set_authorizer(None)
+            connection.rollback()
+            if connection.execute("PRAGMA data_version").fetchone() != version:
+                raise _ReadFailure("concurrent_database_state")
+        finally:
+            connection.set_authorizer(None)
+            connection.close()
 
 
 @contextmanager
@@ -86,27 +144,12 @@ def _readonly_history(config):
     from tradingagents.market_history.store import MarketHistoryStore
 
     settings = MarketHistoryConfig.from_mapping(config)
-    with _stable_database(settings.database_path) as path:
-        connection = sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
-        try:
-            connection.execute("PRAGMA query_only = ON")
-            # Defense in depth: even accidental calls to a store writer cannot
-            # mutate this connection or attach a second database.
-            allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
-            connection.set_authorizer(lambda action, *_: (
-                sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
-            ))
-            row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            if row != (SCHEMA_VERSION,):
-                raise _ReadFailure("unsupported_schema")
-            # __init__ only assigns members; open() migrates and is forbidden.
-            store = MarketHistoryStore(settings, connection)
-            try:
-                yield store
-            finally:
-                store.close()
-        finally:
-            connection.close()
+    with _readonly_database(settings.database_path) as connection:
+        row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        if row != (SCHEMA_VERSION,):
+            raise _ReadFailure("unsupported_schema")
+        # The readonly context owns closure after its snapshot checks.
+        yield MarketHistoryStore(settings, connection)
 
 
 def _market_chain(config):
@@ -179,7 +222,7 @@ def _inspect_market(config, symbol, start, end, issues, checked):
     from tradingagents.market_history.calendar_discovery import read_mainland_calendar_window
     from tradingagents.market_history.current_cache import (
         compatibility_diagnostic,
-        read_prepared_sse_calendar,
+        read_prepared_exchange_calendar,
     )
 
     if resolve_mainland_instrument(symbol) is None:
@@ -192,7 +235,7 @@ def _inspect_market(config, symbol, start, end, issues, checked):
         chain = _market_chain(config)
         with _readonly_history(config) as store:
             try:
-                calendar = read_prepared_sse_calendar(store, symbol, start, end)
+                calendar = read_prepared_exchange_calendar(store, symbol, start, end, config=config)
                 if calendar is None:
                     calendar = read_mainland_calendar_window(store, start, end)
                 if calendar is None:
@@ -249,7 +292,6 @@ def _financial_identity(config, symbol, supplied):
 
 def _financial_payloads(chunks, endpoint, identity, statement_type, now):
     from tradingagents.dataflows._tushare_statement_artifacts import (
-        decode_provider_artifact,
         financial_artifact_identity,
         financial_row_artifact_identities,
     )
@@ -257,11 +299,12 @@ def _financial_payloads(chunks, endpoint, identity, statement_type, now):
     from tradingagents.dataflows.current_tushare_statements import (
         NORMALIZER_VERSION,
         _announcement_in_range,
+        decode_current_statement_artifact,
     )
 
     row_count = 0
     for chunk in chunks:
-        payload = decode_provider_artifact(chunk.payload, endpoint_id=endpoint)
+        payload = decode_current_statement_artifact(chunk.payload, endpoint_id=endpoint)
         for field in ("retrieved_at", "observed_at"):
             observed = datetime.fromisoformat(payload[field].replace("Z", "+00:00"))
             # checked_at is captured before fetch; the response's source time

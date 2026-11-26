@@ -1106,6 +1106,7 @@ class ProviderRequestCoordinator:
         operation: str,
         physical_request: Callable[[], T],
         cooldown_scope: str = "all",
+        record_at_physical_io: bool = False,
     ) -> CoordinatedRequestResult[T]:
         """Execute at most one direct provider request under one typed attempt."""
 
@@ -1122,6 +1123,7 @@ class ProviderRequestCoordinator:
             physical_attempt=lambda _attempt_index: physical_request(),
             cooldown_scope=cooldown_scope,
             _wait_for_initial_pacing=True,
+            record_at_physical_io=record_at_physical_io,
         )
 
     def execute_physical_workflow(

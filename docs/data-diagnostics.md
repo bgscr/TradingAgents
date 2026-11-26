@@ -12,7 +12,7 @@ are the authority source; the operator's runtime identity configuration is not r
 From the checkout, an entirely offline example is:
 
 ```powershell
-& 'D:/prj/TradingAgents/TradingAgents/.venv/Scripts/python.exe' -I -S -B scripts/accept_financial_statements.py --output 'C:/Users/56922/Documents/Codex/2026-10-14/task-3/EXAMPLE-NEW-OFFLINE-RUN' --destination https://api.tushare.pro --account synthetic-offline --as-of 2026-10-15
+& '.\.venv\Scripts\python.exe' -I -S -B scripts/accept_financial_statements.py --output '<new-output-directory>' --destination https://api.tushare.pro --account synthetic-offline --as-of 2026-10-15
 ```
 
 Without `--authorize-live`, the first worker substitutes only the HTTPS connection
@@ -219,5 +219,5 @@ Old failed evidence is never overwritten, and this repair grants no further GETs
 Example replay of an already approved capture:
 
 ```powershell
-& 'D:/prj/TradingAgents/TradingAgents/.venv/Scripts/python.exe' -I -S -B scripts/diagnose_public_news.py --replay 'C:/path/to/approved-capture' --output 'C:/path/to/NEW-replay' --start 2026-10-05 --end 2026-10-12 --acceptance-mode news-content
+& '.\.venv\Scripts\python.exe' -I -S -B scripts/diagnose_public_news.py --replay '<reviewed-replay-file>' --output '<new-output-directory>' --start 2026-10-05 --end 2026-10-12 --acceptance-mode news-content
 ```

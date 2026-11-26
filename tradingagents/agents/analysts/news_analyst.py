@@ -39,6 +39,13 @@ def create_news_analyst(llm):
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
+        system_message += (
+            "\nGlobal macro news, FRED and prediction markets are macro context, not "
+            "company-specific mainland evidence. No mainland insider-transactions tool "
+            "is provided; do not infer insider activity or its absence."
+        )
+        from tradingagents.powershell_news import powershell_news_window_instruction
+        system_message += '\n' + powershell_news_window_instruction(state['company_of_interest'], current_date)
         system_message += "\n\n" + render_allowed_source_ref_catalog(
             state["messages"],
             state["company_of_interest"],

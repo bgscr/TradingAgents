@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,37 @@ from tradingagents.evidence import (
 
 _CLOSED_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid")
 T = TypeVar("T")
+
+
+def _provider_exception_code(exc: Exception) -> str:
+    """Bounded diagnostic only: never provider text, URLs, values or retry policy."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "provider_response_json_invalid"
+    # Do not import an HTTP stack just to classify a pure acquisition failure.
+    # These fixed MRO identities affect diagnostics only, never availability.
+    categories = {
+        ("requests.exceptions", "JSONDecodeError"): "provider_response_json_invalid",
+        ("requests.exceptions", "Timeout"): "provider_timeout",
+        ("requests.exceptions", "ConnectionError"): "provider_connection_error",
+        ("requests.exceptions", "HTTPError"): "provider_http_error",
+        ("tradingagents.dataflows.errors", "NoMarketDataError"): "provider_no_usable_data",
+    }
+    identities = {(kind.__module__, kind.__name__) for kind in type(exc).__mro__}
+    # ConnectTimeout inherits both ConnectionError and Timeout; prefer timeout.
+    for identity, code in categories.items():
+        if identity in identities:
+            return code
+    if isinstance(exc, KeyError):
+        return "provider_schema_key_missing"
+    if isinstance(exc, TimeoutError):
+        return "provider_timeout"
+    if isinstance(exc, ConnectionError):
+        return "provider_connection_error"
+    if isinstance(exc, ValueError):
+        return "provider_value_invalid"
+    if isinstance(exc, TypeError):
+        return "provider_type_invalid"
+    return "provider_exception"
 
 
 class AcquisitionRequest(BaseModel):
@@ -156,11 +188,18 @@ class AcquisitionController:
                 )
                 continue
             for attempt in range(1, self._retry_policy.max_attempts_per_provider + 1):
+                diagnostic_stage = "provider_call"
                 try:
                     raw_value = provider(request)
+                    diagnostic_stage = "validation"
                     value = validator(raw_value)
+                    diagnostic_stage = "serialization"
                     raw_text = serializer(value)
                 except AcquisitionFailure as failure:
+                    if request.tool_name == "get_news":
+                        from tradingagents.run_diagnostics import record_news_exception
+
+                        record_news_exception(failure, stage=diagnostic_stage, provider=provider_name)
                     retryable = (
                         failure.retryable
                         if failure.retryable is not None
@@ -206,7 +245,11 @@ class AcquisitionController:
                     # Evidence contradictions must not become recoverable provider
                     # failures or permit a fallback to overwrite the contradiction.
                     raise
-                except Exception:
+                except Exception as exc:
+                    if request.tool_name == "get_news":
+                        from tradingagents.run_diagnostics import record_news_exception
+
+                        record_news_exception(exc, stage=diagnostic_stage, provider=provider_name)
                     self._record_outcome(
                         outcomes,
                         request,
@@ -220,6 +263,7 @@ class AcquisitionController:
                             retrieved_at=self._timestamp(),
                             retryable=False,
                             reason=AcquisitionUnavailableReason.PROVIDER_ERROR,
+                            error_code=_provider_exception_code(exc),
                         ),
                     )
                     self._open_circuits.add(circuit_key)

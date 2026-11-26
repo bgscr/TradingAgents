@@ -40,7 +40,14 @@ def main():
     SITE = SITE.resolve(strict=True)
     MODE = "focused" if options.test_filter else "matrix"
     ROOT = Path(tempfile.mkdtemp(prefix="synthetic-current-cache-", dir=options.work_dir)).resolve()
-    os.environ.clear()  # Never inspect/copy inherited credential values.
+    # Preserve only named non-secret Windows initialization inputs. No profile,
+    # credential values or complete environment are inspected/copied/logged.
+    system_names = ("SystemRoot", "WINDIR", "SystemDrive", "ComSpec", "PATH", "PATHEXT",
+                    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS")
+    system_environment = {name: os.environ[name] for name in system_names if name in os.environ}
+    os.environ.clear()
+    os.environ.update(system_environment)
+    del system_environment
     sys.pycache_prefix = str(ROOT / "bytecode")  # Fresh source; -B prevents writing caches.
     os.environ.update(
         HOME=str(ROOT),
@@ -52,6 +59,7 @@ def main():
         PYTHONTZPATH=str(SITE / "tzdata/zoneinfo"),
         TZ="UTC",
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PYDANTIC_DISABLE_PLUGINS="__all__",
     )
     os.chdir(ROOT)
 
@@ -120,6 +128,11 @@ def main():
                     "test_tushare_pit_provider.py",
                     "test_tushare_current_incremental.py",
                     "test_tushare_current_acceptance.py",
+                    "test_calendar_exchange_entry.py",
+                    "test_tushare_sse_prepared_calendar.py",
+                    "test_mainland_budget_repairs.py",
+                    "test_mainland_physical_attempt_coordination.py",
+                    "test_acquisition_controller.py",
                 )
             )
             if not writing and not (path in exact or any(below(path, root) for root in allowed)):

@@ -10,7 +10,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
@@ -126,17 +126,23 @@ class CurrentStatementCache:
         self.max_age = max_age
         self.read_only = read_only
 
+    @contextmanager
+    def _read_connection(self):
+        if self.read_only:
+            from tradingagents.budget_readiness import _ReadFailure, _readonly_database
+
+            try:
+                with _readonly_database(self.path) as connection:
+                    yield connection
+            except _ReadFailure as exc:
+                raise sqlite3.OperationalError("read-only cache snapshot unavailable") from exc
+        else:
+            with closing(self._connect()) as connection:
+                yield connection
+
     def _connect(self) -> sqlite3.Connection:
         if self.read_only:
-            # Immutable prevents sidecar creation too. Refuse a live WAL rather
-            # than silently ignore its uncheckpointed observations.
-            if Path(str(self.path) + "-wal").exists():
-                raise sqlite3.OperationalError("read-only cache has a WAL")
-            connection = sqlite3.connect(
-                self.path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True, timeout=5
-            )
-            connection.execute("PRAGMA query_only = ON")
-            return connection
+            raise RuntimeError("read-only cache requires its snapshot context")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=5)
         try:
@@ -170,7 +176,7 @@ class CurrentStatementCache:
         start: date,
         end: date,
     ) -> tuple[list[StatementCacheChunk], str | None]:
-        with closing(self._connect()) as connection:
+        with self._read_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT a.range_start, a.range_end, o.payload, o.checked_at,

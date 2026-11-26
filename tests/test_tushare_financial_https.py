@@ -79,6 +79,45 @@ def test_explicit_https_protocol_one_post(monkeypatch, base, host, path):
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize("reverse_columns", [False, True])
+def test_documented_table_with_extensions_maps_values_by_field_name(monkeypatch, reverse_columns):
+    fields = ["ts_code", "ann_date", "end_date", "new_amount", "optional_amount"]
+    row = ["601328.SH", "20260828", "20260630", 12, None]
+    if reverse_columns:
+        fields.reverse()
+        row.reverse()
+    payload = {
+        "code": 0, "msg": "", "opaque_extension": {"opaque": "not-retained"},
+        "data": {"fields": fields, "items": [row], "extra_metadata": ["not-retained"]},
+    }
+    calls = fake_connection(monkeypatch, payload=payload)
+    frame = transport.create_client("https://api.waditu.com/dataapi").query(
+        "balancesheet", ts_code="601328.SH", start_date="20200101",
+        end_date="20261016", report_type="1",
+    )
+    assert frame.iloc[0]["ts_code"] == "601328.SH"
+    assert frame.iloc[0]["new_amount"] == 12
+    assert frame.iloc[0]["optional_amount"] is None
+    assert frame.attrs["response_completeness"]["total"] is None
+    assert frame.attrs["response_completeness"]["coverage"] == "query_response_only"
+    assert "not-retained" not in json.dumps(frame.attrs)
+    assert sum(call[0] == "request" for call in calls) == 1
+
+
+def test_shape_failure_keeps_actual_http_status_and_fixed_reason(monkeypatch):
+    payload = {"code": 0, "data": {"fields": ["amount"], "items": [[1, 2]]}}
+    fake_connection(monkeypatch, payload=payload)
+    metadata = {}
+    client = transport._Client("https://api.waditu.com/dataapi", "synthetic", failure_metadata=metadata)
+    with pytest.raises(PhysicalAttemptFailure) as caught:
+        client.query("balancesheet", ts_code="601328.SH", start_date="20200101",
+                     end_date="20261016", report_type="1")
+    assert caught.value.status_code == 200
+    assert caught.value.error_code == "financial_response_invalid_table"
+    assert metadata["http_status"] == 200
+    assert metadata["error_code"] == "financial_response_invalid_table"
+
+
 @pytest.mark.parametrize(
     "status,outcome",
     [(302, PhysicalAttemptOutcome.PROVIDER_ERROR), (429, PhysicalAttemptOutcome.RATE_LIMITED)],

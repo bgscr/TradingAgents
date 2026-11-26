@@ -378,6 +378,17 @@ def create_sentiment_analyst(llm):
             local_sentiment_block=blocks["local_sentiment_block"],
         )
 
+        from tradingagents.moneyflow import moneyflow_for_state, moneyflow_markdown
+
+        moneyflow = moneyflow_for_state(state)
+        if moneyflow is not None:
+            system_message += (
+                "\n\nSeparate auxiliary trading-flow observation; this is NOT news or social sentiment. "
+                "Discuss only returned values and stated coverage. Do not create material claims, SourceFacts "
+                "or directional decision assertions from this block; it cannot determine the rating.\n"
+                + moneyflow_markdown({**state, "moneyflow_observation": moneyflow},
+                                     language=get_config().get("output_language", "English"))
+            )
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -476,6 +487,8 @@ def create_sentiment_analyst(llm):
                 merged_evidence,
                 (submission_source, *inline_evidence.sources),
             ).model_dump(mode="json")
+        if moneyflow is not None:
+            update["moneyflow_observation"] = moneyflow
         return update
 
     return sentiment_analyst_node

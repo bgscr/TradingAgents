@@ -1,11 +1,13 @@
 from typing import Annotated
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
 
+from tradingagents.budget_data import policy_disabled_tool_result
 from tradingagents.dataflows.interface import route_to_vendor
 
 
-@tool
+@tool(response_format="content_and_artifact")
 def get_macro_indicators(
     indicator: Annotated[
         str,
@@ -17,7 +19,8 @@ def get_macro_indicators(
     look_back_days: Annotated[
         int | None, "Trailing window length in days; omit for a 1-year window"
     ] = None,
-) -> str:
+    runtime: ToolRuntime = None,
+) -> tuple[str, dict[str, object] | None]:
     """
     Retrieve a macroeconomic indicator time series from FRED (Federal Reserve
     Economic Data): policy rates, Treasury yields, inflation, labor, and growth.
@@ -33,4 +36,6 @@ def get_macro_indicators(
     Returns:
         str: A formatted markdown report of the macro series
     """
-    return route_to_vendor("get_macro_indicators", indicator, curr_date, look_back_days)
+    result = route_to_vendor("get_macro_indicators", indicator, curr_date, look_back_days)
+    return policy_disabled_tool_result(result, method="get_macro_indicators",
+                                       tool_call_id=runtime.tool_call_id if runtime is not None else None)

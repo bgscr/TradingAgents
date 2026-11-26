@@ -874,9 +874,9 @@ def _load_through_provider_coordinator(
     attempt_observer: Callable[[tuple[ProviderPhysicalAttemptEvent, ...]], None]
     | None = None,
 ) -> object:
-    from tradingagents.analysis_budget import require_data_vendor
+    from tradingagents.budget_data import require_budget_snapshot
 
-    require_data_vendor(provider_name)
+    require_budget_snapshot(provider_name, provider)
     from datetime import timedelta
 
     from tradingagents.market_history.config import (
@@ -1890,8 +1890,9 @@ def _ensure_analysis_calendar(start_date, end_date, attempt_observer=None, *, sy
     if config.data_usage_mode is not DataUsageMode.PERSONAL_RESEARCH:
         raise ValueError("calendar usage not entitled")
     with MarketHistoryStore.open(config) as store:
-        from tradingagents.market_history.current_cache import read_prepared_sse_calendar
-        prepared = read_prepared_sse_calendar(store, symbol, date.fromisoformat(start_date), date.fromisoformat(end_date))
+        from tradingagents.market_history.current_cache import read_prepared_exchange_calendar
+        prepared = read_prepared_exchange_calendar(
+            store, symbol, date.fromisoformat(start_date), date.fromisoformat(end_date), config=get_config())
         if prepared is not None:
             return prepared
         with MarketHistoryStore.open_provider_request_authority(config) as authority:

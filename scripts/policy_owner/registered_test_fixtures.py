@@ -173,9 +173,9 @@ def _passing_guest_result() -> GuestQualificationResult:
     probes = tuple(
         AdversarialProbeResult(
             mechanism=mechanism,
-            target_host_path=(rf"C:\Users\56922\.tradingagents\{mechanism.value}.probe"),
+            target_host_path=(rf"C:\Users\ExampleUser\.tradingagents\{mechanism.value}.probe"),
             target_path_identity=host_path_identity(
-                rf"C:\Users\56922\.tradingagents\{mechanism.value}.probe"
+                rf"C:\Users\ExampleUser\.tradingagents\{mechanism.value}.probe"
             ),
             observation=ProbeObservation.GUEST_LOCAL_ONLY,
             contained=True,

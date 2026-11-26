@@ -1082,10 +1082,10 @@ def _passing_guest_result() -> GuestQualificationResult:
         AdversarialProbeResult(
             mechanism=mechanism,
             target_host_path=(
-                rf"C:\Users\56922\.tradingagents\{mechanism.value}.probe"
+                rf"C:\Users\ExampleUser\.tradingagents\{mechanism.value}.probe"
             ),
             target_path_identity=host_path_identity(
-                rf"C:\Users\56922\.tradingagents\{mechanism.value}.probe"
+                rf"C:\Users\ExampleUser\.tradingagents\{mechanism.value}.probe"
             ),
             observation=ProbeObservation.GUEST_LOCAL_ONLY,
             contained=True,
@@ -2930,7 +2930,7 @@ def test_iso_03_export_rejects_a_different_exact_path_probe_plan(
         )
         for item in result.probes
     )
-    changed_path = r"C:\Users\56922\.tradingagents\different.probe"
+    changed_path = r"C:\Users\ExampleUser\.tradingagents\different.probe"
     tampered = (
         AdversarialProbeTarget(
             mechanism=expected_targets[0].mechanism,

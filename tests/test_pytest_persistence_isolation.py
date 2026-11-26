@@ -528,6 +528,61 @@ def test_subprocess_explicit_application_path_is_fail_closed(
         )
 
 
+def test_subprocess_arbitrary_external_project_root_is_fail_closed(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    external_root = Path(__file__).resolve().parents[2] / "pytest-persistence-escape"
+    assert not external_root.is_relative_to(tmp_path_factory.getbasetemp())
+    environment = os.environ.copy()
+    environment["TRADINGAGENTS_PROJECT_ROOT"] = str(external_root)
+
+    with pytest.raises(RuntimeError, match="pytest-owned temporary state"):
+        subprocess.run(
+            [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+            env=environment,
+            check=False,
+        )
+
+
+def test_isolated_python_child_is_rejected_before_guard_bypass(
+    application_default_config_snapshot: dict[str, object],
+) -> None:
+    protected_path = Path(
+        str(application_default_config_snapshot["market_history_payload_root"])
+    ) / "isolated-python-write-probe"
+    code = (
+        "from pathlib import Path; "
+        f"Path({protected_path.as_posix()!r}).write_text('must-not-write')"
+    )
+
+    with pytest.raises(RuntimeError, match="cannot guarantee the persistence guard"):
+        subprocess.run(
+            [sys.executable, "-I", "-c", code],
+            check=False,
+        )
+
+    assert not protected_path.exists()
+
+
+def test_non_python_child_with_application_path_is_fail_closed(
+    application_default_config_snapshot: dict[str, object],
+) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is unavailable")
+    protected_path = Path(
+        str(application_default_config_snapshot["market_history_payload_root"])
+    ) / "non-python-write-probe"
+
+    with pytest.raises(RuntimeError, match="unguarded child command"):
+        subprocess.run(
+            [git, "status", "--short", protected_path.as_posix()],
+            check=False,
+        )
+
+    assert not protected_path.exists()
+
+
 def test_subprocess_relative_application_path_is_fail_closed() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()

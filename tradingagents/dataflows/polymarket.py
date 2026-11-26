@@ -85,6 +85,11 @@ def get_prediction_markets(topic: str, limit: int | None = None) -> str:
     try:
         data = _request("public-search", {"q": topic, "limit_per_type": 20})
     except requests.RequestException as e:
+        from tradingagents.analysis_budget import active_budget
+        from tradingagents.dataflows.config import get_config
+
+        if active_budget() is not None and get_config().get("budget_require_macro_sources", False):
+            raise  # The exact budget adapter converts this to a terminal safe reason.
         logger.warning("Polymarket search failed for %r: %s", topic, e)
         return (
             f"Polymarket data is currently unavailable (network error: {e}). "

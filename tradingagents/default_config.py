@@ -1,6 +1,27 @@
 import json
 import os
 
+# Explicit test-only opt-out. Normal application imports still load the profile.
+# Latch across reloads: clearing the environment cannot turn skipped defaults
+# into runtime-authorized configuration. Restart without the flag to run normally.
+_profile_test_setting = os.environ.get(
+    "TRADINGAGENTS_OFFLINE_TEST_DISABLE_LOCAL_PROFILE", "0"
+)
+if _profile_test_setting not in {"0", "1"}:
+    raise ValueError("invalid_offline_test_profile_setting")
+_OFFLINE_TEST_PROFILE_DISABLED = (
+    globals().get("_OFFLINE_TEST_PROFILE_DISABLED", False)
+    or _profile_test_setting == "1"
+)
+del _profile_test_setting
+
+
+def require_runtime_profile_loading() -> None:
+    """Reject real CLI/Graph startup when this module skipped the local profile."""
+    if _OFFLINE_TEST_PROFILE_DISABLED:
+        raise RuntimeError("offline_test_profile_disabled_runtime_prohibited")
+
+
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 _PROJECT_RUNTIME_ROOT = os.getenv("TRADINGAGENTS_PROJECT_ROOT")
 _DEFAULT_RESULTS_DIR = (
@@ -65,6 +86,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
+    "TRADINGAGENTS_CHECKPOINT_DATA_DIR":  "checkpoint_data_dir",
     "TRADINGAGENTS_EVIDENCE_GATE_MODE":   "evidence_gate_mode",
     "TRADINGAGENTS_IDENTITY_REGISTRY_PATH": "instrument_identity_registry_path",
     "TRADINGAGENTS_IDENTITY_REGISTRY_SHA256": "instrument_identity_registry_sha256",
@@ -73,11 +95,13 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
+    "TRADINGAGENTS_LLM_MAX_OUTPUT_TOKENS": "llm_max_output_tokens",
     "TRADINGAGENTS_ANALYSIS_BUDGET_ENABLED": "analysis_budget_enabled",
     "TRADINGAGENTS_ANALYSIS_MAX_CALLS": "analysis_max_calls",
     "TRADINGAGENTS_ANALYSIS_DISABLE_ALPHA_VANTAGE": "analysis_disable_alpha_vantage",
     "TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS": "analysis_timeout_seconds",
     "TRADINGAGENTS_FINANCIAL_CACHE_ONLY": "financial_cache_only",
+    "TRADINGAGENTS_ANALYSIS_SKIP_OPTIONAL_FUNDAMENTALS": "analysis_skip_optional_fundamentals",
     "TRADINGAGENTS_MARKET_HISTORY_MODE":  "market_history_mode",
     "TRADINGAGENTS_MARKET_HISTORY_DATABASE_PATH": "market_history_database_path",
     "TRADINGAGENTS_MARKET_HISTORY_PAYLOAD_ROOT": "market_history_payload_root",
@@ -106,6 +130,7 @@ _ENV_OVERRIDES = {
     # interactive choice, which is skipped when the matching var is set.
     "TRADINGAGENTS_GOOGLE_THINKING_LEVEL":   "google_thinking_level",
     "TRADINGAGENTS_OPENAI_REASONING_EFFORT": "openai_reasoning_effort",
+    "TRADINGAGENTS_DEEPSEEK_REASONING_EFFORT": "deepseek_reasoning_effort",
     "TRADINGAGENTS_ANTHROPIC_EFFORT":        "anthropic_effort",
 }
 
@@ -147,7 +172,7 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         try:
-            if key in {"analysis_budget_enabled", "financial_cache_only", "analysis_disable_alpha_vantage"} and raw.lower() not in {
+            if key in {"analysis_budget_enabled", "financial_cache_only", "analysis_disable_alpha_vantage", "analysis_skip_optional_fundamentals"} and raw.lower() not in {
                 "true", "false", "1", "0", "yes", "no", "on", "off",
             }:
                 raise ValueError("budget/cache-only flag must be an explicit boolean")
@@ -205,7 +230,8 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
     }
     if not isinstance(local, dict) or set(local) - (
         set(scalar_choices) | {"market_data_vendors", "tool_vendors",
-                              "tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh"}
+                              "tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh",
+                              "analysis_skip_optional_fundamentals"}
     ):
         raise ValueError("Unsupported fields in tradingagents.local.json")
     for key, choices in scalar_choices.items():
@@ -226,6 +252,8 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
             raise ValueError("Invalid financial cache age in tradingagents.local.json")
     if "tushare_financial_force_refresh" in local and type(local["tushare_financial_force_refresh"]) is not bool:
         raise ValueError("Invalid financial refresh in tradingagents.local.json")
+    if "analysis_skip_optional_fundamentals" in local and type(local["analysis_skip_optional_fundamentals"]) is not bool:
+        raise ValueError("Invalid optional fundamentals policy in tradingagents.local.json")
     if "market_data_vendors" in local:
         vendors = local["market_data_vendors"]
         if not isinstance(vendors, dict) or set(vendors) != {"cn_a"}:
@@ -239,7 +267,8 @@ def _apply_local_analysis_overrides(config: dict) -> dict:
     for key in scalar_choices:
         if key in local:
             config[key] = local[key]
-    for key in ("tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh"):
+    for key in ("tushare_financial_cache_max_age_seconds", "tushare_financial_force_refresh",
+                "analysis_skip_optional_fundamentals"):
         if key in local:
             config[key] = local[key]
     if "tool_vendors" in local:
@@ -312,6 +341,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
+    "deepseek_reasoning_effort": None,  # opt-in: "none", "low", "high", "max"
     "anthropic_effort": None,           # "high", "medium", "low"
     # Sampling temperature, forwarded to every provider when set. None leaves
     # each provider at its own default. Lower values reduce run-to-run
@@ -322,6 +352,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # provider/SDK at its own default (usually 2). Raise it to ride out bursty
     # 429 throttling on rate-limited deployments instead of aborting a run (#1091).
     "llm_max_retries": None,
+    # Explicit DeepSeek output cap; None preserves provider defaults. Not a cost cap.
+    "llm_max_output_tokens": None,
     # Opt-in admission limits, not a monetary cap. No personal config is changed.
     "analysis_budget_enabled": False,
     "analysis_max_calls": 30,
@@ -329,9 +361,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "analysis_disable_alpha_vantage": False,
     "analysis_timeout_seconds": 600,
     "financial_cache_only": False,
+    # Explicit omission before dispatch; defaults retain legacy source selection.
+    "analysis_skip_optional_fundamentals": False,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,
+    # Optional checkpoint base; None keeps data_cache_dir/checkpoints. This
+    # never relocates financial/market caches or migrates an existing run.
+    "checkpoint_data_dir": None,
     # Fail closed by default. "shadow" is an explicit temporary legacy override
     # whose directional output is visibly labeled as unenforced.
     "evidence_gate_mode": "enforce",
@@ -417,4 +454,5 @@ DEFAULT_CONFIG = _apply_env_overrides({
 })
 
 # This file is an operator's explicit local selection, not a product default.
-DEFAULT_CONFIG = _apply_local_analysis_overrides(DEFAULT_CONFIG)
+if not _OFFLINE_TEST_PROFILE_DISABLED:
+    DEFAULT_CONFIG = _apply_local_analysis_overrides(DEFAULT_CONFIG)

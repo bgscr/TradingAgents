@@ -57,7 +57,7 @@ prove when the evidence became effective or available. The failed run and all
 historical state remain immutable, Ticket 07 remains **BLOCKED**, and
 authoritative `qualified_v1` remains disabled.
 
-The fresh `601328.SS / 20260825_083711` attempt exposed a fifth Critical gap:
+The fresh `601328.SS / <retained-run>` attempt exposed a fifth Critical gap:
 temporal v1 samples `eligibility_evaluated_at` before physical acquisition,
 while production adapters truthfully assign `retrieved_at` after the response
 arrives, and the evaluator rejects every later retrieval. The retained run and
@@ -1568,7 +1568,7 @@ singleton.
   inventory through the after inventory.
 - **Protected host set.** A versioned, reviewed protected-root manifest is part
   of every run identity. At minimum it includes
-  `C:\Users\56922\.tradingagents` in full; the application provider/coordinator
+  `%USERPROFILE%\.tradingagents` in full; the application provider/coordinator
   ledger and SQLite sidecars; production Market Session Calendar state and
   payloads; historical Ticket 07 evidence; production checkpoints; production
   reports/logs; all retained baselines/inventories and incident evidence; and

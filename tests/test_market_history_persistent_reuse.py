@@ -800,9 +800,15 @@ def current_roundtrip(rig, live, *, start=None, end=None):
     "confirmed_suspension", "representation_noise", "in_range_gap", "factor_revision",
     "rate_limit_fallback", "store_corruption_degradation", "concurrent_write", "crash_recovery",
 ])
-def test_current_cache_real_compatibility_matrix(current_rig, monkeypatch, scenario):
+def test_current_cache_real_compatibility_matrix(current_rig, monkeypatch, scenario, tmp_path):
     from tradingagents.evidence import SourceArtifact
     from tradingagents.market_history import current_cache as cache
+    # Bootstrap codec proof independently of any installed acceptance manifest.
+    absent_manifest = tmp_path / "codec-bootstrap-absent.json"
+    assert not absent_manifest.exists()
+    monkeypatch.setattr(cache, "MANIFEST_PATH", absent_manifest)
+    diagnostic = cache.compatibility_diagnostic()
+    assert diagnostic.startswith("current_cache_gate_denied:FileNotFoundError:"), diagnostic
     rig = current_rig
     start, end = rig["start"], rig["end"]
     symbol = "000001.SZ" if scenario == "shenzhen_primary" else SYMBOL

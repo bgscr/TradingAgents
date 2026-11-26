@@ -23,8 +23,14 @@ from pydantic import (
     model_validator,
 )
 
+from tradingagents.comparison_evidence import ComparisonRecorder, NumericComparisonEvidence
 from tradingagents.dataflows.financial_eligibility_policy import (
     MainlandFinancialEligibilityProjectionBinding,
+)
+from tradingagents.financial_observations import (
+    FINANCIAL_TOOLS,
+    FinancialObservation,
+    bind_current_statement_observation,
 )
 
 if TYPE_CHECKING:
@@ -138,10 +144,152 @@ def _require_concrete_utc_timestamp(value: str) -> str:
 
 
 def _numeric_claim_tokens(text: str) -> tuple[str, ...]:
+    # A sign before an explicit CNY label belongs to the amount. This changes
+    # tokenization only, never currency/field qualification or tolerance.
+    normalized = re.sub(r"(?<![\w.+-])([+-])CNY[ \t]+(?=\d)", r"\1",
+                        _normalize_numeric_text(text))
     return tuple(
         match.group(0).replace(",", "").removeprefix("+")
-        for match in _NUMERIC_CLAIM_PATTERN.finditer(_normalize_numeric_text(text))
+        for match in _NUMERIC_CLAIM_PATTERN.finditer(normalized)
     )
+
+
+def _bound_instrument_symbol(message, call, identity):
+    """Recognize an exact registry identity only in its paired source request."""
+    if not isinstance(identity, InstrumentIdentityEvidence) or not identity.is_authoritative:
+        return None
+    symbol = identity.symbol
+    if re.fullmatch(r"[0-9]{6}\.(?:SS|SZ)", symbol) is None:
+        return None
+    if identity.venue != {"SS": "XSHG", "SZ": "XSHE"}[symbol[-2:]]:
+        return None
+    if (not isinstance(call, Mapping) or call.get("name") != getattr(message, "name", None)
+            or str(call.get("id", "")) != str(getattr(message, "tool_call_id", ""))
+            or not isinstance(call.get("args"), Mapping)):
+        return None
+    values = [call["args"][key] for key in ("ticker", "symbol") if key in call["args"]]
+    if not values or any(value != symbol for value in values):
+        return None
+    return symbol
+
+
+def _instrument_numeric_statement(statement: str, symbol: str | None) -> str:
+    """Exclude identifier spans, never other occurrences of their numeric digits."""
+    if symbol is None:
+        return statement
+    normalized = _normalize_numeric_text(statement)
+    return re.sub(r"(?<![A-Za-z0-9_.+-])" + re.escape(symbol) + r"(?![A-Za-z0-9_.])", "", normalized)
+
+
+def _has_unbound_source_projection(source_ref, available_messages, all_messages):
+    for other in all_messages:
+        raw = getattr(other, "artifact", None)
+        declared_ref = raw.get("source_ref") if isinstance(raw, Mapping) else getattr(raw, "source_ref", None)
+        if declared_ref == source_ref and all(other is not m for m in available_messages):
+            return True
+    return False
+
+
+def _bound_stock_projection_symbol(message, available_messages, all_messages, calls, identity,
+                                   source_ref, quote, statement):
+    """Bind an exact OHLCV row despite distinct projections of one snapshot.
+
+    This narrow extension supplies only an identifier span, never a financial
+    fact or a date/amount exemption. Acquisition envelopes and bytes have already
+    been validated. Duplicate tools, conflicting headers and non-unique quotes
+    cannot choose a convenient projection.
+    """
+    if getattr(message, "name", None) != "get_stock_data":
+        return None
+    # A same-ref result excluded from the trusted call catalog is unresolved,
+    # not evidence that can silently disappear from this identity check.
+    if _has_unbound_source_projection(source_ref, available_messages, all_messages):
+        return None
+    names = [getattr(m, "name", None) for m in available_messages]
+    if (len(names) != len(set(names))
+            or not set(names) <= {"get_stock_data", "get_verified_market_snapshot", "get_indicators"}
+            or sum(str(m.content).count(quote) for m in available_messages) != 1):
+        return None
+    call = calls.get(str(message.tool_call_id))
+    symbol = _bound_instrument_symbol(message, call, identity)
+    if symbol is None or any(_bound_instrument_symbol(m, calls.get(str(m.tool_call_id)), identity)
+                             != symbol for m in available_messages):
+        return None
+    # The immutable snapshot must agree across its differently rendered views.
+    for label in ("Provider", "Adjustment basis", "Frame SHA-256", "Snapshot ID",
+                  "(?:Effective trading date|Latest trading row used)"):
+        values = [re.findall(r"(?m)^(?:# |- )?" + label + r": ([^\r\n]+)\r?$",
+                             str(m.content)) for m in available_messages]
+        flattened = {value for group in values for value in group}
+        if any(not group for group in values) or len(flattened) != 1:
+            return None
+        if label == "Snapshot ID" and flattened != {source_ref}:
+            return None
+    args = call["args"]
+    content = str(message.content)
+    lines = content.splitlines()
+    expected_title = (f"# Authoritative Market Snapshot for {symbol} "
+                      f"from {args.get('start_date')} to {args.get('end_date')}")
+    header = "Date,Open,High,Low,Close,Volume"
+    if (not lines or lines[0] != expected_title or lines.count(header) != 1
+            or lines.count(quote) != 1
+            or [line for line in lines if line.startswith("# Requested date:")]
+            != [f"# Requested date: {args.get('end_date')}"]):
+        return None
+    header_index = lines.index(header)
+    if lines.index(quote) <= header_index:
+        return None
+    numeric = r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+    row_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})(?:," + numeric + r"){5}")
+    rows = [row_pattern.fullmatch(line) for line in lines[header_index + 1:] if line]
+    if not rows or any(row is None for row in rows):
+        return None
+    dates = [row[1] for row in rows]
+    if len(dates) != len(set(dates)):
+        return None
+    selected = row_pattern.fullmatch(quote)
+    if selected is None:
+        return None
+    try:
+        start, end = date.fromisoformat(args['start_date']), date.fromisoformat(args['end_date'])
+        if any(not start <= date.fromisoformat(value) <= end for value in dates):
+            return None
+        if any(calls[str(m.tool_call_id)]["args"].get("curr_date", end.isoformat()) != end.isoformat()
+               for m in available_messages):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    snapshot = next((m for m in available_messages
+                     if getattr(m, "name", None) == "get_verified_market_snapshot"), None)
+    if snapshot is not None:
+        # Shared IDs/headers cannot hide contradictory latest-row projections.
+        # Reuse the strict renderer parser, and compare exact decimals rather
+        # than adding a new tolerance or certifying the model's field semantics.
+        effective = [line.removeprefix("# Effective trading date: ") for line in lines
+                     if line.startswith("# Effective trading date: ")]
+        if len(effective) != 1 or effective[0] not in dates:
+            return None
+        stock_latest = next(row[0].split(",")[1:] for row in rows if row[1] == effective[0])
+        snapshot_content = str(snapshot.content)
+        snapshot_call = calls[str(snapshot.tool_call_id)]
+        for field, stock_value in zip(("Open", "High", "Low", "Close", "Volume"), stock_latest, strict=True):
+            rendered = re.findall(r"(?m)^\| " + field + r" \| [^|\r\n]+ \|\r?$", snapshot_content)
+            if len(rendered) != 1:
+                return None
+            row_quote = rendered[0].rstrip("\r")
+            snapshot_row = _bound_snapshot_row(snapshot, snapshot_content, row_quote,
+                snapshot_content.find(row_quote), snapshot_call, source_ref)
+            if snapshot_row is None or snapshot_row.effective_date != effective[0]:
+                return None
+            try:
+                if Decimal(snapshot_row.value) != Decimal(stock_value):
+                    return None
+            except InvalidOperation:
+                return None
+    stated_dates = re.findall(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?![\w-])", _normalize_numeric_text(statement))
+    if any(value != selected[1] for value in stated_dates):
+        return None
+    return symbol
 
 
 def _numeric_token_parts(token: str) -> tuple[Decimal, int, bool] | None:
@@ -156,25 +304,376 @@ def _numeric_token_parts(token: str) -> tuple[Decimal, int, bool] | None:
     return value, decimals, is_percent
 
 
-def _numeric_token_supported(claim_token: str, source_tokens: Iterable[str]) -> bool:
+def _numeric_token_supported(claim_token: str, source_tokens: Iterable[str], *, comparison=None) -> bool:
     claim_parts = _numeric_token_parts(claim_token)
     if claim_parts is None:
         return False
     claim_value, claim_decimals, claim_percent = claim_parts
+    compared = False
     for source_token in source_tokens:
         source_parts = _numeric_token_parts(source_token)
         if source_parts is None:
             continue
         source_value, _, source_percent = source_parts
+        compared = True
         if claim_percent != source_percent:
+            if comparison is not None:
+                comparison(claim_token, source_token, "percent_mismatch", None, False)
             continue
         if claim_value == source_value:
+            if comparison is not None:
+                comparison(claim_token, source_token, "exact", None, True)
             return True
         if claim_decimals > 0:
             tolerance = Decimal(5).scaleb(-(claim_decimals + 1))
-            if abs(claim_value - source_value) <= tolerance:
+            matched = abs(claim_value - source_value) <= tolerance
+            if comparison is not None:
+                comparison(claim_token, source_token, "absolute_tolerance", tolerance, matched)
+            if matched:
                 return True
+        elif comparison is not None:
+            comparison(claim_token, source_token, "exact", None, False)
+    if not compared and comparison is not None:
+        comparison(claim_token, None, "no_reference", None, False)
     return False
+
+
+_MOVING_AVERAGE_NAMES = {
+    "close_50_sma": ("50", {"均线", "简单均线", "简单移动均线", "简单移动平均线", "SMA"}),
+    "close_200_sma": ("200", {"均线", "简单均线", "简单移动均线", "简单移动平均线", "SMA"}),
+    "close_10_ema": ("10", {"均线", "指数均线", "指数移动均线", "指数移动平均线", "EMA"}),
+}
+# Acronyms use the same whole-observation, bound-period/type checks as Chinese
+# names. Only their name span is metadata; measured values remain evidence-bound.
+_MOVING_AVERAGE_LABEL = (
+    r"(?P<period>\d+)[ \t]*日[ \t]*"
+    r"(?P<kind>简单移动平均线|指数移动平均线|简单移动均线|指数移动均线|简单均线|指数均线|均线|SMA|EMA)"
+)
+_MOVING_AVERAGE_LABEL_RE = re.compile(_MOVING_AVERAGE_LABEL)
+_MOVING_AVERAGE_OBSERVATION_RE = re.compile(
+    r"(?:(?:截至|在|于)?\s*(?P<date>\d{4}-\d{2}-\d{2}|\d{4}年\d{1,2}月\d{1,2}日)\s*(?:[，,]|的)?\s*)?"
+    r"(?P<latest>最新[ \t]*)?"
+    + _MOVING_AVERAGE_LABEL
+    + r"[ \t]*(?:值)?\s*(?:为|是|[:=])\s*(?:约)?(?P<value>[+-]?\d+(?:\.\d+)?)\s*[。. ]?"
+)
+_INDICATOR_CSV_ROW_RE = re.compile(
+    r"(?P<date>\d{4}-\d{2}-\d{2}),(?P<indicator>[a-z][a-z0-9_]*),(?P<value>[+-]?\d+(?:\.\d+)?)"
+)
+_INDICATOR_TEXT_ROW_RE = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2}): (?P<value>[+-]?\d+(?:\.\d+)?)")
+_INDICATOR_DATED_LINE_RE = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2}):.*")
+
+
+class _BoundIndicatorObservation(NamedTuple):
+    indicator: str
+    effective_date: str
+    value: str
+
+
+class _BoundSnapshotRow(NamedTuple):
+    field: str
+    effective_date: str
+    value: str
+
+
+def _bound_snapshot_row(message, content, quote, span_start, call, source_ref):
+    """Bind one whole row of the trusted snapshot renderer, not arbitrary prose.
+
+    The caller has already validated the call-bound acquisition envelope and
+    selected artifact bytes. This only supplies row/label context to excerpt
+    checking; it creates neither a canonical fact nor a strategy rule.
+    """
+    if (getattr(message, "name", None) != "get_verified_market_snapshot"
+            or not isinstance(call, Mapping) or call.get("name") != message.name
+            or call.get("id") != message.tool_call_id or not isinstance(call.get("args"), Mapping)):
+        return None
+    args = call["args"]
+    titles = re.findall(r"(?m)^## Verified market data snapshot for (\S+)\r?$", content)
+    requested = re.findall(r"(?m)^- Requested analysis date: (\d{4}-\d{2}-\d{2})\r?$", content)
+    latest = re.findall(r"(?m)^- Latest trading row used: (\d{4}-\d{2}-\d{2})\r?$", content)
+    ids = re.findall(r"(?m)^Snapshot ID: (\S+)\r?$", content)
+    frames = re.findall(r"(?m)^Frame SHA-256: ([0-9a-f]{64})\r?$", content)
+    prefixes = ("## Verified market data snapshot for ", "- Requested analysis date: ",
+                "- Latest trading row used: ", "Snapshot ID: ", "Frame SHA-256: ")
+    if any(sum(line.startswith(prefix) for line in content.splitlines()) != 1 for prefix in prefixes):
+        return None
+    if (titles != [args.get("symbol")] or requested != [args.get("curr_date")]
+            or len(latest) != 1 or ids != [source_ref] or len(frames) != 1):
+        return None
+    try:
+        if date.fromisoformat(latest[0]) > date.fromisoformat(requested[0]):
+            return None
+    except (ValueError, TypeError):
+        return None
+    if span_start != content.rfind("\n", 0, span_start) + 1:
+        return None
+    end = content.find("\n", span_start)
+    if quote != content[span_start:end if end >= 0 else len(content)].rstrip("\r"):
+        return None
+    row = re.fullmatch(r"\| ([A-Za-z][A-Za-z0-9_]*) \| ([+-]?\d+(?:\.\d+)?) \|", quote)
+    if row is None:
+        return None
+    field, value = row.groups()
+    if field in {"Open", "High", "Low", "Close", "Volume"}:
+        title, header = "### Latest verified OHLCV row", "| Field | Value |"
+    elif field in _MOVING_AVERAGE_NAMES or field == "rsi":
+        title, header = "### Verified technical indicators (latest row)", "| Indicator | Value |"
+    else:
+        return None
+    headings = tuple(re.finditer(r"(?m)^#{1,6} [^\r\n]+", content))
+    first_table = next((h.start() for h in headings if h[0].startswith("### ")), -1)
+    if any(content.find(prefix) >= first_table for prefix in prefixes):
+        return None
+    section = [h for h in headings if h[0] == title]
+    if len(section) != 1:
+        return None
+    start = section[0].end()
+    end = next((h.start() for h in headings if h.start() > section[0].start()), len(content))
+    if not start < span_start < end:
+        return None
+    lines = [line for line in content[start:end].splitlines() if line]
+    if lines[:2] != [header, "|---|---:|"]:
+        return None
+    rows = [re.fullmatch(r"\| ([A-Za-z][A-Za-z0-9_]*) \| ([^|]+) \|", line) for line in lines[2:]]
+    if (not rows or any(r is None for r in rows)
+            or len({r[1] for r in rows}) != len(rows)
+            or sum(r[1] == field and r[2] == value for r in rows) != 1):
+        return None
+    return _BoundSnapshotRow(field, latest[0], value)
+
+
+def _snapshot_dated_statement(statement, row):
+    """Recognize one explicit observation date from this exact row projection."""
+    if row is None:
+        return statement, None
+    normalized = _normalize_numeric_text(statement)
+    matches = tuple(re.finditer(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?![\w-])", normalized))
+    if not matches:
+        return statement, None
+    if len(matches) != 1 or matches[0][0] != row.effective_date:
+        return statement, "snapshot observation date conflicts with the cited row"
+    # The closed Chinese moving-average grammar validates and removes its own
+    # date span together with the bound period below. Other snapshot prose
+    # retains the explicit English observation-date rule.
+    chinese_observation = _MOVING_AVERAGE_OBSERVATION_RE.fullmatch(normalized.strip())
+    if chinese_observation is not None and chinese_observation["date"]:
+        return statement, None
+    match = matches[0]
+    if re.search(r"\b(?:on|as of)\s+$", normalized[:match.start()], re.IGNORECASE) is None:
+        return statement, "snapshot date is not an explicit observation-date span"
+    normalized = normalized[:match.start()] + normalized[match.end():]
+    return normalized, None
+
+
+def _bound_indicator_observation(message, content, quote, span_start, call):
+    """Bind one complete data row to its requested, known indicator schema."""
+    if (getattr(message, "name", None) != "get_indicators" or not isinstance(call, Mapping)
+            or call.get("name") != "get_indicators" or not isinstance(call.get("args"), Mapping)):
+        return None
+    requested = call["args"].get("indicator")
+    if not isinstance(requested, str):
+        return None
+    requested_ids = tuple(item.strip().casefold() for item in requested.split(","))
+    if span_start != content.rfind("\n", 0, span_start) + 1:
+        return None
+    line_end = content.find("\n", span_start)
+    if quote != content[span_start:line_end if line_end >= 0 else len(content)].rstrip("\r"):
+        return None
+    csv_row = _INDICATOR_CSV_ROW_RE.fullmatch(quote)
+    if csv_row:
+        headers = tuple(re.finditer(r"(?m)^date,indicator,value\r?$", content))
+        if len(headers) != 1 or headers[0].end() >= span_start:
+            return None
+        table_rows = [_INDICATOR_CSV_ROW_RE.fullmatch(line)
+                      for line in content[headers[0].end():].splitlines() if line]
+        if any(item is None for item in table_rows):
+            return None
+        indicator = csv_row["indicator"]
+        row = csv_row
+        if sum(item["date"] == row["date"] and item["indicator"] == indicator for item in table_rows) != 1:
+            return None
+    else:
+        row = _INDICATOR_TEXT_ROW_RE.fullmatch(quote)
+        if row is None:
+            return None
+        # Every heading ends the previous section, including unrequested/unknown ones.
+        headings = tuple(re.finditer(r"(?m)^#{1,6}\s+[^\r\n]+", content))
+        previous = [heading for heading in headings if heading.end() < span_start]
+        if not previous:
+            return None
+        heading = re.fullmatch(
+            r"## ([a-z][a-z0-9_]*) values from (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2}):", previous[-1][0])
+        if heading is None:
+            return None
+        indicator = heading[1]
+        same_indicator_headings = [item for item in headings
+            if re.match(rf"## {re.escape(indicator)} values\b", item[0])]
+        if len(same_indicator_headings) != 1:
+            return None
+        section_end = next((item.start() for item in headings if item.start() > previous[-1].start()), len(content))
+        # The production renderer has a single consecutive date-row block after
+        # the heading. Its footer/description is not observation data. Count N/A
+        # or malformed values too, so they cannot conceal a same-date conflict.
+        dated_rows = []
+        position = previous[-1].end()
+        for line in content[position:section_end].splitlines(keepends=True):
+            start = position
+            position += len(line)
+            stripped = line.rstrip("\r\n")
+            if not dated_rows and not stripped.strip():
+                continue
+            dated = _INDICATOR_DATED_LINE_RE.fullmatch(stripped)
+            if dated is None:
+                break
+            dated_rows.append((start, dated["date"]))
+        if (not any(start == span_start for start, _ in dated_rows)
+                or sum(day == row["date"] for _, day in dated_rows) != 1):
+            return None
+        try:
+            if not date.fromisoformat(heading[2]) <= date.fromisoformat(row["date"]) <= date.fromisoformat(heading[3]):
+                return None
+        except ValueError:
+            return None
+    if indicator not in _MOVING_AVERAGE_NAMES or indicator not in requested_ids:
+        return None
+    try:
+        date.fromisoformat(row["date"])
+    except ValueError:
+        return None
+    return _BoundIndicatorObservation(indicator, row["date"], row["value"])
+
+
+def _bound_indicator_projection(message, available_messages, all_messages, calls,
+                                identity, source_ref, quote):
+    """One exact row among compatible trusted views, never select by value."""
+    if (getattr(message, "name", None) != "get_indicators"
+            or _has_unbound_source_projection(source_ref, available_messages, all_messages)):
+        return None
+    names = [getattr(m, "name", None) for m in available_messages]
+    if (len(names) != len(set(names))
+            or not set(names) <= {"get_stock_data", "get_verified_market_snapshot", "get_indicators"}
+            or sum(str(m.content).count(quote) for m in available_messages) != 1):
+        return None
+    call = calls.get(str(message.tool_call_id))
+    symbol = _bound_instrument_symbol(message, call, identity)
+    if symbol is None or any(_bound_instrument_symbol(m, calls.get(str(m.tool_call_id)), identity)
+                             != symbol for m in available_messages):
+        return None
+    for companion in available_messages:
+        args = calls[str(companion.tool_call_id)]['args']
+        if companion.name == 'get_stock_data':
+            title = (f"# Authoritative Market Snapshot for {symbol} "
+                     f"from {args.get('start_date')} to {args.get('end_date')}")
+        elif companion.name == 'get_verified_market_snapshot':
+            title = f"## Verified market data snapshot for {symbol}"
+        else:
+            continue
+        if not str(companion.content).startswith(title + '\n'):
+            return None
+    metadata = {}
+    for label in ("Provider", "Adjustment basis", "Frame SHA-256", "Snapshot ID",
+                  "(?:Effective trading date|Latest trading row used)"):
+        groups = [re.findall(r"(?m)^(?:# |- )?" + label + r": ([^\r\n]+)\r?$", str(m.content))
+                  for m in available_messages]
+        values = {value for group in groups for value in group}
+        if any(not group for group in groups) or len(values) != 1:
+            return None
+        metadata[label] = next(iter(values))
+    if (metadata['Snapshot ID'] != source_ref
+            or re.fullmatch(r"[0-9a-f]{64}", metadata['Frame SHA-256']) is None):
+        return None
+    effective = metadata['(?:Effective trading date|Latest trading row used)']
+    requested = call['args'].get('curr_date')
+    try:
+        if date.fromisoformat(effective) > date.fromisoformat(requested):
+            return None
+        if any(calls[str(m.tool_call_id)]['args'].get('curr_date',
+               calls[str(m.tool_call_id)]['args'].get('end_date')) != requested
+               for m in available_messages):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    content = str(message.content)
+    observation = _bound_indicator_observation(message, content, quote, content.find(quote), call)
+    if observation is None or observation.effective_date > effective:
+        return None
+    # A latest-value companion cannot contradict the exact indicator row.
+    snapshot = next((m for m in available_messages if m.name == 'get_verified_market_snapshot'), None)
+    if snapshot is not None and observation.effective_date == effective:
+        snapshot_content = str(snapshot.content)
+        rows = re.findall(r"(?m)^\| " + re.escape(observation.indicator) + r" \| [^|\r\n]+ \|\r?$", snapshot_content)
+        if len(rows) != 1:
+            return None
+        row_quote = rows[0].rstrip('\r')
+        row = _bound_snapshot_row(snapshot, snapshot_content, row_quote, snapshot_content.find(row_quote),
+                                  calls.get(str(snapshot.tool_call_id)), source_ref)
+        if (row is None or row.effective_date != effective
+                or not _numeric_token_supported(row.value, (observation.value,))):
+            return None
+    return observation
+
+
+def _moving_average_numeric_statement(statement, observation, *, snapshot_context=False,
+                                     indicator_context=False, comparison=None):
+    """Normalize only a bound name span; keep values and evidence verdict strict."""
+    normalized = _normalize_numeric_text(statement).strip()
+    english = tuple(re.finditer(r"(?<![\w.-])(?P<period>\d+)-day (?P<kind>SMA|EMA)(?!\w)", normalized, re.IGNORECASE))
+    if english:
+        # One exact identity span, never all occurrences of its digits. Other
+        # numeric observations retain the existing quote comparator/tolerance.
+        labels = re.findall(r"\b(?:SMA|EMA|RSI|MACD|ATR)\b|close_\d+_(?:sma|ema)", normalized, re.IGNORECASE)
+        if (not (snapshot_context or indicator_context) or len(english) != 1 or len(labels) != 1 or observation is None
+                or _MOVING_AVERAGE_LABEL_RE.search(normalized)):
+            return statement, (), "indicator name metadata is not bound to one unambiguous observation"
+        match = english[0]
+        period, _ = _MOVING_AVERAGE_NAMES[observation.indicator]
+        if match["period"] != period or match["kind"].lower() != observation.indicator.rsplit("_", 1)[1]:
+            return statement, (), "indicator name metadata conflicts with the cited indicator"
+        dates = re.findall(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?![\w-])", normalized)
+        if any(value != observation.effective_date for value in dates):
+            return statement, (), "indicator observation date conflicts with the cited row"
+        if re.search(r"(?i)\b(?:USD|CNY|RMB|dollars?|yuan|shares?|lots?|percent|pct|million|billion|thousand)\b|[%$€¥元股手万亿]", normalized):
+            return statement, (), "indicator observation units are not established by the cited row"
+        start, end = match.span("period")
+        without_name_period = normalized[:start] + normalized[end:]
+        if indicator_context:
+            # Dates are verified against this exact row above; their component
+            # digits must never supply the separate observation value.
+            amounts = _numeric_claim_tokens(re.sub(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?![\w-])", "", without_name_period))
+            if not amounts:
+                return statement, (), "indicator observation value is absent from the dated claim"
+            mismatches = tuple(value for value in amounts if not _numeric_token_supported(
+                value, (observation.value,), comparison=comparison))
+            return without_name_period, mismatches, None
+        return without_name_period, (), None
+    if _MOVING_AVERAGE_LABEL_RE.search(normalized) is None:
+        return statement, (), None
+    matched = _MOVING_AVERAGE_OBSERVATION_RE.fullmatch(normalized)
+    if matched is None or observation is None:
+        return statement, (), "indicator name metadata is not bound to one unambiguous unit-free observation"
+    # A dated indicator series can quote an older row. Only the separately
+    # validated latest-snapshot projection establishes the word "latest".
+    if matched["latest"] and not snapshot_context:
+        return statement, (), "latest indicator observation requires a bound latest snapshot row"
+    period, names = _MOVING_AVERAGE_NAMES[observation.indicator]
+    if matched["period"] != period or matched["kind"] not in names:
+        return statement, (), "indicator name metadata conflicts with the cited indicator"
+    if matched["date"]:
+        stated_date = matched["date"].replace("年", "-").replace("月", "-").removesuffix("日")
+        try:
+            stated_date = date(*map(int, stated_date.split("-"))).isoformat()
+        except ValueError:
+            return statement, (), "indicator observation date is invalid"
+        if stated_date != observation.effective_date:
+            return statement, (), "indicator observation date conflicts with the cited row"
+    # The observation value may not borrow a matching year/month/day or period.
+    unsupported_value = () if _numeric_token_supported(
+        matched["value"], (observation.value,), comparison=comparison) else (matched["value"],)
+    spans = [matched.span("period")]
+    if snapshot_context and matched["date"]:
+        spans.append(matched.span("date"))
+    for start, end in sorted(spans, reverse=True):
+        normalized = normalized[:start] + normalized[end:]
+    return normalized, unsupported_value, None
 
 
 def _source_quote_is_unavailable(quote: str) -> bool:
@@ -934,9 +1433,15 @@ class SourceFact(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    financial_observation: FinancialObservation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_semantics(self) -> SourceFact:
+        if self.financial_observation is not None and self.fact_kind != "excerpt":
+            raise ValueError("CURRENT row observation cannot promote a canonical Source Fact")
         if not self.raw_text.strip():
             raise ValueError("Source Fact raw_text must be a nonblank exact excerpt")
         if (
@@ -1368,6 +1873,56 @@ class ClaimValidation(BaseModel):
     status: ClaimValidationStatus
     detail: str = ""
     fact_ids: tuple[str, ...] = ()
+    comparison_evidence: NumericComparisonEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
+class SubmittedEvidenceNote(BaseModel):
+    """Source limitations submitted by the model, never financial premises."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    note_id: str = Field(pattern=_CLAIM_ID_PATTERN)
+    kind: Literal["provenance", "availability", "coverage", "applicability"]
+    statement: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    source_quote: str = Field(min_length=1)
+
+
+class EvidenceNote(SubmittedEvidenceNote):
+    """A traceable limitation, separate from Source Facts and claim validation.
+
+    Quote binding establishes what the tool reported, not the semantics of the
+    model's paraphrase. Source necessity is the observed source-level policy;
+    it does not establish whether an individual metric is required by a rule.
+    """
+
+    contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
+    analyst: str
+    binding_status: Literal["source_bound_quote", "unverified"] = "unverified"
+    detail: str = "not bound"
+    source_status: EvidenceStatus | None = None
+    source_required: bool | None = None
+    metric_requirement: Literal["not_assessed"] = "not_assessed"
+    semantic_status: Literal["not_established"] = "not_established"
+    decision_qualified: Literal[False] = False
+    tool_call_id: str | None = None
+    source_content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    quote_start: int | None = Field(default=None, ge=0)
+    quote_end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_quote_binding(self) -> EvidenceNote:
+        proof = (self.tool_call_id, self.source_content_sha256, self.quote_start, self.quote_end)
+        if self.binding_status == "source_bound_quote":
+            if (any(value is None for value in proof) or not self.tool_call_id
+                    or self.source_status is None or self.source_required is None
+                    or self.quote_end - self.quote_start != len(self.source_quote)):
+                raise ValueError("source-bound note requires a complete, consistent quote location")
+        elif any(value is not None for value in proof):
+            raise ValueError("unverified note cannot retain a prior quote binding")
+        return self
 
 
 class AnalystEvidenceReport(BaseModel):
@@ -1378,6 +1933,7 @@ class AnalystEvidenceReport(BaseModel):
     contract_version: Literal["1.0"] = EVIDENCE_CONTRACT_VERSION
     report_markdown: str
     material_claims: tuple[SubmittedMaterialClaim, ...] = ()
+    evidence_notes: tuple[SubmittedEvidenceNote, ...] = ()
 
 
 class EvidenceSource(BaseModel):
@@ -1835,6 +2391,9 @@ class EvidenceState(BaseModel):
     instrument_identity: InstrumentIdentityEvidence | None = None
     market_snapshot: MarketSnapshotEvidence | None = None
     material_claims: tuple[MaterialClaim, ...] = ()
+    evidence_notes: tuple[EvidenceNote, ...] = Field(
+        default=(), exclude_if=lambda value: not value,
+    )
     source_facts: tuple[SourceFact, ...] = ()
     current_analysis_source_facts: tuple[SourceFact, ...] = Field(
         default=(),
@@ -2047,6 +2606,8 @@ def merge_material_claims(
     )
     merged = {claim.claim_id: claim for claim in current.material_claims}
     for claim in claims:
+        if any(note.note_id == claim.claim_id for note in current.evidence_notes):
+            raise ValueError("an evidence note cannot be reclassified as a material claim")
         existing = merged.get(claim.claim_id)
         if existing is not None and existing != claim:
             raise ValueError(
@@ -2054,6 +2615,23 @@ def merge_material_claims(
             )
         merged[claim.claim_id] = claim
     return current.model_copy(update={"material_claims": tuple(merged.values())})
+
+
+def merge_evidence_notes(
+    evidence: EvidenceState,
+    notes: Iterable[EvidenceNote],
+) -> EvidenceState:
+    """Preserve limitations without creating facts or replacing financial claims."""
+    merged = {note.note_id: note for note in evidence.evidence_notes}
+    claim_ids = {claim.claim_id for claim in evidence.material_claims}
+    for note in notes:
+        if note.note_id in claim_ids:
+            raise ValueError("a material claim cannot be reclassified as an evidence note")
+        previous = merged.get(note.note_id)
+        if previous is not None and previous != note:
+            raise ValueError("immutable evidence note ID was redefined")
+        merged[note.note_id] = note
+    return evidence.model_copy(update={"evidence_notes": tuple(merged.values())})
 
 
 def merge_source_facts(
@@ -2190,10 +2768,14 @@ def build_tool_evidence_state(
     *,
     tool_call_ids_by_source: Mapping[str, Iterable[str]],
     tool_calls_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    instrument_identity: InstrumentIdentityEvidence | None = None,
+    notes: Iterable[EvidenceNote] = (),
+    include_catalog_sources: bool = False,
 ) -> EvidenceState:
     """Materialize immutable source facts and per-claim validation results."""
     message_list = tuple(messages)
     claim_list = tuple(claims)
+    note_list = tuple(notes)
     call_catalog = tool_calls_by_id or {}
 
     def calculation_ids_for_span(
@@ -2238,7 +2820,7 @@ def build_tool_evidence_state(
             tool_messages.setdefault(str(tool_call_id), []).append(message)
 
     claims_by_source: dict[str, list[MaterialClaim]] = {}
-    for claim in claims:
+    for claim in claim_list:
         for source_ref in claim.source_refs:
             claims_by_source.setdefault(source_ref, []).append(claim)
     allowed_refs = frozenset(tool_call_ids_by_source)
@@ -2246,8 +2828,13 @@ def build_tool_evidence_state(
     sources: list[EvidenceSource] = []
     acquisition_outcomes: list[SourceAcquisitionOutcome] = []
     available_messages_by_source: dict[str, tuple[Any, ...]] = {}
+    validated_messages_by_source: dict[str, tuple[Any, ...]] = {}
     selected_artifacts_by_source_call: dict[tuple[str, str], SourceArtifact] = {}
-    for source_ref in claims_by_source:
+    requested_refs = dict.fromkeys((
+        *claims_by_source, *(note.source_ref for note in note_list),
+        *(tool_call_ids_by_source if include_catalog_sources else ()),
+    ))
+    for source_ref in requested_refs:
         if source_ref not in allowed_refs:
             sources.append(
                 EvidenceSource(
@@ -2363,6 +2950,9 @@ def build_tool_evidence_state(
             for outcome in envelope.acquisition_outcomes
         )
         acquisition_outcomes.extend(attempt_outcomes)
+        validated_messages_by_source[source_ref] = tuple(
+            message for message, _ in envelopes
+        )
         available_messages = tuple(
             message
             for message, envelope in envelopes
@@ -2404,6 +2994,10 @@ def build_tool_evidence_state(
         numeric_diagnostics: list[str] = []
         ambiguous_quote = False
         quote = claim.source_quote.strip() or claim.statement.strip()
+        indicator_observation = None
+        indicator_projection_bound = False
+        snapshot_row = None
+        bound_symbol = None
         for source_ref in claim.source_refs:
             available_messages = available_messages_by_source.get(source_ref, ())
             if not available_messages:
@@ -2425,6 +3019,47 @@ def build_tool_evidence_state(
                 artifact_digest = artifact.artifact_sha256
                 artifact_key = (artifact_digest, artifact_tool_call_id, source_ref)
                 artifacts[artifact_key] = artifact
+                # This opt-in name interpretation requires one unambiguous
+                # artifact. Its fact metadata is source-derived, independent of
+                # claim wording/order when several claims share a fact ID.
+                if len(available_messages) == 1:
+                    bound_symbol = _bound_instrument_symbol(
+                        message, call_catalog.get(wrapper_tool_call_id), instrument_identity)
+                    if (getattr(message, "name", None) == "get_stock_data"
+                            and _has_unbound_source_projection(source_ref, available_messages, message_list)):
+                        bound_symbol = None
+                    indicator_observation = _bound_indicator_observation(
+                        message, content, quote, span_start, call_catalog.get(wrapper_tool_call_id))
+                elif len(claim.source_refs) == 1:
+                    bound_symbol = _bound_stock_projection_symbol(
+                        message, available_messages, message_list, call_catalog, instrument_identity,
+                        source_ref, quote, claim.statement)
+                if len(claim.source_refs) == 1:
+                    projected = _bound_indicator_projection(message, available_messages, message_list,
+                        call_catalog, instrument_identity, source_ref, quote)
+                    if projected is not None:
+                        indicator_observation = projected
+                        indicator_projection_bound = True
+                # Different tools can project the same snapshot ID. Only one
+                # verified-snapshot projection may establish its row context;
+                # duplicate/conflicting projections are never chosen by value.
+                snapshot_messages = tuple(m for m in available_messages
+                    if getattr(m, "name", None) == "get_verified_market_snapshot")
+                if len(snapshot_messages) == 1 and message is snapshot_messages[0]:
+                    snapshot_row = _bound_snapshot_row(message, content, quote, span_start,
+                        call_catalog.get(wrapper_tool_call_id), source_ref)
+                    if snapshot_row is not None and snapshot_row.field in _MOVING_AVERAGE_NAMES:
+                        indicator_observation = _BoundIndicatorObservation(
+                            snapshot_row.field, snapshot_row.effective_date, snapshot_row.value)
+                calculation_ids = ((indicator_observation.indicator,) if indicator_observation
+                    else calculation_ids_for_span(message, content, span_start))
+                financial_observation = None
+                if bound_symbol and instrument_identity is not None and instrument_identity.currency == "CNY":
+                    financial_observation = bind_current_statement_observation(
+                        raw_text=content, quote=quote, source_ref=source_ref,
+                        tool_call_id=artifact_tool_call_id, tool_name=artifact.tool_name,
+                        artifact_sha256=artifact_digest, symbol=bound_symbol,
+                    )
                 fact_id = stable_source_fact_id(
                     source_ref=source_ref,
                     artifact_sha256=artifact_digest,
@@ -2442,19 +3077,40 @@ def build_tool_evidence_state(
                         source_span_start=span_start,
                         source_span_end=span_start + len(quote),
                         normalized_numeric_tokens=_numeric_claim_tokens(quote),
-                        calculation_ids=calculation_ids_for_span(
-                            message,
-                            content,
-                            span_start,
-                        ),
+                        calculation_ids=calculation_ids,
+                        instrument_symbol=bound_symbol if financial_observation is not None else "",
+                        financial_observation=financial_observation,
                     )
                 )
                 break
 
         unique_facts = {fact.fact_id: fact for fact in claim_facts}
         claim_fact_ids = tuple(unique_facts)
+        comparison_recorder = ComparisonRecorder(claim.statement, quote, *claim.source_refs)
+        comparison_digests = {fact.artifact_sha256 for fact in unique_facts.values()}
+        comparison_digest = next(iter(comparison_digests)) if len(comparison_digests) == 1 else None
+        for comparison_artifact in artifacts.values():
+            if comparison_artifact.artifact_sha256 in comparison_digests:
+                comparison_recorder.screen(comparison_artifact.raw_text)
+        instrument_statement = _instrument_numeric_statement(claim.statement, bound_symbol)
+        dated_statement, snapshot_metadata_error = _snapshot_dated_statement(
+            instrument_statement, snapshot_row)
+        numeric_statement, observation_mismatches, indicator_metadata_error = _moving_average_numeric_statement(
+            dated_statement, indicator_observation, snapshot_context=snapshot_row is not None,
+            indicator_context=indicator_projection_bound,
+            comparison=comparison_recorder.observer("indicator_observation", comparison_digest))
+        # A date-role exemption cannot remove the claimed observation itself or
+        # leave only an indicator period. Check after all name normalization.
+        if (snapshot_row is not None and dated_statement != instrument_statement
+                and not any(_numeric_token_supported(token, (snapshot_row.value,),
+                            comparison=comparison_recorder.observer("snapshot_value", comparison_digest))
+                            for token in _numeric_claim_tokens(numeric_statement))):
+            snapshot_metadata_error = "snapshot observation value is absent from the dated claim"
+        indicator_metadata_error = indicator_metadata_error or snapshot_metadata_error
         if claim_fact_ids:
-            unsupported_tokens = unsupported_numeric_claim_tokens((claim,), (quote,))
+            unsupported_tokens = (*observation_mismatches, *unsupported_numeric_claim_tokens(
+                (claim.model_copy(update={"statement": numeric_statement}),), (quote,),
+                comparison=comparison_recorder.observer("tool_excerpt", comparison_digest)))
             numeric_diagnostics.extend(
                 token for token in unsupported_tokens if token not in numeric_diagnostics
             )
@@ -2490,6 +3146,11 @@ def build_tool_evidence_state(
                     fact_ids=claim_fact_ids,
                 )
             )
+        elif indicator_metadata_error:
+            validations.append(
+                ClaimValidation(claim_id=claim.claim_id, status=ClaimValidationStatus.UNSUPPORTED,
+                    detail=indicator_metadata_error, fact_ids=claim_fact_ids)
+            )
         elif numeric_diagnostics:
             validations.append(
                 ClaimValidation(
@@ -2510,11 +3171,61 @@ def build_tool_evidence_state(
                     fact_ids=claim_fact_ids,
                 )
             )
+        validations[-1] = validations[-1].model_copy(update={
+            "comparison_evidence": comparison_recorder.finish(unique_facts.values())
+        })
+        # Observe the exact local decision outside the canonical audit contract.
+        from tradingagents.run_diagnostics import record_claim
+
+        record_claim(claim=claim, validation=validations[-1], facts=tuple(unique_facts.values()),
+                     sources=sources, numeric_statement=numeric_statement,
+                     indicator=indicator_observation, bound_symbol=bound_symbol,
+                     unsupported=tuple(numeric_diagnostics), indicator_error=indicator_metadata_error,
+                     snapshot_row=snapshot_row)
         facts.extend(unique_facts.values())
         enriched_claims.append(claim.model_copy(update={"fact_ids": claim_fact_ids}))
 
+    source_catalog = {source.source_id: source for source in sources}
+    bound_notes = []
+    for note in note_list:
+        source = source_catalog.get(note.source_ref)
+        matches = []
+        for message in validated_messages_by_source.get(note.source_ref, ()):
+            content = str(getattr(message, "content", ""))
+            # Even unavailable results may document a limitation. They never
+            # acquire a SourceArtifact or SourceFact through this diagnostic path.
+            starts = tuple(match.start() for match in re.finditer(
+                re.escape(note.source_quote), content,
+            ))
+            matches.extend((message, content, start) for start in starts)
+        fields: dict[str, Any] = {
+            "binding_status": "unverified",
+            "tool_call_id": None,
+            "source_content_sha256": None,
+            "quote_start": None,
+            "quote_end": None,
+            "source_status": source.status if source else None,
+            "source_required": source.required if source else None,
+            "detail": "quote is not uniquely bound to a validated tool result",
+        }
+        if len(matches) == 1:
+            message, content, start = matches[0]
+            fields.update(
+                binding_status="source_bound_quote",
+                detail="exact tool quote; paraphrase semantics not established",
+                tool_call_id=str(getattr(message, "tool_call_id", "")),
+                source_content_sha256=sha256(content.encode("utf-8")).hexdigest(),
+                quote_start=start, quote_end=start + len(note.source_quote),
+            )
+        bound_note = note.model_copy(update=fields)
+        from tradingagents.run_diagnostics import record_note_binding
+
+        record_note_binding(bound_note, validated_message_count=len(
+            validated_messages_by_source.get(note.source_ref, ())), match_count=len(matches))
+        bound_notes.append(bound_note)
     return EvidenceState(
         material_claims=tuple(enriched_claims),
+        evidence_notes=tuple(bound_notes),
         source_facts=tuple({fact.fact_id: fact for fact in facts}.values()),
         source_artifacts=tuple(artifacts.values()),
         claim_validations=tuple(validations),
@@ -2588,6 +3299,7 @@ def build_inline_evidence_state(
     for claim in claim_list:
         quote = claim.source_quote.strip() or claim.statement.strip()
         claim_facts: dict[str, SourceFact] = {}
+        comparison_recorder = ComparisonRecorder(claim.statement, quote, *claim.source_refs)
         unavailable_refs: list[str] = []
         numeric_diagnostics: list[str] = []
         ambiguous_quote = False
@@ -2596,9 +3308,11 @@ def build_inline_evidence_state(
             if content is None:
                 unavailable_refs.append(source_ref)
                 continue
+            comparison_recorder.screen(content)
             numeric_diagnostics.extend(
                 token
-                for token in unsupported_numeric_claim_tokens((claim,), (content,))
+                for token in unsupported_numeric_claim_tokens((claim,), (content,),
+                    comparison=comparison_recorder.observer("inline_source", sha256(content.encode()).hexdigest()))
                 if token not in numeric_diagnostics
             )
             if quote and content.count(quote) > 1:
@@ -2680,6 +3394,7 @@ def build_inline_evidence_state(
                 status=status,
                 detail=detail,
                 fact_ids=claim_fact_ids,
+                comparison_evidence=comparison_recorder.finish(claim_facts.values()),
             )
         )
         facts.extend(claim_facts.values())
@@ -2715,24 +3430,107 @@ def build_inline_evidence_state(
     )
 
 
+_CALENDAR_DATE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_.])(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|"
+    r"[0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日)(?![0-9]|\.[0-9])"
+)
+
+
+# Recognize complete colon clock tokens, optionally attached to an ISO date.
+# Do not infer compact/partial dates, local-language times, units or UTC instants.
+_CLOCK_TOKEN_PATTERN = (
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
+_TIMESTAMP_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_.])(?P<day>[0-9]{4}-[0-9]{2}-[0-9]{2})[T ]"
+    r"(?P<clock>" + _CLOCK_TOKEN_PATTERN + r")(?![A-Za-z0-9_:+-]|\.[0-9])"
+)
+_CLOCK_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_.:+-])" + _CLOCK_TOKEN_PATTERN
+    + r"(?![A-Za-z0-9_:+-]|\.[0-9])"
+)
+
+
+def _clock_identity(raw: str) -> str | None:
+    # Validate ranges with datetime, but retain all fractional digits: Python's
+    # microsecond conversion must not equate distinct higher-precision times.
+    value = raw.removesuffix("Z") + ("+00:00" if raw.endswith("Z") else "")
+    try:
+        datetime.fromisoformat("2000-01-01T" + value)
+        zone = re.search(r"[+-]([0-9]{2}):([0-9]{2})$", value)
+        if zone and (int(zone[1]) > 23 or int(zone[2]) > 59):
+            return None
+    except ValueError:
+        return None
+    return re.sub(r"\.([0-9]+)", lambda m: ("." + m[1].rstrip("0")).rstrip("."), value)
+
+
+def _numeric_claim_roles(text: str):
+    """Separate explicit calendar/clock identities from amounts without units."""
+    normalized = _normalize_numeric_text(text)
+    temporal = []
+
+    def timestamp_token(match):
+        raw, day, clock = match.group(), match["day"], match["clock"]
+        value = _clock_identity(clock)
+        try:
+            day = date.fromisoformat(day).isoformat()
+        except ValueError:
+            value = None
+        if value is None:
+            temporal.append((raw, None))
+        else:
+            # A full timestamp needs its own identity: never assemble a claimed
+            # date/time from two different source timestamps. Date-only/clock-
+            # only statements may still cite those explicit components.
+            temporal.extend(((raw, "datetime:" + day + "T" + value),
+                             (day, day), (clock, "time:" + value)))
+        return " " * len(raw)
+
+    def clock_token(match):
+        raw = match.group()
+        value = _clock_identity(raw)
+        temporal.append((raw, "time:" + value if value is not None else None))
+        return " " * len(raw)
+
+    def calendar_token(match):
+        raw = match.group()
+        parts = raw.replace("年", "-").replace("月", "-").removesuffix("日").split("-")
+        try:
+            value = date(*map(int, parts)).isoformat()
+        except ValueError:
+            value = None
+        temporal.append((raw, value))
+        return " " * len(raw)
+
+    numeric_text = _TIMESTAMP_TOKEN.sub(timestamp_token, normalized)
+    numeric_text = _CLOCK_TOKEN.sub(clock_token, numeric_text)
+    numeric_text = _CALENDAR_DATE_TOKEN.sub(calendar_token, numeric_text)
+    return _numeric_claim_tokens(numeric_text), tuple(temporal)
+
+
 def unsupported_numeric_claim_tokens(
     claims: Iterable[MaterialClaim],
     source_texts: Iterable[str],
+    *, comparison=None,
 ) -> tuple[str, ...]:
-    """Return numeric claim tokens absent from every supplied source text."""
-    source_tokens = tuple(
-        token
-        for source_text in source_texts
-        for token in _numeric_claim_tokens(source_text)
-    )
+    """Match amounts to non-temporal numbers; explicit times/dates by identity."""
+    source_roles = tuple(_numeric_claim_roles(text) for text in source_texts)
+    source_tokens = tuple(token for tokens, _ in source_roles for token in tokens)
+    source_dates = {value for _, dates in source_roles for _, value in dates if value is not None}
     unsupported = []
     for claim in claims:
-        claim_tokens = _numeric_claim_tokens(claim.statement)
+        claim_tokens, claim_dates = _numeric_claim_roles(claim.statement)
+        # Temporal identity is an exact structural check, not a numerical
+        # tolerance comparison. Do not manufacture numeric execution evidence.
+        for raw, value in claim_dates:
+            if value is None or value not in source_dates:
+                unsupported.extend(token for token in _numeric_claim_tokens(raw) if token not in unsupported)
         unsupported.extend(
             token
             for token in claim_tokens
             if token not in unsupported
-            and not _numeric_token_supported(token, source_tokens)
+            and not _numeric_token_supported(token, source_tokens, comparison=comparison)
         )
     return tuple(unsupported)
 
@@ -2813,6 +3611,8 @@ def _claim_provenance_failure(
                 "Source Artifact"
             )
         calculation_ids.extend(fact.calculation_ids)
+        if fact.fact_kind == "excerpt" and fact.tool_name in FINANCIAL_TOOLS:
+            return "financial excerpt has no canonical semantic qualification; source-row observations are not decision premises"
     if calculation_ids:
         from tradingagents.dataflows.market_snapshot import (
             _minimum_history_for_indicator,
@@ -2828,6 +3628,56 @@ def _claim_provenance_failure(
                 f"{claim.minimum_history_rows} declared; {required_rows} required"
             )
     return None
+
+
+def verified_financial_observations(
+    evidence: EvidenceState | Mapping[str, Any], *, claim_ids: Iterable[str] | None = None,
+) -> tuple[FinancialObservation, ...]:
+    """Rederive display-only observations, including after checkpoint loading."""
+    current = evidence if isinstance(evidence, EvidenceState) else EvidenceState.model_validate(evidence)
+    identity = current.instrument_identity
+    if identity is None or not identity.is_authoritative or identity.currency != "CNY":
+        return ()
+    if (identity.symbol.endswith(".SS") and identity.venue != "XSHG") or (
+        identity.symbol.endswith(".SZ") and identity.venue != "XSHE"
+    ):
+        return ()
+    selected = None if claim_ids is None else frozenset(claim_ids)
+    supported = {v.claim_id: v for v in current.claim_validations if v.status is ClaimValidationStatus.SUPPORTED}
+    claims = tuple(claim for claim in current.material_claims
+                   if (selected is None or claim.claim_id in selected)
+                   and claim.claim_id in supported
+                   and set(claim.fact_ids) == set(supported[claim.claim_id].fact_ids))
+    sources = {source.source_id: source for source in current.sources}
+    artifacts = {(a.artifact_sha256, a.tool_call_id, a.source_ref): a for a in current.source_artifacts}
+    verified = {}
+    for fact in current.source_facts:
+        if (fact.fact_kind != "excerpt"
+                or fact.financial_observation is None or fact.instrument_symbol != identity.symbol):
+            continue
+        if not any(fact.fact_id in claim.fact_ids and fact.source_ref in claim.source_refs
+                   and fact.raw_text == claim.source_quote for claim in claims):
+            continue
+        source = sources.get(fact.source_ref)
+        if source is None or source.status is not EvidenceStatus.AVAILABLE:
+            continue
+        if fact.fact_id != stable_source_fact_id(
+            source_ref=fact.source_ref, artifact_sha256=fact.artifact_sha256,
+            source_span_start=fact.source_span_start, source_span_end=fact.source_span_end,
+        ):
+            continue
+        artifact = artifacts.get((fact.artifact_sha256, fact.tool_call_id, fact.source_ref))
+        if (artifact is None or artifact.tool_name != fact.tool_name
+                or artifact.raw_text[fact.source_span_start:fact.source_span_end] != fact.raw_text):
+            continue
+        expected = bind_current_statement_observation(
+            raw_text=artifact.raw_text, quote=fact.raw_text, source_ref=fact.source_ref,
+            tool_call_id=fact.tool_call_id, tool_name=fact.tool_name,
+            artifact_sha256=fact.artifact_sha256, symbol=identity.symbol,
+        )
+        if expected is not None and expected == fact.financial_observation:
+            verified[expected.observation_id] = expected
+    return tuple(verified.values())
 
 
 def decision_ready_material_claims(
@@ -3147,24 +3997,31 @@ def evaluate_decision_gate(
                 for claim, source_ref in unregistered_sources
             ),
         )
-    supported_numeric_claims = {
-        token
+    cited_roles = tuple(
+        _numeric_claim_roles(source_text)
         for claim_id in draft.material_claim_ids
         for source_text in (
             claims_by_id[claim_id].statement,
             claims_by_id[claim_id].source_quote,
         )
-        for token in _numeric_claim_tokens(source_text)
-    }
+    )
+    supported_numeric_claims = {token for tokens, _ in cited_roles for token in tokens}
+    supported_dates = {value for _, dates in cited_roles for _, value in dates if value is not None}
     numeric_narrative = draft.narrative
     for claim_id in draft.material_claim_ids:
         # The closed-ledger renderer annotates each premise as ``[claim_id]``.
         # Digits inside that immutable identifier are provenance, not a factual
         # assertion in the thesis, and must not be compared with source values.
         numeric_narrative = numeric_narrative.replace(f"[{claim_id}]", "")
-    unsupported_numeric_claims = tuple(
+    narrative_tokens, narrative_dates = _numeric_claim_roles(numeric_narrative)
+    unsupported_dates = tuple(
+        token for raw, value in narrative_dates
+        if value is None or value not in supported_dates
+        for token in _numeric_claim_tokens(raw)
+    )
+    unsupported_numeric_claims = unsupported_dates + tuple(
         token
-        for token in _numeric_claim_tokens(numeric_narrative)
+        for token in narrative_tokens
         if not _numeric_token_supported(token, supported_numeric_claims)
     )
     if unsupported_numeric_claims:
@@ -3878,6 +4735,9 @@ _ANALYSIS_DIAGNOSTIC_LABELS = {
     AnalysisDiagnosticCode.DETERMINISTIC_GATE_REJECTED: (
         "A deterministic trust-boundary check rejected publication."
     ),
+    AnalysisDiagnosticCode.OPTIONAL_EVIDENCE_UNAVAILABLE: (
+        "An optional evidence source was unavailable; this alone does not block a decision."
+    ),
     AnalysisDiagnosticCode.INSTRUMENT_CURRENTLY_SUSPENDED: (
         "The latest applicable mainland session authoritatively confirms suspension."
     ),
@@ -4112,6 +4972,18 @@ def evaluate_preflight_gate(
 
 
 def evaluate_admission_gate(
+    evidence: EvidenceState,
+    minimum_history_rows: int = 1,
+) -> AdmissionGateResult:
+    """Evaluate unchanged admission rules and retain opt-in safe gate context."""
+    from tradingagents.run_diagnostics import record_admission_gate
+
+    result = _evaluate_admission_gate(evidence, minimum_history_rows)
+    record_admission_gate(evidence, result)
+    return result
+
+
+def _evaluate_admission_gate(
     evidence: EvidenceState,
     minimum_history_rows: int = 1,
 ) -> AdmissionGateResult:

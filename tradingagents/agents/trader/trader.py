@@ -15,6 +15,7 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.report_presentation import advisory_direction_projection
 
 
 def create_trader(llm):
@@ -48,17 +49,26 @@ def create_trader(llm):
             },
         ]
 
+        projection = None
+
+        def render_and_capture(proposal):
+            nonlocal projection
+            body = render_trader_proposal(proposal)
+            projection = advisory_direction_projection(state, "trader", proposal.action.value, body)
+            return body
+
         trader_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
             messages,
-            render_trader_proposal,
+            render_and_capture,
             "Trader",
         )
 
         return {
             "messages": [AIMessage(content=trader_plan)],
             "trader_investment_plan": trader_plan,
+            "trader_advisory_direction": projection,
             "sender": name,
         }
 

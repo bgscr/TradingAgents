@@ -53,6 +53,7 @@ from cli.utils import (
     select_research_depth,
     select_shallow_thinking_agent,
 )
+from tradingagents.analysis_budget import checkpoint_storage_directory
 from tradingagents.asset_configuration import (
     RunAssetConfigurationError,
     resolve_run_asset_configuration,
@@ -72,7 +73,7 @@ from tradingagents.capability_routing import (
 )
 from tradingagents.dataflows.market_snapshot import authoritative_snapshot_run
 from tradingagents.dataflows.symbol_utils import resolve_mainland_instrument
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.default_config import DEFAULT_CONFIG, require_runtime_profile_loading
 from tradingagents.evidence import (
     EvidencePreflightResult,
     EvidenceState,
@@ -600,6 +601,7 @@ message_buffer = MessageBuffer()
 
 def get_user_selections():
     """Get all user selections before starting the analysis display."""
+    require_runtime_profile_loading()
     if os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT"):
         from tradingagents.runtime_protection_handoff import validate_protected_configuration
 
@@ -835,6 +837,10 @@ def get_user_selections():
     anthropic_effort = None
 
     provider_lower = selected_llm_provider.lower()
+    deepseek_effort = (
+        DEFAULT_CONFIG.get("deepseek_reasoning_effort")
+        if provider_lower == "deepseek" else None
+    )
     if provider_from_env:
         thinking_level = DEFAULT_CONFIG["google_thinking_level"]
         reasoning_effort = DEFAULT_CONFIG["openai_reasoning_effort"]
@@ -870,6 +876,7 @@ def get_user_selections():
         "deep_thinker": selected_deep_thinker,
         "google_thinking_level": thinking_level,
         "openai_reasoning_effort": reasoning_effort,
+        "deepseek_reasoning_effort": deepseek_effort,
         "anthropic_effort": anthropic_effort,
         "output_language": output_language,
         "china_a_enhancement_preset": china_a_enhancement_preset,
@@ -907,9 +914,14 @@ def get_analysis_date(ticker: str | None = None):
             )
 
 
-def save_report_to_disk(final_state, ticker: str, save_path: Path, *, output_language="English"):
+def save_report_to_disk(final_state, ticker: str, save_path: Path, *, output_language="English",
+                        supplemental_statement=None, company_announcement=None, announcement_timeout_seconds=25,
+                        announcement_remaining=None, news_source_selection=None):
     """Save the complete analysis report to disk (shared CLI/API writer)."""
-    return write_report_tree(final_state, ticker, save_path, output_language=output_language)
+    return write_report_tree(final_state, ticker, save_path, output_language=output_language,
+                             supplemental_statement=supplemental_statement, company_announcement=company_announcement,
+                             announcement_timeout_seconds=announcement_timeout_seconds,
+                             announcement_remaining=announcement_remaining, news_source_selection=news_source_selection)
 
 
 def display_complete_report(final_state):
@@ -998,7 +1010,7 @@ ANALYST_REPORT_MAP = {
 _ANALYST_SUBMISSION_PREFIX = "analyst."
 _ANALYST_SUBMISSION_NAMES = {"social": "sentiment"}
 _SAFE_SUBMISSION_REASON_CLASSES = frozenset(
-    {"unsupported", "none_parsed", "validation_error", "transport_error"}
+    {"unsupported", "none_parsed", "validation_error", "transport_error", "output_limit"}
 )
 _SAFE_SUBMISSION_MODES = frozenset(
     {"direct_tool", "direct_structured", "finalized_structured"}
@@ -1062,7 +1074,7 @@ def _submission_agent_status(submission: dict | None) -> str | None:
     reason_class = submission.get("reason_class")
     if reason_class == "transport_error":
         return "degraded"
-    if reason_class == "validation_error":
+    if reason_class in {"validation_error", "output_limit"}:
         return "failed"
     return "unavailable"
 
@@ -1315,13 +1327,20 @@ def _runtime_graph_phase_for_chunk(chunk: dict) -> str:
     return "analysis"
 
 
-def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
+def _build_run_config(
+    selections: dict, checkpoint: bool | None, *, mainland_budget_sources: bool = False,
+    mainland_core_sources: bool = False,
+) -> dict:
     """Assemble the run config from interactive selections, honoring env precedence.
 
     Round counts and checkpoint follow "explicit env/flag wins": an env-applied
     value on DEFAULT_CONFIG is preserved unless the user overrode it on the CLI.
     """
     config = DEFAULT_CONFIG.copy()
+    # This stricter failure policy is opt-in per CLI invocation, not inherited
+    # from the previous run's process configuration.
+    config["budget_require_macro_sources"] = False
+    config["analysis_allowed_data_vendors"] = None
     # Research depth sets both round counts, but an explicit env override
     # (TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS) wins over the
     # interactive selection — leave the env-applied value in place (#977).
@@ -1336,6 +1355,9 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     # Provider-specific thinking configuration
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
+    config["deepseek_reasoning_effort"] = selections.get(
+        "deepseek_reasoning_effort", config.get("deepseek_reasoning_effort")
+    )
     config["anthropic_effort"] = selections.get("anthropic_effort")
     config["output_language"] = selections.get("output_language", "English")
     config["china_a_enhancement_preset"] = selections.get(
@@ -1348,6 +1370,13 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
         config["checkpoint_enabled"] = checkpoint
     from tradingagents.analysis_budget import validate_budget_config
 
+    if mainland_budget_sources and mainland_core_sources:
+        raise ValueError("choose exactly one mainland source policy")
+    if mainland_budget_sources or mainland_core_sources:
+        from tradingagents.budget_preflight import apply_mainland_budget_sources
+
+        config = apply_mainland_budget_sources(config, ticker=selections["ticker"],
+                                              include_macro_sources=not mainland_core_sources)
     if config.get("analysis_budget_enabled", False) is not False:
         from tradingagents.budget_preflight import validate_budget_preflight
         from tradingagents.dataflows.config import preview_config
@@ -1392,7 +1421,54 @@ def _safe_backend_host(backend_url) -> str | None:
     return parsed.hostname.lower() if parsed.hostname else None
 
 
-def _record_analyst_submission_observability(artifacts: dict, evidence_state) -> None:
+def _safe_submission_diagnostic_values(item):
+    """Apply the same whitelist to new and previously persisted observations."""
+    from tradingagents.agents.utils.structured import safe_output_diagnostics
+
+    if not isinstance(item, dict):
+        return None
+    stage, attempts = item.get("stage"), item.get("attempts")
+    if (stage not in ("initial_response", "finalizer") or type(attempts) is not int
+            or attempts not in (0, 1, 2) or stage == "initial_response" and attempts != 1):
+        return None
+    return {"stage": stage, "attempts": attempts, **safe_output_diagnostics(item)}
+
+
+def _safe_submission_diagnostic(messages, analyst_key, reason_class):
+    """Keep only fixed application fields and numeric counters from a failed submission."""
+    expected = _ANALYST_SUBMISSION_NAMES.get(analyst_key, analyst_key)
+    for message in reversed(messages or ()):
+        metadata = _value_from_mapping_or_object(message, "response_metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        item = metadata.get("analyst_submission_diagnostic")
+        if (not isinstance(item, dict) or type(item.get("version")) is not int
+                or item["version"] != 1 or item.get("analyst") != expected
+                or item.get("reason_class") != reason_class):
+            continue
+        diagnostic = _safe_submission_diagnostic_values(item)
+        if diagnostic is not None:
+            return diagnostic
+    return None
+
+
+def _run_diagnostic_scope(artifacts):
+    """Private run artifacts, synchronous references, no public audit/prose mutation."""
+    from tradingagents.run_diagnostics import diagnostic_scope
+
+    def persist(event):
+        payload = event["payload"]
+        critical = (event["kind"] in {"stock_news_attempt","news_exception", "news_business_status",
+                                     "news_response_shape", "news_selection"}
+                    or event["kind"] == "claim_validation" and payload["validation"]["status"] != "supported"
+                    or event["kind"] == "evidence_note_binding" and payload["binding_status"] != "source_bound_quote"
+                    or event["kind"] == "admission_gate" and not payload["admitted"]
+                    or event["kind"] == "analyst_output" and payload["outcome"] not in {"response", "success"})
+        artifacts["runtime_writer"].record_diagnostic(_now_iso(), event, critical=critical)
+    return diagnostic_scope(persist)
+
+
+def _record_analyst_submission_observability(artifacts: dict, evidence_state, messages=()) -> None:
     """Append safe structured-output outcome classes to the run status artifact."""
     if evidence_state is None:
         return
@@ -1416,6 +1492,14 @@ def _record_analyst_submission_observability(artifacts: dict, evidence_state) ->
         if submission["status"] != "available" and reason_class is not None:
             entry["reason_class"] = reason_class
             fallback_reason_classes[analyst_key] = reason_class
+            diagnostic = _safe_submission_diagnostic(messages, analyst_key, reason_class)
+            if diagnostic is None:
+                previous = submissions.get(analyst_key, {})
+                if (previous.get("status") == submission["status"]
+                        and previous.get("reason_class") == reason_class):
+                    diagnostic = _safe_submission_diagnostic_values(previous.get("diagnostic"))
+            if diagnostic is not None:
+                entry["diagnostic"] = diagnostic
         submissions[analyst_key] = entry
 
     payload["analyst_submissions"] = submissions
@@ -1772,7 +1856,7 @@ def _exception_log_summary(summary: str, diagnostics: dict) -> str:
     return f"{summary}; root cause: {root_summary}"
 
 
-def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: str) -> None:
+def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: str, *, verified_deadline: dict | None = None) -> None:
     if artifacts is None:
         return
     error_category = (
@@ -1784,6 +1868,8 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             else "graph_execution"
         )
     )
+    if verified_deadline is not None:
+        error_category = "deadline_exceeded"
     detail_digest: str | None = None
     with suppress(BaseException):
         detail_digest = persist_runtime_artifact(
@@ -1824,6 +1910,7 @@ def _mark_run_failed(artifacts: dict | None, exc: BaseException, current_phase: 
             operational_error_category=error_category,
             error_summary=summary,
             error_diagnostics=diagnostics,
+            **(verified_deadline or {}),
         )
     with suppress(BaseException):
         runtime_writer = artifacts.get("runtime_writer")
@@ -1851,7 +1938,9 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
     final_state["configuration_digest"] = artifacts["configuration_digest"]
     telemetry_ledger = artifacts.get("run_telemetry_ledger")
     if telemetry_ledger is not None:
-        terminal_route = final_state.get("terminal_outcome_kind")
+        from tradingagents.research_stream import verified_research
+        research=verified_research(final_state)
+        terminal_route = "portfolio_research" if research is not None else final_state.get("terminal_outcome_kind")
         if terminal_route is None:
             terminal_route = (
                 "trading_decision"
@@ -1867,6 +1956,9 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
         final_state, ticker, artifacts["report_dir"],
         output_language=artifacts.get("output_language", "English"),
     )
+    from tradingagents.research_stream import verified_research,verify_export
+    if verified_research(final_state) is not None:
+        verify_export(final_state,report_file)
     runtime_writer = artifacts.get("runtime_writer")
     if runtime_writer is not None:
         runtime_writer.record_duration(
@@ -1881,7 +1973,49 @@ def _write_run_reports(final_state: dict, ticker: str, artifacts: dict) -> Path:
     return report_file
 
 
+def _publish_stream_result(final_state,selections,artifacts,full_owner,budget):
+    from tradingagents.full_publication import publish_full
+    full_result=None
+    from tradingagents.research_stream import verified_research,full_graph_valid
+    if verified_research(final_state,stream_finished=True) is not None:
+        if budget is None or full_owner is None:
+            raise ValueError("research_full_budget_or_sources_missing")
+        budget.check()
+    if full_owner is None:
+        _write_run_reports(final_state, selections["ticker"], artifacts)
+    else:
+        from tradingagents.terminal_contract import build_terminal_contract
+        from tradingagents.full_matrix import LocalSource, FLOW, margin_source
+        for name in (FLOW, margin_source(selections["ticker"])):
+            owner = full_owner.get(name)
+            from tradingagents.full_pair_producer import ProducedSource
+            if type(owner) in (LocalSource,ProducedSource):
+                owner.bind_snapshot(final_state, selections["ticker"], selections["analysis_date"])
+        full_result = publish_full(
+            full_owner, budget, selections["ticker"], selections["analysis_date"], artifacts["report_dir"],
+            lambda: _write_run_reports(final_state, selections["ticker"], artifacts),
+            graph_valid=full_graph_valid(final_state),
+        )
+        if verified_research(final_state) is not None:
+            from tradingagents.research_stream import bind_full_publication
+            bind_full_publication(final_state,artifacts["report_dir"],full_result,budget)
+        _update_run_status(artifacts, basic_status="completed", full_acceptance=full_result["status"],
+                           enhancement_sources=full_result["sources"])
+    return full_result
+
+
 def _mark_run_completed(final_state: dict, artifacts: dict) -> None:
+    from tradingagents.research_stream import verified_research
+    research=verified_research(final_state)
+    if research is not None:
+        from tradingagents.research_stream import verified_full_binding
+        binding=verified_full_binding(final_state,artifacts["report_dir"])
+        item,digest=research
+        _update_run_status(artifacts,status="completed",current_phase=None,lifecycle_status="completed",
+                           terminal_outcome_kind="portfolio_research",research_status=item["status"],research_publication_sha256=binding,
+                           canonical_run_id=item["graph"],research_owner_id=item["run"],
+                           configuration_digest=final_state["configuration_digest"],audit_digest=digest)
+        return
     _update_run_status(
         artifacts,
         status="completed",
@@ -1899,6 +2033,23 @@ def _append_line_to_run_logs(paths: list[Path], line: str) -> None:
     for path in paths:
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
+
+
+def _finish_configuration_failure(final_state, selections, artifacts):
+    from tradingagents.full_publication import full_sources
+    full_requested = full_sources.get() is not None and selections.get("china_a_enhancement_preset") == "all"
+    if full_requested:
+        from tradingagents.full_publication import publish_full
+        result = publish_full({}, None, selections["ticker"], selections["analysis_date"], artifacts["report_dir"],
+                              lambda: _write_run_reports(final_state, selections["ticker"], artifacts),
+                              graph_valid=False)
+        _update_run_status(artifacts, full_acceptance=result["status"], enhancement_sources=result["sources"])
+    else:
+        _write_run_reports(final_state, selections["ticker"], artifacts)
+    _mark_run_completed(final_state, artifacts)
+    if full_requested:
+        raise typer.Exit(code=2)
+    return final_state
 
 
 def _complete_asset_configuration_failure(
@@ -1930,9 +2081,7 @@ def _complete_asset_configuration_failure(
         "reason": error.reason.value,
         "diagnostic_code": error.diagnostic_code,
     }
-    _write_run_reports(final_state, selections["ticker"], artifacts)
-    _mark_run_completed(final_state, artifacts)
-    return final_state
+    return _finish_configuration_failure(final_state, selections, artifacts)
 
 
 def _complete_capability_routing_failure(
@@ -1999,9 +2148,7 @@ def _complete_capability_routing_failure(
         mode="json",
         exclude={"analysis_outcome"},
     )
-    _write_run_reports(final_state, selections["ticker"], artifacts)
-    _mark_run_completed(final_state, artifacts)
-    return final_state
+    return _finish_configuration_failure(final_state, selections, artifacts)
 
 
 def build_qualified_financial_routing_composition(
@@ -2178,10 +2325,37 @@ def run_analysis(
     checkpoint: bool | None = None,
     *,
     qualified_financial_routing: Any | None = None,
+    mainland_budget_sources: bool = False,
+    mainland_core_sources: bool = False,
     qualified_routing_validation: bool = False,
     qualified_routing_composition_factory: str | None = None,
     qualified_routing_calendar_revision_id: str | None = None,
 ):
+    from tradingagents.analysis_budget import analysis_preparation_scope
+
+    with analysis_preparation_scope(DEFAULT_CONFIG):
+        return _run_analysis(
+            checkpoint,
+            qualified_financial_routing=qualified_financial_routing,
+            mainland_budget_sources=mainland_budget_sources,
+            mainland_core_sources=mainland_core_sources,
+            qualified_routing_validation=qualified_routing_validation,
+            qualified_routing_composition_factory=qualified_routing_composition_factory,
+            qualified_routing_calendar_revision_id=qualified_routing_calendar_revision_id,
+        )
+
+
+def _run_analysis(
+    checkpoint: bool | None = None,
+    *,
+    qualified_financial_routing: Any | None = None,
+    mainland_budget_sources: bool = False,
+    mainland_core_sources: bool = False,
+    qualified_routing_validation: bool = False,
+    qualified_routing_composition_factory: str | None = None,
+    qualified_routing_calendar_revision_id: str | None = None,
+):
+    require_runtime_profile_loading()
     cli_announcements_enabled = None
     if qualified_routing_validation:
         cli_announcements_enabled = announcements_enabled()
@@ -2192,7 +2366,17 @@ def run_analysis(
     # First get all user selections
     selections = get_user_selections()
 
-    config = _build_run_config(selections, checkpoint)
+    from tradingagents.full_publication import full_sources, publish_full
+    full_owner = full_sources.get() if selections.get("china_a_enhancement_preset") == "all" else None
+    if full_owner is not None:
+        # Preserve the requested preset in run metadata; the graph itself produces Basic.
+        graph_selections = dict(selections, china_a_enhancement_preset="basic")
+    else:
+        graph_selections = selections
+    config = _build_run_config(
+        graph_selections, checkpoint, mainland_budget_sources=mainland_budget_sources,
+        mainland_core_sources=mainland_core_sources,
+    )
     if os.environ.get("TRADINGAGENTS_PROTECTION_CONTEXT"):
         from tradingagents.runtime_protection_handoff import validate_protected_configuration
 
@@ -2575,6 +2759,7 @@ def run_analysis(
     snapshot_scope = ExitStack()
     primary_failure: BaseException | None = None
     try:
+        snapshot_scope.enter_context(_run_diagnostic_scope(artifacts))
         from tradingagents.analysis_budget import analysis_budget_scope
 
         budget = snapshot_scope.enter_context(analysis_budget_scope(config))
@@ -2752,6 +2937,7 @@ def run_analysis(
             _record_analyst_submission_observability(
                 artifacts,
                 chunk.get("evidence_state"),
+                chunk.get("messages", ()),
             )
 
             # Research Team - Handle Investment Debate State
@@ -2860,7 +3046,10 @@ def run_analysis(
             budget.check()
             final_state["analysis_budget"] = budget.receipt()
         _update_run_status(artifacts, current_phase=current_phase)
-        _write_run_reports(final_state, selections["ticker"], artifacts)
+        from tradingagents.research_stream import verified_research
+        full_result=_publish_stream_result(final_state,selections,artifacts,full_owner,budget)
+        if verified_research(final_state) is not None and budget is not None:
+            budget.check()
         checkpoint_clearer = getattr(graph, "clear_run_checkpoint", None)
         if config.get("checkpoint_enabled"):
             current_phase = "checkpoint_cleanup"
@@ -2892,7 +3081,13 @@ def run_analysis(
     finally:
         terminal_cleanup_failure: BaseException | None = None
         try:
-            snapshot_scope.close()
+            # close() discards the active exception and would mark an
+            # interrupted persistent budget as successfully completed.
+            snapshot_scope.__exit__(
+                type(primary_failure) if primary_failure is not None else None,
+                primary_failure,
+                primary_failure.__traceback__ if primary_failure is not None else None,
+            )
         except BaseException as exc:
             terminal_cleanup_failure = exc
         try:
@@ -2925,9 +3120,16 @@ def run_analysis(
             if terminal_cleanup_failure is not None and primary_failure is None:
                 raise terminal_cleanup_failure
 
+    if full_owner is not None and full_result["status"] not in ("completed","custom_complete"):
+        raise typer.Exit(code=2)
+
     # Post-analysis prompts (outside Live context for clean interaction)
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
     console.print(f"[dim]{analyst_wall_time_tracker.format_summary()}[/dim]")
+
+    # The bounded launcher already published the report before checkpoint cleanup.
+    if config.get("bounded_noninteractive") is True:
+        return
 
     # Prompt to save report
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
@@ -2958,6 +3160,17 @@ def run_analysis(
 @app.callback()
 def default_analysis_command(
     ctx: typer.Context,
+    mainland_core_sources: bool = typer.Option(
+        False, "--mainland-core-sources",
+        help="Budget/cache-only mainland equity: Tushare market/statements and AKShare local news/summary. "
+             "Disable Alpha Vantage, FRED and Polymarket at dispatch; report optional gaps.",
+    ),
+    mainland_budget_sources: bool = typer.Option(
+        False, "--mainland-budget-sources",
+        help="Explicit budget/cache-only mainland equity sources: Tushare market/statements, "
+             "AKShare company news/summary, Alpha Vantage global macro, FRED and Polymarket. "
+             "No source fallback; macro permissions remain required.",
+    ),
     checkpoint: bool | None = typer.Option(
         None,
         "--checkpoint/--no-checkpoint",
@@ -2999,9 +3212,13 @@ def default_analysis_command(
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
 
-        count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
+        count = clear_all_checkpoints(checkpoint_storage_directory(DEFAULT_CONFIG))
         console.print(f"[yellow]Cleared {count} checkpoint(s).[/yellow]")
     analysis_kwargs: dict[str, Any] = {"checkpoint": checkpoint}
+    if mainland_budget_sources:
+        analysis_kwargs["mainland_budget_sources"] = True
+    if mainland_core_sources:
+        analysis_kwargs["mainland_core_sources"] = True
     if qualified_routing_validation:
         analysis_kwargs["qualified_routing_validation"] = True
     if (
@@ -3365,6 +3582,17 @@ def identity_registry_refresh(
 
 @app.command()
 def analyze(
+    mainland_core_sources: bool = typer.Option(
+        False, "--mainland-core-sources",
+        help="Budget/cache-only mainland equity: Tushare market/statements and AKShare local news/summary. "
+             "Disable Alpha Vantage, FRED and Polymarket at dispatch; report optional gaps.",
+    ),
+    mainland_budget_sources: bool = typer.Option(
+        False, "--mainland-budget-sources",
+        help="Explicit budget/cache-only mainland equity sources: Tushare market/statements, "
+             "AKShare company news/summary, Alpha Vantage global macro, FRED and Polymarket. "
+             "No source fallback; macro permissions remain required.",
+    ),
     checkpoint: bool | None = typer.Option(
         None,
         "--checkpoint/--no-checkpoint",
@@ -3401,11 +3629,16 @@ def analyze(
         ),
     ),
 ):
+    require_runtime_profile_loading()
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
-        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
+        n = clear_all_checkpoints(checkpoint_storage_directory(DEFAULT_CONFIG))
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     analysis_kwargs: dict[str, Any] = {"checkpoint": checkpoint}
+    if mainland_budget_sources:
+        analysis_kwargs["mainland_budget_sources"] = True
+    if mainland_core_sources:
+        analysis_kwargs["mainland_core_sources"] = True
     if qualified_routing_validation:
         analysis_kwargs["qualified_routing_validation"] = True
     if (
@@ -3477,3 +3710,4 @@ def replay_recorded(
 
 if __name__ == "__main__":
     app()
+

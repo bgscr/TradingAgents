@@ -50,7 +50,7 @@ current frontier.
   `.tradingagents`, host home, host temp, credential stores, production evidence
   roots, audit working directories, or any protected host root.
 - The protected-root manifest includes the full
-  `C:\Users\56922\.tradingagents` tree and every additional protected root
+  `%USERPROFILE%\.tradingagents` tree and every additional protected root
   declared by the immutable-state verifier. A protected root may not be silently
   omitted because it is missing, inaccessible, redirected, or a reparse point.
 - If inspection input is required, supply only a prepared immutable,

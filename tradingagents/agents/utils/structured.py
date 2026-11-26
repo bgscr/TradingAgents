@@ -14,9 +14,11 @@ leaking provider payloads into reports or logs.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from langchain_core.messages import HumanMessage
@@ -27,6 +29,33 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+def submission_id_prefix(analyst: str) -> str:
+    return f"{analyst}."
+
+
+_MARKET_ID_PREFIX = submission_id_prefix("market")
+
+
+_LOCAL_REPAIRS = {
+    "blank_report": "Provide a nonblank report_markdown grounded in the original sources.",
+    "duplicate_claim_id": "Give each distinct material claim a unique claim_id.",
+    "claim_namespace": "Start every claim_id with the analyst namespace followed by a dot.",
+    "duplicate_note_id": "Give each distinct evidence note a unique note_id.",
+    "claim_note_collision": "Use distinct identifiers for material claims and evidence notes.",
+    "note_namespace": "Start every note_id with the analyst namespace followed by a dot."
+}
+
+
+class SubmissionConstraintError(ValueError):
+    """A fixed local finalizer constraint, with no submitted values."""
+
+    def __init__(self, kind: str):
+        if kind not in _LOCAL_REPAIRS:
+            raise ValueError("unknown submission constraint")
+        super().__init__(_LOCAL_REPAIRS[kind])
+        self.kind = kind
+
+
 @dataclass(frozen=True)
 class RequiredStructuredResult:
     """A fail-closed structured invocation result with a safe reason class."""
@@ -34,6 +63,7 @@ class RequiredStructuredResult:
     value: Any | None
     reason: str | None = None
     attempts: int = 0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -45,9 +75,11 @@ class RequiredStructuredBinding:
     model_name: str
     method: str | None = None
 
+    schema_json: str | None = None
+
     def invoke(self, prompt: Any) -> Any:
         if self.method == "json_mode":
-            prompt = _json_mode_prompt(prompt, self.schema_name)
+            prompt = _json_mode_prompt(prompt, self.schema_name, self.schema_json)
         return self.runnable.invoke(prompt)
 
 
@@ -88,7 +120,19 @@ def bind_required_structured(
         )
         method_resolver = getattr(type(llm), "get_required_structured_method", None)
         method = llm.get_required_structured_method() if callable(method_resolver) else None
-        return RequiredStructuredBinding(runnable, schema.__name__, model_name, method)
+        schema_json = None
+        if method == "json_mode" and agent_name == "Market Analyst":
+            from tradingagents.evidence import AnalystEvidenceReport
+
+            if schema is AnalystEvidenceReport:
+                wire_schema = schema.model_json_schema()
+                for definition, field_name in (
+                    ("SubmittedEvidenceNote", "note_id"), ("SubmittedMaterialClaim", "claim_id"),
+                ):
+                    field = wire_schema["$defs"][definition]["properties"][field_name]
+                    field["allOf"] = [{"pattern": "^" + re.escape(_MARKET_ID_PREFIX)}]
+                schema_json = json.dumps(wire_schema, separators=(",", ":"))
+        return RequiredStructuredBinding(runnable, schema.__name__, model_name, method, schema_json)
     except (NotImplementedError, AttributeError, ValueError, TypeError, RuntimeError):
         logger.warning(
             "%s: required structured output is unsupported by the provider",
@@ -103,8 +147,11 @@ def invoke_required_structured(
     agent_name: str,
     *,
     validator: Callable[[Any], Any] | None = None,
+    max_attempts: int = 2,
 ) -> RequiredStructuredResult:
-    """Invoke a required schema with one bounded fail-closed repair attempt."""
+    """Invoke a required schema, optionally allowing one fail-closed repair."""
+    if type(max_attempts) is not int or max_attempts not in (1, 2):
+        raise ValueError("structured max_attempts must be 1 or 2")
     if structured_llm is None:
         return RequiredStructuredResult(value=None, reason="unsupported", attempts=0)
 
@@ -112,13 +159,21 @@ def invoke_required_structured(
     model_name = getattr(structured_llm, "model_name", "unknown")
     current_prompt = prompt
     last_reason = "none_parsed"
-    for attempt in (1, 2):
+    for attempt in range(1, max_attempts + 1):
+        diagnostics = {}
+        validating_submission = False
         try:
             raw_result = structured_llm.invoke(current_prompt)
             value, reason, diagnostics = _unwrap_required_result(raw_result)
             if value is not None and validator is not None:
+                validating_submission = True
                 value = validator(value)
+                validating_submission = False
             if value is not None:
+                from tradingagents.run_diagnostics import record_output
+
+                record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
+                              diagnostics, outcome="success")
                 logger.info(
                     "%s: required structured output succeeded "
                     "(schema=%s model=%s attempt=%d%s)",
@@ -132,8 +187,19 @@ def invoke_required_structured(
             last_reason = reason or "none_parsed"
         except Exception as exc:  # noqa: BLE001 - classified without provider payloads
             last_reason = _structured_failure_reason(exc)
-            diagnostics = _safe_exception_diagnostics(exc)
+            if agent_name != "Market Analyst":
+                diagnostics = {}
+            diagnostics.update(_safe_exception_diagnostics(exc))
+            if last_reason == "validation_error":
+                if validating_submission and agent_name == "Market Analyst" and isinstance(exc, SubmissionConstraintError):
+                    diagnostics["validation_kind"] = exc.kind
+                else:
+                    diagnostics.update(_validation_metadata(exc))
 
+        from tradingagents.run_diagnostics import record_output
+
+        record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
+                      diagnostics, outcome=last_reason)
         logger.warning(
             "%s: required structured output failed "
             "(schema=%s model=%s attempt=%d reason=%s%s)",
@@ -144,23 +210,40 @@ def invoke_required_structured(
             last_reason,
             _format_safe_diagnostics(diagnostics),
         )
-        if attempt == 2 or last_reason not in {"none_parsed", "validation_error"}:
+        if attempt == max_attempts or last_reason not in {"none_parsed", "validation_error"}:
             return RequiredStructuredResult(
                 value=None,
                 reason=last_reason,
                 attempts=attempt,
+                diagnostics=safe_output_diagnostics(diagnostics),
             )
-        current_prompt = _repair_prompt(prompt, schema_name)
+        fields = ()
+        if isinstance(structured_llm, RequiredStructuredBinding) and structured_llm.schema_json:
+            fields = safe_output_diagnostics(diagnostics).get("validation_fields", ())
+        local_kind = diagnostics.get("validation_kind") if agent_name == "Market Analyst" else None
+        current_prompt = _repair_prompt(prompt, schema_name, fields, local_kind)
 
     raise AssertionError("unreachable structured retry state")
 
 
 def _structured_failure_reason(exc: Exception) -> str:
+    if _is_output_limit(exc):
+        return "output_limit"
     return (
         "validation_error"
         if isinstance(exc, (ValidationError, ValueError, TypeError))
         else "transport_error"
     )
+
+
+def _is_output_limit(exc: Exception) -> bool:
+    # Lazy: pure classification users need not initialize an additional SDK.
+    # An actual SDK length exception already implies that OpenAI was imported.
+    import sys
+
+    sdk = sys.modules.get("openai")
+    length_error = getattr(sdk, "LengthFinishReasonError", None)
+    return isinstance(length_error, type) and isinstance(exc, length_error)
 
 
 def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[str, Any]]:
@@ -177,14 +260,20 @@ def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[s
     parsing_error = result.get("parsing_error")
     metadata = getattr(raw, "response_metadata", {}) or {}
     tool_calls = getattr(raw, "tool_calls", ()) or ()
-    diagnostics: dict[str, Any] = {
-        "finish_reason": metadata.get("finish_reason"),
-        "tool_call_count": len(tool_calls),
-    }
+    diagnostics = response_output_diagnostics(raw)
+    diagnostics["tool_call_count"] = len(tool_calls)
     if parsing_error is not None:
         diagnostics.update(_safe_exception_diagnostics(parsing_error))
+    if metadata.get("finish_reason") == "length" or (
+        parsing_error is not None and _is_output_limit(parsing_error)
+    ):
+        # A partially parsed object is not complete evidence. Do not spend an
+        # automatic repair attempt or silently raise the configured output cap.
+        return None, "output_limit", diagnostics
     if parsed is not None:
         return parsed, None, diagnostics
+    if parsing_error is not None:
+        diagnostics.update(_validation_metadata(parsing_error))
     return (
         None,
         "validation_error" if parsing_error is not None else "none_parsed",
@@ -192,15 +281,105 @@ def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[s
     )
 
 
+_REPORT_FIELDS = frozenset({
+    "contract_version", "report_markdown", "material_claims", "evidence_notes",
+    "material_claims[].claim_id", "material_claims[].statement",
+    "material_claims[].source_ref", "material_claims[].source_quote",
+    "evidence_notes[].note_id", "evidence_notes[].kind", "evidence_notes[].statement",
+    "evidence_notes[].source_ref", "evidence_notes[].source_quote",
+})
+_VALIDATION_KINDS = frozenset({"json_syntax", "schema_validation", "validation_unspecified", *_LOCAL_REPAIRS})
+
+
+def _validation_metadata(exc):
+    # Inspect typed causes only. SDK parser messages may contain the entire output.
+    current = exc
+    for _ in range(5):
+        if not isinstance(current, BaseException):
+            break
+        if isinstance(current, json.JSONDecodeError):
+            return {"validation_kind": "json_syntax"}
+        if isinstance(current, ValidationError):
+            errors = current.errors(include_url=False, include_input=False, include_context=False)
+            if any(error["type"] == "json_invalid" for error in errors):
+                return {"validation_kind": "json_syntax"}
+            fields = set()
+            for error in errors[:8]:
+                loc = error["loc"]
+                if len(loc) == 1 and type(loc[0]) is str and loc[0] in (
+                        "contract_version", "report_markdown", "material_claims", "evidence_notes"):
+                    fields.add(loc[0])
+                elif (len(loc) == 3 and loc[0] in ("material_claims", "evidence_notes")
+                      and type(loc[1]) is int and type(loc[2]) is str):
+                    path = f"{loc[0]}[].{loc[2]}"
+                    if path in _REPORT_FIELDS:
+                        fields.add(path)
+            return {"validation_kind": "schema_validation", "validation_fields": sorted(fields)}
+        current = current.__cause__
+        if current is None:
+            break
+    return {"validation_kind": "validation_unspecified"}
+
+
 def _safe_exception_diagnostics(exc: Exception) -> dict[str, Any]:
-    diagnostics: dict[str, Any] = {"error_type": type(exc).__name__}
-    if isinstance(exc, ValidationError):
-        fields = []
-        for error in exc.errors(include_url=False, include_input=False)[:8]:
-            location = ".".join(str(part) for part in error.get("loc", ()))
-            fields.append(f"{location}:{error.get('type', 'validation_error')}")
-        diagnostics["validation_fields"] = tuple(fields)
+    diagnostics: dict[str, Any] = {}
+    if _is_output_limit(exc):
+        diagnostics["finish_reason"] = "length"
+        usage = getattr(getattr(exc, "completion", None), "usage", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        if type(completion_tokens) is int and completion_tokens >= 0:
+            diagnostics["completion_tokens"] = completion_tokens
+            details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(details, "reasoning_tokens", None)
+            if type(reasoning_tokens) is int and 0 <= reasoning_tokens <= completion_tokens:
+                diagnostics["reasoning_tokens"] = reasoning_tokens
     return diagnostics
+
+
+def safe_output_diagnostics(value: Any) -> dict[str, Any]:
+    """Whitelist observed output metadata; never infer usage from the configured cap."""
+    if not isinstance(value, Mapping):
+        return {}
+    safe = {}
+    finish = value.get("finish_reason")
+    if isinstance(finish, str) and finish in {
+        "stop", "length", "tool_calls", "function_call", "content_filter",
+    }:
+        safe["finish_reason"] = finish
+    completion = value.get("completion_tokens")
+    if type(completion) is int and completion >= 0:
+        safe["completion_tokens"] = completion
+        reasoning = value.get("reasoning_tokens")
+        if type(reasoning) is int and 0 <= reasoning <= completion:
+            safe["reasoning_tokens"] = reasoning
+    kind = value.get("validation_kind")
+    if type(kind) is str and kind in _VALIDATION_KINDS:
+        safe["validation_kind"] = kind
+        fields = value.get("validation_fields")
+        if kind == "schema_validation" and type(fields) in (list, tuple):
+            safe["validation_fields"] = sorted({f for f in fields[:8] if type(f) is str and f in _REPORT_FIELDS})
+    return safe
+
+
+def response_output_diagnostics(response: Any) -> dict[str, Any]:
+    """Read only SDK/LangChain usage counters, not response or reasoning content."""
+    metadata = getattr(response, "response_metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    usage = getattr(response, "usage_metadata", None)
+    usage = usage if isinstance(usage, Mapping) else {}
+    provider_usage = metadata.get("token_usage")
+    provider_usage = provider_usage if isinstance(provider_usage, Mapping) else {}
+    completion = usage.get("output_tokens", provider_usage.get("completion_tokens"))
+    details = usage.get("output_token_details")
+    details = details if isinstance(details, Mapping) else {}
+    provider_details = provider_usage.get("completion_tokens_details")
+    provider_details = provider_details if isinstance(provider_details, Mapping) else {}
+    reasoning = details.get("reasoning", provider_details.get("reasoning_tokens"))
+    return safe_output_diagnostics({
+        "finish_reason": metadata.get("finish_reason"),
+        "completion_tokens": completion,
+        "reasoning_tokens": reasoning,
+    })
 
 
 def _format_safe_diagnostics(diagnostics: Mapping[str, Any]) -> str:
@@ -212,22 +391,30 @@ def _format_safe_diagnostics(diagnostics: Mapping[str, Any]) -> str:
     return " " + " ".join(safe) if safe else ""
 
 
-def _repair_prompt(original_prompt: Any, schema_name: str) -> Any:
+def _repair_prompt(original_prompt: Any, schema_name: str, fields: tuple[str, ...] | list[str] = (), kind: str | None = None) -> Any:
     correction = (
         "Previous structured attempt failed validation. "
         f"Produce {schema_name} exactly once with every required field and no prose. "
         "Use only evidence and source references from the original request."
     )
+    if kind in _LOCAL_REPAIRS:
+        correction += f" Local constraint [{kind}]: {_LOCAL_REPAIRS[kind]}"
+        if kind in {"claim_namespace", "note_namespace"}:
+            correction += f" Use the literal prefix {_MARKET_ID_PREFIX!r}."
+    if fields:
+        correction += " Failed schema paths: " + ", ".join(fields) + "."
     if isinstance(original_prompt, (list, tuple)):
         return [*original_prompt, HumanMessage(content=correction)]
     return f"{original_prompt}\n\n{correction}"
 
 
-def _json_mode_prompt(original_prompt: Any, schema_name: str) -> Any:
+def _json_mode_prompt(original_prompt: Any, schema_name: str, schema_json: str | None = None) -> Any:
     instruction = (
         f"Return exactly one valid JSON object matching {schema_name}. "
         "Return JSON only, with no markdown fence or surrounding prose."
     )
+    if schema_json is not None:
+        instruction += "\nJSON Schema:\n" + schema_json
     if isinstance(original_prompt, (list, tuple)):
         return [*original_prompt, HumanMessage(content=instruction)]
     return f"{original_prompt}\n\n{instruction}"

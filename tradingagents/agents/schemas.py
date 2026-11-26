@@ -407,13 +407,31 @@ class SentimentReport(BaseModel):
     )
 
 
-def render_sentiment_report(report: SentimentReport) -> str:
+def render_sentiment_report(report: SentimentReport, *, output_language: str = "English") -> str:
     """Render a SentimentReport to the markdown shape the rest of the system expects.
 
     The structured header (band + score + confidence) is prepended to the
     narrative so the saved report is both human-readable and machine-parseable
     without regex.
     """
+    from tradingagents.report_presentation import is_chinese
+
+    if is_chinese(output_language):
+        bands = {
+            SentimentBand.BULLISH: "看多",
+            SentimentBand.MILDLY_BULLISH: "偏多",
+            SentimentBand.NEUTRAL: "中性",
+            SentimentBand.MIXED: "分歧",
+            SentimentBand.MILDLY_BEARISH: "偏空",
+            SentimentBand.BEARISH: "看空",
+        }
+        confidence = {"low": "低", "medium": "中", "high": "高"}[report.confidence]
+        return "\n".join([
+            f"**总体情绪：** **{bands[report.overall_band]}** （评分：{report.overall_score:.1f}/10）",
+            f"**置信度：** {confidence}",
+            "",
+            report.narrative,
+        ])
     return "\n".join([
         f"**Overall Sentiment:** **{report.overall_band.value}** "
         f"(Score: {report.overall_score:.1f}/10)",

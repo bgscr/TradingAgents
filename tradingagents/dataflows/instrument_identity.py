@@ -175,12 +175,12 @@ def _routing_lookup_keys(symbol: str) -> frozenset[str]:
         return frozenset(keys)
     code = match.group("code")
     suffix = match.group("suffix")
-    keys.add(code)
     if suffix in {"SS", "SH"}:
         keys.update({f"{code}.SS", f"{code}.SH"})
     elif suffix == "SZ":
         keys.add(f"{code}.SZ")
     else:
+        keys.add(code)
         # These are candidates only.  A matching registry row is still required
         # and ambiguity across venues fails closed below.
         keys.update({f"{code}.SS", f"{code}.SH", f"{code}.SZ"})
@@ -283,7 +283,12 @@ def resolve_authoritative_instrument_identity(
     for row in artifact.rows:
         row_keys: set[str] = set()
         for alias in (row.canonical_symbol, *row.aliases):
-            row_keys.update(_routing_lookup_keys(alias))
+            # A bare stored alias does not authorize every explicit venue. Bare
+            # user input can still discover all matching rows and fail on ambiguity.
+            if re.fullmatch(r"\d{6}", alias):
+                row_keys.add(alias)
+            else:
+                row_keys.update(_routing_lookup_keys(alias))
         if requested_keys.intersection(row_keys):
             matches.append(row)
 

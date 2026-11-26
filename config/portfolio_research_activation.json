@@ -1,0 +1,39 @@
+{
+  "mode": "portfolio-research-v3",
+  "budget": [
+    60,
+    3,
+    1200
+  ],
+  "search_enabled": false,
+  "sources": {
+    "start_tradingagents.ps1": "5808c16e5e523dc1d50ab4d67d77c9951aaabd3e8e5254f35b829a9aae1ffb83",
+    "cli/main.py": "9190883bf7da30f36c037b2d9ffd3d4512e28816f19765b54501650044dff0a7",
+    "scripts/analyze_mainland_bounded.py": "2c629a0e54ae3b5139dfdcd5aae5c3b5073586a838b12a6173904a5d610e097d",
+    "scripts/full_latest_intake.py": "ef9a47d8d94b754378ba3157f746f3826ad6be172c35d4569863bb2737a4d5fb",
+    "scripts/research_launch.py": "743dfe8dcaa62684e3d2fb888f83862ae5d5d05fac7d3fa5d132ce750786bb03",
+    "scripts/Start-MainlandAnalysis.ps1": "1b3c0159d04fcd6701294bcb2fded54dc8081c0f15e944ff5ff765a4b134cb3a",
+    "tradingagents/full_publication.py": "1b2241cfd86e3784659b09c363c5092c244816c964f141d5dcfbab5749dfb928",
+    "tradingagents/portfolio_research_checkpoint.py": "b9f6f602e0715b540a7397720d63ba68a6592f4865910be307dd10887603df40",
+    "tradingagents/portfolio_research_run.py": "896c7a92a6cfaac5fff0cd6362ca03ab78a4c0f0ad72cf62034ddffc39167592",
+    "tradingagents/portfolio_research_terminal.py": "413af7114e3aefd7ba583fc7d5161c1d72b0be0569a76fcda59f484b14d7ad1d",
+    "tradingagents/reporting.py": "e7f97077f388b55ea35c11b916f8ecd8b7155570be8a3c4469e1bc156daec4cb",
+    "tradingagents/research_stream.py": "571e19ad2134b414920f75f01d559d86b177966724a0a280beb0e8b5b2c042c7",
+    "tradingagents/reviewed_search.py": "a21ffbf3b488b4d76542e655dfd50974e4f0a95860edd382ed2906d2ad552667",
+    "tradingagents/run_telemetry.py": "f7c870eb33a8660f5ffc6b4ea67653a1683507323978936c2cd82c73f94c9725",
+    "tradingagents/graph/financial_tools.py": "52c0f887637878d272966824dc828e0bfb17ab9c5d251beea5b0cd7378f2e61f",
+    "tradingagents/graph/setup.py": "0fe639a3aa7c0037a9c2bfe42431add31f301664c174219111bada562a2ae682",
+    "tradingagents/graph/trading_graph.py": "a5c084611160996415ca47ce074efd1529d477495e1e53c5a1b4e69bc24fb846",
+    "tradingagents/portfolio_research_inputs/financial.py": "44d51cf4928ad149643961592f144c438b20d9c74a8ab84f034cabb47bddf230",
+    "tradingagents/portfolio_research_inputs/market.py": "cd69711aafbd991a18f35412bc01e718a38139c475d09057979d4e1be9c6563b",
+    "tradingagents/portfolio_research_inputs/storage.py": "5a14d066841d0fc00c91ca35db99b82a591311035a250265902fe1fbe8e3a4e3",
+    "tradingagents/portfolio_research_inputs/__init__.py": "7f7ac8428688f1ab8b41f906a4d03de6b56c500e7e5a0f665c58f74210a0b320",
+    "tradingagents/agents/utils/agent_states.py": "bf74720009fda2f0cde79e7bdb033cae2c2c000d511e11af2d71f593381742b0",
+    "tradingagents/agents/utils/news_data_tools.py": "7ab865e6bf03d1b8e670e362637f3f606598f950df20fe5f749d680d6ec94a42",
+    "tradingagents/research_submission_validation.py": "2f5045c50862f9748dc300c7381cb0fc50206226fdba0fcc2a7a7de4a5f7e693",
+    "tradingagents/powershell_fundflow.py": "5c9616ede947dc9ce6caf77a4e5feecedd1b46f53ff9639a850aa3c17a941922",
+    "config/ordinary-full-pair-policy.json": "f825955b9dc8dcd0b50837ce01df98e77ac000a7abb23d8a0d3e410b798db6bc",
+    "scripts/Get-PublicFundflow.ps1": "daf38b9c1dbdf61f1b35fea2e04de66ed6d72c3dfb13f9faf324d625a24a01fb",
+    "tradingagents/full_pair_producer.py": "df2f2721d93f5a5dacff5d7d73d06b3282b53a6c1fe8fd58d52e142eea154789"
+  }
+}

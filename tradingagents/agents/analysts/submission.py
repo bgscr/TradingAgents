@@ -5,15 +5,19 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
 from tradingagents.agents.utils.structured import (
+    SubmissionConstraintError,
+    submission_id_prefix,
     bind_required_structured,
     invoke_required_structured,
+    response_output_diagnostics,
+    safe_output_diagnostics,
 )
 from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
@@ -23,6 +27,7 @@ from tradingagents.dataflows.market_snapshot import (
 )
 from tradingagents.evidence import (
     AnalystEvidenceReport,
+    EvidenceNote,
     EvidenceSource,
     EvidenceState,
     EvidenceStatus,
@@ -31,18 +36,66 @@ from tradingagents.evidence import (
     ToolExecutionEvidenceEnvelope,
     build_tool_evidence_state,
     merge_claim_validations,
+    merge_evidence_notes,
     merge_evidence_sources,
     merge_material_claims,
     merge_source_acquisition_outcomes,
     merge_source_artifacts,
     merge_source_facts,
     project_history_store_access,
+    verified_financial_observations,
 )
+from tradingagents.financial_observations import FINANCIAL_TOOLS
 
 logger = logging.getLogger(__name__)
 
 _REPORT_TOOL_NAME = AnalystEvidenceReport.__name__
 _SOURCE_PREVIEW_LIMIT = 4_000
+ANALYST_OUTPUT_GUIDANCE = (
+    "Keep the final JSON concise so the entire object, including exact source quotes, "
+    "fits the configured output budget. Aim for a report of about 1,500 characters; "
+    "this is a presentation target, not permission to omit required evidence checks. "
+    "Prioritize decision-relevant findings, uncertainty, and every material data gap. "
+    "Use short exact quotes and avoid repeating raw tables or the same premise in multiple claims. "
+    "Every financial decision premise retained in the report needs its material_claim. "
+    "Put source provenance, availability, coverage and applicability limitations "
+    "in evidence_notes and retain them in the report; each note requires one exact "
+    "source_ref and contiguous source_quote. "
+    "A note quote must occur exactly once across all tool outputs sharing that source_ref. "
+    "Copy a complete source line and preserve leading punctuation (such as '- ' or '# '); "
+    "if that line repeats, include adjacent source text until the contiguous quote is unique. "
+    "Never splice non-adjacent lines or separate tool outputs; do not invent a locator or discard a material limitation "
+    "to avoid a binding failure. If no unique quote exists, report the unresolved binding explicitly. "
+    "Notes are not financial evidence, do not qualify an investment conclusion, and must not hide unsupported "
+    "financial premises. Missing metrics must never be inferred as zero; "
+    "remove unsupported conclusions instead of weakening their evidence requirements. "
+    "Do not equate a concise report with complete historical coverage. "
+    "For a verified market snapshot, keep each material observation atomic: quote one complete "
+    "OHLCV or indicator row per claim. Do not bundle prices and multiple indicators in one claim. "
+    "A moving-average period is part of its identity and requires that exact indicator's unique row; "
+    "do not use another indicator row or a whole table to justify the period. This does not exempt "
+    "any price, date, threshold or other numeric assertion from validation. "
+    "For versioned CURRENT statement tables, quote exactly one complete CSV data row "
+    "per observation; do not combine rows, omit columns or quote a table header as a value. "
+    "The application derives the row's field, base currency, period and quantity scale; "
+    "your prose remains advisory. A CURRENT observation is not a canonical decision premise. "
+)
+
+
+MARKET_EVIDENCE_GUIDANCE = (
+    "Use a market fact in material_claims only when its cited tool output supplies the exact "
+    "observation, instrument and applicable date. Copy the supporting row verbatim. "
+    "For a Chinese moving-average claim, use the form '〈周期〉日均线为〈读数〉。' "
+    "with the period and reading from that indicator row; omit the claim if either is unbound. "
+    "Price basis describes applicability. Only if the current sources or auxiliary context establish qfq, "
+    "explain its total-return limitation in report_markdown. "
+    "An evidence_note about applicability needs its own unique verbatim quotation from the cited "
+    "tool output. The separate multi-year commentary, even when it displays a snapshot ID, "
+    "is not such a tool output. Never turn its price-basis line into an availability note. "
+    "Use availability only for an actual source-availability limitation documented by that tool. "
+    "When only commentary supports a limitation, keep it in the report and leave it out of "
+    "evidence_notes; an empty evidence_notes array is valid."
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +104,7 @@ class AnalystSubmissionResult:
     report: str
     claims: tuple[MaterialClaim, ...] = ()
     submission_source: EvidenceSource | None = None
+    notes: tuple[EvidenceNote, ...] = ()
 
 
 def bind_analyst_finalizer(llm: Any, analyst: str) -> Any | None:
@@ -93,6 +147,8 @@ def _source_ref(
     ticker: str,
     trade_date: str,
     tool_calls_by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    include_unavailable_financial: bool = False,
 ) -> str | None:
     tool_name = getattr(message, "name", None)
     tool_call_id = getattr(message, "tool_call_id", None)
@@ -132,7 +188,7 @@ def _source_ref(
             if (
                 financial.tool_call_id != str(tool_call_id)
                 or financial.tool_name != tool_name
-                or financial.artifact_sha256 is None
+                or (financial.artifact_sha256 is None and not include_unavailable_financial)
             ):
                 return None
             return financial.request_ref
@@ -164,8 +220,15 @@ def source_ref_tool_call_ids(
     messages: list[Any],
     ticker: str,
     trade_date: str,
+    *,
+    include_unavailable_financial: bool = False,
 ) -> dict[str, tuple[str, ...]]:
-    """Map each exact source ref to the paired tool-call IDs that produced it."""
+    """Map paired results; unavailable financial refs are operational-only opt-in.
+
+    Claim/finalizer catalogs keep the default. The evidence collector opts in so
+    typed failures survive even when the model makes no claim or note about them.
+    No failure text is parsed to construct an outcome or source fact.
+    """
     refs: dict[str, list[str]] = {}
     tool_calls_by_id = _tool_calls_by_id(messages)
     for message in messages:
@@ -174,6 +237,7 @@ def source_ref_tool_call_ids(
             ticker,
             trade_date,
             tool_calls_by_id,
+            include_unavailable_financial=include_unavailable_financial,
         )
         tool_call_id = getattr(message, "tool_call_id", None)
         if source_ref is None or not tool_call_id:
@@ -212,7 +276,10 @@ def _finalization_prompt(
     trade_date: str,
     draft: str,
     messages: list[Any],
+    auxiliary_context: str = "",
 ) -> str:
+    from tradingagents.agents.utils.agent_utils import get_language_instruction
+
     catalog = []
     seen_artifacts = set()
     tool_calls_by_id = _tool_calls_by_id(messages)
@@ -238,6 +305,10 @@ def _finalization_prompt(
             )
         catalog.append(f"- {source_ref}\n  Evidence: {content or '[empty tool result]'}")
     source_catalog = "\n".join(catalog) if catalog else "- (no source refs available)"
+    note_example = ('"evidence_notes":[]}.' if analyst == "market" else
+                    '"evidence_notes":[{"note_id":"' + analyst + '.unique_note",'
+                    '"kind":"availability","statement":"source limitation",'
+                    '"source_ref":"one allowed ref","source_quote":"exact quote"}]}.')
     return (
         f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
         "Return exactly one AnalystEvidenceReport. Preserve only claims supported "
@@ -249,12 +320,30 @@ def _finalization_prompt(
         "rewritten. Return one JSON object shaped exactly as "
         '{"report_markdown":"...","material_claims":['
         '{"claim_id":"' + analyst + '.unique_id","statement":"...",'
-        '"source_ref":"one allowed ref","source_quote":"exact quote"}]}. '
-        "Do not add analyst, source_refs, fact_ids, or minimum_history_rows; "
+        '"source_ref":"one allowed ref","source_quote":"exact quote"}],'
+        + note_example + " "
+        + "Do not add analyst, source_refs, fact_ids, or minimum_history_rows; "
         "the application derives those fields. "
         "If no listed source supports a decision-relevant premise, omit that claim.\n\n"
+        + ANALYST_OUTPUT_GUIDANCE + (" " + MARKET_EVIDENCE_GUIDANCE if analyst == "market" else "") + "\n\n"
+        + get_language_instruction()
+        + " Preserve JSON schema keys, identifiers, source_ref and source_quote unchanged; "
+        "the language instruction applies only to report_markdown and human-readable "
+        "statements, never to exact source quotations.\n\n"
         "Allowed source refs and collected evidence:\n"
         f"{source_catalog}\n\n"
+        + ("Deterministic auxiliary observations (report commentary only; do not add "
+           "material_claims, evidence_notes, source refs or rating premises from this section). "
+           "Include a concise multi-year commentary section in report_markdown. When available, "
+           "retain the cumulative adjusted-price return, annual-return pattern with its baseline "
+           "and partial-period labels, and maximum drawdown with peak/trough dates. Preserve "
+           "coverage and retrospective limitations. Do not discard these supplied auxiliary "
+           "observations merely because they are outside the source catalog; they remain "
+           "advisory, never decision premises. If unavailable, preserve the limitation and do "
+           "not invent numbers. Distinct tool date windows can legitimately have distinct row "
+           "counts; a subwindow is not by itself a conflict with the full snapshot.\n"
+           + auxiliary_context + "\n\n" if auxiliary_context else "")
+        +
         "Unvalidated prose draft (do not return it unless converted into the schema):\n"
         f"{draft.strip() or '[empty draft]'}"
     )
@@ -263,23 +352,21 @@ def _finalization_prompt(
 def _normalize_submission(
     submitted: AnalystEvidenceReport | Mapping[str, Any],
     analyst: str,
-) -> tuple[str, tuple[MaterialClaim, ...]]:
+) -> tuple[str, tuple[MaterialClaim, ...], tuple[EvidenceNote, ...]]:
     validated = AnalystEvidenceReport.model_validate(submitted)
     report = validated.report_markdown.strip()
     if not report:
-        raise ValueError("structured report markdown was empty")
+        raise SubmissionConstraintError("blank_report")
     claim_ids = tuple(claim.claim_id for claim in validated.material_claims)
     if len(set(claim_ids)) != len(claim_ids):
-        raise ValueError("structured report contained duplicate material claim IDs")
+        raise SubmissionConstraintError("duplicate_claim_id")
     invalid_ids = tuple(
         claim_id
         for claim_id in claim_ids
-        if not claim_id.startswith(f"{analyst}.")
+        if not claim_id.startswith(submission_id_prefix(analyst))
     )
     if invalid_ids:
-        raise ValueError(
-            f"{analyst} material claim IDs must use the {analyst}. namespace"
-        )
+        raise SubmissionConstraintError("claim_namespace")
     claims = tuple(
         MaterialClaim(
             claim_id=claim.claim_id,
@@ -290,7 +377,18 @@ def _normalize_submission(
         )
         for claim in validated.material_claims
     )
-    return report, claims
+    note_ids = tuple(note.note_id for note in validated.evidence_notes)
+    if len(set(note_ids)) != len(note_ids):
+        raise SubmissionConstraintError("duplicate_note_id")
+    if set(note_ids) & set(claim_ids):
+        raise SubmissionConstraintError("claim_note_collision")
+    if any(not note_id.startswith(submission_id_prefix(analyst)) for note_id in note_ids):
+        raise SubmissionConstraintError("note_namespace")
+    notes = tuple(
+        EvidenceNote(analyst=analyst, **note.model_dump())
+        for note in validated.evidence_notes
+    )
+    return report, claims, notes
 
 
 def _apply_deterministic_history_requirements(
@@ -320,14 +418,23 @@ def _apply_deterministic_history_requirements(
     return evidence.model_copy(update={"material_claims": tuple(claims)})
 
 
-def _unavailable_result(analyst: str, reason: str) -> AnalystSubmissionResult:
+def _unavailable_result(
+    analyst: str, reason: str, *, stage: str = "finalizer", attempts: int = 0,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> AnalystSubmissionResult:
     label = analyst.title()
     report = (
         f"ANALYSIS_UNAVAILABLE: The {label} Analyst did not produce a validated "
         "structured evidence report. No directional conclusion was issued."
     )
     return AnalystSubmissionResult(
-        message=AIMessage(content=report),
+        message=AIMessage(content=report, response_metadata={
+            "analyst_submission_diagnostic": {
+                "version": 1, "analyst": analyst, "reason_class": reason,
+                "stage": stage, "attempts": attempts,
+                **safe_output_diagnostics(diagnostics),
+            },
+        }),
         report=report,
         submission_source=_submission_source(
             analyst,
@@ -345,6 +452,7 @@ def _finalize_required(
     trade_date: str,
     draft: str,
     messages: list[Any],
+    auxiliary_context: str = "",
 ) -> AnalystSubmissionResult:
     if finalizer is None:
         return _unavailable_result(analyst, "unsupported")
@@ -354,6 +462,7 @@ def _finalize_required(
         trade_date=trade_date,
         draft=draft,
         messages=messages,
+        auxiliary_context=auxiliary_context,
     )
     structured_result = invoke_required_structured(
         finalizer,
@@ -365,12 +474,15 @@ def _finalize_required(
         return _unavailable_result(
             analyst,
             structured_result.reason or "none_parsed",
+            attempts=structured_result.attempts,
+            diagnostics=structured_result.diagnostics,
         )
-    report, claims = structured_result.value
+    report, claims, notes = structured_result.value
     return AnalystSubmissionResult(
         message=AIMessage(content=report),
         report=report,
         claims=claims,
+        notes=notes,
         submission_source=_submission_source(
             analyst,
             EvidenceStatus.AVAILABLE,
@@ -387,8 +499,21 @@ def process_analyst_response(
     ticker: str,
     trade_date: str,
     messages: list[Any],
+    auxiliary_context: str = "",
 ) -> AnalystSubmissionResult:
     """Accept a typed report, continue data calls, or finalize prose exactly once."""
+    from tradingagents.run_diagnostics import record_output
+
+    record_output(analyst, "initial_response", 1, response_output_diagnostics(response),
+                  outcome="output_limit" if response.response_metadata.get("finish_reason") == "length" else "response")
+    if response.response_metadata.get("finish_reason") == "length":
+        # The initial tool-calling turn has the same completeness requirement as
+        # the finalizer. A parseable prefix is not a completed report/tool plan,
+        # and an output-limit failure must not spend an automatic repair call.
+        return _unavailable_result(
+            analyst, "output_limit", stage="initial_response", attempts=1,
+            diagnostics=response_output_diagnostics(response),
+        )
     tool_calls = tuple(response.tool_calls or ())
     report_calls = tuple(
         call for call in tool_calls if call["name"] == _REPORT_TOOL_NAME
@@ -407,7 +532,7 @@ def process_analyst_response(
 
     if report_calls:
         try:
-            report, claims = _normalize_submission(report_calls[0]["args"], analyst)
+            report, claims, notes = _normalize_submission(report_calls[0]["args"], analyst)
         except (ValidationError, ValueError, TypeError):
             return _finalize_required(
                 finalizer=finalizer,
@@ -416,11 +541,13 @@ def process_analyst_response(
                 trade_date=trade_date,
                 draft=str(response.content),
                 messages=messages,
+                auxiliary_context=auxiliary_context,
             )
         return AnalystSubmissionResult(
             message=AIMessage(content=report),
             report=report,
             claims=claims,
+            notes=notes,
             submission_source=_submission_source(
                 analyst,
                 EvidenceStatus.AVAILABLE,
@@ -435,6 +562,7 @@ def process_analyst_response(
         trade_date=trade_date,
         draft=str(response.content),
         messages=messages,
+        auxiliary_context=auxiliary_context,
     )
 
 
@@ -454,6 +582,67 @@ def _same_market_snapshot_observation(
     ) == active.model_dump(mode="python", exclude=runtime_fields)
 
 
+def _route_multiyear_advisory_notes(state, result, evidence, active_snapshot, report_key):
+    """Demote only exact application-generated limitations, never qualify them.
+
+    Ordinary source notes and every material claim keep the original gate.
+    Model paraphrases are discarded here, not certified or promoted to facts.
+    """
+    if (report_key != "market_report" or not result.notes
+            or result.submission_source.source_id != "analyst.market.submission"
+            or result.submission_source.status is not EvidenceStatus.AVAILABLE):
+        return result
+    from tradingagents.multiyear_trend import (
+        TrendUnavailable,
+        bound_multiyear_limitations,
+        render_multiyear_trend,
+    )
+
+    try:
+        summary, quotes = bound_multiyear_limitations(
+            evidence, symbol=state["company_of_interest"], as_of=state["trade_date"],
+            active_snapshot=active_snapshot,
+        )
+    except TrendUnavailable:
+        return result
+    if active_snapshot is not None and (
+        active_snapshot.snapshot_id != summary.lineage.input_snapshot_id
+        or active_snapshot.frame_sha256 != summary.lineage.input_artifact_sha256
+        or active_snapshot.requested_date != summary.as_of
+    ):
+        return result
+    protected_ids = {c.claim_id for c in (*evidence.material_claims, *result.claims)}
+    protected_ids.update(n.note_id for n in evidence.evidence_notes)
+    routed = tuple(n for n in result.notes if (
+        n.analyst == "market" and n.note_id not in protected_ids
+        and n.source_ref == summary.lineage.input_snapshot_id
+        and (quotes.get(n.source_quote) == n.kind or (
+            # Historical availability is also a valid label for this exact
+            # regenerated temporal limitation. The model's label/paraphrase
+            # is discarded, not certified; arbitrary notes retain the gate.
+            n.kind == "availability" and quotes.get(n.source_quote) == "applicability"
+            and n.source_quote.startswith(("- 时间证据:", "- Temporal evidence:"))
+        ))
+    ))
+    if not routed:
+        return result
+    from tradingagents.dataflows.config import get_config
+    from tradingagents.report_presentation import is_chinese
+
+    language = get_config().get("output_language", "English")
+    zh = is_chinese(language)
+    lines = [line for line in render_multiyear_trend(summary, language).splitlines() if line in quotes]
+    title = "### 确定性辅助说明（不属于决定证据）" if zh else "### Deterministic advisory limitations (not decision evidence)"
+    notice = ("以下说明由当前绑定快照重新生成；模型附带的转述未获事实认证，不进入评分。" if zh else
+              "Regenerated from the current bound snapshot; model paraphrases are not certified facts and do not enter scoring.")
+    appendix = "\n".join([title, notice, f"{summary.symbol} / {summary.as_of}",
+        f"Snapshot: `{summary.lineage.input_snapshot_id}`",
+        f"SHA-256: `{summary.lineage.input_artifact_sha256}`", *lines])
+    report = result.report + "\n\n" + appendix
+    return replace(result, report=report, message=result.message.model_copy(update={"content": report}),
+                   notes=tuple(n for n in result.notes if n not in routed))
+
+
 def build_analyst_update(
     state: Mapping[str, Any],
     result: AnalystSubmissionResult,
@@ -465,10 +654,17 @@ def build_analyst_update(
     }
     if result.submission_source is None:
         return update
+    evidence = EvidenceState.model_validate(state.get("evidence_state", {}))
+    active_snapshot = get_active_authoritative_market_snapshot(
+        str(state["company_of_interest"]), str(state["trade_date"]),
+    )
+    result = _route_multiyear_advisory_notes(state, result, evidence, active_snapshot, report_key)
+    update.update({"messages": [result.message], report_key: result.report})
     call_ids_by_source = source_ref_tool_call_ids(
         state["messages"],
         str(state["company_of_interest"]),
         str(state["trade_date"]),
+        include_unavailable_financial=True,
     )
     tool_calls_by_id = _tool_calls_by_id(state["messages"])
     tool_evidence = build_tool_evidence_state(
@@ -476,13 +672,11 @@ def build_analyst_update(
         result.claims,
         tool_call_ids_by_source=call_ids_by_source,
         tool_calls_by_id=tool_calls_by_id,
+        instrument_identity=evidence.instrument_identity,
+        notes=result.notes,
+        include_catalog_sources=True,
     )
     tool_evidence = _apply_deterministic_history_requirements(tool_evidence)
-    evidence = EvidenceState.model_validate(state.get("evidence_state", {}))
-    active_snapshot = get_active_authoritative_market_snapshot(
-        str(state["company_of_interest"]),
-        str(state["trade_date"]),
-    )
     if active_snapshot is not None:
         history_access, history_diagnostic = project_history_store_access(
             active_snapshot.history_store_status,
@@ -593,6 +787,14 @@ def build_analyst_update(
                 )
         evidence = refresh_active_evidence_physical_attempts(evidence)
     try:
+        # Capture source necessity from policy/state, never from a model note.
+        # This projection is independent of whether the model cited the source.
+        evidence = merge_evidence_sources(evidence, tool_evidence.sources)
+        sources = {source.source_id: source for source in evidence.sources}
+        notes = tuple(note.model_copy(update={
+            "source_status": sources[note.source_ref].status,
+            "source_required": sources[note.source_ref].required,
+        }) for note in tool_evidence.evidence_notes)
         evidence = merge_material_claims(
             evidence,
             tool_evidence.material_claims,
@@ -607,6 +809,7 @@ def build_analyst_update(
             tool_evidence.acquisition_outcomes,
         )
         evidence = merge_claim_validations(evidence, tool_evidence.claim_validations)
+        evidence = merge_evidence_notes(evidence, notes)
     except ValueError:
         conflicted_submission = result.submission_source.model_copy(
             update={
@@ -619,8 +822,33 @@ def build_analyst_update(
             (conflicted_submission,),
         ).model_dump(mode="json")
         return update
+    submission_source = result.submission_source
+    if any(note.binding_status != "source_bound_quote" for note in notes):
+        submission_source = submission_source.model_copy(update={
+            "status": EvidenceStatus.UNAVAILABLE,
+            "detail": "evidence note quote is not uniquely source-bound",
+        })
     update["evidence_state"] = merge_evidence_sources(
         evidence,
-        (result.submission_source, *tool_evidence.sources),
+        (submission_source,),
     ).model_dump(mode="json")
+    financial_refs = {source_ref for source_ref, call_ids in call_ids_by_source.items()
+                      if any(tool_calls_by_id.get(call_id, {}).get("name") in FINANCIAL_TOOLS
+                             for call_id in call_ids)}
+    if (any(fact.tool_name in FINANCIAL_TOOLS for fact in tool_evidence.source_facts)
+            or any(ref in financial_refs for claim in result.claims for ref in claim.source_refs)):
+        observations = verified_financial_observations(
+            update["evidence_state"], claim_ids=(claim.claim_id for claim in result.claims))
+        rendered = "\n".join("- " + observation.render() for observation in observations)
+        update[report_key] = (
+            "## Advisory commentary / 咨询性文字\n"
+            "Source quotation support does not verify this prose's financial meaning. "
+            "引用一致不等于字段、币种或期间语义已核验。\n\n"
+            + result.report
+            + "\n\n## Source-bound CURRENT observations / 来源绑定的财务观测\n"
+            "Only the following source-row values are deterministically bound. "
+            "They are not PIT evidence, canonical facts or investment-qualified premises; "
+            "quarterly income/cashflow retain cumulative report_type=1 semantics.\n"
+            + (rendered or "- No uniquely bound complete financial row / 无唯一完整财务行绑定。")
+        )
     return update

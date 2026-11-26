@@ -57,21 +57,23 @@ def test_akshare_news_wire_response_survives_arrow_string_backend(monkeypatch):
     calls = []
     rows = [{
         "date": "2026-10-10 12:00:00", "mediaName": "Synthetic fixture",
-        "code": "202610100001", "title": "<em>项目</em>进展",
+        "code": "202610100001", "title": "600895 <em>项目</em>进展",
         "content": "园区\u3000运营\r\n消息", "image": "",
     }]
 
     def response(url, *, params, **kwargs):
         calls.append((url, json.loads(params["param"]), kwargs))
         body = params["cb"] + "(" + json.dumps({"result": {"cmsArticleWebOld": rows}}) + ")"
-        return SimpleNamespace(status_code=200, text=body)
+        return SimpleNamespace(status_code=200, content=body.encode(), close=lambda: None)
 
-    # Keep the real SDK parser and replace only its wire response.
+    # Keep the registered safe parser and replace only its wire response.
     import importlib
+
+    import requests
 
     sdk_module = importlib.import_module(akshare_data.ak.stock_news_em.__module__)
     sdk_function = akshare_data.ak.stock_news_em
-    monkeypatch.setattr(sdk_module.requests, "get", response)
+    monkeypatch.setattr(requests, "get", response)
     string_storage = pd.options.mode.string_storage
     with authoritative_snapshot_run():
         result = interface.route_to_vendor_acquired(
@@ -240,7 +242,10 @@ def test_acquisition_identity_serializes_through_unions_without_warnings(availab
     if acquisition_id is not None:
         assert payload["acquisition_id"] == acquisition_id
     if not available:
-        assert "error_code" in payload and payload["error_code"] is None
+        assert payload["error_code"] == "provider_exception"
+        # Existing evidence with no diagnostic remains valid and is not upgraded.
+        legacy = {**payload, "error_code": None}
+        assert adapter.validate_json(json.dumps(legacy)).error_code is None
 
 
 def _mainland_identity() -> InstrumentIdentityEvidence:
@@ -649,7 +654,7 @@ def test_rate_limited_only_news_tool_exposes_no_artifact_fact_or_available_sourc
 @pytest.mark.unit
 def test_news_providers_raise_typed_no_data_on_acquired_path():
     with mock.patch.object(
-        akshare_data.ak, "stock_news_em", return_value=pd.DataFrame()
+        akshare_data, "_stock_news_em", return_value=pd.DataFrame()
     ), pytest.raises(NoMarketDataError):
         akshare_data.get_news("600895.SS", "2026-07-01", "2026-07-20")
 

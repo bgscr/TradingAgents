@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -21,17 +24,20 @@ from tradingagents.dataflows.financial_dispatch import (
     FinancialDispatchAuditProjectionV6,
 )
 from tradingagents.decision_audit import write_immutable_decision_audit
-from tradingagents.decision_policy import TradingDecisionContract
+from tradingagents.decision_policy import TradingDecisionContract, ValidatedDecisionContext
 from tradingagents.evidence import (
     AnalysisOutcome,
     EvidenceState,
+    InstrumentKind,
     SourceAcquisitionUnavailable,
     render_analysis_outcome,
 )
+from tradingagents.multiyear_trend import multiyear_trend_markdown
 from tradingagents.report_exports import preflight_report_paths, publish_report_export
 from tradingagents.report_presentation import (
     advisory_markdown,
     advisory_sections,
+    decision_scope_markdown,
     evidence_diagnostic_markdown,
     is_chinese,
     localize_report,
@@ -43,6 +49,7 @@ from tradingagents.terminal_contract import (
     DecisionCoverage,
     TerminalContract,
     TerminalOutcomeKind,
+    validated_trading_decision_from_state,
 )
 
 
@@ -147,6 +154,12 @@ def _render_acquisition_outcomes(evidence: EvidenceState) -> list[str]:
         lines.extend(["No acquisition outcomes were recorded.", ""])
     else:
         for index, outcome in enumerate(outcomes, 1):
+            if outcome.provider == 'eastmoney_powershell':
+                lines.extend(['### PowerShell 新闻传输', '',
+                    '本次选择固定、无 profile 的 PowerShell Invoke-WebRequest；仅 available 表示取得合格文本，未使用 Requests 回退。失败不等于没有新闻。',
+                    '收到时间不是历史发布时间证明；通过原结构、股票和截止日期校验后用于辅助分析，单页历史覆盖未知，评级规则不变。',
+                    *(['未采用原因：`' + outcome.error_code + '`。'] if isinstance(outcome, SourceAcquisitionUnavailable)
+                      and outcome.error_code and outcome.error_code.startswith('powershell_news_') else []), ''])
             if isinstance(outcome, SourceAcquisitionUnavailable):
                 reason = outcome.reason.value
                 retry_after = (
@@ -1361,21 +1374,34 @@ def render_analysis_outcome_report(
 def budget_data_gap_markdown(state: dict, language="English") -> str:
     """Render fixed operational gaps separately from the validated decision."""
     from tradingagents.budget_data import ALPHA_ENRICHMENT_TOOLS
+    from tradingagents.evidence_diagnostics import NEWS_DIAGNOSTIC_LABELS
 
     receipt = state.get("analysis_budget") or {}
     allowed = {"user_disabled", "not_configured", "authentication_failed", "permission_denied", "rate_limited"}
+    core_gaps = {
+        ("get_fundamentals.business", "akshare", "optional_business_omitted"),
+        ("get_fundamentals.financial_summary", "akshare", "optional_financial_summary_omitted"),
+        ("get_news.coverage", "akshare", "news_window_coverage_unknown"),
+        ("get_news", "akshare", "news_unavailable"),
+    }
     rows = [item for item in receipt.get("data_gaps", [])
-            if item.get("tool") in ALPHA_ENRICHMENT_TOOLS
-            and item.get("provider") == "alpha_vantage" and item.get("reason") in allowed]
+            if (item.get("tool") in ALPHA_ENRICHMENT_TOOLS
+                and item.get("provider") == "alpha_vantage" and item.get("reason") in allowed)
+            or (item.get("tool"), item.get("provider"), item.get("reason")) in core_gaps]
     if not rows:
         return ""
     heading = "## 预算运行数据缺口" if is_chinese(language) else "## Budget run data gaps"
     warning = ("运行诊断，不是来源事实；未自动换源，不代表没有新闻或内幕交易。"
                if is_chinese(language) else
                "Operational diagnostics, not source facts. No automatic fallback; these gaps do not mean no news or insider transactions.")
-    return "\n".join([heading, "", warning, "", *(
-        f"- DATA_UNAVAILABLE: `{item['tool']}`; `alpha_vantage`; `{item['reason']}`."
-        for item in rows), ""])
+    lines = [heading, "", warning, ""]
+    for item in rows:
+        coverage_gap = item['reason'] == 'news_window_coverage_unknown'
+        label = 'DATA_GAP' if coverage_gap else 'DATA_UNAVAILABLE'
+        lines.append(f"- {label}: `{item['tool']}`; `{item['provider']}`; `{item['reason']}`.")
+        if coverage_gap:
+            lines.append(NEWS_DIAGNOSTIC_LABELS[item['reason']][int(is_chinese(language))] + ".")
+    return "\n".join([*lines, ""])
 
 
 def _report_header(
@@ -1403,15 +1429,106 @@ def _report_header(
     )
 
 
-def write_report_tree(final_state: dict, ticker: str, save_path, *, output_language="English") -> Path:
+@dataclass(frozen=True, slots=True)
+class SupplementalStatementRequest:
+    """Explicit trusted retained input; never discovered from graph state or cache.
+
+    The caller supplies the authorized original bytes and independently trusted
+    digest. Report symbol and cutoff are bound from the existing run, not here.
+    """
+
+    raw_payload: bytes
+    expected_sha256: str
+    report_period: str
+    row_index: int
+
+
+def _supplemental_report_text(final_state, ticker, request, output_language="Chinese"):
+    if request is None:
+        return ""
+    from tradingagents.supplemental_observation import (
+        observe_retained_payload,
+        render_supplemental,
+    )
+
+    def symbol(value):
+        if type(value) is not str or re.fullmatch(r"[0-9]{6}\.(?:SH|SS|SZ)", value) is None:
+            raise ValueError("supplemental_report_binding_invalid")
+        return value[:-3] + ".SH" if value.endswith(".SS") else value
+
+    try:
+        if type(request) is not SupplementalStatementRequest:
+            raise ValueError("supplemental_request_type_invalid")
+        terminal = TerminalContract.model_validate(final_state["terminal_contract"])
+        if terminal.terminal_outcome_kind not in {
+            TerminalOutcomeKind.ANALYSIS_OUTCOME, TerminalOutcomeKind.TRADING_DECISION,
+        }:
+            raise ValueError("supplemental_terminal_invalid")
+        evidence = EvidenceState.model_validate(final_state["evidence_state"])
+        identity = evidence.instrument_identity
+        if identity is None or not identity.is_authoritative:
+            raise ValueError("supplemental_identity_missing")
+        bound_symbol = symbol(identity.symbol)
+        expected_venue = {"SH": "XSHG", "SZ": "XSHE"}[bound_symbol[-2:]]
+        if (identity.instrument_kind is not InstrumentKind.EQUITY
+                or identity.venue != expected_venue or identity.currency != "CNY"):
+            raise ValueError("supplemental_equity_identity_invalid")
+        def identity_matches(instrument):
+            return (symbol(instrument.symbol) == bound_symbol
+                    and instrument.instrument_kind is InstrumentKind.EQUITY
+                    and instrument.venue == expected_venue and instrument.currency == "CNY")
+        if symbol(ticker) != bound_symbol or symbol(final_state["company_of_interest"]) != bound_symbol:
+            raise ValueError("supplemental_symbol_mismatch")
+        raw_cutoff = final_state["trade_date"]
+        if type(raw_cutoff) is not str or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw_cutoff) is None:
+            raise ValueError("supplemental_cutoff_invalid")
+        cutoff = date.fromisoformat(raw_cutoff)
+        raw_context = final_state.get("validated_decision_context")
+        if raw_context is not None:
+            context = ValidatedDecisionContext.model_validate(raw_context)
+            if not identity_matches(context.instrument) or context.as_of_date != cutoff:
+                raise ValueError("supplemental_context_mismatch")
+        if final_state.get("trading_decision") is not None or terminal.terminal_outcome_kind is TerminalOutcomeKind.TRADING_DECISION:
+            decision = validated_trading_decision_from_state(final_state)
+            if decision is None or not identity_matches(decision.instrument) or decision.as_of_date != cutoff:
+                raise ValueError("supplemental_decision_mismatch")
+        observation = observe_retained_payload(
+            request.raw_payload, expected_sha256=request.expected_sha256,
+            ticker=bound_symbol, report_period=request.report_period,
+            as_of=cutoff.isoformat(), row_index=request.row_index,
+        )
+        chinese = is_chinese(output_language)
+        footer = ("附录由报告导出完整性摘要覆盖；这不是决策审计的资格认证。" if chinese else
+                  "The appendix is covered by the report export integrity digest; this is not qualification by the decision audit.")
+        return "\n\n---\n\n" + render_supplemental(observation, chinese=chinese) + "\n" + footer + "\n"
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # No arbitrary state, payload, validation detail or source value escapes.
+        raise ValueError("supplemental_report_binding_invalid") from None
+
+
+def write_report_tree(final_state: dict, ticker: str, save_path, *, output_language="English",
+                      supplemental_statement: SupplementalStatementRequest | None = None,
+                      company_announcement=None, announcement_timeout_seconds=25, announcement_remaining=None,
+                      news_source_selection=None) -> Path:
     """Publish the validated decision and separately labeled advisory stages."""
 
+    from tradingagents.portfolio_research_run import active_selection
+    if active_selection() is not None or final_state.get("portfolio_research_terminal"):
+        from tradingagents.portfolio_research_terminal import publish
+        return publish(final_state,ticker,save_path,output_language)
+    supplemental_text = _supplemental_report_text(final_state, ticker, supplemental_statement, output_language)
+    from tradingagents.news_projection import render_source_selection_report
+    if news_source_selection is not None:
+        render_source_selection_report(news_source_selection, final_state.get('company_of_interest'), final_state.get('trade_date'))
+    news_selection_text = render_source_selection_report(news_source_selection, ticker, final_state.get('trade_date'))
     with ReportStore(save_path) as publication:
         preflight_report_paths(publication)
-        return _write_report_tree(final_state, ticker, publication, output_language)
+        return _write_report_tree(final_state, ticker, publication, output_language, supplemental_text,
+                                  company_announcement, announcement_timeout_seconds, announcement_remaining, news_selection_text)
 
 
-def _write_report_tree(final_state, ticker, publication, output_language):
+def _write_report_tree(final_state, ticker, publication, output_language, supplemental_text="",
+                       company_announcement=None, announcement_timeout_seconds=25, announcement_remaining=None, news_selection_text=""):
     save_path = publication.root
     write_immutable_decision_audit(final_state, save_path, publication=publication)
     terminal = TerminalContract.model_validate(final_state["terminal_contract"])
@@ -1462,6 +1579,7 @@ def _write_report_tree(final_state, ticker, publication, output_language):
     if identity.audit_digest is None:
         raise ValueError("canonical export identity is missing its audit digest")
 
+    decision = None
     if terminal.terminal_outcome_kind is TerminalOutcomeKind.ANALYSIS_OUTCOME:
         outcome = AnalysisOutcome.model_validate(
             final_state["analysis_outcome_contract"]
@@ -1497,10 +1615,29 @@ def _write_report_tree(final_state, ticker, publication, output_language):
     else:
         raise ValueError("operational failures cannot be published as decision reports")
 
-    body = localize_report(body, output_language)
+    body = decision_scope_markdown(final_state, decision, evidence, output_language) + "\n" + localize_report(body, output_language)
     body += "\n" + evidence_diagnostic_markdown(evidence, output_language)
     body += "\n" + budget_data_gap_markdown(final_state, output_language)
     documents = {terminal_path: body}
+    trend = multiyear_trend_markdown(
+        evidence, symbol=ticker, as_of=final_state.get("trade_date"), language=output_language,
+    )
+    if trend:
+        documents["1_analysts/multiyear_trend.md"] = trend
+    from tradingagents.moneyflow import moneyflow_markdown
+
+    moneyflow = moneyflow_markdown(final_state, language=output_language)
+    if moneyflow:
+        documents["1_analysts/moneyflow.md"] = moneyflow
+    from tradingagents.margin_balance import margin_balance_markdown
+
+    margin_balance = margin_balance_markdown(final_state, language=output_language)
+    if margin_balance:
+        documents["1_analysts/margin_balance.md"] = margin_balance
+    from tradingagents.powershell_fundflow import fundflow_markdown
+    eastmoney_flow = fundflow_markdown(final_state)
+    if eastmoney_flow:
+        documents["1_analysts/eastmoney_fundflow.md"] = eastmoney_flow
 
     header = _report_header(
         ticker,
@@ -1510,10 +1647,42 @@ def _write_report_tree(final_state, ticker, publication, output_language):
     )
     advisory = []
     stages = []
+    rule_summary = ""
+    # Equality only deduplicates the old text. The new system summary is rendered
+    # from the gated contract, never attributed to the author of a matching string.
+    canonical_decision_text = None
+    if decision is not None:
+        from tradingagents.agents.managers.direction_selector import render_trading_decision
+
+        canonical_decision_text = render_trading_decision(decision)
+    target = _current_full_target.get()
+    targeted = target is not None and target == (ticker, str(final_state.get("trade_date"))) and ticker == final_state.get("company_of_interest") and is_chinese(output_language)
+    verified = section(publication, ticker, str(final_state["trade_date"]), getattr(financial_dispatch, "requests", ())) if targeted else None
     for relative, title, chinese_title, content in advisory_sections(final_state):
+        if relative == "4_risk/manager.md" and content == canonical_decision_text:
+            rating = decision.rating.value
+            if is_chinese(output_language):
+                label = {"Buy": "买入", "Hold": "持有", "Sell": "卖出"}.get(rating, rating)
+                text = ("# 规则决定摘要（系统生成）\n\n"
+                        f"规则评级：{label}。由本次通过门禁的决定合同生成，"
+                        "不是独立的风险经理模型建议或多分析员共识。\n\n"
+                        f"决定编号：`{decision.decision_id}`。完整规则依据见报告前部。\n")
+            else:
+                text = ("# Rule decision summary (system-generated)\n\n"
+                        f"Rule-based rating: {rating}. Generated from the gated decision contract, "
+                        "not a separate risk-manager model recommendation or analyst consensus.\n\n"
+                        f"Decision ID: `{decision.decision_id}`. See the rule basis above.\n")
+            documents[relative] = text
+            rule_summary = "\n\n---\n\n" + text
+            continue
         text = advisory_markdown(
-            chinese_title if is_chinese(output_language) else title, content, output_language
+            chinese_title if is_chinese(output_language) else title, content, output_language,
+            decision=decision, evidence=evidence,
+            flow_windows_unverified=final_state.get("moneyflow_observation") is not None,
         )
+        documents[relative] = text
+        if targeted:
+            text = checked_advisory(relative, text, verified)
         documents[relative] = text
         stages.append(relative)
         advisory.append(text)
@@ -1521,5 +1690,100 @@ def _write_report_tree(final_state, ticker, publication, output_language):
     if advisory:
         heading = "辅助分析阶段正文" if is_chinese(output_language) else "Advisory stage reports"
         appendix = "\n\n---\n\n# " + heading + "\n\n" + "\n\n".join(advisory)
-    documents["complete_report.md"] = localize_report(header, output_language) + body + appendix
+    trend_section = "\n\n---\n\n" + trend if trend else ""
+    if moneyflow:
+        trend_section += "\n\n---\n\n" + moneyflow
+    if margin_balance:
+        trend_section += "\n\n---\n\n" + margin_balance
+    from tradingagents.announcement_report import announcement_appendix
+
+    announcement = announcement_appendix(final_state, ticker, company_announcement,
+                                        language=output_language, timeout=announcement_timeout_seconds,
+                                        remaining=announcement_remaining)
+    documents["complete_report.md"] = localize_report(header, output_language) + news_selection_text + body + trend_section + ('\n\n' + eastmoney_flow if eastmoney_flow else '') + rule_summary + appendix + supplemental_text + announcement
     return publish_report_export(publication, identity, output_language, documents, stages)
+
+
+
+from contextvars import ContextVar
+_current_full_target = ContextVar("current_full_financial_target", default=None)
+"""Offline candidate for a dedicated, deterministic financial-report section."""
+from decimal import Decimal
+
+TABLES = {"income": ("利润表", "归母净利润", "n_income_attr_p"),
+          "cash": ("现金流量表", "现金及现金等价物净增加额", "n_incr_cash_cash_equ"),
+          "balance": ("资产负债表", "资产总额", "total_assets")}
+
+def render(ticker, cutoff, facts, latest_references=()):
+    lines = [f"# {ticker} 财务报告期核验", "", f"分析截止日 {cutoff}。按本次已核验 CURRENT 观测展示。", ""]
+    rejected = 0
+    for ref in latest_references:
+        table = ref.get("table")
+        expected = facts.get(table) if isinstance(table,str) else None
+        if not expected or ref != {"table":table, **expected}:
+            rejected += 1
+    for key,(title,label,field) in TABLES.items():
+        fact = facts.get(key)
+        if not fact or fact["field"] != field:
+            lines.append(f"- {title}：本次工具未提供可核验的{label}。")
+            continue
+        amount = Decimal(fact["value"]) / Decimal(100000000)
+        lines.append(f"- {title}：{fact['period']}，公告日 {fact['announcement']}，{fact['basis']}；{label} {amount:f} 亿元。附件 SHA-256：{fact['source']}。")
+    lines += ["", "季度利润与现金流按报告期累计展示，未推导单季金额。"]
+    if rejected:
+        lines.append(f"有 {rejected} 条最新期间引用未通过核验，已从本节剔除。")
+    return "\n".join(lines)+"\n"
+
+import zlib,csv,gzip,io,re
+from datetime import date
+from hashlib import sha256
+from tradingagents.financial_observations import CURRENT_STATEMENT_COLUMNS,CURRENT_OBSERVATION_MARKER,STATEMENT_TITLES,_valid_row
+from tradingagents.dataflows.financial_dispatch import FinancialDispatchAuditRequest
+
+
+TOOLS={"income":("get_income_statement","income_statement","n_income_attr_p","net_income"),"cash":("get_cashflow","cash_flow","n_incr_cash_cash_equ","net_change_in_cash"),"balance":("get_balance_sheet","balance_sheet","total_assets","total_assets")}
+
+def extract(store,ticker,cutoff,request,spec):
+    tool,statement,field,normalized=spec
+    if not isinstance(request,FinancialDispatchAuditRequest) or request.tool_name!=tool or request.statement_type.value!=statement or request.frequency.value!="quarterly" or request.as_of_date!=date.fromisoformat(cutoff):return None
+    digest=request.artifact_sha256
+    available=[o for o in request.outcomes if o.outcome=="available"]
+    if not digest or len(available)!=1 or (available[0].provider,available[0].artifact_sha256)!=("tushare",digest):return None
+    with gzip.GzipFile(fileobj=io.BytesIO(store.read_bytes(f"evidence_artifacts/sha256/{digest[:2]}/{digest}.utf8.gz"))) as f:
+        raw=f.read(4_000_001)
+    if len(raw)>4_000_000 or sha256(raw).hexdigest()!=digest:return None
+    lines=raw.decode().splitlines()
+    header=",".join(CURRENT_STATEMENT_COLUMNS)
+    if not lines or lines[0]!=f"# {STATEMENT_TITLES[tool]} data for {ticker} (quarterly)" or lines.count(header)!=1:return None
+    i=lines.index(header)
+    pre=lines[:i]
+    if any(not l.startswith("# ") for l in pre) or any(pre.count(tag)!=1 for tag in (CURRENT_OBSERVATION_MARKER,"# CURRENT-only; source=tushare; not strict PIT evidence.")):return None
+    if tool!="get_balance_sheet" and pre.count("# Income/cashflow quarterly rows retain cumulative report_type=1 values, not standalone-quarter deltas.")!=1:return None
+    if not any(l.startswith("# degraded=false;") for l in pre) or any(l.startswith(("# missing","# stale","# degraded=true")) for l in pre):return None
+    parsed=list(csv.DictReader(lines[i:],strict=True))
+    if any(None in r or None in r.values() or not _valid_row(r,"quarterly") for r in parsed) or len(set(lines[i+1:]))!=len(parsed):return None
+    eligible=[r for r in parsed if max(r["period_end"],r["ann_date"],r["f_ann_date"])<=cutoff]
+    last=max((r["period_end"] for r in eligible),default=None)
+    found=[r for r in eligible if r["period_end"]==last and r["provider_field"]==field and r["field"]==normalized and r["value_status"]=="reported"]
+    if len(found)!=1:return None
+    r=found[0]
+    return dict(period=last,announcement=r["ann_date"],basis="期末余额" if tool=="get_balance_sheet" else "报告期累计",value=r["value"],source=digest,field=field,view="quarterly")
+
+def section(store,ticker,cutoff,requests):
+    facts={}
+    for key,spec in TOOLS.items():
+        matches=[r for r in requests if r.tool_name==spec[0] and r.frequency.value=="quarterly"]
+        if len(matches)==1:
+            try:
+                fact=extract(store,ticker,cutoff,matches[0],spec)
+            except (zlib.error,ValueError,OSError,EOFError,csv.Error,KeyError):
+                fact=None
+            if fact:facts[key]=fact
+    return render(ticker,cutoff,facts)
+
+def checked_advisory(relative,text,verified):
+    if relative=="1_analysts/fundamentals.md":return verified
+    if relative.startswith(("2_research/","3_trading/","4_risk/")):return "此阶段无逐项核验的自由正文，已省略。经核验的结构化决定与市场数据见主报告。"
+    return text
+
+
