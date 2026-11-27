@@ -2,6 +2,10 @@
 param(
     [string] $Ticker,
     [switch] $PreparedData,
+    [switch] $Basic,
+    [switch] $SkipNews,
+    [switch] $SkipMargin,
+    [switch] $SkipRatio,
     [Parameter(ParameterSetName = 'Check')] [switch] $CheckOnly,
     [Parameter(Mandatory, ParameterSetName = 'Research')] [switch] $Run
 )
@@ -42,6 +46,10 @@ $entry = Join-Path $PSScriptRoot 'scripts/personal_full.py'
 Assert-LocalPath $entry
 $selection = @()
 if ($PreparedData) { $selection += '--prepared-data' }
+if ($Basic) { $selection += '--basic' }
+if ($SkipNews) { $selection += '--skip-news' }
+if ($SkipMargin) { $selection += '--skip-margin' }
+if ($SkipRatio) { $selection += '--skip-ratio' }
 if (-not $Run) {
     & $python -I -B $entry --ticker $Ticker $mode @selection
     exit $LASTEXITCODE

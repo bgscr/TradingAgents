@@ -235,6 +235,18 @@ def install_graph_boundary(monkeypatch, symbol, trace):
         with Path(trace).open("a", encoding="utf8") as out:
             out.write(name + "\n")
 
+    from scripts import personal_observations as observations
+
+    def public_page(ticker, day, remaining, admit):
+        assert ticker == symbol and day == "2024-02-29"
+        remaining()
+        admit()
+        event("personal:public_news")
+        from tests.test_personal_observations import page_bytes
+
+        return page_bytes(ticker)
+
+    monkeypatch.setattr(observations, "get_page", public_page)
     original = feed.post
 
     def capture(*args):
@@ -355,11 +367,27 @@ def test_cold_real_graph_entry(tmp_path, monkeypatch, capsys, symbol):
     )
     trace = tmp_path / "synthetic-transport.txt"
     install_graph_boundary(monkeypatch, symbol, trace)
+    from scripts import personal_observations
+
+    def denied_news(ticker, day, remaining, admit):
+        admit()
+        with trace.open("a", encoding="utf8") as stream:
+            stream.write("personal:news_denied\n")
+        raise PermissionError
+
+    monkeypatch.setattr(personal_observations, "get_page", denied_news)
     assert personal_full.main(["--ticker", symbol, "--check-only"]) == 2
     assert not trace.exists() and not (tmp_path / "reports").exists()
     capsys.readouterr()
-    code = personal_full.main(["--ticker", symbol, "--run"])
+    options = ["--basic"] if symbol.endswith(".SZ") else []
+    code = personal_full.main(["--ticker", symbol, "--run", *options])
     receipt = json.loads(capsys.readouterr().out)
+    if options:
+        assert set(receipt["enhancements"].values()) == {"not_selected"}
+        assert "personal:news_denied" not in trace.read_text()
+    else:
+        assert receipt["enhancements"]["news"] == "permission_denied"
+        assert trace.read_text().count("personal:news_denied") == 1
     assert code in (0, 3) and receipt["report_written"], (receipt, trace.read_text())
     assert receipt["exchange_session"] == "2024-02-29" and receipt["ticker"] == symbol
     events = trace.read_text().splitlines()
@@ -451,7 +479,7 @@ except BaseException:
         DEEPSEEK_API_KEY="synthetic-example",
     )
 
-    def launch(flag):
+    def launch(flag, *options):
         proc = subprocess.run(
             [
                 pwsh,
@@ -463,6 +491,7 @@ except BaseException:
                 "-Ticker",
                 ticker,
                 flag,
+                *options,
             ],
             cwd=project,
             env=env,
@@ -483,12 +512,13 @@ except BaseException:
         ".SH", ".SS"
     )
     assert code == 0 and receipt["rating_status"] == "validated_decision"
-    assert receipt["full_data_acceptance"] == "unverified" and receipt["evidence_preset"] == "basic"
+    assert receipt["full_data_acceptance"] == "unverified" and receipt["evidence_preset"] == "full"
     assert receipt["enhancements"] == {
-        "news": "unverified",
-        "margin_balance": "not_enabled",
-        "eastmoney_fundflow_ratio": "not_enabled",
+        "news": "verified",
+        "margin_balance": "publication_pending",
+        "eastmoney_fundflow_ratio": "publication_pending",
     }
+    assert len(receipt["source_evidence"]["news"]["articles"]) == 1
     assert (
         receipt["verified_inputs"]["stock_identity"]
         == receipt["verified_inputs"]["stock_close"]
@@ -528,6 +558,10 @@ except BaseException:
         and warm["stock_close_verified"]
         and warm["exchange_session"] == receipt["exchange_session"]
     ), warm
+    assert trace.read_text().splitlines() == counts
+    code, basic = launch("-CheckOnly", "-Basic")
+    assert code == 0 and basic["evidence_preset"] == "basic"
+    assert set(basic["enhancements"].values()) == {"not_selected"}
     assert trace.read_text().splitlines() == counts
     env.update(TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS="1", PERSONAL_FIXTURE_STALL="1")
     stopped = subprocess.run(

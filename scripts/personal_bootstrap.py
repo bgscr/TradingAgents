@@ -111,7 +111,7 @@ def post(token, endpoint, params, fields, remaining, admit):
         PhysicalAttemptOutcome,
     )
 
-    if endpoint not in {*FIELDS, *FINANCE, "stock_basic"}:
+    if endpoint not in {*FIELDS, *FINANCE, "stock_basic", "margin_detail"}:
         raise PreparationError("unsupported_personal_endpoint")
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -150,6 +150,15 @@ def post(token, endpoint, params, fields, remaining, admit):
                 retry_after_seconds=_retry_after_seconds(response.getheader("Retry-After", "")),
                 error_code="personal_rate_limited",
             )
+        if endpoint == "margin_detail" and response.status in (401, 403):
+            raise PhysicalAttemptFailure(
+                outcome=PhysicalAttemptOutcome.AUTHENTICATION
+                if response.status == 401
+                else PhysicalAttemptOutcome.PERMISSION_DENIED,
+                retryable=False,
+                status_code=response.status,
+                error_code="margin_access_rejected",
+            )
         if response.status != 200:
             raise PreparationError("provider_http_rejected")
         raw = bytearray()
@@ -164,6 +173,8 @@ def post(token, endpoint, params, fields, remaining, admit):
             if len(raw) > 16 * 1024 * 1024:
                 raise PreparationError("provider_response_too_large")
         remaining()
+        if endpoint == "margin_detail":
+            return bytes(raw)  # The established margin decoder preserves exact decimal values.
         result = decode_json(bytes(raw))
         if type(result) is not dict or type(result.get("code")) is not int or result["code"] != 0:
             raise PreparationError("provider_business_rejected")
@@ -177,6 +188,7 @@ class Session:
         from tradingagents.market_history.config import MarketHistoryConfig
         from tradingagents.market_history.coordinator import upstream_service_identity_for_provider
 
+        self.account_scope = config.get("tushare_account_scope_label")
         self.maximum = config["analysis_max_calls"]
         duration = config["analysis_timeout_seconds"]
         if (
@@ -217,6 +229,18 @@ class Session:
                 "start_date": first.strftime("%Y%m%d"),
                 "end_date": self.today.strftime("%Y%m%d"),
             }
+        elif self.day is not None and endpoint == "margin_detail":
+            from tradingagents.margin_balance import FIELDS as margin_fields
+
+            valid = (
+                self.day < now().astimezone(ZoneInfo("Asia/Shanghai")).date()
+                and fields == ",".join(margin_fields)
+                and params
+                == {
+                    "ts_code": code,
+                    "trade_date": self.day.strftime("%Y%m%d"),
+                }
+            )
         elif self.day is not None and endpoint in {"daily", "adj_factor", "suspend_d"}:
             start = self.factor_start if endpoint == "adj_factor" else self.day
             valid = fields == FIELDS[endpoint] and params == {
@@ -257,13 +281,35 @@ class Session:
             raise PreparationError("personal_deadline_reached")
         time.sleep(seconds)
 
-    def query(self, token, endpoint, params, fields):
+    def query(self, token, endpoint, params, fields, *, margin_binding=None):
         from tradingagents.market_history.coordinator import (
             ProviderRequestCoordinator,
             RequestPriority,
         )
         from tradingagents.market_history.store import MarketHistoryStore
 
+        request_key = "personal:" + uuid4().hex
+        if endpoint == "margin_detail":
+            import re
+
+            from scripts.personal_observations import margin_key
+
+            if (
+                type(margin_binding) is not dict
+                or not self.account_scope
+                or self.day is None
+                or set(margin_binding)
+                != {"symbol", "trade_date", "as_of", "identity_sha256", "snapshot_id"}
+                or margin_binding["symbol"] != self.symbol.replace(".SS", ".SH")
+                or margin_binding["trade_date"] != self.day.isoformat()
+                or margin_binding["as_of"] != self.day.isoformat()
+                or not re.fullmatch(r"[a-f0-9]{64}", margin_binding["identity_sha256"])
+                or not re.fullmatch(r"snapshot:v2:[a-f0-9]{64}", margin_binding["snapshot_id"])
+            ):
+                raise PreparationError("unbound_personal_request")
+            if sum(self.counts.get(k, 0) for k in (*FINANCE, endpoint)) >= 3:
+                raise PreparationError("personal_attempt_limit")
+            request_key = margin_key(margin_binding, self.account_scope)
         self.validate(endpoint, params, fields)
         self.remaining()
         if sum(self.counts.values()) >= self.maximum or self.counts.get(endpoint, 0):
@@ -280,7 +326,29 @@ class Session:
             self.counts[endpoint] = 1
 
         def send():
-            return post(token, endpoint, params, fields, self.remaining, admit)
+            raw = post(token, endpoint, params, fields, self.remaining, admit)
+            if endpoint == "margin_detail":
+                from scripts.personal_observations import project_margin
+                from tradingagents.market_history.coordinator import (
+                    PhysicalAttemptFailure,
+                    PhysicalAttemptOutcome,
+                )
+                from tradingagents.moneyflow import MoneyflowUnavailable
+
+                try:
+                    return project_margin(raw, margin_binding)
+                except MoneyflowUnavailable as exc:
+                    denied = str(exc) == "permission_denied"
+                    raise PhysicalAttemptFailure(
+                        outcome=PhysicalAttemptOutcome.PERMISSION_DENIED
+                        if denied
+                        else PhysicalAttemptOutcome.MALFORMED_RESPONSE,
+                        retryable=False,
+                        error_code="margin_date_mismatch"
+                        if exc.rejection == "date_window"
+                        else "margin_response_rejected",
+                    ) from None
+            return raw
 
         with MarketHistoryStore.open_provider_request_authority(self.history) as store:
             coord = ProviderRequestCoordinator(store)
@@ -296,7 +364,7 @@ class Session:
             elif ceiling.allow_prewarming or ceiling.minimum_interval < self.interval:
                 raise PreparationError("personal_rate_policy_mismatch")
             result = coord.execute_physical_workflow(
-                request_key="personal:" + uuid4().hex,
+                request_key=request_key,
                 upstream_service_id=self.service,
                 owner_id="personal:" + uuid4().hex,
                 priority=RequestPriority.INTERACTIVE_MAINLAND,

@@ -33,6 +33,7 @@ def test_clean_cli_without_config(tmp_path, ticker, canonical):
         "scripts/personal_full.py",
         "scripts/personal_graph.py",
         "scripts/personal_bootstrap.py",
+        "scripts/personal_observations.py",
         "scripts/project_credentials.py",
         "tradingagents/__init__.py",
         "tradingagents/default_config.py",

@@ -229,6 +229,10 @@ def main(argv=None):
         action="store_true",
         help="Use explicitly configured pre-existing research data",
     )
+    parser.add_argument("--basic", action="store_true")
+    parser.add_argument("--skip-news", action="store_true")
+    parser.add_argument("--skip-margin", action="store_true")
+    parser.add_argument("--skip-ratio", action="store_true")
     args = parser.parse_args(argv)
     from scripts import personal_graph
     from scripts.project_credentials import ProjectCredentialError, credential_failure_code
@@ -242,6 +246,13 @@ def main(argv=None):
         config = dict(
             DEFAULT_CONFIG, market_history_mode="current", data_usage_mode="personal_research"
         )
+        config["personal_mode"] = "basic" if args.basic else "full"
+        enabled = (
+            ("news", args.skip_news),
+            ("margin_balance", args.skip_margin),
+            ("eastmoney_fundflow_ratio", args.skip_ratio),
+        )
+        config["personal_sources"] = tuple(k for k, skip in enabled if not args.basic and not skip)
         if not args.prepared_data:
             from scripts import personal_bootstrap as bootstrap
 
@@ -288,7 +299,7 @@ def main(argv=None):
                     "preparation_attempts": dict(session.counts) if session else {},
                     "report_written": False,
                     "rating_status": "unavailable",
-                    **personal_graph.data_scope(),
+                    **personal_graph.data_scope(config),
                 }
                 if args.run:
                     record_stop(receipt)
@@ -317,7 +328,7 @@ def record_stop(receipt):
 def finish(args, result, keys, config, started, session):
     from scripts import personal_graph
 
-    result.update(personal_graph.data_scope(), rating_status="not_run", preflight_ready=False)
+    result.update(personal_graph.data_scope(config), rating_status="not_run", preflight_ready=False)
     if any(os.environ.get(key) or os.environ.get(key.lower()) for key in TRANSPORT_OVERRIDES):
         result["configuration_issue"] = "custom_proxy_or_tls_settings_require_review"
     elif not result["cache_issue"] and not result["missing_credentials"]:

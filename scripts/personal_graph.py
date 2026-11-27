@@ -121,6 +121,10 @@ def configured(config, ticker):
         raise ValueError("invalid_session_limits")
     config = dict(
         config,
+        personal_public_news_allowed=(
+            config.get("personal_public_news_allowed") is not False
+            and (enabled is None or "akshare" in enabled)
+        ),
         analysis_budget_enabled=True,
         analysis_max_calls=min(60, calls),
         analysis_timeout_seconds=min(1200, seconds),
@@ -144,16 +148,10 @@ def configured(config, ticker):
     return config
 
 
-def data_scope():
-    return {
-        "evidence_preset": "basic",
-        "full_data_acceptance": "unverified",
-        "enhancements": {
-            "news": "unverified",
-            "margin_balance": "not_enabled",
-            "eastmoney_fundflow_ratio": "not_enabled",
-        },
-    }
+def data_scope(config):
+    from scripts.personal_observations import scope
+
+    return scope(config)
 
 
 def rating_status(terminal):
@@ -184,7 +182,7 @@ def prepare(config, ticker, day):
 
 
 @contextmanager
-def personal_sources(ticker=None, day=None):
+def personal_sources(ticker=None, day=None, news=None):
     """Run only in the dedicated CLI. Public scrapers and external helpers are unavailable."""
     from requests import RequestException, Session
 
@@ -274,6 +272,13 @@ def personal_sources(ticker=None, day=None):
         from tradingagents.agents.analysts import sentiment_analyst
         from tradingagents.dataflows import interface
 
+        if news is not None:
+            reader = news.graph_metadata
+            stack.enter_context(patch.object(interface, "get_akshare_news", reader))
+            stack.enter_context(
+                patch.dict(interface.VENDOR_METHODS["get_news"], {"akshare": reader})
+            )
+
         stack.enter_context(
             patch.object(sentiment_analyst, "get_china_a_local_sentiment", no_scrape)
         )
@@ -300,7 +305,12 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         analysis_session_deadline_epoch=started[0] + config["analysis_timeout_seconds"],
         analysis_session_monotonic_deadline=started[1] + config["analysis_timeout_seconds"],
     )
-    graph = None
+    from scripts.personal_observations import PersonalNews, snapshot_binding, supplement
+
+    graph = state = binding = None
+    news = None
+    if preparation is not None and "news" in config.get("personal_sources", ()):
+        news = PersonalNews(ticker, day, preparation, True, config["personal_public_news_allowed"])
     receipt = {
         "mode": "personal_research",
         "run_id": run_id,
@@ -312,7 +322,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         "verified_inputs": dict(
             config["personal_verified_inputs"], stock_identity="verified", stock_close="verified"
         ),
-        **data_scope(),
+        **data_scope(config),
     }
     output.mkdir(parents=True, exist_ok=False)
     try:
@@ -322,7 +332,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             redirect_stderr(quiet),
             local_payloads(),
             analysis_preparation_scope(config),
-            personal_sources(ticker, day),
+            personal_sources(ticker, day, news),
         ):
             if (
                 time.time() >= config["analysis_session_deadline_epoch"]
@@ -335,6 +345,20 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 selected_analysts=ANALYSTS, config=config, instrument_symbol=ticker
             )
             graph.graph = graph.graph.with_config(max_concurrency=1)
+            if preparation is not None and {
+                "margin_balance",
+                "eastmoney_fundflow_ratio",
+            }.intersection(config.get("personal_sources", ())):
+                run_graph = graph._run_graph
+
+                def run_with_binding(*args, **kwargs):
+                    nonlocal binding
+                    value = run_graph(*args, **kwargs)
+                    # Verify against the live snapshot before propagate leaves its run scope.
+                    binding = snapshot_binding(value[0], ticker, day)
+                    return value
+
+                graph._run_graph = run_with_binding
             state, _ = graph.propagate(ticker, day)
             terminal = TerminalContract.model_validate(state["terminal_contract"])
             report = graph.save_reports(state, ticker, output / "report")
@@ -355,14 +379,71 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         receipt.update(
             {key: budget[key] for key in ("admitted_attempts", "model_attempts", "data_attempts")}
         )
+    status_path = output / "status.json"
+    if news and news.result is not None:
+        receipt["enhancements"]["news"] = news.result["status"]
+        receipt["source_evidence"] = {
+            "news": dict(news.result, returned_to_news_tool=news.returned_to_news_tool)
+        }
+    if receipt["report_written"] and config.get("personal_sources"):
+        # A supervisor timeout in optional collection must leave the sealed core result discoverable.
+        preliminary = dict(receipt, supplement_status="pending", usage_final=False)
+        if preparation is not None:
+            preliminary["preparation_attempts"] = dict(preparation.counts)
+            for key in ("admitted_attempts", "data_attempts"):
+                if key in preliminary:
+                    preliminary[key] += sum(preparation.counts.values())
+            preliminary["financial_attempts"] = sum(
+                preparation.counts.get(k, 0) for k in ("balancesheet", "income", "cashflow")
+            )
+        with status_path.open("x", encoding="utf-8") as stream:
+            json.dump(preliminary, stream, ensure_ascii=False)
+        if (
+            preparation is None
+            or budget is None
+            or type(receipt.get("admitted_attempts")) is not int
+        ):
+            for key in config["personal_sources"]:
+                receipt["enhancements"][key] = "isolated_session_unavailable"
+        else:
+            prep_counts = dict(preparation.counts)
+            try:
+                supplement(
+                    config,
+                    binding,
+                    ticker,
+                    day,
+                    receipt,
+                    preparation,
+                    news,
+                    os.environ.get("TUSHARE_TOKEN", ""),
+                )
+            except Exception:
+                # The report and terminal were published before the optional phase.
+                receipt["supplement_error"] = "source_evidence_unavailable"
+            receipt["supplement_attempts"] = {
+                k: v for k, v in preparation.counts.items() if k not in prep_counts
+            }
     if preparation is not None:
-        receipt["preparation_attempts"] = dict(preparation.counts)
+        receipt["preparation_attempts"] = {
+            k: v for k, v in preparation.counts.items() if k not in ("margin_detail", "public_news")
+        }
         receipt["financial_attempts"] = sum(
-            preparation.counts.get(e, 0) for e in ("balancesheet", "income", "cashflow")
+            preparation.counts.get(e, 0)
+            for e in ("balancesheet", "income", "cashflow", "margin_detail")
         )
         for key in ("data_attempts", "admitted_attempts"):
             if key in receipt:
                 receipt[key] += sum(preparation.counts.values())
-    with (output / "status.json").open("x", encoding="utf-8") as stream:
-        json.dump(receipt, stream, ensure_ascii=False)
+    from scripts.personal_bootstrap import write_local
+
+    receipt["enhancement_coverage"] = (
+        "all_three_verified"
+        if all(v == "verified" for v in receipt["enhancements"].values())
+        else "not_selected"
+        if all(v == "not_selected" for v in receipt["enhancements"].values())
+        else "incomplete"
+    )
+    receipt["usage_final"] = budget is not None
+    write_local(status_path, json.dumps(receipt, ensure_ascii=False).encode("utf8"))
     return receipt
