@@ -1,10 +1,15 @@
 """Stage an ordinary Full release from locked Git blobs into a prepared local runtime."""
+
 import argparse
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+import ntpath
+import os
+import re
+import stat
 import subprocess
 import sys
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 RECIPE = Path(__file__).resolve().parents[1] / "config/ordinary-full-release-lock.json"
 RECIPE_SHA256 = "28af7420b47467010d5da28e60389505f162211ad00c3ae8544a21c0d829d036"
@@ -29,12 +34,68 @@ def ordinary_path(path):
     return path
 
 
-def read_sources(repo, revision, recipe):
+def backup_path_info(path):
+    # Inspect the parent before any lookup below it can traverse a link.
+    for item in (*reversed(path.parents), path):
+        try:
+            info = item.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("linked_release_path")
+    return info
+
+
+def check_local_backup_roots(repo, target):
+    for raw in (repo, target):
+        windows = PureWindowsPath(raw)
+        if windows.drive.startswith("\\\\") or (windows.drive and not windows.root):
+            raise ValueError("local_backup_roots_required")
+    for raw in (repo, target):
+        absolute = raw.absolute()
+        if absolute.drive.startswith("\\\\"):
+            raise ValueError("local_backup_roots_required")
+        if os.name == "nt":
+            from ctypes import windll
+
+            # Reject mapped network drives as well as UNC and device paths.
+            if windll.kernel32.GetDriveTypeW(absolute.anchor) not in (2, 3, 5, 6):
+                raise ValueError("local_backup_roots_required")
+        backup_path_info(absolute)
+
+
+def source_manifest_path(repo, manifest_backup=None, target=None):
+    if manifest_backup is None:
+        return ordinary_path(repo / "config/bounded_mainland_release.json")
+
+    # Only numbered transaction preimages under this checkout are eligible.
+    parts = str(manifest_backup).replace("\\", "/").split("/")
+    if (len(parts) < 3 or parts[0] != ".scratch"
+            or not re.fullmatch(r"[0-9]+\.before", parts[-1])
+            or any(not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", p)
+                   or ntpath.isreserved(p) or p.endswith(".") for p in parts[1:-1])):
+        raise ValueError("invalid_manifest_backup")
+    if target is None or target.is_relative_to(repo) or repo.is_relative_to(target):
+        raise ValueError("use_separate_target")
+    check_local_backup_roots(repo, target)
+    candidate = repo.joinpath(*parts)
+    info = backup_path_info(candidate)
+    if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+        raise ValueError("invalid_manifest_backup")
+    return candidate
+
+
+def read_sources(repo, revision, recipe, *, manifest_backup=None, target=None):
+    manifest = source_manifest_path(repo, manifest_backup, target)
+    git_env = None
+    if manifest_backup is not None:
+        git_env = dict(os.environ, GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1",
+                       GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     git = ["git", "--no-replace-objects", "-C", str(repo)]
     commit = subprocess.check_output(git + ["rev-parse", "--verify", "--end-of-options",
-                                             revision + "^{commit}"], text=True).strip()
+                                             revision + "^{commit}"], text=True, env=git_env).strip()
     local = recipe["local_evidence"]
-    manifest_bytes = ordinary_path(repo / "config/bounded_mainland_release.json").read_bytes()
+    manifest_bytes = manifest.read_bytes()
     if digest(manifest_bytes) != local["source_manifest_sha256"]:
         raise ValueError("local_evidence_manifest_changed")
     manifest = json.loads(manifest_bytes)
@@ -58,7 +119,7 @@ def read_sources(repo, revision, recipe):
                 raise ValueError("local_evidence_digest_mismatch")
             output[name] = data
             continue
-        result = subprocess.run(git + ["cat-file", "blob", commit + ":" + name], capture_output=True)
+        result = subprocess.run(git + ["cat-file", "blob", commit + ":" + name], capture_output=True, env=git_env)
         if result.returncode:
             raise ValueError("missing_git_source: " + name)
         data = result.stdout
@@ -93,7 +154,11 @@ def main():
     parser.add_argument("--revision", default="HEAD")
     parser.add_argument("--verify", action="store_true", help="Verify an already staged candidate")
     parser.add_argument("--target", type=Path, required=True)
+    parser.add_argument("--source-manifest-backup", metavar="RELATIVE_PREIMAGE",
+                        help="Read a numbered transaction preimage under the source checkout .scratch directory")
     args = parser.parse_args()
+    if args.source_manifest_backup is not None:
+        check_local_backup_roots(args.repo, args.target)
     repo = args.repo.resolve(strict=True)
     target = ordinary_path(args.target.absolute()).resolve(strict=True)
     if target.is_relative_to(repo) or repo.is_relative_to(target):
@@ -101,7 +166,7 @@ def main():
     if not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
         raise ValueError("run_builder_with_-I_-S_-B")
     recipe = load_recipe()
-    sources = read_sources(repo, args.revision, recipe)
+    sources = read_sources(repo, args.revision, recipe, manifest_backup=args.source_manifest_backup, target=target)
     verify_runtime(target, recipe)
     if not args.verify:
         if {p.name for p in target.iterdir()} != {".venv"}:

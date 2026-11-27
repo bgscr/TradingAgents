@@ -21,7 +21,7 @@ def checked(operation):
         # Report only known builder codes. Exceptions can contain local paths.
         code = str(exc).partition(":")[0]
         if code in {
-            "linked_release_path", "release_recipe_changed", "invalid_release_path",
+            "invalid_manifest_backup", "use_separate_target", "local_backup_roots_required", "linked_release_path", "release_recipe_changed", "invalid_release_path",
             "local_evidence_manifest_changed", "local_evidence_root_mismatch",
             "local_evidence_unbound", "local_evidence_source_unbound",
             "local_evidence_digest_mismatch", "missing_git_source", "unreviewed_git_source",
@@ -32,14 +32,16 @@ def checked(operation):
     return "verified"
 
 
-def inspect(repo, target, build):
+def inspect(repo, target, build, *, manifest_backup=None):
     plain = build["ordinary_path"]
     recipe = build["load_recipe"]()
-    inputs = ["config/bounded_mainland_release.json", *recipe["local_evidence"]["paths"]]
-    missing = [name for name in inputs if not plain(repo / name).is_file()]
-    source = "source_inputs_missing" if inputs[0] in missing else checked(
-        lambda: build["read_sources"](repo, "HEAD", recipe)
-    )
+    manifest = build["source_manifest_path"](repo, manifest_backup, target)
+    missing = [name for name in recipe["local_evidence"]["paths"] if not plain(repo / name).is_file()]
+    if not manifest.is_file():
+        missing.insert(0, "source_manifest_backup" if manifest_backup is not None else "config/bounded_mainland_release.json")
+        source = "source_inputs_missing"
+    else:
+        source = checked(lambda: build["read_sources"](repo, "HEAD", recipe, manifest_backup=manifest_backup, target=target))
     if target.is_relative_to(repo) or repo.is_relative_to(target):
         runtime = "use_separate_target"
     elif not target.is_dir():
@@ -66,6 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True, help="Source checkout of the reviewed revision")
     parser.add_argument("--target", type=Path, required=True, help="Separate candidate directory")
+    parser.add_argument("--source-manifest-backup", metavar="RELATIVE_PREIMAGE",
+                        help="Read a numbered transaction preimage under the source checkout .scratch directory")
     args = parser.parse_args()
     if not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
         parser.error("run with -I -S -B")
@@ -76,8 +80,10 @@ def main():
     result = {}
 
     def run_check():
+        if args.source_manifest_backup is not None:
+            build["check_local_backup_roots"](args.repo, args.target)
         paths = [build["ordinary_path"](p.absolute()).resolve() for p in (args.repo, args.target)]
-        result.update(inspect(*paths, build))
+        result.update(inspect(*paths, build, manifest_backup=args.source_manifest_backup))
 
     status = checked(run_check)
     if status != "verified":
