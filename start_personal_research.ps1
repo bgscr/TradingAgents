@@ -1,6 +1,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
     [string] $Ticker,
+    [switch] $PreparedData,
     [Parameter(ParameterSetName = 'Check')] [switch] $CheckOnly,
     [Parameter(Mandatory, ParameterSetName = 'Research')] [switch] $Run
 )
@@ -39,5 +40,36 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 $mode = if ($Run) { '--run' } else { '--check-only' }
 $entry = Join-Path $PSScriptRoot 'scripts/personal_full.py'
 Assert-LocalPath $entry
-& $python -I -B $entry --ticker $Ticker $mode
-exit $LASTEXITCODE
+$selection = @()
+if ($PreparedData) { $selection += '--prepared-data' }
+if (-not $Run) {
+    & $python -I -B $entry --ticker $Ticker $mode @selection
+    exit $LASTEXITCODE
+}
+# The supervisor also bounds stalls before Python can check its session deadline.
+$start = [System.Diagnostics.ProcessStartInfo]::new()
+$start.FileName = $python
+$start.UseShellExecute = $false
+foreach ($item in (@('-I', '-B', $entry, '--ticker', $Ticker, $mode) + $selection)) {
+    $start.ArgumentList.Add($item)
+}
+$limitMs = 1200000L
+$seconds = 0
+if ([int]::TryParse($env:TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS, [ref]$seconds) -and $seconds -gt 0 -and $seconds -lt 1200) {
+    $limitMs = [long]$seconds * 1000
+}
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$child = [System.Diagnostics.Process]::Start($start)
+try {
+    $remaining = [Math]::Max(0L, $limitMs - $clock.ElapsedMilliseconds)
+    if (-not $child.WaitForExit([int]$remaining)) {
+        try { $child.Kill($true) } catch [System.InvalidOperationException] {
+            if (-not $child.HasExited) { throw }
+        }
+        [Console]::Error.WriteLine('{"status":"personal_deadline_exceeded","usage":"inspect_local_records"}')
+        exit 124
+    }
+    exit $child.ExitCode
+} finally {
+    $child.Dispose()
+}

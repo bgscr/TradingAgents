@@ -224,6 +224,11 @@ def main(argv=None):
         action="store_true",
         help="Use the configured accounts for one personal research run",
     )
+    parser.add_argument(
+        "--prepared-data",
+        action="store_true",
+        help="Use explicitly configured pre-existing research data",
+    )
     args = parser.parse_args(argv)
     from scripts import personal_graph
     from scripts.project_credentials import ProjectCredentialError, credential_failure_code
@@ -237,6 +242,10 @@ def main(argv=None):
         config = dict(
             DEFAULT_CONFIG, market_history_mode="current", data_usage_mode="personal_research"
         )
+        if not args.prepared_data:
+            from scripts import personal_bootstrap as bootstrap
+
+            config = bootstrap.profile(config, ROOT, keys)
         check_store_paths(config)
         result = check(args.ticker.upper(), config, keys, datetime.now(timezone.utc))
     except ProjectCredentialError as exc:
@@ -245,12 +254,80 @@ def main(argv=None):
     except (ValueError, OSError):
         print(json.dumps({"error": "invalid_personal_equity_or_configuration"}))
         return 2
-    result["preflight_ready"] = False
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        session = None
+        if (
+            not args.prepared_data
+            and not result["missing_credentials"]
+            and not any(os.environ.get(k) or os.environ.get(k.lower()) for k in TRANSPORT_OVERRIDES)
+        ):
+            try:
+                config = personal_graph.configured(config, result["ticker"])
+                if args.run:
+                    stack.enter_context(bootstrap.exclusive(config))
+                    session = bootstrap.Session(config, started)
+                    bootstrap.hydrate(config, result["ticker"], keys["TUSHARE_TOKEN"], session)
+                    remaining = session.maximum - sum(session.counts.values())
+                    if remaining < 1:
+                        raise bootstrap.PreparationError("personal_attempt_limit")
+                    config["analysis_max_calls"] = remaining
+                else:
+                    bootstrap.identity(config, result["ticker"], bootstrap.now())
+                result = check(args.ticker.upper(), config, keys, bootstrap.now())
+            except Exception as exc:
+                receipt = {
+                    "mode": "personal_research",
+                    "ticker": result["ticker"],
+                    "status": "preparation_failed",
+                    "error": str(exc)
+                    if isinstance(exc, bootstrap.PreparationError)
+                    else "personal_preparation_unavailable",
+                    "stage": session.stage if session else "local_configuration",
+                    "preparation_attempts": dict(session.counts) if session else {},
+                    "report_written": False,
+                    "rating_status": "unavailable",
+                    **personal_graph.data_scope(),
+                }
+                if args.run:
+                    record_stop(receipt)
+                print(json.dumps(receipt))
+                return 2
+        return finish(args, result, keys, config, started, session)
+
+
+def record_stop(receipt):
+    from uuid import uuid4
+
+    attempts = receipt["preparation_attempts"]
+    receipt.update(
+        run_id=uuid4().hex,
+        model_attempts=0,
+        data_attempts=sum(attempts.values()),
+        admitted_attempts=sum(attempts.values()),
+        financial_attempts=sum(attempts.get(k, 0) for k in ("balancesheet", "income", "cashflow")),
+    )
+    out = local_path(ROOT / "reports" / "personal" / receipt["run_id"])
+    out.mkdir(parents=True, exist_ok=False)
+    with (out / "status.json").open("x", encoding="utf8") as stream:
+        json.dump(receipt, stream)
+
+
+def finish(args, result, keys, config, started, session):
+    from scripts import personal_graph
+
+    result.update(personal_graph.data_scope(), rating_status="not_run", preflight_ready=False)
     if any(os.environ.get(key) or os.environ.get(key.lower()) for key in TRANSPORT_OVERRIDES):
         result["configuration_issue"] = "custom_proxy_or_tls_settings_require_review"
     elif not result["cache_issue"] and not result["missing_credentials"]:
         try:
             config = personal_graph.prepare(config, result["ticker"], result["exchange_session"])
+            result["verified_inputs"] = dict(
+                config["personal_verified_inputs"],
+                stock_identity="verified",
+                stock_close="verified",
+            )
             result["preflight_ready"] = True
         except ValueError as exc:
             from tradingagents.budget_preflight import BudgetRouteConfigurationError
@@ -274,6 +351,13 @@ def main(argv=None):
             else:
                 result["configuration_issue"] = "invalid_research_configuration"
     if not args.run or not result["preflight_ready"]:
+        if args.run and session is not None:
+            result.update(
+                status="preflight_failed",
+                report_written=False,
+                preparation_attempts=dict(session.counts),
+            )
+            record_stop(result)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["preflight_ready"] else 2
     from unittest.mock import patch
@@ -285,6 +369,7 @@ def main(argv=None):
             result["exchange_session"],
             ROOT / "reports" / "personal",
             started,
+            preparation=session,
         )
     print(json.dumps(receipt, ensure_ascii=False))
     if receipt["status"] != "completed" or not receipt["report_written"]:

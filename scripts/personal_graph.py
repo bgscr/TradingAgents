@@ -83,13 +83,10 @@ def check_account(config):
         raise ValueError("personal_account_policy_required") from exc
 
 
-def prepare(config, ticker, day):
+def configured(config, ticker):
     """Validate a warm local research configuration before constructing any client."""
     from tradingagents.analysis_budget import coerce_output_token_limit, validate_budget_config
-    from tradingagents.budget_preflight import (
-        apply_mainland_budget_sources,
-        validate_budget_preflight,
-    )
+    from tradingagents.budget_preflight import apply_mainland_budget_sources
 
     if config.get("llm_provider") != "deepseek" or config.get("backend_url") not in {
         None,
@@ -144,14 +141,50 @@ def prepare(config, ticker, day):
     )
     config = apply_mainland_budget_sources(config, ticker=ticker, include_macro_sources=False)
     validate_budget_config(config)
+    return config
+
+
+def data_scope():
+    return {
+        "evidence_preset": "basic",
+        "full_data_acceptance": "unverified",
+        "enhancements": {
+            "news": "unverified",
+            "margin_balance": "not_enabled",
+            "eastmoney_fundflow_ratio": "not_enabled",
+        },
+    }
+
+
+def rating_status(terminal):
+    from tradingagents.terminal_contract import TerminalOutcomeKind
+
+    return {
+        TerminalOutcomeKind.TRADING_DECISION: "validated_decision",
+        TerminalOutcomeKind.ANALYSIS_OUTCOME: "no_rating",
+        TerminalOutcomeKind.OPERATIONAL_FAILURE: "unavailable",
+    }[terminal.terminal_outcome_kind]
+
+
+def prepare(config, ticker, day):
+    from tradingagents.budget_preflight import validate_budget_preflight
+
+    config = configured(config, ticker)
     with local_payloads():
-        validate_budget_preflight(config, ticker=ticker, as_of_date=day, selected_analysts=ANALYSTS)
+        _, readiness = validate_budget_preflight(
+            config, ticker=ticker, as_of_date=day, selected_analysts=ANALYSTS
+        )
+        config["personal_verified_inputs"] = {
+            item.location: item.status
+            for item in readiness.checked
+            if item.location == "calendar" or item.location.startswith("financial.")
+        }
         check_account(config)
     return config
 
 
 @contextmanager
-def personal_sources():
+def personal_sources(ticker=None, day=None):
     """Run only in the dedicated CLI. Public scrapers and external helpers are unavailable."""
     from requests import RequestException, Session
 
@@ -167,9 +200,70 @@ def personal_sources():
     def no_enhancement(*args, **kwargs):
         return ""
 
+    from tradingagents import tushare_https
     from tradingagents.market_history.coordinator import ProviderRequestCoordinator
 
+    send_market = tushare_https.send_once
+
+    def scoped_market(url, payload, timeout, **kwargs):
+        from datetime import date, datetime
+
+        from dateutil.relativedelta import relativedelta
+
+        from tradingagents.picker.pit_models import Dataset
+        from tradingagents.picker.tushare_provider import ENDPOINTS
+
+        tushare_https.validate_request(url, payload, timeout)
+        endpoint = payload["api_name"]
+        params = payload["params"]
+        fields = {
+            "trade_cal": ENDPOINTS[Dataset.TRADE_CAL].fields,
+            "daily": ENDPOINTS[Dataset.DAILY].fields,
+            "adj_factor": "ts_code,trade_date,adj_factor",
+            "suspend_d": "ts_code,trade_date,suspend_timing,suspend_type",
+        }
+        bad = ValueError("personal_graph_request_scope_mismatch")
+        if (
+            not ticker
+            or not day
+            or kwargs
+            or endpoint not in fields
+            or fields[endpoint] != payload["fields"]
+        ):
+            raise bad
+        owner_field = "exchange" if endpoint == "trade_cal" else "ts_code"
+        owner = (
+            ("SSE" if ticker.endswith(".SS") else "SZSE")
+            if endpoint == "trade_cal"
+            else ticker.replace(".SS", ".SH")
+        )
+        expected = {owner_field, "ts_type_name", "limit", "offset", "end_date"}
+        if endpoint != "adj_factor" or "start_date" in params:
+            expected.add("start_date")
+        if (
+            set(params) != expected
+            or params[owner_field] != owner
+            or type(params["limit"]) is not int
+            or not 1 <= params["limit"] <= 5000
+            or type(params["offset"]) is not int
+            or params["offset"] < 0
+        ):
+            raise bad
+        selected = date.fromisoformat(day)
+        end = datetime.strptime(params["end_date"], "%Y%m%d").date()
+        if end > selected or end.strftime("%Y%m%d") != params["end_date"]:
+            raise bad
+        if "start_date" in params:
+            start = datetime.strptime(params["start_date"], "%Y%m%d").date()
+            if (
+                not selected - relativedelta(years=5) <= start <= end
+                or start.strftime("%Y%m%d") != params["start_date"]
+            ):
+                raise bad
+        return send_market(url, payload, timeout)
+
     with ExitStack() as stack:
+        stack.enter_context(patch.object(tushare_https, "send_once", scoped_market))
         stack.enter_context(patch.object(Session, "send", unavailable))
         stack.enter_context(patch.object(subprocess, "Popen", no_children))
         stack.enter_context(
@@ -194,7 +288,7 @@ def personal_sources():
         yield
 
 
-def run(config, ticker, day, output_root, started):
+def run(config, ticker, day, output_root, started, *, preparation=None):
     from tradingagents.analysis_budget import AnalysisBudgetStopped, analysis_preparation_scope
     from tradingagents.terminal_contract import TerminalContract
 
@@ -214,6 +308,11 @@ def run(config, ticker, day, output_root, started):
         "exchange_session": day,
         "status": "failed",
         "report_written": False,
+        "rating_status": "unavailable",
+        "verified_inputs": dict(
+            config["personal_verified_inputs"], stock_identity="verified", stock_close="verified"
+        ),
+        **data_scope(),
     }
     output.mkdir(parents=True, exist_ok=False)
     try:
@@ -223,7 +322,7 @@ def run(config, ticker, day, output_root, started):
             redirect_stderr(quiet),
             local_payloads(),
             analysis_preparation_scope(config),
-            personal_sources(),
+            personal_sources(ticker, day),
         ):
             if (
                 time.time() >= config["analysis_session_deadline_epoch"]
@@ -242,6 +341,8 @@ def run(config, ticker, day, output_root, started):
             receipt.update(
                 status=terminal.lifecycle_status.value,
                 outcome=terminal.terminal_outcome_kind.value,
+                rating_status=rating_status(terminal),
+                decision_coverage=terminal.coverage.model_dump(mode="json"),
                 report_written=report.is_file(),
                 report_relative_path=report.relative_to(output).as_posix(),
             )
@@ -254,6 +355,14 @@ def run(config, ticker, day, output_root, started):
         receipt.update(
             {key: budget[key] for key in ("admitted_attempts", "model_attempts", "data_attempts")}
         )
+    if preparation is not None:
+        receipt["preparation_attempts"] = dict(preparation.counts)
+        receipt["financial_attempts"] = sum(
+            preparation.counts.get(e, 0) for e in ("balancesheet", "income", "cashflow")
+        )
+        for key in ("data_attempts", "admitted_attempts"):
+            if key in receipt:
+                receipt[key] += sum(preparation.counts.values())
     with (output / "status.json").open("x", encoding="utf-8") as stream:
         json.dump(receipt, stream, ensure_ascii=False)
     return receipt

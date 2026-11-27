@@ -32,6 +32,7 @@ def test_clean_cli_without_config(tmp_path, ticker, canonical):
     for name in (
         "scripts/personal_full.py",
         "scripts/personal_graph.py",
+        "scripts/personal_bootstrap.py",
         "scripts/project_credentials.py",
         "tradingagents/__init__.py",
         "tradingagents/default_config.py",
@@ -424,10 +425,10 @@ def test_real_personal_graph_to_chinese_report(
     monkeypatch.setattr(personal, "datetime", MarketClock)
     for key in personal.KEYS:
         monkeypatch.setenv(key, "synthetic-example")
-    assert personal.main(["--ticker", symbol, "--check-only"]) == 0
+    assert personal.main(["--ticker", symbol, "--check-only", "--prepared-data"]) == 0
     preflight = json.loads(capsys.readouterr().out)
     assert preflight["stock_close_verified"] and preflight["exchange_session"] == date
-    assert personal.main(["--ticker", symbol, "--run"]) == 0
+    assert personal.main(["--ticker", symbol, "--run", "--prepared-data"]) == 0
     receipt = json.loads(capsys.readouterr().out)
     assert receipt["outcome"] == "trading_decision" and receipt["report_written"] is True
     assert (

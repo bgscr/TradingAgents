@@ -2,27 +2,43 @@
 
 ## 个人研究与本机验收
 
-在 PowerShell 7 中打开项目根目录。记下 `git rev-parse HEAD`，在自己的 Python 3.13 虚拟环境安装本项目的公开依赖及 `pit`、`dev` extras。个人研究使用交易所日历、本股票的已收盘行情和用户自己的数据源、模型账户。个人入口和本机验收均无需项目签名或维护者批准。
+在 Windows 的 PowerShell 7 中进入项目根目录。个人研究使用上游多 Agent 图和自己的 Tushare、DeepSeek 账户。首次运行可以从空缓存开始，无需项目签名、维护者批准或其他机器的文件。
 
 ```powershell
+git rev-parse HEAD
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[pit,dev]"
+.\.venv\Scripts\python.exe -m pytest -q tests/test_personal_full.py tests/test_personal_bootstrap.py
 .\start_personal_research.ps1 -Ticker 600895.SH -CheckOnly
-.\start_personal_research.ps1 -Ticker 000001.SZ -CheckOnly
-.\.venv\Scripts\python.exe -m pytest -q tests/test_personal_full.py
 ```
 
-预检不调用模型或供应商。它先按北京时间查最近已收盘的交易日，再核验该股票本日的收盘和缓存新鲜度。不同股票不能互用收盘记录。空缓存会返回 `market_cache_missing`。本版支持已有可验证本地资料的机器；刚安装依赖并填写密钥的空白机器，还缺少首次自动建立证券身份、交易所日历、日线和三表覆盖的流程。合成测试只在临时目录产生测试报告。
+将自己的 `TUSHARE_TOKEN` 和 `DEEPSEEK_API_KEY` 一起配置在项目根目录的私有 `.env`，或一起配置在当前进程环境中。使用有权访问当前上市证券资料、交易日历、行情与财务报表的 Tushare 账户。默认模型为 `deepseek-v4-flash` 和 `deepseek-v4-pro`。如果账户需要其他受支持的 DeepSeek 型号，可用 `TRADINGAGENTS_QUICK_THINK_LLM` 和 `TRADINGAGENTS_DEEP_THINK_LLM` 指定。
 
-温启动使用项目现有的 CURRENT 个人研究配置、可核验的身份与日历、Tushare 市场来源、账户限速及三个 Tushare 财报工具的有效缓存。在个人配置中将 `market_data_vendors.cn_a.core_stock_apis` 和 `tool_vendors` 里的 `get_balance_sheet`、`get_income_statement`、`get_cashflow` 设为 `tushare`。财报 HTTPS 地址与账户作用域必须和本机缓存的来源一致。将自己的 `TUSHARE_TOKEN` 和 `DEEPSEEK_API_KEY` 一起配在进程环境或项目根目录的私有 `.env`。通过项目支持的环境变量 `TRADINGAGENTS_LLM_PROVIDER`、`TRADINGAGENTS_QUICK_THINK_LLM`、`TRADINGAGENTS_DEEP_THINK_LLM` 明确选择 DeepSeek 和账户可用的模型。预检通过后，确认愿意付费时运行：
+`-CheckOnly` 完全离线。首次出现 `market_cache_missing` 和退出码 2 表示尚无可核验的本地行情。确认愿意使用账户配额和模型费用后，选择自己的股票，显式运行一次。例如深市股票：
 
 ```powershell
-.\start_personal_research.ps1 -Ticker 600895.SH -Run
+.\start_personal_research.ps1 -Ticker 000001.SZ -Run
 ```
 
-该命令使用四个分析师、多空辩论、交易员与风险团队，沿用普通图的证据准入和决策规则。已配置的市场适配器可按现有协调策略补行情缺口。财报只读缓存，此路径的财报请求上限为零。公开网页抓取关闭，新闻或情绪缺证据时如实降级。模型通过固定 DeepSeek HTTPS 入口，禁用 SDK 重试。总尝试上限 60，分析预算最多 20 分钟，个人报告位于 `reports/personal/<run_id>/` 下回执给出的相对路径。证据不足可产生无评级结果。
+首次取数针对一个标的核验上市身份和交易所，按北京时间选择最近已收盘交易日，核对该股当日成交、收盘与复权数据，再准备资产负债表、利润表和现金流量表的公告日期区间。合格缓存优先复用。三表每个端点最多尝试一次，分析期间只读财报缓存；成功空表会保留为无可用行。交易所覆盖有缺口、个股无合格收盘、账户拒绝或返回不完整时会停止。财报同一端点若有多个被新鲜数据隔开的缺口，保留原数据并报告 `disjoint_statement_gaps`。
 
-本机真实验收需在同一提交上完成一次本人明确启动的研究，核对交易日、实际终态、四类分析、辩论与风险章节、中文报告和用量。预检或合成测试成功只能证明其各自覆盖的步骤。对外分享提交号、终态、用量和缺项即可，报告正文、原始行情、路径及密钥留在本机。
+首次准备与后续分析共用总尝试和截止时间，总计最多 60 次、财务最多 3 次、最长 20 分钟，并服从更小的项目预算。数据传输使用固定 Tushare HTTPS 来源和本地账户限速；模型只使用 DeepSeek HTTPS，不追加重试。四个分析师之后还有多空辩论、交易员、风险团队与最终决策。公开网页抓取关闭，新闻或情绪缺项写入覆盖说明。证据不足时可以无评级。
+
+个人数据按账户保存在 `reports/personal/.data/`，成功或已开始准备的失败运行在 `reports/personal/<run_id>/status.json` 留下结果，成功时用其中的 `report_relative_path` 找到中文报告。已明确配置原有个人 CURRENT 数据源、身份与限速库的用户可显式加 `-PreparedData` 使用已有资料，其财报仍然只读。受控历史回放继续使用原有入口。
+
+### 如何读个人研究回执
+
+| 核对项 | 本入口能证明什么 |
+| --- | --- |
+| 图与报告 | `status=completed` 和 `report_written=true` 表示研究已结束且中文报告已写出。 |
+| 评级 | `rating_status=validated_decision` 表示通过图的决策门；`no_rating` 表示研究结束、无可验证评级；失败时为 `unavailable`。预检不会产生评级。 |
+| 市场与财报 | `verified_inputs` 列出身份、所选股票收盘、交易所日历和各报表的公告区间检查。成功空响应会明确标注，不能推断财务值为零。 |
+| 新闻 | `enhancements.news=unverified`。新闻分析师参与讨论，独立新闻证据覆盖仍未验证。 |
+| 融资与资金流 | `margin_balance` 与 `eastmoney_fundflow_ratio` 均为 `not_enabled`，不会据此推断融资余额或占比。 |
+
+`evidence_preset=basic` 描述当前的数据预设。四个分析师和完整图都可运行，`full_data_acceptance` 仍为 `unverified`。PowerShell 的运行监督器在达到截止时间时返回 124；此时按本地记录核对已发生的用量，避免重复启动。
+
+本机真实验收以固定 Git 提交、本人显式启动的真实研究、实际终态、中文报告及用量为准。上述离线回归使用合成市场和模型响应。对外只分享提交号、脱敏状态、各类尝试次数和覆盖缺项；密钥、原始响应和报告正文留在本机。
 
 ## 开发与离线检查
 

@@ -27,6 +27,10 @@
 
 # TradingAgents: Multi-Agents LLM Financial Trading Framework
 
+## Windows A 股个人 Full
+
+从干净检出安装公开依赖，配置自己的 Tushare 和 DeepSeek 凭据，即可使用 `start_personal_research.ps1`。先用 `-CheckOnly` 做零外呼预检。空缓存会报告缺少行情；确认使用账户额度后，`-Run` 会为所选股票补齐可核验的数据并运行多 Agent 分析。当前数据预设为 Basic，新闻未验证，融资余额和东方财富资金流占比未启用。图完成后，回执会区分通过决策门的评级和无评级结果。[安装步骤、离线验收与报告位置](docs/mainland-clean-start.md#个人研究与本机验收)
+
 ## News
 - [2026-07] **TradingAgents v0.3.1** released with correctness and stability fixes: Alpha Vantage look-ahead filtering, graph-router crash-safety, graph-shape-aware checkpoint resume, working crypto sentiment sources, a configurable LLM retry budget, Bedrock API-key auth, and Claude Sonnet 5 / Fable 5 support. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 - [2026-06] **TradingAgents v0.3.0** released with a verified data-access contract, an expanded provider registry (NVIDIA, Kimi, Groq, Mistral, Bedrock, and any OpenAI-compatible endpoint), FRED and Polymarket data vendors, a current-generation model catalog, and a CI gate.
