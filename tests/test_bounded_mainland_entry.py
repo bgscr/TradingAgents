@@ -117,6 +117,7 @@ def test_release_rejects_escape_or_secret_before_read(tmp_path, monkeypatch, rel
         module.verify_release(manifest, source=tmp_path, python_root=tmp_path)
 
 
+@pytest.mark.installed_release
 def test_installed_release_contains_no_test_output_or_consumed_packet_dependencies():
     manifest = json.loads((ROOT / 'config/bounded_mainland_release.json').read_text())
     assert manifest['old_authorization_reused'] is False

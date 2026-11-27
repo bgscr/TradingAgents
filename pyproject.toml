@@ -77,8 +77,9 @@ tradingagents = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not installed_release'"
 markers = [
+    "installed_release: audit an independently reviewed installation and its local release manifest",
     "unit: fast isolated unit tests",
     "integration: tests requiring external services",
     "smoke: quick sanity-check tests",

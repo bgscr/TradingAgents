@@ -105,9 +105,11 @@ Our framework decomposes complex trading tasks into specialized roles.
 
 ### Installation
 
-Clone TradingAgents:
+For Windows A-share research, see the [clean checkout and Full startup guide](docs/mainland-clean-start.md).
+
+Clone this fork:
 ```bash
-git clone https://github.com/TauricResearch/TradingAgents.git
+git clone https://github.com/bgscr/TradingAgents.git
 cd TradingAgents
 ```
 

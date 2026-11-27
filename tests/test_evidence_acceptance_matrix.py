@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = ROOT / ".scratch" / "evidence-integrity-remediation" / "spec.md"
+SPEC = ROOT / "docs" / "evidence-acceptance-contract.md"
 MAPPING = ROOT / "tests" / "fixtures" / "evidence_integrity_acceptance_matrix.json"
 
 

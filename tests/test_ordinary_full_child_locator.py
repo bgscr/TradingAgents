@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import venv
 import json
 
 import pytest
@@ -28,12 +29,12 @@ pins = {row["relative"]: row["sha256"] for row in manifest["files"] if row["root
 runtime = load_policy(root, pins)
 assert runtime and "--check-only" in sys.argv and "--run" not in sys.argv
 assert sys.argv[sys.argv.index("--session-max-calls") + 1] == "60"
-selection = {"ticker": "601328.SS", "analysis_date": "2026-11-20"}
+selection = {"ticker": sys.argv[sys.argv.index("--ticker") + 1].replace(".SH", ".SS"), "analysis_date": "2026-11-20"}
 names = {FLOW, margin_source(selection["ticker"])}
 with session_sources(selection, None, selected=names, producer_config={}, pair_runtime=runtime):
     sources = full_sources.get()
     assert set(sources) == names and all(isinstance(s, ProducedSource) for s in sources.values())
-print(json.dumps({"registered": len(names), "locator": os.environ["TRADINGAGENTS_ORDINARY_FULL_PWSH"]}))
+print(json.dumps({"ticker": selection["ticker"], "registered": len(names), "locator": os.environ["TRADINGAGENTS_ORDINARY_FULL_PWSH"]}))
 """
 
 
@@ -41,12 +42,11 @@ print(json.dumps({"registered": len(names), "locator": os.environ["TRADINGAGENTS
 def test_child_locator(tmp_path):
     root = Path(__file__).resolve().parents[1]
     pwsh = shutil.which("pwsh.exe")
-    if not pwsh or not (root / ".venv/Scripts/python.exe").is_file():
-        pytest.skip("requires project interpreter and reviewed PowerShell 7")
+    if not pwsh:
+        pytest.skip("requires reviewed PowerShell 7")
     import hashlib
     paths = ["start_tradingagents.ps1", "scripts/Start-MainlandAnalysis.ps1",
-             "scripts/Get-PublicFundflow.ps1", "config/ordinary-full-pair-policy.json",
-             ".venv/pyvenv.cfg", ".venv/Scripts/python.exe"]
+             "scripts/Get-PublicFundflow.ps1", "config/ordinary-full-pair-policy.json"]
     for name in paths:
         dest = tmp_path / name
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +54,7 @@ def test_child_locator(tmp_path):
     policy = json.loads((tmp_path / paths[3]).read_bytes())
     if hashlib.sha256(Path(pwsh).read_bytes()).hexdigest() != policy["executable_sha256"]:
         pytest.skip("host differs from reviewed binary")
+    venv.EnvBuilder(with_pip=False).create(tmp_path / ".venv")
     rows = [{"root": "project", "relative": n, "sha256": hashlib.sha256((tmp_path / n).read_bytes()).hexdigest()} for n in paths[2:4]]
     (tmp_path / "config/bounded_mainland_release.json").write_text(json.dumps({"files": rows}))
     probe = PROBE.replace('sys.path.insert(0, str(root))', 'sys.path.insert(0, ' + repr(str(root)) + ')')
@@ -79,6 +80,12 @@ def test_child_locator(tmp_path):
             result_data = json.loads(result.stdout)
             assert result_data["registered"] == 2
             assert Path(result_data["locator"]) == Path(explicit or pwsh)
+    shenzhen = command.copy()
+    shenzhen[shenzhen.index("601328.SH")] = "000001.SZ"
+    result = subprocess.run(shenzhen, env=env, cwd=tmp_path, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["ticker"] == "000001.SZ" and summary["registered"] == 2
     alternate.write_bytes(b"not the reviewed executable")
     result = subprocess.run(command, env={**env, key: str(alternate)}, cwd=tmp_path,
                             capture_output=True, timeout=30)

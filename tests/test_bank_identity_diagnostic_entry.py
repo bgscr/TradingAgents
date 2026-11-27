@@ -114,6 +114,7 @@ def test_modes_cannot_be_combined(monkeypatch):
     assert stopped.value.code == 2
 
 
+@pytest.mark.installed_release
 def test_deployment_binding_covers_changed_production_sources():
     support = importlib.import_module('analyze_mainland_bounded')
     release = json.loads((PROJECT / 'config/bounded_mainland_release.json').read_bytes())
