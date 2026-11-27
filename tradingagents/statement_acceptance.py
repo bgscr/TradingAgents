@@ -311,6 +311,8 @@ def acquire(root, *, ticker, destination, account, as_of, token, exchange_guard=
     )
     if not isinstance(token, str) or not token:
         raise ValueError("explicit in-memory token required")
+    # This acceptance contract admits at most one exchange per statement endpoint.
+    config["statement_single_exchange"] = True
     attempted = []
     failure_metadata = {}
     progress = {} if progress is None else progress

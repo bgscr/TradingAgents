@@ -98,6 +98,7 @@ class CurrentTushareStatements:
                 "tushare_financial_force_refresh",
                 "tushare_financial_cache_max_age_seconds",
                 "financial_cache_only",
+                "statement_single_exchange",
             )
         }
         self._max_age_seconds = config.get("tushare_financial_cache_max_age_seconds", 86400)
@@ -177,6 +178,7 @@ class CurrentTushareStatements:
                 range_end=end,
                 now=self._clock(),
                 refresh=self._config["tushare_financial_force_refresh"] is True,
+                single_exchange=self._config["statement_single_exchange"] is True,
                 fetch=lambda lo, hi: self._fetch(scope, lo, hi),
             )
         result = self._responses[memo_key]

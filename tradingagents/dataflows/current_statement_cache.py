@@ -287,6 +287,8 @@ class CurrentStatementCache:
         now: datetime,
         fetch: Callable[[date, date], bytes],
         refresh: bool = False,
+        *,
+        single_exchange: bool = False,
     ) -> StatementCacheResult:
         if self.read_only:
             # An analysis date or caller's reconstruction clock is never now.
@@ -321,6 +323,17 @@ class CurrentStatementCache:
             if active_budget() is not None:
                 active_budget().stop(reason)
             raise AnalysisBudgetStopped(reason)
+        if single_exchange and len(ranges) > 1:
+            # Separate gaps need separate exchanges. Keep fresh coverage intact and
+            # stop before the coordinator records work the guarded worker cannot send.
+            from tradingagents.dataflows.acquisition import AcquisitionFailure
+            from tradingagents.evidence import AcquisitionUnavailableReason
+
+            raise AcquisitionFailure(
+                reason=AcquisitionUnavailableReason.INSUFFICIENT_HISTORY,
+                error_code="financial_window_requires_multiple_exchanges",
+                retryable=False,
+            )
         for start, end in ranges:
             try:
                 payload = fetch(start, end)
