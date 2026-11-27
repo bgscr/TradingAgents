@@ -426,12 +426,11 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             }
     if preparation is not None:
         receipt["preparation_attempts"] = {
-            k: v for k, v in preparation.counts.items() if k not in ("margin_detail", "public_news")
+            k: v
+            for k, v in preparation.counts.items()
+            if k not in ("margin_detail", "moneyflow_dc", "public_news")
         }
-        receipt["financial_attempts"] = sum(
-            preparation.counts.get(e, 0)
-            for e in ("balancesheet", "income", "cashflow", "margin_detail")
-        )
+        receipt["financial_attempts"] = preparation.financial_attempts()
         for key in ("data_attempts", "admitted_attempts"):
             if key in receipt:
                 receipt[key] += sum(preparation.counts.values())

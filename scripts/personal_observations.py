@@ -18,6 +18,11 @@ def scope(config):
     return {
         "evidence_preset": config.get("personal_mode", "full"),
         "full_data_acceptance": "unverified",
+        "news_evidence_scope": "publication_index_only",
+        "news_content_verified": False,
+        "ratio_policy": "cache_or_one_account_query"
+        if config.get("personal_fetch_dc_ratio") is True
+        else "cache_only",
         "enhancements": {key: "not_run" if key in selected else "not_selected" for key in SOURCES},
     }
 
@@ -180,13 +185,18 @@ class PersonalNews:
         ]
         if not records:
             raise NoMarketDataError(symbol, self.ticker, "news_metadata_unavailable")
-        lines = [
-            f"{self.ticker} 东方财富单页新闻索引。以下为来源链接与标注的发布时间。",
-            f"本机观察时间 {result['observed_at']}。标题和正文未进入模型，题材、情绪和全市场覆盖均未知。",
-        ]
-        lines.extend(f"{item['published_at']} {item['source']}" for item in records)
-        self.returned_to_news_tool = True
-        return "\n".join(lines)
+        # get_news / sentiment_news require substantive article evidence. A verified
+        # publication index stays in the run receipt and cannot satisfy either capability.
+        from tradingagents.dataflows.acquisition import (
+            AcquisitionFailure,
+            AcquisitionUnavailableReason,
+        )
+
+        raise AcquisitionFailure(
+            reason=AcquisitionUnavailableReason.NO_DATA,
+            error_code="personal_news_index_only",
+            retryable=False,
+        )
 
 
 def margin_key(binding, account):
@@ -223,7 +233,14 @@ def margin_observation(session, binding, token, account, authority):
     key = margin_key(binding, account)
 
     def received(value):
-        if isinstance(value, tuple) and len(value) == 3 and value[0] == []:
+        if type(value) is not tuple or len(value) != 3 or not isinstance(value[2], str):
+            return None
+        stamp = datetime.fromisoformat(value[2])
+        if stamp.utcoffset() != timedelta(0) or not timedelta(0) <= cold.now() - stamp < timedelta(
+            days=1
+        ):
+            return None
+        if value[0] == []:
             return (
                 value[2]
                 if value[1] == moneyflow._projection_digest("margin_detail", binding, [])
@@ -244,7 +261,7 @@ def margin_observation(session, binding, token, account, authority):
         source = "account_request"
         if day >= cold.now().astimezone(SHANGHAI).date():
             return {"status": "publication_pending", "rule": "retrospective_window_not_open"}
-        if sum(session.counts.get(k, 0) for k in (*cold.FINANCE, "margin_detail")) >= 3:
+        if session.financial_attempts() >= 3:
             return {"status": "financial_budget_unavailable"}
         try:
             value = session.query(
@@ -252,7 +269,7 @@ def margin_observation(session, binding, token, account, authority):
                 "margin_detail",
                 {"ts_code": binding["symbol"], "trade_date": day.strftime("%Y%m%d")},
                 ",".join(margin.FIELDS),
-                margin_binding=binding,
+                observation_binding=binding,
             )
         except PhysicalAttemptBudgetExhausted as exc:
             status = exc.failure.outcome.value
@@ -407,6 +424,21 @@ def supplement(config, binding, ticker, day, receipt, session, news, token):
                 if key == "margin_balance"
                 else reader(binding, authority)
             )
+            if key == "eastmoney_fundflow_ratio" and value["status"] == "verified":
+                age = cold.now() - datetime.fromisoformat(value["observed_at"])
+                if not timedelta(0) <= age < timedelta(days=1):
+                    value = {"status": "cache_stale"}
+            if key == "eastmoney_fundflow_ratio" and value["status"] in {
+                "cache_missing_or_unverified",
+                "cache_stale",
+            }:
+                from scripts import personal_dc_ratio
+
+                account_value = personal_dc_ratio.observe(
+                    session, binding, token, authority, fetch=session.fetch_dc_ratio
+                )
+                if account_value["status"] != "cache_missing":
+                    value = account_value
         except PhysicalAttemptBudgetExhausted as exc:
             outcome = exc.failure.outcome.value
             value = {

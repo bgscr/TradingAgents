@@ -8,7 +8,7 @@
 git rev-parse HEAD
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[pit,dev]"
-.\.venv\Scripts\python.exe -m pytest -q tests/test_personal_full.py tests/test_personal_bootstrap.py tests/test_personal_observations.py
+.\.venv\Scripts\python.exe -m pytest -q tests/test_personal_full.py tests/test_personal_bootstrap.py tests/test_personal_observations.py tests/test_personal_dc_ratio.py
 .\start_personal_research.ps1 -Ticker 600895.SH -CheckOnly
 ```
 
@@ -22,11 +22,22 @@ py -3.13 -m venv .venv
 
 首次取数针对一个标的核验上市身份和交易所，按北京时间选择最近已收盘交易日，核对该股当日成交、收盘与复权数据，再准备资产负债表、利润表和现金流量表的公告日期区间。合格缓存优先复用。三表每个端点最多尝试一次，分析期间只读财报缓存；成功空表会保留为无可用行。交易所覆盖有缺口、个股无合格收盘、账户拒绝或返回不完整时会停止。财报同一端点若有多个被新鲜数据隔开的缺口，保留原数据并报告 `disjoint_statement_gaps`。
 
-首次准备与后续分析共用总尝试和截止时间，总计最多 60 次、财务最多 3 次、最长 20 分钟，并服从更小的项目预算。证券、行情、三张财报及融资使用固定 Tushare HTTPS 来源和本地账户限速。模型只使用 DeepSeek HTTPS。默认 Full 还允许在项目配置已允许 AKShare 时读取一个东方财富公开新闻搜索页，最多一次，只传股票代码，不带账户凭据，不打开文章链接，不重试。模型只可看到通过来源、股票和时间核验的文章链接与发布时间。标题和正文留在网页信任边界外。四个分析师之后还有多空辩论、交易员、风险团队与最终决策。证据不足时可以无评级。
+首次准备与后续分析共用总尝试和截止时间，总计最多 60 次、财务最多 3 次、最长 20 分钟，并服从更小的项目预算。证券、行情、三张财报及融资使用固定 Tushare HTTPS 来源和本地账户限速。模型只使用 DeepSeek HTTPS。默认 Full 还允许在项目配置已允许 AKShare 时读取一个东方财富公开新闻搜索页，最多一次，只传股票代码，不带账户凭据，不打开文章链接，不重试。经来源、股票和时间核验的文章链接与发布时间保存在回执。面向正文的研究工具会收到 `personal_news_index_only` 缺项，标题、正文及其情绪均未验证。四个分析师之后还有多空辩论、交易员、风险团队与最终决策。证据不足时可以无评级。
 
 `-SkipNews`、`-SkipMargin`、`-SkipRatio` 可逐项关闭。例：`.\start_personal_research.ps1 -Ticker 000001.SZ -SkipNews -Run` 只使用账户数据和已有合格占比缓存。`-Basic` 显式关闭全部三项。以上选项都保留完整研究图与同一预算。`-CheckOnly` 仅列出选择与核心准备状态，无法离线确认真实账户对融资端点的权限。
 
 个人数据按账户保存在 `reports/personal/.data/`，成功或已开始准备的失败运行在 `reports/personal/<run_id>/status.json` 留下结果，成功时用其中的 `report_relative_path` 找到中文报告。已明确配置原有个人 CURRENT 数据源、身份与限速库的用户可显式加 `-PreparedData` 使用已有资料，其财报仍然只读。受控历史回放继续使用原有入口。
+
+### 首次取得东财占比
+
+须先满足项目已有的东方财富来源许可（若配置了数据商白名单，须包含 `akshare`）。北京时间已过所选交易日、Tushare 已发布该日数据且本人账户具备该接口权限时，可在**原本要做的那一次 Full** 中选择占比查询。个人账户初次使用可直接运行下列命令，无需旧机文件。若同次三张财报均需补取，财务额度已经用完，融资与占比会报告缺项。后续本来就要进行的研究可复用同账户、同证券且在有效期内的三表，从而留出额度；请先查已有回执，不为补数字重跑整图。
+
+```powershell
+.\start_personal_research.ps1 -Ticker 601328.SH -CheckOnly -FetchEastmoneyRatio
+.\start_personal_research.ps1 -Ticker 601328.SH -Run -FetchEastmoneyRatio
+```
+
+数据日期来自供应商行的交易日。新路径通过 Tushare 获取东方财富的盘后日数据，可回查已公布的会话。实时排行截面、请求发生日期或其他资金流指标均不用于代填。回执的 `source=eastmoney.via_tushare.moneyflow_dc` 标明这一来源。该接口的公开文档列明权限条件，实际可用性取决于本人账户。[指标、更新时点与权限说明](https://tushare.pro/document/2?doc_id=349)
 
 ### 如何读个人研究回执
 
@@ -35,9 +46,9 @@ py -3.13 -m venv .venv
 | 图与报告 | `status=completed` 和 `report_written=true` 表示研究已结束且中文报告已写出。 |
 | 评级 | `rating_status=validated_decision` 表示通过图的决策门；`no_rating` 表示研究结束、无可验证评级；失败时为 `unavailable`。预检不会产生评级。 |
 | 市场与财报 | `verified_inputs` 列出身份、所选股票收盘、交易所日历和各报表的公告区间检查。成功空响应会明确标注，不能推断财务值为零。 |
-| 新闻 | `source_evidence.news` 给出单页窗口、收到时间和匹配文章的来源链接、上海发布时间。`returned_to_news_tool` 记录索引是否返回给图中的新闻工具。仅在报告之后取得的索引不参与评级。单页缺行无法证明市场没有相关新闻。 |
-| 融资余额 | 报告封存后先读已验证协调缓存。回溯窗口开放（北京时间已过所选交易日）且财务额度有余时，才可用本人账户查询同股同日 `margin_detail.rzye`。三表与融资合计最多三次。列出交易日、观察时间及人民币元，成功空行不补零。 |
-| 东财占比 | 回溯窗口内只读该个人账户库中与证券身份、交易日、快照及摘要匹配的单次成功采集记录，只报告主力净流入百分比。新安装没有这类记录，个人入口没有生成或导入它的通道。金额、价格和远程回退均关闭。 |
+| 新闻 | `source_evidence.news` 给出单页窗口、收到时间和匹配文章的来源链接、上海发布时间。`news_evidence_scope=publication_index_only` 与 `news_content_verified=false` 说明仅核实观察时该页列有匹配链接及所标时间。索引不能佐证报道主题、事件事实、情绪或投资方向。新闻分析师无法从这个索引取得正文，评级不引用索引作为内容证据。单页缺行无法证明市场没有相关新闻。 |
+| 融资余额 | 报告封存后先读已验证协调缓存。回溯窗口开放（北京时间已过所选交易日）且财务额度有余时，才可用本人账户查询同股同日 `margin_detail.rzye`。三表、融资和可选的东财占比账户查询合计最多三次。列出交易日、观察时间及人民币元，成功空行不补零。 |
+| 东财占比 | 默认只读合格的个人缓存。`-FetchEastmoneyRatio` 允许在报告封存后由本人账户补查一次。固定请求 `moneyflow_dc` 的 `ts_code,trade_date,net_amount_rate`，只认同股、同日及主力净流入百分比，成功后读回物理账本验证。错日、返回额外列或权限不足均不给出占比。 |
 
 `evidence_preset=full` 为默认个人模式。`enhancements` 分别记录 `not_selected`、`permission_not_configured` / `permission_denied`、`valid_empty`、`publication_pending`、`date_mismatch`、`verified` 等结果。`enhancement_coverage=all_three_verified` 只表示该股票及交易日的三项观察均有证据。`full_data_acceptance` 保守标为 `unverified`，单页新闻及事后观察均不能证明截至收盘的完整信息。融资和资金流仅作为本次回执中的事后补充，不改变已写入的评级。`-PreparedData` 沿用独立的旧个人数据配置，未建立个人账户隔离会话时不在那里补采。PowerShell 的运行监督器在达到截止时间时返回 124；此时按本地记录核对已发生的用量，避免重复启动。
 

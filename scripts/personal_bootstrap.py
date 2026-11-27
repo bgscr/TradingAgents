@@ -24,6 +24,7 @@ FIELDS = {
     "suspend_d": "ts_code,trade_date,suspend_type,suspend_timing",
 }
 FINANCE = ("balancesheet", "income", "cashflow")
+SUPPLEMENTAL_FINANCE = ("margin_detail", "moneyflow_dc")
 
 
 def digest_bytes(data):
@@ -111,8 +112,13 @@ def post(token, endpoint, params, fields, remaining, admit):
         PhysicalAttemptOutcome,
     )
 
-    if endpoint not in {*FIELDS, *FINANCE, "stock_basic", "margin_detail"}:
+    if endpoint not in {*FIELDS, *FINANCE, *SUPPLEMENTAL_FINANCE, "stock_basic"}:
         raise PreparationError("unsupported_personal_endpoint")
+    if endpoint == "moneyflow_dc":
+        from scripts.personal_dc_ratio import FIELDS as ratio_fields
+
+        if fields != ratio_fields or set(params) != {"ts_code", "trade_date"}:
+            raise PreparationError("personal_request_scope_mismatch")
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
@@ -150,14 +156,16 @@ def post(token, endpoint, params, fields, remaining, admit):
                 retry_after_seconds=_retry_after_seconds(response.getheader("Retry-After", "")),
                 error_code="personal_rate_limited",
             )
-        if endpoint == "margin_detail" and response.status in (401, 403):
+        if endpoint in SUPPLEMENTAL_FINANCE and response.status in (401, 403):
             raise PhysicalAttemptFailure(
                 outcome=PhysicalAttemptOutcome.AUTHENTICATION
                 if response.status == 401
                 else PhysicalAttemptOutcome.PERMISSION_DENIED,
                 retryable=False,
                 status_code=response.status,
-                error_code="margin_access_rejected",
+                error_code="dc_ratio_access_rejected"
+                if endpoint == "moneyflow_dc"
+                else "margin_access_rejected",
             )
         if response.status != 200:
             raise PreparationError("provider_http_rejected")
@@ -166,15 +174,16 @@ def post(token, endpoint, params, fields, remaining, admit):
         # HTTPResponse keeps the same open socket through its buffered file.
         while True:
             sock.settimeout(min(30, remaining()))
-            block = response.read1(65536)
+            limit = 16384 if endpoint == "moneyflow_dc" else 16 * 1024 * 1024
+            block = response.read1(min(65536, limit + 1 - len(raw)))
             if not block:
                 break
             raw.extend(block)
-            if len(raw) > 16 * 1024 * 1024:
+            if len(raw) > limit:
                 raise PreparationError("provider_response_too_large")
         remaining()
-        if endpoint == "margin_detail":
-            return bytes(raw)  # The established margin decoder preserves exact decimal values.
+        if endpoint in SUPPLEMENTAL_FINANCE:
+            return bytes(raw)  # Preserve numeric tokens for the source-specific decimal decoders.
         result = decode_json(bytes(raw))
         if type(result) is not dict or type(result.get("code")) is not int or result["code"] != 0:
             raise PreparationError("provider_business_rejected")
@@ -189,6 +198,7 @@ class Session:
         from tradingagents.market_history.coordinator import upstream_service_identity_for_provider
 
         self.account_scope = config.get("tushare_account_scope_label")
+        self.fetch_dc_ratio = config.get("personal_fetch_dc_ratio") is True
         self.maximum = config["analysis_max_calls"]
         duration = config["analysis_timeout_seconds"]
         if (
@@ -229,12 +239,15 @@ class Session:
                 "start_date": first.strftime("%Y%m%d"),
                 "end_date": self.today.strftime("%Y%m%d"),
             }
-        elif self.day is not None and endpoint == "margin_detail":
+        elif self.day is not None and endpoint in SUPPLEMENTAL_FINANCE:
+            from scripts.personal_dc_ratio import FIELDS as ratio_fields
             from tradingagents.margin_balance import FIELDS as margin_fields
 
             valid = (
                 self.day < now().astimezone(ZoneInfo("Asia/Shanghai")).date()
-                and fields == ",".join(margin_fields)
+                and (endpoint != "moneyflow_dc" or self.fetch_dc_ratio)
+                and fields
+                == (ratio_fields if endpoint == "moneyflow_dc" else ",".join(margin_fields))
                 and params
                 == {
                     "ts_code": code,
@@ -281,7 +294,10 @@ class Session:
             raise PreparationError("personal_deadline_reached")
         time.sleep(seconds)
 
-    def query(self, token, endpoint, params, fields, *, margin_binding=None):
+    def financial_attempts(self):
+        return sum(self.counts.get(k, 0) for k in (*FINANCE, *SUPPLEMENTAL_FINANCE))
+
+    def query(self, token, endpoint, params, fields, *, observation_binding=None):
         from tradingagents.market_history.coordinator import (
             ProviderRequestCoordinator,
             RequestPriority,
@@ -289,44 +305,59 @@ class Session:
         from tradingagents.market_history.store import MarketHistoryStore
 
         request_key = "personal:" + uuid4().hex
-        if endpoint == "margin_detail":
+        if endpoint in SUPPLEMENTAL_FINANCE:
             import re
 
+            from scripts import personal_dc_ratio
             from scripts.personal_observations import margin_key
 
             if (
-                type(margin_binding) is not dict
+                type(observation_binding) is not dict
                 or not self.account_scope
                 or self.day is None
-                or set(margin_binding)
+                or set(observation_binding)
                 != {"symbol", "trade_date", "as_of", "identity_sha256", "snapshot_id"}
-                or margin_binding["symbol"] != self.symbol.replace(".SS", ".SH")
-                or margin_binding["trade_date"] != self.day.isoformat()
-                or margin_binding["as_of"] != self.day.isoformat()
-                or not re.fullmatch(r"[a-f0-9]{64}", margin_binding["identity_sha256"])
-                or not re.fullmatch(r"snapshot:v2:[a-f0-9]{64}", margin_binding["snapshot_id"])
+                or observation_binding["symbol"] != self.symbol.replace(".SS", ".SH")
+                or observation_binding["trade_date"] != self.day.isoformat()
+                or observation_binding["as_of"] != self.day.isoformat()
+                or not re.fullmatch(r"[a-f0-9]{64}", observation_binding["identity_sha256"])
+                or not re.fullmatch(r"snapshot:v2:[a-f0-9]{64}", observation_binding["snapshot_id"])
             ):
                 raise PreparationError("unbound_personal_request")
-            if sum(self.counts.get(k, 0) for k in (*FINANCE, endpoint)) >= 3:
-                raise PreparationError("personal_attempt_limit")
-            request_key = margin_key(margin_binding, self.account_scope)
+            if (
+                not isinstance(token, str)
+                or "personal-" + digest_bytes(("personal-tushare-v1\0" + token).encode())
+                != self.account_scope
+            ):
+                raise PreparationError("personal_account_scope_mismatch")
+            make_key = personal_dc_ratio.request_key if endpoint == "moneyflow_dc" else margin_key
+            request_key = make_key(observation_binding, self.account_scope)
         self.validate(endpoint, params, fields)
-        self.remaining()
-        if sum(self.counts.values()) >= self.maximum or self.counts.get(endpoint, 0):
-            raise PreparationError("personal_attempt_limit")
+
+        def ensure_capacity():
+            self.remaining()
+            if (
+                sum(self.counts.values()) >= self.maximum
+                or self.counts.get(endpoint, 0)
+                or endpoint in (*FINANCE, *SUPPLEMENTAL_FINANCE)
+                and self.financial_attempts() >= 3
+            ):
+                raise PreparationError("personal_attempt_limit")
+
+        ensure_capacity()
         self.stage = endpoint
 
         def admit():
             from tradingagents.market_history.coordinator import record_active_physical_attempt_io
 
-            self.remaining()
-            if sum(self.counts.values()) >= self.maximum or self.counts.get(endpoint, 0):
-                raise PreparationError("personal_attempt_limit")
+            ensure_capacity()
             record_active_physical_attempt_io()
             self.counts[endpoint] = 1
 
         def send():
             raw = post(token, endpoint, params, fields, self.remaining, admit)
+            if endpoint == "moneyflow_dc":
+                return personal_dc_ratio.project(raw, observation_binding)
             if endpoint == "margin_detail":
                 from scripts.personal_observations import project_margin
                 from tradingagents.market_history.coordinator import (
@@ -336,7 +367,7 @@ class Session:
                 from tradingagents.moneyflow import MoneyflowUnavailable
 
                 try:
-                    return project_margin(raw, margin_binding)
+                    return project_margin(raw, observation_binding)
                 except MoneyflowUnavailable as exc:
                     denied = str(exc) == "permission_denied"
                     raise PhysicalAttemptFailure(

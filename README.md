@@ -29,7 +29,7 @@
 
 ## Windows A 股个人 Full
 
-从干净检出安装公开依赖，配置自己的 Tushare 和 DeepSeek 凭据，即可使用 `start_personal_research.ps1`。先用 `-CheckOnly` 做零外呼预检。空缓存会报告缺少行情；确认使用账户额度后，`-Run` 会为所选股票补齐可核验的数据并运行多 Agent 分析。默认 Full 会核对相关新闻、融资余额和东财主力净流入占比的证据。`-Basic` 可显式关闭这三项。首次使用没有占比缓存，当日融资也可能尚未发布，回执会逐项说明。图完成后，回执会区分通过决策门的评级和无评级结果。[安装步骤、离线验收与报告位置](docs/mainland-clean-start.md#个人研究与本机验收)
+从干净检出安装公开依赖，配置自己的 Tushare 和 DeepSeek 凭据，即可使用 `start_personal_research.ps1`。先用 `-CheckOnly` 做零外呼预检。空缓存会报告缺少行情；确认使用账户额度后，`-Run` 会为所选股票补齐可核验的数据并运行多 Agent 分析。默认 Full 会核对相关新闻、融资余额和东财主力净流入占比的证据。`-Basic` 可显式关闭这三项。空缓存可在 Full 中显式加 `-FetchEastmoneyRatio`，使用有相应权限的本人 Tushare 账户查询东财发布的同股同日占比。回执标明来源、日期、额度或缺项。新闻索引仅支持链接与发布时间核对。图完成后，回执会区分通过决策门的评级和无评级结果。[安装步骤、离线验收与报告位置](docs/mainland-clean-start.md#个人研究与本机验收)
 
 ## News
 - [2026-07] **TradingAgents v0.3.1** released with correctness and stability fixes: Alpha Vantage look-ahead filtering, graph-router crash-safety, graph-shape-aware checkpoint resume, working crypto sentiment sources, a configurable LLM retry budget, Bedrock API-key auth, and Claude Sonnet 5 / Fable 5 support. See [CHANGELOG.md](CHANGELOG.md) for the full list.

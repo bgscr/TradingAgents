@@ -233,7 +233,10 @@ def main(argv=None):
     parser.add_argument("--skip-news", action="store_true")
     parser.add_argument("--skip-margin", action="store_true")
     parser.add_argument("--skip-ratio", action="store_true")
+    parser.add_argument("--fetch-eastmoney-ratio", action="store_true")
     args = parser.parse_args(argv)
+    if args.fetch_eastmoney_ratio and (args.basic or args.skip_ratio or args.prepared_data):
+        parser.error("--fetch-eastmoney-ratio requires personal Full with the ratio selected")
     from scripts import personal_graph
     from scripts.project_credentials import ProjectCredentialError, credential_failure_code
 
@@ -247,6 +250,7 @@ def main(argv=None):
             DEFAULT_CONFIG, market_history_mode="current", data_usage_mode="personal_research"
         )
         config["personal_mode"] = "basic" if args.basic else "full"
+        config["personal_fetch_dc_ratio"] = args.fetch_eastmoney_ratio
         enabled = (
             ("news", args.skip_news),
             ("margin_balance", args.skip_margin),

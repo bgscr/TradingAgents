@@ -1,6 +1,6 @@
 """Empty personal-account store. Every transport boundary is synthetic."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -45,6 +45,18 @@ class SyntheticFeed:
             items = [row]
             if self.fault == "wrong_identity":
                 row[0] = "601328.SH"
+        elif endpoint in cold.SUPPLEMENTAL_FINANCE:
+            import json
+
+            assert params == {"ts_code": self.symbol, "trade_date": "20240229"}
+            if endpoint == "moneyflow_dc":
+                assert fields == "ts_code,trade_date,net_amount_rate"
+                day = "20240228" if self.fault == "stale_ratio" else "20240229"
+                values = [self.symbol, day, -1.25]
+            else:
+                assert fields == "trade_date,ts_code,rzye"
+                values = ["20240229", self.symbol, 321]
+            return json.dumps({"code": 0, "data": {"fields": columns, "items": [values]}}).encode()
         elif endpoint == "trade_cal":
             first = datetime.strptime(params["start_date"], "%Y%m%d")
             last = datetime.strptime(params["end_date"], "%Y%m%d")
@@ -103,7 +115,11 @@ def feed_for(monkeypatch, symbol):
 
     from scripts import personal_full
     from tradingagents import budget_readiness
-    from tradingagents.dataflows import current_statement_cache, tushare_market_history
+    from tradingagents.dataflows import (
+        current_statement_cache,
+        market_snapshot,
+        tushare_market_history,
+    )
     from tradingagents.market_history import current_incremental
 
     feed = SyntheticFeed(symbol)
@@ -113,6 +129,10 @@ def feed_for(monkeypatch, symbol):
 
     monkeypatch.setattr(socket, "getaddrinfo", deny)
     monkeypatch.setattr(socket.socket, "connect", deny)
+    monkeypatch.setattr(
+        market_snapshot, "_coordinator_now", lambda: feed.instant.astimezone(timezone.utc)
+    )
+    monkeypatch.setattr(market_snapshot, "_coordinator_sleep", feed.wait)
     monkeypatch.setattr(cold, "now", lambda: feed.instant)
     monkeypatch.setattr(cold, "post", feed.post)
     monkeypatch.setattr(cold.Session, "wait", lambda session, seconds: feed.wait(seconds))
@@ -444,6 +464,10 @@ try:
     feed = install_graph_boundary(changes, {ticker.replace(".SH", ".SS")!r}, Path({str(trace)!r}))
     if Path({str(trace)!r}).exists():
         feed.instant += timedelta(minutes=5)
+    if os.environ.get("PERSONAL_FIXTURE_NEXT_MORNING") == "1":
+        feed.instant += timedelta(hours=17)
+        if feed.exchange == "SZSE":
+            feed.fault = "stale_ratio"
 except BaseException:
     os._exit(71)
 """
@@ -563,6 +587,32 @@ except BaseException:
     assert code == 0 and basic["evidence_preset"] == "basic"
     assert set(basic["enhancements"].values()) == {"not_selected"}
     assert trace.read_text().splitlines() == counts
+    env["PERSONAL_FIXTURE_NEXT_MORNING"] = "1"
+    code, next_day = launch("-Run", "-FetchEastmoneyRatio")
+    assert code in (0, 3) and next_day["report_written"], next_day
+    assert next_day["exchange_session"] == "2024-02-29"
+    assert next_day["financial_attempts"] == 2
+    assert next_day["supplement_attempts"].get("margin_detail") == 1
+    assert next_day["supplement_attempts"].get("moneyflow_dc") == 1
+    assert all(name not in next_day["preparation_attempts"] for name in cold.FINANCE)
+    assert (
+        next_day["enhancements"]["news"] == next_day["enhancements"]["margin_balance"] == "verified"
+    )
+    assert not next_day["news_content_verified"]
+    ratio = next_day["source_evidence"]["eastmoney_fundflow_ratio"]
+    if ticker.endswith(".SH"):
+        assert (
+            next_day["enhancement_coverage"] == "all_three_verified"
+            and ratio["status"] == "verified"
+        )
+        assert ratio["main_net_percent"] == "-1.25" and ratio["trade_date"] == "2024-02-29"
+        assert ratio["source"] == "eastmoney.via_tushare.moneyflow_dc"
+    else:
+        assert ratio["status"] == "date_mismatch" and "main_net_percent" not in ratio
+        assert next_day["enhancement_coverage"] == "incomplete"
+    later = trace.read_text().splitlines()
+    assert next_day["admitted_attempts"] == len(later) - len(counts) <= 60
+    counts = later
     env.update(TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS="1", PERSONAL_FIXTURE_STALL="1")
     stopped = subprocess.run(
         [

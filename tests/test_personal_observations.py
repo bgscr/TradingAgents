@@ -61,7 +61,7 @@ def test_news_provenance_and_time(case, status):
         assert result["articles"][0]["source"].startswith("https://finance.eastmoney.com/a/")
 
 
-def test_acquired_news_tool_returns_verified_times_and_links_once(monkeypatch):
+def test_publication_index_cannot_satisfy_article_evidence(monkeypatch):
     from types import SimpleNamespace
 
     from scripts.personal_graph import personal_sources
@@ -109,11 +109,17 @@ def test_acquired_news_tool_returns_verified_times_and_links_once(monkeypatch):
         assert ask("000001.SZ", 0).artifact is None and not sends
         for n in (1, 2):
             result = ask(SYMBOL, n)
-            assert result.artifact and "2024-02-29T13:00:00+08:00" in result.value
-            assert "finance.eastmoney.com/a/202402290000000001.html" in result.value
-            assert "合成公告" not in result.value and "普通测试正文" not in result.value
+            assert result.artifact is None
+            assert any(
+                getattr(o, "error_code", None) == "personal_news_index_only"
+                for o in result.outcomes
+            )
+            article = owner.result["articles"][0]
+            assert article["published_at"] == "2024-02-29T13:00:00+08:00"
+            assert article["source"] == "https://finance.eastmoney.com/a/202402290000000001.html"
+            assert "合成公告" not in str(owner.result) and "普通测试正文" not in str(owner.result)
         assert sends == [(SYMBOL, DAY)] and budget.receipt()["data_attempts"] == 1
-    assert owner.returned_to_news_tool
+    assert not owner.returned_to_news_tool
 
 
 def test_denied_optional_vendor_stays_denied(tmp_path, monkeypatch):

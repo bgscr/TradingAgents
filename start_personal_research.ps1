@@ -6,6 +6,7 @@ param(
     [switch] $SkipNews,
     [switch] $SkipMargin,
     [switch] $SkipRatio,
+    [switch] $FetchEastmoneyRatio,
     [Parameter(ParameterSetName = 'Check')] [switch] $CheckOnly,
     [Parameter(Mandatory, ParameterSetName = 'Research')] [switch] $Run
 )
@@ -50,6 +51,7 @@ if ($Basic) { $selection += '--basic' }
 if ($SkipNews) { $selection += '--skip-news' }
 if ($SkipMargin) { $selection += '--skip-margin' }
 if ($SkipRatio) { $selection += '--skip-ratio' }
+if ($FetchEastmoneyRatio) { $selection += '--fetch-eastmoney-ratio' }
 if (-not $Run) {
     & $python -I -B $entry --ticker $Ticker $mode @selection
     exit $LASTEXITCODE
