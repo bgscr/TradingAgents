@@ -3,6 +3,7 @@ param(
     [switch]$Full,
     [ValidateSet('portfolio-research-v3')][string]$DecisionMode,
     [switch]$Run,
+    [ValidatePattern('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')][string]$ExpectedTradingDate,
     [switch]$FiveSnapshotsOnce,
     [switch]$CalendarOnly,
     [switch]$CalendarNineOnce,
@@ -47,6 +48,9 @@ if ($announcementCount -eq 3 -and (-not $hasTicker -or -not $hasAnalysisDate -or
     throw 'Local announcement requires explicit Ticker/AnalysisDate and three nonempty announcement arguments.'
 }
 $autoLatest = $Full -and $hasTicker -and -not $hasAnalysisDate
+if ($PSBoundParameters.ContainsKey('ExpectedTradingDate') -and (-not $autoLatest -or $CalendarOnly -or $FiveSnapshotsOnce -or $Guided)) {
+    throw 'ExpectedTradingDate requires ordinary latest Full.'
+}
 if ($PSBoundParameters.ContainsKey('DecisionMode') -and (-not $autoLatest -or $CalendarOnly -or $FiveSnapshotsOnce -or $Guided)) { throw 'DecisionMode requires ordinary latest Full.' }
 if ($Run -and (-not $autoLatest -or $CheckOnly -or -not $UseProjectEnv)) {
     throw '-Run requires default latest Full with -UseProjectEnv and no -CheckOnly.'
@@ -91,6 +95,7 @@ if ($CalendarOnly -or $PSBoundParameters.ContainsKey('SessionMaxCalls')) { $entr
 if ($Full) { $entryArguments += '--full' }
 if ($PSBoundParameters.ContainsKey('DecisionMode')) { $entryArguments += @('--decision-mode', $DecisionMode) }
 if ($autoLatest) { $entryArguments += '--auto-latest' }
+if ($PSBoundParameters.ContainsKey('ExpectedTradingDate')) { $entryArguments += @('--expected-trading-date', $ExpectedTradingDate) }
 if ($Run) { $entryArguments += '--run' }
 if ($CalendarOnly) { $entryArguments += '--calendar-only' }
 foreach ($name in $Enhancement) { $entryArguments += @('--enhancement', $name) }

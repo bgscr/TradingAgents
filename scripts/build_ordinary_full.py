@@ -12,7 +12,7 @@ import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 RECIPE = Path(__file__).resolve().parents[1] / "config/ordinary-full-release-lock.json"
-RECIPE_SHA256 = "28af7420b47467010d5da28e60389505f162211ad00c3ae8544a21c0d829d036"
+RECIPE_SHA256 = "bfd01e07756e566e916377e3e65b29c5c4691649231dd35179c4ee69a3b48321"
 RECEIPT = "config/ordinary-full-package.json"
 
 

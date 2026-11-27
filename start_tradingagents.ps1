@@ -27,7 +27,7 @@ if ($args.Count -gt 0 -and $args[0] -ieq '-Full') {
     $options = @{ Full = $true; SessionMaxCalls = 60 }
     $seen = @{}
     $switches = @{'-CheckOnly'='CheckOnly'; '-UseProjectEnv'='UseProjectEnv'; '-Run'='Run'; '-CalendarOnly'='CalendarOnly'}
-    $values = @{'-DecisionMode'='DecisionMode'; '-Ticker'='Ticker'; '-AnalysisDate'='AnalysisDate'; '-SessionMaxCalls'='SessionMaxCalls'}
+    $values = @{'-DecisionMode'='DecisionMode'; '-Ticker'='Ticker'; '-AnalysisDate'='AnalysisDate'; '-ExpectedTradingDate'='ExpectedTradingDate'; '-SessionMaxCalls'='SessionMaxCalls'}
     for ($n = 1; $n -lt $args.Count; $n++) {
         $flag = [string]$args[$n]
         if ($seen.ContainsKey($flag)) { throw "Duplicate Full option: $flag" }
