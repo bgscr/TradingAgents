@@ -22,6 +22,7 @@ IMPORTS = {
 
 NEW_HELPER = "scripts/proposed_latest_target_review.py"
 INIT = "scripts/__init__.py"
+INIT_SOURCE = b'"""Ordinary latest candidate helpers."""\n'
 INTAKE = "scripts/full_latest_intake.py"
 ACTIVATION = "config/portfolio_research_activation.json"
 # Independently reviewed byte identities for the one activation-policy entry that moves.
@@ -32,7 +33,7 @@ CHANGED = {*IMPORTS, INTAKE, ACTIVATION}
 
 def added_sources():
     return {
-        INIT: b'"""Ordinary latest candidate helpers."""\n',
+        INIT: INIT_SOURCE,
         NEW_HELPER: H["R"]["small_file"](ROOT / NEW_HELPER, 32768).replace(b"\r\n", b"\n"),
     }
 
@@ -141,6 +142,10 @@ def proposal():
         public[name] = H["sha"](after)
         changes[name] = {"before": before, "proposed": public[name]}
     additions = {n: H["sha"](b) for n, b in added_sources().items()}
+    return describe_proposal(base, public, changes, additions)
+
+
+def describe_proposal(base, public, changes, additions):
     H["require"](not (public.keys() & additions.keys()), "unexpected_existing_helper")
     public.update(additions)
     return {

@@ -159,8 +159,9 @@ def seed(site, exchange):
 
     base = site / "data/market_history"
     mixed = exchange in {"mixed", "conflict"}
+    expired = exchange == "expired"
     generic_open = exchange == "mixed"
-    if mixed:
+    if mixed or expired:
         exchange = "SSE"
     config = MarketHistoryConfig(
         MarketHistoryMode.CURRENT,
@@ -210,7 +211,12 @@ def seed(site, exchange):
                 },
             )
             store.publish_session_calendar(
-                replace(publication, observed_at=datetime.fromisoformat(NOW))
+                replace(
+                    publication,
+                    observed_at=datetime.fromisoformat(
+                        "2026-11-25T17:00:00+08:00" if expired else NOW
+                    ),
+                )
             )
             if mixed:
                 from tradingagents.dataflows.baostock_calendar import (

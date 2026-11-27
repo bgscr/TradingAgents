@@ -124,12 +124,34 @@ class ProposalContract(unittest.TestCase):
     os.name == "nt", "requires reviewed Windows PowerShell 7 and a local project runtime"
 )
 class LatestRecipe(unittest.TestCase):
+    @staticmethod
+    def historical_inputs(key):
+        return H["public"](H["recipe"](ROOT)), H["R"]["small_file"](ROOT / key, 500000)
+
     @classmethod
     def setUpClass(cls):
         temp = tempfile.TemporaryDirectory(prefix="latest recipe lab ")
         cls.addClassCleanup(temp.cleanup)
         cls.root = Path(temp.name)
         cls.public = cls.root / "public"
+        cls.prepare_public()
+        cls.station = cls.root / "independent fixture inputs"
+        cls.pwsh = shutil.which("pwsh.exe")
+        policy = json.loads((cls.public / "config/ordinary-full-pair-policy.json").read_bytes())
+        if not cls.pwsh or H["sha"](Path(cls.pwsh).read_bytes()) != policy["executable_sha256"]:
+            raise ValueError("reviewed_powershell_required")
+        cls.deps = Path(sys.executable).absolute().parents[1] / "Lib/site-packages"
+        cls.env = {k: os.environ[k] for k in ("SystemRoot", "WINDIR", "TEMP", "TMP")}
+        cls.env.update(POWERSHELL_TELEMETRY_OPTOUT="1", DOTNET_CLI_TELEMETRY_OPTOUT="1")
+        cls.projection, cls.originals = fixture_close()
+        cls.close_pins = P["proposed_close_bindings"](
+            "601328.SS", DAY, cls.projection, H["sha"](cls.projection)
+        )
+        cls.review_key = "config/full_evidence/XSHG/601328.SS/latest-target-review.json"
+        write(cls.root, "SYNTHETIC-ONLY", b"no authority\n")
+
+    @classmethod
+    def prepare_public(cls):
         cls.draft = P["proposal"]()
         cls.pins = cls.draft["public_project"]
         # Never read the historical receipt or either private original, even if locally available.
@@ -151,23 +173,21 @@ class LatestRecipe(unittest.TestCase):
             chosen = next(
                 (b for b in (data, lf, lf.replace(b"\n", b"\r\n")) if H["sha"](b) == digest), None
             )
+            if chosen is None and name in {
+                "tradingagents/dataflows/current_statement_cache.py",
+                "tradingagents/dataflows/current_statement_diagnostics.py",
+            }:
+                # A clean checkout after Issue #7 has the newer pair. The v1
+                # control must still exercise the pinned historical file bytes.
+                raw = H["git"](ROOT, ["cat-file", "blob", H["RELEASE"] + ":" + name])
+                lf = raw.replace(b"\r\n", b"\n")
+                chosen = next(
+                    (b for b in (raw, lf, lf.replace(b"\n", b"\r\n")) if H["sha"](b) == digest),
+                    None,
+                )
             if chosen is None:
                 raise ValueError("use_clean_reviewed_snapshot: " + name)
             write(cls.public, name, chosen)
-        cls.station = cls.root / "independent fixture inputs"
-        cls.pwsh = shutil.which("pwsh.exe")
-        policy = json.loads((cls.public / "config/ordinary-full-pair-policy.json").read_bytes())
-        if not cls.pwsh or H["sha"](Path(cls.pwsh).read_bytes()) != policy["executable_sha256"]:
-            raise ValueError("reviewed_powershell_required")
-        cls.deps = Path(sys.executable).absolute().parents[1] / "Lib/site-packages"
-        cls.env = {k: os.environ[k] for k in ("SystemRoot", "WINDIR", "TEMP", "TMP")}
-        cls.env.update(POWERSHELL_TELEMETRY_OPTOUT="1", DOTNET_CLI_TELEMETRY_OPTOUT="1")
-        cls.projection, cls.originals = fixture_close()
-        cls.close_pins = P["proposed_close_bindings"](
-            "601328.SS", DAY, cls.projection, H["sha"](cls.projection)
-        )
-        cls.review_key = "config/full_evidence/XSHG/601328.SS/latest-target-review.json"
-        write(cls.root, "SYNTHETIC-ONLY", b"no authority\n")
 
     def setUp(self):
         self.site = self.root / self._testMethodName
@@ -425,9 +445,9 @@ class LatestRecipe(unittest.TestCase):
             "revision": revision,
             "observed_at": day + "T17:00:00+08:00",
         }
-        old = H["public"](H["recipe"](ROOT))
         key = "scripts/full_date_evidence.py"
-        original = H["R"]["small_file"](ROOT / key, 500000).replace(b"\r\n", b"\n")
+        old, original = self.historical_inputs(key)
+        original = original.replace(b"\r\n", b"\n")
         write(
             self.site,
             key,

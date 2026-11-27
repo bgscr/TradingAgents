@@ -118,3 +118,16 @@ py -3.13 -I -S -B .\tests\test_ordinary_first_install_review.py -v
 | 回放与准入 | 旧配方及固定回放的三件证据留在旧发行。新机的 latest 数据不能给予当时可得、历史回放或 Full 验收资格。候选不更改已发布构建器、审查工具的固定配方摘要或正式批准格式。拟正式采用时，发行维护者须单独审定后继配方、目标证据及生成目标清单的流程，并用该机的独立批准绑定本次摘要。 |
 
 演练使用冻结源码的两个真实 PowerShell 文件、正常 latest 参数、隔离 venv、合成接收材料和 SQLite 市场库。测试入口和 reader 的文件/时钟接线属于实验，调用真实 intake、候选 CURRENT 选择器和原有交易所、时点、内容与收盘校验。另用原版生产 Python 入口验证只有提案不能启动。Python 夹具拒绝套接字操作与未列入的子进程，分别记录被拦的本机能力探测和唯一允许的本地 reader；没有系统级断网或第二台机器实测。真实签发、历史私有材料和供应商传输均不在这项复验范围。
+
+## 审查包含财报缓存键重构的固定版本
+
+维护者可在 Windows 原仓根运行以下命令。`$reviewDirectory` 须为同机固定磁盘上的全新绝对路径，位于仓库外，父目录已存在。
+
+```powershell
+& .\.venv\Scripts\python.exe -I -S -B .\scripts\export_latest_source_review.py $reviewDirectory
+& .\.venv\Scripts\python.exe -I -S -B .\tests\test_latest_source_review.py -v
+```
+
+导出器从 Git 对象固定选择 `144ad68898ede4d3b83d697a6dc15b91f8a2ec64`。与旧配方对照，财报缓存和回执诊断两个文件逐字节采用该提交，另有前述五个 latest 候选变更及两个新增路径。共 303 个公开文件，写完后逐个回读。目录中的 `unapproved-latest-144ad688.json` 记录来源和摘要。正式 v1 导出、暂存及批准仍沿用其原有固定版本。
+
+维护者须独立择定并审核该配方。随后在第二台 Windows 的新目录核对运行时，取得并审核目标机的交易所日历、证券收盘来源和原件，用目标机、目录及重测清单的精确摘要取得独立批准，再进行首装和当地的零发送预检。
