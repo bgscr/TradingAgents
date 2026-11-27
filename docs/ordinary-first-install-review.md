@@ -62,3 +62,35 @@ py -3.13 -I -S -B .\tests\test_ordinary_first_install_review.py -v
 ## 第二台机器实测
 
 在两台独立机器上分别从目标最终目录采集脱敏回执，来自机器 A 的批准不能用于 B。在取得可合法使用的发行输入及真实独立批准渠道后，维护者须用该机的正式发布机制完成第一次签发，再用公开 PowerShell 入口执行 `-Full -Ticker 600895.SH -CheckOnly` 并核对退出码、安装完整性及本机行情证据。测试演练的成功不授予该操作的权限。
+
+## 离线核验独立批准
+
+目标机可以在暂存结束后，用 Windows 系统自带的 OpenSSH `ssh-keygen.exe -Y verify` 和维护者独立取得的 Ed25519 公钥检查批准。已有的角色注册服务只证明角色登记，旧安装过渡工具只认其固定前后像。两者均未向新目标提供通用首装签发权。仓库未附生产批准方、公钥或签名。
+
+1. 由实际发行负责人通过既有独立渠道确认批准方身份、其首装授权范围，以及当前有效的公钥指纹。只有维护者能管理受信工具和公钥所在的目录。核验器固定读取**维护工具检出的父目录**下的 `ordinary-full-first-install-authority/allowed_signers`。文件只允许一行 `tradingagents-first-install ssh-ed25519 <OpenSSH 公钥的 base64 字段>`。操作者负责公钥的更新与撤回。没有可独立核实的公钥或实际授权人时，在此停下。
+2. 发行人审阅目标机的请求后，从外部交付 `approval.json` 与标准 SSHSIG 分离签名 `approval.json.sig`。消息为 UTF-8 JSON；签名覆盖原字节，命名空间为 `tradingagents-ordinary-first-install-v1`。消息必须恰含下表字段，不接受候选指定的公钥、标签或附加字段。
+
+   | 字段 | 签发方应核对并签入的值 |
+   |---|---|
+   | `contract`、`purpose` | `ordinary-first-install-approval-v1`、`approve-ordinary-full-first-install` |
+   | `release`、`recipe_sha256`、`powershell_sha256` | 本次受审版本、固定配方和受审 PowerShell 文件 |
+   | `host_binding`、`target_binding`、`manifest_sha256` | 目标机标识绑定、含规范绝对目录及文件身份的绑定、该目标拟发布清单的精确字节摘要 |
+   | `not_before`、`expires` | UTC Unix 整数秒，开始时刻含、截止时刻不含 |
+
+3. 使用时钟正确的目标 Windows 和经过审核的维护解释器。在核验期间保持候选、运行时、工具、收件箱、公钥目录及其父路径静止。收件箱、候选、维护工具和公钥目录必须彼此独立。普通 SSH 公钥文件并不能证明签发权，核验器也不会联网检查撤销状态。
+
+   ```powershell
+   py -3.13 -I -S -B .\scripts\verify_ordinary_first_install_approval.py --candidate "$target" --approval-dir "$inbox" --pwsh ([Environment]::ProcessPath)
+   ```
+
+   退出 0 和 `signature_and_target_verified` 表示系统 OpenSSH 在固定用途下验证了预期签名人，且本机重新读出的所有绑定与签名一致。拒绝时退出 1 并给出错误码。此命令只读，输出没有部署效力。安装时仍必须经过负责正式发布的机制，复核当时的批准有效性与目标状态。合成回归可独立执行 `py -3.13 -I -S -B .\tests\test_ordinary_first_install_approval.py -v`。
+
+### 目标机日期证据交接
+
+| 当前发行指定材料 | 目标机可以核对什么 | 缺件时的动作 |
+|---|---|---|
+| 上交所 2026-11-20 的 `completed-day.json` | 已合法持有该受审回执时，核对来源清单原根、唯一条目、文件摘要、日期与交易所。回执内两项摘要分别引用原始交接记录和日历载荷。 | 新查询可佐证当天是否开市，无法证明原观察时间或重造旧回执。将目标机可合法取得的版本及来源提交新配方审查。 |
+| `originals/6e18d194…cc101.bin` | 已合法持有原字节时，逐字节验摘要，再依回执中的引用验证其角色。 | 缺少获准原件时保留缺项。新的日历采集需走目标机已有的正规市场数据准入，并由维护者审定新证据。 |
+| `originals/d2be3c22…dd31.bin` | 同样核对原根、摘要和回执引用。程序对交接记录核对来源、日期和版本，对日历载荷核对规范化、交易所、覆盖及修订摘要。 | 独立采集会产生该机的交接记录。若原根、来源清单或任一字节不同，一并交由维护者审核新配方。 |
+
+公开配方只列两份原件的内容地址，源码按回执的 `handoff_sha256` 和 `raw_sha256` 识别各自角色。仅凭文件名不能给两个哈希分配角色。源码也没有授予目标机重新分发或取得这三件原件的权利。**共同门槛**是有合法用途、与固定摘要 `c6fc155e…` 完全一致且绑定原根的来源清单，以及逐项匹配的证据；未满足时，维护者须审定目标机适用的新来源及新配方，普通签名核验不会改变这项门槛。
