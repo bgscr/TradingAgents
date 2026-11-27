@@ -25,3 +25,15 @@ py -3.13 -m venv .venv
 干净 Git 检出提供源码。正式入口还会核验项目内的 `.venv`、机器与安装目录绑定的 `config/bounded_mainland_release.json` 和受审运行时。现有打包器 `scripts/build_ordinary_full.py` 还要求发行配方指定的来源清单及三份本地日期证据，产物需经受控发布。当前仓库没有从一台空白机器签发首份可信来源清单的流程。新机要运行受保护的 Full，需由发行维护者提供适用的受审安装与本机策略。不要复制旧机器的绑定清单、数据库、报告或凭据。
 
 显式日期的 `-Full -CheckOnly` 在有合格日期证据的受审安装上检查绑定和选择；不会验证真实供应商可用性或产出正式研究报告。
+
+## 首装前只读检查
+
+用计划用于构建的 Windows Python 3.13 运行下面的命令。`--repo` 指向可信来源检出，`--target` 指向拟存放候选的独立目录。检查可以在目标尚不存在时运行。
+
+```powershell
+py -3.13 -I -S -B scripts/check_ordinary_full_inputs.py --repo . --target ..\TradingAgents-candidate
+```
+
+输出分别列出来源和目标状态。空白检出将列出缺失的来源清单、上交所 2026-11-20 的完成日回执和两份原始日历载荷。来源清单存在时，检查会调用构建器，在本地核对来源清单固定摘要、来源目录、证据绑定和当前 Git 字节。目标需只有已准备的 `.venv`，且通过 24 项解释器环境和 5 项标准库摘要核验。空 venv 缺少依赖时，`missing_runtime` 会列出配方内的相对路径，可据此准备对应的受审运行包。退出 0 只表明这两组检查通过，命令不会写入候选或签发安装清单。
+
+正式暂存使用 `scripts/build_ordinary_full.py --repo <来源检出> --target <准备好的独立目录>`，同样使用 `-I -S -B`，暂存后加 `--verify` 复核。它生成 `config/ordinary-full-package.json` 候选回执；公开主线没有生成首份可信来源清单或批准正式目标清单的命令。应从维护者的受审发行流程取得适用于目标的安装，再配置该机器的授权来源与账户策略。`scripts/build_windows_release.ps1` 生成另一种通用便携分发包，不能用于签发此 Full 安装。
