@@ -162,3 +162,40 @@ def test_backup_parent_is_checked_before_descendants(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "lstat", recorded)
     with pytest.raises(ValueError, match="linked_release_path"):
         inspect_path(leaf)
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("match", "verified"), ("wrong_digest", "pwsh_digest_mismatch"),
+    ("missing_host", "pwsh_file_missing"), ("no_locator", "pwsh_locator_required"),
+    ("relative", "pwsh_locator_invalid"), ("wrong_name", "pwsh_locator_invalid"),
+    ("missing_policy", "pwsh_policy_missing"), ("modified_policy", "pwsh_policy_unverified"),
+])
+def test_readonly_powershell_check(tmp_path, case, expected):
+    check = runpy.run_path(str(CHECK))
+    build = runpy.run_path(str(BUILD))
+    locator = tmp_path / "pwsh.exe"
+    reviewed = b"synthetic host bytes"
+    if case != "missing_host":
+        locator.write_bytes(b"changed host" if case == "wrong_digest" else reviewed)
+    name = "config/ordinary-full-pair-policy.json"
+    raw = json.dumps({"executable_name": "pwsh.exe", "executable_sha256": build["digest"](reviewed)}).encode()
+    recipe = {"project": {name: build["digest"](raw)}}
+    path = tmp_path / name
+    path.parent.mkdir()
+    if case != "missing_policy":
+        path.write_bytes(raw + b" " if case == "modified_policy" else raw)
+    locator = {"relative": "pwsh.exe", "wrong_name": tmp_path / "other.exe", "no_locator": None}.get(case, locator)
+    assert check["checked"](lambda: check["verify_powershell"](tmp_path, recipe, build, locator)) == expected
+
+
+def test_preflight_cli_preserves_explicit_locator_precedence(tmp_path, monkeypatch):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    target = tmp_path / "target"
+    monkeypatch.setenv("TRADINGAGENTS_ORDINARY_FULL_PWSH", "relative.exe")
+    result = subprocess.run([sys.executable, "-I", "-S", "-B", str(CHECK), "--repo", str(repo),
+                             "--target", str(target), "--pwsh", str(tmp_path / "pwsh.exe")],
+                            capture_output=True, timeout=20)
+    assert result.returncode == 1 and not result.stderr
+    assert json.loads(result.stdout)["powershell"] == "pwsh_locator_invalid"
+    assert not target.exists() and list(repo.iterdir()) == []
