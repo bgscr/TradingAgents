@@ -1,5 +1,29 @@
 # Windows A 股研究：从干净检出开始
 
+## 个人研究与本机验收
+
+在 PowerShell 7 中打开项目根目录。记下 `git rev-parse HEAD`，在自己的 Python 3.13 虚拟环境安装本项目的公开依赖及 `pit`、`dev` extras。个人研究使用交易所日历、本股票的已收盘行情和用户自己的数据源、模型账户。个人入口和本机验收均无需项目签名或维护者批准。
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[pit,dev]"
+.\start_personal_research.ps1 -Ticker 600895.SH -CheckOnly
+.\start_personal_research.ps1 -Ticker 000001.SZ -CheckOnly
+.\.venv\Scripts\python.exe -m pytest -q tests/test_personal_full.py
+```
+
+预检不调用模型或供应商。它先按北京时间查最近已收盘的交易日，再核验该股票本日的收盘和缓存新鲜度。不同股票不能互用收盘记录。空缓存会返回 `market_cache_missing`。本版支持已有可验证本地资料的机器；刚安装依赖并填写密钥的空白机器，还缺少首次自动建立证券身份、交易所日历、日线和三表覆盖的流程。合成测试只在临时目录产生测试报告。
+
+温启动使用项目现有的 CURRENT 个人研究配置、可核验的身份与日历、Tushare 市场来源、账户限速及三个 Tushare 财报工具的有效缓存。在个人配置中将 `market_data_vendors.cn_a.core_stock_apis` 和 `tool_vendors` 里的 `get_balance_sheet`、`get_income_statement`、`get_cashflow` 设为 `tushare`。财报 HTTPS 地址与账户作用域必须和本机缓存的来源一致。将自己的 `TUSHARE_TOKEN` 和 `DEEPSEEK_API_KEY` 一起配在进程环境或项目根目录的私有 `.env`。通过项目支持的环境变量 `TRADINGAGENTS_LLM_PROVIDER`、`TRADINGAGENTS_QUICK_THINK_LLM`、`TRADINGAGENTS_DEEP_THINK_LLM` 明确选择 DeepSeek 和账户可用的模型。预检通过后，确认愿意付费时运行：
+
+```powershell
+.\start_personal_research.ps1 -Ticker 600895.SH -Run
+```
+
+该命令使用四个分析师、多空辩论、交易员与风险团队，沿用普通图的证据准入和决策规则。已配置的市场适配器可按现有协调策略补行情缺口。财报只读缓存，此路径的财报请求上限为零。公开网页抓取关闭，新闻或情绪缺证据时如实降级。模型通过固定 DeepSeek HTTPS 入口，禁用 SDK 重试。总尝试上限 60，分析预算最多 20 分钟，个人报告位于 `reports/personal/<run_id>/` 下回执给出的相对路径。证据不足可产生无评级结果。
+
+本机真实验收需在同一提交上完成一次本人明确启动的研究，核对交易日、实际终态、四类分析、辩论与风险章节、中文报告和用量。预检或合成测试成功只能证明其各自覆盖的步骤。对外分享提交号、终态、用量和缺项即可，报告正文、原始行情、路径及密钥留在本机。
+
 ## 开发与离线检查
 
 从本 fork 的 `main` 检出源码，在项目根目录使用 PowerShell 7。以下示例使用 Windows Python 3.13，安装步骤需要已准备好的依赖包或可访问的包源。
@@ -12,7 +36,7 @@ py -3.13 -m venv .venv
 
 这组选定的回归使用公开验收契约、跟踪的测试材料和 pytest 临时目录，无需账户密钥、旧缓存或历史 `.scratch`。隔离测试会验证历史路径受到写保护，空目录也必须拦截写入。默认 pytest 会排除标记为 `installed_release` 的本机审计。完成受审安装后，显式运行 `python -m pytest -m installed_release tests/test_bank_identity_diagnostic_entry.py tests/test_bounded_mainland_entry.py` 检查真实绑定；缺少必需输入时审计会失败。
 
-## 正式 Full
+## 旧受保护的验收与历史回放
 
 完成受审安装后，从 PowerShell 7 运行：
 
