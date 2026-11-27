@@ -1,4 +1,4 @@
-"""Optional Eastmoney order-class flow; fixed GET, auxiliary only, one run owner.
+"""Optional Eastmoney order-class flow from a verified retrospective cache.
 
 Amounts and prices are excluded pending independent unit verification. Ratios
 are not statement facts, Tushare all-order moneyflow, or investment-rule inputs.
@@ -239,6 +239,39 @@ class PowerShellFundflow:
                                      AcquisitionUnavailableReason.UPSTREAM_BUSY):
                 raise
             self.metadata['unavailable_reason'] = error.error_code or error.reason.value
+
+    def read_basic_cache(self, ticker, as_of, store_config, *, request_key, mode, pinned_digest):
+        from tradingagents.dataflows.acquisition import AcquisitionFailure, AcquisitionUnavailableReason
+        from tradingagents.retrospective_observations import retrospective_observation
+
+        if not self.after_report or self.identity_sha is None or _symbol(ticker) != self.symbol or as_of != self.end:
+            raise FundflowStop('fundflow_binding_required')
+        budget = budget_api.active_budget()
+        if budget is None:
+            raise FundflowStop('fundflow_binding_required')
+        self._check_collection(budget)
+        cached = None
+        if mode == 'retrospective':
+            try:
+                store_config.database_path.stat()
+            except FileNotFoundError:
+                pass
+            else:
+                cached = retrospective_observation(
+                    store_config, request_key=request_key, provider='akshare',
+                    operation='financial-fundamentals:stock_individual_fund_flow.powershell',
+                    as_of=_day(as_of),
+                    receipt_time=lambda value: self.cached_receipt_time(value, pinned_digest),
+                )
+        self._check_collection(budget)
+        if cached is None:
+            self.metadata = {'status': 'retrospective_cache_unavailable', 'attempted': False}
+            reason = ('fundflow_historical_availability_unverified' if mode == 'as_known_on_date'
+                      else 'fundflow_cache_unavailable')
+            raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NO_DATA, retryable=False, error_code=reason)
+        self.value = self._observation('available_partial', cached['projection'], cached['received_at'])
+        self.metadata = {'status': 'retrospective_cache_hit', 'attempted': False}
+        return self._tool_result()
 
     def acquire(self, ticker, as_of, *, physical_request):
         raise FundflowStop("fundflow_live_transport_unavailable")

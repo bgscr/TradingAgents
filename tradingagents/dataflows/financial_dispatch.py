@@ -8161,6 +8161,21 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
         raise AcquisitionFailure(
             reason=AcquisitionUnavailableReason.USAGE_NOT_ENTITLED
         )
+    if fundflow_owner is not None and fundflow_owner.after_report:
+        from tradingagents.market_history.config import provider_request_authority_config
+        from tradingagents.powershell_fundflow import FundflowStop
+
+        if material_arguments:
+            raise FundflowStop("fundflow_arguments_invalid")
+        operation = "stock_individual_fund_flow.powershell"
+        key = stable_acquisition_source_ref(
+            "financial-provider-physical-request", canonical_request_key, "1", operation,
+        )
+        return fundflow_owner.read_basic_cache(
+            canonical_symbol, current_date, provider_request_authority_config(history_config),
+            request_key=key, mode=config.get("bounded_observation_cache_mode"),
+            pinned_digest=config.get("bounded_fundflow_observation_sha256"),
+        )
     if fundflow_owner is not None and config.get("bounded_observation_cache_mode") == "as_known_on_date":
         raise AcquisitionFailure(reason=AcquisitionUnavailableReason.NO_DATA, retryable=False,
                                  error_code="fundflow_historical_availability_unverified")
@@ -8192,22 +8207,6 @@ def _invoke_dispatcher_owned_akshare_fundamentals(
                 str(physical_request_index),
                 operation,
             )
-            if (fundflow_owner is not None and config.get("bounded_observation_cache_mode") == "retrospective"
-                    and operation == "stock_individual_fund_flow.powershell"):
-                from tradingagents.retrospective_observations import retrospective_observation
-
-                cached = retrospective_observation(store.config,
-                    request_key=subrequest_key, provider="akshare",
-                    operation="financial-fundamentals:" + operation, as_of=date.fromisoformat(current_date),
-                    receipt_time=lambda result: fundflow_owner.cached_receipt_time(
-                        result, config.get("bounded_fundflow_observation_sha256")),
-                )
-                if cached is not None:
-                    fundflow_owner.metadata = {"status": "retrospective_cache_hit", "attempted": False}
-                    if "normalized_sha256" not in cached:
-                        return {**cached, "normalized_sha256": config["bounded_fundflow_observation_sha256"]}
-                    return cached
-
             def typed_physical_request() -> object:
                 value = _typed_mainland_physical_request(physical_request)
                 if value is None or getattr(value, "empty", False) is True:

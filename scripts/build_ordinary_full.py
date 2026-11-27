@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 RECIPE = Path(__file__).resolve().parents[1] / "config/ordinary-full-release-lock.json"
-RECIPE_SHA256 = "d638d8de0f7f425ca04d4c404e117095730a7e1f694752de299f0aa67c78a2ed"
+RECIPE_SHA256 = "28af7420b47467010d5da28e60389505f162211ad00c3ae8544a21c0d829d036"
 RECEIPT = "config/ordinary-full-package.json"
 
 

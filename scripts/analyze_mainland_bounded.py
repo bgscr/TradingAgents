@@ -689,6 +689,7 @@ class Session:
                             observation = fundflow.summary()['observation'] or {}
                             transport = fundflow.summary()['transport']
                             self._enhancement_status['fundflow'] = ('timeout' if transport.get('status') == 'timeout'
+                                else 'unavailable' if transport.get('status') == 'retrospective_cache_unavailable'
                                 else observation.get('status', 'not_collected'))
                         if collect_margin is not None:
                             self._enhancement_status['margin'] = 'interrupted'
@@ -1068,7 +1069,7 @@ def parse_arguments(argv=None):
                         help='One fixed no-profile PowerShell news GET per run; explicit ticker/date required; failure degrades without stdin/retry.')
     parser.add_argument('--powershell-news-executable', help=argparse.SUPPRESS)
     parser.add_argument('--powershell-fundflow', action='store_true',
-                        help='Use one bounded PowerShell GET instead of the AKShare individual fund-flow branch; no statements or rating change.')
+                        help='Read verified retrospective individual fund-flow ratios after Basic publication. A cache miss sends no request.')
     parser.add_argument('--powershell-fundflow-executable', help=argparse.SUPPRESS)
     parser.add_argument('--observation-cache-mode', choices=('retrospective', 'as_known_on_date', 'disabled'),
                         help='Cache policy for selected margin, PowerShell fundflow and news observations only.')
@@ -1481,8 +1482,8 @@ def main(clock=None, run_id=None):
         print('来源策略：逐条排除来源无效文章；全局/敏感校验失败仍整批拒绝；报告注明部分覆盖。'
               if args.news_source_isolation else '来源策略：严格模式，任一来源异常整批拒绝。')
     if args.powershell_fundflow:
-        print('个股资金流：显式 PowerShell 路径，仅替换原 AKShare 个股资金流请求，最多一次 GET，计入原共享预算及期限。'
-              '无自动重试、重定向或备用供应商；普通失败降级，权限/取消/预算/关闭失败停止。'
+        print('个股资金流：仅复用与本次证券、身份和日期匹配的合格回顾性缓存，零资金流外部调用。'
+              '缺少合格缓存时标记不可用，保留已发布的 Basic；不启动请求子进程，不重试。'
               '窗口为截至日及之前 7 个日历日。只采用已核实单位的净占比和涨跌幅（%）；金额和收盘价单位未核实，排除。'
               '不是财报指标，不与 Tushare 全单净额合并，不改变评级；事后回补不证明历史时点可得。')
     require(input('Start ONE new billable session with these limits? Type START: ') == 'START', 'not_confirmed')
