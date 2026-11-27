@@ -7,7 +7,6 @@ Only the supplied SQLite path is used; no transport, credentials or SDK is loade
 """
 
 import json
-import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing, contextmanager
@@ -15,6 +14,8 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+
+from tradingagents.dataflows.current_statement_diagnostics import StatementScopeIdentity
 
 DateRange = tuple[date, date]
 
@@ -29,29 +30,21 @@ class StatementCacheScope:
     transport_identity: str
     normalizer_version: str
 
+    def _identity(self) -> StatementScopeIdentity:
+        return StatementScopeIdentity(
+            account_scope=self.account_scope,
+            instrument_identity_revision=self.instrument_identity_revision,
+            endpoint_id=self.endpoint_id,
+            transport_identity=self.transport_identity,
+            normalizer_version=self.normalizer_version,
+        )
+
     def __post_init__(self) -> None:
-        for value in (
-            self.account_scope,
-            self.instrument_identity_revision,
-            self.endpoint_id,
-            self.transport_identity,
-            self.normalizer_version,
-        ):
-            if not isinstance(value, str) or not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value
-            ):
-                raise ValueError("cache scope requires bounded non-secret opaque identifiers")
+        self._identity().validate()
 
     @property
     def key(self) -> str:
-        identity = [
-            self.account_scope,
-            self.instrument_identity_revision,
-            self.endpoint_id,
-            self.transport_identity,
-            self.normalizer_version,
-        ]
-        return sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+        return self._identity().key
 
 
 @dataclass(frozen=True)

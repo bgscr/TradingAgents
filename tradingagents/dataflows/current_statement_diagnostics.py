@@ -13,6 +13,7 @@ import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, datetime
+from typing import NamedTuple
 
 CONTRACT = "current-statement-diagnostics-v1"
 _COLLECTOR = ContextVar("current_statement_diagnostics", default=None)
@@ -66,26 +67,40 @@ _ENDPOINTS = {
 }
 
 
+class StatementScopeIdentity(NamedTuple):
+    """Ordered v1 cache-key fields, shared by independent producers and verifiers."""
+
+    account_scope: str
+    instrument_identity_revision: str
+    endpoint_id: str
+    transport_identity: str
+    normalizer_version: str
+
+    def validate(self):
+        for value in self:
+            if not isinstance(value, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value
+            ):
+                raise ValueError("cache scope requires bounded non-secret opaque identifiers")
+
+    @property
+    def key(self):
+        return hashlib.sha256(json.dumps(self, separators=(",", ":")).encode()).hexdigest()
+
+
 def scopes_from_binding(binding):
-    values = [
-        binding["account"],
-        binding["instrument_identity_revision"],
-        None,
-        hashlib.sha256(binding["destination"].encode()).hexdigest(),
-        binding["normalizer_version"],
-    ]
+    account = binding["account"]
+    revision = binding["instrument_identity_revision"]
+    transport = hashlib.sha256(binding["destination"].encode()).hexdigest()
+    normalizer = binding["normalizer_version"]
     result = {}
     for tool, endpoint in _ENDPOINTS.items():
-        values[2] = endpoint
-        if any(
-            not isinstance(value, str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", value)
-            for value in values
-        ):
-            raise ValueError("cache scope requires bounded non-secret opaque identifiers")
-        result[tool] = hashlib.sha256(
-            json.dumps(values, separators=(",", ":")).encode()
-        ).hexdigest()
+        identity = StatementScopeIdentity(
+            account_scope=account, instrument_identity_revision=revision, endpoint_id=endpoint,
+            transport_identity=transport, normalizer_version=normalizer,
+        )
+        identity.validate()
+        result[tool] = identity.key
     return result
 
 
