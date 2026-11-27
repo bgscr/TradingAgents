@@ -525,10 +525,42 @@ except BaseException:
         assert proc.stdout, (proc.returncode, proc.stderr[-300:])
         return proc.returncode, json.loads(proc.stdout)
 
-    code, check = launch("-CheckOnly")
+    for flag, options, expected in [
+        ("-Run", ["-TusharePoints", "2000"], "below_minimum"),
+        ("-CheckOnly", [], "undeclared"),
+    ]:
+        code, blocked = launch(flag, "-FetchEastmoneyRatio", *options)
+        assert code == 2 and blocked["error"] == "moneyflow_dc_points_requirement"
+        assert blocked["moneyflow_dc_access"] == {
+            "endpoint": "moneyflow_dc",
+            "minimum_points": 5000,
+            "points_status": expected,
+            "entitlement_checked": False,
+        }
+        assert (
+            blocked["admitted_attempts"]
+            == blocked["financial_attempts"]
+            == blocked["model_attempts"]
+            == 0
+        )
+        assert (
+            not blocked["report_written"]
+            and not (project / "reports").exists()
+            and not trace.exists()
+        )
+    code, check = launch("-CheckOnly", "-TusharePoints", "2000")
+    assert (
+        check["moneyflow_dc_access"]["points_status"] == "below_minimum"
+        and check["ratio_policy"] == "cache_only"
+    )
     assert code == 2 and check["cache_issue"] == "market_cache_missing"
     assert not (project / "reports").exists() and not trace.exists()
-    code, receipt = launch("-Run")
+    # Low-points research still exercises the normal graph. Keep the no-option path on Shenzhen.
+    options = ("-TusharePoints", "2000") if ticker.endswith(".SH") else ()
+    code, receipt = launch("-Run", *options)
+    assert receipt["moneyflow_dc_access"]["points_status"] == (
+        "below_minimum" if options else "undeclared"
+    )
     assert code in {0, 3} and receipt["status"] == "completed" and receipt["report_written"], (
         receipt
     )
@@ -588,7 +620,8 @@ except BaseException:
     assert set(basic["enhancements"].values()) == {"not_selected"}
     assert trace.read_text().splitlines() == counts
     env["PERSONAL_FIXTURE_NEXT_MORNING"] = "1"
-    code, next_day = launch("-Run", "-FetchEastmoneyRatio")
+    code, next_day = launch("-Run", "-FetchEastmoneyRatio", "-TusharePoints", "5000")
+    assert next_day["moneyflow_dc_access"]["entitlement_checked"] is False
     assert code in (0, 3) and next_day["report_written"], next_day
     assert next_day["exchange_session"] == "2024-02-29"
     assert next_day["financial_attempts"] == 2

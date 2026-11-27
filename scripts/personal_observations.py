@@ -13,6 +13,20 @@ SOURCES = ("news", "margin_balance", "eastmoney_fundflow_ratio")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+MONEYFLOW_DC_MINIMUM_POINTS = 5000  # Tushare API document 349.
+
+
+def dc_account_access(meets_minimum):
+    """Describe a local declaration without querying the account or granting access."""
+    status = {True: "declared_at_or_above_minimum", False: "below_minimum", None: "undeclared"}
+    return {
+        "endpoint": "moneyflow_dc",
+        "minimum_points": MONEYFLOW_DC_MINIMUM_POINTS,
+        "points_status": status[meets_minimum],
+        "entitlement_checked": False,
+    }
+
+
 def scope(config):
     selected = config.get("personal_sources", SOURCES)
     return {
@@ -20,6 +34,7 @@ def scope(config):
         "full_data_acceptance": "unverified",
         "news_evidence_scope": "publication_index_only",
         "news_content_verified": False,
+        "moneyflow_dc_access": dc_account_access(config.get("personal_dc_meets_minimum")),
         "ratio_policy": "cache_or_one_account_query"
         if config.get("personal_fetch_dc_ratio") is True
         else "cache_only",

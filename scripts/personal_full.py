@@ -234,11 +234,41 @@ def main(argv=None):
     parser.add_argument("--skip-margin", action="store_true")
     parser.add_argument("--skip-ratio", action="store_true")
     parser.add_argument("--fetch-eastmoney-ratio", action="store_true")
+    parser.add_argument(
+        "--tushare-points",
+        type=int,
+        help="Locally declared account points for the optional moneyflow_dc lookup",
+    )
     args = parser.parse_args(argv)
     if args.fetch_eastmoney_ratio and (args.basic or args.skip_ratio or args.prepared_data):
         parser.error("--fetch-eastmoney-ratio requires personal Full with the ratio selected")
-    from scripts import personal_graph
+    from scripts import personal_graph, personal_observations
     from scripts.project_credentials import ProjectCredentialError, credential_failure_code
+
+    if args.tushare_points is not None and args.tushare_points < 0:
+        parser.error("--tushare-points must be nonnegative")
+    meets_minimum = (
+        None
+        if args.tushare_points is None
+        else args.tushare_points >= personal_observations.MONEYFLOW_DC_MINIMUM_POINTS
+    )
+    if args.fetch_eastmoney_ratio and meets_minimum is not True:
+        print(
+            json.dumps(
+                {
+                    "status": "not_started",
+                    "error": "moneyflow_dc_points_requirement",
+                    "moneyflow_dc_access": personal_observations.dc_account_access(meets_minimum),
+                    "preflight_ready": False,
+                    "report_written": False,
+                    "rating_status": "not_run",
+                    "admitted_attempts": 0,
+                    "financial_attempts": 0,
+                    "model_attempts": 0,
+                }
+            )
+        )
+        return 2
 
     try:
         local_path(ROOT / "tradingagents.local.json")
@@ -251,6 +281,7 @@ def main(argv=None):
         )
         config["personal_mode"] = "basic" if args.basic else "full"
         config["personal_fetch_dc_ratio"] = args.fetch_eastmoney_ratio
+        config["personal_dc_meets_minimum"] = meets_minimum
         enabled = (
             ("news", args.skip_news),
             ("margin_balance", args.skip_margin),

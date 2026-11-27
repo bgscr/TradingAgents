@@ -15,6 +15,33 @@ from tradingagents.market_history.coordinator import PhysicalAttemptFailure
 from tradingagents.market_history.store import MarketHistoryStore
 
 
+@pytest.mark.parametrize(
+    "score,expected", [(None, "undeclared"), (0, "below_minimum"), (4999, "below_minimum")]
+)
+def test_ineligible_explicit_fetch_stops_before_credentials_or_run(
+    score, expected, monkeypatch, capsys
+):
+    from scripts import personal_full
+
+    def forbidden():
+        pytest.fail("eligibility must stop before credential resolution")
+
+    monkeypatch.setattr(personal_full, "credentials", forbidden)
+    argv = ["--ticker", "600895.SH", "--run", "--fetch-eastmoney-ratio"]
+    if score is not None:
+        argv.extend(["--tushare-points", str(score)])
+    assert personal_full.main(argv) == 2
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "not_started" and receipt["rating_status"] == "not_run"
+    assert receipt["moneyflow_dc_access"]["points_status"] == expected
+    assert (
+        receipt["admitted_attempts"]
+        == receipt["financial_attempts"]
+        == receipt["model_attempts"]
+        == 0
+    )
+
+
 def wire(rows, *, fields=None, code=0):
     return json.dumps(
         {"code": code, "data": {"fields": fields or ratio.FIELDS.split(","), "items": rows}}

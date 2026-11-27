@@ -7,6 +7,7 @@ param(
     [switch] $SkipMargin,
     [switch] $SkipRatio,
     [switch] $FetchEastmoneyRatio,
+    [ValidateRange(0, 2147483647)] [int] $TusharePoints,
     [Parameter(ParameterSetName = 'Check')] [switch] $CheckOnly,
     [Parameter(Mandatory, ParameterSetName = 'Research')] [switch] $Run
 )
@@ -52,6 +53,9 @@ if ($SkipNews) { $selection += '--skip-news' }
 if ($SkipMargin) { $selection += '--skip-margin' }
 if ($SkipRatio) { $selection += '--skip-ratio' }
 if ($FetchEastmoneyRatio) { $selection += '--fetch-eastmoney-ratio' }
+if ($PSBoundParameters.ContainsKey('TusharePoints')) {
+    $selection += @('--tushare-points', $TusharePoints.ToString([Globalization.CultureInfo]::InvariantCulture))
+}
 if (-not $Run) {
     & $python -I -B $entry --ticker $Ticker $mode @selection
     exit $LASTEXITCODE

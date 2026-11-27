@@ -30,14 +30,24 @@ py -3.13 -m venv .venv
 
 ### 首次取得东财占比
 
-须先满足项目已有的东方财富来源许可（若配置了数据商白名单，须包含 `akshare`）。北京时间已过所选交易日、Tushare 已发布该日数据且本人账户具备该接口权限时，可在**原本要做的那一次 Full** 中选择占比查询。个人账户初次使用可直接运行下列命令，无需旧机文件。若同次三张财报均需补取，财务额度已经用完，融资与占比会报告缺项。后续本来就要进行的研究可复用同账户、同证券且在有效期内的三表，从而留出额度；请先查已有回执，不为补数字重跑整图。
+**2000 分账户**可先运行下方预检。普通 Full 保留占比缓存读取；干净安装没有合格历史行时会报告缺项。三表与融资余额的公布门槛为 2000 分，同次三个财务名额若都用于三表，融资也须留缺。同账户的新鲜合格缓存可减少所需请求。是否已有目标日数据、账户实际授权和额度，都不能由积分声明证明。[三表积分说明](https://tushare.pro/document/1?doc_id=108) · [融资余额的更新及权限](https://tushare.pro/document/2?doc_id=59)
 
 ```powershell
-.\start_personal_research.ps1 -Ticker 601328.SH -CheckOnly -FetchEastmoneyRatio
-.\start_personal_research.ps1 -Ticker 601328.SH -Run -FetchEastmoneyRatio
+.\start_personal_research.ps1 -Ticker 601328.SH -CheckOnly -TusharePoints 2000
+```
+
+**具备东财接口权限的账户**可在原本计划的 Full 中显式选择补查。须如实声明自己的当前积分，满足 5000 分门槛、项目已有的东方财富来源许可（若配置了数据商白名单，须包含 `akshare`）、回溯窗口和共同预算。低于门槛或未声明时，显式补查会在读取凭据、补行情或启动模型之前以退出码 2 结束。预检只报告已知门槛，不向供应商探测权限。以下以恰好 5000 分为例。
+
+```powershell
+.\start_personal_research.ps1 -Ticker 601328.SH -CheckOnly -FetchEastmoneyRatio -TusharePoints 5000
+.\start_personal_research.ps1 -Ticker 601328.SH -Run -FetchEastmoneyRatio -TusharePoints 5000
 ```
 
 数据日期来自供应商行的交易日。新路径通过 Tushare 获取东方财富的盘后日数据，可回查已公布的会话。实时排行截面、请求发生日期或其他资金流指标均不用于代填。回执的 `source=eastmoney.via_tushare.moneyflow_dc` 标明这一来源。该接口的公开文档列明权限条件，实际可用性取决于本人账户。[指标、更新时点与权限说明](https://tushare.pro/document/2?doc_id=349)
+
+东方财富网站提供带日期的个股历史资金流向表，可供人工核对。项目现有直连接口使用含金额和价格的宽字段，生产采集器已关闭；个人入口没有能独立认证手填数值、网页截图或 CSV 来源的导入器。2000 分可用的 Tushare `moneyflow` 是另一个指标。以上材料均不能给个人回执补出已验证的东财占比。[东方财富个股历史表（交通银行示例）](https://data.eastmoney.com/zjlx/601328.html)
+
+新闻索引只支持链接和标注时间。若有合法取得的交易所或巨潮公司公告 PDF，可按现有独立入口核对代码、日期、页码和文本摘要，作为本地补充。来源 URL 属于用户声明，未通过在线认证；公告和网页正文均不进入普通新闻评级。[单份本地公司公告说明](local-company-announcement.md)
 
 ### 如何读个人研究回执
 
