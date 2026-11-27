@@ -106,9 +106,15 @@ def verify_release(manifest, *, source=SOURCE, python_root=None):
         require(key not in seen, 'duplicate_bound_path')
         seen.add(key)
         path = roots[item['root']] / relative
-        regular_path(path)
-        require(hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256'],
-                'bound_source_changed')
+        try:
+            regular_path(path)
+            require(hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256'],
+                    'bound_source_changed')
+        except Stop as error:
+            if str(error) in {'missing_bound_file', 'bound_source_changed'}:
+                error.diagnostic = ('bound_runtime_mismatch' if item['root'] in {'python', 'stdlib'}
+                                    else 'bound_project_mismatch')
+            raise
 
 
 class SharedSessionClock:
@@ -1360,7 +1366,12 @@ def research_policy(manifest):
 
 def main(clock=None, run_id=None):
     require(sys.flags.isolated and sys.dont_write_bytecode, 'python_flags')
-    manifest = read_json(SOURCE / 'config/bounded_mainland_release.json')
+    try:
+        manifest = read_json(SOURCE / 'config/bounded_mainland_release.json')
+    except Stop as error:
+        if str(error) == 'missing_bound_file':
+            error.diagnostic = 'reviewed_install_manifest_missing'
+        raise
     verify_release(manifest)
     require(Path(sys.executable).resolve() == SOURCE / '.venv/Scripts/python.exe', 'python_identity')
     if '--auto-latest' in sys.argv[1:]:
@@ -1763,8 +1774,18 @@ def cli_exit(clock=None, run_id=None):
         hint = selection_error_hint(error)
         if hint is not None:
             print(hint, file=sys.stderr)
-        print(json.dumps({'status': 'stopped', 'exception_type': type(error).__name__,
-                          'reason': str(error) if type(error) is Stop else 'entry_error'}))
+        reason = str(error) if type(error) is Stop else 'entry_error'
+        details = {'status': 'stopped', 'exception_type': type(error).__name__, 'reason': reason}
+        diagnostic = getattr(error, 'diagnostic', None) if type(error) is Stop else None
+        if diagnostic in {'reviewed_install_manifest_missing', 'bound_runtime_mismatch', 'bound_project_mismatch'}:
+            details['diagnostic'] = diagnostic
+        elif reason in {'installation_root_mismatch', 'python_identity'}:
+            details['diagnostic'] = 'installation_identity_mismatch'
+        elif reason in {'local_market_store_unavailable', 'calendar_coverage_missing', 'security_close_missing',
+                        'no_completed_session', 'verified_close_time_missing', 'calendar_not_observed',
+                        'prepared SSE calendar range incomplete', 'prepared SZSE calendar range incomplete'}:
+            details['diagnostic'] = 'local_market_evidence_missing'
+        print(json.dumps(details))
         return 1
 
 

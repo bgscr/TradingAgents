@@ -255,6 +255,16 @@ def _read_calendar_evidence(run, record, mode):
             raise ValueError("calendar_owner_mismatch")
     return calendar_evidence
 
+def verify_market_store_paths(db, marker, entry):
+    try:
+        entry["regular_path"](db)
+    except entry["Stop"] as error:
+        if str(error) == "missing_bound_file":
+            raise ValueError("local_market_store_unavailable") from None
+        raise
+    entry["regular_path"](marker)
+
+
 def main():
     from tradingagents.market_history.store import MarketHistoryStore
     from tradingagents.market_history.config import MarketHistoryConfig, MarketHistoryMode, DataUsageMode
@@ -293,8 +303,7 @@ def main():
     elif len(sys.argv)!=4:raise ValueError("invalid_run")
     db=base/"market_history.sqlite3"
     marker = base / "payloads/.market-history-database-owner"
-    for path in (db, marker):
-        entry["regular_path"](path)
+    verify_market_store_paths(db, marker, entry)
     if marker.read_bytes() != os.path.normcase(str(db)).encode() + b"\n":
         raise ValueError("calendar_store_owner_mismatch")
     con = sqlite3.connect(db.as_uri()+"?mode=ro", uri=True)
@@ -320,7 +329,7 @@ if __name__ == "__main__":
         print(json.dumps(dict(error="same_day_close_required",need=error.args[0])))
         sys.exit(2)
     except Exception as error:
-        known = {"latest_calendar_expired","daily_window_not_open","auction_rule_inapplicable","special_session","known_security_suspension","security_close_missing", "wrong_security", "calendar_coverage_missing", "calendar_not_observed",
+        known = {"local_market_store_unavailable", "latest_calendar_expired","daily_window_not_open","auction_rule_inapplicable","special_session","known_security_suspension","security_close_missing", "wrong_security", "calendar_coverage_missing", "calendar_not_observed",
                  "prepared SSE calendar range incomplete","prepared SZSE calendar range incomplete", "no_completed_session", "verified_close_time_missing",
                  "reviewed_input_missing", "calendar_membership_conflict", "calendar_store_owner_mismatch", "future_date"}
         print(json.dumps({"error": str(error) if str(error) in known else "calendar_evidence_unverified"}))

@@ -41,3 +41,18 @@ py -3.13 -I -S -B scripts/check_ordinary_full_inputs.py --repo . --target ..\Tra
 正式暂存使用 `scripts/build_ordinary_full.py --repo <来源检出> --target <准备好的独立目录>`，同样使用 `-I -S -B`，暂存后加 `--verify` 复核。它生成 `config/ordinary-full-package.json` 候选回执；公开主线没有生成首份可信来源清单或批准正式目标清单的命令。应从维护者的受审发行流程取得适用于目标的安装，再配置该机器的授权来源与账户策略。`scripts/build_windows_release.ps1` 生成另一种通用便携分发包，不能用于签发此 Full 安装。
 
 如原安装已经更新，维护者可以对预检、暂存和 `--verify` 使用同一个 `--source-manifest-backup RELATIVE_PREIMAGE`。参数应指向来源检出内 `.scratch` 事务目录的编号前像（文件名为数字加 `.before`），目标目录必须独立。三个步骤始终使用同一受审配方；备份须逐字节匹配配方指定的来源清单，且绑定同一来源根。三份日期证据仍从原来源检出的固定位置验证。省略此参数会读取原有默认清单。该选项用于维护者暂存和复核，不发布目标清单，也不授予正式运行权限。
+
+### 在另一台 Windows 上核对首装
+
+维护者须为目标电脑审定运行时、部署根目录和正式安装清单。开发检出、候选包回执及另一台电脑的正式清单都不能签发这台电脑的安装。每台机器独立配置账户准入、限流和市场证据。请勿把来源电脑的凭据、缓存、协调库或私有回执随源码分发。
+
+从目标目录用 PowerShell 7 执行 `.\start_tradingagents.ps1 -Full -Ticker 600895.SH -CheckOnly`。保留退出码和脱敏 JSON。缺少项目 Python 时先完成受审运行时准备；Python 入口已启动后，以下诊断定位下一步：
+
+| `diagnostic` | 处理 |
+| --- | --- |
+| `reviewed_install_manifest_missing` | 缺正式安装清单，请维护者完成目标机器发行审核。 |
+| `bound_runtime_mismatch` 或 `installation_identity_mismatch` | 核对受审解释器、标准库和实际安装根。不接受本机自行改写摘要。 |
+| `bound_project_mismatch` | 核对或恢复该发行的项目文件。 |
+| `local_market_evidence_missing` | 根据 `reason` 区分缺行情库、交易所日历或该股票收盘证据，使用本机现有受控初始化与采集流程。 |
+
+未知响应、来源不符或所有权校验失败仍按原错误阻止。跨机验收须在独立 Windows 主机重复检查，记录实际发行版本、宿主、退出码和诊断；离线预检不证明真实数据与模型可用。

@@ -9,7 +9,7 @@
   "sources": {
     "start_tradingagents.ps1": "559ed473bab6d645e60b7624801a6e4ace8cb1095c1b0d66b7da1101111963ae",
     "cli/main.py": "9190883bf7da30f36c037b2d9ffd3d4512e28816f19765b54501650044dff0a7",
-    "scripts/analyze_mainland_bounded.py": "28f43aa73268631bfd1a5f5ccc4b24883c495cdf6fb75264045676a379890c5d",
+    "scripts/analyze_mainland_bounded.py": "13c5c2012bb8a669a52aabab383de20db6735604f0055793a140ee0a0c85b3dc",
     "scripts/full_latest_intake.py": "e44852edefe43d83d50cba5554c4e399e72541a9522331a8ae5e23d50033f846",
     "scripts/research_launch.py": "743dfe8dcaa62684e3d2fb888f83862ae5d5d05fac7d3fa5d132ce750786bb03",
     "scripts/Start-MainlandAnalysis.ps1": "21c7d7bf2a1f908f5824c9c6ccfe601fadb514c38d264d4774d1570d393920ad",
