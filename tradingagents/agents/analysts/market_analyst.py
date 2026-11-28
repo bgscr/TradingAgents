@@ -1,3 +1,4 @@
+from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from tradingagents.agents.analysts.submission import (
@@ -5,9 +6,11 @@ from tradingagents.agents.analysts.submission import (
     MARKET_EVIDENCE_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
+    finalize_analyst_submission,
     personal_full_tool_prompt,
     process_analyst_response,
     render_allowed_source_ref_catalog,
+    uses_personal_deepseek_analyst_policy,
 )
 from tradingagents.agents.utils.agent_utils import (
     get_indicators,
@@ -24,6 +27,19 @@ def create_market_analyst(llm):
 
     def market_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
+        messages = state["messages"]
+        acquisition_only = uses_personal_deepseek_analyst_policy(llm)
+        if acquisition_only and any(
+            isinstance(message, ToolMessage) and message.name == "get_verified_market_snapshot"
+            for message in messages
+        ):
+            result = finalize_analyst_submission(
+                finalizer=bind_analyst_finalizer(llm, "market", personal_market=True),
+                analyst="market", ticker=ticker, trade_date=current_date, messages=messages,
+                personal_market=True,
+            )
+            return build_analyst_update(state, result, "market_report")
         instrument_context = get_instrument_context_from_state(state)
 
         data_tools = [
@@ -31,7 +47,7 @@ def create_market_analyst(llm):
             get_indicators,
             get_verified_market_snapshot,
         ]
-        tools = [*data_tools, AnalystEvidenceReport]
+        tools = data_tools if acquisition_only else [*data_tools, AnalystEvidenceReport]
 
         system_message = personal_full_tool_prompt(
             "market",
@@ -83,9 +99,17 @@ When the analysis is complete, submit it through AnalystEvidenceReport. Put the 
             + ANALYST_OUTPUT_GUIDANCE + " " + MARKET_EVIDENCE_GUIDANCE + " "
             + get_language_instruction()
         )
+        if acquisition_only:
+            system_message = (
+                f"Collect market evidence for {ticker} on {current_date}. Call get_stock_data first. "
+                "If needed, request technical indicators with get_indicators before calling "
+                "get_verified_market_snapshot for the ticker and analysis date. The snapshot is the "
+                "last tool call. Return only data tool calls. The finalizer will select verified rows "
+                "and write the market report."
+            )
         system_message += "\n\n" + render_allowed_source_ref_catalog(
-            state["messages"],
-            state["company_of_interest"],
+            messages,
+            ticker,
             current_date,
         )
         # The report exporter renders the verified multi-year appendix from bound evidence.
@@ -115,7 +139,7 @@ When the analysis is complete, submit it through AnalystEvidenceReport. Put the 
         prompt = prompt.partial(
             tool_names=", ".join(
                 [tool.name for tool in data_tools]
-                + [AnalystEvidenceReport.__name__]
+                + ([] if acquisition_only else [AnalystEvidenceReport.__name__])
             )
         )
         prompt = prompt.partial(current_date=current_date)
@@ -123,14 +147,15 @@ When the analysis is complete, submit it through AnalystEvidenceReport. Put the 
 
         chain = prompt | llm.bind_tools(tools)
 
-        response = chain.invoke(state["messages"])
+        response = chain.invoke(messages)
         result = process_analyst_response(
             response,
             finalizer=finalizer,
             analyst="market",
-            ticker=state["company_of_interest"],
+            ticker=ticker,
             trade_date=current_date,
-            messages=state["messages"],
+            messages=messages,
+            acquisition_only=acquisition_only,
         )
         return build_analyst_update(state, result, "market_report")
 

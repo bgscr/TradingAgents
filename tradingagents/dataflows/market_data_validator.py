@@ -64,6 +64,30 @@ def _fmt(value) -> str:
     return str(value)
 
 
+def verified_snapshot_values(
+    df: pd.DataFrame, indicators: Iterable[str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Format prices and indicator readings from an already validated frame."""
+    latest = df.iloc[-1]
+    ohlcv = {field: _fmt(latest.get(field)) for field in ("Open", "High", "Low", "Close", "Volume")}
+    readings = {}
+    stock_df = wrap(df.copy())
+    for name in indicators:
+        minimum_history = _minimum_history_for_indicator(name)
+        if len(df) < minimum_history:
+            readings[name] = (
+                "N/A: insufficient history "
+                f"({len(df)} rows available; {minimum_history} required)"
+            )
+            continue
+        try:
+            stock_df[name]  # triggers stockstats calculation
+            readings[name] = _fmt(stock_df.iloc[-1][name])
+        except Exception as exc:  # noqa: BLE001 — one bad indicator shouldn't sink the snapshot
+            readings[name] = f"N/A ({type(exc).__name__})"
+    return ohlcv, readings
+
+
 def build_verified_market_snapshot(
     symbol: str,
     curr_date: str,
@@ -85,23 +109,8 @@ def build_verified_market_snapshot(
         df = authoritative.frame.copy()
     else:
         df = _verified_rows(symbol, curr_date)
-    stock_df = wrap(df.copy())
-
     selected = tuple(indicators or DEFAULT_SNAPSHOT_INDICATORS)
-    indicator_values: dict[str, str] = {}
-    for name in selected:
-        minimum_history = _minimum_history_for_indicator(name)
-        if len(df) < minimum_history:
-            indicator_values[name] = (
-                "N/A: insufficient history "
-                f"({len(df)} rows available; {minimum_history} required)"
-            )
-            continue
-        try:
-            stock_df[name]  # triggers stockstats calculation
-            indicator_values[name] = _fmt(stock_df.iloc[-1][name])
-        except Exception as exc:  # noqa: BLE001 — one bad indicator shouldn't sink the snapshot
-            indicator_values[name] = f"N/A ({type(exc).__name__})"
+    ohlcv, indicator_values = verified_snapshot_values(df, selected)
 
     latest = df.iloc[-1]
     latest_date = _fmt(latest["Date"])
@@ -135,8 +144,8 @@ def build_verified_market_snapshot(
             "|---|---:|",
         ]
     )
-    for field in ("Open", "High", "Low", "Close", "Volume"):
-        lines.append(f"| {field} | {_fmt(latest.get(field))} |")
+    for field, value in ohlcv.items():
+        lines.append(f"| {field} | {value} |")
 
     lines += ["", "### Verified technical indicators (latest row)", "",
               "| Indicator | Value |", "|---|---:|"]

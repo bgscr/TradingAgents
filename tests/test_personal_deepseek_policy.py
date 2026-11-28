@@ -35,6 +35,17 @@ FINANCIAL_LIMITATION = "现金流资料缺失，无法形成现金流主张。"
 STATEMENT_TOOLS = {"get_balance_sheet", "get_income_statement", "get_cashflow"}
 ANALYSTS = {"market", "sentiment", "news", "fundamentals"}
 DAY = "2024-02-29"
+MARKET_EXTRA_FIELDS = {
+    "market_wrong_value": {"statement": "fixture unsupported price 98765"},
+    "market_wrong_date": {"effective_date": "2024-02-28"},
+    "market_wrong_basis": {"adjustment_basis": "raw"},
+    "market_wrong_window": {"window": 10},
+}
+MARKET_SOURCE_MISMATCHES = {
+    "market_wrong_snapshot": ("- Adjustment basis: qfq", "- Adjustment basis: raw"),
+    "market_wrong_snapshot_date": (f"- Latest trading row used: {DAY}", "- Latest trading row used: 2024-02-28"),
+    "market_wrong_source_value": ("| Close | 12.00 |", "| Close | 98765.00 |"),
+}
 
 
 def _statement_claims(prompt):
@@ -101,6 +112,15 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         return response
 
     monkeypatch.setattr(personal_bootstrap, "post", statement_post)
+    if scenario in MARKET_SOURCE_MISMATCHES:
+        from tradingagents.agents.utils import market_data_validation_tools
+
+        render = market_data_validation_tools.build_verified_market_snapshot
+        monkeypatch.setattr(
+            market_data_validation_tools,
+            "build_verified_market_snapshot",
+            lambda *args: render(*args).replace(*MARKET_SOURCE_MISMATCHES[scenario]),
+        )
     if scenario == "fundamentals_metadata":
         from tradingagents.dataflows import current_tushare_statements
 
@@ -142,6 +162,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         phase = "debate_or_risk"
         completion_tokens = 12
         verified_statement_prompt = None
+        verified_market_prompt = None
         statement_output_chars = None
 
         def tool(name, args):
@@ -158,12 +179,24 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
 
         if "get_verified_market_snapshot" in names:
             analyst, phase = "market", "tools"
-            if not tool_result:
+            if scenario == "length_tools":
+                finish, message["content"] = "length", PARTIAL
+            elif not tool_result and scoped and scenario == "fundamentals_metadata":
+                finish = tool("get_stock_data", {
+                    "symbol": "600895.SS", "start_date": "2023-11-30", "end_date": DAY,
+                })
+            elif scoped and scenario == "fundamentals_metadata" and not any(
+                msg["role"] == "tool" and "## close_50_sma values" in (msg.get("content") or "")
+                for msg in body["messages"]
+            ):
+                finish = tool("get_indicators", {
+                    "symbol": "600895.SS", "indicator": "close_50_sma", "curr_date": DAY,
+                    "look_back_days": 20,
+                })
+            elif not tool_result or scoped:
                 finish = tool(
                     "get_verified_market_snapshot", {"symbol": "600895.SS", "curr_date": DAY}
                 )
-            elif scenario == "length_tools":
-                finish, message["content"] = "length", PARTIAL
         elif "get_news" in names:
             analyst, phase = "news", "tools"
             if scenario == "unavailable_news":
@@ -203,6 +236,35 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                     "material_claims": [],
                     "evidence_notes": [],
                 }
+                if analyst == "market" and scoped:
+                    _, _, raw_schema = prompt.rpartition("\nJSON Schema:\n")
+                    schema = json.loads(raw_schema) if raw_schema else {}
+                    definitions = schema.get("$defs", {})
+                    citation = definitions.get("_PersonalMarketCitation", {})
+                    verified_market_prompt = {
+                        "closed_citation": citation.get("additionalProperties") is False
+                        and set(citation.get("properties", {})) == {"evidence_id"},
+                        "market_rows": all(text in prompt for text in (
+                            f"M01 | Close on {DAY}: 12.00 CNY (qfq)",
+                            f"M07 | 50-day SMA on {DAY}: 12.00",
+                            "Exact quote: | close_50_sma | 12.00 |",
+                        )),
+                        "no_unbound_bollinger": "Exact quote: | boll |" not in prompt,
+                        "advisory_context": scenario != "fundamentals_metadata" or all(
+                            text in prompt for text in (
+                                "Collected market context for commentary and evidence notes only.",
+                                "from 2023-11-30 to 2024-02-29",
+                                "## close_50_sma values",
+                            )
+                        ),
+                    }
+                    content["material_claims"] = [
+                        {"evidence_id": "M01"}, {"evidence_id": "M07"}
+                    ]
+                    if scenario in MARKET_EXTRA_FIELDS:
+                        content["material_claims"][0].update(MARKET_EXTRA_FIELDS[scenario])
+                    if scenario == "market_unbound_indicator":
+                        content["material_claims"][0]["evidence_id"] = "M99"
                 if analyst == "news" and scenario == "incomplete":
                     content = {
                         "material_claims": [
@@ -356,6 +418,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             "tool_result": tool_result,
             "has_report_tool": "AnalystEvidenceReport" in names,
             "verified_statement_prompt": verified_statement_prompt,
+            "verified_market_prompt": verified_market_prompt,
             "statement_output_chars": statement_output_chars,
             "replayed_reasoning": any("reasoning_content" in msg for msg in body["messages"]),
             "sdk_retry": request.headers.get("x-stainless-retry-count"),
@@ -413,7 +476,8 @@ def assert_wire_policy(requests, *, full, quick, effort, limit):
             assert not request["has_thinking"] and request["reasoning_effort"] == effort
             assert request["has_reasoning_effort"] is (effort is not None)
     market_followups = [r for r in analysts if r["analyst"] == "market" and r["tool_result"]]
-    assert len(market_followups) == 1 and market_followups[0]["replayed_reasoning"] is (not full)
+    if not full:
+        assert len(market_followups) == 1 and market_followups[0]["replayed_reasoning"]
 
 
 def assert_unavailable_news_outcome(receipt, run_dir, attempts):
@@ -440,7 +504,7 @@ def assert_unavailable_news_outcome(receipt, run_dir, attempts):
     assert {row["capability"] for row in outcomes} == capabilities
     assert all(row["outcome"] == "unavailable" and not row.get("artifact_ref") for row in outcomes)
     unavailable_ids = {row["source_id"] for row in outcomes}
-    assert not evidence["material_claims"]
+    assert all(claim["analyst"] != "news" for claim in evidence["material_claims"])
     assert all(fact["source_id"] not in unavailable_ids for fact in evidence["source_facts"])
     assert audit["admission_gate"]["admitted"] is True
     assert audit["admission_gate"]["readiness"] == "degraded"
@@ -588,6 +652,10 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
         ("fundamentals_false_value", True, "deepseek-v4-flash", None, 4096),
         ("fundamentals_large_report", True, "deepseek-v4-flash", None, 4096),
         ("fundamentals_excess_claims", True, "deepseek-v4-flash", None, 4096),
+        *(
+            (scenario, True, "deepseek-v4-flash", None, 4096)
+            for scenario in (*MARKET_EXTRA_FIELDS, "market_unbound_indicator", *MARKET_SOURCE_MISMATCHES)
+        ),
     ],
 )
 def test_personal_entry_deepseek_wire(
@@ -629,13 +697,17 @@ def test_personal_entry_deepseek_wire(
     assert receipt["financial_attempts"] == 3
     assert_wire_policy(requests, full=full, quick=quick, effort=effort, limit=limit)
     order = Counter((row["analyst"], row["phase"]) for row in requests)
-    assert order["market", "tools"] == 2
+    assert order["market", "tools"] == (3 if scenario == "fundamentals_metadata" else 2 if not full else 1)
     assert order["news", "finalizer"] == {
         "unavailable_news": 0,
         "incomplete": 2,
         "news_constraint": 2,
     }.get(scenario, 1)
-    assert order["market", "finalizer"] == (0 if scenario == "length_tools" else 1)
+    assert order["market", "finalizer"] == (
+        0 if scenario in {"length_tools", *MARKET_SOURCE_MISMATCHES}
+        else 2 if scenario in {*MARKET_EXTRA_FIELDS, "market_unbound_indicator"}
+        else 1
+    )
     assert order["fundamentals", "tools"] == 1
     assert order["fundamentals", "finalizer"] == {
         "fundamentals_length": 0,
@@ -651,11 +723,13 @@ def test_personal_entry_deepseek_wire(
     assert all(
         row["has_report_tool"] is (not full)
         for row in requests
-        if row["analyst"] == "fundamentals" and row["phase"] == "tools"
+        if row["analyst"] in {"fundamentals", "market"} and row["phase"] == "tools"
     )
     for row in requests:
         if row["verified_statement_prompt"] is not None:
             assert all(row["verified_statement_prompt"].values()), row["verified_statement_prompt"]
+        if row["verified_market_prompt"] is not None:
+            assert all(row["verified_market_prompt"].values()), row["verified_market_prompt"]
         if row["statement_output_chars"] is not None:
             compact, expanded = row["statement_output_chars"]
             assert 0 < compact * 2 < expanded
@@ -711,6 +785,8 @@ def test_personal_entry_deepseek_wire(
         )
     if scenario.startswith("fundamentals_"):
         assert_personal_financial_outcome(receipt, folder, scenario)
+    if full and (valid_submission or scenario.startswith("market_")):
+        assert_personal_market_outcome(receipt, folder, scenario)
     if scenario in {"length_tools", "length_finalizer", "fundamentals_length"}:
         analyst, stage, observation = {
             "length_tools": ("market", "initial_response", "raw_finish_reason_length"),
@@ -725,6 +801,38 @@ def test_personal_entry_deepseek_wire(
             "completion_tokens": 4096 if scenario == "fundamentals_length" else 12,
             "reasoning_tokens": 0,
         } in receipt["analyst_output_diagnostics"]["events"]
+
+
+def assert_personal_market_outcome(receipt, folder, scenario):
+    report_path = folder / receipt["report_relative_path"]
+    report = report_path.read_text(encoding="utf8")
+    audit = json.loads((folder / "report" / "decision-audit.json").read_text(encoding="utf8"))
+    market_claims = [
+        claim for claim in audit["evidence_state"]["claim_validations"]
+        if claim["claim_id"].startswith("market.")
+    ]
+    events = [
+        event for event in receipt["analyst_output_diagnostics"]["events"]
+        if event["analyst"] == "market" and event["stage"] == "finalizer"
+    ]
+    if scenario.startswith("market_"):
+        assert not market_claims and audit["admission_gate"]["admitted"] is False
+        if scenario in MARKET_SOURCE_MISMATCHES:
+            assert not events
+        else:
+            observation = "validation_error" if scenario == "market_unbound_indicator" else "schema_validation"
+            assert [event["observation"] for event in events] == [observation, observation]
+        assert "98765" not in report
+        return
+    assert [event["observation"] for event in events] == ["success"]
+    assert {claim["claim_id"]: claim["status"] for claim in market_claims} == {
+        "market.M01": "supported", "market.M07": "supported",
+    }
+    for claim in market_claims:
+        assert len(claim["fact_ids"]) == 1
+    assert "Close on 2024-02-29: 12.00 CNY (qfq)" in report
+    assert "50-day SMA on 2024-02-29: 12.00 CNY (qfq)" in report
+    assert audit["admission_gate"]["admitted"] is True
 
 
 @pytest.mark.parametrize(

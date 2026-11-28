@@ -27,6 +27,7 @@ from tradingagents.agents.utils.structured import (
     safe_output_diagnostics,
     submission_id_prefix,
 )
+from tradingagents.dataflows.market_data_validator import verified_snapshot_values
 from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
     get_active_authoritative_market_snapshot,
@@ -44,6 +45,7 @@ from tradingagents.evidence import (
     SubmittedEvidenceNote,
     SubmittedMaterialClaim,
     ToolExecutionEvidenceEnvelope,
+    _bound_snapshot_row,
     build_tool_evidence_state,
     merge_claim_validations,
     merge_evidence_notes,
@@ -219,6 +221,40 @@ class PersonalFundamentalsReport(BaseModel):
     evidence_notes: tuple[_PersonalFundamentalsNote, ...] = Field(max_length=_STATEMENT_MAX_NOTES)
 
 
+class _PersonalMarketCitation(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_id: str = Field(pattern=r"^M[0-9]{2}$")
+
+
+class PersonalMarketReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    report_markdown: str = Field(min_length=1, max_length=900)
+    material_claims: tuple[_PersonalMarketCitation, ...] = Field(min_length=1, max_length=6)
+    evidence_notes: tuple[SubmittedEvidenceNote, ...] = Field(max_length=3)
+
+
+_MARKET_ROWS = {
+    "Close": ("Close", "CNY"),
+    "Open": ("Open", "CNY"),
+    "High": ("High", "CNY"),
+    "Low": ("Low", "CNY"),
+    "Volume": ("Volume", "shares"),
+    "close_10_ema": ("10-day EMA", "CNY"),
+    "close_50_sma": ("50-day SMA", "CNY"),
+    "close_200_sma": ("200-day SMA", "CNY"),
+    "rsi": ("RSI", ""),
+}
+
+
+@dataclass(frozen=True)
+class _MarketObservation:
+    quote: str
+    statement: str
+    display: str
+
+
 @dataclass(frozen=True)
 class _StatementEvidence:
     source_ref: str
@@ -226,13 +262,20 @@ class _StatementEvidence:
     observation: FinancialObservation | None = None
 
 
-def bind_analyst_finalizer(llm: Any, analyst: str, *, personal_statements: bool = False) -> Any | None:
+def bind_analyst_finalizer(
+    llm: Any, analyst: str, *, personal_statements: bool = False, personal_market: bool = False,
+) -> Any | None:
     """Bind the required structured finalizer when the provider supports it."""
+    schema = AnalystEvidenceReport
+    if personal_statements:
+        schema = PersonalFundamentalsReport
+    if personal_market:
+        schema = PersonalMarketReport
     return bind_required_structured(
         llm,
-        PersonalFundamentalsReport if personal_statements else AnalystEvidenceReport,
+        schema,
         f"{analyst.title()} Analyst",
-        strict_json=personal_statements,
+        strict_json=personal_statements or personal_market,
     )
 
 
@@ -355,6 +398,63 @@ def _dispatched_statement(message, ticker, trade_date, calls):
     ) == envelope.request_ref:
         return envelope
     return None
+
+
+def _personal_market_catalog(
+    messages, ticker, trade_date,
+) -> tuple[str, dict[str, _MarketObservation]] | None:
+    """Select complete current rows only from the run-bound, model-visible snapshot."""
+    paired = _paired_tool_turns(messages)
+    snapshot = get_active_authoritative_market_snapshot(ticker, trade_date)
+    if paired is None or snapshot is None or snapshot.effective_trading_date != trade_date:
+        return None
+    calls, results = paired
+    candidates = [item for item in results if item.name == "get_verified_market_snapshot"]
+    if len(candidates) != 1:
+        return None
+    message = candidates[0]
+    call = calls[message.tool_call_id]
+    if not isinstance(message.content, str) or _source_ref(
+        message, ticker, trade_date, calls,
+    ) != snapshot.snapshot_id:
+        return None
+    try:
+        envelope = ToolExecutionEvidenceEnvelope.model_validate(message.artifact)
+    except (TypeError, ValueError):
+        return None
+    artifact = envelope.selected_artifact
+    text = message.content
+    if artifact is None or artifact.raw_text != text or envelope.capability != "market_snapshot":
+        return None
+    labels = {
+        "- Provider: ": snapshot.provider,
+        "- Adjustment basis: ": snapshot.adjustment_basis,
+        "- History rows: ": str(len(snapshot.frame)),
+        "Frame SHA-256: ": snapshot.frame_sha256,
+    }
+    lines = text.splitlines()
+    if any([line for line in lines if line.startswith(label)] != [label + value]
+           for label, value in labels.items()):
+        return None
+    prices, indicators = verified_snapshot_values(
+        snapshot.frame, (field for field in _MARKET_ROWS if field[0].islower()),
+    )
+    values = prices | indicators
+    catalog = {}
+    for number, (field, (label, unit)) in enumerate(_MARKET_ROWS.items(), 1):
+        quotes = [line for line in lines if line.startswith(f"| {field} | ")]
+        if len(quotes) != 1 or text.count(quotes[0]) != 1:
+            continue
+        quote = quotes[0]
+        if quote != f"| {field} | {values[field]} |":
+            return None
+        row = _bound_snapshot_row(message, text, quote, text.index(quote), call, snapshot.snapshot_id)
+        if row is None or row.effective_date != trade_date:
+            continue
+        statement = f"{label} on {row.effective_date}: {row.value}"
+        display = f"{statement} {unit}".rstrip() + f" ({snapshot.adjustment_basis})"
+        catalog[f"M{number:02d}"] = _MarketObservation(quote, statement, display)
+    return snapshot.snapshot_id, catalog
 
 
 def _statement_frequency(call):
@@ -518,18 +618,7 @@ def _personal_statement_prompt(messages, ticker, trade_date) -> tuple[str, dict[
     return prompt, catalog
 
 
-def _finalization_prompt(
-    *,
-    analyst: str,
-    ticker: str,
-    trade_date: str,
-    draft: str,
-    messages: list[Any],
-    auxiliary_context: str = "",
-    personal_news_policy: bool = False,
-) -> str:
-    from tradingagents.agents.utils.agent_utils import get_language_instruction
-
+def _collected_evidence_preview(messages, ticker, trade_date):
     catalog = []
     seen_artifacts = set()
     preview_omitted_evidence = False
@@ -556,7 +645,22 @@ def _finalization_prompt(
                 + content[-tail_length:]
             )
         catalog.append(f"- {source_ref}\n  Evidence: {content or '[empty tool result]'}")
-    source_catalog = "\n".join(catalog) if catalog else "- (no source refs available)"
+    return "\n".join(catalog) if catalog else "- (no source refs available)", preview_omitted_evidence
+
+
+def _finalization_prompt(
+    *,
+    analyst: str,
+    ticker: str,
+    trade_date: str,
+    draft: str,
+    messages: list[Any],
+    auxiliary_context: str = "",
+    personal_news_policy: bool = False,
+) -> str:
+    from tradingagents.agents.utils.agent_utils import get_language_instruction
+
+    source_catalog, preview_omitted_evidence = _collected_evidence_preview(messages, ticker, trade_date)
     source_context = f"Allowed source refs and collected evidence:\n{source_catalog}\n\n"
     if auxiliary_context:
         source_context += (
@@ -817,10 +921,60 @@ def finalize_analyst_submission(
     auxiliary_context: str = "",
     personal_statements: bool = False,
     personal_news_policy: bool = False,
+    personal_market: bool = False,
 ) -> AnalystSubmissionResult:
     if finalizer is None:
         return _unavailable_result(analyst, "unsupported")
-    if personal_statements:
+    if personal_market:
+        from tradingagents.agents.utils.agent_utils import get_language_instruction
+
+        observed = _personal_market_catalog(messages, ticker, trade_date)
+        if observed is None or not observed[1]:
+            return _unavailable_result(analyst, "incomplete_acquisition")
+        source_ref, catalog = observed
+        preview, _ = _collected_evidence_preview(messages, ticker, trade_date)
+        prompt = (
+            f"Finalize the market analyst report for {ticker} on {trade_date}. "
+            "Return PersonalMarketReport. Choose one to six evidence IDs, each for one complete row. "
+            "Material claims contain only evidence_id. The application attaches the exact observation. "
+            "Do not repeat or calculate numbers in commentary. Summarize trends, risks and gaps. "
+            "Use [] for evidence_notes unless an exact listed source quote establishes a limitation. "
+            "Front-adjusted prices do not measure total return. "
+            + get_language_instruction() + "\n\nVerified snapshot rows:\n"
+            + "\n".join(f"{key} | {row.display}\n  Exact quote: {row.quote}" for key, row in catalog.items())
+            + f"\nSource ref: {source_ref}"
+            + "\n\nCollected market context for commentary and evidence notes only. "
+            "Describe material gaps and window differences. A subwindow can have fewer rows "
+            "than the full snapshot. Supplemental enhancements are advisory. "
+            "Keep material claims limited to the selectable IDs above.\n" + preview
+        )
+
+        def validator(submitted):
+            if not submitted.report_markdown.strip():
+                raise SubmissionConstraintError("blank_report")
+            selected = [entry.evidence_id for entry in submitted.material_claims]
+            if any(key not in catalog for key in selected):
+                raise SubmissionConstraintError("unknown_evidence_id")
+            observations = [catalog[key] for key in selected]
+            canonical = AnalystEvidenceReport(
+                report_markdown=(
+                    "## Advisory market commentary / 市场分析参考\n"
+                    + submitted.report_markdown
+                    + "\n\n## Verified snapshot observations / 已核验行情观测\n"
+                    + "\n".join(f"- {row.display}" for row in observations)
+                ),
+                material_claims=tuple(
+                    SubmittedMaterialClaim(
+                        claim_id=f"market.{key}", statement=row.statement,
+                        source_ref=source_ref, source_quote=row.quote,
+                    )
+                    for key, row in zip(selected, observations, strict=True)
+                ),
+                evidence_notes=submitted.evidence_notes,
+            )
+            return _normalize_submission(canonical, analyst)
+
+    elif personal_statements:
         prompt, catalog = _personal_statement_prompt(messages, ticker, trade_date)
         def validator(submitted):
             return _normalize_personal_fundamentals(submitted, catalog)
@@ -836,7 +990,7 @@ def finalize_analyst_submission(
         prompt,
         f"{analyst.title()} Analyst",
         validator=validator,
-        personal_validation_details=personal_news_policy or personal_statements,
+        personal_validation_details=personal_news_policy or personal_statements or personal_market,
     )
     if structured_result.value is None:
         return _unavailable_result(
