@@ -407,7 +407,10 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 state, _ = graph.propagate(ticker, day)
             terminal = TerminalContract.model_validate(state["terminal_contract"])
             stop_stage = "report_publication"
-            report = graph.save_reports(state, ticker, output / "report")
+            report_state = state
+            if config.get("personal_mode") == "full":
+                report_state = dict(state, personal_report_sources=tuple(config.get("personal_sources", ())))
+            report = graph.save_reports(report_state, ticker, output / "report")
             receipt.update(
                 status=terminal.lifecycle_status.value,
                 outcome=terminal.terminal_outcome_kind.value,

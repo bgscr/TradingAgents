@@ -88,6 +88,11 @@ def _display_decimal(value):
     return number if number.is_finite() and abs(number) < Decimal("1e12") else None
 
 
+def _exact_percent(value):
+    sign, digits, exponent = value.as_tuple()
+    return f"{Decimal((sign, digits, exponent + 2))}%"
+
+
 def decision_scope_markdown(state, decision, evidence, language):
     """Explain the gated rule scope, without changing or inferring a direction."""
     chinese = is_chinese(language)
@@ -126,9 +131,44 @@ def decision_scope_markdown(state, decision, evidence, language):
                 comparison = f"{value * 100:.2f}% {comparisons[rule.comparator]} {threshold * 100:.2f}%"
                 lines.append(f"本次规则依据：20个交易日{basis}收盘价格收益 {comparison}。该评级只采用这项价格规则；五年趋势、资金流、融资余额及模型建议未加入本次评级依据。"
                              if chinese else f"Rule basis: 20-trading-session close-price return {comparison}. Only this price rule supports this rating; multiyear trend, moneyflow, financing balance and model commentary were not added to its premises.")
+            elif (rating == rule.target_rating.value == "Hold"
+                  and rule.rule_id == "market.return_20d.hold" and rule.rule_version == "1.0"
+                  and rule.predicate_id == "market_return_threshold"
+                  and rule.comparator == "absolute_value_less_than"
+                  and rule.horizon.count == 20 and rule.horizon.unit.value == "trading_days"
+                  and rule.fact_ids == (fact.fact_id,)
+                  and fact.canonical_field == "market.close_return_20d" and fact.unit == "ratio"
+                  and value is not None and threshold is not None and value.copy_abs() < threshold):
+                qfq = fact.calculation_lineage and fact.calculation_lineage.adjustment_basis == "qfq"
+                # Preserve the strict inequality at the threshold.
+                comparison = f"|{_exact_percent(value)}| < {_exact_percent(threshold)}"
+                lines.append(
+                    f"本次评级只依据这一项市场事实。20 个交易日{'前复权' if qfq else ''}收盘价格收益满足 `{comparison}`。"
+                    "财报与融资余额仅供参考，新闻、资金流和模型建议均未参与本次评级。"
+                    if chinese else
+                    f"The only market fact used for the rating is the 20-trading-session "
+                    f"{'front-adjusted ' if qfq else ''}close-price return, which satisfies `{comparison}`. "
+                    "The financial statements and financing balance are advisory. "
+                    "News, moneyflow and model suggestions are outside the rating basis."
+                )
     else:
         lines.append("当前展示输入缺少可核对的决定事实，无法自动比较；不以辅助正文补齐。"
                      if chinese else "Decision facts cannot be reconciled with this display input; automatic comparison is unavailable, and commentary cannot fill the gap.")
+    selected_sources = state.get("personal_report_sources")
+    if isinstance(selected_sources, tuple):
+        if "news" in selected_sources:
+            lines.append("发行人新闻正文未核验。" if chinese else "Issuer news article bodies were unverified.")
+        pending = []
+        if "margin_balance" in selected_sources:
+            pending.append("融资余额在报告发布时尚未核验。" if chinese else
+                           "Financing balance was unverified at publication.")
+        if "eastmoney_fundflow_ratio" in selected_sources:
+            pending.append("东财资金流占比在报告发布时尚未核验。" if chinese else
+                           "Eastmoney flow ratio was unverified at publication.")
+        if pending:
+            pending.append("补充核验的最终状态见本次运行目录的 `status.json`。" if chinese else
+                           "See `status.json` in the run directory for the final supplemental status.")
+            lines.append((" " if not chinese else "").join(pending))
     debate = state.get("investment_debate_state")
     research = debate.get("judge_decision") if isinstance(debate, dict) else None
     research = research or state.get("investment_plan")

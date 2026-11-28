@@ -130,6 +130,42 @@ def test_price_rule_scope_is_limited_to_its_bound_fact():
     assert "8.00%" not in render_scope(state)
 
 
+@pytest.mark.parametrize("language", ["Chinese", "English"])
+def test_hold_opening_identifies_the_only_fact_and_personal_source_limits(language):
+    # Reproduce the report presentation seam with a synthetic Hold boundary value.
+    state = state_with_suggestions(research="Overweight", action="Buy")
+    state["personal_report_sources"] = ("news", "margin_balance", "eastmoney_fundflow_ratio")
+    decision = state["trading_decision"]
+    decision["rating"] = "Hold"
+    fact = decision["facts"][0]
+    fact.update(canonical_field="market.close_return_20d", normalized_value="-0.04999999", unit="ratio")
+    fact["calculation_lineage"]["adjustment_basis"] = "qfq"
+    decision["assertions"][0].update(
+        rule_id="market.return_20d.hold", rule_version="1.0", target_rating="Hold",
+        predicate_id="market_return_threshold", comparator="absolute_value_less_than", threshold="0.05",
+    )
+    source = state["evidence_state"]["source_facts"][0]
+    source.update(canonical_field=fact["canonical_field"], normalized_value=fact["normalized_value"])
+    source["calculation_lineage"]["adjustment_basis"] = "qfq"
+    before = copy.deepcopy(state)
+    text = render_scope(state, language)
+    assert text.index("|-4.999999%| < 5%") < text.index("status.json")
+    expected = (
+        ("只依据这一项市场事实", "财报与融资余额仅供参考", "发行人新闻正文未核验",
+         "东财资金流占比在报告发布时尚未核验", "增配；标签与规则评级不同", "买入；标签与规则评级不同")
+        if language == "Chinese" else
+        ("only market fact used for the rating", "financial statements and financing balance are advisory",
+         "Issuer news article bodies were unverified", "Eastmoney flow ratio was unverified at publication",
+         "Overweight; its label differs", "Buy; its label differs")
+    )
+    assert all(marker in text for marker in expected)
+    assert state == before
+    source["normalized_value"] = "0.08"
+    assert "|-4.999999%|" not in render_scope(state, language)
+    source["normalized_value"] = fact["normalized_value"] = "-0.05"
+    assert "|-5%| < 5%" not in render_scope(state, language)
+
+
 @pytest.mark.parametrize("stage", ["research", "trader"])
 @pytest.mark.parametrize("invalid_binding", [False, True])
 def test_real_nodes_capture_only_structured_success_and_clear_fallback(monkeypatch, stage, invalid_binding):
