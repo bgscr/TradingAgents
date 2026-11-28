@@ -2,7 +2,7 @@ import math
 import os
 import re
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
@@ -518,11 +518,26 @@ def _input_to_messages(input_: Any) -> list:
     return []
 
 
+_DEEPSEEK_V4_CHAT_MODELS = frozenset({
+    "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro",
+})
+_DEEPSEEK_ANALYST_NON_THINKING = ContextVar("deepseek_analyst_non_thinking", default=False)
+
+
+@contextmanager
+def deepseek_analyst_non_thinking():
+    """Use non-thinking Chat Completions during one personal Full analyst node."""
+    token = _DEEPSEEK_ANALYST_NON_THINKING.set(True)
+    try:
+        yield
+    finally:
+        _DEEPSEEK_ANALYST_NON_THINKING.reset(token)
+
+
 class DeepSeekChatOpenAI(NormalizedChatOpenAI):
     """DeepSeek-specific overrides on top of the OpenAI-compatible client.
 
-    Thinking-mode round-trip is the only DeepSeek-specific behavior that
-    stays here. When DeepSeek's thinking models return a response with
+    When DeepSeek's thinking models return a response with
     ``reasoning_content``, that field must be echoed back as part of the
     assistant message on the next turn or the API fails with HTTP 400.
     ``_create_chat_result`` captures it on receive and
@@ -535,10 +550,7 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 
     def get_required_structured_method(self) -> str:
         """Return the transport used by fail-closed required schemas."""
-        if self.model_name in {
-            "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
-            "deepseek-v4-pro",
-        }:
+        if self.model_name in _DEEPSEEK_V4_CHAT_MODELS:
             return "json_mode"
         return get_capabilities(self.model_name).preferred_structured_method
 
@@ -557,9 +569,22 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
             return self.with_structured_output(schema, method="json_mode", **kwargs)
         return self.with_structured_output(schema, **kwargs)
 
+    def _analyst_non_thinking(self) -> bool:
+        return _DEEPSEEK_ANALYST_NON_THINKING.get() and self.model_name in _DEEPSEEK_V4_CHAT_MODELS
+
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        if self.reasoning_effort is not None:
+        non_thinking = self._analyst_non_thinking()
+        if non_thinking:
+            # OpenAI's SDK merges extra_body into the wire request. Copy it so
+            # a bound client can keep its original policy for decision stages.
+            extra = dict(payload.get("extra_body") or {})
+            extra["thinking"] = {"type": "disabled"}
+            extra.pop("reasoning_effort", None)
+            payload["extra_body"] = extra
+            payload.pop("thinking", None)
+            payload.pop("reasoning_effort", None)
+        elif self.reasoning_effort is not None:
             effort = coerce_deepseek_reasoning_effort(self.reasoning_effort)
             extra = payload.get("extra_body") or {}
             expected_thinking = {"type": "disabled" if effort == "none" else "enabled"}
@@ -581,16 +606,22 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
                 raise ValueError("DeepSeek output limit cannot be overridden")
             payload["max_tokens"] = value
         outgoing = payload.get("messages", [])
-        for message_dict, message in zip(outgoing, _input_to_messages(input_), strict=False):
-            if not isinstance(message, AIMessage):
-                continue
-            reasoning = message.additional_kwargs.get("reasoning_content")
-            if reasoning is not None:
-                message_dict["reasoning_content"] = reasoning
+        if non_thinking:
+            for message_dict in outgoing:
+                message_dict.pop("reasoning_content", None)
+        else:
+            for message_dict, message in zip(outgoing, _input_to_messages(input_), strict=False):
+                if not isinstance(message, AIMessage):
+                    continue
+                reasoning = message.additional_kwargs.get("reasoning_content")
+                if reasoning is not None:
+                    message_dict["reasoning_content"] = reasoning
         return payload
 
     def _create_chat_result(self, response, generation_info=None):
         chat_result = super()._create_chat_result(response, generation_info)
+        if self._analyst_non_thinking():
+            return chat_result
         response_dict = (
             response
             if isinstance(response, dict)

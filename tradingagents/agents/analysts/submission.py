@@ -121,12 +121,16 @@ MARKET_EVIDENCE_GUIDANCE = (
 
 @contextmanager
 def personal_full_prompt_scope(enabled: bool):
-    """Select compact prompts for the analysts inside one personal Full graph run."""
+    """Select the analyst policy inside one personal Full graph run."""
     token = _PERSONAL_FULL_PROMPTS.set(enabled)
     try:
         yield
     finally:
         _PERSONAL_FULL_PROMPTS.reset(token)
+
+
+def personal_full_analysts_active() -> bool:
+    return _PERSONAL_FULL_PROMPTS.get()
 
 
 def _compact_submission_prompt(analyst: str) -> str:

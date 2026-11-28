@@ -106,6 +106,15 @@ def create_capability_guarded_analyst_node(
             if applicable:
                 if analyst_node is None:
                     analyst_node = analyst_factory()
+                from tradingagents.agents.analysts.submission import personal_full_analysts_active
+
+                if personal_full_analysts_active():
+                    from tradingagents.llm_clients.openai_client import (
+                        deepseek_analyst_non_thinking,
+                    )
+
+                    with deepseek_analyst_non_thinking():
+                        return analyst_node(state)
                 return analyst_node(state)
             status = EvidenceStatus.NOT_APPLICABLE
             required = False
