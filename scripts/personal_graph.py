@@ -332,6 +332,7 @@ def personal_sources(ticker=None, day=None, news=None):
 
 def run(config, ticker, day, output_root, started, *, preparation=None):
     from tradingagents.analysis_budget import AnalysisBudgetStopped, analysis_preparation_scope
+    from tradingagents.run_diagnostics import personal_analyst_output_scope
     from tradingagents.terminal_contract import TerminalContract
 
     run_id = uuid4().hex
@@ -371,7 +372,9 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             local_payloads(),
             analysis_preparation_scope(config),
             personal_sources(ticker, day, news),
+            personal_analyst_output_scope() as analyst_output,
         ):
+            receipt["analyst_output_diagnostics"] = analyst_output
             if (
                 time.time() >= config["analysis_session_deadline_epoch"]
                 or time.monotonic() >= config["analysis_session_monotonic_deadline"]

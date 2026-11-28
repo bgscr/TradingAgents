@@ -10,8 +10,16 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
 from hashlib import sha256
+from threading import Lock
 
 _SINK = ContextVar('run_diagnostic_sink', default=None)
+_PERSONAL_OUTPUT_SINK = ContextVar('personal_analyst_output_sink', default=None)
+_OUTPUT_ANALYSTS = frozenset({'market', 'fundamentals', 'news', 'social', 'sentiment'})
+_OUTPUT_STAGES = frozenset({'initial_response', 'finalizer'})
+_OUTPUT_OUTCOMES = frozenset({'response', 'success', 'output_limit', 'none_parsed',
+                              'validation_error', 'transport_error'})
+_LENGTH_OBSERVATIONS = frozenset({'raw_finish_reason_length', 'sdk_length_finish_reason_error'})
+_PERSONAL_OUTPUT_LIMIT = 60
 _KINDS = frozenset({'claim_validation', 'analyst_output', 'news_exception',
                     'evidence_note_binding', 'admission_gate', 'news_business_status',
                     'news_response_shape', 'news_selection'})
@@ -49,6 +57,31 @@ def diagnostic_scope(sink):
         yield
     finally:
         _SINK.reset(token)
+
+
+@contextmanager
+def personal_analyst_output_scope():
+    """Capture only projected analyst observations without enabling the general sink."""
+    result = {'events': [], 'dropped_events': 0}
+    lock = Lock()
+    closed = False
+
+    def retain(event):
+        with lock:
+            if closed:
+                return
+            if len(result['events']) < _PERSONAL_OUTPUT_LIMIT:
+                result['events'].append(event)
+            else:
+                result['dropped_events'] += 1
+
+    token = _PERSONAL_OUTPUT_SINK.set(retain)
+    try:
+        yield result
+    finally:
+        with lock:
+            closed = True
+        _PERSONAL_OUTPUT_SINK.reset(token)
 
 
 class DiagnosticPersistenceError(BaseException):
@@ -238,16 +271,37 @@ def record_admission_gate(evidence, result):
     })
 
 
-def record_output(analyst, stage, attempt, diagnostics, *, outcome):
-    if _SINK.get() is None:
+def record_output(analyst, stage, attempt, diagnostics, *, outcome, personal_observation=None):
+    retain = _PERSONAL_OUTPUT_SINK.get()
+    if _SINK.get() is None and retain is None:
         return
-    from tradingagents.agents.utils.structured import safe_output_diagnostics
-    names = {'market', 'fundamentals', 'news', 'social', 'sentiment'}
-    emit('analyst_output', {'analyst': analyst if analyst in names else 'other',
-        'stage': stage if stage in {'initial_response','finalizer'} else 'other',
-        'attempt': attempt, 'outcome': outcome if outcome in {'response','success','output_limit',
-            'none_parsed','validation_error','transport_error'} else 'other',
-        **safe_output_diagnostics(diagnostics)})
+    from tradingagents.agents.utils.structured import (
+        bounded_analyst_output_usage,
+        safe_output_diagnostics,
+    )
+    safe = safe_output_diagnostics(diagnostics)
+    emit('analyst_output', {'analyst': analyst if analyst in _OUTPUT_ANALYSTS else 'other',
+        'stage': stage if stage in _OUTPUT_STAGES else 'other',
+        'attempt': attempt, 'outcome': outcome if outcome in _OUTPUT_OUTCOMES else 'other',
+        **safe})
+    if retain is None or not (
+        analyst in _OUTPUT_ANALYSTS and stage in _OUTPUT_STAGES and outcome in _OUTPUT_OUTCOMES
+    ):
+        return
+
+    observation = outcome
+    usage = safe
+    if personal_observation is not None:
+        observed_code, observed_diagnostics = personal_observation
+        if outcome == 'output_limit' and observed_code in _LENGTH_OBSERVATIONS:
+            observation = observed_code
+            usage = observed_diagnostics
+        elif outcome == observed_code:
+            usage = observed_diagnostics
+    if outcome == 'validation_error' and safe.get('validation_kind') in {'json_syntax', 'schema_validation'}:
+        observation = safe['validation_kind']
+    retain({'analyst': analyst, 'stage': stage, 'observation': observation,
+            **bounded_analyst_output_usage(usage)})
 
 
 def record_news_response_shape(payload, *, callback_matches, stage='response_parse'):

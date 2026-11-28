@@ -150,6 +150,8 @@ def invoke_required_structured(
     max_attempts: int = 2,
 ) -> RequiredStructuredResult:
     """Invoke a required schema, optionally allowing one fail-closed repair."""
+    from tradingagents.run_diagnostics import record_output
+
     if type(max_attempts) is not int or max_attempts not in (1, 2):
         raise ValueError("structured max_attempts must be 1 or 2")
     if structured_llm is None:
@@ -161,17 +163,16 @@ def invoke_required_structured(
     last_reason = "none_parsed"
     for attempt in range(1, max_attempts + 1):
         diagnostics = {}
+        personal_observation = None
         validating_submission = False
         try:
             raw_result = structured_llm.invoke(current_prompt)
-            value, reason, diagnostics = _unwrap_required_result(raw_result)
+            value, reason, diagnostics, personal_observation = _unwrap_required_result(raw_result)
             if value is not None and validator is not None:
                 validating_submission = True
                 value = validator(value)
                 validating_submission = False
             if value is not None:
-                from tradingagents.run_diagnostics import record_output
-
                 record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
                               diagnostics, outcome="success")
                 logger.info(
@@ -187,19 +188,23 @@ def invoke_required_structured(
             last_reason = reason or "none_parsed"
         except Exception as exc:  # noqa: BLE001 - classified without provider payloads
             last_reason = _structured_failure_reason(exc)
+            response_diagnostics = diagnostics
             if agent_name != "Market Analyst":
                 diagnostics = {}
-            diagnostics.update(_safe_exception_diagnostics(exc))
+            exception_diagnostics = _safe_exception_diagnostics(exc)
+            diagnostics.update(exception_diagnostics)
+            if last_reason == "output_limit":
+                personal_observation = ("sdk_length_finish_reason_error", exception_diagnostics)
+            elif validating_submission and agent_name != "Market Analyst":
+                personal_observation = (last_reason, response_diagnostics)
             if last_reason == "validation_error":
                 if validating_submission and agent_name == "Market Analyst" and isinstance(exc, SubmissionConstraintError):
                     diagnostics["validation_kind"] = exc.kind
                 else:
                     diagnostics.update(_validation_metadata(exc))
 
-        from tradingagents.run_diagnostics import record_output
-
         record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
-                      diagnostics, outcome=last_reason)
+                      diagnostics, outcome=last_reason, personal_observation=personal_observation)
         logger.warning(
             "%s: required structured output failed "
             "(schema=%s model=%s attempt=%d reason=%s%s)",
@@ -246,38 +251,49 @@ def _is_output_limit(exc: Exception) -> bool:
     return isinstance(length_error, type) and isinstance(exc, length_error)
 
 
-def _unwrap_required_result(result: Any) -> tuple[Any | None, str | None, dict[str, Any]]:
+def _unwrap_required_result(
+    result: Any,
+) -> tuple[Any | None, str | None, dict[str, Any], tuple[str, dict[str, Any]] | None]:
     """Remove LangChain's include_raw envelope without retaining its payload."""
     if not isinstance(result, Mapping) or not {
         "raw",
         "parsed",
         "parsing_error",
     }.issubset(result):
-        return result, None if result is not None else "none_parsed", {}
+        return result, None if result is not None else "none_parsed", {}, None
 
     raw = result.get("raw")
     parsed = result.get("parsed")
     parsing_error = result.get("parsing_error")
     metadata = getattr(raw, "response_metadata", {}) or {}
     tool_calls = getattr(raw, "tool_calls", ()) or ()
-    diagnostics = response_output_diagnostics(raw)
-    diagnostics["tool_call_count"] = len(tool_calls)
-    if parsing_error is not None:
-        diagnostics.update(_safe_exception_diagnostics(parsing_error))
-    if metadata.get("finish_reason") == "length" or (
-        parsing_error is not None and _is_output_limit(parsing_error)
-    ):
-        # A partially parsed object is not complete evidence. Do not spend an
-        # automatic repair attempt or silently raise the configured output cap.
-        return None, "output_limit", diagnostics
+    raw_diagnostics = response_output_diagnostics(raw)
+    sdk_diagnostics = _safe_exception_diagnostics(parsing_error) if parsing_error is not None else {}
+    diagnostics = {**raw_diagnostics, "tool_call_count": len(tool_calls), **sdk_diagnostics}
+    raw_length = metadata.get("finish_reason") == "length"
+    sdk_length = sdk_diagnostics.get("finish_reason") == "length"
+    if raw_length or sdk_length:
+        # Both signals can describe a single truncated response. Keep one
+        # observation with its own counters, preferring raw when equally complete.
+        use_sdk = sdk_length and (
+            not raw_length
+            or len(bounded_analyst_output_usage(sdk_diagnostics))
+            > len(bounded_analyst_output_usage(raw_diagnostics))
+        )
+        observation = (
+            ("sdk_length_finish_reason_error", sdk_diagnostics)
+            if use_sdk else ("raw_finish_reason_length", raw_diagnostics)
+        )
+        return None, "output_limit", diagnostics, observation
     if parsed is not None:
-        return parsed, None, diagnostics
+        return parsed, None, diagnostics, None
     if parsing_error is not None:
         diagnostics.update(_validation_metadata(parsing_error))
     return (
         None,
         "validation_error" if parsing_error is not None else "none_parsed",
         diagnostics,
+        None,
     )
 
 
@@ -380,6 +396,18 @@ def response_output_diagnostics(response: Any) -> dict[str, Any]:
         "completion_tokens": completion,
         "reasoning_tokens": reasoning,
     })
+
+
+def bounded_analyst_output_usage(diagnostics: Mapping[str, Any]) -> dict[str, int]:
+    """Project only usable counters for the personal receipt's bounded event."""
+    completion = diagnostics.get("completion_tokens")
+    if type(completion) is not int or not 0 <= completion < (1 << 31):
+        return {}
+    usage = {"completion_tokens": completion}
+    reasoning = diagnostics.get("reasoning_tokens")
+    if type(reasoning) is int and 0 <= reasoning <= completion:
+        usage["reasoning_tokens"] = reasoning
+    return usage
 
 
 def _format_safe_diagnostics(diagnostics: Mapping[str, Any]) -> str:

@@ -13,11 +13,11 @@ from pydantic import ValidationError
 
 from tradingagents.agents.utils.structured import (
     SubmissionConstraintError,
-    submission_id_prefix,
     bind_required_structured,
     invoke_required_structured,
     response_output_diagnostics,
     safe_output_diagnostics,
+    submission_id_prefix,
 )
 from tradingagents.dataflows.market_snapshot import (
     _minimum_history_for_indicator,
@@ -46,6 +46,7 @@ from tradingagents.evidence import (
     verified_financial_observations,
 )
 from tradingagents.financial_observations import FINANCIAL_TOOLS
+from tradingagents.run_diagnostics import record_output
 
 logger = logging.getLogger(__name__)
 
@@ -502,17 +503,20 @@ def process_analyst_response(
     auxiliary_context: str = "",
 ) -> AnalystSubmissionResult:
     """Accept a typed report, continue data calls, or finalize prose exactly once."""
-    from tradingagents.run_diagnostics import record_output
-
-    record_output(analyst, "initial_response", 1, response_output_diagnostics(response),
-                  outcome="output_limit" if response.response_metadata.get("finish_reason") == "length" else "response")
-    if response.response_metadata.get("finish_reason") == "length":
+    truncated = response.response_metadata.get("finish_reason") == "length"
+    diagnostics = response_output_diagnostics(response)
+    record_output(
+        analyst, "initial_response", 1, diagnostics,
+        outcome="output_limit" if truncated else "response",
+        personal_observation=("raw_finish_reason_length", diagnostics) if truncated else None,
+    )
+    if truncated:
         # The initial tool-calling turn has the same completeness requirement as
         # the finalizer. A parseable prefix is not a completed report/tool plan,
         # and an output-limit failure must not spend an automatic repair call.
         return _unavailable_result(
             analyst, "output_limit", stage="initial_response", attempts=1,
-            diagnostics=response_output_diagnostics(response),
+            diagnostics=diagnostics,
         )
     tool_calls = tuple(response.tool_calls or ())
     report_calls = tuple(
