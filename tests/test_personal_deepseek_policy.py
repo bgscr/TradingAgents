@@ -12,6 +12,7 @@ from tradingagents.analysis_budget import httpx_transport_modules
 
 REASONING = "fixture-private-reasoning-never-persist"
 PARTIAL = "fixture-partial-report-never-publish"
+NO_NEWS_REPORT = "发行人新闻来源不可用，无法核实本窗口内的发行人事件。"
 ANALYSTS = {"market", "sentiment", "news", "fundamentals"}
 DAY = "2024-02-29"
 
@@ -23,6 +24,18 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
     factory = trading_graph.create_llm_client
     install_graph_boundary(monkeypatch, "600895.SS", transport_trace)
     monkeypatch.setattr(trading_graph, "create_llm_client", factory)
+    if scenario == "unavailable_news":
+        from scripts import personal_observations
+
+        def unavailable_page(ticker, day, remaining, admit):
+            assert (ticker, day) == ("600895.SS", DAY)
+            remaining()
+            admit()
+            with transport_trace.open("a", encoding="utf8") as out:
+                out.write("personal:public_news_unavailable\n")
+            raise OSError("synthetic issuer news transport failure")
+
+        monkeypatch.setattr(personal_observations, "get_page", unavailable_page)
     requests = []
 
     def send(request, family):
@@ -62,6 +75,18 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                 finish, message["content"] = "length", PARTIAL
         elif "get_news" in names:
             analyst, phase = "news", "tools"
+            if scenario == "unavailable_news":
+                if not tool_result:
+                    finish = tool(
+                        "get_news",
+                        {"ticker": "600895.SS", "start_date": "2024-02-22", "end_date": DAY},
+                    )
+                else:
+                    assert any(
+                        msg["role"] == "tool"
+                        and "DATA_UNAVAILABLE: news acquisition unavailable" in msg["content"]
+                        for msg in body["messages"]
+                    )
         elif "get_balance_sheet" in names:
             analyst, phase = "fundamentals", "tools"
         elif body.get("response_format") == {"type": "json_object"}:
@@ -79,6 +104,8 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                     content = {"material_claims": []}
                 if analyst == "news" and scenario == "length_finalizer":
                     finish, content = "length", {"report_markdown": PARTIAL}
+                if analyst == "news" and scenario == "unavailable_news":
+                    content["report_markdown"] = NO_NEWS_REPORT
                 message["content"] = json.dumps(content)
             else:
                 assert "matching SentimentReport" in prompt
@@ -174,6 +201,37 @@ def assert_wire_policy(requests, *, full, quick, effort, limit):
     assert len(market_followups) == 1 and market_followups[0]["replayed_reasoning"] is (not full)
 
 
+def assert_unavailable_news_outcome(receipt, run_dir, attempts):
+    assert attempts.count("personal:public_news_unavailable") == 1
+    assert "personal:public_news" not in attempts
+    assert receipt["enhancements"]["news"] == "unavailable"
+    assert receipt["source_evidence"]["news"] == {
+        "status": "unavailable",
+        "returned_to_news_tool": False,
+    }
+    assert receipt["news_content_verified"] is False
+    events = receipt["analyst_output_diagnostics"]["events"]
+    assert [
+        e["observation"] for e in events if e["analyst"] == "news" and e["stage"] == "finalizer"
+    ] == ["success"]
+    assert NO_NEWS_REPORT in (run_dir / receipt["report_relative_path"]).read_text(encoding="utf8")
+
+    audit = json.loads((run_dir / "report" / "decision-audit.json").read_text(encoding="utf8"))
+    evidence = audit["evidence_state"]
+    capabilities = {"get_news", "sentiment_news"}
+    outcomes = [
+        row for row in evidence["acquisition_outcomes"] if row["capability"] in capabilities
+    ]
+    assert {row["capability"] for row in outcomes} == capabilities
+    assert all(row["outcome"] == "unavailable" and not row.get("artifact_ref") for row in outcomes)
+    unavailable_ids = {row["source_id"] for row in outcomes}
+    assert not evidence["material_claims"]
+    assert all(fact["source_id"] not in unavailable_ids for fact in evidence["source_facts"])
+    assert audit["admission_gate"]["admitted"] is True
+    assert audit["admission_gate"]["readiness"] == "degraded"
+    assert "optional_evidence_unavailable" in audit["admission_gate"]["diagnostic_codes"]
+
+
 @pytest.mark.parametrize(
     "scenario,full,quick,effort,limit",
     [
@@ -183,6 +241,7 @@ def assert_wire_policy(requests, *, full, quick, effort, limit):
         ("length_tools", True, "deepseek-v4-flash", None, 4096),
         ("length_finalizer", True, "deepseek-v4-flash", None, 4096),
         ("incomplete", True, "deepseek-v4-flash", None, 4096),
+        ("unavailable_news", True, "deepseek-v4-flash", None, 4096),
     ],
 )
 def test_personal_entry_deepseek_wire(
@@ -208,7 +267,8 @@ def test_personal_entry_deepseek_wire(
     code = personal_full.main(args if full else [*args, "--basic"])
     output = capsys.readouterr()
     receipt = json.loads(output.out)
-    assert code == (0 if scenario == "success" else 3), receipt.get("error")
+    valid_submission = scenario in {"success", "unavailable_news"}
+    assert code == (0 if valid_submission else 3), receipt.get("error")
     assert receipt["status"] == "completed" and receipt["report_written"] and receipt["usage_final"]
     assert (
         receipt["model_attempts"] == len(requests) == trace.read_text().splitlines().count("model")
@@ -221,8 +281,8 @@ def test_personal_entry_deepseek_wire(
     assert order["news", "finalizer"] == (2 if scenario == "incomplete" else 1)
     assert order["market", "finalizer"] == (0 if scenario == "length_tools" else 1)
     count_after_admission = sum(row["analyst"] is None for row in requests)
-    assert bool(count_after_admission) is (scenario == "success")
-    if scenario == "success":
+    assert bool(count_after_admission) is valid_submission
+    if valid_submission:
         assert receipt["rating_status"] == "validated_decision"
         assert any(
             r["model"] == "deepseek-v4-pro" and r["phase"] == "research_plan" for r in requests
@@ -232,15 +292,19 @@ def test_personal_entry_deepseek_wire(
         assert receipt["rating_status"] == "no_rating"
     folder = tmp_path / "reports" / "personal" / receipt["run_id"]
     raw = (folder / "status.json").read_text(encoding="utf8")
-    report = (folder / receipt["report_relative_path"]).read_text(encoding="utf8")
+    report_path = folder / receipt["report_relative_path"]
+    report = report_path.read_text(encoding="utf8")
     assert json.loads(raw) == receipt
     assert all(
         token not in block
         for token in (REASONING, PARTIAL, "synthetic-example")
         for block in (output.out, output.err, caplog.text, raw, report)
     )
-    if scenario != "success":
+    if not valid_submission:
         assert "admission_blocked" in report and "required_evidence_unavailable" in report
+    if scenario == "unavailable_news":
+        assert order["news", "tools"] == 2
+        assert_unavailable_news_outcome(receipt, folder, trace.read_text().splitlines())
     if scenario in {"length_tools", "length_finalizer"}:
         analyst, stage, observation = {
             "length_tools": ("market", "initial_response", "raw_finish_reason_length"),
