@@ -405,7 +405,22 @@ class Session:
             return raw
 
         with MarketHistoryStore.open_provider_request_authority(self.history) as store:
-            coord = ProviderRequestCoordinator(store)
+            from scripts.personal_margin_coordinator import (
+                MarginCacheHit,
+                PersonalMarginCoordinator,
+            )
+
+            if endpoint == "margin_detail":
+                from scripts.personal_observations import cached_margin
+                from tradingagents.market_history.config import provider_request_authority_config
+
+                authority = provider_request_authority_config(self.history)
+                coord = PersonalMarginCoordinator(
+                    store, request_key, self.service,
+                    lambda: cached_margin(authority, observation_binding, request_key), now,
+                )
+            else:
+                coord = ProviderRequestCoordinator(store)
             coord.register_upstream_service(self.service, self.name)
             ceiling = coord.configured_operator_ceiling(self.service)
             if ceiling is None:
@@ -417,27 +432,22 @@ class Session:
                 )
             elif ceiling.allow_prewarming or ceiling.minimum_interval < self.interval:
                 raise PreparationError("personal_rate_policy_mismatch")
-            if endpoint == "margin_detail":
-                from scripts.personal_observations import margin_request_unsettled
-                from tradingagents.market_history.config import provider_request_authority_config
-
-                if margin_request_unsettled(
-                    provider_request_authority_config(self.history), request_key, self.service
-                ):
-                    raise PreparationError("prior_margin_attempt_unsettled")
-            result = coord.execute_physical_workflow(
-                request_key=request_key,
-                upstream_service_id=self.service,
-                owner_id="personal:" + uuid4().hex,
-                priority=RequestPriority.INTERACTIVE_MAINLAND,
-                now=now,
-                sleep=self.wait,
-                lease_duration=timedelta(minutes=2),
-                max_physical_operations=1,
-                wait_for_initial_pacing=True,
-                cooldown_scope="market-snapshot",
-                workflow=lambda execute: execute(endpoint, send),
-            )
+            try:
+                result = coord.execute_physical_workflow(
+                    request_key=request_key,
+                    upstream_service_id=self.service,
+                    owner_id="personal:" + uuid4().hex,
+                    priority=RequestPriority.INTERACTIVE_MAINLAND,
+                    now=now,
+                    sleep=self.wait,
+                    lease_duration=timedelta(minutes=2),
+                    max_physical_operations=1,
+                    wait_for_initial_pacing=True,
+                    cooldown_scope="market-snapshot",
+                    workflow=lambda execute: execute(endpoint, send),
+                )
+            except MarginCacheHit as hit:
+                return hit.value
             return result.value
 
 

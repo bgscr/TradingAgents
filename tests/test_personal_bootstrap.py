@@ -464,6 +464,9 @@ try:
     feed = install_graph_boundary(changes, {ticker.replace(".SH", ".SS")!r}, Path({str(trace)!r}))
     if Path({str(trace)!r}).exists():
         feed.instant += timedelta(minutes=5)
+    if os.environ.get("PERSONAL_FIXTURE_EXPIRED_MARGIN") == "1":
+        from tests.test_personal_margin_publication import install_expired_margin_fixture
+        install_expired_margin_fixture(changes, feed)
     if os.environ.get("PERSONAL_FIXTURE_EARLY_MORNING") == "1":
         feed.instant += timedelta(hours=15, minutes=30)
     if os.environ.get("PERSONAL_FIXTURE_NEXT_MORNING") == "1":
@@ -563,7 +566,9 @@ except BaseException:
     retrospective = ticker.endswith(".SH")
     if retrospective:
         env["PERSONAL_FIXTURE_NEXT_MORNING"] = "1"
+        env["PERSONAL_FIXTURE_EXPIRED_MARGIN"] = "1"
     code, receipt = launch("-Run", *options)
+    env.pop("PERSONAL_FIXTURE_EXPIRED_MARGIN", None)
     assert receipt["moneyflow_dc_access"]["points_status"] == (
         "below_minimum" if options else "undeclared"
     )

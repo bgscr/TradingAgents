@@ -11,6 +11,7 @@ from tests.test_personal_observations import binding, profile
 from tradingagents import margin_balance
 from tradingagents.market_history.config import provider_request_authority_config
 from tradingagents.market_history.coordinator import (
+    PhysicalAttemptFailure,
     ProviderRequestCoordinator,
     RequestPriority,
     record_active_physical_attempt_io,
@@ -185,3 +186,244 @@ def test_early_physical_query_cannot_bypass_observation_window(tmp_path, monkeyp
             observation_binding=case.binding,
         )
     assert case.sends == [] and case.session.financial_attempts() == 0
+
+
+def _acquire_fixture_margin(coord, session, bound, now):
+    lease = coord.acquire(
+        request_key=full.margin_key(bound, session.account_scope),
+        upstream_service_id=session.service,
+        owner_id="fixture-worker",
+        priority=RequestPriority.INTERACTIVE_MAINLAND,
+        now=now,
+        lease_duration=timedelta(minutes=2),
+        cooldown_scope="market-snapshot",
+    ).lease
+    assert lease is not None
+    return lease
+
+
+def install_expired_margin_fixture(changes, feed):
+    observe = full.margin_observation
+
+    def observe_after_zero_attempt_crash(session, bound, token, account, authority):
+        feed.wait(session.interval.total_seconds())
+        with MarketHistoryStore.open_provider_request_authority(session.history) as store:
+            coord = ProviderRequestCoordinator(store)
+            old = _acquire_fixture_margin(coord, session, bound, cold.now())
+            sequence = coord._sequence_id(old)
+            coord._create_retry_sequence(sequence, old)
+        feed.wait(121)
+        result = observe(session, bound, token, account, authority)
+        with MarketHistoryStore.open_provider_request_authority(session.history) as store:
+            assert store._connection.execute(
+                "SELECT status, final_physical_attempt_count, failure_error_code "
+                "FROM provider_request_sequences WHERE sequence_id=?",
+                (sequence,),
+            ).fetchone() == ("failed", 0, "personal_margin_expired_before_send")
+        return result
+
+    changes.setattr(full, "margin_observation", observe_after_zero_attempt_crash)
+
+
+@pytest.mark.parametrize(
+    "state", ["expired_zero", "fresh", "sent_unknown", "orphan", "different_generation"]
+)
+def test_personal_margin_recovers_only_owned_expired_zero(tmp_path, monkeypatch, state):
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T10:00")
+    s = case.session
+    with MarketHistoryStore.open_provider_request_authority(s.history) as store:
+        coord = ProviderRequestCoordinator(store)
+        lease = _acquire_fixture_margin(coord, s, case.binding, case.now)
+        old = coord._sequence_id(lease)
+        coord._create_retry_sequence(old, lease)
+        if state == "sent_unknown":
+            coord._start_attempt_event(
+                sequence_id=old,
+                lease=lease,
+                service_name=s.name,
+                operation="margin_detail",
+                attempt_index=1,
+                attempted_at=lease.acquired_at,
+                pacing_event="permit_acquired",
+                pacing_wait_seconds=0,
+            )
+        if state in {"orphan", "different_generation"}:
+            coord.release(lease)
+        if state == "different_generation":
+            case.now += timedelta(seconds=1)
+            _acquire_fixture_margin(coord, s, case.binding, case.now)
+        if state != "fresh":
+            case.now += timedelta(minutes=3)
+
+    result = case.observe()
+    success = state == "expired_zero"
+    assert result["status"] == ("valid_empty" if success else "prior_margin_attempt_unsettled")
+    assert len(case.sends) == s.financial_attempts() == int(success)
+    with MarketHistoryStore.open_provider_request_authority(s.history) as store:
+        prior = store._connection.execute(
+            "SELECT status, final_physical_attempt_count FROM provider_request_sequences WHERE sequence_id=?",
+            (old,),
+        ).fetchone()
+        if state == "expired_zero":
+            assert prior == ("failed", 0)
+        else:
+            assert prior == ("running", None)
+    case.session = case.new_session()
+    again = case.observe()
+    assert again["status"] == result["status"]
+    assert case.session.financial_attempts() == 0 and len(case.sends) == int(success)
+
+
+def test_expired_margin_permit_stops_before_mock_send(tmp_path, monkeypatch):
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T10:00")
+
+    def delayed_transport(token, endpoint, params, fields, remaining, admit):
+        case.now += timedelta(minutes=3)
+        admit()
+        pytest.fail("expired work reached mock send")
+
+    monkeypatch.setattr(cold, "post", delayed_transport)
+    assert case.observe()["status"] == "unverified"
+    assert case.session.financial_attempts() == 0
+    with MarketHistoryStore.open_provider_request_authority(case.session.history) as store:
+        assert store._connection.execute(
+            "SELECT count(*) FROM provider_request_attempts"
+        ).fetchone() == (0,)
+
+
+def test_margin_rechecks_completed_cache_at_claim(tmp_path, monkeypatch):
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T10:00")
+    checked = full.cached_margin
+    reads = 0
+
+    def observed_cache(*args):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            # Another completed projection becomes visible after the first lookup.
+            case.seed_old_result(timedelta(0))
+            return None
+        return checked(*args)
+
+    monkeypatch.setattr(full, "cached_margin", observed_cache)
+    result = case.observe()
+    assert result["status"] == "valid_empty" and result["acquisition"] == "coordinator_cache"
+    assert reads >= 2 and case.sends == [] and case.session.financial_attempts() == 0
+
+
+@pytest.mark.parametrize(
+    "state", ["orphan_event", "missing_attempt", "inconsistent_zero", "nullable_scope"]
+)
+def test_ambiguous_terminal_margin_history_stays_blocked(tmp_path, monkeypatch, state):
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T08:40")
+    old = case.seed_old_result(timedelta(0))
+    case.now += timedelta(hours=1)
+    with MarketHistoryStore.open_provider_request_authority(case.session.history) as store:
+        db = store._connection
+        if state == "orphan_event":
+            db.execute(
+                "DELETE FROM provider_request_sequences WHERE sequence_id=?", (old.sequence_id,)
+            )
+        elif state == "missing_attempt":
+            db.execute(
+                "DELETE FROM provider_request_attempts WHERE sequence_id=?", (old.sequence_id,)
+            )
+        elif state == "nullable_scope":
+            db.execute(
+                "UPDATE provider_request_attempts SET capacity_scope=NULL WHERE sequence_id=?",
+                (old.sequence_id,),
+            )
+        else:
+            db.execute(
+                "UPDATE provider_request_sequences SET status='failed', failure_outcome_kind='abandoned', "
+                "failure_error_code=?, final_physical_attempt_count=0 WHERE sequence_id=?",
+                (
+                    "personal_margin_expired_before_send",
+                    old.sequence_id,
+                ),
+            )
+    assert case.observe()["status"] == "prior_margin_attempt_unsettled"
+    assert case.sends == [] and case.session.financial_attempts() == 0
+
+
+def test_margin_lifecycle_preserves_new_lease_generation(tmp_path, monkeypatch):
+    from scripts.personal_margin_coordinator import (
+        PersonalMarginCoordinator,
+        PriorMarginRequestUnsettled,
+    )
+
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T10:00")
+    s = case.session
+    with MarketHistoryStore.open_provider_request_authority(s.history) as store:
+        coord = PersonalMarginCoordinator(
+            store,
+            full.margin_key(case.binding, s.account_scope),
+            s.service,
+            lambda: None,
+            lambda: case.now,
+        )
+        old = _acquire_fixture_margin(coord, s, case.binding, case.now)
+        seq = coord._sequence_id(old)
+        coord._create_retry_sequence(seq, old)
+        case.now += timedelta(minutes=3)
+        current = _acquire_fixture_margin(coord, s, case.binding, case.now)
+        assert current.owner_id == old.owner_id and current.acquired_at != old.acquired_at
+        assert coord.renew(old, now=case.now, lease_duration=timedelta(minutes=2)) is None
+        coord.release(old)
+        with pytest.raises(PriorMarginRequestUnsettled):
+            coord._create_retry_sequence(seq, old)
+        assert coord.renew(current, now=case.now, lease_duration=timedelta(minutes=2)) is not None
+        assert not coord.physical_attempt_events(seq)
+        current_seq = coord._sequence_id(current)
+        coord._create_retry_sequence(current_seq, current)
+        coord._close_running_sequence(
+            sequence_id=current_seq, completed_at=case.now, error_code="synthetic_terminal"
+        )
+        with pytest.raises(PhysicalAttemptFailure):
+            coord._start_attempt_event(
+                sequence_id=current_seq,
+                lease=current,
+                service_name=s.name,
+                operation="margin_detail",
+                attempt_index=1,
+                attempted_at=case.now,
+                pacing_event="permit_acquired",
+                pacing_wait_seconds=0,
+            )
+        assert not coord.physical_attempt_events(current_seq)
+        sampled_before_lock = case.now
+        case.now += timedelta(minutes=3)
+        assert (
+            coord.renew(current, now=sampled_before_lock, lease_duration=timedelta(minutes=2))
+            is None
+        )
+
+
+def test_generic_recovery_without_original_lease_stays_blocked(tmp_path, monkeypatch):
+    case = MarginWindow(tmp_path, monkeypatch, "600895.SH", "2024-03-01", "2024-03-02T10:00")
+    session = case.session
+    with MarketHistoryStore.open_provider_request_authority(session.history) as store:
+        coord = ProviderRequestCoordinator(store)
+        lease = _acquire_fixture_margin(coord, session, case.binding, case.now)
+        sequence = coord._sequence_id(lease)
+        coord._create_retry_sequence(sequence, lease)
+        case.now += timedelta(minutes=3)
+        # An earlier unrelated data step can run ordinary expiry recovery first.
+        other = coord.acquire(
+            request_key="other-synthetic-data-step",
+            upstream_service_id=session.service,
+            owner_id="other-fixture-worker",
+            priority=RequestPriority.INTERACTIVE_MAINLAND,
+            now=case.now,
+            lease_duration=timedelta(minutes=2),
+            cooldown_scope="market-snapshot",
+        ).lease
+        assert other is not None
+        coord.release(other)
+        assert store._connection.execute(
+            "SELECT failure_error_code, final_physical_attempt_count "
+            "FROM provider_request_sequences WHERE sequence_id=?",
+            (sequence,),
+        ).fetchone() == ("coordinator_lease_expired", 0)
+    assert case.observe()["status"] == "prior_margin_attempt_unsettled"
+    assert case.session.financial_attempts() == 0 and case.sends == []
