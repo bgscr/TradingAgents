@@ -22,15 +22,15 @@ py -3.13 -m venv .venv
 
 首次取数针对一个标的核验上市身份和交易所，按北京时间选择最近已收盘交易日，核对该股当日成交、收盘与复权数据，再准备资产负债表、利润表和现金流量表的公告日期区间。合格缓存优先复用。三表每个端点最多尝试一次，分析期间只读财报缓存；成功空表会保留为无可用行。交易所覆盖有缺口、个股无合格收盘、账户拒绝或返回不完整时会停止。财报同一端点若有多个被新鲜数据隔开的缺口，保留原数据并报告 `disjoint_statement_gaps`。
 
-首次准备与后续分析共用总尝试和截止时间，总计最多 60 次、财务最多 3 次、最长 20 分钟，并服从更小的项目预算。证券、行情、三张财报及融资使用固定 Tushare HTTPS 来源和本地账户限速。模型只使用 DeepSeek HTTPS。默认 Full 还允许在项目配置已允许 AKShare 时读取一个东方财富公开新闻搜索页，最多一次，只传股票代码，不带账户凭据，不打开文章链接，不重试。经来源、股票和时间核验的文章链接与发布时间保存在回执。面向正文的研究工具会收到 `personal_news_index_only` 缺项，标题、正文及其情绪均未验证。四个分析师之后还有多空辩论、交易员、风险团队与最终决策。证据不足时可以无评级。
+首次准备与后续分析共用总尝试和截止时间，总计最多 60 次、最长 20 分钟，并服从更小的项目预算。证券、行情、三张财报及融资使用固定 Tushare HTTPS 来源和本地账户限速。模型只使用 DeepSeek HTTPS。默认 Full 还允许在项目配置已允许 AKShare 时读取一个东方财富公开新闻搜索页，最多一次，只传股票代码，不带账户凭据，不打开文章链接，不重试。经来源、股票和时间核验的文章链接与发布时间保存在回执。面向正文的研究工具会收到 `personal_news_index_only` 缺项，标题、正文及其情绪均未验证。四个分析师之后还有多空辩论、交易员、风险团队与最终决策。证据不足时可以无评级。
 
-`-SkipNews`、`-SkipMargin`、`-SkipRatio` 可逐项关闭。例：`.\start_personal_research.ps1 -Ticker 000001.SZ -SkipNews -Run` 只使用账户数据和已有合格占比缓存。`-Basic` 显式关闭全部三项。以上选项都保留完整研究图与同一预算。`-CheckOnly` 仅列出选择与核心准备状态，无法离线确认真实账户对融资端点的权限。
+`-SkipNews`、`-SkipMargin`、`-SkipRatio` 可逐项关闭。例：`.\start_personal_research.ps1 -Ticker 000001.SZ -SkipNews -Run` 只使用账户数据和已有合格占比缓存。`-Basic` 显式关闭全部三项。以上选项都保留完整研究图。Basic 和跳过融资的 Full 沿用最多三次财务尝试。`-CheckOnly` 仅列出选择与核心准备状态，无法离线确认真实账户对融资端点的权限。
 
 个人数据按账户保存在 `reports/personal/.data/`，成功或已开始准备的失败运行在 `reports/personal/<run_id>/status.json` 留下结果，成功时用其中的 `report_relative_path` 找到中文报告。已明确配置原有个人 CURRENT 数据源、身份与限速库的用户可显式加 `-PreparedData` 使用已有资料，其财报仍然只读。受控历史回放继续使用原有入口。
 
 ### 首次取得东财占比
 
-**2000 分账户**可先运行下方预检。普通 Full 保留占比缓存读取；干净安装没有合格历史行时会报告缺项。三表与融资余额的公布门槛为 2000 分，同次三个财务名额若都用于三表，融资也须留缺。同账户的新鲜合格缓存可减少所需请求。是否已有目标日数据、账户实际授权和额度，都不能由积分声明证明。[三表积分说明](https://tushare.pro/document/1?doc_id=108) · [融资余额的更新及权限](https://tushare.pro/document/2?doc_id=59)
+**2000 分账户**可先运行下方预检。普通 Full 保留占比缓存读取；干净安装没有合格历史行时会报告缺项。三表与融资余额的公布门槛为 2000 分，个人 Full 为合格的融资余额查询单独预留一次；即使三表均需补查，融资仍可在总次数和时限内查询一次。同账户的新鲜合格缓存可减少所需请求。是否已有目标日数据、账户实际授权和额度，都不能由积分声明证明。[三表积分说明](https://tushare.pro/document/1?doc_id=108) · [融资余额的更新及权限](https://tushare.pro/document/2?doc_id=59)
 
 ```powershell
 .\start_personal_research.ps1 -Ticker 601328.SH -CheckOnly -TusharePoints 2000
@@ -57,8 +57,8 @@ py -3.13 -m venv .venv
 | 评级 | `rating_status=validated_decision` 表示通过图的决策门；`no_rating` 表示研究结束、无可验证评级；失败时为 `unavailable`。预检不会产生评级。 |
 | 市场与财报 | `verified_inputs` 列出身份、所选股票收盘、交易所日历和各报表的公告区间检查。成功空响应会明确标注，不能推断财务值为零。 |
 | 新闻 | `source_evidence.news` 给出单页窗口、收到时间和匹配文章的来源链接、上海发布时间。`news_evidence_scope=publication_index_only` 与 `news_content_verified=false` 说明仅核实观察时该页列有匹配链接及所标时间。索引不能佐证报道主题、事件事实、情绪或投资方向。新闻分析师无法从这个索引取得正文，评级不引用索引作为内容证据。单页缺行无法证明市场没有相关新闻。 |
-| 融资余额 | 报告封存后先读已验证协调缓存。回溯窗口开放（北京时间已过所选交易日）且财务额度有余时，才可用本人账户查询同股同日 `margin_detail.rzye`。三表、融资和可选的东财占比账户查询合计最多三次。列出交易日、观察时间及人民币元，成功空行不补零。 |
-| 东财占比 | 默认只读合格的个人缓存。`-FetchEastmoneyRatio` 允许在报告封存后由本人账户补查一次。固定请求 `moneyflow_dc` 的 `ts_code,trade_date,net_amount_rate`，只认同股、同日及主力净流入百分比，成功后读回物理账本验证。错日、返回额外列或权限不足均不给出占比。 |
+| 融资余额 | 报告封存后先读已验证协调缓存。回溯窗口开放（北京时间已过所选交易日）且财务额度有余时，才可用本人账户查询同股同日 `margin_detail.rzye`。个人 Full 选用融资时，回执列出 `financial_attempt_limit=4` 和 `financial_reserved_endpoint=margin_detail`。`financial_attempts` 是实际物理尝试数，合格缓存命中不消耗名额。列出交易日、观察时间及人民币元，成功空行不补零。 |
+| 东财占比 | 默认只读合格的个人缓存。`-FetchEastmoneyRatio` 允许在报告封存后由本人账户使用前三次财务尝试中的剩余名额补查一次。固定请求 `moneyflow_dc` 的 `ts_code,trade_date,net_amount_rate`，只认同股、同日及主力净流入百分比，成功后读回物理账本验证。错日、返回额外列或权限不足均不给出占比。 |
 
 `evidence_preset=full` 为默认个人模式。`enhancements` 分别记录 `not_selected`、`permission_not_configured` / `permission_denied`、`valid_empty`、`publication_pending`、`date_mismatch`、`verified` 等结果。`enhancement_coverage=all_three_verified` 只表示该股票及交易日的三项观察均有证据。`full_data_acceptance` 保守标为 `unverified`，单页新闻及事后观察均不能证明截至收盘的完整信息。融资和资金流仅作为本次回执中的事后补充，不改变已写入的评级。`-PreparedData` 沿用独立的旧个人数据配置，未建立个人账户隔离会话时不在那里补采。PowerShell 的运行监督器在达到截止时间时返回 124；此时按本地记录核对已发生的用量，避免重复启动。
 

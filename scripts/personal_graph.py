@@ -367,6 +367,11 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         ),
         **data_scope(config),
     }
+    if preparation is not None and preparation.margin_reserve:
+        from scripts.personal_bootstrap import SHARED_FINANCIAL_LIMIT
+
+        receipt["financial_attempt_limit"] = SHARED_FINANCIAL_LIMIT + 1
+        receipt["financial_reserved_endpoint"] = "margin_detail"
     output.mkdir(parents=True, exist_ok=False)
     stop_stage = "graph_setup"
 
@@ -500,9 +505,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             for key in ("admitted_attempts", "data_attempts"):
                 if key in preliminary:
                     preliminary[key] += sum(preparation.counts.values())
-            preliminary["financial_attempts"] = sum(
-                preparation.counts.get(k, 0) for k in ("balancesheet", "income", "cashflow")
-            )
+            preliminary["financial_attempts"] = preparation.financial_attempts()
         with status_path.open("x", encoding="utf-8") as stream:
             json.dump(preliminary, stream, ensure_ascii=False)
         if (

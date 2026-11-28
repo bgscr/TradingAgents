@@ -25,6 +25,7 @@ FIELDS = {
 }
 FINANCE = ("balancesheet", "income", "cashflow")
 SUPPLEMENTAL_FINANCE = ("margin_detail", "moneyflow_dc")
+SHARED_FINANCIAL_LIMIT = 3
 
 
 def digest_bytes(data):
@@ -199,6 +200,9 @@ class Session:
 
         self.account_scope = config.get("tushare_account_scope_label")
         self.fetch_dc_ratio = config.get("personal_fetch_dc_ratio") is True
+        self.margin_reserve = config.get("personal_mode") == "full" and (
+            "margin_balance" in config.get("personal_sources", ())
+        )
         self.maximum = config["analysis_max_calls"]
         duration = config["analysis_timeout_seconds"]
         if (
@@ -297,6 +301,20 @@ class Session:
     def financial_attempts(self):
         return sum(self.counts.get(k, 0) for k in (*FINANCE, *SUPPLEMENTAL_FINANCE))
 
+    def financial_capacity_available(self, endpoint):
+        used = self.financial_attempts()
+        if self.counts.get(endpoint, 0):
+            return False
+        if used < SHARED_FINANCIAL_LIMIT:
+            return True
+        if not self.margin_reserve or used != SHARED_FINANCIAL_LIMIT:
+            return False
+        # An earlier margin request already used the reserve. A statement can
+        # still take its ordinary slot. A ratio request never gets a fourth send.
+        return endpoint == "margin_detail" or (
+            endpoint in FINANCE and self.counts.get("margin_detail") == 1
+        )
+
     def query(self, token, endpoint, params, fields, *, observation_binding=None):
         from tradingagents.market_history.coordinator import (
             ProviderRequestCoordinator,
@@ -340,7 +358,7 @@ class Session:
                 sum(self.counts.values()) >= self.maximum
                 or self.counts.get(endpoint, 0)
                 or endpoint in (*FINANCE, *SUPPLEMENTAL_FINANCE)
-                and self.financial_attempts() >= 3
+                and not self.financial_capacity_available(endpoint)
             ):
                 raise PreparationError("personal_attempt_limit")
 

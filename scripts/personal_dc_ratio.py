@@ -252,7 +252,7 @@ def observe(session, binding, token, authority, *, fetch):
     value = cached(authority, key, binding)
     if not fetch or value["status"] not in ("cache_missing", "cache_stale"):
         return value
-    if session.financial_attempts() >= 3:
+    if not session.financial_capacity_available(ENDPOINT):
         return {"status": "financial_budget_unavailable"}
     try:
         session.query(

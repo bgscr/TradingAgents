@@ -294,7 +294,7 @@ def margin_observation(session, binding, token, account, authority):
         source = "account_request"
         if day >= cold.now().astimezone(SHANGHAI).date():
             return {"status": "publication_pending", "rule": "retrospective_window_not_open"}
-        if session.financial_attempts() >= 3:
+        if not session.financial_capacity_available("margin_detail"):
             return {"status": "financial_budget_unavailable"}
         try:
             value = session.query(

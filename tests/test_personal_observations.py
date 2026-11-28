@@ -2,7 +2,7 @@
 
 import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -258,6 +258,8 @@ def binding(day=DAY):
         ("wrong_day", "date_mismatch", 1),
         ("same_day", "publication_pending", 0),
         ("statements_used_three", "financial_budget_unavailable", 0),
+        ("basic", "financial_budget_unavailable", 0),
+        ("skip_margin", "financial_budget_unavailable", 0),
     ],
 )
 def test_own_margin_scope_and_physical_cache(tmp_path, monkeypatch, case, status, calls):
@@ -265,13 +267,17 @@ def test_own_margin_scope_and_physical_cache(tmp_path, monkeypatch, case, status
     from tradingagents.market_history.store import MarketHistoryStore
 
     c = profile(tmp_path)
+    if case == "basic":
+        c.update(personal_mode="basic", personal_sources=())
+    elif case == "skip_margin":
+        c.update(personal_mode="full", personal_sources=("news", "eastmoney_fundflow_ratio"))
     s = cold.Session(c, (time.time(), time.monotonic()))
     s.symbol, s.day = SYMBOL, date.fromisoformat(DAY)
     moment = datetime.fromisoformat(
         ("2024-02-29" if case == "same_day" else "2024-03-01") + "T04:00:00+00:00"
     )
     monkeypatch.setattr(cold, "now", lambda: moment)
-    if case == "statements_used_three":
+    if case in {"statements_used_three", "basic", "skip_margin"}:
         s.counts = dict.fromkeys(cold.FINANCE, 1)
     with MarketHistoryStore.open_provider_request_authority(s.history):
         pass
@@ -310,6 +316,102 @@ def test_own_margin_scope_and_physical_cache(tmp_path, monkeypatch, case, status
             and again["acquisition"] == "coordinator_cache"
             and len(sent) == 1
         )
+
+
+@pytest.mark.parametrize("margin_position", range(4))
+def test_reserved_margin_and_statements_in_any_order(tmp_path, monkeypatch, margin_position):
+    from scripts import personal_dc_ratio as ratio
+    from tests.test_personal_bootstrap import feed_for
+    from tradingagents.default_config import DEFAULT_CONFIG
+    from tradingagents.market_history.config import provider_request_authority_config
+    from tradingagents.market_history.store import MarketHistoryStore
+
+    token = "synthetic-example"
+    feed = feed_for(monkeypatch, SYMBOL)
+    feed.instant += timedelta(hours=17)
+    c = cold.profile(DEFAULT_CONFIG, tmp_path, {"TUSHARE_TOKEN": token})
+    c.update(personal_mode="full", personal_sources=full.SOURCES, personal_fetch_dc_ratio=True)
+    s = cold.Session(c, (time.time(), time.monotonic()))
+    s.symbol, s.day, s.today = SYMBOL, date.fromisoformat(DAY), feed.instant.date()
+    with MarketHistoryStore.open_provider_request_authority(s.history):
+        pass
+    authority = provider_request_authority_config(s.history)
+    order = list(cold.FINANCE)
+    order.insert(margin_position, "margin_detail")
+    params = {
+        "ts_code": binding()["symbol"], "report_type": "1",
+        "start_date": "20180101", "end_date": "20240229",
+    }
+
+    def query_ratio():
+        return s.query(
+            token, ratio.ENDPOINT, {"ts_code": binding()["symbol"], "trade_date": "20240229"},
+            ratio.FIELDS, observation_binding=binding(),
+        )
+
+    for endpoint in order:
+        if len(feed.calls) == 3:
+            rejected = ratio.observe(s, binding(), token, authority, fetch=True)
+            assert rejected["status"] == "financial_budget_unavailable"
+            with pytest.raises(cold.PreparationError, match="personal_attempt_limit"):
+                query_ratio()
+        if endpoint == "margin_detail":
+            result = full.margin_observation(s, binding(), token, s.account_scope, authority)
+            assert result["status"] == "verified"
+        else:
+            s.query(token, endpoint, params, "")
+    assert s.financial_attempts() == 4
+    with pytest.raises(cold.PreparationError, match="personal_attempt_limit"):
+        query_ratio()
+    with pytest.raises(cold.PreparationError, match="personal_attempt_limit"):
+        s.query(token, "income", params, "")
+    assert feed.calls == order
+
+
+@pytest.mark.parametrize("boundary", ["total", "deadline", "at_send"])
+def test_margin_reserve_respects_physical_boundaries(tmp_path, monkeypatch, boundary):
+    from tradingagents.market_history.config import provider_request_authority_config
+    from tradingagents.market_history.store import MarketHistoryStore
+
+    c = dict(profile(tmp_path), personal_mode="full", personal_sources=full.SOURCES)
+    s = cold.Session(c, (time.time(), time.monotonic()))
+    s.symbol, s.day = SYMBOL, date.fromisoformat(DAY)
+    s.counts = dict.fromkeys(cold.FINANCE, 1)
+    if boundary == "total":
+        # The graph has finalized 57 attempts, leaving three for preparation/supplements.
+        s.maximum -= 57
+    if boundary == "deadline":
+        s.deadline = time.monotonic() - 1
+    entered = []
+
+    def wire(token, endpoint, params, fields, remaining, admit):
+        entered.append(endpoint)
+        s.maximum = sum(s.counts.values())
+        try:
+            admit()
+        except cold.PreparationError as exc:
+            assert str(exc) == "personal_attempt_limit"
+            entered.append("admission_denied")
+            raise
+        pytest.fail("physical send after budget exhaustion")
+
+    monkeypatch.setattr(cold, "post", wire)
+    with MarketHistoryStore.open_provider_request_authority(s.history):
+        pass
+    authority = provider_request_authority_config(s.history)
+    error = "personal_deadline_reached" if boundary == "deadline" else "personal_attempt_limit"
+
+    def observe():
+        return full.margin_observation(s, binding(), "synthetic", s.account_scope, authority)
+
+    if boundary == "at_send":
+        # The coordinator projects a send-stage failure to the observation's safe status.
+        assert observe()["status"] == "unverified"
+    else:
+        with pytest.raises(cold.PreparationError, match=error):
+            observe()
+    assert entered == (["margin_detail", "admission_denied"] if boundary == "at_send" else [])
+    assert s.financial_attempts() == 3
 
 
 @pytest.mark.parametrize(

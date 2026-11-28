@@ -557,6 +557,10 @@ except BaseException:
     assert not (project / "reports").exists() and not trace.exists()
     # Low-points research still exercises the normal graph. Keep the no-option path on Shenzhen.
     options = ("-TusharePoints", "2000") if ticker.endswith(".SH") else ()
+    # Shanghai starts the following morning with an empty account cache.
+    retrospective = ticker.endswith(".SH")
+    if retrospective:
+        env["PERSONAL_FIXTURE_NEXT_MORNING"] = "1"
     code, receipt = launch("-Run", *options)
     assert receipt["moneyflow_dc_access"]["points_status"] == (
         "below_minimum" if options else "undeclared"
@@ -571,8 +575,8 @@ except BaseException:
     assert receipt["full_data_acceptance"] == "unverified" and receipt["evidence_preset"] == "full"
     assert receipt["enhancements"] == {
         "news": "verified",
-        "margin_balance": "publication_pending",
-        "eastmoney_fundflow_ratio": "publication_pending",
+        "margin_balance": "verified" if retrospective else "publication_pending",
+        "eastmoney_fundflow_ratio": "cache_missing_or_unverified" if retrospective else "publication_pending",
     }
     assert len(receipt["source_evidence"]["news"]["articles"]) == 1
     assert (
@@ -588,7 +592,12 @@ except BaseException:
     counts = trace.read_text().splitlines()
     assert len(counts) == receipt["admitted_attempts"] <= 60
     assert counts.count("model") == receipt["model_attempts"] > 0
-    assert receipt["financial_attempts"] == 3
+    assert receipt["financial_attempt_limit"] == 4
+    assert receipt["financial_reserved_endpoint"] == "margin_detail"
+    assert receipt["financial_attempts"] == (4 if retrospective else 3)
+    assert all(counts.count("prepare:" + endpoint) == 1 for endpoint in cold.FINANCE)
+    assert counts.count("prepare:margin_detail") == int(retrospective)
+    assert "prepare:moneyflow_dc" not in counts
     out = project / "reports/personal" / receipt["run_id"]
     assert json.loads((out / "status.json").read_bytes()) == receipt
     markdown = (out / receipt["report_relative_path"]).read_text("utf8")
@@ -624,8 +633,8 @@ except BaseException:
     assert next_day["moneyflow_dc_access"]["entitlement_checked"] is False
     assert code in (0, 3) and next_day["report_written"], next_day
     assert next_day["exchange_session"] == "2024-02-29"
-    assert next_day["financial_attempts"] == 2
-    assert next_day["supplement_attempts"].get("margin_detail") == 1
+    assert next_day["financial_attempts"] == (1 if retrospective else 2)
+    assert next_day["supplement_attempts"].get("margin_detail", 0) == int(not retrospective)
     assert next_day["supplement_attempts"].get("moneyflow_dc") == 1
     assert all(name not in next_day["preparation_attempts"] for name in cold.FINANCE)
     assert (
@@ -646,6 +655,15 @@ except BaseException:
     later = trace.read_text().splitlines()
     assert next_day["admitted_attempts"] == len(later) - len(counts) <= 60
     counts = later
+    if retrospective:
+        code, cached = launch("-Run", "-TusharePoints", "2000")
+        assert code in (0, 3) and cached["financial_attempts"] == 0
+        assert cached["source_evidence"]["margin_balance"]["acquisition"] == "coordinator_cache"
+        after_cache = trace.read_text().splitlines()
+        added = after_cache[len(counts):]
+        assert cached["admitted_attempts"] == len(added) <= 60
+        assert set(added).isdisjoint("prepare:" + e for e in (*cold.FINANCE, *cold.SUPPLEMENTAL_FINANCE))
+        counts = after_cache
     env.update(TRADINGAGENTS_ANALYSIS_TIMEOUT_SECONDS="1", PERSONAL_FIXTURE_STALL="1")
     stopped = subprocess.run(
         [
