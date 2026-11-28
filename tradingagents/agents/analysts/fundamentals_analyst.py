@@ -37,9 +37,9 @@ def create_fundamentals_analyst(llm):
                 ticker=ticker,
                 trade_date=current_date,
                 messages=messages,
-                complete_statement_rows=True,
+                personal_statements=True,
             )
-            return build_analyst_update(state, result, "fundamentals_report")
+            return build_analyst_update(state, result, "fundamentals_report", personal_statements=True)
         instrument_context = get_instrument_context_from_state(state)
 
         data_tools = [

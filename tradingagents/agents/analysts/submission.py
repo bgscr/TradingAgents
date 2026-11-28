@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,6 +15,10 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from tradingagents.agents.analysts.statement_excerpts import (
+    statement_excerpts,
+    verified_row_freshness,
+)
 from tradingagents.agents.utils.structured import (
     SubmissionConstraintError,
     bind_required_structured,
@@ -51,7 +56,11 @@ from tradingagents.evidence import (
     stable_acquisition_source_ref,
     verified_financial_observations,
 )
-from tradingagents.financial_observations import FINANCIAL_TOOLS, STATEMENT_TITLES
+from tradingagents.financial_observations import (
+    CURRENT_STATEMENT_COLUMNS,
+    FINANCIAL_TOOLS,
+    STATEMENT_TITLES,
+)
 from tradingagents.run_diagnostics import record_output
 
 logger = logging.getLogger(__name__)
@@ -179,15 +188,24 @@ class AnalystSubmissionResult:
     notes: tuple[EvidenceNote, ...] = ()
 
 
-class _PersonalFundamentalsCitation(BaseModel):
+_STATEMENT_REPORT_CHARS = 480
+_STATEMENT_ENTRY_CHARS = 96
+_STATEMENT_MAX_CLAIMS = 6
+_STATEMENT_MAX_NOTES = 3
+
+
+class _PersonalStatementEntry(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    statement: str = Field(min_length=1)
-    source_ref: str = Field(min_length=1)
-    source_quote: str = Field(min_length=1)
+    statement: str = Field(min_length=1, max_length=_STATEMENT_ENTRY_CHARS)
 
 
-class _PersonalFundamentalsNote(_PersonalFundamentalsCitation):
+class _PersonalFundamentalsCitation(_PersonalStatementEntry):
+    evidence_id: str = Field(pattern=r"^R[0-9]{3}$")
+
+
+class _PersonalFundamentalsNote(_PersonalStatementEntry):
+    evidence_id: str = Field(pattern=r"^N[0-9]{3}$")
     kind: Literal["provenance", "availability", "coverage", "applicability"]
 
 
@@ -196,9 +214,9 @@ class PersonalFundamentalsReport(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    report_markdown: str = Field(min_length=1)
-    material_claims: tuple[_PersonalFundamentalsCitation, ...]
-    evidence_notes: tuple[_PersonalFundamentalsNote, ...]
+    report_markdown: str = Field(min_length=1, max_length=_STATEMENT_REPORT_CHARS)
+    material_claims: tuple[_PersonalFundamentalsCitation, ...] = Field(max_length=_STATEMENT_MAX_CLAIMS)
+    evidence_notes: tuple[_PersonalFundamentalsNote, ...] = Field(max_length=_STATEMENT_MAX_NOTES)
 
 
 def bind_analyst_finalizer(llm: Any, analyst: str, *, personal_statements: bool = False) -> Any | None:
@@ -430,6 +448,65 @@ def render_allowed_source_ref_catalog(
     )
 
 
+def _personal_statement_prompt(messages, ticker, trade_date) -> tuple[str, dict[str, tuple[str, str]]]:
+    from tradingagents.agents.utils.agent_utils import get_language_instruction
+
+    calls = _tool_calls_by_id(messages)
+    sources = []
+    for message in messages:
+        result = _dispatched_statement(message, ticker, trade_date, calls)
+        if result is not None and result.disposition == "executed":
+            frequency = _statement_frequency(calls[message.tool_call_id])
+            sources.append((message, result, frequency))
+    groups = Counter((message.name, frequency) for message, _, frequency in sources)
+    catalog = {}
+    next_id = {"R": 1, "N": 1}
+    sections = []
+    gaps = []
+    for message, result, frequency in sources:
+        if groups[message.name, frequency] != 1:
+            continue
+        label = f"{message.name} ({frequency}) through {trade_date}"
+        if result.artifact_sha256 is None:
+            reasons = ", ".join(sorted({outcome.reason.value for outcome in result.acquisition_outcomes}))
+            gaps.append(f"- {label}: {reasons}.")
+            continue
+        rows, notes, missing = statement_excerpts(
+            message.content if isinstance(message.content, str) else "",
+            tool_name=message.name, frequency=frequency, ticker=ticker, trade_date=trade_date,
+            source_ref=result.request_ref, tool_call_id=message.tool_call_id,
+            artifact_sha256=result.artifact_sha256,
+        )
+        if not rows:
+            gaps.append(f"- {label}: no bindable core statement rows.")
+            continue
+        gaps.extend(f"- {label}: {entry}." for entry in missing)
+        sections.append(f"# {STATEMENT_TITLES[message.name]} data for {ticker} ({frequency})")
+        for prefix, excerpts in (("R", rows), ("N", notes)):
+            for quote in excerpts:
+                evidence_id = f"{prefix}{next_id[prefix]:03d}"
+                next_id[prefix] += 1
+                catalog[evidence_id] = (result.request_ref, quote)
+                sections.append(f"{evidence_id} | {quote}")
+    if any(count > 1 for count in groups.values()):
+        gaps.append("- Duplicate statement scopes were excluded.")
+    prompt = (
+        f"Finalize the fundamentals analyst report for {ticker} on {trade_date}. "
+        f"Return one PersonalFundamentalsReport JSON object. report_markdown: at most {_STATEMENT_REPORT_CHARS} characters. "
+        f"Select up to {_STATEMENT_MAX_CLAIMS} material_claims using R IDs and up to {_STATEMENT_MAX_NOTES} evidence_notes using N IDs. "
+        f"Each statement is at most {_STATEMENT_ENTRY_CHARS} characters. Use [] if no supported entry. "
+        "Return only the ID as evidence_id. Keep each claim atomic and use only values visible on its one row. "
+        "Cover material findings, counterevidence and relevant gaps in short bullets without reproducing the evidence table. "
+        "Preserve units, period and freshness. CURRENT rows are advisory. Report missing values as unavailable. "
+        + get_language_instruction()
+        + "\n\nExact core statement excerpts. Row columns: " + ",".join(CURRENT_STATEMENT_COLUMNS) + "\n"
+        + ("\n".join(sections) if sections else "(none)")
+    )
+    if gaps:
+        prompt += "\n\nStatement acquisition gaps (report as limitations):\n" + "\n".join(gaps)
+    return prompt, catalog
+
+
 def _finalization_prompt(
     *,
     analyst: str,
@@ -438,23 +515,15 @@ def _finalization_prompt(
     draft: str,
     messages: list[Any],
     auxiliary_context: str = "",
-    complete_statement_rows: bool = False,
     personal_news_policy: bool = False,
 ) -> str:
     from tradingagents.agents.utils.agent_utils import get_language_instruction
 
     catalog = []
-    statement_gaps = []
     seen_artifacts = set()
     preview_omitted_evidence = False
     tool_calls_by_id = _tool_calls_by_id(messages)
     for message in messages:
-        result = (
-            _dispatched_statement(message, ticker, trade_date, tool_calls_by_id)
-            if complete_statement_rows else None
-        )
-        if result is not None and result.disposition == "duplicate_suppressed":
-            continue
         source_ref = _source_ref(
             message,
             ticker,
@@ -462,17 +531,11 @@ def _finalization_prompt(
             tool_calls_by_id,
         )
         artifact_key = (source_ref, str(getattr(message, "tool_call_id", "")))
-        if result is not None and result.artifact_sha256 is None:
-            frequency = _statement_frequency(tool_calls_by_id[message.tool_call_id])
-            reasons = ", ".join(sorted({outcome.reason.value for outcome in result.acquisition_outcomes}))
-            statement_gaps.append(f"- {message.name} ({frequency}) through {trade_date}: {reasons}.")
         if source_ref is None or artifact_key in seen_artifacts:
             continue
         seen_artifacts.add(artifact_key)
         content = str(getattr(message, "content", "")).strip()
-        if len(content) > _SOURCE_PREVIEW_LIMIT and not (
-            complete_statement_rows and getattr(message, "name", None) in STATEMENT_TITLES
-        ):
+        if len(content) > _SOURCE_PREVIEW_LIMIT:
             preview_omitted_evidence = True
             head_length = _SOURCE_PREVIEW_LIMIT // 2
             tail_length = _SOURCE_PREVIEW_LIMIT - head_length
@@ -484,11 +547,6 @@ def _finalization_prompt(
         catalog.append(f"- {source_ref}\n  Evidence: {content or '[empty tool result]'}")
     source_catalog = "\n".join(catalog) if catalog else "- (no source refs available)"
     source_context = f"Allowed source refs and collected evidence:\n{source_catalog}\n\n"
-    if statement_gaps:
-        source_context += (
-            "Statement acquisition gaps (report as limitations, never quote as source evidence):\n"
-            + "\n".join(statement_gaps) + "\n\n"
-        )
     if auxiliary_context:
         source_context += (
             "Deterministic auxiliary observations (report commentary only; do not add "
@@ -513,18 +571,6 @@ def _finalization_prompt(
         "Unvalidated prose draft (do not return it unless converted into the schema):\n"
         f"{draft.strip() or '[empty draft]'}"
     )
-    if complete_statement_rows:
-        return (
-            f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
-            "Return one PersonalFundamentalsReport JSON object. Provide concise report_markdown, "
-            "material_claims and evidence_notes. The application assigns IDs and the version. "
-            "Use [] for either array when there is no supported entry. Keep each statement "
-            "atomic and cite its exact available source_ref and one contiguous source_quote. "
-            "Record source limitations in the report. Only use evidence_notes when a unique "
-            "quotation actually supports the note. Leave unsupported claims out. "
-            "Preserve dates, units, reliability, counterevidence and any gaps. Do not duplicate tables. "
-            + _PERSONAL_EVIDENCE_GUIDANCE["fundamentals"] + language + source_context
-        )
     if _PERSONAL_FULL_PROMPTS.get() and analyst in _PERSONAL_EVIDENCE_GUIDANCE:
         # A draft may point to dated evidence outside a shortened preview.
         news_gap_guidance = (
@@ -607,16 +653,25 @@ def _normalize_submission(
 
 def _normalize_personal_fundamentals(
     submitted: PersonalFundamentalsReport,
+    catalog: Mapping[str, tuple[str, str]],
 ) -> tuple[str, tuple[MaterialClaim, ...], tuple[EvidenceNote, ...]]:
     content = PersonalFundamentalsReport.model_validate(submitted)
+
+    def resolve(entry):
+        match = catalog.get(entry.evidence_id)
+        if match is None:
+            raise SubmissionConstraintError("unknown_evidence_id")
+        source_ref, source_quote = match
+        return {"statement": entry.statement, "source_ref": source_ref, "source_quote": source_quote}
+
     canonical = AnalystEvidenceReport(
         report_markdown=content.report_markdown,
         material_claims=tuple(
-            SubmittedMaterialClaim(claim_id=f"fundamentals.claim-{index}", **claim.model_dump())
+            SubmittedMaterialClaim(claim_id=f"fundamentals.claim-{index}", **resolve(claim))
             for index, claim in enumerate(content.material_claims, 1)
         ),
         evidence_notes=tuple(
-            SubmittedEvidenceNote(note_id=f"fundamentals.note-{index}", **note.model_dump())
+            SubmittedEvidenceNote(note_id=f"fundamentals.note-{index}", kind=note.kind, **resolve(note))
             for index, note in enumerate(content.evidence_notes, 1)
         ),
     )
@@ -729,31 +784,28 @@ def finalize_analyst_submission(
     draft: str = "",
     messages: list[Any],
     auxiliary_context: str = "",
-    complete_statement_rows: bool = False,
+    personal_statements: bool = False,
     personal_news_policy: bool = False,
 ) -> AnalystSubmissionResult:
     if finalizer is None:
         return _unavailable_result(analyst, "unsupported")
-    prompt = _finalization_prompt(
-        analyst=analyst,
-        ticker=ticker,
-        trade_date=trade_date,
-        draft=draft,
-        messages=messages,
-        auxiliary_context=auxiliary_context,
-        complete_statement_rows=complete_statement_rows,
-        personal_news_policy=personal_news_policy,
-    )
-    validator = (
-        _normalize_personal_fundamentals if complete_statement_rows
-        else lambda submitted: _normalize_submission(submitted, analyst)
-    )
+    if personal_statements:
+        prompt, catalog = _personal_statement_prompt(messages, ticker, trade_date)
+        def validator(submitted):
+            return _normalize_personal_fundamentals(submitted, catalog)
+    else:
+        prompt = _finalization_prompt(
+            analyst=analyst, ticker=ticker, trade_date=trade_date, draft=draft,
+            messages=messages, auxiliary_context=auxiliary_context, personal_news_policy=personal_news_policy,
+        )
+        def validator(submitted):
+            return _normalize_submission(submitted, analyst)
     structured_result = invoke_required_structured(
         finalizer,
         prompt,
         f"{analyst.title()} Analyst",
         validator=validator,
-        personal_validation_details=personal_news_policy or complete_statement_rows,
+        personal_validation_details=personal_news_policy or personal_statements,
     )
     if structured_result.value is None:
         return _unavailable_result(
@@ -942,6 +994,8 @@ def build_analyst_update(
     state: Mapping[str, Any],
     result: AnalystSubmissionResult,
     report_key: str,
+    *,
+    personal_statements: bool = False,
 ) -> dict[str, Any]:
     update: dict[str, Any] = {
         "messages": [result.message],
@@ -1134,7 +1188,18 @@ def build_analyst_update(
             or any(ref in financial_refs for claim in result.claims for ref in claim.source_refs)):
         observations = verified_financial_observations(
             update["evidence_state"], claim_ids=(claim.claim_id for claim in result.claims))
-        rendered = "\n".join("- " + observation.render() for observation in observations)
+        freshness = {}
+        if personal_statements:
+            accepted = {observation.observation_id for observation in observations}
+            freshness = {
+                fact.financial_observation.observation_id: verified_row_freshness(fact.raw_text)
+                for fact in tool_evidence.source_facts
+                if fact.financial_observation and fact.financial_observation.observation_id in accepted
+            }
+        rendered = "\n".join(
+            "- " + observation.render() + freshness.get(observation.observation_id, "")
+            for observation in observations
+        )
         update[report_key] = (
             "## Advisory commentary / 咨询性文字\n"
             "Source quotation support does not verify this prose's financial meaning. "

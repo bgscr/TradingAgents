@@ -42,6 +42,7 @@ _LOCAL_REPAIRS = {
     "claim_namespace": "Start every claim_id with the analyst namespace followed by a dot.",
     "duplicate_note_id": "Give each distinct evidence note a unique note_id.",
     "claim_note_collision": "Use distinct identifiers for material claims and evidence notes.",
+    "unknown_evidence_id": "Use only evidence IDs shown in the original statement catalog.",
     "note_namespace": "Start every note_id with the analyst namespace followed by a dot."
 }
 
@@ -351,6 +352,7 @@ _REPORT_FIELDS = frozenset({
     "material_claims[].source_ref", "material_claims[].source_quote",
     "evidence_notes[].note_id", "evidence_notes[].kind", "evidence_notes[].statement",
     "evidence_notes[].source_ref", "evidence_notes[].source_quote",
+    "material_claims[].evidence_id", "evidence_notes[].evidence_id",
 })
 _VALIDATION_KINDS = frozenset({"json_syntax", "schema_validation", "validation_unspecified", *_LOCAL_REPAIRS})
 

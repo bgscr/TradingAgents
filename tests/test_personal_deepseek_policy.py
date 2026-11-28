@@ -12,10 +12,9 @@ from scripts import personal_bootstrap, personal_full
 from tests.test_current_tushare_statements import statement_rows
 from tests.test_personal_bootstrap import install_graph_boundary
 from tradingagents.agents.analysts.submission import (
-    _finalization_prompt,
+    _personal_statement_prompt,
     collected_personal_statements,
     finalize_observed_unavailable_news,
-    personal_full_prompt_scope,
 )
 from tradingagents.analysis_budget import httpx_transport_modules
 from tradingagents.dataflows.financial_dispatch import FinancialToolMessageAuditEnvelope
@@ -42,20 +41,20 @@ def _statement_claims(prompt):
         "Income Statement": "total_revenue",
         "Cash Flow": "n_cashflow_act",
     }
-    for source, title, table in re.findall(
-        r"^- (financial-request:v1:[a-f0-9]{64})\n  Evidence: # ([^\n]+) data for [^\n]+ \(quarterly\)\n(.*?)(?=\n- |\n\n|\Z)",
+    for title, table in re.findall(
+        r"^# ([^\n]+) data for [^\n]+ \((?:annual|quarterly)\)\n(.*?)(?=\n# |\n\n|\Z)",
         prompt,
         re.MULTILINE | re.DOTALL,
     ):
-        for line in table.splitlines():
-            if not line.startswith("2022-12-31,"):
+        for content in table.splitlines():
+            evidence_id, _, line = content.partition(" | ")
+            if not evidence_id.startswith("R") or not line.startswith("2022-12-31,"):
                 continue
             row = next(reader([line]))
             if row[5] == fields[title]:
                 yield {
                     "statement": f"2022-12-31 {row[8]}: {row[9]} CNY.",
-                    "source_ref": source,
-                    "source_quote": line,
+                    "evidence_id": evidence_id,
                 }
                 break
 
@@ -64,11 +63,14 @@ def _fundamental_wire_schema(prompt):
     _, found, raw = prompt.rpartition("\nJSON Schema:\n")
     schema = json.loads(raw) if found else {}
     fields = {"report_markdown", "material_claims", "evidence_notes"}
-    citation = {"statement", "source_ref", "source_quote"}
+    citation = {"statement", "evidence_id"}
     return (
         "matching PersonalFundamentalsReport" in prompt
         and schema.get("additionalProperties") is False
         and set(schema.get("required", ())) == set(schema.get("properties", {})) == fields
+        and schema["properties"]["report_markdown"]["maxLength"] == 480
+        and schema["properties"]["material_claims"]["maxItems"] == 6
+        and schema["properties"]["evidence_notes"]["maxItems"] == 3
         and {frozenset(entry["required"]) for entry in schema["$defs"].values()}
         == {frozenset(citation), frozenset({*citation, "kind"})}
         and all(
@@ -130,6 +132,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         phase = "debate_or_risk"
         completion_tokens = 12
         verified_statement_prompt = None
+        statement_output_chars = None
 
         def tool(name, args):
             calls = message.setdefault("tool_calls", [])
@@ -175,10 +178,10 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                         finish = tool(
                             name, {"ticker": "600895.SS", "curr_date": DAY, "freq": "quarterly"}
                         )
-                    finish = tool(
-                        "get_income_statement",
-                        {"ticker": "600895.SS", "curr_date": DAY, "freq": "annual"},
-                    )
+                    for name in sorted(STATEMENT_TOOLS):
+                        finish = tool(
+                            name, {"ticker": "600895.SS", "curr_date": DAY, "freq": "annual"}
+                        )
         elif body.get("response_format") == {"type": "json_object"}:
             phase = "finalizer"
             prompt = "\n".join(msg.get("content") or "" for msg in body["messages"])
@@ -233,7 +236,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                                 "report_markdown",
                                 "material_claims",
                                 "evidence_notes",
-                                "source_quote",
+                                "evidence_id",
                             )
                         ),
                         "date_and_currency": all(
@@ -248,34 +251,56 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                             if scenario == "fundamentals_coverage_gap"
                             else "Cash Flow data for 600895.SS (quarterly)" in prompt
                         ),
-                        "annual": "Income Statement data for 600895.SS (annual)" in prompt,
+                        "annual": all(
+                            f"{title} data for 600895.SS (annual)" in prompt
+                            for title in ("Balance Sheet", "Income Statement")
+                        ),
                         "no_draft": "Unvalidated prose draft" not in prompt,
                     }
-                    if scenario in {
+                    if wire_schema and scenario in {
                         "fundamentals_metadata",
                         "fundamentals_invalid_payload",
                         "fundamentals_coverage_gap",
                         "fundamentals_wrong_evidence",
+                        "fundamentals_false_value",
+                        "fundamentals_excess_claims",
                     }:
                         claims = list(_statement_claims(prompt))
-                        if not wire_schema:
-                            # Replay the old prompt following its namespace instruction but using localized IDs.
-                            claims = [
-                                dict(claim, claim_id=f"fundamentals.财报{index}")
-                                for index, claim in enumerate(claims)
-                            ]
                         if scenario == "fundamentals_invalid_payload":
-                            del claims[0]["source_quote"]
+                            del claims[0]["evidence_id"]
                             claims[0][PRIVATE_FIELD] = PARTIAL
                             completion_tokens = (
                                 2710 if "Previous structured attempt" not in prompt else 2978
                             )
                         if scenario == "fundamentals_wrong_evidence":
-                            claims[0]["source_quote"] += " altered"
-                            claims[1]["source_ref"] = "financial-request:v1:" + "0" * 64
+                            claims[0]["evidence_id"] = "R999"
+                        if scenario == "fundamentals_false_value":
+                            claims[0]["statement"] = "Reported value was 987654321 CNY."
+                        if scenario == "fundamentals_excess_claims":
+                            claims.append(claims[0].copy())
                         if scenario == "fundamentals_coverage_gap":
                             content["report_markdown"] = FINANCIAL_LIMITATION
                         content["material_claims"] = claims
+                        if scenario == "fundamentals_metadata":
+                            exact_rows = dict(
+                                re.findall(r"^(R[0-9]{3}) \| (.+)$", prompt, re.MULTILINE)
+                            )
+                            expanded = dict(
+                                content,
+                                material_claims=[
+                                    {
+                                        "statement": claim["statement"],
+                                        "source_ref": "financial-request:v1:" + "0" * 64,
+                                        "source_quote": exact_rows[claim["evidence_id"]],
+                                    }
+                                    for claim in claims
+                                ],
+                            )
+                            statement_output_chars = [
+                                len(json.dumps(item)) for item in (content, expanded)
+                            ]
+                    if scenario == "fundamentals_large_report":
+                        content["report_markdown"] = "测" * 481
                 message["content"] = json.dumps(content)
                 if analyst == "fundamentals":
                     if scenario == "fundamentals_partial_json":
@@ -321,6 +346,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             "tool_result": tool_result,
             "has_report_tool": "AnalystEvidenceReport" in names,
             "verified_statement_prompt": verified_statement_prompt,
+            "statement_output_chars": statement_output_chars,
             "replayed_reasoning": any("reasoning_content" in msg for msg in body["messages"]),
             "sdk_retry": request.headers.get("x-stainless-retry-count"),
         }
@@ -419,9 +445,20 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
             (e["observation"], e["validation_kind"], e["validation_fields"], e["completion_tokens"])
             for e in finalizers
         ] == [
-            ("schema_validation", "schema_validation", ["material_claims[].source_quote"], n)
+            ("schema_validation", "schema_validation", ["material_claims[].evidence_id"], n)
             for n in (2710, 2978)
         ]
+        return
+    if scenario == "fundamentals_wrong_evidence":
+        assert [(e["observation"], e["validation_kind"]) for e in finalizers] == [
+            ("validation_error", "unknown_evidence_id")
+        ] * 2
+        return
+    if scenario in {"fundamentals_large_report", "fundamentals_excess_claims"}:
+        field = "report_markdown" if scenario == "fundamentals_large_report" else "material_claims"
+        assert [(e["validation_kind"], e["validation_fields"]) for e in finalizers] == [
+            ("schema_validation", [field])
+        ] * 2
         return
     if scenario in {"fundamentals_partial_json", "fundamentals_duplicate_json"}:
         assert [(e["observation"], e["validation_kind"]) for e in finalizers] == [
@@ -436,7 +473,7 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
     if scenario not in {
         "fundamentals_metadata",
         "fundamentals_coverage_gap",
-        "fundamentals_wrong_evidence",
+        "fundamentals_false_value",
     }:
         return
     assert [e["observation"] for e in finalizers] == ["success"]
@@ -445,33 +482,43 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
     financial_claims = [
         row for row in evidence["material_claims"] if row["analyst"] == "fundamentals"
     ]
-    expected_count = 2 if scenario == "fundamentals_coverage_gap" else 3
+    expected_count = 4 if scenario == "fundamentals_coverage_gap" else 6
     assert [row["claim_id"] for row in financial_claims] == [
         f"fundamentals.claim-{n}" for n in range(1, expected_count + 1)
     ]
     validations = {row["claim_id"]: row for row in evidence["claim_validations"]}
     for index, claim in enumerate(financial_claims):
-        unsupported = scenario == "fundamentals_wrong_evidence" and index < 2
         row = validations[claim["claim_id"]]
-        assert row["status"] == ("unsupported" if unsupported else "supported")
-        assert bool(row["fact_ids"]) is (not unsupported)
+        expected = (
+            "unsupported" if scenario == "fundamentals_false_value" and index == 0 else "supported"
+        )
+        assert row["status"] == expected and row["fact_ids"]
     financial_facts = [row for row in evidence["source_facts"] if row.get("financial_context")]
-    assert len(financial_facts) == (
-        1 if scenario == "fundamentals_wrong_evidence" else expected_count
-    )
+    assert len(financial_facts) == (expected_count - (scenario == "fundamentals_false_value"))
     assert all(row["financial_context"]["decision_qualified"] is False for row in financial_facts)
     directional_facts = {row["fact_id"] for row in audit["validated_decision_context"]["facts"]}
     assert directional_facts.isdisjoint(row["fact_id"] for row in financial_facts)
     assert audit["admission_gate"]["admitted"] is True
+    report = (run_dir / receipt["report_relative_path"]).read_text(encoding="utf8")
+    if scenario == "fundamentals_metadata":
+        for marker in (
+            "total_assets | 1000 CNY",
+            "operating_revenue | 900 CNY",
+            "cash_from_operations | 160 CNY",
+            "period_end=2022-12-31",
+            "ann_date=2023-04-20",
+            "retrieved_at=2024-02-29",
+            "observed_at=2024-02-29",
+        ):
+            assert marker in report, marker
     if scenario == "fundamentals_coverage_gap":
-        report = (run_dir / receipt["report_relative_path"]).read_text(encoding="utf8")
         assert FINANCIAL_LIMITATION in report
         cashflow = [
             row
             for row in audit["financial_dispatch"]["requests"]
             if row["tool_name"] == "get_cashflow"
         ]
-        assert len(cashflow) == 1 and cashflow[0]["artifact_sha256"] is None
+        assert len(cashflow) == 2 and all(row["artifact_sha256"] is None for row in cashflow)
 
 
 @pytest.mark.parametrize(
@@ -496,6 +543,9 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
         ("fundamentals_metadata", True, "deepseek-v4-flash", None, 4096),
         ("fundamentals_coverage_gap", True, "deepseek-v4-flash", None, 4096),
         ("fundamentals_wrong_evidence", True, "deepseek-v4-flash", None, 4096),
+        ("fundamentals_false_value", True, "deepseek-v4-flash", None, 4096),
+        ("fundamentals_large_report", True, "deepseek-v4-flash", None, 4096),
+        ("fundamentals_excess_claims", True, "deepseek-v4-flash", None, 4096),
     ],
 )
 def test_personal_entry_deepseek_wire(
@@ -527,7 +577,7 @@ def test_personal_entry_deepseek_wire(
         "news_false_claim",
         "fundamentals_metadata",
         "fundamentals_coverage_gap",
-        "fundamentals_wrong_evidence",
+        "fundamentals_false_value",
     }
     assert code == (0 if valid_submission else 3), receipt.get("error")
     assert receipt["status"] == "completed" and receipt["report_written"] and receipt["usage_final"]
@@ -552,6 +602,9 @@ def test_personal_entry_deepseek_wire(
         "fundamentals_invalid_payload": 2,
         "fundamentals_partial_json": 2,
         "fundamentals_duplicate_json": 2,
+        "fundamentals_wrong_evidence": 2,
+        "fundamentals_large_report": 2,
+        "fundamentals_excess_claims": 2,
     }.get(scenario, 1)
     assert all(
         row["has_report_tool"] is (not full)
@@ -561,6 +614,9 @@ def test_personal_entry_deepseek_wire(
     for row in requests:
         if row["verified_statement_prompt"] is not None:
             assert all(row["verified_statement_prompt"].values()), row["verified_statement_prompt"]
+        if row["statement_output_chars"] is not None:
+            compact, expanded = row["statement_output_chars"]
+            assert 0 < compact * 2 < expanded
     count_after_admission = sum(row["analyst"] is None for row in requests)
     assert bool(count_after_admission) is valid_submission
     if valid_submission:
@@ -680,7 +736,7 @@ def test_news_shortcut_requires_an_exact_unavailable_tool_result(variant):
     assert finalize_observed_unavailable_news(messages, ticker, DAY) is None
 
 
-def test_financial_finalizer_preserves_middle_rows_and_reports_typed_gaps():
+def test_financial_collection_retains_frequencies_and_excludes_unbindable_text():
     ticker = "600895.SS"
     middle = "2021-12-31,2022-04-28,CNY,reported,1.0000"
     long_statement = "A" * 2_050 + "\n" + middle + "\n" + "B" * 2_050
@@ -746,17 +802,75 @@ def test_financial_finalizer_preserves_middle_rows_and_reports_typed_gaps():
     wrong_window = dict(repeat_call, args=dict(repeat_call["args"], freq="annual"))
     mismatched = [AIMessage(content="", tool_calls=[*calls, wrong_window]), *results, repeat_result]
     assert not collected_personal_statements(mismatched, ticker, DAY)
-    with personal_full_prompt_scope(True):
-        prompt = _finalization_prompt(
-            analyst="fundamentals",
-            ticker=ticker,
-            trade_date=DAY,
-            draft="",
-            messages=repeated,
-            complete_statement_rows=True,
-        )
-    assert prompt.count(middle) == 3 and "[middle omitted]" not in prompt
+    prompt, catalog = _personal_statement_prompt(repeated, ticker, DAY)
+    assert middle not in prompt and not catalog
     assert f"get_cashflow (annual) through {DAY}" in prompt and PARTIAL not in prompt
+
+
+def test_bank_statement_excerpts_keep_core_data_and_expose_gaps_without_handles():
+    from hashlib import sha256
+
+    from tradingagents.agents.analysts.statement_excerpts import statement_excerpts
+    from tradingagents.financial_observations import (
+        CURRENT_OBSERVATION_MARKER,
+        CURRENT_STATEMENT_COLUMNS,
+    )
+
+    stamp = f"{DAY}T08:30:00+00:00"
+
+    def row(period, announced, field, provider_field="", value=""):
+        unit = "CNY_BASE_UNIT" if value else ""
+        return ",".join(
+            (
+                period,
+                announced,
+                announced,
+                stamp,
+                stamp,
+                provider_field,
+                value,
+                unit,
+                field,
+                value,
+                unit,
+                "financial-provider-artifact:v1:" + "0" * 64,
+                "reported" if value else "missing",
+            )
+        )
+
+    income = row("2023-06-30", "2023-08-20", "interest_income", "int_income", "7")
+    expense = row("2023-06-30", "2023-08-20", "interest_expense", "int_exp", "5")
+    latest_gap = row("2023-06-30", "2023-08-20", "net_income")
+    earlier_profit = row("2022-12-31", "2023-04-20", "net_income", "n_income_attr_p", "2")
+    future = row("2023-12-31", "2024-03-01", "interest_income", "int_income", "9")
+    current = "# CURRENT-only; source=tushare; not strict PIT evidence."
+    raw = "\n".join(
+        (
+            "# Income Statement data for 600895.SS (quarterly)",
+            current,
+            CURRENT_OBSERVATION_MARKER,
+            ",".join(CURRENT_STATEMENT_COLUMNS),
+            income,
+            expense,
+            latest_gap,
+            earlier_profit,
+            future,
+        )
+    )
+    args = {
+        "tool_name": "get_income_statement",
+        "frequency": "quarterly",
+        "ticker": "600895.SS",
+        "trade_date": DAY,
+        "source_ref": "fixture",
+        "tool_call_id": "fixture",
+    }
+    rows, notes, gaps = statement_excerpts(
+        raw, artifact_sha256=sha256(raw.encode()).hexdigest(), **args
+    )
+    assert rows == [income, expense, earlier_profit]
+    assert notes == [current] and gaps == ["2023-06-30 net_income: missing"]
+    assert statement_excerpts(raw, artifact_sha256="0" * 64, **args) == ([], [], [])
 
 
 def test_personal_financial_unknown_validation_is_explicit_and_private(tmp_path, monkeypatch):
@@ -800,31 +914,42 @@ def test_personal_financial_content_cannot_supply_assembly_metadata():
     from tradingagents.agents.analysts.submission import _normalize_personal_fundamentals
     from tradingagents.evidence import EVIDENCE_CONTRACT_VERSION
 
-    citation = {
-        "statement": "Synthetic coverage limitation.",
-        "source_ref": "fixture-ref",
-        "source_quote": "Exact text.",
-    }
+    citation = {"statement": "Synthetic coverage limitation.", "evidence_id": "R001"}
+    catalog = {"R001": ("fixture-ref", "Exact row."), "N001": ("fixture-ref", "Exact note.")}
     payload = {
         "report_markdown": "Synthetic report.",
         "material_claims": [citation],
-        "evidence_notes": [dict(citation, kind="coverage")],
+        "evidence_notes": [dict(citation, kind="coverage", evidence_id="N001")],
     }
-    _, (claim,), (note,) = _normalize_personal_fundamentals(payload)
+    _, (claim,), (note,) = _normalize_personal_fundamentals(payload, catalog)
     assert (claim.claim_id, note.note_id) == ("fundamentals.claim-1", "fundamentals.note-1")
     assert claim.contract_version == note.contract_version == EVIDENCE_CONTRACT_VERSION
-    assert note.source_ref == claim.source_refs[0] == citation["source_ref"]
-    assert note.source_quote == claim.source_quote == citation["source_quote"]
+    assert note.source_ref == claim.source_refs[0] == "fixture-ref"
+    assert note.source_quote == "Exact note." and claim.source_quote == "Exact row."
     assert note.binding_status == "unverified" and note.decision_qualified is False
     with pytest.raises(ValidationError):
-        _normalize_personal_fundamentals(dict(payload, contract_version=EVIDENCE_CONTRACT_VERSION))
-    with pytest.raises(ValidationError):
         _normalize_personal_fundamentals(
-            dict(payload, material_claims=[dict(citation, claim_id="fundamentals.fake")])
+            dict(payload, contract_version=EVIDENCE_CONTRACT_VERSION), catalog
         )
     with pytest.raises(ValidationError):
         _normalize_personal_fundamentals(
-            {k: v for k, v in payload.items() if k != "evidence_notes"}
+            dict(payload, material_claims=[dict(citation, claim_id="fundamentals.fake")]), catalog
+        )
+    with pytest.raises(ValidationError):
+        _normalize_personal_fundamentals(
+            {k: v for k, v in payload.items() if k != "evidence_notes"}, catalog
+        )
+    with pytest.raises(ValidationError):
+        _normalize_personal_fundamentals(
+            dict(payload, evidence_notes=payload["evidence_notes"] * 4), catalog
+        )
+    with pytest.raises(ValidationError):
+        _normalize_personal_fundamentals(
+            dict(payload, material_claims=[dict(citation, statement="x" * 97)]), catalog
+        )
+    with pytest.raises(ValidationError):
+        _normalize_personal_fundamentals(
+            dict(payload, material_claims=[dict(citation, evidence_id="N001")]), catalog
         )
 
 
