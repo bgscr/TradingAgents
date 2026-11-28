@@ -26,6 +26,11 @@ from tradingagents.evidence import (
     make_source_acquisition_outcome,
     stable_acquisition_source_ref,
 )
+from tradingagents.personal_research_conclusion import (
+    PersonalResearchConclusion,
+    _stages,
+    render_personal_research_conclusion,
+)
 
 REASONING = "fixture-private-reasoning-never-persist"
 PARTIAL = "fixture-partial-report-never-publish"
@@ -37,10 +42,11 @@ ANALYSTS = {"market", "sentiment", "news", "fundamentals"}
 DAY = "2024-02-29"
 SYNTHESIS_CASES = {
     "synthesis_low_risk", "synthesis_high_risk", "synthesis_wrong_market", "synthesis_wrong_financial",
-    "synthesis_missing_role", "synthesis_truncated", "synthesis_budget_stop",
+    "synthesis_missing_role", "synthesis_label_only_roles", "synthesis_truncated", "synthesis_budget_stop",
     "synthesis_wrong_instrument", "synthesis_foreign_result", "synthesis_no_budget", "synthesis_spoof_rating",
 }
 SYNTHESIS_ROLES = {"bull", "bear", "manager", "trader", "aggressive", "conservative", "neutral"}
+LABEL_ONLY_ROLES = ("bull", "conservative", "neutral")
 BEAR_CONCERNS = {
     "synthesis_low_risk": "盈利覆盖资金成本，关注短期波动。",
     "synthesis_high_risk": "负债结构与贷款质量仍缺核验，限制风险判断。",
@@ -479,7 +485,11 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             else:
                 for name in ("Bull", "Aggressive", "Conservative", "Neutral"):
                     if re.search(r"^(?:You are (?:a |the )?|As the )" + name + r"\b", prompt, re.IGNORECASE):
-                        message["content"] = f"fixture-{name.lower()}-perspective"
+                        role = name.lower()
+                        message["content"] = (
+                            "" if scenario == "synthesis_label_only_roles" and role in LABEL_ONLY_ROLES
+                            else f"fixture-{role}-perspective"
+                        )
                         break
 
         observation = {
@@ -908,6 +918,7 @@ def assert_personal_research_outcome(receipt, folder, scenario, requests):
         "synthesis_wrong_market": "invalid_reference",
         "synthesis_wrong_financial": "invalid_reference",
         "synthesis_missing_role": "missing_role",
+        "synthesis_label_only_roles": "missing_role",
         "synthesis_truncated": "submission_incomplete",
         "synthesis_budget_stop": "session_stopped",
         "synthesis_wrong_instrument": "missing_validated_evidence",
@@ -937,6 +948,16 @@ def assert_personal_research_outcome(receipt, folder, scenario, requests):
         assert decision["rating"] == "Hold" and len(decision["facts"]) == 1
         assert [row["rule_id"] for row in decision["assertions"]] == ["market.return_20d.hold"]
         assert "synthetic-unknown" not in report and PARTIAL not in section
+    if scenario in {"synthesis_missing_role", "synthesis_label_only_roles"}:
+        absent = ("bear",) if scenario == "synthesis_missing_role" else LABEL_ONLY_ROLES
+        assert receipt.get("research_synthesis_role_diagnostics") == [
+            {"role": role, "reason": "label_only"} for role in absent
+        ]
+        assert section.count("只有角色标签") == len(absent)
+        assert all(f"`{role}`" in section for role in absent)
+        assert "fixture-" not in section
+    else:
+        assert "research_synthesis_role_diagnostics" not in receipt
     if scenario == "synthesis_budget_stop":
         assert (receipt["error"], receipt["stop_reason"], receipt["stop_stage"]) == (
             "research_budget_or_transport_stopped", "deadline_exceeded", "research_synthesis",
@@ -974,6 +995,65 @@ def assert_personal_market_outcome(receipt, folder, scenario):
     assert "Close on 2024-02-29: 12.00 CNY (qfq)" in report
     assert "50-day SMA on 2024-02-29: 12.00 CNY (qfq)" in report
     assert audit["admission_gate"]["admitted"] is True
+
+
+def test_research_role_diagnostics_distinguish_blank_body_and_state():
+    state = {
+        "investment_debate_state": {"bull_history": "Bull Analyst: ", "bear_history": "fixture-bear-valid"},
+        "investment_plan": " \t\n",
+        "trader_investment_plan": "fixture-trader-valid",
+        "risk_debate_state": {
+            "aggressive_history": "fixture-aggressive-valid",
+            "conservative_history": {"content": "fixture-invalid-state-private"},
+        },
+    }
+    stages, issues = _stages(state)
+    assert [issue.model_dump() for issue in issues] == [
+        {"role": "bull", "reason": "label_only"},
+        {"role": "manager", "reason": "blank_body"},
+        {"role": "conservative", "reason": "invalid_state"},
+        {"role": "neutral", "reason": "missing_state"},
+    ]
+    assert list(stages) == ["bear", "trader", "aggressive"]
+    conclusion = PersonalResearchConclusion.for_state(state, reason="missing_role", role_diagnostics=issues)
+    for language, labels in (
+        ("zh-CN", ("只有角色标签", "正文为空白", "阶段状态无效", "阶段状态缺失")),
+        ("English", ("Role label only", "Blank stage text", "Invalid stage state", "Missing stage state")),
+    ):
+        report = render_personal_research_conclusion(conclusion, language)
+        assert all(label in report for label in labels)
+        assert "fixture-" not in report and "Bull Analyst:" not in report
+
+
+@pytest.mark.parametrize(
+    ("investment", "reason"), [({}, "missing_state"), ({"investment_debate_state": None}, "invalid_state")],
+)
+def test_research_role_diagnostics_scope_missing_or_invalid_group(investment, reason):
+    state = {
+        **investment,
+        "investment_plan": "manager body",
+        "trader_investment_plan": "trader body",
+        "risk_debate_state": {
+            "aggressive_history": "aggressive body",
+            "conservative_history": "conservative body",
+            "neutral_history": "neutral body",
+        },
+    }
+    stages, issues = _stages(state)
+    assert list(stages) == ["manager", "trader", "aggressive", "conservative", "neutral"]
+    assert [(issue.role, issue.reason) for issue in issues] == [("bull", reason), ("bear", reason)]
+
+
+def test_research_role_diagnostics_does_not_ascribe_unrecognized_labels():
+    state = {
+        "investment_debate_state": {"bull_history": "Bear Analyst:", "bear_history": "Bear Analyst:"},
+        "investment_plan": "Questions for the Credit Analyst:",
+    }
+    stages, issues = _stages(state)
+    assert not stages
+    assert [(issue.role, issue.reason) for issue in issues[:3]] == [
+        ("bull", "invalid_state"), ("bear", "label_only"), ("manager", "invalid_state"),
+    ]
 
 
 @pytest.mark.parametrize(

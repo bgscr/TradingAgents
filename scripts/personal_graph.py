@@ -381,6 +381,10 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 receipt["research_synthesis_status"] = conclusion.status
                 if conclusion.reason is not None:
                     receipt["research_synthesis_reason"] = conclusion.reason
+                if conclusion.reason == "missing_role" and conclusion.role_diagnostics:
+                    receipt["research_synthesis_role_diagnostics"] = [
+                        issue.model_dump(mode="json") for issue in conclusion.role_diagnostics
+                    ]
         report = graph.save_reports(report_state, ticker, output / "report")
         receipt.update(
             status=terminal.lifecycle_status.value if "error" not in receipt else "failed",

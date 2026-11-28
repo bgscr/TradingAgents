@@ -35,12 +35,26 @@ _VIEWS = {
 }
 _NO_CONCLUSION = {
     "missing_validated_evidence": ("缺少可核验的市场或财报证据。", "Verified market or statement evidence is missing."),
-    "missing_role": ("多空研究、研究经理、交易员或风险角色的正文缺失。", "A required research, trading or risk stage is missing."),
+    "missing_role": ("部分必要角色缺少可用于综合的正文。", "Some required roles lack usable stage text."),
     "budget_unavailable": ("本次调用预算没有余量。", "The run had no remaining call allowance."),
     "submission_incomplete": ("模型未完成结构化提交。", "The model did not complete a structured submission."),
     "invalid_reference": ("提交引用未通过核验。", "The submitted references did not validate."),
     "session_stopped": ("综合阶段触发会话停止条件。", "A session stop occurred during synthesis."),
 }
+_ROLE_ISSUE_LABELS = {
+    "blank_body": ("正文为空白", "Blank stage text"),
+    "label_only": ("只有角色标签", "Role label only"),
+    "missing_state": ("阶段状态缺失", "Missing stage state"),
+    "invalid_state": ("阶段状态无效", "Invalid stage state"),
+}
+_MISSING = object()
+
+
+class ResearchRoleDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    role: Literal["bull", "bear", "manager", "trader", "aggressive", "conservative", "neutral"]
+    reason: Literal["blank_body", "label_only", "missing_state", "invalid_state"]
 
 
 class PersonalResearchSubmission(BaseModel):
@@ -63,6 +77,7 @@ class PersonalResearchConclusion:
     reason: str | None = None
     market: str = ""
     financial: str = ""
+    role_diagnostics: tuple[ResearchRoleDiagnostic, ...] = ()
 
     @property
     def status(self):
@@ -79,25 +94,36 @@ class PersonalResearchConclusion:
 
 
 def _stages(state):
-    debate = state.get("investment_debate_state")
-    risk = state.get("risk_debate_state")
-    if not isinstance(debate, dict) or not isinstance(risk, dict):
-        return {}
-    bodies = {
-        "bull": debate.get("bull_history"),
-        "bear": debate.get("bear_history"),
-        "manager": state.get("investment_plan"),
-        "trader": state.get("trader_investment_plan"),
-        "aggressive": risk.get("aggressive_history"),
-        "conservative": risk.get("conservative_history"),
-        "neutral": risk.get("neutral_history"),
+    fields = {
+        "bull": ("investment_debate_state", "bull_history", "Bull Analyst:"),
+        "bear": ("investment_debate_state", "bear_history", "Bear Analyst:"),
+        "manager": (None, "investment_plan", None),
+        "trader": (None, "trader_investment_plan", None),
+        "aggressive": ("risk_debate_state", "aggressive_history", "Aggressive Analyst:"),
+        "conservative": ("risk_debate_state", "conservative_history", "Conservative Analyst:"),
+        "neutral": ("risk_debate_state", "neutral_history", "Neutral Analyst:"),
     }
-    return {
-        role: {"role": role, "text": body.strip()}
-        for role, body in bodies.items()
-        if isinstance(body, str) and len(body) <= 16_000 and body.strip()
-        and not re.fullmatch(r"[^:\n]+(?: Analyst| Researcher):", body.strip())
-    }
+    stages = {}
+    issues = []
+    for role, (group, key, label) in fields.items():
+        container = state if group is None else state.get(group, _MISSING)
+        body = container.get(key, _MISSING) if isinstance(container, dict) else None
+        if container is _MISSING or body is _MISSING:
+            reason = "missing_state"
+        elif not isinstance(body, str) or len(body) > 16_000:
+            reason = "invalid_state"
+        elif not (text := body.strip()):
+            reason = "blank_body"
+        elif text == label:
+            reason = "label_only"
+        elif re.fullmatch(r"[^:\n]+(?: Analyst| Researcher):", text):
+            # Preserve the existing rejection without attributing an unfamiliar label.
+            reason = "invalid_state"
+        else:
+            stages[role] = {"role": role, "text": text}
+            continue
+        issues.append(ResearchRoleDiagnostic(role=role, reason=reason))
+    return stages, tuple(issues)
 
 
 def synthesize_personal_research(state, llm):
@@ -134,9 +160,11 @@ def synthesize_personal_research(state, llm):
         return PersonalResearchConclusion.for_state(state, reason="missing_validated_evidence")
     if not market or not financial:
         return PersonalResearchConclusion.for_state(state, reason="missing_validated_evidence")
-    stages = _stages(state)
-    if stages.keys() != _ROLE_LABELS.keys():
-        return PersonalResearchConclusion.for_state(state, reason="missing_role")
+    stages, role_diagnostics = _stages(state)
+    if role_diagnostics:
+        return PersonalResearchConclusion.for_state(
+            state, reason="missing_role", role_diagnostics=role_diagnostics,
+        )
     budget = active_budget()
     if budget is None or budget.receipt()["admitted_attempts"] >= budget.max_calls:
         return PersonalResearchConclusion.for_state(state, reason="budget_unavailable")
@@ -176,7 +204,15 @@ def render_personal_research_conclusion(result, language):
     if result.submission is None:
         label = "无综合结论" if chinese else "No research conclusion"
         reason = _NO_CONCLUSION.get(result.reason, _NO_CONCLUSION["submission_incomplete"])[index]
-        return f"{heading}\n\n**{label}** {reason}\n"
+        lines = [heading, "", f"**{label}** {reason}"]
+        if result.reason == "missing_role" and result.role_diagnostics:
+            lines.append("")
+            lines.extend(
+                f"- {_ROLE_LABELS[issue.role][index]} (`{issue.role}`) · "
+                f"{_ROLE_ISSUE_LABELS[issue.reason][index]} (`{issue.reason}`)"
+                for issue in result.role_diagnostics
+            )
+        return "\n".join(lines) + "\n"
     submission = result.submission
     view = _VIEWS[submission.view][index]
     roles = ", ".join(_ROLE_LABELS[role][index] for role in submission.stages)
