@@ -4,9 +4,12 @@ from tradingagents.agents.analysts.submission import (
     ANALYST_OUTPUT_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
+    collected_personal_statements,
+    finalize_analyst_submission,
     personal_full_tool_prompt,
     process_analyst_response,
     render_allowed_source_ref_catalog,
+    uses_personal_deepseek_analyst_policy,
 )
 from tradingagents.agents.utils.agent_utils import (
     get_balance_sheet,
@@ -24,6 +27,19 @@ def create_fundamentals_analyst(llm):
 
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
+        messages = state["messages"]
+        acquisition_only = uses_personal_deepseek_analyst_policy(llm)
+        if acquisition_only and collected_personal_statements(messages, ticker, current_date):
+            result = finalize_analyst_submission(
+                finalizer=finalizer,
+                analyst="fundamentals",
+                ticker=ticker,
+                trade_date=current_date,
+                messages=messages,
+                complete_statement_rows=True,
+            )
+            return build_analyst_update(state, result, "fundamentals_report")
         instrument_context = get_instrument_context_from_state(state)
 
         data_tools = [
@@ -32,24 +48,33 @@ def create_fundamentals_analyst(llm):
             get_cashflow,
             get_income_statement,
         ]
-        tools = [*data_tools, AnalystEvidenceReport]
+        tools = data_tools if acquisition_only else [*data_tools, AnalystEvidenceReport]
 
-        system_message = personal_full_tool_prompt(
-            "fundamentals",
-            "Review the balance sheet, income and cash flow and available company information as of the "
-            "analysis date across the full requested financial window. Focus on material changes, risks and "
-            "limitations. Keep disclosure snapshots supplemental, and never invent filing details or use "
-            "omitted business, summary or fund-flow fields as evidence.",
-        ) or (
-            "You analyze company fundamentals as of the requested analysis date, using the full requested financial window available in the tools. Review the statements and available company information for decision-relevant changes, risks, and limitations. Summarize the findings instead of reproducing financial history or every table row."
-            + " Use one compact summary table only if it adds information without repeating the prose. "
-            + ANALYST_OUTPUT_GUIDANCE
-            + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
-            + " For mainland China A-shares, fundamentals may include source-labeled disclosure snapshots; treat them as supplemental company-event context and do not invent missing filing details."
-            + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote."
-            + " Record synthetic-data warnings and missing or inapplicable bank metrics as evidence_notes, not as financial premises. Preserve their limitations in the report. An available financial table does not make every metric available; omitted business, summary or fund-flow sources provide no financial evidence. Notes never satisfy the evidence required for a financial conclusion."
-            + get_language_instruction()
-        )
+        if acquisition_only:
+            system_message = (
+                f"Collect the balance sheet, income statement, and cash flow for {ticker} "
+                f"as of {current_date}. Use the three specific statement tools and keep their "
+                "full financial windows. Select the appropriate reporting frequency and request "
+                "any additional needed frequency in the same tool turn. Return only data tool calls. "
+                "The finalizer will write the report from the tool results."
+            )
+        else:
+            system_message = personal_full_tool_prompt(
+                "fundamentals",
+                "Review the balance sheet, income and cash flow and available company information as of the "
+                "analysis date across the full requested financial window. Focus on material changes, risks and "
+                "limitations. Keep disclosure snapshots supplemental, and never invent filing details or use "
+                "omitted business, summary or fund-flow fields as evidence.",
+            ) or (
+                "You analyze company fundamentals as of the requested analysis date, using the full requested financial window available in the tools. Review the statements and available company information for decision-relevant changes, risks, and limitations. Summarize the findings instead of reproducing financial history or every table row."
+                + " Use one compact summary table only if it adds information without repeating the prose. "
+                + ANALYST_OUTPUT_GUIDANCE
+                + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements."
+                + " For mainland China A-shares, fundamentals may include source-labeled disclosure snapshots; treat them as supplemental company-event context and do not invent missing filing details."
+                + " When the analysis is complete, submit it through AnalystEvidenceReport: put human-readable Markdown in report_markdown and every decision-relevant factual premise in material_claims. Each claim must contain only claim_id, statement, one exact source_ref, and an exact contiguous source_quote."
+                + " Record synthetic-data warnings and missing or inapplicable bank metrics as evidence_notes, not as financial premises. Preserve their limitations in the report. An available financial table does not make every metric available; omitted business, summary or fund-flow sources provide no financial evidence. Notes never satisfy the evidence required for a financial conclusion."
+                + get_language_instruction()
+            )
         system_message += "\n\n" + render_allowed_source_ref_catalog(
             state["messages"],
             state["company_of_interest"],
@@ -75,8 +100,8 @@ def create_fundamentals_analyst(llm):
         prompt = prompt.partial(system_message=system_message)
         prompt = prompt.partial(
             tool_names=", ".join(
-                [tool.name for tool in data_tools]
-                + [AnalystEvidenceReport.__name__]
+                tool.name if tool is not AnalystEvidenceReport else AnalystEvidenceReport.__name__
+                for tool in tools
             )
         )
         prompt = prompt.partial(current_date=current_date)
@@ -89,9 +114,10 @@ def create_fundamentals_analyst(llm):
             response,
             finalizer=finalizer,
             analyst="fundamentals",
-            ticker=state["company_of_interest"],
+            ticker=ticker,
             trade_date=current_date,
-            messages=state["messages"],
+            messages=messages,
+            acquisition_only=acquisition_only,
         )
         return build_analyst_update(state, result, "fundamentals_report")
 

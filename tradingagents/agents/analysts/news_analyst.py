@@ -3,9 +3,11 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.analysts.submission import (
     bind_analyst_finalizer,
     build_analyst_update,
+    finalize_observed_unavailable_news,
     personal_full_tool_prompt,
     process_analyst_response,
     render_allowed_source_ref_catalog,
+    uses_personal_deepseek_analyst_policy,
 )
 from tradingagents.agents.utils.agent_utils import (
     get_global_news,
@@ -23,6 +25,13 @@ def create_news_analyst(llm):
 
     def news_analyst_node(state):
         current_date = state["trade_date"]
+        personal_news_policy = uses_personal_deepseek_analyst_policy(llm)
+        if personal_news_policy:
+            result = finalize_observed_unavailable_news(
+                state["messages"], state["company_of_interest"], current_date,
+            )
+            if result is not None:
+                return build_analyst_update(state, result, "news_report")
         asset_type = state.get("asset_type", "stock")
         asset_label = "company" if asset_type == "stock" else "asset"
         instrument_context = get_instrument_context_from_state(state)
@@ -93,6 +102,7 @@ def create_news_analyst(llm):
             ticker=state["company_of_interest"],
             trade_date=current_date,
             messages=state["messages"],
+            personal_news_policy=personal_news_policy,
         )
         return build_analyst_update(state, result, "news_report")
 

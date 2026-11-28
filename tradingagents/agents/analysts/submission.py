@@ -8,9 +8,10 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import ValidationError
 
 from tradingagents.agents.utils.structured import (
@@ -45,9 +46,10 @@ from tradingagents.evidence import (
     merge_source_artifacts,
     merge_source_facts,
     project_history_store_access,
+    stable_acquisition_source_ref,
     verified_financial_observations,
 )
-from tradingagents.financial_observations import FINANCIAL_TOOLS
+from tradingagents.financial_observations import FINANCIAL_TOOLS, STATEMENT_TITLES
 from tradingagents.run_diagnostics import record_output
 
 logger = logging.getLogger(__name__)
@@ -133,6 +135,14 @@ def personal_full_analysts_active() -> bool:
     return _PERSONAL_FULL_PROMPTS.get()
 
 
+def uses_personal_deepseek_analyst_policy(llm: Any) -> bool:
+    if not personal_full_analysts_active():
+        return False
+    from tradingagents.llm_clients.openai_client import DeepSeekChatOpenAI
+
+    return isinstance(llm, DeepSeekChatOpenAI) and llm.uses_personal_analyst_policy()
+
+
 def _compact_submission_prompt(analyst: str) -> str:
     return (
         "Submit one AnalystEvidenceReport. report_markdown is a string; material_claims and evidence_notes "
@@ -202,6 +212,20 @@ def _tool_calls_by_id(messages: list[Any]) -> dict[str, Mapping[str, Any]]:
     return calls
 
 
+def _paired_tool_turns(messages):
+    calls = _tool_calls_by_id(messages)
+    ai_messages = [message for message in messages if isinstance(message, AIMessage)]
+    results = [message for message in messages if isinstance(message, ToolMessage)]
+    if (
+        any(message.invalid_tool_calls for message in ai_messages)
+        or sum(len(message.tool_calls) for message in ai_messages) != len(calls)
+        or len(results) != len(calls)
+        or {message.tool_call_id for message in results} != calls.keys()
+    ):
+        return None
+    return calls, results
+
+
 def _source_ref(
     message: Any,
     ticker: str,
@@ -265,6 +289,58 @@ def _source_ref(
     if tool_name == "get_verified_market_snapshot":
         return f"snapshot:{ticker}:{trade_date}"
     return f"{tool_name}:{ticker}:{trade_date}"
+
+
+def _dispatched_statement(message, ticker, trade_date, calls):
+    from tradingagents.dataflows.financial_dispatch import FinancialToolMessageAuditEnvelope
+
+    if not isinstance(message, ToolMessage) or message.name not in STATEMENT_TITLES:
+        return None
+    try:
+        envelope = FinancialToolMessageAuditEnvelope.model_validate(message.artifact)
+    except ValidationError:
+        return None
+    if _source_ref(
+        message, ticker, trade_date, calls, include_unavailable_financial=True,
+    ) == envelope.request_ref:
+        return envelope
+    return None
+
+
+def _statement_frequency(call):
+    args = call["args"]
+    raw = args.get("freq", args.get("frequency", "quarterly"))
+    value = raw.strip().casefold() if isinstance(raw, str) else None
+    return value if value in ("annual", "quarterly") else "unverified"
+
+
+def collected_personal_statements(messages: list[Any], ticker: str, trade_date: str) -> bool:
+    """Check for dispatched results from all three statement tools, including typed gaps."""
+    paired = _paired_tool_turns(messages)
+    if paired is None:
+        return False
+    calls, results = paired
+    statements = [
+        message for message in results if calls[message.tool_call_id]["name"] in STATEMENT_TITLES
+    ]
+    if {message.name for message in statements} != set(STATEMENT_TITLES):
+        return False
+    dispatched = [_dispatched_statement(message, ticker, trade_date, calls) for message in statements]
+    if any(result is None for result in dispatched):
+        return False
+    results_by_request = [
+        ((result.tool_name, result.request_ref, _statement_frequency(calls[result.tool_call_id])), result)
+        for result in dispatched
+    ]
+    executed = {
+        key: (result.artifact_sha256, result.acquisition_outcomes)
+        for key, result in results_by_request if result.disposition == "executed"
+    }
+    return all(
+        key[2] != "unverified"
+        and executed.get(key) == (result.artifact_sha256, result.acquisition_outcomes)
+        for key, result in results_by_request
+    )
 
 
 def allowed_source_refs(
@@ -337,14 +413,23 @@ def _finalization_prompt(
     draft: str,
     messages: list[Any],
     auxiliary_context: str = "",
+    complete_statement_rows: bool = False,
+    personal_news_policy: bool = False,
 ) -> str:
     from tradingagents.agents.utils.agent_utils import get_language_instruction
 
     catalog = []
+    statement_gaps = []
     seen_artifacts = set()
     preview_omitted_evidence = False
     tool_calls_by_id = _tool_calls_by_id(messages)
     for message in messages:
+        result = (
+            _dispatched_statement(message, ticker, trade_date, tool_calls_by_id)
+            if complete_statement_rows else None
+        )
+        if result is not None and result.disposition == "duplicate_suppressed":
+            continue
         source_ref = _source_ref(
             message,
             ticker,
@@ -352,11 +437,17 @@ def _finalization_prompt(
             tool_calls_by_id,
         )
         artifact_key = (source_ref, str(getattr(message, "tool_call_id", "")))
+        if result is not None and result.artifact_sha256 is None:
+            frequency = _statement_frequency(tool_calls_by_id[message.tool_call_id])
+            reasons = ", ".join(sorted({outcome.reason.value for outcome in result.acquisition_outcomes}))
+            statement_gaps.append(f"- {message.name} ({frequency}) through {trade_date}: {reasons}.")
         if source_ref is None or artifact_key in seen_artifacts:
             continue
         seen_artifacts.add(artifact_key)
         content = str(getattr(message, "content", "")).strip()
-        if len(content) > _SOURCE_PREVIEW_LIMIT:
+        if len(content) > _SOURCE_PREVIEW_LIMIT and not (
+            complete_statement_rows and getattr(message, "name", None) in STATEMENT_TITLES
+        ):
             preview_omitted_evidence = True
             head_length = _SOURCE_PREVIEW_LIMIT // 2
             tail_length = _SOURCE_PREVIEW_LIMIT - head_length
@@ -368,6 +459,11 @@ def _finalization_prompt(
         catalog.append(f"- {source_ref}\n  Evidence: {content or '[empty tool result]'}")
     source_catalog = "\n".join(catalog) if catalog else "- (no source refs available)"
     source_context = f"Allowed source refs and collected evidence:\n{source_catalog}\n\n"
+    if statement_gaps:
+        source_context += (
+            "Statement acquisition gaps (report as limitations, never quote as source evidence):\n"
+            + "\n".join(statement_gaps) + "\n\n"
+        )
     if auxiliary_context:
         source_context += (
             "Deterministic auxiliary observations (report commentary only; do not add "
@@ -394,10 +490,15 @@ def _finalization_prompt(
     )
     if _PERSONAL_FULL_PROMPTS.get() and analyst in _PERSONAL_EVIDENCE_GUIDANCE:
         # A draft may point to dated evidence outside a shortened preview.
+        news_gap_guidance = (
+            "If no substantive article is verified, state that coverage limit in report_markdown. "
+            "Use empty material_claims and evidence_notes unless a real source supports an entry. "
+            if personal_news_policy else ""
+        )
         return (
             f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
             "Return one JSON object without surrounding prose. "
-            + _compact_submission_prompt(analyst) + language + source_context
+            + _compact_submission_prompt(analyst) + news_gap_guidance + language + source_context
             + (draft_context if preview_omitted_evidence and draft.strip() else "")
         )
     note_example = ('"evidence_notes":[]}.' if analyst == "market" else
@@ -520,15 +621,61 @@ def _unavailable_result(
     )
 
 
-def _finalize_required(
+def finalize_observed_unavailable_news(
+    messages: list[Any], ticker: str, trade_date: str,
+) -> AnalystSubmissionResult | None:
+    """Submit a coverage limitation only after the scoped issuer query actually returned."""
+    paired = _paired_tool_turns(messages)
+    if paired is None:
+        return None
+    calls, results = paired
+    first = (date.fromisoformat(trade_date) - timedelta(days=7)).isoformat()
+    issuer_unavailable = False
+    for message in results:
+        try:
+            envelope = ToolExecutionEvidenceEnvelope.model_validate(message.artifact)
+        except ValidationError:
+            return None
+        if (
+            envelope.selected_artifact is not None
+            or envelope.capability != message.name
+            or _source_ref(message, ticker, trade_date, calls) != envelope.source_ref
+        ):
+            return None
+        if message.name == "get_news":
+            args = calls[message.tool_call_id]["args"]
+            window = (args.get("ticker"), args.get("start_date"), args.get("end_date"))
+            if envelope.source_ref != stable_acquisition_source_ref("news", *window):
+                return None
+            if window == (ticker, first, trade_date):
+                issuer_unavailable = True
+    if not issuer_unavailable:
+        return None
+
+    report, claims, notes = _normalize_submission(
+        AnalystEvidenceReport(
+            report_markdown="本次查询未取得可核验的发行人新闻正文。覆盖不足，无法判断期间是否发生发行人事件。",
+        ),
+        "news",
+    )
+    record_output("news", "finalizer", 0, {}, outcome="deterministic_unavailable_news")
+    return AnalystSubmissionResult(
+        message=AIMessage(content=report), report=report, claims=claims, notes=notes,
+        submission_source=_submission_source("news", EvidenceStatus.AVAILABLE, "observed_unavailable"),
+    )
+
+
+def finalize_analyst_submission(
     *,
     finalizer: Any | None,
     analyst: str,
     ticker: str,
     trade_date: str,
-    draft: str,
+    draft: str = "",
     messages: list[Any],
     auxiliary_context: str = "",
+    complete_statement_rows: bool = False,
+    personal_news_policy: bool = False,
 ) -> AnalystSubmissionResult:
     if finalizer is None:
         return _unavailable_result(analyst, "unsupported")
@@ -539,12 +686,15 @@ def _finalize_required(
         draft=draft,
         messages=messages,
         auxiliary_context=auxiliary_context,
+        complete_statement_rows=complete_statement_rows,
+        personal_news_policy=personal_news_policy,
     )
     structured_result = invoke_required_structured(
         finalizer,
         prompt,
         f"{analyst.title()} Analyst",
         validator=lambda submitted: _normalize_submission(submitted, analyst),
+        personal_validation_details=personal_news_policy,
     )
     if structured_result.value is None:
         return _unavailable_result(
@@ -576,6 +726,8 @@ def process_analyst_response(
     trade_date: str,
     messages: list[Any],
     auxiliary_context: str = "",
+    acquisition_only: bool = False,
+    personal_news_policy: bool = False,
 ) -> AnalystSubmissionResult:
     """Accept a typed report, continue data calls, or finalize prose exactly once."""
     truncated = response.response_metadata.get("finish_reason") == "length"
@@ -609,11 +761,14 @@ def process_analyst_response(
             report="",
         )
 
+    if acquisition_only:
+        return _unavailable_result(analyst, "incomplete_acquisition", stage="initial_response", attempts=1)
+
     if report_calls:
         try:
             report, claims, notes = _normalize_submission(report_calls[0]["args"], analyst)
         except (ValidationError, ValueError, TypeError):
-            return _finalize_required(
+            return finalize_analyst_submission(
                 finalizer=finalizer,
                 analyst=analyst,
                 ticker=ticker,
@@ -621,6 +776,7 @@ def process_analyst_response(
                 draft=str(response.content),
                 messages=messages,
                 auxiliary_context=auxiliary_context,
+                personal_news_policy=personal_news_policy,
             )
         return AnalystSubmissionResult(
             message=AIMessage(content=report),
@@ -634,7 +790,7 @@ def process_analyst_response(
             ),
         )
 
-    return _finalize_required(
+    return finalize_analyst_submission(
         finalizer=finalizer,
         analyst=analyst,
         ticker=ticker,
@@ -642,6 +798,7 @@ def process_analyst_response(
         draft=str(response.content),
         messages=messages,
         auxiliary_context=auxiliary_context,
+        personal_news_policy=personal_news_policy,
     )
 
 

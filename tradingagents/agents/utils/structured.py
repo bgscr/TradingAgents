@@ -148,6 +148,7 @@ def invoke_required_structured(
     *,
     validator: Callable[[Any], Any] | None = None,
     max_attempts: int = 2,
+    personal_validation_details: bool = False,
 ) -> RequiredStructuredResult:
     """Invoke a required schema, optionally allowing one fail-closed repair."""
     from tradingagents.run_diagnostics import record_output
@@ -196,6 +197,8 @@ def invoke_required_structured(
             if last_reason == "output_limit":
                 personal_observation = ("sdk_length_finish_reason_error", exception_diagnostics)
             elif validating_submission and agent_name != "Market Analyst":
+                if personal_validation_details and isinstance(exc, SubmissionConstraintError):
+                    response_diagnostics["validation_kind"] = exc.kind
                 personal_observation = (last_reason, response_diagnostics)
             if last_reason == "validation_error":
                 if validating_submission and agent_name == "Market Analyst" and isinstance(exc, SubmissionConstraintError):
@@ -204,7 +207,8 @@ def invoke_required_structured(
                     diagnostics.update(_validation_metadata(exc))
 
         record_output(agent_name.removesuffix(" Analyst").lower(), "finalizer", attempt,
-                      diagnostics, outcome=last_reason, personal_observation=personal_observation)
+                      diagnostics, outcome=last_reason, personal_observation=personal_observation,
+                      personal_validation_details=personal_validation_details)
         logger.warning(
             "%s: required structured output failed "
             "(schema=%s model=%s attempt=%d reason=%s%s)",

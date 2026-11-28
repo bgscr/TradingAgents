@@ -17,7 +17,7 @@ _PERSONAL_OUTPUT_SINK = ContextVar('personal_analyst_output_sink', default=None)
 _OUTPUT_ANALYSTS = frozenset({'market', 'fundamentals', 'news', 'social', 'sentiment'})
 _OUTPUT_STAGES = frozenset({'initial_response', 'finalizer'})
 _OUTPUT_OUTCOMES = frozenset({'response', 'success', 'output_limit', 'none_parsed',
-                              'validation_error', 'transport_error'})
+                              'validation_error', 'transport_error', 'deterministic_unavailable_news'})
 _LENGTH_OBSERVATIONS = frozenset({'raw_finish_reason_length', 'sdk_length_finish_reason_error'})
 _PERSONAL_OUTPUT_LIMIT = 60
 _KINDS = frozenset({'claim_validation', 'analyst_output', 'news_exception',
@@ -271,7 +271,8 @@ def record_admission_gate(evidence, result):
     })
 
 
-def record_output(analyst, stage, attempt, diagnostics, *, outcome, personal_observation=None):
+def record_output(analyst, stage, attempt, diagnostics, *, outcome, personal_observation=None,
+                  personal_validation_details=False):
     retain = _PERSONAL_OUTPUT_SINK.get()
     if _SINK.get() is None and retain is None:
         return
@@ -300,8 +301,14 @@ def record_output(analyst, stage, attempt, diagnostics, *, outcome, personal_obs
             usage = observed_diagnostics
     if outcome == 'validation_error' and safe.get('validation_kind') in {'json_syntax', 'schema_validation'}:
         observation = safe['validation_kind']
-    retain({'analyst': analyst, 'stage': stage, 'observation': observation,
-            **bounded_analyst_output_usage(usage)})
+    event = {'analyst': analyst, 'stage': stage, 'observation': observation,
+             **bounded_analyst_output_usage(usage)}
+    if personal_validation_details and analyst == 'news' and stage == 'finalizer' and outcome == 'validation_error':
+        validation = safe_output_diagnostics(usage)
+        event['validation_kind'] = validation.get('validation_kind', safe.get('validation_kind', 'validation_unspecified'))
+        if fields := validation.get('validation_fields', safe.get('validation_fields')):
+            event['validation_fields'] = fields
+    retain(event)
 
 
 def record_news_response_shape(payload, *, callback_matches, stage='response_parse'):

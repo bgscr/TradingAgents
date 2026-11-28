@@ -569,12 +569,12 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
             return self.with_structured_output(schema, method="json_mode", **kwargs)
         return self.with_structured_output(schema, **kwargs)
 
-    def _analyst_non_thinking(self) -> bool:
+    def uses_personal_analyst_policy(self) -> bool:
         return _DEEPSEEK_ANALYST_NON_THINKING.get() and self.model_name in _DEEPSEEK_V4_CHAT_MODELS
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        non_thinking = self._analyst_non_thinking()
+        non_thinking = self.uses_personal_analyst_policy()
         if non_thinking:
             # OpenAI's SDK merges extra_body into the wire request. Copy it so
             # a bound client can keep its original policy for decision stages.
@@ -620,7 +620,7 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 
     def _create_chat_result(self, response, generation_info=None):
         chat_result = super()._create_chat_result(response, generation_info)
-        if self._analyst_non_thinking():
+        if self.uses_personal_analyst_policy():
             return chat_result
         response_dict = (
             response
