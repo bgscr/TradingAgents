@@ -303,7 +303,8 @@ def record_output(analyst, stage, attempt, diagnostics, *, outcome, personal_obs
         observation = safe['validation_kind']
     event = {'analyst': analyst, 'stage': stage, 'observation': observation,
              **bounded_analyst_output_usage(usage)}
-    if personal_validation_details and analyst == 'news' and stage == 'finalizer' and outcome == 'validation_error':
+    if (personal_validation_details and analyst in {'news', 'fundamentals'}
+            and stage == 'finalizer' and outcome == 'validation_error'):
         validation = safe_output_diagnostics(usage)
         event['validation_kind'] = validation.get('validation_kind', safe.get('validation_kind', 'validation_unspecified'))
         if fields := validation.get('validation_fields', safe.get('validation_fields')):

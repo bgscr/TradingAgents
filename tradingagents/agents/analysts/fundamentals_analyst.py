@@ -32,7 +32,7 @@ def create_fundamentals_analyst(llm):
         acquisition_only = uses_personal_deepseek_analyst_policy(llm)
         if acquisition_only and collected_personal_statements(messages, ticker, current_date):
             result = finalize_analyst_submission(
-                finalizer=finalizer,
+                finalizer=bind_analyst_finalizer(llm, "fundamentals", personal_statements=True),
                 analyst="fundamentals",
                 ticker=ticker,
                 trade_date=current_date,

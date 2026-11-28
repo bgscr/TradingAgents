@@ -76,6 +76,7 @@ class RequiredStructuredBinding:
     method: str | None = None
 
     schema_json: str | None = None
+    strict_json_model: type[BaseModel] | None = None
 
     def invoke(self, prompt: Any) -> Any:
         if self.method == "json_mode":
@@ -104,6 +105,8 @@ def bind_required_structured(
     llm: Any,
     schema: type[T],
     agent_name: str,
+    *,
+    strict_json: bool = False,
 ) -> Any | None:
     """Bind required structured output without promising a free-text fallback."""
     try:
@@ -121,7 +124,11 @@ def bind_required_structured(
         method_resolver = getattr(type(llm), "get_required_structured_method", None)
         method = llm.get_required_structured_method() if callable(method_resolver) else None
         schema_json = None
-        if method == "json_mode" and agent_name == "Market Analyst":
+        if strict_json:
+            if method != "json_mode":
+                raise ValueError("strict JSON validation requires JSON mode")
+            schema_json = json.dumps(schema.model_json_schema(), separators=(",", ":"))
+        elif method == "json_mode" and agent_name == "Market Analyst":
             from tradingagents.evidence import AnalystEvidenceReport
 
             if schema is AnalystEvidenceReport:
@@ -132,7 +139,10 @@ def bind_required_structured(
                     field = wire_schema["$defs"][definition]["properties"][field_name]
                     field["allOf"] = [{"pattern": "^" + re.escape(_MARKET_ID_PREFIX)}]
                 schema_json = json.dumps(wire_schema, separators=(",", ":"))
-        return RequiredStructuredBinding(runnable, schema.__name__, model_name, method, schema_json)
+        return RequiredStructuredBinding(
+            runnable, schema.__name__, model_name, method, schema_json,
+            strict_json_model=schema if strict_json else None,
+        )
     except (NotImplementedError, AttributeError, ValueError, TypeError, RuntimeError):
         logger.warning(
             "%s: required structured output is unsupported by the provider",
@@ -160,6 +170,9 @@ def invoke_required_structured(
 
     schema_name = getattr(structured_llm, "schema_name", "required schema")
     model_name = getattr(structured_llm, "model_name", "unknown")
+    strict_json_model = (
+        structured_llm.strict_json_model if isinstance(structured_llm, RequiredStructuredBinding) else None
+    )
     current_prompt = prompt
     last_reason = "none_parsed"
     for attempt in range(1, max_attempts + 1):
@@ -168,7 +181,9 @@ def invoke_required_structured(
         validating_submission = False
         try:
             raw_result = structured_llm.invoke(current_prompt)
-            value, reason, diagnostics, personal_observation = _unwrap_required_result(raw_result)
+            value, reason, diagnostics, personal_observation = _unwrap_required_result(
+                raw_result, strict_json_model=strict_json_model,
+            )
             if value is not None and validator is not None:
                 validating_submission = True
                 value = validator(value)
@@ -257,6 +272,8 @@ def _is_output_limit(exc: Exception) -> bool:
 
 def _unwrap_required_result(
     result: Any,
+    *,
+    strict_json_model: type[BaseModel] | None = None,
 ) -> tuple[Any | None, str | None, dict[str, Any], tuple[str, dict[str, Any]] | None]:
     """Remove LangChain's include_raw envelope without retaining its payload."""
     if not isinstance(result, Mapping) or not {
@@ -264,6 +281,8 @@ def _unwrap_required_result(
         "parsed",
         "parsing_error",
     }.issubset(result):
+        if strict_json_model is not None:
+            return None, "validation_error", {"validation_kind": "validation_unspecified"}, None
         return result, None if result is not None else "none_parsed", {}, None
 
     raw = result.get("raw")
@@ -289,6 +308,20 @@ def _unwrap_required_result(
             if use_sdk else ("raw_finish_reason_length", raw_diagnostics)
         )
         return None, "output_limit", diagnostics, observation
+    if strict_json_model is not None:
+        # LangChain may repair partial JSON before building its parsed model.
+        # Validate the complete raw text locally, after checking SDK/raw length.
+        try:
+            text = getattr(raw, "content", None)
+            if not isinstance(text, str):
+                raise TypeError("JSON response must be text")
+            parsed = strict_json_model.model_validate(json.loads(
+                text, object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            ))
+        except (ValueError, TypeError) as exc:
+            diagnostics.update(_validation_metadata(exc))
+            return None, "validation_error", diagnostics, None
     if parsed is not None:
         return parsed, None, diagnostics, None
     if parsing_error is not None:
@@ -299,6 +332,17 @@ def _unwrap_required_result(
         diagnostics,
         None,
     )
+
+
+def _unique_json_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise json.JSONDecodeError("duplicate JSON key", "", 0)
+    return result
+
+
+def _reject_json_constant(_):
+    raise json.JSONDecodeError("nonfinite JSON constant", "", 0)
 
 
 _REPORT_FIELDS = frozenset({

@@ -9,10 +9,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, ToolMessage
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tradingagents.agents.utils.structured import (
     SubmissionConstraintError,
@@ -36,6 +36,8 @@ from tradingagents.evidence import (
     EvidenceStatus,
     MarketSnapshotEvidence,
     MaterialClaim,
+    SubmittedEvidenceNote,
+    SubmittedMaterialClaim,
     ToolExecutionEvidenceEnvelope,
     build_tool_evidence_state,
     merge_claim_validations,
@@ -177,12 +179,35 @@ class AnalystSubmissionResult:
     notes: tuple[EvidenceNote, ...] = ()
 
 
-def bind_analyst_finalizer(llm: Any, analyst: str) -> Any | None:
+class _PersonalFundamentalsCitation(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    statement: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+    source_quote: str = Field(min_length=1)
+
+
+class _PersonalFundamentalsNote(_PersonalFundamentalsCitation):
+    kind: Literal["provenance", "availability", "coverage", "applicability"]
+
+
+class PersonalFundamentalsReport(BaseModel):
+    """Model-authored content for the personal statement finalizer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    report_markdown: str = Field(min_length=1)
+    material_claims: tuple[_PersonalFundamentalsCitation, ...]
+    evidence_notes: tuple[_PersonalFundamentalsNote, ...]
+
+
+def bind_analyst_finalizer(llm: Any, analyst: str, *, personal_statements: bool = False) -> Any | None:
     """Bind the required structured finalizer when the provider supports it."""
     return bind_required_structured(
         llm,
-        AnalystEvidenceReport,
+        PersonalFundamentalsReport if personal_statements else AnalystEvidenceReport,
         f"{analyst.title()} Analyst",
+        strict_json=personal_statements,
     )
 
 
@@ -488,6 +513,18 @@ def _finalization_prompt(
         "Unvalidated prose draft (do not return it unless converted into the schema):\n"
         f"{draft.strip() or '[empty draft]'}"
     )
+    if complete_statement_rows:
+        return (
+            f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
+            "Return one PersonalFundamentalsReport JSON object. Provide concise report_markdown, "
+            "material_claims and evidence_notes. The application assigns IDs and the version. "
+            "Use [] for either array when there is no supported entry. Keep each statement "
+            "atomic and cite its exact available source_ref and one contiguous source_quote. "
+            "Record source limitations in the report. Only use evidence_notes when a unique "
+            "quotation actually supports the note. Leave unsupported claims out. "
+            "Preserve dates, units, reliability, counterevidence and any gaps. Do not duplicate tables. "
+            + _PERSONAL_EVIDENCE_GUIDANCE["fundamentals"] + language + source_context
+        )
     if _PERSONAL_FULL_PROMPTS.get() and analyst in _PERSONAL_EVIDENCE_GUIDANCE:
         # A draft may point to dated evidence outside a shortened preview.
         news_gap_guidance = (
@@ -566,6 +603,24 @@ def _normalize_submission(
         for note in validated.evidence_notes
     )
     return report, claims, notes
+
+
+def _normalize_personal_fundamentals(
+    submitted: PersonalFundamentalsReport,
+) -> tuple[str, tuple[MaterialClaim, ...], tuple[EvidenceNote, ...]]:
+    content = PersonalFundamentalsReport.model_validate(submitted)
+    canonical = AnalystEvidenceReport(
+        report_markdown=content.report_markdown,
+        material_claims=tuple(
+            SubmittedMaterialClaim(claim_id=f"fundamentals.claim-{index}", **claim.model_dump())
+            for index, claim in enumerate(content.material_claims, 1)
+        ),
+        evidence_notes=tuple(
+            SubmittedEvidenceNote(note_id=f"fundamentals.note-{index}", **note.model_dump())
+            for index, note in enumerate(content.evidence_notes, 1)
+        ),
+    )
+    return _normalize_submission(canonical, "fundamentals")
 
 
 def _apply_deterministic_history_requirements(
@@ -689,12 +744,16 @@ def finalize_analyst_submission(
         complete_statement_rows=complete_statement_rows,
         personal_news_policy=personal_news_policy,
     )
+    validator = (
+        _normalize_personal_fundamentals if complete_statement_rows
+        else lambda submitted: _normalize_submission(submitted, analyst)
+    )
     structured_result = invoke_required_structured(
         finalizer,
         prompt,
         f"{analyst.title()} Analyst",
-        validator=lambda submitted: _normalize_submission(submitted, analyst),
-        personal_validation_details=personal_news_policy,
+        validator=validator,
+        personal_validation_details=personal_news_policy or complete_statement_rows,
     )
     if structured_result.value is None:
         return _unavailable_result(
