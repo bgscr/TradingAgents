@@ -4,8 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,6 +177,103 @@ def test_refuse_unconfigured_provider_before_graph():
         personal_graph.prepare({"llm_provider": "deepseek"}, "000001.SZ", "2026-11-26")
 
 
+@pytest.mark.parametrize(
+    "stop_at,error,expected_reason,expected_stage",
+    [
+        ("deadline", "deadline_exceeded", "deadline_exceeded", "graph_setup"),
+        (
+            "construction",
+            "preparation_network_forbidden",
+            "preparation_network_forbidden",
+            "graph_setup",
+        ),
+        ("propagate", "deadline_exceeded", "deadline_exceeded", "graph_execution"),
+        ("propagate", "call_limit_exceeded", "call_limit_exceeded", "graph_execution"),
+        (
+            "propagate",
+            "uncovered_data_transport_settings",
+            "uncovered_data_transport_settings",
+            "graph_execution",
+        ),
+        ("propagate", "financial_cache_stale", "financial_cache_stale", "graph_execution"),
+        ("propagate", "unreviewed", "unknown", "graph_execution"),
+        ("publication", "deadline_exceeded", "deadline_exceeded", "report_publication"),
+        ("propagate", None, None, None),
+    ],
+)
+def test_personal_graph_failure_receipt(
+    tmp_path, monkeypatch, capsys, stop_at, error, expected_reason, expected_stage
+):
+    from tradingagents.analysis_budget import AnalysisBudgetStopped
+    from tradingagents.graph import trading_graph
+    from tradingagents.terminal_contract import TerminalContract
+
+    private_details = "fixture-token fixture-private-path fixture-provider-response"
+
+    def stop():
+        print(private_details, file=sys.stderr)
+        cause = RuntimeError(private_details)
+        if error is None:
+            raise cause
+        reason = private_details if error == "unreviewed" else error
+        raise AnalysisBudgetStopped(reason) from cause
+
+    class FixtureGraph:
+        def __init__(self, **kwargs):
+            if stop_at == "construction":
+                stop()
+            self.graph = SimpleNamespace(with_config=lambda **kwargs: self.graph)
+            self.last_analysis_budget = {
+                "admitted_attempts": 10,
+                "data_attempts": 10,
+                "model_attempts": 0,
+            }
+
+        def propagate(self, ticker, day):
+            if stop_at == "propagate":
+                stop()
+            return {"terminal_contract": {}}, None
+
+        def save_reports(self, state, ticker, output):
+            stop()
+
+    monkeypatch.setattr(trading_graph, "TradingAgentsGraph", FixtureGraph)
+    if stop_at == "publication":
+        monkeypatch.setattr(TerminalContract, "model_validate", lambda _: None)
+    elapsed = 120 if stop_at == "deadline" else 0
+    receipt = personal_graph.run(
+        {
+            "analysis_timeout_seconds": 60,
+            "analysis_budget_enabled": True,
+            "personal_verified_inputs": {},
+        },
+        "600895.SS",
+        "2026-11-26",
+        tmp_path,
+        (time.time() - elapsed, time.monotonic() - elapsed),
+    )
+
+    path = tmp_path / receipt["run_id"] / "status.json"
+    raw = path.read_text(encoding="utf-8")
+    assert json.loads(raw) == receipt
+    assert receipt["status"] == "failed" and receipt["report_written"] is False
+    assert receipt["rating_status"] == "unavailable"
+    assert list(path.parent.iterdir()) == [path]
+    if error is None:
+        assert receipt["error"] == "research_or_publication_failed"
+        assert "stop_reason" not in receipt and "stop_stage" not in receipt
+    else:
+        assert receipt["error"] == "research_budget_or_transport_stopped"
+        assert receipt["stop_reason"] == expected_reason
+        assert receipt["stop_stage"] == expected_stage
+    if stop_at in ("propagate", "publication"):
+        assert receipt["admitted_attempts"] == receipt["data_attempts"] == 10
+        assert receipt["model_attempts"] == 0
+    for marker in private_details.split():
+        assert marker not in raw
+    assert capsys.readouterr() == ("", "")
+
+
 def identity_profile(tmp_path, config, symbol, venue):
     from hashlib import sha256
 
@@ -315,8 +414,6 @@ def test_real_personal_graph_to_chinese_report(
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
-    from types import SimpleNamespace
-
     from langchain_core.callbacks import BaseCallbackHandler
 
     from tests.test_budget_readiness import END, START, publish_statements

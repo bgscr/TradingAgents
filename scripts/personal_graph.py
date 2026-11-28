@@ -12,6 +12,43 @@ from uuid import uuid4
 
 ANALYSTS = ("market", "social", "news", "fundamentals")
 
+# Only reviewed, fixed codes from the personal graph's budget and data guards
+# may enter the receipt. New or unexpected reasons use the same safe fallback.
+_PERSONAL_STOP_REASONS = frozenset(
+    {
+        "call_limit_exceeded",
+        "concurrent_analysis_unsupported",
+        "data_redirect_forbidden",
+        "deadline_exceeded",
+        "disabled_data_vendor",
+        "financial_cache_changed",
+        "financial_cache_missing",
+        "financial_cache_refresh_conflict",
+        "financial_cache_stale",
+        "financial_cache_unreadable",
+        "inactive_transport",
+        "model_output_limit_unbound",
+        "model_redirect_forbidden",
+        "optional_sources_require_budget",
+        "preparation_network_forbidden",
+        "source_policy_changed",
+        "uncovered_data_credentials",
+        "uncovered_data_destination",
+        "uncovered_data_transport_settings",
+        "uncovered_data_vendor",
+        "uncovered_httpx_transport",
+        "uncovered_model_destination",
+        "uncovered_model_transport",
+        "uncovered_model_transport_settings",
+        "uncovered_native_transport",
+        "uncovered_requests_adapter",
+        "uncovered_scheduler_transport",
+        "uncovered_socket_transport",
+        "uncovered_transport",
+        "uncovered_tushare_endpoint",
+    }
+)
+
 
 @contextmanager
 def local_payloads():
@@ -325,6 +362,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         **data_scope(config),
     }
     output.mkdir(parents=True, exist_ok=False)
+    stop_stage = "graph_setup"
     try:
         with (
             open(os.devnull, "w", encoding="utf-8") as quiet,
@@ -359,8 +397,10 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                     return value
 
                 graph._run_graph = run_with_binding
+            stop_stage = "graph_execution"
             state, _ = graph.propagate(ticker, day)
             terminal = TerminalContract.model_validate(state["terminal_contract"])
+            stop_stage = "report_publication"
             report = graph.save_reports(state, ticker, output / "report")
             receipt.update(
                 status=terminal.lifecycle_status.value,
@@ -370,8 +410,15 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 report_written=report.is_file(),
                 report_relative_path=report.relative_to(output).as_posix(),
             )
-    except AnalysisBudgetStopped:
-        receipt["error"] = "research_budget_or_transport_stopped"
+    except AnalysisBudgetStopped as exc:
+        reason = exc.reason
+        receipt.update(
+            error="research_budget_or_transport_stopped",
+            stop_reason=reason
+            if type(reason) is str and reason in _PERSONAL_STOP_REASONS
+            else "unknown",
+            stop_stage=stop_stage,
+        )
     except Exception:
         receipt["error"] = "research_or_publication_failed"
     budget = getattr(graph, "last_analysis_budget", None)
