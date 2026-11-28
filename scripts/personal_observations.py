@@ -2,7 +2,7 @@
 
 import http.client
 import ssl
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from threading import Lock
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -232,6 +232,33 @@ class PersonalNews:
         )
 
 
+def margin_publication_window(symbol, day):
+    """Earliest local query time, not proof that the provider has published."""
+    if not symbol.endswith((".SH", ".SZ")):
+        raise ValueError("unsupported_margin_market")
+    days = 3 if symbol.endswith(".SZ") and day.weekday() == 4 else 1
+    return datetime.combine(day + timedelta(days=days), time(9), SHANGHAI)
+
+
+def margin_request_unsettled(authority, key, service):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(authority.database_path.as_uri() + "?mode=ro", uri=True)) as db:
+        return db.execute("""
+            SELECT 1 FROM provider_request_sequences
+            WHERE request_key=? AND upstream_service_id=? AND capacity_scope='market-snapshot'
+              AND (status='running' OR completed_at IS NULL OR final_physical_attempt_count IS NULL
+                   OR (failure_outcome_kind='abandoned' AND final_physical_attempt_count>0))
+            UNION ALL
+            SELECT 1 FROM provider_request_attempts
+            WHERE request_key=? AND upstream_service_id=? AND capacity_scope='market-snapshot'
+              AND (outcome='started' OR final_physical_attempt_count IS NULL
+                   OR COALESCE(terminal_outcome_kind, terminal_outcome)='abandoned')
+            LIMIT 1
+        """, (key, service, key, service)).fetchone() is not None
+
+
 def margin_key(binding, account):
     from tradingagents import margin_balance as margin, moneyflow
 
@@ -264,6 +291,7 @@ def margin_observation(session, binding, token, account, authority):
 
     day = date.fromisoformat(binding["trade_date"])
     key = margin_key(binding, account)
+    window = margin_publication_window(binding["symbol"], day)
 
     def received(value):
         if type(value) is not tuple or len(value) != 3 or not isinstance(value[2], str):
@@ -281,29 +309,35 @@ def margin_observation(session, binding, token, account, authority):
             )
         return margin.cached_receipt_time(value, binding)
 
-    value = retrospective_observation(
-        authority,
-        request_key=key,
-        provider="tushare",
-        operation="margin_detail",
-        as_of=day,
-        receipt_time=received,
-    )
+    def cached():
+        return retrospective_observation(
+            authority, request_key=key, provider="tushare", operation="margin_detail",
+            as_of=day, receipt_time=received,
+            accept_attempt=lambda value, sent: bool(value[0]) or sent >= window,
+        )
+
+    value = cached()
     source = "coordinator_cache"
     if value is None:
         source = "account_request"
-        if day >= cold.now().astimezone(SHANGHAI).date():
+        if cold.now() < window:
             return {"status": "publication_pending", "rule": "retrospective_window_not_open"}
         if not session.financial_capacity_available("margin_detail"):
             return {"status": "financial_budget_unavailable"}
         try:
-            value = session.query(
+            session.query(
                 token,
                 "margin_detail",
                 {"ts_code": binding["symbol"], "trade_date": day.strftime("%Y%m%d")},
                 ",".join(margin.FIELDS),
                 observation_binding=binding,
             )
+        except cold.PreparationError as exc:
+            if str(exc) == "prior_margin_attempt_unsettled":
+                return {"status": "prior_margin_attempt_unsettled"}
+            if str(exc) == "margin_publication_window_not_open":
+                return {"status": "publication_pending", "rule": "retrospective_window_not_open"}
+            raise
         except PhysicalAttemptBudgetExhausted as exc:
             status = exc.failure.outcome.value
             if exc.failure.error_code == "margin_date_mismatch":
@@ -314,7 +348,12 @@ def margin_observation(session, binding, token, account, authority):
                 in {"date_mismatch", "permission_denied", "authentication", "rate_limited"}
                 else "unverified"
             }
-    if received(value) is None:
+        # A follower may have joined an older client. Verify the actual send
+        # time and completed ledger entry before accepting even a fresh empty.
+        value = cached()
+        if not session.counts.get("margin_detail"):
+            source = "coordinator_cache"
+    if value is None:
         return {"status": "unverified"}
     rows, _, stamp = value
     return {

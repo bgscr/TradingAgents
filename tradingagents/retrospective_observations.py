@@ -11,7 +11,8 @@ from tradingagents.market_history.result_codec import decode_coordinated_result,
 
 
 def retrospective_observation(store_config, *, request_key: str, provider: str, operation: str,
-                              as_of: date, receipt_time: Callable[[object], str | None], with_receipt=False):
+                              as_of: date, receipt_time: Callable[[object], str | None], with_receipt=False,
+                              accept_attempt: Callable[[object, datetime], bool] | None = None):
     """Read a completed, single-send advisory projection for current retrospective use."""
 
     if store_config.data_usage_mode is not DataUsageMode.PERSONAL_RESEARCH or (provider, operation) not in {
@@ -71,6 +72,8 @@ def retrospective_observation(store_config, *, request_key: str, provider: str, 
         # This reader serves closed historical windows only. A fresh
         # intraday observation cannot become an end-of-day cache entry.
         if times[2].astimezone(timezone(timedelta(hours=8))).date() <= as_of:
+            return None
+        if accept_attempt is not None and not accept_attempt(value, times[1]):
             return None
         if with_receipt:
             return dict(sequence_id=sequence, request_key=request_key, result_sha256=digest,

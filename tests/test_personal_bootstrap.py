@@ -464,6 +464,8 @@ try:
     feed = install_graph_boundary(changes, {ticker.replace(".SH", ".SS")!r}, Path({str(trace)!r}))
     if Path({str(trace)!r}).exists():
         feed.instant += timedelta(minutes=5)
+    if os.environ.get("PERSONAL_FIXTURE_EARLY_MORNING") == "1":
+        feed.instant += timedelta(hours=15, minutes=30)
     if os.environ.get("PERSONAL_FIXTURE_NEXT_MORNING") == "1":
         feed.instant += timedelta(hours=17)
         if feed.exchange == "SZSE":
@@ -628,6 +630,17 @@ except BaseException:
     assert code == 0 and basic["evidence_preset"] == "basic"
     assert set(basic["enhancements"].values()) == {"not_selected"}
     assert trace.read_text().splitlines() == counts
+    if not retrospective:
+        env["PERSONAL_FIXTURE_EARLY_MORNING"] = "1"
+        code, early = launch("-Run", "-TusharePoints", "2000")
+        del env["PERSONAL_FIXTURE_EARLY_MORNING"]
+        assert code in (0, 3) and early["exchange_session"] == receipt["exchange_session"]
+        assert early["enhancements"]["margin_balance"] == "publication_pending"
+        assert early["financial_attempts"] == 0
+        after_early = trace.read_text().splitlines()
+        assert "prepare:margin_detail" not in after_early[len(counts):]
+        assert early["admitted_attempts"] == len(after_early) - len(counts) <= 60
+        counts = after_early
     env["PERSONAL_FIXTURE_NEXT_MORNING"] = "1"
     code, next_day = launch("-Run", "-FetchEastmoneyRatio", "-TusharePoints", "5000")
     assert next_day["moneyflow_dc_access"]["entitlement_checked"] is False

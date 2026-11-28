@@ -354,6 +354,11 @@ class Session:
 
         def ensure_capacity():
             self.remaining()
+            if endpoint == "margin_detail":
+                from scripts.personal_observations import margin_publication_window
+
+                if now() < margin_publication_window(observation_binding["symbol"], self.day):
+                    raise PreparationError("margin_publication_window_not_open")
             if (
                 sum(self.counts.values()) >= self.maximum
                 or self.counts.get(endpoint, 0)
@@ -412,6 +417,14 @@ class Session:
                 )
             elif ceiling.allow_prewarming or ceiling.minimum_interval < self.interval:
                 raise PreparationError("personal_rate_policy_mismatch")
+            if endpoint == "margin_detail":
+                from scripts.personal_observations import margin_request_unsettled
+                from tradingagents.market_history.config import provider_request_authority_config
+
+                if margin_request_unsettled(
+                    provider_request_authority_config(self.history), request_key, self.service
+                ):
+                    raise PreparationError("prior_margin_attempt_unsettled")
             result = coord.execute_physical_workflow(
                 request_key=request_key,
                 upstream_service_id=self.service,
