@@ -6,6 +6,7 @@ The usual pytest temp parent and numbered directory are used. A new session
 may get a longer counter suffix. Plugin autoload, cache and old-temp pruning
 are disabled. Capture uses memory instead of temporary files. Output is one
 JSON line. The exit status is pytest's, or 2 if the probe's guard stops it.
+Unrecognized pytest setup failures keep the operation "probe_setup".
 """
 
 import contextlib
@@ -178,6 +179,48 @@ def diagnostic_error(error, known_types, path=None):
     }
 
 
+def pytest_setup_operation(error):
+    """Classify only observed frames from the installed pytest implementation."""
+    tmpdir = sys.modules.get("_pytest.tmpdir")
+    paths = sys.modules.get("_pytest.pathlib")
+    factory = getattr(tmpdir, "TempPathFactory", None)
+    trace = {frame.f_code: lineno for frame, lineno in walk_tb(error.__traceback__)}
+
+    def in_trace(owner, name):
+        return getattr(getattr(owner, name, None), "__code__", None) in trace
+
+    def source_line(owner, name):
+        code = getattr(getattr(owner, name, None), "__code__", None)
+        return linecache.getline(code.co_filename, trace[code]).strip() if code in trace else ""
+
+    base_line = source_line(factory, "getbasetemp")
+    if base_line.startswith("temproot = Path(") and base_line.endswith(".resolve()"):
+        return "pytest_temp_root_resolution"
+    if base_line.startswith("rootdir.mkdir("):
+        return "pytest_temp_user_directory_create"
+    if in_trace(factory, "getbasetemp"):
+        if in_trace(paths, "create_cleanup_lock"):
+            return "pytest_temp_cleanup_lock"
+        # tmpdir keeps the original allocator while the probe wraps the pathlib alias.
+        if in_trace(tmpdir, "make_numbered_dir"):
+            if in_trace(paths, "find_prefixed"):
+                return "pytest_temp_numbered_directory_scan"
+            if source_line(tmpdir, "make_numbered_dir").startswith(("new_path.mkdir(", "raise OSError(")):
+                return "pytest_temp_numbered_directory_create"
+    if source_line(factory, "mktemp").startswith("p.mkdir("):
+        return "pytest_temp_child_directory_create"
+    if in_trace(tmpdir, "pytest_sessionfinish") and in_trace(paths, "cleanup_dead_symlinks"):
+        return "pytest_temp_session_cleanup"
+    return "probe_setup"
+
+
+def pytest_setup_diagnostic(error):
+    return {
+        "operation": pytest_setup_operation(error),
+        **diagnostic_error(error, ERROR_TYPES, getattr(error, "filename", None)),
+    }
+
+
 def locate_failure(error, bootstrap, store):
     """Match known operations. If the failure site is ambiguous, use the containing stage."""
     history = store.MarketHistoryStore
@@ -252,8 +295,7 @@ def plugin_for(pytest, boundary, row):
 
         def pytest_internalerror(self, excinfo):
             if row["operation"] == "probe_setup":
-                error = excinfo.value
-                row.update(diagnostic_error(error, ERROR_TYPES, getattr(error, "filename", None)))
+                row.update(pytest_setup_diagnostic(excinfo.value))
 
         @pytest.hookimpl(hookwrapper=True)
         def pytest_runtest_call(self, item):
@@ -363,7 +405,8 @@ def main():
         except OfflineBoundaryStop:
             row["operation"] = "offline_boundary_stopped"
         except BaseException as exc:
-            row.update(diagnostic_error(exc, ERROR_TYPES))
+            setup = pytest_setup_diagnostic(exc) if row["operation"] == "probe_setup" else None
+            row.update(setup if setup and setup["operation"] != "probe_setup" else diagnostic_error(exc, ERROR_TYPES))
     print(json.dumps(row, separators=(",", ":")))
     return status
 
