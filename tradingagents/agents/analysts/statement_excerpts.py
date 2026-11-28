@@ -12,6 +12,7 @@ from tradingagents.dataflows.financial_contracts import (
 from tradingagents.financial_observations import (
     CURRENT_STATEMENT_COLUMNS,
     STATEMENT_TITLES,
+    FinancialObservation,
     bind_current_statement_observation,
 )
 
@@ -66,7 +67,7 @@ def statement_excerpts(
     source_ref: str,
     tool_call_id: str,
     artifact_sha256: str,
-) -> tuple[list[str], list[str], list[str]]:
+) -> tuple[list[tuple[str, FinancialObservation]], list[str], list[str]]:
     """Return exact rows and notes, plus non-citable missing-field observations."""
     lines = raw_text.splitlines()
     title = f"# {STATEMENT_TITLES[tool_name]} data for {ticker} ({frequency})"
@@ -113,7 +114,7 @@ def statement_excerpts(
             symbol=ticker,
         )
         if observation is not None:
-            rows.append(quote)
+            rows.append((quote, observation))
     if not rows:
         return [], [], []
     notes = []

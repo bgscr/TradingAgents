@@ -60,6 +60,7 @@ from tradingagents.financial_observations import (
     CURRENT_STATEMENT_COLUMNS,
     FINANCIAL_TOOLS,
     STATEMENT_TITLES,
+    FinancialObservation,
 )
 from tradingagents.run_diagnostics import record_output
 
@@ -194,18 +195,17 @@ _STATEMENT_MAX_CLAIMS = 6
 _STATEMENT_MAX_NOTES = 3
 
 
-class _PersonalStatementEntry(BaseModel):
+class _PersonalFundamentalsCitation(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    statement: str = Field(min_length=1, max_length=_STATEMENT_ENTRY_CHARS)
-
-
-class _PersonalFundamentalsCitation(_PersonalStatementEntry):
     evidence_id: str = Field(pattern=r"^R[0-9]{3}$")
 
 
-class _PersonalFundamentalsNote(_PersonalStatementEntry):
+class _PersonalFundamentalsNote(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     evidence_id: str = Field(pattern=r"^N[0-9]{3}$")
+    statement: str = Field(min_length=1, max_length=_STATEMENT_ENTRY_CHARS)
     kind: Literal["provenance", "availability", "coverage", "applicability"]
 
 
@@ -217,6 +217,13 @@ class PersonalFundamentalsReport(BaseModel):
     report_markdown: str = Field(min_length=1, max_length=_STATEMENT_REPORT_CHARS)
     material_claims: tuple[_PersonalFundamentalsCitation, ...] = Field(max_length=_STATEMENT_MAX_CLAIMS)
     evidence_notes: tuple[_PersonalFundamentalsNote, ...] = Field(max_length=_STATEMENT_MAX_NOTES)
+
+
+@dataclass(frozen=True)
+class _StatementEvidence:
+    source_ref: str
+    quote: str
+    observation: FinancialObservation | None = None
 
 
 def bind_analyst_finalizer(llm: Any, analyst: str, *, personal_statements: bool = False) -> Any | None:
@@ -448,7 +455,7 @@ def render_allowed_source_ref_catalog(
     )
 
 
-def _personal_statement_prompt(messages, ticker, trade_date) -> tuple[str, dict[str, tuple[str, str]]]:
+def _personal_statement_prompt(messages, ticker, trade_date) -> tuple[str, dict[str, _StatementEvidence]]:
     from tradingagents.agents.utils.agent_utils import get_language_instruction
 
     calls = _tool_calls_by_id(messages)
@@ -482,22 +489,26 @@ def _personal_statement_prompt(messages, ticker, trade_date) -> tuple[str, dict[
             continue
         gaps.extend(f"- {label}: {entry}." for entry in missing)
         sections.append(f"# {STATEMENT_TITLES[message.name]} data for {ticker} ({frequency})")
-        for prefix, excerpts in (("R", rows), ("N", notes)):
-            for quote in excerpts:
-                evidence_id = f"{prefix}{next_id[prefix]:03d}"
-                next_id[prefix] += 1
-                catalog[evidence_id] = (result.request_ref, quote)
-                sections.append(f"{evidence_id} | {quote}")
+        for quote, observation in rows:
+            evidence_id = f"R{next_id['R']:03d}"
+            next_id["R"] += 1
+            catalog[evidence_id] = _StatementEvidence(result.request_ref, quote, observation)
+            sections.append(f"{evidence_id} | {quote}")
+        for quote in notes:
+            evidence_id = f"N{next_id['N']:03d}"
+            next_id["N"] += 1
+            catalog[evidence_id] = _StatementEvidence(result.request_ref, quote)
+            sections.append(f"{evidence_id} | {quote}")
     if any(count > 1 for count in groups.values()):
         gaps.append("- Duplicate statement scopes were excluded.")
     prompt = (
         f"Finalize the fundamentals analyst report for {ticker} on {trade_date}. "
         f"Return one PersonalFundamentalsReport JSON object. report_markdown: at most {_STATEMENT_REPORT_CHARS} characters. "
         f"Select up to {_STATEMENT_MAX_CLAIMS} material_claims using R IDs and up to {_STATEMENT_MAX_NOTES} evidence_notes using N IDs. "
-        f"Each statement is at most {_STATEMENT_ENTRY_CHARS} characters. Use [] if no supported entry. "
-        "Return only the ID as evidence_id. Keep each claim atomic and use only values visible on its one row. "
-        "Cover material findings, counterevidence and relevant gaps in short bullets without reproducing the evidence table. "
-        "Preserve units, period and freshness. CURRENT rows are advisory. Report missing values as unavailable. "
+        f"Each evidence note statement is at most {_STATEMENT_ENTRY_CHARS} characters. Use [] if no supported entry. "
+        "Each material_claims entry contains only evidence_id. The application renders the exact amount, unit and period. "
+        "Cover material findings, counterevidence and relevant gaps in short bullets. Leave amounts to the selected rows. "
+        "CURRENT rows are advisory. Report missing values as unavailable. "
         + get_language_instruction()
         + "\n\nExact core statement excerpts. Row columns: " + ",".join(CURRENT_STATEMENT_COLUMNS) + "\n"
         + ("\n".join(sections) if sections else "(none)")
@@ -653,7 +664,7 @@ def _normalize_submission(
 
 def _normalize_personal_fundamentals(
     submitted: PersonalFundamentalsReport,
-    catalog: Mapping[str, tuple[str, str]],
+    catalog: Mapping[str, _StatementEvidence],
 ) -> tuple[str, tuple[MaterialClaim, ...], tuple[EvidenceNote, ...]]:
     content = PersonalFundamentalsReport.model_validate(submitted)
 
@@ -661,19 +672,39 @@ def _normalize_personal_fundamentals(
         match = catalog.get(entry.evidence_id)
         if match is None:
             raise SubmissionConstraintError("unknown_evidence_id")
-        source_ref, source_quote = match
-        return {"statement": entry.statement, "source_ref": source_ref, "source_quote": source_quote}
+        return match
+
+    claims = []
+    for index, claim in enumerate(content.material_claims, 1):
+        match = resolve(claim)
+        observation = match.observation
+        if observation is None:
+            raise SubmissionConstraintError("unknown_evidence_id")
+        period = (
+            f"balance at period end {observation.period_end}"
+            if observation.period_basis == "period_end_balance"
+            else f"cumulative from fiscal year start through {observation.period_end}"
+        )
+        claims.append(SubmittedMaterialClaim(
+            claim_id=f"fundamentals.claim-{index}",
+            statement=f"{observation.field}: {observation.value} {observation.unit} "
+                      f"({period}; {observation.frequency} source).",
+            source_ref=match.source_ref,
+            source_quote=match.quote,
+        ))
+
+    notes = []
+    for index, note in enumerate(content.evidence_notes, 1):
+        match = resolve(note)
+        notes.append(SubmittedEvidenceNote(
+            note_id=f"fundamentals.note-{index}", kind=note.kind, statement=note.statement,
+            source_ref=match.source_ref, source_quote=match.quote,
+        ))
 
     canonical = AnalystEvidenceReport(
         report_markdown=content.report_markdown,
-        material_claims=tuple(
-            SubmittedMaterialClaim(claim_id=f"fundamentals.claim-{index}", **resolve(claim))
-            for index, claim in enumerate(content.material_claims, 1)
-        ),
-        evidence_notes=tuple(
-            SubmittedEvidenceNote(note_id=f"fundamentals.note-{index}", kind=note.kind, **resolve(note))
-            for index, note in enumerate(content.evidence_notes, 1)
-        ),
+        material_claims=tuple(claims),
+        evidence_notes=tuple(notes),
     )
     return _normalize_submission(canonical, "fundamentals")
 
