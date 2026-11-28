@@ -401,7 +401,10 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
 
                 graph._run_graph = run_with_binding
             stop_stage = "graph_execution"
-            state, _ = graph.propagate(ticker, day)
+            from tradingagents.agents.analysts.submission import personal_full_prompt_scope
+
+            with personal_full_prompt_scope(config.get("personal_mode") == "full"):
+                state, _ = graph.propagate(ticker, day)
             terminal = TerminalContract.model_validate(state["terminal_contract"])
             stop_stage = "report_publication"
             report = graph.save_reports(state, ticker, output / "report")

@@ -5,6 +5,7 @@ from tradingagents.agents.analysts.submission import (
     MARKET_EVIDENCE_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
+    personal_full_tool_prompt,
     process_analyst_response,
     render_allowed_source_ref_catalog,
 )
@@ -32,7 +33,16 @@ def create_market_analyst(llm):
         ]
         tools = [*data_tools, AnalystEvidenceReport]
 
-        system_message = (
+        system_message = personal_full_tool_prompt(
+            "market",
+            "Analyze market trends, conflicts and uncertainty over the requested window. Call get_stock_data "
+            "first; call get_verified_market_snapshot for the ticker and analysis date before submitting. "
+            "Use the snapshot for exact OHLCV and indicator claims. Flag conflicts and keep China A-share "
+            "enhancements supplemental. For get_indicators, choose up to eight complementary indicators "
+            "as one comma-separated list. Exact keys: close_50_sma, close_200_sma, close_10_ema, macd, macds, "
+            "macdh, rsi, boll, boll_ub, boll_lb, atr, vwma. Require dated evidence for exact moves or historical "
+            "claims. For a Chinese moving average state the measured period and reading, separately from interpretation.",
+        ) or (
             """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
 
 Moving Averages:

@@ -4,6 +4,7 @@ from tradingagents.agents.analysts.submission import (
     ANALYST_OUTPUT_GUIDANCE,
     bind_analyst_finalizer,
     build_analyst_update,
+    personal_full_tool_prompt,
     process_analyst_response,
     render_allowed_source_ref_catalog,
 )
@@ -33,7 +34,13 @@ def create_fundamentals_analyst(llm):
         ]
         tools = [*data_tools, AnalystEvidenceReport]
 
-        system_message = (
+        system_message = personal_full_tool_prompt(
+            "fundamentals",
+            "Review the balance sheet, income and cash flow and available company information as of the "
+            "analysis date across the full requested financial window. Focus on material changes, risks and "
+            "limitations. Keep disclosure snapshots supplemental, and never invent filing details or use "
+            "omitted business, summary or fund-flow fields as evidence.",
+        ) or (
             "You analyze company fundamentals as of the requested analysis date, using the full requested financial window available in the tools. Review the statements and available company information for decision-relevant changes, risks, and limitations. Summarize the findings instead of reproducing financial history or every table row."
             + " Use one compact summary table only if it adds information without repeating the prose. "
             + ANALYST_OUTPUT_GUIDANCE

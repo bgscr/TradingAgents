@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -52,6 +54,24 @@ logger = logging.getLogger(__name__)
 
 _REPORT_TOOL_NAME = AnalystEvidenceReport.__name__
 _SOURCE_PREVIEW_LIMIT = 4_000
+_PERSONAL_FULL_PROMPTS = ContextVar("personal_full_analyst_prompts", default=False)
+_PERSONAL_EVIDENCE_GUIDANCE = {
+    "market": (
+        "Use one complete verified OHLCV or exact indicator row per claim, with its date and period. "
+        "For Chinese moving averages use ‘〈周期〉日均线为〈读数〉。’. "
+        "Keep thresholds and interpretations advisory. If qfq is established, disclose its "
+        "total-return limitation. Auxiliary commentary is not a quotation source."
+    ),
+    "news": (
+        "Separate company events from sector and macro context. An index entry alone cannot "
+        "support article content or sentiment, and a coverage gap does not establish no news."
+    ),
+    "fundamentals": (
+        "For CURRENT statements quote one complete CSV data row per observation. Keep period, "
+        "currency, units and any reliability restrictions. CURRENT rows are advisory, and "
+        "synthetic warnings, unavailable or inapplicable metrics belong in notes, never as zero."
+    ),
+}
 ANALYST_OUTPUT_GUIDANCE = (
     "Keep the final JSON concise so the entire object, including exact source quotes, "
     "fits the configured output budget. Aim for a report of about 1,500 characters; "
@@ -97,6 +117,41 @@ MARKET_EVIDENCE_GUIDANCE = (
     "When only commentary supports a limitation, keep it in the report and leave it out of "
     "evidence_notes; an empty evidence_notes array is valid."
 )
+
+
+@contextmanager
+def personal_full_prompt_scope(enabled: bool):
+    """Select compact prompts for the analysts inside one personal Full graph run."""
+    token = _PERSONAL_FULL_PROMPTS.set(enabled)
+    try:
+        yield
+    finally:
+        _PERSONAL_FULL_PROMPTS.reset(token)
+
+
+def _compact_submission_prompt(analyst: str) -> str:
+    return (
+        "Submit one AnalystEvidenceReport. report_markdown is a string; material_claims and evidence_notes "
+        "are arrays of objects (use [] when empty). Use short bullets for the supported conclusion, "
+        "counterevidence, uncertainty and material gaps. Aim for about 600 characters of prose when "
+        "practical; keep all decision-relevant evidence and qualifications. Skip duplicated prose and tables. "
+        "Preserve dates or periods and source reliability. Use material_claims for each supported material premise "
+        "once (claim_id, statement, source_ref, source_quote). Use evidence_notes for material source limitations "
+        "(note_id, kind, statement, source_ref, source_quote). Note kinds: provenance, availability, coverage, "
+        "applicability. Keep notes separate from decision premises. "
+        f"Use unique {analyst}. IDs. Copy allowed refs and exact contiguous, unique source quotations; "
+        "keep required complete rows, without translation or splicing. Leave unsupported premises out and "
+        "explain unresolved limitations in the report. "
+        + _PERSONAL_EVIDENCE_GUIDANCE[analyst]
+    )
+
+
+def personal_full_tool_prompt(analyst: str, tool_guidance: str) -> str | None:
+    if not _PERSONAL_FULL_PROMPTS.get():
+        return None
+    from tradingagents.agents.utils.agent_utils import get_language_instruction
+
+    return f"{tool_guidance}\n{_compact_submission_prompt(analyst)}{get_language_instruction()}"
 
 
 @dataclass(frozen=True)
@@ -283,6 +338,7 @@ def _finalization_prompt(
 
     catalog = []
     seen_artifacts = set()
+    preview_omitted_evidence = False
     tool_calls_by_id = _tool_calls_by_id(messages)
     for message in messages:
         source_ref = _source_ref(
@@ -297,6 +353,7 @@ def _finalization_prompt(
         seen_artifacts.add(artifact_key)
         content = str(getattr(message, "content", "")).strip()
         if len(content) > _SOURCE_PREVIEW_LIMIT:
+            preview_omitted_evidence = True
             head_length = _SOURCE_PREVIEW_LIMIT // 2
             tail_length = _SOURCE_PREVIEW_LIMIT - head_length
             content = (
@@ -306,6 +363,39 @@ def _finalization_prompt(
             )
         catalog.append(f"- {source_ref}\n  Evidence: {content or '[empty tool result]'}")
     source_catalog = "\n".join(catalog) if catalog else "- (no source refs available)"
+    source_context = f"Allowed source refs and collected evidence:\n{source_catalog}\n\n"
+    if auxiliary_context:
+        source_context += (
+            "Deterministic auxiliary observations (report commentary only; do not add "
+            "material_claims, evidence_notes, source refs or rating premises from this section). "
+            "Include a concise multi-year commentary section in report_markdown. When available, "
+            "retain the cumulative adjusted-price return, annual-return pattern with its baseline "
+            "and partial-period labels, and maximum drawdown with peak/trough dates. Preserve "
+            "coverage and retrospective limitations. Do not discard these supplied auxiliary "
+            "observations merely because they are outside the source catalog; they remain "
+            "advisory, never decision premises. If unavailable, preserve the limitation and do "
+            "not invent numbers. Distinct tool date windows can legitimately have distinct row "
+            "counts; a subwindow is not by itself a conflict with the full snapshot.\n"
+            + auxiliary_context + "\n\n"
+        )
+    language = (
+        get_language_instruction()
+        + " Preserve JSON schema keys, identifiers, source_ref and source_quote unchanged; "
+        "the language instruction applies only to report_markdown and human-readable "
+        "statements, never to exact source quotations.\n\n"
+    )
+    draft_context = (
+        "Unvalidated prose draft (do not return it unless converted into the schema):\n"
+        f"{draft.strip() or '[empty draft]'}"
+    )
+    if _PERSONAL_FULL_PROMPTS.get() and analyst in _PERSONAL_EVIDENCE_GUIDANCE:
+        # A draft may point to dated evidence outside a shortened preview.
+        return (
+            f"Finalize the {analyst} analyst report for {ticker} on {trade_date}. "
+            "Return one JSON object without surrounding prose. "
+            + _compact_submission_prompt(analyst) + language + source_context
+            + (draft_context if preview_omitted_evidence and draft.strip() else "")
+        )
     note_example = ('"evidence_notes":[]}.' if analyst == "market" else
                     '"evidence_notes":[{"note_id":"' + analyst + '.unique_note",'
                     '"kind":"availability","statement":"source limitation",'
@@ -327,26 +417,7 @@ def _finalization_prompt(
         "the application derives those fields. "
         "If no listed source supports a decision-relevant premise, omit that claim.\n\n"
         + ANALYST_OUTPUT_GUIDANCE + (" " + MARKET_EVIDENCE_GUIDANCE if analyst == "market" else "") + "\n\n"
-        + get_language_instruction()
-        + " Preserve JSON schema keys, identifiers, source_ref and source_quote unchanged; "
-        "the language instruction applies only to report_markdown and human-readable "
-        "statements, never to exact source quotations.\n\n"
-        "Allowed source refs and collected evidence:\n"
-        f"{source_catalog}\n\n"
-        + ("Deterministic auxiliary observations (report commentary only; do not add "
-           "material_claims, evidence_notes, source refs or rating premises from this section). "
-           "Include a concise multi-year commentary section in report_markdown. When available, "
-           "retain the cumulative adjusted-price return, annual-return pattern with its baseline "
-           "and partial-period labels, and maximum drawdown with peak/trough dates. Preserve "
-           "coverage and retrospective limitations. Do not discard these supplied auxiliary "
-           "observations merely because they are outside the source catalog; they remain "
-           "advisory, never decision premises. If unavailable, preserve the limitation and do "
-           "not invent numbers. Distinct tool date windows can legitimately have distinct row "
-           "counts; a subwindow is not by itself a conflict with the full snapshot.\n"
-           + auxiliary_context + "\n\n" if auxiliary_context else "")
-        +
-        "Unvalidated prose draft (do not return it unless converted into the schema):\n"
-        f"{draft.strip() or '[empty draft]'}"
+        + language + source_context + draft_context
     )
 
 
