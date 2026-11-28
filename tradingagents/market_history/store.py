@@ -596,11 +596,11 @@ class MarketHistoryStore:
         payload_root.mkdir(parents=True, exist_ok=True)
         owner_path = payload_root / _PAYLOAD_ROOT_OWNER_FILENAME
         expected_owner = os.path.normcase(str(config.database_path)).encode("utf-8") + b"\n"
-        temporary_owner = payload_root / (
-            f"{_PAYLOAD_ROOT_OWNER_FILENAME}.{uuid4().hex}.tmp"
-        )
+        temporary_owner = payload_root / f".mh-{uuid4().hex[:20]}.tmp"
+        # Only clean up the candidate after its exclusive creation succeeds.
+        handle = temporary_owner.open("xb")
         try:
-            with temporary_owner.open("xb") as handle:
+            with handle:
                 handle.write(expected_owner)
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -770,7 +770,11 @@ def write_immutable_decision_audit(
 ) -> Path:
     """Publish a complete audit atomically and never overwrite different data."""
     directory = Path(directory)
+    name = filename if filename is not None else f"decision-audit-{final_state.get('trade_date')}-"
     if publication is None:
+        # A fixed staging prefix no longer couples the target to the staging directory.
+        if not name.strip(" .") or any(char in name for char in "/\\:\0"):
+            raise ValueError("decision audit filename must be one path component")
         directory.mkdir(parents=True, exist_ok=True)
     elif directory != publication.root:
         raise ValueError("audit directory differs from its pinned report root")
@@ -786,10 +790,7 @@ def write_immutable_decision_audit(
         publication=publication,
     )
     if filename is None:
-        filename = (
-            f"decision-audit-{final_state.get('trade_date')}-"
-            f"{audit_payload['audit_sha256'][:16]}.json"
-        )
+        filename = f"{name}{audit_payload['audit_sha256'][:16]}.json"
     encoded = (
         json.dumps(audit_payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     )
@@ -811,7 +812,7 @@ def write_immutable_decision_audit(
 
     descriptor, temporary_name = tempfile.mkstemp(
         dir=directory,
-        prefix=f".{filename}.",
+        prefix=".audit-",
         suffix=".tmp",
     )
     temporary = Path(temporary_name)
