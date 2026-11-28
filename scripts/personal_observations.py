@@ -11,6 +11,13 @@ from scripts import personal_bootstrap as cold
 
 SOURCES = ("news", "margin_balance", "eastmoney_fundflow_ratio")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+_NEWS_RESPONSE_SHAPE_REJECTIONS = frozenset({
+    "body_type", "body_limit", "encoding_invalid", "callback_invalid", "callback_mismatch",
+    "wrapper_invalid", "duplicate_json_key", "nonfinite_json_number", "json_invalid",
+    "trailing_syntax", "root_not_object", "structure_limit", "invalid_envelope",
+    "articles_missing", "articles_null", "articles_not_list", "article_limit",
+    "schema_invalid", "article_core_missing", "non_string_article_field", "article_core_invalid",
+})
 
 
 MONEYFLOW_DC_MINIMUM_POINTS = 5000  # Tushare API document 349.
@@ -104,21 +111,32 @@ def news_page(raw, ticker, day, observed):
         )
     except NewsResponseError as exc:
         counts = exc.source_selection
+        status = "unverified"
+        diagnostic = {"reason": "unknown"}
         if exc.reason == "no_usable_articles" and counts is not None:
+            diagnostic = {"reason": "candidates_rejected", "selection_counts": counts.as_dict()}
             if counts.returned == 0:
+                diagnostic["reason"] = "no_candidates"
                 return {
                     "status": "valid_empty",
                     "coverage": "one_page",
                     "observed_at": observed.isoformat(),
+                    "index_diagnostic": diagnostic,
                 }
             if counts.outside_window == counts.returned:
-                return {"status": "date_mismatch"}
-        return {"status": "unverified"}
+                status = "date_mismatch"
+        elif exc.reason == "business_failure":
+            diagnostic["reason"] = "source_business_rejected"
+        elif exc.reason in _NEWS_RESPONSE_SHAPE_REJECTIONS:
+            diagnostic["reason"] = "unexpected_response"
+        elif exc.reason in {"invalid_article_date", "conflicting_article_duplicate"}:
+            diagnostic["reason"] = "candidates_rejected"
+        return {"status": status, "index_diagnostic": diagnostic}
     articles = []
     for row in page.rows:
         published = datetime.fromisoformat(row["date"]).replace(tzinfo=SHANGHAI)
         if published > observed:
-            return {"status": "date_mismatch"}
+            return {"status": "date_mismatch", "index_diagnostic": {"reason": "candidates_rejected"}}
         # Only verifier-built numeric article references and times leave this boundary.
         articles.append({"source": row["url"], "published_at": published.isoformat()})
     return {

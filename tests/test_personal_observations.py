@@ -13,7 +13,7 @@ DAY = "2024-02-29"
 SYMBOL = "600895.SS"
 
 
-def page_bytes(ticker, when="2024-02-29 13:00:00", *, empty=False, url=None):
+def page_bytes(ticker, when="2024-02-29 13:00:00", *, empty=False, url=None, business=None):
     from tradingagents.powershell_news import make_request
 
     code = "202402290000000001"
@@ -25,23 +25,28 @@ def page_bytes(ticker, when="2024-02-29 13:00:00", *, empty=False, url=None):
         "url": url or "http://finance.eastmoney.com/a/" + code + ".html",
     }
     data = {"code": 0, "msg": "OK", "result": {"cmsArticleWebOld": [] if empty else [article]}}
+    if business is not None:
+        data.update(business)
     return (make_request(ticker, DAY).callback + "(" + json.dumps(data) + ")").encode()
 
 
 @pytest.mark.parametrize(
-    "case,status",
+    "case,status,reason,selection",
     [
-        ("available", "verified"),
-        ("empty", "valid_empty"),
-        ("other_stock", "unverified"),
-        ("wrong_day", "date_mismatch"),
-        ("future_time", "date_mismatch"),
-        ("wrong_source", "unverified"),
-        ("wrong_callback", "unverified"),
+        ("available", "verified", None, None),
+        ("empty", "valid_empty", "no_candidates", {}),
+        ("other_stock", "unverified", "candidates_rejected", {"returned": 1, "wrong_stock": 1}),
+        ("wrong_day", "date_mismatch", "candidates_rejected", {"returned": 1, "outside_window": 1}),
+        ("future_time", "date_mismatch", "candidates_rejected", None),
+        ("wrong_source", "unverified", "candidates_rejected", {"returned": 1, "source_rejected": 1}),
+        ("wrong_callback", "unverified", "unexpected_response", None),
+        ("business_failure", "unverified", "source_business_rejected", None),
+        ("unverified_status", "unverified", "unknown", None),
     ],
 )
-def test_news_provenance_and_time(case, status):
+def test_news_provenance_and_time(case, status, reason, selection):
     stamp = datetime.fromisoformat("2024-02-29T16:30:00+08:00")
+    private_marker = "fixture-raw-provider-marker"
     raw = page_bytes(
         "000001.SZ" if case == "other_stock" else SYMBOL,
         {"wrong_day": "2024-03-01 13:00:00", "future_time": "2024-02-29 18:00:00"}.get(
@@ -49,12 +54,27 @@ def test_news_provenance_and_time(case, status):
         ),
         empty=case == "empty",
         url="https://example.invalid/page" if case == "wrong_source" else None,
+        business={
+            "business_failure": {"success": False, "error": private_marker},
+            "unverified_status": {"code": 98657, "msg": private_marker},
+        }.get(case),
     )
     if case == "wrong_callback":
         raw = b"other" + raw[raw.index(b"(") :]
     result = full.news_page(raw, SYMBOL, DAY, stamp)
     assert result["status"] == status
     assert "普通测试正文" not in str(result) and "合成公告" not in str(result)
+    assert all(marker not in str(result) for marker in (private_marker, "98657", "example.invalid"))
+    if reason is None:
+        assert "index_diagnostic" not in result
+    else:
+        expected = {"reason": reason}
+        if selection is not None:
+            expected["selection_counts"] = dict.fromkeys((
+                "returned", "accepted", "source_rejected", "wrong_stock",
+                "outside_window", "malformed", "undated", "duplicate",
+            ), 0) | selection
+        assert result["index_diagnostic"] == expected
     if status == "verified":
         assert result["coverage"] == "one_page"
         assert result["articles"][0]["published_at"] < result["observed_at"]
