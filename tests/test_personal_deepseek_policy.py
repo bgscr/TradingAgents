@@ -35,6 +35,16 @@ FINANCIAL_LIMITATION = "现金流资料缺失，无法形成现金流主张。"
 STATEMENT_TOOLS = {"get_balance_sheet", "get_income_statement", "get_cashflow"}
 ANALYSTS = {"market", "sentiment", "news", "fundamentals"}
 DAY = "2024-02-29"
+SYNTHESIS_CASES = {
+    "synthesis_low_risk", "synthesis_high_risk", "synthesis_wrong_market", "synthesis_wrong_financial",
+    "synthesis_missing_role", "synthesis_truncated", "synthesis_budget_stop",
+    "synthesis_wrong_instrument", "synthesis_foreign_result", "synthesis_no_budget", "synthesis_spoof_rating",
+}
+SYNTHESIS_ROLES = {"bull", "bear", "manager", "trader", "aggressive", "conservative", "neutral"}
+BEAR_CONCERNS = {
+    "synthesis_low_risk": "盈利覆盖资金成本，关注短期波动。",
+    "synthesis_high_risk": "负债结构与贷款质量仍缺核验，限制风险判断。",
+}
 MARKET_EXTRA_FIELDS = {
     "market_wrong_value": {"statement": "fixture unsupported price 98765"},
     "market_wrong_date": {"effective_date": "2024-02-28"},
@@ -112,6 +122,28 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         return response
 
     monkeypatch.setattr(personal_bootstrap, "post", statement_post)
+    if scenario in {"synthesis_wrong_instrument", "synthesis_foreign_result", "synthesis_no_budget"}:
+        from dataclasses import replace
+
+        from tradingagents import personal_research_conclusion
+        from tradingagents.analysis_budget import active_budget
+
+        synthesize = personal_research_conclusion.synthesize_personal_research
+
+        def test_synthesis_boundary(state, llm):
+            if scenario == "synthesis_wrong_instrument":
+                return synthesize(dict(state, company_of_interest="000001.SZ"), llm)
+            if scenario == "synthesis_foreign_result":
+                return replace(synthesize(state, llm), audit_digest="f" * 64)
+            budget = active_budget()
+            maximum = budget.max_calls
+            budget.max_calls = budget.receipt()["admitted_attempts"]
+            try:
+                return synthesize(state, llm)
+            finally:
+                budget.max_calls = maximum
+
+        monkeypatch.setattr(personal_research_conclusion, "synthesize_personal_research", test_synthesis_boundary)
     if scenario in MARKET_SOURCE_MISMATCHES:
         from tradingagents.agents.utils import market_data_validation_tools
 
@@ -163,6 +195,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         completion_tokens = 12
         verified_statement_prompt = None
         verified_market_prompt = None
+        verified_synthesis_prompt = None
         statement_output_chars = None
 
         def tool(name, args):
@@ -229,7 +262,42 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             phase = "finalizer"
             prompt = "\n".join(msg.get("content") or "" for msg in body["messages"])
             match = re.search(r"Finalize the (market|news|fundamentals) analyst", prompt)
-            if match:
+            if "matching PersonalResearchSubmission" in prompt:
+                phase = "research_synthesis"
+                raw = prompt.split("Evidence and commentary JSON:\n", 1)[1]
+                inputs, _ = json.JSONDecoder().raw_decode(raw)
+                stages = inputs["stages"]
+                assert stages.keys() == SYNTHESIS_ROLES
+                assert all(row["role"] == role and row["text"].strip() for role, row in stages.items())
+                market = inputs["market"]
+                financial = inputs["financial"]
+                assert len(market) == 1 and "market.close_return_20d" in next(iter(market.values()))
+                assert "2022-12-31" in next(iter(financial.values()))
+                if scenario in SYNTHESIS_CASES:
+                    for role in SYNTHESIS_ROLES - {"bear"}:
+                        assert f"fixture-{role}-perspective" in stages[role]["text"]
+                    assert BEAR_CONCERNS.get(scenario, BEAR_CONCERNS["synthesis_low_risk"]) in stages["bear"]["text"]
+                cautious = BEAR_CONCERNS["synthesis_high_risk"] in stages["bear"]["text"]
+                market_id, financial_id = next(iter(market)), next(iter(financial))
+                verified_synthesis_prompt = {
+                    "roles": sorted(stages),
+                    "market_values": sorted(market.values()),
+                    "financial_values": sorted(financial.values()),
+                    "bear_concern": "strong" if cautious else "limited",
+                }
+                content = {
+                    "view": "cautious" if cautious else "constructive",
+                    "support": "bull", "opposition": "bear", "stages": sorted(stages),
+                    "market_fact": "synthetic-unknown-market" if scenario == "synthesis_wrong_market" else market_id,
+                    "financial_fact": "synthetic-unknown-financial" if scenario == "synthesis_wrong_financial" else financial_id,
+                    "tradeoff": "贷款质量仍待观察。" if cautious else "资金成本压力可控。",
+                }
+                if scenario == "synthesis_truncated":
+                    finish, content["tradeoff"] = "length", PARTIAL
+                if scenario == "synthesis_spoof_rating":
+                    content["rating"] = "Buy"
+                message["content"] = json.dumps(content)
+            elif match:
                 analyst = match[1]
                 content = {
                     "report_markdown": "合成记录，已标注资料覆盖。",
@@ -329,7 +397,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                         ),
                         "no_draft": "Unvalidated prose draft" not in prompt,
                     }
-                    if wire_schema and scenario in {
+                    if wire_schema and scenario in SYNTHESIS_CASES | {
                         "fundamentals_metadata",
                         "fundamentals_invalid_payload",
                         "fundamentals_coverage_gap",
@@ -397,11 +465,22 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             phase = "research_plan"
             finish = tool(
                 "ResearchPlan",
-                {"recommendation": "Buy", "rationale": "fixture", "strategic_actions": "fixture"},
+                {"recommendation": "Buy", "rationale": "fixture-manager-perspective", "strategic_actions": "fixture"},
             )
         elif "TraderProposal" in names:
             phase = "trader"
-            finish = tool("TraderProposal", {"action": "Buy", "reasoning": "fixture"})
+            finish = tool("TraderProposal", {"action": "Buy", "reasoning": "fixture-trader-perspective"})
+        elif scenario in SYNTHESIS_CASES:
+            prompt = body["messages"][0].get("content") or ""
+            if "You are a Bear Analyst" in prompt:
+                message["content"] = "" if scenario == "synthesis_missing_role" else BEAR_CONCERNS.get(
+                    scenario, BEAR_CONCERNS["synthesis_low_risk"],
+                )
+            else:
+                for name in ("Bull", "Aggressive", "Conservative", "Neutral"):
+                    if re.search(r"^(?:You are (?:a |the )?|As the )" + name + r"\b", prompt, re.IGNORECASE):
+                        message["content"] = f"fixture-{name.lower()}-perspective"
+                        break
 
         observation = {
             "analyst": analyst,
@@ -419,6 +498,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             "has_report_tool": "AnalystEvidenceReport" in names,
             "verified_statement_prompt": verified_statement_prompt,
             "verified_market_prompt": verified_market_prompt,
+            "verified_synthesis_prompt": verified_synthesis_prompt,
             "statement_output_chars": statement_output_chars,
             "replayed_reasoning": any("reasoning_content" in msg for msg in body["messages"]),
             "sdk_retry": request.headers.get("x-stainless-retry-count"),
@@ -429,6 +509,10 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         if wire_trace is not None:
             with wire_trace.open("a", encoding="utf8") as out:
                 out.write(json.dumps(observation) + "\n")
+        if scenario == "synthesis_budget_stop" and phase == "research_synthesis":
+            from tradingagents.analysis_budget import active_budget
+
+            active_budget().stop("deadline_exceeded")
         return family.Response(
             200,
             request=request,
@@ -656,6 +740,7 @@ def assert_personal_financial_outcome(receipt, run_dir, scenario):
             (scenario, True, "deepseek-v4-flash", None, 4096)
             for scenario in (*MARKET_EXTRA_FIELDS, "market_unbound_indicator", *MARKET_SOURCE_MISMATCHES)
         ),
+        *((scenario, True, "deepseek-v4-flash", None, 4096) for scenario in sorted(SYNTHESIS_CASES)),
     ],
 )
 def test_personal_entry_deepseek_wire(
@@ -681,15 +766,17 @@ def test_personal_entry_deepseek_wire(
     code = personal_full.main(args if full else [*args, "--basic"])
     output = capsys.readouterr()
     receipt = json.loads(output.out)
-    valid_submission = scenario in {
+    valid_submission = scenario in SYNTHESIS_CASES | {
         "success",
         "unavailable_news",
         "news_false_claim",
         "fundamentals_metadata",
         "fundamentals_coverage_gap",
     }
-    assert code == (0 if valid_submission else 3), receipt.get("error")
-    assert receipt["status"] == "completed" and receipt["report_written"] and receipt["usage_final"]
+    stopped = scenario == "synthesis_budget_stop"
+    assert code == (1 if stopped else 0 if valid_submission else 3), receipt.get("error")
+    assert receipt["status"] == ("failed" if stopped else "completed")
+    assert receipt["report_written"] and receipt["usage_final"]
     assert (
         receipt["model_attempts"] == len(requests) == trace.read_text().splitlines().count("model")
     )
@@ -748,6 +835,10 @@ def test_personal_entry_deepseek_wire(
     report_path = folder / receipt["report_relative_path"]
     report = report_path.read_text(encoding="utf8")
     assert json.loads(raw) == receipt
+    if full:
+        assert_personal_research_outcome(receipt, folder, scenario, requests)
+    else:
+        assert "research_synthesis_status" not in receipt
     assert all(
         token not in block
         for token in (REASONING, PARTIAL, PRIVATE_FIELD, "synthetic-example")
@@ -801,6 +892,56 @@ def test_personal_entry_deepseek_wire(
             "completion_tokens": 4096 if scenario == "fundamentals_length" else 12,
             "reasoning_tokens": 0,
         } in receipt["analyst_output_diagnostics"]["events"]
+
+
+def assert_personal_research_outcome(receipt, folder, scenario, requests):
+    report_path = folder / receipt["report_relative_path"]
+    report = report_path.read_text(encoding="utf8")
+    subject = report_path.parent / "2_research" / "conclusion.md"
+    section = subject.read_text(encoding="utf8")
+    manifest = json.loads((report_path.parent / "manifest.json").read_text(encoding="utf8"))
+    assert section in report and "2_research/conclusion.md" in manifest["advisory_stages"]
+    audit = json.loads((folder / "report" / "decision-audit.json").read_text(encoding="utf8"))
+    assert not any(key.startswith("personal_research_conclusion") for key in audit)
+    calls = [row for row in requests if row["phase"] == "research_synthesis"]
+    expected = {
+        "synthesis_wrong_market": "invalid_reference",
+        "synthesis_wrong_financial": "invalid_reference",
+        "synthesis_missing_role": "missing_role",
+        "synthesis_truncated": "submission_incomplete",
+        "synthesis_budget_stop": "session_stopped",
+        "synthesis_wrong_instrument": "missing_validated_evidence",
+        "synthesis_foreign_result": "invalid_reference",
+        "synthesis_no_budget": "budget_unavailable",
+        "synthesis_spoof_rating": "submission_incomplete",
+    }
+    has_conclusion = scenario in {
+        "fundamentals_metadata", "fundamentals_coverage_gap", "synthesis_low_risk", "synthesis_high_risk",
+    }
+    assert len(calls) == int(
+        has_conclusion or expected.get(scenario) in {"invalid_reference", "submission_incomplete", "session_stopped"}
+    )
+    assert all(row["model"] == "deepseek-v4-pro" and not row["has_tool_choice"] for row in calls)
+    assert receipt["research_synthesis_status"] == ("research_conclusion" if has_conclusion else "no_conclusion")
+    if has_conclusion:
+        assert "research_synthesis_reason" not in receipt and "无综合结论" not in section
+        view = "偏谨慎" if scenario == "synthesis_high_risk" else "偏积极"
+        assert f"研究观点：{view}" in section and "综合研究仅供参考" in section
+        assert all(label in section for label in ("多头", "空头", "研究经理", "交易员", "激进", "保守", "中立"))
+        assert r"market.close\_return\_20d" in section and "财报参考观测" in section
+    else:
+        assert receipt["research_synthesis_reason"] == expected.get(scenario, "missing_validated_evidence")
+        assert "无综合结论" in section and "研究观点：" not in section
+    if scenario in SYNTHESIS_CASES:
+        decision = audit["trading_decision"]
+        assert decision["rating"] == "Hold" and len(decision["facts"]) == 1
+        assert [row["rule_id"] for row in decision["assertions"]] == ["market.return_20d.hold"]
+        assert "synthetic-unknown" not in report and PARTIAL not in section
+    if scenario == "synthesis_budget_stop":
+        assert (receipt["error"], receipt["stop_reason"], receipt["stop_stage"]) == (
+            "research_budget_or_transport_stopped", "deadline_exceeded", "research_synthesis",
+        )
+        assert "supplement_attempts" not in receipt
 
 
 def assert_personal_market_outcome(receipt, folder, scenario):

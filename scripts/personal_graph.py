@@ -345,7 +345,8 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
     )
     from scripts.personal_observations import PersonalNews, snapshot_binding, supplement
 
-    graph = state = binding = None
+    graph = state = binding = synthesis = None
+    personal_full = config.get("personal_mode") == "full"
     news = None
     if preparation is not None and "news" in config.get("personal_sources", ()):
         news = PersonalNews(ticker, day, preparation, True, config["personal_public_news_allowed"])
@@ -364,6 +365,32 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
     }
     output.mkdir(parents=True, exist_ok=False)
     stop_stage = "graph_setup"
+
+    def publish():
+        terminal = TerminalContract.model_validate(state["terminal_contract"])
+        report_state = state
+        if personal_full:
+            from tradingagents.personal_research_conclusion import PersonalResearchConclusion
+
+            report_state = dict(state, personal_report_sources=tuple(config.get("personal_sources", ())))
+            if synthesis is not None:
+                conclusion = synthesis if synthesis.matches(state) else PersonalResearchConclusion.for_state(
+                    state, reason="invalid_reference",
+                )
+                report_state["personal_research_conclusion"] = conclusion
+                receipt["research_synthesis_status"] = conclusion.status
+                if conclusion.reason is not None:
+                    receipt["research_synthesis_reason"] = conclusion.reason
+        report = graph.save_reports(report_state, ticker, output / "report")
+        receipt.update(
+            status=terminal.lifecycle_status.value if "error" not in receipt else "failed",
+            outcome=terminal.terminal_outcome_kind.value,
+            rating_status=rating_status(terminal),
+            decision_coverage=terminal.coverage.model_dump(mode="json"),
+            report_written=report.is_file(),
+            report_relative_path=report.relative_to(output).as_posix(),
+        )
+
     try:
         with (
             open(os.devnull, "w", encoding="utf-8") as quiet,
@@ -386,39 +413,40 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 selected_analysts=ANALYSTS, config=config, instrument_symbol=ticker
             )
             graph.graph = graph.graph.with_config(max_concurrency=1)
-            if preparation is not None and {
+            capture_snapshot = preparation is not None and bool({
                 "margin_balance",
                 "eastmoney_fundflow_ratio",
-            }.intersection(config.get("personal_sources", ())):
+            }.intersection(config.get("personal_sources", ())))
+            if capture_snapshot or personal_full:
                 run_graph = graph._run_graph
 
                 def run_with_binding(*args, **kwargs):
-                    nonlocal binding
+                    nonlocal binding, state, stop_stage, synthesis
                     value = run_graph(*args, **kwargs)
-                    # Verify against the live snapshot before propagate leaves its run scope.
-                    binding = snapshot_binding(value[0], ticker, day)
+                    completed_state = value[0]
+                    if capture_snapshot:
+                        # Verify against the live snapshot before propagate leaves its run scope.
+                        binding = snapshot_binding(completed_state, ticker, day)
+                    if personal_full and not completed_state.get("portfolio_research_terminal"):
+                        from tradingagents.personal_research_conclusion import (
+                            synthesize_personal_research,
+                        )
+
+                        # The rule decision and its audit are already complete. This output
+                        # travels separately and shares the active session's transport budget.
+                        state = completed_state
+                        stop_stage = "research_synthesis"
+                        synthesis = synthesize_personal_research(completed_state, graph.deep_thinking_llm)
                     return value
 
                 graph._run_graph = run_with_binding
             stop_stage = "graph_execution"
             from tradingagents.agents.analysts.submission import personal_full_prompt_scope
 
-            with personal_full_prompt_scope(config.get("personal_mode") == "full"):
+            with personal_full_prompt_scope(personal_full):
                 state, _ = graph.propagate(ticker, day)
-            terminal = TerminalContract.model_validate(state["terminal_contract"])
             stop_stage = "report_publication"
-            report_state = state
-            if config.get("personal_mode") == "full":
-                report_state = dict(state, personal_report_sources=tuple(config.get("personal_sources", ())))
-            report = graph.save_reports(report_state, ticker, output / "report")
-            receipt.update(
-                status=terminal.lifecycle_status.value,
-                outcome=terminal.terminal_outcome_kind.value,
-                rating_status=rating_status(terminal),
-                decision_coverage=terminal.coverage.model_dump(mode="json"),
-                report_written=report.is_file(),
-                report_relative_path=report.relative_to(output).as_posix(),
-            )
+            publish()
     except AnalysisBudgetStopped as exc:
         reason = exc.reason
         receipt.update(
@@ -428,6 +456,16 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             else "unknown",
             stop_stage=stop_stage,
         )
+        if stop_stage == "research_synthesis" and state is not None:
+            from tradingagents.personal_research_conclusion import PersonalResearchConclusion
+
+            synthesis = PersonalResearchConclusion.for_state(state, reason="session_stopped")
+            try:
+                with local_payloads():
+                    publish()
+            except Exception:
+                # Keep the original transport/budget stop and the pre-existing audit.
+                receipt["report_written"] = False
     except Exception:
         receipt["error"] = "research_or_publication_failed"
     budget = getattr(graph, "last_analysis_budget", None)
@@ -441,7 +479,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
         receipt["source_evidence"] = {
             "news": dict(news.result, returned_to_news_tool=news.returned_to_news_tool)
         }
-    if receipt["report_written"] and config.get("personal_sources"):
+    if receipt["report_written"] and "error" not in receipt and config.get("personal_sources"):
         # A supervisor timeout in optional collection must leave the sealed core result discoverable.
         preliminary = dict(receipt, supplement_status="pending", usage_final=False)
         if preparation is not None:

@@ -1647,6 +1647,20 @@ def _write_report_tree(final_state, ticker, publication, output_language, supple
     )
     advisory = []
     stages = []
+    synthesis_text = ""
+    if ((synthesis := final_state.get("personal_research_conclusion")) is not None
+            and isinstance(final_state.get("personal_report_sources"), tuple)):
+        from tradingagents.personal_research_conclusion import (
+            PersonalResearchConclusion,
+            render_personal_research_conclusion,
+        )
+
+        if isinstance(synthesis, PersonalResearchConclusion) and synthesis.matches(final_state):
+            relative = "2_research/conclusion.md"
+            text = render_personal_research_conclusion(synthesis, output_language)
+            documents[relative] = text
+            stages.append(relative)
+            synthesis_text = "\n\n---\n\n" + text
     rule_summary = ""
     # Equality only deduplicates the old text. The new system summary is rendered
     # from the gated contract, never attributed to the author of a matching string.
@@ -1700,7 +1714,7 @@ def _write_report_tree(final_state, ticker, publication, output_language, supple
     announcement = announcement_appendix(final_state, ticker, company_announcement,
                                         language=output_language, timeout=announcement_timeout_seconds,
                                         remaining=announcement_remaining)
-    documents["complete_report.md"] = localize_report(header, output_language) + news_selection_text + body + trend_section + ('\n\n' + eastmoney_flow if eastmoney_flow else '') + rule_summary + appendix + supplemental_text + announcement
+    documents["complete_report.md"] = localize_report(header, output_language) + news_selection_text + body + synthesis_text + trend_section + ('\n\n' + eastmoney_flow if eastmoney_flow else '') + rule_summary + appendix + supplemental_text + announcement
     return publish_report_export(publication, identity, output_language, documents, stages)
 
 
