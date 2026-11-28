@@ -332,7 +332,10 @@ def personal_sources(ticker=None, day=None, news=None):
 
 def run(config, ticker, day, output_root, started, *, preparation=None):
     from tradingagents.analysis_budget import AnalysisBudgetStopped, analysis_preparation_scope
-    from tradingagents.run_diagnostics import personal_analyst_output_scope
+    from tradingagents.run_diagnostics import (
+        personal_analyst_output_scope,
+        personal_bear_response_scope,
+    )
     from tradingagents.terminal_contract import TerminalContract
 
     run_id = uuid4().hex
@@ -346,6 +349,7 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
     from scripts.personal_observations import PersonalNews, snapshot_binding, supplement
 
     graph = state = binding = synthesis = None
+    bear_response = None
     personal_full = config.get("personal_mode") == "full"
     news = None
     if preparation is not None and "news" in config.get("personal_sources", ()):
@@ -447,7 +451,10 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
             stop_stage = "graph_execution"
             from tradingagents.agents.analysts.submission import personal_full_prompt_scope
 
-            with personal_full_prompt_scope(personal_full):
+            with (
+                personal_full_prompt_scope(personal_full),
+                personal_bear_response_scope(personal_full) as bear_response,
+            ):
                 state, _ = graph.propagate(ticker, day)
             stop_stage = "report_publication"
             publish()
@@ -472,6 +479,8 @@ def run(config, ticker, day, output_root, started, *, preparation=None):
                 receipt["report_written"] = False
     except Exception:
         receipt["error"] = "research_or_publication_failed"
+    if bear_response:
+        receipt["bear_response_diagnostics"] = bear_response
     budget = getattr(graph, "last_analysis_budget", None)
     if budget is not None:
         receipt.update(

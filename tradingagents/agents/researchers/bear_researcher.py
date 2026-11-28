@@ -2,6 +2,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
 )
+from tradingagents.run_diagnostics import record_personal_bear_response
 
 
 def create_bear_researcher(llm):
@@ -47,6 +48,7 @@ Use this information to deliver a compelling bear argument, refute the bull's cl
 """ + get_language_instruction()
 
         response = llm.invoke(prompt)
+        record_personal_bear_response(response)
 
         argument = f"Bear Analyst: {response.content}"
 

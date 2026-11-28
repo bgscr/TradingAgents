@@ -31,6 +31,10 @@ from tradingagents.personal_research_conclusion import (
     _stages,
     render_personal_research_conclusion,
 )
+from tradingagents.run_diagnostics import (
+    personal_bear_response_scope,
+    record_personal_bear_response,
+)
 
 REASONING = "fixture-private-reasoning-never-persist"
 PARTIAL = "fixture-partial-report-never-publish"
@@ -42,7 +46,8 @@ ANALYSTS = {"market", "sentiment", "news", "fundamentals"}
 DAY = "2024-02-29"
 SYNTHESIS_CASES = {
     "synthesis_low_risk", "synthesis_high_risk", "synthesis_wrong_market", "synthesis_wrong_financial",
-    "synthesis_missing_role", "synthesis_label_only_roles", "synthesis_truncated", "synthesis_budget_stop",
+    "synthesis_missing_role", "synthesis_bear_length", "synthesis_label_only_roles", "synthesis_truncated",
+    "synthesis_budget_stop",
     "synthesis_wrong_instrument", "synthesis_foreign_result", "synthesis_no_budget", "synthesis_spoof_rating",
 }
 SYNTHESIS_ROLES = {"bull", "bear", "manager", "trader", "aggressive", "conservative", "neutral"}
@@ -199,6 +204,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         analyst = None
         phase = "debate_or_risk"
         completion_tokens = 12
+        reasoning_tokens = 0
         verified_statement_prompt = None
         verified_market_prompt = None
         verified_synthesis_prompt = None
@@ -479,9 +485,13 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
         elif scenario in SYNTHESIS_CASES:
             prompt = body["messages"][0].get("content") or ""
             if "You are a Bear Analyst" in prompt:
-                message["content"] = "" if scenario == "synthesis_missing_role" else BEAR_CONCERNS.get(
-                    scenario, BEAR_CONCERNS["synthesis_low_risk"],
-                )
+                phase = "bear_researcher"
+                if scenario == "synthesis_bear_length":
+                    finish, message["content"], completion_tokens, reasoning_tokens = "length", None, 4096, 4096
+                elif scenario == "synthesis_missing_role":
+                    message["content"] = ""
+                else:
+                    message["content"] = BEAR_CONCERNS.get(scenario, BEAR_CONCERNS["synthesis_low_risk"])
             else:
                 for name in ("Bull", "Aggressive", "Conservative", "Neutral"):
                     if re.search(r"^(?:You are (?:a |the )?|As the )" + name + r"\b", prompt, re.IGNORECASE):
@@ -523,6 +533,14 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
             from tradingagents.analysis_budget import active_budget
 
             active_budget().stop("deadline_exceeded")
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 10 + completion_tokens,
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        }
+        if scenario == "synthesis_missing_role" and phase == "bear_researcher":
+            usage = {"prompt_tokens": 10}
         return family.Response(
             200,
             request=request,
@@ -532,12 +550,7 @@ def install_personal_deepseek_wire(monkeypatch, transport_trace, scenario, wire_
                 "created": 1,
                 "model": body["model"],
                 "choices": [{"index": 0, "finish_reason": finish, "message": message}],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": 10 + completion_tokens,
-                    "completion_tokens_details": {"reasoning_tokens": 0},
-                },
+                "usage": usage,
             },
         )
 
@@ -792,6 +805,8 @@ def test_personal_entry_deepseek_wire(
     )
     assert receipt["admitted_attempts"] == len(trace.read_text().splitlines()) <= 60
     assert receipt["financial_attempts"] == 3
+    if not full:
+        assert "bear_response_diagnostics" not in receipt
     assert_wire_policy(requests, full=full, quick=quick, effort=effort, limit=limit)
     order = Counter((row["analyst"], row["phase"]) for row in requests)
     assert order["market", "tools"] == (3 if scenario == "fundamentals_metadata" else 2 if not full else 1)
@@ -913,11 +928,13 @@ def assert_personal_research_outcome(receipt, folder, scenario, requests):
     assert section in report and "2_research/conclusion.md" in manifest["advisory_stages"]
     audit = json.loads((folder / "report" / "decision-audit.json").read_text(encoding="utf8"))
     assert not any(key.startswith("personal_research_conclusion") for key in audit)
+    assert "bear_response_diagnostics" not in audit
     calls = [row for row in requests if row["phase"] == "research_synthesis"]
     expected = {
         "synthesis_wrong_market": "invalid_reference",
         "synthesis_wrong_financial": "invalid_reference",
         "synthesis_missing_role": "missing_role",
+        "synthesis_bear_length": "missing_role",
         "synthesis_label_only_roles": "missing_role",
         "synthesis_truncated": "submission_incomplete",
         "synthesis_budget_stop": "session_stopped",
@@ -948,8 +965,23 @@ def assert_personal_research_outcome(receipt, folder, scenario, requests):
         assert decision["rating"] == "Hold" and len(decision["facts"]) == 1
         assert [row["rule_id"] for row in decision["assertions"]] == ["market.return_20d.hold"]
         assert "synthetic-unknown" not in report and PARTIAL not in section
-    if scenario in {"synthesis_missing_role", "synthesis_label_only_roles"}:
-        absent = ("bear",) if scenario == "synthesis_missing_role" else LABEL_ONLY_ROLES
+    bear_label_only = scenario in {"synthesis_missing_role", "synthesis_bear_length"}
+    if scenario in SYNTHESIS_CASES:
+        assert sum(row["phase"] == "bear_researcher" for row in requests) == 1
+        length = scenario == "synthesis_bear_length"
+        expected_bear = {
+            "content_presence": "empty" if bear_label_only else "present",
+            "finish_reason": "length" if length else "stop",
+        }
+        if scenario != "synthesis_missing_role":
+            expected_bear.update(
+                completion_tokens=4096 if length else 12,
+                reasoning_tokens=4096 if length else 0,
+            )
+        assert receipt["bear_response_diagnostics"] == expected_bear
+        assert REASONING not in json.dumps(receipt)
+    if bear_label_only or scenario == "synthesis_label_only_roles":
+        absent = ("bear",) if bear_label_only else LABEL_ONLY_ROLES
         assert receipt.get("research_synthesis_role_diagnostics") == [
             {"role": role, "reason": "label_only"} for role in absent
         ]
@@ -963,6 +995,36 @@ def assert_personal_research_outcome(receipt, folder, scenario, requests):
             "research_budget_or_transport_stopped", "deadline_exceeded", "research_synthesis",
         )
         assert "supplement_attempts" not in receipt
+
+
+def test_personal_bear_response_projection_bounds_metadata_and_retains_one_observation():
+    response = AIMessage(
+        content=" \n",
+        response_metadata={
+            "finish_reason": PRIVATE_FIELD,
+            "token_usage": {"completion_tokens": 1 << 31, "completion_tokens_details": {"reasoning_tokens": 1}},
+        },
+        additional_kwargs={"reasoning_content": REASONING},
+    )
+    record_personal_bear_response(response)
+    with personal_bear_response_scope(False) as disabled:
+        record_personal_bear_response(response)
+        assert disabled is None
+    with personal_bear_response_scope(True) as observed:
+        record_personal_bear_response(response)
+        record_personal_bear_response(AIMessage(content="fixture-private-body"))
+    assert observed == {"content_presence": "empty"}
+    with personal_bear_response_scope(True) as observed:
+        record_personal_bear_response(AIMessage(content=[{"type": "text", "text": PRIVATE_FIELD}]))
+    assert observed == {"content_presence": "unknown"}
+    with personal_bear_response_scope(True) as observed:
+        record_personal_bear_response(AIMessage(
+            content="",
+            response_metadata={
+                "token_usage": {"completion_tokens": 0, "completion_tokens_details": {"reasoning_tokens": 0}},
+            },
+        ))
+    assert observed == {"content_presence": "empty", "completion_tokens": 0, "reasoning_tokens": 0}
 
 
 def assert_personal_market_outcome(receipt, folder, scenario):

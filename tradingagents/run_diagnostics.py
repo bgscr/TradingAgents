@@ -6,6 +6,7 @@ configuration reads, global handlers, or qualification decisions occur here.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
@@ -14,6 +15,7 @@ from threading import Lock
 
 _SINK = ContextVar('run_diagnostic_sink', default=None)
 _PERSONAL_OUTPUT_SINK = ContextVar('personal_analyst_output_sink', default=None)
+_PERSONAL_BEAR_RESPONSE = ContextVar('personal_bear_response', default=None)
 _OUTPUT_ANALYSTS = frozenset({'market', 'fundamentals', 'news', 'social', 'sentiment'})
 _OUTPUT_STAGES = frozenset({'initial_response', 'finalizer'})
 _OUTPUT_OUTCOMES = frozenset({'response', 'success', 'output_limit', 'none_parsed',
@@ -82,6 +84,48 @@ def personal_analyst_output_scope():
         with lock:
             closed = True
         _PERSONAL_OUTPUT_SINK.reset(token)
+
+
+@contextmanager
+def personal_bear_response_scope(enabled: bool):
+    """Keep at most one adapted Bear response observation for the personal Full receipt."""
+    observation = {} if enabled else None
+    token = _PERSONAL_BEAR_RESPONSE.set(observation)
+    try:
+        yield observation
+    finally:
+        _PERSONAL_BEAR_RESPONSE.reset(token)
+
+
+def record_personal_bear_response(response):
+    observation = _PERSONAL_BEAR_RESPONSE.get()
+    if observation is None or observation:
+        return
+    from tradingagents.agents.utils.structured import (
+        bounded_analyst_output_usage,
+        safe_output_diagnostics,
+    )
+
+    content = getattr(response, 'content', None)
+    if type(content) is str:
+        presence = 'empty' if not content or content.isspace() else 'present'
+    else:
+        presence = 'unknown'
+    metadata = getattr(response, 'response_metadata', None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    # LangChain's normalized usage can turn a missing provider counter into zero.
+    usage = metadata.get('token_usage')
+    usage = usage if isinstance(usage, Mapping) else {}
+    details = usage.get('completion_tokens_details')
+    details = details if isinstance(details, Mapping) else {}
+    diagnostics = safe_output_diagnostics({
+        'finish_reason': metadata.get('finish_reason'),
+        'completion_tokens': usage.get('completion_tokens'),
+        'reasoning_tokens': details.get('reasoning_tokens'),
+    })
+    observation.update(content_presence=presence, **bounded_analyst_output_usage(diagnostics))
+    if 'finish_reason' in diagnostics:
+        observation['finish_reason'] = diagnostics['finish_reason']
 
 
 class DiagnosticPersistenceError(BaseException):
